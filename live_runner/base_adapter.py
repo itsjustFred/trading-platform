@@ -157,6 +157,11 @@ class ControlOutcome:
                       unreadable status. Not an error to retry blindly; the payload is the
                       problem, so it is named rather than skipped.
     ``failed``        items the broker refused, or where the request raised
+    ``pending_cancel`` ids whose cancel the broker accepted but which were still listed as
+                      cancelling on the verification re-read. They do not make the sweep
+                      incomplete (the cancel was accepted), but such an order may still
+                      fill in a cancel/fill race, so a STOPPED deployment must not be
+                      stamped enforced while any remain. Empty for brokers with no such state.
 
     ``complete`` is the contract: a caller may only treat the account as stopped/flat when the
     sweep was complete. A partial sweep must be retried or escalated, never recorded as enforced.
@@ -167,6 +172,7 @@ class ControlOutcome:
     completed: int = 0
     unidentified: tuple[str, ...] = ()
     failed: tuple[str, ...] = ()
+    pending_cancel: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -267,3 +273,11 @@ class BaseLiveAdapter(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} cannot identify orphaned protections"
         )
+
+    async def backfill_commissions(self) -> int:
+        """Fill in commissions the broker reports only after the fill. Returns the rows updated.
+
+        A no-op by default: a broker that states its fee on the fill has nothing to backfill.
+        Alpaca posts crypto fees end of day and overrides this (#124).
+        """
+        return 0

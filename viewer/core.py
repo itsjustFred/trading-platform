@@ -290,6 +290,18 @@ def _optimization_summary_payload(payload: dict[str, Any], path: Path) -> dict[s
         "train_stats": payload.get("train_stats", {}),
         "test_stats": payload.get("test_stats", {}),
     }
+    # New three-way split keys (issue #164). The list carries only the small
+    # keys; the full `three_way` section is served by the detail endpoint.
+    for key in (
+        "validation_split_pct",
+        "test_split_pct",
+        "validation_period",
+        "validation_stats",
+        "final_test_period",
+        "final_test_stats",
+    ):
+        if key in payload:
+            summary[key] = payload.get(key)
     for key in (
         "best_metric_key",
         "best_raw_value",
@@ -498,6 +510,17 @@ def _trade_realized_risk(trade: Trade) -> tuple[float | None, float | None]:
     return None, None
 
 
+def _trade_event_time(trade: Trade) -> str:
+    """Time at which a trade's PnL is booked on the viewer equity curve.
+
+    #123: ``Trade.last_exit_time`` raises for a trade without exits. Stored
+    results can legitimately contain such a trade (``_trade_to_viewer`` already
+    tolerates it), so fall back to ``entry_time`` explicitly here, as the old
+    implicit fallback did, instead of crashing the whole equity curve.
+    """
+    return trade.last_exit_time if trade.exits else trade.entry_time
+
+
 def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
     if not result.trades:
         return []
@@ -506,14 +529,14 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
     ordered_trades = sorted(
         result.trades,
         key=lambda trade: (
-            _iso_to_unix(trade.last_exit_time or trade.entry_time),
+            _iso_to_unix(_trade_event_time(trade)),
             _iso_to_unix(trade.entry_time),
             trade.id,
         ),
     )
 
     first_trade_time = _iso_to_unix(
-        ordered_trades[0].entry_time or ordered_trades[0].last_exit_time
+        ordered_trades[0].entry_time or _trade_event_time(ordered_trades[0])
     )
     points: list[dict] = []
     if first_trade_time > 0:
@@ -521,7 +544,7 @@ def _equity_curve_from_trades(result: BacktestResult) -> list[dict]:
 
     running_equity = initial_capital
     for trade in ordered_trades:
-        event_time = _iso_to_unix(trade.last_exit_time or trade.entry_time)
+        event_time = _iso_to_unix(_trade_event_time(trade))
         if event_time <= 0:
             continue
         running_equity += _trade_net_pnl(trade)
@@ -1474,6 +1497,10 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
     # PSR / p-value
     stats["psr"] = _defined_stat_value(raw, "psr")
     stats["p_value"] = _defined_stat_value(raw, "p_value")
+    # #132: surface the ruin flag so a null Sharpe/PSR is explained, not mistaken
+    # for "not computed". Legacy artifacts predate the flag and read as not ruined.
+    stats["ruined"] = bool(raw.get("ruined", False))
+    stats["ruin_time"] = raw.get("ruin_time")
     return stats
 
 

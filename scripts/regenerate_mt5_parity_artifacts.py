@@ -62,7 +62,11 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_eurusd_h1.json"),
-        "use_native_daily_ohlcv": True,
+        # MT5 builds D1 bars on the server clock; the UTC-day 1d parquet has other day
+        # boundaries (and Sunday-evening rows), so the D1 bars come from the M1 bars.
+        "use_native_daily_ohlcv": False,
+        # Dukascopy-demo tester history clock (shared/broker_clock.py, audit README).
+        "broker_clock": "dukascopy_mt5_forex",
         # Account-Währung aus Tester-Setfile Currency=... (EURUSD_H1_setfile.ini: USD).
         "account_currency": "USD",
     },
@@ -75,6 +79,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_nas100_m15.json"),
+        "broker_clock": "dukascopy_mt5_index",
         # Account-Währung aus Tester-Setfile Currency=... (NAS100_M15_setfile.ini: EUR).
         "account_currency": "EUR",
     },
@@ -87,6 +92,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_sp500_m1.json"),
+        "broker_clock": "dukascopy_mt5_index",
         # Account-Währung aus Tester-Setfile Currency=... (SP500_M1_setfile.ini: USD).
         "account_currency": "USD",
     },
@@ -507,7 +513,8 @@ def regenerate_case(
             "comparison_label": case["label"],
             "reference_symbol": case["symbol"],
             "reference_timeframe": case["report_timeframe"],
-            "session_timezone": "Europe/Athens",
+            # MT5 server time = the broker clock of the tester history, not a civil zone.
+            "broker_clock": case["broker_clock"],
         }
     )
     df = _load_ohlcv(
@@ -593,12 +600,31 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--risk-pct", type=float, default=0.01)
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=[str(case["label"]) for case in COMPARISON_CASES],
+        help="Regenerate only this case (repeatable; default: all). One case at a time keeps peak RAM "
+        "low.",
+    )
     args = parser.parse_args()
 
-    conversion = _conversion_series(args.data_dir, "2018-01-01", "2026-06-23")
+    cases = [case for case in COMPARISON_CASES if not args.case or case["label"] in args.case]
+    needs_conversion = any(
+        str(case.get("account_currency", "USD")).upper() == "EUR" for case in cases
+    )
+    conversion = (
+        _conversion_series(args.data_dir, "2018-01-01", "2026-06-23") if needs_conversion else None
+    )
     summary = [
-        regenerate_case(case, data_dir=args.data_dir, capital=args.capital, risk_pct=args.risk_pct, conversion=conversion)
-        for case in COMPARISON_CASES
+        regenerate_case(
+            case,
+            data_dir=args.data_dir,
+            capital=args.capital,
+            risk_pct=args.risk_pct,
+            conversion=conversion,
+        )
+        for case in cases
     ]
     print(json.dumps(summary, indent=2, default=str))
 

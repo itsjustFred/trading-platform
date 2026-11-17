@@ -318,6 +318,265 @@ def test_dedupe_does_not_overwrite_existing_broker_order_id(isolated_db, signal_
     assert rows[0].broker_order_id == "BRK-AAA"
 
 
+def test_conflicting_broker_order_id_is_persisted_and_reported(
+    isolated_db, signal_parent, caplog
+) -> None:
+    """Issue #126: a conflicting id is recorded on the signal, not only logged."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-3", broker_order_id="BRK-AAA")
+    )
+    with caplog.at_level("ERROR"):
+        for _ in range(2):  # redelivery of the same conflict is recorded once
+            save_live_signal(
+                _make_live_signal(discord_message_id="ord-3", broker_order_id="BRK-BBB")
+            )
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.broker_order_id == "BRK-AAA"
+        assert row.metadata_json["conflicting_broker_order_ids"] == ["BRK-BBB"]
+    assert any("BRK-BBB" in record.getMessage() for record in caplog.records)
+    assert list_live_signal_broker_order_conflicts() == [
+        {
+            "signal_id": first_id,
+            "deployment_id": "dep-1",
+            "symbol": "AAPL",
+            "broker_order_id": "BRK-AAA",
+            "conflicting_broker_order_ids": ["BRK-BBB"],
+        }
+    ]
+
+
+def test_matching_or_missing_broker_order_id_records_no_conflict(
+    isolated_db, signal_parent
+) -> None:
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    save_live_signal(_make_live_signal(discord_message_id="ord-4", broker_order_id="BRK-1"))
+    save_live_signal(_make_live_signal(discord_message_id="ord-4", broker_order_id="BRK-1"))
+    save_live_signal(_make_live_signal(discord_message_id="ord-4"))
+    assert list_live_signal_broker_order_conflicts() == []
+
+
+def _make_live_signal_at(
+    timestamp: datetime, *, discord_message_id: str, broker_order_id: str | None = None
+) -> LiveSignal:
+    metadata: dict = {"discord_message_id": discord_message_id}
+    if broker_order_id is not None:
+        metadata["broker_order_id"] = broker_order_id
+    return LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=timestamp,
+        metadata=metadata,
+    )
+
+
+def test_conflict_merge_does_not_drop_ids_committed_by_another_writer(
+    isolated_db, signal_parent
+) -> None:
+    """Read-modify-write race: a writer holding a stale copy must merge, not overwrite."""
+    from shared.database import (
+        _reconcile_existing_live_signal,
+        list_live_signal_broker_order_conflicts,
+    )
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-6", broker_order_id="BRK-AAA")
+    )
+    with get_session() as stale_session:
+        stale_existing = stale_session.get(LiveSignalModel, first_id)
+        assert stale_existing is not None
+        # Another writer records BRK-BBB and commits while this one still holds its copy.
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-6", broker_order_id="BRK-BBB")
+        )
+        incoming = LiveSignalModel.from_live_signal(
+            _make_live_signal(discord_message_id="ord-6", broker_order_id="BRK-CCC")
+        )
+        _reconcile_existing_live_signal(stale_session, stale_existing, incoming)
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.metadata_json["conflicting_broker_order_ids"] == ["BRK-BBB", "BRK-CCC"]
+    assert list_live_signal_broker_order_conflicts()[0]["conflicting_broker_order_ids"] == [
+        "BRK-BBB",
+        "BRK-CCC",
+    ]
+
+
+@pytest.mark.parametrize("stored", [42, "BRK-BBB", {"BRK-BBB": True}])
+def test_malformed_stored_conflict_value_is_ignored_not_iterated(
+    isolated_db, signal_parent, stored
+) -> None:
+    """A non-list value under the reserved key must not crash redelivery or leak fake ids."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-7", broker_order_id="BRK-AAA")
+    )
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        row.metadata_json = {**row.metadata_json, "conflicting_broker_order_ids": stored}
+        session.add(row)
+        session.commit()
+
+    # Must not raise (TypeError on int, char-by-char split on str).
+    save_live_signal(_make_live_signal(discord_message_id="ord-7", broker_order_id="BRK-CCC"))
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.metadata_json["conflicting_broker_order_ids"] == ["BRK-CCC"]
+    assert list_live_signal_broker_order_conflicts()[0]["conflicting_broker_order_ids"] == [
+        "BRK-CCC"
+    ]
+
+
+@pytest.mark.parametrize("stored", ["BRK-BBB", 42, {"id": "BRK-BBB"}])
+def test_conflict_query_skips_a_malformed_row_and_keeps_valid_ones(
+    isolated_db, signal_parent, stored
+) -> None:
+    """One row with a non-list value under the key must not break the whole report."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    save_live_signal(_make_live_signal(discord_message_id="ord-ok", broker_order_id="BRK-AAA"))
+    save_live_signal(_make_live_signal(discord_message_id="ord-ok", broker_order_id="BRK-CCC"))
+    bad_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-bad", broker_order_id="BRK-DDD")
+    )
+    with get_session() as session:
+        row = session.get(LiveSignalModel, bad_id)
+        row.metadata_json = {**row.metadata_json, "conflicting_broker_order_ids": stored}
+        session.add(row)
+        session.commit()
+
+    conflicts = list_live_signal_broker_order_conflicts()
+
+    assert [c["conflicting_broker_order_ids"] for c in conflicts] == [["BRK-CCC"]]
+
+
+def test_producer_cannot_preseed_the_conflict_ledger(isolated_db, signal_parent) -> None:
+    """The reserved key is written only by the conflict ledger, never by producer metadata."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    forged = _make_live_signal(discord_message_id="ord-8", broker_order_id="BRK-AAA")
+    forged.metadata["conflicting_broker_order_ids"] = ["BRK-FORGED"]
+    first_id, _ = save_live_signal(forged)
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert "conflicting_broker_order_ids" not in row.metadata_json
+    assert list_live_signal_broker_order_conflicts() == []
+
+    save_live_signal(_make_live_signal(discord_message_id="ord-8", broker_order_id="BRK-BBB"))
+    assert list_live_signal_broker_order_conflicts()[0]["conflicting_broker_order_ids"] == [
+        "BRK-BBB"
+    ]
+
+
+def test_conflict_query_applies_limit_and_newest_first_before_truncating(
+    isolated_db, signal_parent
+) -> None:
+    """The cap must count only conflicted signals, newest first, and must bound the scan."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    base = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    for day in range(4):
+        ts = base.replace(day=day + 1)
+        save_live_signal(
+            _make_live_signal_at(ts, discord_message_id=f"q-{day}", broker_order_id="BRK-A")
+        )
+        save_live_signal(
+            _make_live_signal_at(ts, discord_message_id=f"q-{day}", broker_order_id="BRK-B")
+        )
+    # A newer signal with no conflict must not consume the limit.
+    save_live_signal(
+        _make_live_signal_at(
+            base.replace(day=20), discord_message_id="q-clean", broker_order_id="BRK-A"
+        )
+    )
+    save_live_signal(
+        _make_live_signal_at(base.replace(day=20), discord_message_id="q-clean")
+    )
+    # An even newer signal carrying an empty ledger list is not a conflict either.
+    empty_list_id, _ = save_live_signal(
+        _make_live_signal_at(
+            base.replace(day=25), discord_message_id="q-empty", broker_order_id="BRK-A"
+        )
+    )
+    with get_session() as session:
+        empty_row = session.get(LiveSignalModel, empty_list_id)
+        empty_row.metadata_json = {
+            **empty_row.metadata_json,
+            "conflicting_broker_order_ids": [],
+        }
+        session.add(empty_row)
+        session.commit()
+
+    rows = list_live_signal_broker_order_conflicts(limit=2)
+    assert [row["conflicting_broker_order_ids"] for row in rows] == [["BRK-B"], ["BRK-B"]]
+    assert len(list_live_signal_broker_order_conflicts()) == 4
+    assert len(list_live_signal_broker_order_conflicts(limit=0)) == 1
+    # Newest-first: the first returned row is the day-4 conflict.
+    with get_session() as session:
+        newest = session.get(LiveSignalModel, rows[0]["signal_id"])
+        assert newest.discord_message_id == "q-3"
+        second = session.get(LiveSignalModel, rows[1]["signal_id"])
+        assert second.discord_message_id == "q-2"
+
+
+def test_concurrent_loser_records_its_conflicting_broker_order_id(
+    isolated_db, signal_parent
+) -> None:
+    """Loser of the unique-constraint race must not drop a differing broker id silently."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    database, _engine, _data_dir, _bt = isolated_db
+    winner_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="race-2", broker_order_id="BRK-AAA")
+    )
+
+    real_exec = database.Session.exec
+    state = {"precheck_done": False}
+
+    def fake_exec(self, statement, *args, **kwargs):  # noqa: ANN001
+        stmt_text = str(statement).lower()
+        if (
+            not state["precheck_done"]
+            and "discord_message_id" in stmt_text
+            and "select" in stmt_text
+        ):
+            state["precheck_done"] = True
+
+            class _Empty:
+                def first(self_inner):  # noqa: N805
+                    return None
+
+                def all(self_inner):  # noqa: N805
+                    return []
+
+            return _Empty()
+        return real_exec(self, statement, *args, **kwargs)
+
+    database.Session.exec = fake_exec
+    try:
+        loser_id, created = save_live_signal(
+            _make_live_signal(discord_message_id="race-2", broker_order_id="BRK-BBB")
+        )
+    finally:
+        database.Session.exec = real_exec
+
+    assert created is False
+    assert loser_id == winner_id
+    assert list_live_signal_broker_order_conflicts()[0]["conflicting_broker_order_ids"] == [
+        "BRK-BBB"
+    ]
+
+
 # ─── Finding 5: migration backfill of discord_message_id ─────────────────────
 
 

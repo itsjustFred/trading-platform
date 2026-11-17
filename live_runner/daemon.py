@@ -8,9 +8,11 @@ import math
 import os
 import re
 import uuid
+import weakref
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -34,6 +36,25 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
+from live_runner.exit_signals import (
+    DEFAULT_QTY_TOLERANCE,
+    EXIT_POSITION_SIDE_KEY,
+    FULL_EXIT,
+    ExitBelowStepError,
+    ExitInFlightError,
+    ExitInstruction,
+    LedgerMismatchError,
+    NothingToExitError,
+    broker_position_qty,
+    ensure_ledgers_match_broker,
+    exit_instruction_from_metadata,
+    exit_intent_metadata,
+    is_exit_intent,
+    is_exit_order,
+    resolve_exit_order,
+    round_exit_qty_down,
+    usable_qty_tolerance,
+)
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_sources import (
     DiscordSignalSource,
@@ -43,6 +64,8 @@ from live_runner.signal_sources import (
 from live_runner.signal_sources.discord_source import DiscordAuthenticationError
 from live_runner.stockkit_routing import (
     infer_stockkit_route,
+    is_stockkit_marked,
+    resolve_deployment_stockkit_route,
     validate_stockkit_deployment_route,
 )
 from risk import RiskConfig, RiskEngine, TradeSignal
@@ -54,10 +77,13 @@ from shared.database import (
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
     create_service,
+    get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
     get_service,
+    list_account_unfilled_exit_orders,
     list_live_accounts,
+    list_live_deployment_unfilled_exit_orders,
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
@@ -67,6 +93,7 @@ from shared.database import (
     save_live_balance,
     update_service_status,
 )
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     LiveAccountConfig,
@@ -78,6 +105,12 @@ from shared.models import (
     ServiceType,
 )
 from shared.sentry import capture_exception, initialize_sentry
+from shared.trailing import (
+    LIVE_SUPPORTED_TRAILING_MODES,
+    TRAILING_SL_CONFIG_METADATA_KEY,
+    validate_live_deployment_trailing_override,
+    validate_trailing_sl_config,
+)
 from signal_bots.registry import get_signal_processor
 
 initialize_sentry("live-runner")
@@ -89,6 +122,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
+# A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
+# deployment stays unstamped while one is listed (it could still fill); after this many
+# consecutive enforcement passes (~1 minute at the poll interval) the WARNING becomes an
+# ERROR so a stuck cancel reaches an operator.
+PENDING_CANCEL_ESCALATION_PASSES = 6
+_PENDING_CANCEL_PASSES: dict[str, int] = {}
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
 _DISCORD_AUTH_BLOCKED_REASONS: dict[str, str] = {}
@@ -575,13 +614,14 @@ def _deployment_matches_stockkit_route(
     account_broker_login: str | None = None,
     accounts_env_values: Mapping[str, str] | None = None,
 ) -> bool:
+    marked = is_stockkit_marked(deployment)
     route = infer_stockkit_route(
         signal_source_id=deployment.signal_source_id,
         signal_config=deployment.signal_config,
         settings=deployment.settings,
         metadata=signal_metadata,
     )
-    if not route:
+    if not route and not marked:
         return True
     try:
         validate_stockkit_deployment_route(
@@ -589,6 +629,10 @@ def _deployment_matches_stockkit_route(
             account_broker_login=account_broker_login,
             accounts_env_values=accounts_env_values,
         )
+        if marked:
+            # The explicit marking is authoritative over inference (#121); it was
+            # validated just above, so this cannot raise a new refusal.
+            route = resolve_deployment_stockkit_route(deployment)
     except ValueError as exc:
         logger.warning(
             "Blocking misrouted StockKit deployment",
@@ -596,13 +640,55 @@ def _deployment_matches_stockkit_route(
                 "data": {
                     "deployment_id": str(deployment.id),
                     "account_id": deployment.account_id,
+                    "stockkit_marked": marked,
                     "error": str(exc),
                 }
             },
         )
+        if marked:
+            # #121 decision 5: a marked StockKit deployment whose route is unknown
+            # or unresolvable is a broken service, not one skipped signal.
+            _mark_discord_deployment_service_unhealthy(deployment, str(exc))
         return False
     signal_route = infer_stockkit_route(metadata=signal_metadata)
     return not signal_route or signal_route == route
+
+
+def _mark_discord_deployment_service_unhealthy(
+    deployment: LiveDeploymentConfig, reason: str
+) -> None:
+    """Mark the deployment's Discord service FAILED, never overriding PAUSE/STOP.
+
+    Best effort: the refusal itself already happened, so a lookup or write
+    failure here is logged and swallowed rather than tearing down the fan-out.
+    """
+    try:
+        service_id = _service_id_for_discord_deployment(deployment)
+        if service_id is None:
+            logger.error(
+                "StockKit route refused but the deployment has no unique service row "
+                "to mark unhealthy",
+                extra={"data": {"deployment_id": str(deployment.id), "reason": reason}},
+            )
+            return
+        update_service_status(
+            service_id, ServiceStatus.FAILED, respect_operator_intent=True
+        )
+        logger.error(
+            "Marked Discord service unhealthy: StockKit route cannot be resolved",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "service_id": service_id,
+                    "reason": reason,
+                }
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Could not mark the Discord service unhealthy after a StockKit route refusal",
+            extra={"data": {"deployment_id": str(deployment.id)}},
+        )
 
 
 def _timeframe_age_budget_seconds(timeframe: str) -> float:
@@ -733,6 +819,19 @@ def _apply_signal_processor(
         "metadata": dict(signal.metadata or {}),
     }
     processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
+    # #150 fail closed at signal time: a processed signal that asks for a
+    # trailing mode the live path cannot execute (live trailing does not
+    # exist yet, #167) is rejected here — the signal is not traded, instead
+    # of running with the requested trailing silently dropped. The caller
+    # logs the refusal and skips the signal.
+    validate_trailing_sl_config(
+        (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
+        supported=LIVE_SUPPORTED_TRAILING_MODES,
+        context=(
+            f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
+            f"signal processor '{processor_name}'"
+        ),
+    )
     metadata = dict(signal.metadata or {})
     metadata.update(dict(processed.metadata or {}))
     metadata["signal_processor"] = processor_name
@@ -802,100 +901,382 @@ def size_live_signal_for_submission(
     return signal.model_copy(update={"metadata": metadata})
 
 
-def _resolve_exit_only_target_qty(
-    positions: Iterable[Mapping[str, object]],
-    symbol: str,
+def _position_qty_tolerance(adapter: BaseLiveAdapter, symbol: str) -> float:
+    """The instrument's quantity precision, or the strict default.
+
+    An adapter that cannot say (no method, an error, a nonsensical value) gets
+    the strict default: an unknown precision must never widen the match.
+    """
+    method = getattr(adapter, "position_qty_tolerance", None)
+    if not callable(method):
+        return DEFAULT_QTY_TOLERANCE
+    try:
+        raw = method(symbol)
+    except Exception as exc:
+        logger.warning(
+            "Could not read the instrument quantity precision; using the strict default",
+            extra={"data": {"symbol": symbol, "error": str(exc)}},
+        )
+        return DEFAULT_QTY_TOLERANCE
+    tolerance = usable_qty_tolerance(raw)
+    if tolerance == DEFAULT_QTY_TOLERANCE and raw != DEFAULT_QTY_TOLERANCE:
+        logger.warning(
+            "Adapter reported an unusable quantity precision; using the strict default",
+            extra={"data": {"symbol": symbol, "reported": repr(raw)}},
+        )
+    return tolerance
+
+
+def _round_exit_qty_to_adapter_step(
+    adapter: BaseLiveAdapter, symbol: str, qty: float
 ) -> float:
-    quantities: list[float] = []
-    for position in positions:
-        position_symbol = str(position.get("symbol") or "").strip().upper()
-        if position_symbol != symbol.upper():
-            continue
-        quantity = _coerce_live_float(position.get("qty"), field_name="qty")
-        if not math.isfinite(quantity) or quantity == 0:
-            raise ValueError(
-                f"Exit-only signal for {symbol} received a non-positive broker position."
-            )
-        quantities.append(quantity)
-    if not quantities:
-        return 0.0
-    if len(quantities) > 1:
-        raise ValueError(
-            f"Exit-only signal for {symbol} has multiple broker positions; "
-            "refusing an unaddressed aggregate close."
+    """``qty`` floored to the adapter's exit quantity step for ``symbol``.
+
+    An adapter that names no step is left to its own conversion (both real
+    adapters name one and floor exits again themselves). Raises
+    :class:`ExitBelowStepError` when less than one step remains.
+    """
+    method = getattr(adapter, "exit_qty_step", None)
+    if not callable(method):
+        return float(qty)
+    step = float(method(symbol))
+    rounded = round_exit_qty_down(qty, step)
+    if rounded <= 0.0:
+        raise ExitBelowStepError(
+            f"Exit for {symbol} ignored: the requested {qty:g} is below the "
+            f"instrument's quantity step {step:g}; closing one step would close more "
+            "than this deployment owns or was asked to close.",
+            requested_qty=qty,
+            qty_step=step,
         )
-    if quantities[0] < 0:
-        return abs(quantities[0])
-    return quantities[0]
+    return rounded
 
 
-def _exit_only_close_action(positions: Iterable[Mapping[str, object]], symbol: str) -> str:
-    quantities: list[float] = []
-    for position in positions:
-        position_symbol = str(position.get("symbol") or "").strip().upper()
-        if position_symbol != symbol.upper():
-            continue
-        quantity = _coerce_live_float(position.get("qty"), field_name="qty")
-        if not math.isfinite(quantity) or quantity == 0:
-            raise ValueError(
-                f"Exit-only signal for {symbol} received a non-positive broker position."
-            )
-        quantities.append(quantity)
-    if not quantities:
-        return "sell"
-    if len(quantities) > 1:
-        raise ValueError(
-            f"Exit-only signal for {symbol} has multiple broker positions; "
-            "refusing an ambiguous aggregate close."
+def _log_exit_below_step(
+    account_id: str, deployment: LiveDeploymentConfig, symbol: str, exc: ExitBelowStepError
+) -> None:
+    logger.warning(
+        "Exit signal ignored: the exit is below the instrument's quantity step",
+        extra={
+            "data": {
+                "account_id": account_id,
+                "deployment_id": str(deployment.id),
+                "symbol": symbol,
+                "requested_qty": exc.requested_qty,
+                "qty_step": exc.qty_step,
+                "reason": str(exc),
+            }
+        },
+    )
+
+
+def _describe_exit_rows(
+    rows: Iterable[Mapping[str, Any]], deployment: LiveDeploymentConfig
+) -> str:
+    return ", ".join(
+        f"signal {row.get('signal_id')} / order {row.get('broker_order_id') or '?'}"
+        + (
+            ""
+            if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
+            else f" of deployment {row.get('deployment_id')}"
         )
-    return "buy" if quantities[0] < 0 else "sell"
+        for row in rows
+    )
 
 
-async def _metadata_for_exit_only_order(
-    signal: LiveSignal,
+async def _ensure_no_exit_in_flight(
+    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
+) -> list[dict[str, Any]]:
+    """Refuse while an earlier exit of THIS deployment may still be working.
+
+    Returns the still-working exits of OTHER deployments on the account (empty
+    when none), which the caller subtracts from the broker position it sizes
+    against.
+
+    Deployments on one account share a netted broker position. This
+    deployment's own earlier exit blocks a new one: sizing off a ledger without
+    its fills would close the same units twice. Another deployment's working
+    exit must not drop this exit (a message fans out to every deployment, and
+    with the market closed the first exit is always still working when the
+    second is processed); its unfilled quantity is reserved instead.
+
+    Earlier exits whose persisted fills cover what they asked for are done. Any
+    other one is checked against the broker's working orders, by broker order id
+    or by client order id (the signal id; the broker id can be missing when the
+    response was lost). An adapter that cannot list its working orders cannot
+    prove an earlier exit is over, so that refuses too. Raises
+    :class:`ExitInFlightError`.
+    """
+    own = await asyncio.to_thread(
+        list_live_deployment_unfilled_exit_orders, str(deployment.id), symbol
+    )
+    others = await asyncio.to_thread(
+        _list_other_deployments_unfilled_exits, deployment, symbol
+    )
+    pending = [*own, *others]
+    if not pending:
+        return []
+    working_order_ids = getattr(adapter, "working_order_ids", None)
+    if not callable(working_order_ids):
+        raise ExitInFlightError(
+            f"Refusing exit for {symbol}: a previous exit on this account is not "
+            "known to be finished and this broker adapter cannot list its working "
+            "orders to prove it."
+        )
+    try:
+        working = {str(order_id) for order_id in await working_order_ids()}
+    except Exception as exc:
+        raise ExitInFlightError(
+            f"Refusing exit for {symbol}: a previous exit on this account is not "
+            f"known to be finished and the broker's working orders could not be read "
+            f"({exc})."
+        ) from exc
+    blocking = [
+        row
+        for row in pending
+        if (row.get("broker_order_id") and str(row["broker_order_id"]) in working)
+        or str(row.get("signal_id") or "") in working
+    ]
+    own_blocking = [
+        row
+        for row in blocking
+        if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
+    ]
+    if own_blocking:
+        raise ExitInFlightError(
+            f"Refusing exit for {symbol}: a previous exit of this deployment is "
+            f"still working at the broker ({_describe_exit_rows(own_blocking, deployment)}); "
+            "the ledger and the broker position do not include its fills yet."
+        )
+    return [row for row in blocking if row not in own_blocking]
+
+
+def _reserved_by_other_exits(
+    rows: Iterable[Mapping[str, Any]], *, close_action: str, symbol: str, deployment_id: str
+) -> float:
+    """Unfilled quantity of other deployments' working exits that close the same side.
+
+    An exit row without a readable requested quantity cannot be sized: it raises,
+    so the caller refuses rather than guessing how much is already spoken for.
+    """
+    reserved = 0.0
+    for row in rows:
+        action = str(row.get("action") or "").strip().lower()
+        if action and action != close_action:
+            continue
+        requested = row.get("requested_qty")
+        if requested is None or not math.isfinite(float(requested)):
+            raise ExitInFlightError(
+                f"Refusing exit for {symbol}: the working exit of deployment "
+                f"{row.get('deployment_id')} (signal {row.get('signal_id')}) has no "
+                "readable quantity, so what remains of the position for deployment "
+                f"{deployment_id} cannot be told."
+            )
+        reserved += max(float(requested) - float(row.get("filled_qty") or 0.0), 0.0)
+    return reserved
+
+
+def _list_other_deployments_unfilled_exits(
+    deployment: LiveDeploymentConfig, symbol: str
+) -> list[dict[str, Any]]:
+    return list_account_unfilled_exit_orders(
+        deployment.account_id, symbol, exclude_deployment_id=str(deployment.id)
+    )
+
+
+#: Exits being prepared and submitted, per running event loop, account and symbol.
+_EXIT_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[str, str], asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
+    """The lock serialising exits of every deployment on one account and symbol.
+
+    Held from sizing through submission (which persists the signal), so a second
+    exit cannot size or pass :func:`_ensure_no_exit_in_flight` in the window where
+    the first has read the broker position but not yet persisted its order. The
+    in-flight guard covers what is already persisted; this covers dispatchers of
+    this process racing before that.
+    """
+    locks = _EXIT_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
+
+
+def _alert_ledger_mismatch(
+    deployment: LiveDeploymentConfig,
+    symbol: str,
+    exc: LedgerMismatchError,
+    *,
+    own_qty: float,
+    exit_qty: float,
+) -> None:
+    """Operator alert (ERROR, which Sentry turns into an event) for a ledger gap.
+
+    The exit is still submitted, capped at the broker position (#121 decision 2).
+    The residual risk is stated in the alert: on a netted account, a broker-side
+    close made for another deployment lowers the broker position, and the cap
+    then closes part of that deployment's share.
+    """
+    logger.error(
+        "ALERT: deployment ledgers do not match the broker position; submitting "
+        "the exit capped at the broker position. If another deployment's "
+        "position was closed broker-side, this exit may close part of that "
+        "deployment's share; reconcile the ledgers",
+        extra={
+            "data": {
+                "alert": "exit_ledger_mismatch",
+                "account_id": deployment.account_id,
+                "deployment_id": str(deployment.id),
+                "symbol": symbol,
+                "own_ledger_qty": float(own_qty),
+                "exit_qty_before_step": float(exit_qty),
+                "reason": str(exc),
+                **exc.log_data(),
+            }
+        },
+    )
+
+
+async def prepare_exit_intent_order(
     adapter: BaseLiveAdapter,
-    metadata: dict[str, object],
-) -> dict[str, object]:
+    deployment: LiveDeploymentConfig,
+    signal: LiveSignal,
+    *,
+    instruction: ExitInstruction | None = None,
+) -> tuple[LiveSignal, float]:
+    """Size an exit against this deployment's own position (#121).
+
+    Every exit goes through here: a parsed exit/close message (its instruction is
+    read from the metadata) and a plain or momentum-reversal SELL on a deployment
+    that cannot short (``instruction`` is a full exit). The quantity is the
+    deployment's net persisted fills for the symbol (the ledger), capped at the
+    broker position, times the instruction's fraction, so another deployment's
+    share of a netted position stays open. The close side comes from that
+    position, never from the message. No earlier exit of this deployment and
+    symbol may still be working. When the ledgers of the deployments on the
+    account do not add up to the broker position (or the own quantity exceeds
+    it), the capped exit still goes out and an ERROR alert is logged.
+
+    Raises :class:`NothingToExitError` when there is nothing of this
+    deployment's to close (the caller logs and ignores it),
+    :class:`ExitInFlightError` while an earlier exit may be working, and
+    ``ValueError`` when a close would be ambiguous or would extend exposure.
+    Nothing here places an order.
+
+    Deliberately independent of the entry path (no risk sizing, no SL/TP guard).
+    This function checks no deployment status itself, but its callers dispatch
+    only for ACTIVE deployments, so an exit on a PAUSED one never gets here.
+    """
+    metadata = dict(signal.metadata or {})
+    if instruction is None:
+        instruction = exit_instruction_from_metadata(metadata)
     get_positions = getattr(adapter, "get_positions", None)
     if not callable(get_positions):
-        raise ValueError("Exit-only signal requires broker adapter with get_positions support")
+        raise ValueError("Exit signal requires a broker adapter with get_positions support")
+    # One exit at a time per deployment and symbol: a second exit sized while
+    # the first is still working would size off a ledger without its fills.
+    other_working = await _ensure_no_exit_in_flight(adapter, deployment, signal.symbol)
     positions = list(await get_positions())
+    ledgers = await asyncio.to_thread(
+        get_account_net_filled_qty_by_deployment, deployment.account_id, signal.symbol
+    )
+    ledger_qty = float(ledgers.get(str(deployment.id), 0.0))
+    broker_qty = broker_position_qty(positions, signal.symbol)
+    # Other deployments' exits still working at the broker are not in the broker
+    # position yet but will leave it: their unfilled quantity is spoken for and
+    # this exit may only close what remains (floored at 0).
+    reserved = 0.0
+    sized_positions = positions
+    effective_cap = abs(broker_qty)
+    if other_working and broker_qty != 0.0:
+        reserved = _reserved_by_other_exits(
+            other_working,
+            close_action="sell" if broker_qty > 0 else "buy",
+            symbol=signal.symbol,
+            deployment_id=str(deployment.id),
+        )
+        effective_cap = max(abs(broker_qty) - reserved, 0.0)
+        if reserved > 0.0 and effective_cap > 0.0:
+            sized_positions = [
+                {**position, "qty": math.copysign(effective_cap, broker_qty)}
+                if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
+                and float(position.get("qty") or 0.0) != 0.0
+                else position
+                for position in positions
+            ]
+    # Resolved against the real position first, so "nothing of this deployment's
+    # to close" and ambiguous closes are reported as such.
+    close_action, target_qty = resolve_exit_order(
+        symbol=signal.symbol,
+        ledger_qty=ledger_qty,
+        broker_positions=positions,
+        instruction=instruction,
+    )
+    if reserved > 0.0 and effective_cap <= 0.0:
+        raise ExitInFlightError(
+            f"Refusing exit for {signal.symbol}: the whole broker position "
+            f"({broker_qty:g}) is already spoken for by exits of other deployments "
+            f"on account {deployment.account_id} that are still working "
+            f"({_describe_exit_rows(other_working, deployment)}); nothing is left "
+            "for this deployment to close, so its position stays open."
+        )
+    if sized_positions is not positions:
+        close_action, target_qty = resolve_exit_order(
+            symbol=signal.symbol,
+            ledger_qty=ledger_qty,
+            broker_positions=sized_positions,
+            instruction=instruction,
+        )
+    # An exit closes only the own ledger quantity, capped at the broker position
+    # (#121 decision 2), here reduced by what other working exits will take.
+    # When the ledgers do not explain the broker position, or the own quantity
+    # exceeds the cap, the capped exit is still submitted, but an operator must
+    # hear about it: a close the ledgers never saw (a stop or target leg, a
+    # flatten, a manual close) happened.
+    tolerance = _position_qty_tolerance(adapter, signal.symbol)
+    try:
+        ensure_ledgers_match_broker(
+            symbol=signal.symbol,
+            ledgers=ledgers,
+            broker_qty=broker_qty,
+            tolerance=tolerance,
+        )
+    except LedgerMismatchError as exc:
+        _alert_ledger_mismatch(
+            deployment, signal.symbol, exc, own_qty=ledger_qty, exit_qty=target_qty
+        )
+    else:
+        if abs(ledger_qty) > effective_cap + tolerance:
+            # Offsetting ledgers of other deployments hide the overhang from
+            # the total, or other working exits leave less than this
+            # deployment's share; either way the own quantity exceeds the cap.
+            _alert_ledger_mismatch(
+                deployment,
+                signal.symbol,
+                LedgerMismatchError(
+                    "own ledger quantity exceeds the broker position"
+                    + (
+                        f" less {reserved:g} reserved by other deployments' working exits"
+                        if reserved
+                        else ""
+                    ),
+                    ledgers=ledgers,
+                    broker_qty=broker_qty,
+                    tolerance=tolerance,
+                ),
+                own_qty=ledger_qty,
+                exit_qty=target_qty,
+            )
+    # Never round an exit up: a partial closes at most its fraction, a full exit
+    # at most the own quantity (#121 review). Done here, before persistence, so
+    # the stored qty is the one sent.
+    target_qty = _round_exit_qty_to_adapter_step(adapter, signal.symbol, target_qty)
     matching_positions = [
         position
         for position in positions
         if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
     ]
-    quantities: list[float] = []
-    for position in matching_positions:
-        try:
-            quantity = _coerce_live_float(position.get("qty"), field_name="broker position qty")
-        except ValueError as exc:
-            raise ValueError(
-                f"Exit-only signal for {signal.symbol} received an invalid "
-                "broker position quantity."
-            ) from exc
-        if not math.isfinite(quantity) or quantity == 0:
-            raise ValueError(
-                f"Exit-only signal for {signal.symbol} received a non-positive broker position."
-            )
-        quantities.append(quantity)
-    if not quantities:
-        raise ValueError(
-            f"Exit-only signal received for {signal.symbol} but no position is open"
-        )
-    if any(quantity < 0 for quantity in quantities) and any(
-        quantity > 0 for quantity in quantities
-    ):
-        raise ValueError(
-            f"Exit-only signal for {signal.symbol} has mixed long and short broker positions; "
-            "refusing an ambiguous close."
-        )
-    if len(quantities) > 1:
-        raise ValueError(
-            f"Exit-only signal for {signal.symbol} has multiple broker positions; "
-            "refusing an unaddressed aggregate close."
-        )
-    target_qty = abs(quantities[0])
     for key in (
         "qty",
         "explicit_qty",
@@ -904,11 +1285,25 @@ async def _metadata_for_exit_only_order(
         "position_id",
         "position_ids",
         "position_count",
+        # An exit closes; it never carries the entry bracket.
+        "stop_loss",
+        "take_profit",
+        "sl_price",
+        "tp_price",
+        "stop_price",
+        "resolved_stop_loss",
     ):
         metadata.pop(key, None)
+    # Stamp the instruction actually executed, so the persisted signal records
+    # every exit the same way whichever producer it came from. A side the
+    # executed instruction does not name must not survive from the payload.
+    metadata.pop(EXIT_POSITION_SIDE_KEY, None)
+    metadata.update(exit_intent_metadata(instruction))
     metadata["qty"] = float(target_qty)
     metadata["explicit_qty"] = float(target_qty)
+    metadata["exit_only"] = True
     metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
+    metadata["exit_ledger_qty"] = float(ledger_qty)
     metadata["position_count"] = len(matching_positions)
     position_ids: list[int] = []
     for position in matching_positions:
@@ -923,12 +1318,10 @@ async def _metadata_for_exit_only_order(
             position_ids.append(position_id)
     if len(matching_positions) == 1 and len(position_ids) == 1:
         metadata["position_id"] = position_ids[0]
-    elif position_ids:
-        metadata["position_ids"] = position_ids
-    close_action = _exit_only_close_action(positions, signal.symbol)
     metadata["action"] = close_action
     metadata["signal_action"] = signal.action
-    return metadata
+    prepared = signal.model_copy(update={"metadata": metadata, "action": close_action})
+    return prepared, float(target_qty)
 
 
 def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
@@ -1004,20 +1397,31 @@ async def prepare_order_with_risk(
     balance) because sizing has to see broker truth.
     """
     metadata = dict(signal.metadata or {})
-    if signal.action == "sell" and bool(metadata.get("exit_only")):
-        # Exit-only orders close an existing position at the broker-observed
-        # quantity. They bypass risk sizing and the entry fail-closed SL/TP
-        # guard: they reduce exposure instead of opening a new position.
-        metadata = await _metadata_for_exit_only_order(signal, adapter, metadata)
-        # The close side is derived from the broker book (a short must be
-        # bought back), so the stamped action wins over the signal's.
-        update: dict[str, object] = {"metadata": metadata}
-        close_action = metadata.get("action")
-        if close_action in {"buy", "sell"} and close_action != signal.action:
-            update["action"] = close_action
-        # C1/B2: the broker-resolved flatten qty is binding — pass it
-        # explicitly so the adapter never re-sizes.
-        return signal.model_copy(update=update), float(metadata["explicit_qty"])
+    if is_exit_order(signal.action, metadata):
+        # Every exit closes only this deployment's own ledger quantity (#121),
+        # never the whole netted broker position: a parsed exit/close message
+        # (its instruction is in the metadata, whatever the action placeholder
+        # says) and a plain or momentum-reversal SELL on a deployment that cannot
+        # short (a full exit). Exits bypass risk sizing and the entry SL/TP guard
+        # because they reduce exposure. The close side comes from the position (a
+        # short is bought back), and the resolved qty is binding (C1/B2) so the
+        # adapter never re-sizes.
+        return await prepare_exit_intent_order(
+            adapter,
+            deployment,
+            signal,
+            instruction=None if is_exit_intent(metadata) else FULL_EXIT,
+        )
+    # #150 fail closed at the last chokepoint before the broker: the live path
+    # never trails (#167), so an entry signal carrying a trailing config its
+    # mode cannot satisfy here is refused — never submitted untrailed. This
+    # gate also covers signals that reach submission without a signal
+    # processor (the processor path is gated in _apply_signal_processor).
+    validate_trailing_sl_config(
+        metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
+        supported=LIVE_SUPPORTED_TRAILING_MODES,
+        context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
+    )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
     open_positions_count, broker_exposure = await _broker_exposure_estimate(
@@ -1167,21 +1571,38 @@ def _mint_signal_idempotency_key(
     producer_stamp = metadata.get("signal_timestamp") or metadata.get("timestamp")
     if not producer_stamp:
         return
-    key_material = "|".join(
-        [
-            str(deployment.id),
-            str(signal.symbol).upper(),
-            str(signal.action).lower(),
-            repr(float(signal.entry_price)),
-            repr(signal.stop_loss),
-            repr(signal.take_profit),
-            str(signal.timeframe),
-            str(producer_stamp),
-        ]
-    )
-    metadata["idempotency_key"] = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[
-        :32
-    ]
+    # The same producer event can be redelivered with its timestamp spelled differently (``Z``
+    # vs ``+00:00``, aware vs naive, another UTC offset). Key on the instant, not the spelling,
+    # without rounding it: distinct instants - even a microsecond apart - keep distinct keys.
+    # Text that is not a time keeps its verbatim form.
+    raw_stamp = str(producer_stamp)
+    canonical_stamp = canonical_utc_timestamp(producer_stamp) or raw_stamp
+
+    def _key(stamp: str) -> str:
+        key_material = "|".join(
+            [
+                str(deployment.id),
+                str(signal.symbol).upper(),
+                str(signal.action).lower(),
+                repr(float(signal.entry_price)),
+                repr(signal.stop_loss),
+                repr(signal.take_profit),
+                str(signal.timeframe),
+                stamp,
+            ]
+        )
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:32]
+
+    metadata["idempotency_key"] = _key(canonical_stamp)
+    if canonical_stamp != raw_stamp:
+        # Signals persisted before #127 were keyed on the verbatim spelling. A replay of one of
+        # them right after the upgrade (a restart is exactly when producers replay) must still
+        # find that row instead of placing a second broker order, so the pre-#127 key travels
+        # along as a lookup-only fallback. It is never stored as the row's own key.
+        # Bound: this only dedupes a replay that carries the SAME spelling as the stored
+        # pre-#127 row. A replay re-spelled differently (``Z`` stored, ``+00:00`` replayed)
+        # misses it; closing that needs a data migration of stored keys and is not done here.
+        metadata["legacy_idempotency_key"] = _key(raw_stamp)
 
 
 def _trade_signal_to_live_signal(
@@ -1196,7 +1617,16 @@ def _trade_signal_to_live_signal(
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
     _mint_signal_idempotency_key(signal, deployment, metadata)
-    if signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
+    if is_exit_intent(metadata):
+        # A parsed exit is reduce-only whatever the deployment allows: on a
+        # long+short deployment a plain sell is a real short, an exit is not
+        # (#121). Validated here so a malformed instruction fails before sizing.
+        exit_instruction_from_metadata(metadata)
+        metadata["exit_only"] = True
+        metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
+        for key in ("stop_loss", "take_profit"):
+            metadata.pop(key, None)
+    elif signal.action in {"sell", "short"} and not _deployment_allows_short(deployment):
         metadata["exit_only"] = True
         metadata["risk_sizing_mode"] = EXIT_ONLY_RISK_SIZING_MODE
     # Whitelist at the conversion site itself (B-2): never default an unmapped
@@ -1513,7 +1943,9 @@ async def _prepare_discord_signal_for_submission(
     # information — discard anything older than one deployment-timeframe
     # candle instead.
     if not signal_is_fresh(trade_signal, signal_timeframe):
-        logger.info(
+        # A dropped exit leaves a position open: a warning, not routine info.
+        log_stale = logger.warning if is_exit_intent(trade_signal.metadata) else logger.info
+        log_stale(
             "Skipping stale discord signal: older than one timeframe candle",
             extra={
                 "data": {
@@ -1547,7 +1979,11 @@ async def _prepare_discord_signal_for_submission(
             # here, so the gate is told rather than made to sniff metadata.
             require_producer_timestamp=True,
         )
-        normalized_signal = _apply_signal_processor(normalized_signal, deployment)
+        if not is_exit_intent(normalized_signal.metadata):
+            # Entry processors (ATR/SL/TP, BUY-only gates) shape entries. An exit
+            # closes what exists; Nitro's BUY-only processor would refuse every
+            # close on a Nitro deployment (#121).
+            normalized_signal = _apply_signal_processor(normalized_signal, deployment)
     except ValueError as exc:
         logger.warning(
             "Signal processor rejected discord signal",
@@ -1605,7 +2041,8 @@ async def _prepare_discord_signal_for_submission(
         )
         return None
     if not signal_is_fresh(normalized_signal, signal_timeframe):
-        logger.info(
+        log_aged = logger.warning if is_exit_intent(normalized_signal.metadata) else logger.info
+        log_aged(
             "Skipping discord signal: aged out during candle-close wait",
             extra={
                 "data": {
@@ -1656,6 +2093,29 @@ async def _submit_normalized_discord_signal(
         )
         return
 
+    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    if is_exit:
+        # Exits of every deployment on this account and symbol go one after the
+        # other, from sizing to the persisted order (see ``_exit_lock``).
+        async with _exit_lock(account_id, live_signal.symbol):
+            await _prepare_claim_and_submit_signal(
+                account_id, adapter, deployment, normalized_signal, live_signal, is_exit=True
+            )
+        return
+    await _prepare_claim_and_submit_signal(
+        account_id, adapter, deployment, normalized_signal, live_signal, is_exit=False
+    )
+
+
+async def _prepare_claim_and_submit_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    normalized_signal: TradeSignal,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+) -> None:
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -1664,7 +2124,64 @@ async def _submit_normalized_discord_signal(
         prepared_signal, prepared_qty = await prepare_order_with_risk(
             adapter, deployment, live_signal
         )
+    except NothingToExitError as exc:
+        # #121 decision 1: no position -> ignore and log. Not an error. A broker
+        # position that is all somebody else's is worth a warning: either this
+        # deployment never held it, or its ledger missed a fill.
+        log = logger.warning if exc.broker_qty else logger.info
+        log(
+            "Exit signal ignored: nothing of this deployment's to close",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "broker_qty": exc.broker_qty,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
+    except ExitBelowStepError as exc:
+        _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
+        return
+    except ExitInFlightError as exc:
+        # An error, not a skipped signal: nothing was sent and this deployment's
+        # position stays open (a later exit signal is sized once the earlier
+        # exit is over, but this one is not queued). An operator has to look.
+        logger.error(
+            "Exit signal refused: a previous exit of this deployment is still "
+            "working, the other deployments' working exits leave nothing to "
+            "close, or no earlier exit can be shown to be finished; nothing was "
+            "sent to the broker and the position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
     except Exception as exc:
+        if is_exit:
+            # A refused exit leaves this deployment's position open: an operator
+            # has to look at it, so it is an error, not a skipped signal (#121).
+            logger.error(
+                "Exit signal refused before submission; nothing was sent to the "
+                "broker and the position stays open",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "action": live_signal.action,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
         logger.warning(
             "Discord signal refused before submission; nothing was sent to the broker",
             extra={
@@ -1727,14 +2244,31 @@ async def _submit_normalized_discord_signal(
                     # handled refusal into an exception that aborts the fan-out
                     # to the remaining deployments.
                     logger.exception("Could not release the submission lease")
-                logger.warning(
-                    "Discord signal was refused before the broker request; "
-                    "released the submission lease",
+                if isinstance(exc, ExitBelowStepError):
+                    # The adapter's own floor found less than one step to close:
+                    # an ignored exit, like the daemon's own check, not a failure.
+                    _log_exit_below_step(
+                        account_id, deployment, prepared_signal.symbol, exc
+                    )
+                    return
+                # A refused exit leaves the position open (#121): error, so an
+                # operator sees it. A refused entry opened nothing: warning.
+                log = logger.error if is_exit else logger.warning
+                log(
+                    (
+                        "Exit signal was refused before the broker request; "
+                        "released the submission lease and the position stays open"
+                        if is_exit
+                        else "Discord signal was refused before the broker request; "
+                        "released the submission lease"
+                    ),
                     extra={
                         "data": {
                             "account_id": account_id,
                             "deployment_id": str(deployment.id),
                             "symbol": prepared_signal.symbol,
+                            "action": prepared_signal.action,
+                            "exit": is_exit,
                             "error": str(exc),
                         }
                     },
@@ -1754,6 +2288,8 @@ async def _submit_normalized_discord_signal(
                         "account_id": account_id,
                         "deployment_id": str(deployment.id),
                         "symbol": prepared_signal.symbol,
+                        "action": prepared_signal.action,
+                        "exit": is_exit,
                         "error": str(exc),
                     }
                 },
@@ -1782,8 +2318,9 @@ async def _submit_normalized_discord_signal(
                 "deployment_id": str(deployment.id),
                 "signal_id": str(live_signal.id),
                 "broker_order_id": broker_order_id,
-                "symbol": live_signal.symbol,
-                "action": live_signal.action,
+                "symbol": prepared_signal.symbol,
+                "action": prepared_signal.action,
+                "exit": is_exit,
             }
         },
     )
@@ -1807,8 +2344,9 @@ def _deployment_accepts_signal_author(
     resolver fell back to `os.environ` - and `.accounts.env` is never installed
     there, only read into a mapping. The allowlist therefore resolved empty, the
     empty case was treated as "no restriction", and this gate was **inert**: it
-    accepted every author. An empty allowlist now rejects every author. The one defence against a deployment trading on another bot's author
-    was not running, silently, in the documented production config.
+    accepted every author. An empty allowlist now rejects every author. The one
+    defence against a deployment trading on another bot's author was not running,
+    silently, in the documented production config.
     """
     allowlist = _deployment_trusted_author_ids(
         deployment, accounts_env_values=accounts_env_values
@@ -3002,6 +3540,59 @@ async def _poll_balances(
         await asyncio.sleep(interval_seconds)
 
 
+#: How often unknown commissions are backfilled (#124). Alpaca posts crypto fees once a day, so an
+#: hourly pass prices a posted day within the hour and costs a handful of REST calls.
+COMMISSION_BACKFILL_INTERVAL_SECONDS = 3600
+#: One hung broker must not stall the pass for the others.
+COMMISSION_BACKFILL_TIMEOUT_SECONDS = 120.0
+
+
+async def _backfill_commissions_once(adapters: dict[str, BaseLiveAdapter]) -> None:
+    """Run every ready adapter's commission backfill once; a failure is logged, never raised."""
+    ready = [
+        (account_id, adapter)
+        for account_id, adapter in list(adapters.items())
+        if _adapter_is_ready(adapter)
+    ]
+
+    async def _backfill_one(account_id: str, adapter: BaseLiveAdapter) -> None:
+        try:
+            updated = await asyncio.wait_for(
+                adapter.backfill_commissions(), timeout=COMMISSION_BACKFILL_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Commission backfill failed; commissions stay unknown until the next pass",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc) or type(exc).__name__,
+                    }
+                },
+            )
+            return
+        if updated:
+            logger.info(
+                "Backfilled commissions",
+                extra={"data": {"account_id": account_id, "executions": updated}},
+            )
+
+    await asyncio.gather(*(_backfill_one(account_id, adapter) for account_id, adapter in ready))
+
+
+async def _backfill_commissions_loop(
+    adapters: dict[str, BaseLiveAdapter],
+    *,
+    interval_seconds: int = COMMISSION_BACKFILL_INTERVAL_SECONDS,
+) -> None:
+    while True:
+        await _backfill_commissions_once(adapters)
+        await asyncio.sleep(interval_seconds)
+
+
 def _deployment_task_name(account_id: str, kind: str) -> str:
     return f"deployment-{kind}-{account_id}"
 
@@ -3290,6 +3881,13 @@ async def _enforce_stopped_deployments(
     order - or a cancel call that failed outright - still lets the flatten run,
     because leaving positions open is worse than leaving an order resting. It
     does gate the stamp.
+
+    The stamp is also withheld while the cancel sweep reports ids still in the
+    broker's ``pending_cancel`` state (``ControlOutcome.pending_cancel``): such an
+    order can still fill in a cancel/fill race, so the pass logs a WARNING naming
+    them and retries, escalating to ERROR after
+    ``PENDING_CANCEL_ESCALATION_PASSES`` consecutive passes. A fill is flattened
+    by the next pass before the stamp. cTrader never reports any, so it is unchanged.
     """
     stopped = [
         deployment
@@ -3305,6 +3903,13 @@ async def _enforce_stopped_deployments(
         if deployment_id not in stopped_ids
     }
     already_enforced.difference_update(left_stopped)
+    # The pending_cancel escalation count belongs to one STOPPED episode. Drop it for
+    # any deployment that is no longer STOPPED or was deleted - including one that
+    # never got stamped, which the ledger above does not track - so the count cannot
+    # grow without bound or carry over into a later STOPPED episode.
+    for deployment_id in list(_PENDING_CANCEL_PASSES):
+        if deployment_id not in stopped_ids:
+            del _PENDING_CANCEL_PASSES[deployment_id]
     # The persisted stamp is authoritative, not this process's ledger: a deployment
     # that was resumed and stopped again between two ticks was never observed
     # leaving STOPPED, so the ledger still lists it while its stamp (cleared by the
@@ -3556,6 +4161,30 @@ async def _enforce_stopped_deployments(
                 },
             )
             continue
+        if cancelled.pending_cancel:
+            passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
+            _PENDING_CANCEL_PASSES[deployment_id] = passes
+            log = (
+                logger.error
+                if passes >= PENDING_CANCEL_ESCALATION_PASSES
+                else logger.warning
+            )
+            log(
+                "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
+                "and may yet fill (pass %d). Retrying next tick",
+                sorted(cancelled.pending_cancel),
+                passes,
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "account_id": deployment.account_id,
+                        "pending_cancel": sorted(cancelled.pending_cancel),
+                        "passes": passes,
+                    }
+                },
+            )
+            continue
+        _PENDING_CANCEL_PASSES.pop(deployment_id, None)
         if not orphan_sweep_unsupported and (
             orphaned is None or not orphaned.complete
         ):
@@ -3616,6 +4245,22 @@ async def _load_db_accounts_and_deployments(
     accounts_task = asyncio.to_thread(list_live_accounts)
     deployments_task = asyncio.to_thread(list_live_deployments)
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
+    # #150: a stored deployment whose trailing override live cannot run is still
+    # loaded (so it stays listed, stoppable and enforceable), but every signal
+    # it produces is refused by the live gates. Say so loudly at load time.
+    for deployment in deployments:
+        try:
+            validate_live_deployment_trailing_override(
+                deployment.signal_config,
+                context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+            )
+        except ValueError as exc:
+            logger.error(
+                "Stored live deployment has an unsupported trailing mode; its entry "
+                "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
     return accounts, deployments
 
 
@@ -4023,8 +4668,11 @@ async def run_daemon(
         name="service-sync-loop",
     )
     balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
+    commission_task = asyncio.create_task(
+        _backfill_commissions_loop(active_adapters), name="commission-backfill"
+    )
     try:
-        await asyncio.gather(sync_task, service_sync_task, balance_task)
+        await asyncio.gather(sync_task, service_sync_task, balance_task, commission_task)
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
@@ -4041,12 +4689,16 @@ async def run_daemon(
         # B2: cancel EVERYTHING (sync + balance loops leaked before) and
         # await the cancels — fire-and-forget cancel() leaves pending tasks
         # and "Task was destroyed" warnings behind.
-        for task in (sync_task, service_sync_task, balance_task):
+        for task in (sync_task, service_sync_task, balance_task, commission_task):
             if not task.done():
                 task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(
-                sync_task, service_sync_task, balance_task, return_exceptions=True
+                sync_task,
+                service_sync_task,
+                balance_task,
+                commission_task,
+                return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):
             if not task.done():

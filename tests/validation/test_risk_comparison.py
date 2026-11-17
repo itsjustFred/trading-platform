@@ -123,7 +123,9 @@ class TestPositionSizeMismatch:
         ref1 = _make_reference([t1])
         ref2 = _make_reference([t2])
         config = _make_config(
-            stop_distance_pct=1.0,
+            # #128: 10 -> 50 is 400% drift against the reference; this test
+            # targets position size, so keep stop distance inside tolerance.
+            stop_distance_pct=4.0,
             risk_per_trade_pct=1.0,
             position_size_pct=0.5,
         )
@@ -146,7 +148,9 @@ class TestRiskPerTradeMismatch:
         ref1 = _make_reference([t1])
         ref2 = _make_reference([t2])
         config = _make_config(
-            stop_distance_pct=1.0,
+            # #128: 10 -> 50 is 400% drift against the reference; this test
+            # targets risk per trade, so keep stop distance inside tolerance.
+            stop_distance_pct=4.0,
             risk_per_trade_pct=0.3,
             position_size_pct=1.0,
         )

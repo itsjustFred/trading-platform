@@ -124,7 +124,13 @@ def test_cross_platform_matrix_loads_mt5_reference_timestamps_in_report_timezone
         Path(row["reference_path"]),
         source_timezone=row["reference_source_timezone"],
     )
-    platform = json.loads(Path(row["platform_path"]).read_text(encoding="utf-8"))
+    platform_path = Path(row["platform_path"])
+    if not platform_path.exists():
+        pytest.skip(
+            f"{platform_path.name} not present (artifacts are generated locally, not "
+            "committed); run scripts/regenerate_mt5_parity_artifacts.py"
+        )
+    platform = json.loads(platform_path.read_text(encoding="utf-8"))
 
     first_reference_entry = reference.trades[0].entry_time
     first_platform_entry = platform["trades"][0]["entry_time"].replace("+00:00", "Z")

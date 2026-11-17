@@ -194,6 +194,107 @@ def test_adapter_that_cannot_cancel_still_flattens_but_does_not_stamp(
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
 
 
+_PENDING = ControlOutcome(completed=1, pending_cancel=("entry-1",))
+
+
+def _stamped(database) -> bool:
+    return DEPLOYMENT_ID in list_stopped_enforced_deployment_ids()
+
+
+def test_pending_cancel_blocks_the_stamp_but_still_flattens(
+    isolated_db_sandbox, caplog
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    adapter = _ControlAdapter(cancel=_PENDING)
+
+    with caplog.at_level("WARNING"):
+        ledger = _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert ledger == set()
+    assert not _stamped(database)
+    warnings = [r for r in caplog.records if "pending_cancel" in r.getMessage()]
+    assert warnings
+    assert all(r.levelname == "WARNING" for r in warnings)
+    assert "entry-1" in warnings[0].getMessage()
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+def test_pending_cancel_that_cancels_is_stamped_next_pass(isolated_db_sandbox) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    _enforce(database, _ControlAdapter(cancel=_PENDING))
+    assert not _stamped(database)
+
+    ledger = _enforce(database, _ControlAdapter())
+
+    assert _stamped(database)
+    assert ledger == {DEPLOYMENT_ID}
+    assert daemon._PENDING_CANCEL_PASSES == {}
+
+
+def test_pending_cancel_that_fills_is_flattened_then_stamped(
+    isolated_db_sandbox,
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    _enforce(database, _ControlAdapter(cancel=_PENDING))
+
+    # The order filled: the book is clean, the flatten now closes the new position.
+    adapter = _ControlAdapter(flatten=ControlOutcome(completed=1))
+    _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert _stamped(database)
+
+
+def test_persistent_pending_cancel_escalates_to_error(
+    isolated_db_sandbox, caplog
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    limit = daemon.PENDING_CANCEL_ESCALATION_PASSES
+
+    with caplog.at_level("WARNING"):
+        for _ in range(limit - 1):
+            _enforce(database, _ControlAdapter(cancel=_PENDING))
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+        _enforce(database, _ControlAdapter(cancel=_PENDING))
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors
+    assert "entry-1" in errors[-1].getMessage()
+    assert not _stamped(database)
+
+
+def test_pending_cancel_counter_resets_when_deployment_leaves_stopped(
+    isolated_db_sandbox, caplog
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    for _ in range(3):
+        _enforce(database, _ControlAdapter(cancel=_PENDING))
+    assert daemon._PENDING_CANCEL_PASSES[DEPLOYMENT_ID] == 3
+
+    # Resumed (or deleted): the stuck episode is over, so its count must not survive.
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+    _enforce(database, _ControlAdapter())
+    assert DEPLOYMENT_ID not in daemon._PENDING_CANCEL_PASSES
+
+    # A later STOPPED episode starts from pass 1: WARNING, not an inflated ERROR.
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    with caplog.at_level("WARNING"):
+        _enforce(database, _ControlAdapter(cancel=_PENDING))
+    assert daemon._PENDING_CANCEL_PASSES[DEPLOYMENT_ID] == 1
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
 def test_incomplete_orphan_sweep_does_not_stamp(isolated_db_sandbox) -> None:
     """A stop that outlived its position can still trigger and open one.
 

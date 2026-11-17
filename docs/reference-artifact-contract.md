@@ -42,7 +42,7 @@ Current importer behavior:
 | Header statistics | Matrix reference metrics such as trade count, win rate, net profit, Sharpe. |
 | Orders table | Entry order stop-loss and take-profit levels keyed by order id. |
 | Trades table | Paired entry/exit trades, prices, volume, PnL, swap, commission, comments. |
-| `source_timezone` | Report-local timestamp timezone, currently `Europe/Athens` for parity cases. |
+| `source_timezone` | Report-local timestamp timezone, currently `Europe/Athens` for parity cases. Known to be 1 h off for the index history in summer 2018–2023 and in US-only DST weeks from 2024-04 (see the audit README); the fix is a follow-up. |
 
 Rules:
 
@@ -204,7 +204,8 @@ stats unless the row explicitly states that basis change and tests cover it.
 ## Protected Baseline Files
 
 The following files contain parity-sensitive behavior and must not be changed
-without a focused test and a before/after matrix note:
+without a focused test and a before/after matrix note. Record the note in
+[Comparison Matrix Change Notes](comparison-matrix-change-notes.md):
 
 - `validation/importers/mt5_xlsx.py`
 - `validation/statistics/cross_platform.py`

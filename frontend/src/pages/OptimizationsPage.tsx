@@ -225,7 +225,7 @@ export function OptimizationsPage() {
             const oosEvidence = classifyOptimizationOosEvidence(
               optimization.target_metric,
               compatibleInSampleValue,
-              optimization.test_stats,
+              optimization.final_test_stats ?? optimization.test_stats,
               optimization.oos_status ?? "unavailable",
             );
             return (
@@ -286,7 +286,9 @@ export function OptimizationsPage() {
                       {optimization.base_backtest_id}
                     </div>
                     <div style={{ marginTop: "6px", color: "var(--color-text-muted)", fontSize: "0.82rem" }}>
-                      {optimization.n_trials} trials • split {Math.round(optimization.train_split_pct * 100)} / {Math.round((1 - optimization.train_split_pct) * 100)}
+                      {optimization.n_trials} trials • split {optimization.validation_split_pct && optimization.test_split_pct
+                        ? `${Math.round(optimization.train_split_pct * 100)} / ${Math.round(optimization.validation_split_pct * 100)} / ${Math.round(optimization.test_split_pct * 100)}`
+                        : `${Math.round(optimization.train_split_pct * 100)} / ${Math.round((1 - optimization.train_split_pct) * 100)}`}
                     </div>
                     <div style={{ marginTop: "6px", color: "#cbd5e1", fontSize: "0.78rem", lineHeight: 1.45 }}>
                       {formatSymbols(optimization.best_symbols || optimization.symbols)}
@@ -324,10 +326,15 @@ export function OptimizationsPage() {
                     }}
                   >
                     <div style={{ fontSize: "0.72rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "#86efac" }}>
-                      OOS Sharpe
+                      {optimization.final_test_stats ? "Test Sharpe (holdout)" : "OOS Sharpe"}
                     </div>
                     <div style={{ marginTop: "8px", fontSize: "1.4rem", fontWeight: 700 }}>
-                      {formatMetricValue("sharpe_ratio", optimization.test_stats?.sharpe_ratio)}
+                      {formatMetricValue(
+                        "sharpe_ratio",
+                        optimization.final_test_stats
+                          ? optimization.final_test_stats.sharpe_ratio
+                          : optimization.test_stats?.sharpe_ratio,
+                      )}
                     </div>
                   </div>
                 </div>

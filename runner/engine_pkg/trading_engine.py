@@ -32,7 +32,14 @@ from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
 from runner.fees import resolve_fee_model
-from shared.models import BacktestResult, EquityPoint, IndicatorSeries, Trade, TradeExit
+from shared.models import (
+    BacktestResult,
+    EquityPoint,
+    IndicatorSeries,
+    Trade,
+    TradeExit,
+    normalize_direction_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,14 @@ logger = logging.getLogger(__name__)
 #: (Cleanup 16-D1, F22). Deliberately a module constant, not a strategy
 #: parameter: strategy ``parameters`` must not rewrite engine risk policy.
 TRADE_ENGINE_MAX_POSITIONS = 5
+
+
+def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
+    """Order TP candidates: plain ``tp`` first, then ``tpN`` by numeric N (#154)."""
+    name = item[0]
+    if name == "tp":
+        return (0, 0, name)
+    return (1, int(name[2:]), name)
 
 
 class TradeEngine:
@@ -175,10 +190,12 @@ class TradeEngine:
             lower = str(key).lower()
             if lower in {"take_profit", "tp_price"} and pd.notna(row.get(key)):
                 tp_candidates.append(("tp", float(row.get(key))))
-            elif lower.startswith("tp") and lower[2:].isdigit() and pd.notna(row.get(key)):
+            elif lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
                 tp_candidates.append((lower, float(row.get(key))))
 
-        tp_candidates.sort(key=lambda item: item[0])
+        # Plain "tp" (take_profit / tp_price) first, then numbered levels by
+        # their numeric suffix so tp10 follows tp9, not tp1.
+        tp_candidates.sort(key=_tp_sort_key)
         if tp_candidates:
             default_fraction = 1.0 / len(tp_candidates)
             for name, price in tp_candidates:
@@ -197,8 +214,11 @@ class TradeEngine:
         return stop_loss, tp_levels
 
     def _resolve_direction(self, row: pd.Series) -> str:
-        direction = str(row.get("direction", "LONG")).upper()
-        return "SHORT" if direction == "SHORT" else "LONG"
+        # No direction column => long-only strategy. A present-but-unknown
+        # value (NaN, 0, "BUY", ...) raises rather than silently trading LONG.
+        if "direction" not in row.index:
+            return "LONG"
+        return normalize_direction_value(row["direction"])
 
     def _current_risk_exposure(
         self, reference_price: float, exclude_order: Order | None = None
