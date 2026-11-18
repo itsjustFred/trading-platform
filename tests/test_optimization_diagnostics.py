@@ -1242,7 +1242,7 @@ def test_three_way_split_rejects_empty_segments():
             embargo_pct=0.5,
         )
     # Fractions don't sum to 1
-    with pytest.raises(ValueError, match="sum to 1.0"):
+    with pytest.raises(ValueError, match=r"sum to 1\.0"):
         three_way_split(
             "2024-01-01T00:00:00+00:00",
             "2024-01-11T00:00:00+00:00",

@@ -38,7 +38,7 @@ def _curve(equities: list[float]) -> list[EquityPoint]:
 # Strong, steady gains, then a single wipe-out, then a "recovery" that must
 # not count: the account is gone at index 6.
 PRE_RUIN = [100_000, 101_000, 102_500, 103_000, 104_200, 105_000]
-RUINED = PRE_RUIN + [0.0, 50_000, 150_000, 200_000]
+RUINED = [*PRE_RUIN, 0.0, 50_000, 150_000, 200_000]
 RUIN_INDEX = len(PRE_RUIN)
 
 
@@ -106,7 +106,7 @@ def test_ruined_curve_is_truncated_at_ruin(quantstats_flag) -> None:
 
 
 def test_negative_equity_point_counts_as_ruin(quantstats_flag) -> None:
-    curve = _curve(PRE_RUIN + [-5_000.0, 120_000])
+    curve = _curve([*PRE_RUIN, -5_000.0, 120_000])
     stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
 
     assert stats["ruined"] is True
@@ -145,12 +145,12 @@ def test_no_curve_is_not_ruined() -> None:
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")], ids=str)
 def test_non_finite_equity_is_ruin_and_fails_closed(quantstats_flag, bad) -> None:
     """NaN/inf equity is never a tradeable account: treat it as ruin, never skip it."""
-    curve = _curve(PRE_RUIN + [bad, 120_000.0])
+    curve = _curve([*PRE_RUIN, bad, 120_000.0])
     stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
 
     assert stats["ruined"] is True
     assert stats["ruin_time"] == curve[len(PRE_RUIN)].time
-    for metric in RETURN_METRICS + ("cagr", "calmar_ratio"):
+    for metric in (*RETURN_METRICS, "cagr", "calmar_ratio"):
         assert stats[metric] is None, metric
         assert metric in stats["undefined_metrics"], metric
     # The curve ends on a point no metric can be measured from. Publishing the
@@ -183,13 +183,13 @@ def test_unreadable_equity_point_is_ruin_not_a_crash(quantstats_flag, bad) -> No
     `OverflowError`, the same "cannot read this point" case one exception type
     over (#139/#250).
     """
-    curve = _curve(PRE_RUIN + [120_000.0])
+    curve = _curve([*PRE_RUIN, 120_000.0])
     curve[len(PRE_RUIN)] = EquityPoint(time=curve[len(PRE_RUIN)].time, equity=bad)
     stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
 
     assert stats["ruined"] is True
     assert stats["ruin_time"] == curve[len(PRE_RUIN)].time
-    for metric in RETURN_METRICS + ("cagr", "calmar_ratio"):
+    for metric in (*RETURN_METRICS, "cagr", "calmar_ratio"):
         assert stats[metric] is None, metric
         assert metric in stats["undefined_metrics"], metric
     # The terminating point is NaN, so the endpoint figures are unmeasurable:
@@ -216,7 +216,7 @@ def test_unreadable_point_truncates_inclusively(
     existing degenerate shape (no return computable), so its `total_return`
     stays the published 0.0 and is named undefined there.
     """
-    curve = _curve(PRE_RUIN + [120_000.0])
+    curve = _curve([*PRE_RUIN, 120_000.0])
     curve[bad_index] = EquityPoint(time=curve[bad_index].time, equity=None)
     stats = compute_stats([], initial_capital=100_000.0, equity_curve=curve)
 

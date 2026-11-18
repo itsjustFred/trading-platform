@@ -1556,8 +1556,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 requested_qty=qty,
                 qty_step=step_qty,
             )
-        # A whole number of steps: round() only removes float noise here.
-        return int(round(floored_qty * float(scale.volume_per_qty)))
+        # A whole number of steps: round() on a float returns an int, and this
+        # only removes float noise.
+        return round(floored_qty * float(scale.volume_per_qty))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``."""

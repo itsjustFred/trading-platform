@@ -25,13 +25,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from shared.models import (
     PRICE_ABSENT,
@@ -53,7 +54,7 @@ OTHER_DEPLOYMENT = "dep-alpaca-124-b"
 
 @pytest.fixture
 def db(isolated_db):
-    database, engine, _data_dir = isolated_db
+    database, _engine, _data_dir = isolated_db
     database.init_db()
     with database.get_session() as session:
         session.add(database.LiveAccountModel(id=ACCOUNT, broker="alpaca", name=ACCOUNT))
@@ -675,7 +676,7 @@ def test_legacy_not_null_commission_column_is_migrated_to_nullable(isolated_db_n
         "ix_live_executions_timestamp",
         "ix_live_executions_broker_order_id",
     } <= index_names
-    with pytest.raises(Exception):
+    with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             connection.execute(
                 text(
@@ -2542,7 +2543,7 @@ def test_reconcile_refusal_names_the_connect_that_retries_it(db, live_runner_log
 
 @pytest.mark.parametrize(
     "date_only",
-    ["2026-11-03", "20261103", "2026-11-03T", "2026-W45", datetime(2026, 11, 3).date()],
+    ["2026-11-03", "20261103", "2026-11-03T", "2026-W45", date(2026, 11, 3)],
 )
 def test_a_date_without_a_time_of_day_is_not_a_fill_timestamp(date_only):
     from live_runner.alpaca_adapter import _broker_fill_timestamp

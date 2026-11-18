@@ -807,7 +807,10 @@ class LiveTrailingStopManager:
             raise _TrailingFailure("market data has no timestamp/close columns")
         bars: list[tuple[datetime, float]] = []
         ordered = frame.sort_values("timestamp")
-        for raw_time, raw_close in zip(ordered["timestamp"], ordered["close"]):
+        # Both are columns of the same sorted frame, so the two are the same
+        # length by construction: ``strict=True`` turns them getting out of step
+        # into an error instead of pairing a close with the wrong time.
+        for raw_time, raw_close in zip(ordered["timestamp"], ordered["close"], strict=True):
             opened = pd.Timestamp(raw_time)
             if opened.tzinfo is None:
                 opened = opened.tz_localize("UTC")

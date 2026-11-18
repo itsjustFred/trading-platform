@@ -4406,7 +4406,7 @@ def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
     stop to a full tick would exceed the per-trade risk, so it fails closed."""
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
-    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+    with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
         adapter._build_new_order_request(_ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9)
     # Exactly one tick is accepted.
     request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
@@ -4424,7 +4424,7 @@ def test_ctrader_sub_tick_stop_loss_is_refused_for_each_sub_tick_price(stop: flo
 def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
     module, adapter = _make_ctrader_request_builder_adapter()
     _seed_digits(module, adapter, 2)
-    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+    with pytest.raises(ValueError, match=r"SL distance .* below one tick"):
         adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
     request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
     assert request.relativeStopLoss == 1000

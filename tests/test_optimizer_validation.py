@@ -828,7 +828,7 @@ def test_three_way_split_rejects_non_positive_fractions():
 
 def test_three_way_split_rejects_sum_not_one():
     """Fractions must sum to 1.0 within 1e-9 tolerance."""
-    with pytest.raises(ValueError, match="must sum to 1.0"):
+    with pytest.raises(ValueError, match=r"must sum to 1\.0"):
         OptimizationConfig(
             base_backtest_id="bt_x",
             target_metric="sharpe_ratio",
@@ -838,7 +838,7 @@ def test_three_way_split_rejects_sum_not_one():
             test_split_pct=0.3,  # Sum = 1.1
             parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
         )
-    with pytest.raises(ValueError, match="must sum to 1.0"):
+    with pytest.raises(ValueError, match=r"must sum to 1\.0"):
         OptimizationConfig(
             base_backtest_id="bt_x",
             target_metric="sharpe_ratio",
