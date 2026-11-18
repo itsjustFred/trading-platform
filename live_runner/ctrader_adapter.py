@@ -20,13 +20,18 @@ from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
     ControlOutcome,
+    LivePipValue,
+    LiveQuote,
     coerce_positive_live_qty,
+    commission_cost,
     is_unbounded_tp,
     money_digits_from_trader,
     money_scale,
     order_not_submitted,
+    validate_live_quote_prices,
 )
 from live_runner.credential_env import resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
@@ -142,11 +147,19 @@ def _first_metadata_float(
 #     broker_volume / volume_per_qty. The risk engine sizes in these units
 #     (position_size = risk_amount / (risk_distance * pip_value)).
 #     volume_per_qty = lotSize / 100 from the broker symbol properties
-#     (FX: 100000/100 = 1000, pinned by contract tests), else the static
+#     (EURUSD on the demo: 10_000_000 / 100 = 100_000), else the static
 #     fallback table per symbol class (FX/JPY/XAU/XAG/index).
 #   * Raw cTrader protocol fields (ProtoOANewOrderReq.volume,
 #     tradeData.volume, deal.filledVolume, order.executedVolume) are in
-#     BROKER VOLUME UNITS: broker_volume == qty * volume_per_qty.
+#     BROKER VOLUME UNITS: broker_volume == qty * volume_per_qty. Broker
+#     volume (and lotSize) is in CENTS of the base asset, so one qty unit is
+#     volume_per_qty / 100 base units (EURUSD: 1,000 EUR).
+#   * pip_value (#146) is the account-currency P&L of one qty unit per 1.0
+#     price move: volume_per_qty / 100 * (quote -> account rate), from
+#     CTraderLiveAdapter.get_pip_value. Entries are only sized from a
+#     broker-sent lotSize: the static fallback table records lot sizes in
+#     base units, 100x below the broker's cents for FX/XAU (#184), and is
+#     never used for sizing.
 #
 # Every crossing of that boundary goes through _qty_to_broker_volume /
 # _broker_volume_to_qty with the symbol's scale (adapter._scale_for, #80:
@@ -156,9 +169,104 @@ def _first_metadata_float(
 #: Legacy FX scale, kept as the pinned default for the module-level helpers
 #: and the FX fallback entry below (qty 5.0 -> volume 5000).
 QTY_VOLUME_SCALE = 1000.0
+#: cTrader volumes (order volume, ``lotSize``, ``minVolume``, ``stepVolume``)
+#: are in CENTS of the base asset: volume 100_000 = 1,000 units (EURUSD 0.01
+#: lot). Verified on the demo: EURUSD lotSize 10_000_000 (100,000 EUR),
+#: XAUUSD 10_000 (100 oz), US500 100 (1 index unit).
+CTRADER_VOLUME_PER_BASE_UNIT = 100.0
+#: Upper bound on the broker's quote->account conversion chain (#146). The
+#: demo returns one hop (JPY->USD via USDJPY); a longer chain is unexpected.
+MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+
+
+def _power_of_ten_exponent(value: int) -> int:
+    """Return ``n`` for ``value == 10 ** n``; fail loudly for any other value."""
+    exponent = len(str(value)) - 1 if value > 0 else -1
+    if exponent < 0 or 10**exponent != value:
+        raise ValueError(f"Expected a power of ten, got {value!r}.")
+    return exponent
+
+
+def _relative_distance(
+    symbol: str,
+    reference_price: float,
+    price: float,
+    scale: int,
+    grid: int,
+    *,
+    is_stop: bool,
+) -> int:
+    """Positive SL/TP distance in 1/``scale`` price units, floored to ``grid``.
+
+    Floors toward the entry so a stop never widens beyond the risk the position was
+    sized for. A stop under one tick is refused; a take-profit under one tick is
+    sent as one tick (0 would mean "no TP").
+    """
+    leg = "SL" if is_stop else "TP"
+    if math.isnan(price) or math.isinf(price) or price <= 0:
+        raise ValueError(f"Invalid {leg} price for {symbol}: {price!r}; refusing to submit.")
+    distance = abs(reference_price - price)
+    if distance <= 0:
+        raise ValueError(
+            f"{leg} price {price!r} equals the reference price {reference_price!r} "
+            f"for {symbol}; refusing to submit a zero-distance {leg}."
+        )
+    raw = distance * scale
+    if not math.isfinite(raw) or raw < 1:
+        raise ValueError(
+            f"{leg} distance for {symbol} resolves to {raw!r} "
+            f"(below one 1/{scale} price unit); refusing to submit."
+        )
+    if is_stop and raw < grid * (1 - 1e-9):  # float noise at exactly one tick
+        raise ValueError(
+            f"{leg} distance for {symbol} is below one tick of the symbol "
+            f"price grid ({raw!r} < {grid} protocol units); refusing to submit "
+            "rather than widen the stop beyond the sized risk."
+        )
+    return max(grid, math.floor(raw / grid + 1e-9) * grid)
+
+
+def _utc_now() -> datetime:
+    """Receive-time clock for spot events (a seam so tests can freeze it)."""
+    return datetime.now(timezone.utc)
+
+
+@dataclasses.dataclass
+class _SpotWaiter:
+    """Collects one bid/ask from spot events for a pending :meth:`get_quote`.
+
+    cTrader spot events may carry only the side that changed, so the two
+    sides are accumulated across events received after the subscription.
+    ``timestamp`` is the latest broker spot time seen; ``received_at`` the
+    local time the completing event arrived, used only when the broker sent
+    no time at all.
+    """
+
+    future: asyncio.Future[LiveQuote]
+    bid: float | None = None
+    ask: float | None = None
+    timestamp: datetime | None = None
+    received_at: datetime | None = None
+
+
+def _present_proto_field(payload: Any, name: str) -> Any | None:
+    """The field's value when it was sent, else ``None``.
+
+    Spot ``bid``/``ask`` are ``optional uint64``: ``HasField`` tells an omitted
+    side from a sent one. A payload without ``HasField`` (a test double) falls
+    back to attribute presence.
+    """
+    has_field = getattr(payload, "HasField", None)
+    if has_field is not None:
+        try:
+            if not bool(has_field(name)):
+                return None
+        except (TypeError, ValueError):
+            return None
+    return getattr(payload, name, None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -167,11 +275,22 @@ class SymbolScale:
 
     ``volume_per_qty``: broker volume units per risk-engine qty unit.
     The qty unit is 0.01 lots, so ``volume_per_qty = lotSize / 100``
-    (FX: 100000/100 = 1000, pinned by contract tests).
-    ``price_digits``: broker-reported symbol price decimals retained as symbol
-    metadata; relative SL/TP always uses the fixed protocol divisor.
+    (broker EURUSD: 10_000_000/100 = 100_000; the fallback table's FX
+    100_000/100 = 1000 is in base units, see the unit contract above).
+    ``price_digits``: broker-reported symbol price decimals. Relative SL/TP units
+    always use the fixed protocol divisor; ``price_digits`` only sizes the price-grid
+    the distance is floored to, toward the entry (``10 ** (5 - price_digits)`` units,
+    1 if finer).
     ``min_volume``: broker minimum order volume (fail-closed floor).
     ``source``: "broker" (ProtoOASymbol props) or "fallback" (static table).
+    ``lot_size_from_broker``: the broker sent ``lotSize`` itself. A "broker"
+    scale may still borrow a missing ``lotSize`` from the fallback table; the
+    pip value (#146) is only derived from a broker-sent one.
+    ``step_volume``: broker volume increment (``stepVolume``). cTrader rejects
+    any order volume that is not a multiple of it (``TRADING_BAD_VOLUME``), so
+    entries and exits are both floored onto this grid. Unknown means one broker
+    volume unit (no known grid), so a full close of the real position volume is
+    never cut short.
     """
 
     volume_per_qty: float
@@ -179,6 +298,8 @@ class SymbolScale:
     min_volume: int
     lot_size: float
     source: str = "fallback"
+    lot_size_from_broker: bool = False
+    step_volume: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -279,40 +400,58 @@ def _fallback_symbol_scale(symbol: str) -> SymbolScale:
     )
 
 
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fallback_field(fallback: SymbolScale | None, name: str, default: Any = None) -> Any:
+    return getattr(fallback, name) if fallback is not None else default
+
+
 def _symbol_scale_from_broker_props(
     *,
     digits: int | None,
     lot_size: float | None,
     min_volume: int | None,
     fallback: SymbolScale | None,
+    step_volume: Any = None,
 ) -> SymbolScale | None:
     """Build a broker-authoritative scale, using a fallback only when available."""
-    try:
-        digit_count = int(digits) if digits is not None else None
-    except (TypeError, ValueError):
-        digit_count = None
+    digit_count = _optional_int(digits)
     if digit_count is None or not 0 <= digit_count <= 10:
-        digit_count = fallback.price_digits if fallback is not None else None
-    try:
-        lots = float(lot_size) if lot_size is not None else None
-    except (TypeError, ValueError):
-        lots = None
-    if lots is None or not math.isfinite(lots) or lots <= 0:
-        lots = fallback.lot_size if fallback is not None else None
-    try:
-        minimum = int(min_volume) if min_volume is not None else None
-    except (TypeError, ValueError):
-        minimum = None
+        digit_count = _fallback_field(fallback, "price_digits")
+    lots = _optional_float(lot_size)
+    lots_from_broker = lots is not None and math.isfinite(lots) and lots > 0
+    if not lots_from_broker:
+        lots = _fallback_field(fallback, "lot_size")
+    minimum = _optional_int(min_volume)
     if minimum is None or minimum <= 0:
-        minimum = fallback.min_volume if fallback is not None else None
+        minimum = _fallback_field(fallback, "min_volume")
     if digit_count is None or lots is None or minimum is None:
         return None
+    step = _optional_int(step_volume)
+    if step is None or step <= 0:
+        # Protobuf reports an unset optional as 0. One unit never cuts a full
+        # close short; a wrong partial is the broker's to reject, never upsized.
+        step = _fallback_field(fallback, "step_volume", 1)
     return SymbolScale(
         volume_per_qty=lots / 100.0,
         price_digits=digit_count,
         min_volume=minimum,
         lot_size=lots,
         source="broker",
+        lot_size_from_broker=lots_from_broker,
+        step_volume=step,
     )
 
 
@@ -321,18 +460,61 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     qty_value = coerce_positive_live_qty(qty)
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
-    volume = int(round(qty_value * float(volume_per_qty)))
+    # Floor, never round: rounding to nearest can size up by half a volume unit
+    # and put the loss at the stop above the risk budget. The relative nudge
+    # only absorbs binary float error (0.29 * 100 == 28.999999999999996).
+    volume = math.floor(qty_value * float(volume_per_qty) * (1.0 + 1e-12))
     if volume <= 0:
         raise ValueError(
-            "Signal has no positive quantity ('qty'); "
-            "refusing to submit an order with a default size."
+            f"qty {qty_value!r} is below one broker volume unit at "
+            f"{float(volume_per_qty)!r} units per qty; refusing to round it up "
+            "past the risk budget."
         )
-    return volume
+    return int(volume)
+
+
+def _floor_to_volume_step(volume: int, step_volume: int) -> int:
+    """Floor *volume* onto the broker's volume grid.
+
+    cTrader rejects an order whose volume is not a multiple of the symbol's
+    ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
+    lands on that grid, so it is rounded DOWN: rounding up would exceed the
+    risk budget. A result below the broker minimum is refused by the caller.
+    """
+    step = int(step_volume)
+    if step <= 1:
+        return int(volume)
+    return (int(volume) // step) * step
 
 
 def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
     """Convert broker volume units into qty units (risk-engine units)."""
     return _to_float(volume, default=0.0) / float(volume_per_qty)
+
+
+def _light_symbol_assets(symbol: Any) -> tuple[int, int] | None:
+    """(baseAssetId, quoteAssetId) of a ``ProtoOALightSymbol``, or ``None``.
+
+    Both are optional on the light symbol; an unset id reads as 0, which is
+    never a real asset, so it is treated as missing.
+    """
+    try:
+        base = int(getattr(symbol, "baseAssetId", 0) or 0)
+        quote = int(getattr(symbol, "quoteAssetId", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if base <= 0 or quote <= 0:
+        return None
+    return base, quote
+
+
+def _conversion_quote_prices(quote: Any, *, symbol: str) -> tuple[float, float]:
+    """Validated (bid, ask) of a conversion-rate quote, failing closed (#146).
+
+    The rules are shared with the daemon's entry gate
+    (:func:`live_runner.base_adapter.validate_live_quote_prices`); only the label is ours.
+    """
+    return validate_live_quote_prices(quote, symbol=symbol, label="cTrader conversion quote")
 
 
 def _deal_id_or_none(deal: Any | None) -> int | None:
@@ -349,7 +531,11 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
 
 
 def _deal_commission(deal: Any | None) -> float:
-    """A deal's commission in account currency.
+    """A deal's commission in account currency, as a positive cost.
+
+    cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
+    positive cost, the ``live_executions.commission`` convention shared with Alpaca (see
+    ``base_adapter.commission_cost``).
 
     ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
     ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
@@ -363,7 +549,7 @@ def _deal_commission(deal: Any | None) -> float:
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
     if not raw or not math.isfinite(raw):
         return 0.0
-    return raw / money_scale(money_digits_from_trader(deal))
+    return commission_cost(raw / money_scale(money_digits_from_trader(deal)))
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -579,6 +765,11 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
 class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
+    broker_name = "ctrader"
+    # No `supports_stop_amendment`: the daemon has no cTrader market data to
+    # trail on, so this adapter stays on trailing mode "none" (issue #167; see
+    # `shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`).
+
     def __init__(
         self,
         *,
@@ -651,9 +842,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connect_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
         self._symbol_name_to_id: dict[str, int] = {}
+        # #125: pending get_quote calls by symbolId, and one lock per symbol
+        # (cTrader allows a single spot subscription per symbol and session).
+        self._spot_waiters: dict[int, _SpotWaiter] = {}
+        self._spot_locks: dict[int, asyncio.Lock] = {}
+        self.quote_timeout_seconds = 5.0
         # #80: broker-authoritative per-symbol scales (digits/lotSize), keyed
         # by upper symbol name. Tests/fallbacks use _fallback_symbol_scale.
         self._symbol_props: dict[str, SymbolScale] = {}
+        # #146: (baseAssetId, quoteAssetId) per upper symbol name, from the
+        # light symbol list, and the account's deposit asset. Session state.
+        self._symbol_assets: dict[str, tuple[int, int]] = {}
+        self._deposit_asset_id: int | None = None
+        self._asset_names: dict[int, str] = {}
+        self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
         self._position_ids_by_symbol: dict[str, tuple[int, ...]] = {}
         self._order_id_to_signal_id: dict[int, str] = {}
         # #80: order id -> upper symbol name (for order-only fills whose
@@ -701,7 +903,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionType: Any = None
         self._ProtoOATimeInForce: Any = None
 
+        self._ProtoOASubscribeSpotsReq: Any = None
+        self._ProtoOAUnsubscribeSpotsReq: Any = None
+
         self._heartbeat_payload_type: int | None = None
+        self._spot_payload_type: int | None = None
         self._execution_payload_type: int | None = None
         self._error_payload_type: int | None = None
         self._order_error_payload_type: int | None = None
@@ -735,10 +941,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAReconcileRes,
                 ProtoOARefreshTokenReq,
                 ProtoOARefreshTokenRes,
+                ProtoOASpotEvent,
+                ProtoOASubscribeSpotsReq,
                 ProtoOASymbolsListReq,
                 ProtoOASymbolsListRes,
                 ProtoOATraderReq,
                 ProtoOATraderRes,
+                ProtoOAUnsubscribeSpotsReq,
             )
             from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
                 ProtoOADealStatus,
@@ -791,7 +1000,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAExecutionType = ProtoOAExecutionType
         self._ProtoOATimeInForce = ProtoOATimeInForce
 
+        self._ProtoOASubscribeSpotsReq = ProtoOASubscribeSpotsReq
+        self._ProtoOAUnsubscribeSpotsReq = ProtoOAUnsubscribeSpotsReq
+
         self._heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
+        self._spot_payload_type = ProtoOASpotEvent().payloadType
         self._execution_payload_type = ProtoOAExecutionEvent().payloadType
         self._error_payload_type = ProtoOAErrorRes().payloadType
         self._order_error_payload_type = ProtoOAOrderErrorEvent().payloadType
@@ -962,6 +1175,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             payload = self._Protobuf.extract(message)
         except Exception as exc:
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
+            return
+
+        if self._spot_payload_type is not None and payload_type == self._spot_payload_type:
+            self._handle_spot_event(payload)
             return
 
         if payload_type == self._execution_payload_type:
@@ -1236,9 +1453,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected symbols response: {type(symbols_res).__name__}")
 
         symbol_name_to_id: dict[str, int] = {}
+        symbol_assets: dict[str, tuple[int, int]] = {}
         for symbol in symbols_res.symbol:
-            symbol_name_to_id[str(symbol.symbolName).upper()] = int(symbol.symbolId)
+            name = str(symbol.symbolName).upper()
+            symbol_name_to_id[name] = int(symbol.symbolId)
+            assets = _light_symbol_assets(symbol)
+            if assets is not None:
+                symbol_assets[name] = assets
         self._symbol_name_to_id = symbol_name_to_id
+        self._symbol_assets = symbol_assets
         # #80: broker-API symbol properties (digits/lotSize/minVolume) are the
         # source of truth for per-symbol scales. Best-effort: the light list
         # above stays authoritative for ids when the detail fetch fails.
@@ -1296,6 +1519,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 lot_size=getattr(detail, "lotSize", None),
                 min_volume=getattr(detail, "minVolume", None),
                 fallback=fallback,
+                step_volume=getattr(detail, "stepVolume", None),
             )
             if scale is not None:
                 self._symbol_props[name] = scale
@@ -1309,6 +1533,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if hasattr(payload, "orderId") and int(getattr(payload, "orderId", 0)) > 0:
             return int(payload.orderId)
         return None
+
+    def exit_qty_step(self, symbol: str) -> float:
+        """The symbol's volume step in qty units: what an exit is floored to."""
+        scale = self._scale_for(symbol)
+        return float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
+
+    @staticmethod
+    def _exit_volume(symbol: str, qty: float, scale: SymbolScale) -> int:
+        """An exit's broker volume, rounded DOWN to the step (#121 review).
+
+        ``round()`` (the entry conversion) could close up to half a volume unit
+        more than the fraction asked for. Raises :class:`ExitBelowStepError`
+        when less than one step remains.
+        """
+        step_qty = float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
+        floored_qty = round_exit_qty_down(qty, step_qty)
+        if floored_qty <= 0.0:
+            raise ExitBelowStepError(
+                f"cTrader exit for {symbol} ignored: the requested qty {qty:g} is below "
+                f"the volume step ({step_qty:g} qty = {scale.step_volume} volume units).",
+                requested_qty=qty,
+                qty_step=step_qty,
+            )
+        # A whole number of steps: round() only removes float noise here.
+        return int(round(floored_qty * float(scale.volume_per_qty)))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``."""
@@ -1333,7 +1582,42 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "Signal has no positive quantity ('qty'); refusing to "
                 "submit an order with a default size."
             ) from exc
-        volume = _qty_to_broker_volume(qty, scale.volume_per_qty)
+        sized_units = metadata.get("pip_value_units_per_qty")
+        if sized_units is None and metadata.get("pip_value_source") == "caller":
+            # An explicit caller pip value carries no units-per-qty, so the
+            # submit-time scale check below cannot run; converting the sized
+            # qty with whatever scale is current could be a different
+            # position size (#146). Fail closed instead of skipping the check.
+            raise ValueError(
+                f"cTrader cannot verify the volume scale for {signal.symbol}: the "
+                "caller-supplied pip value carries no pip_value_units_per_qty; "
+                "refusing to submit a qty whose sizing scale is unknown."
+            )
+        if sized_units is not None:
+            # #146: the daemon sized this qty with a pip value derived from the
+            # symbol scale at sizing time. If the scale changed since (e.g. a
+            # reconnect whose props fetch failed fell back to the static
+            # table), the same qty would be a different position size.
+            current_units = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
+            try:
+                sized_units_value = float(sized_units)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Invalid pip_value_units_per_qty for {signal.symbol}: {sized_units!r}"
+                ) from exc
+            if not math.isclose(sized_units_value, current_units, rel_tol=1e-9, abs_tol=0.0):
+                raise ValueError(
+                    f"cTrader volume scale for {signal.symbol} changed since sizing "
+                    f"({sized_units_value!r} -> {current_units!r} units per qty); "
+                    "refusing to submit a qty sized for a different contract."
+                )
+        if str(metadata.get("risk_sizing_mode") or "") == EXIT_ONLY_RISK_SIZING_MODE:
+            volume = self._exit_volume(signal.symbol, qty, scale)
+        else:
+            # Entries: floor onto the broker grid (never exceed the risk budget).
+            volume = _floor_to_volume_step(
+                _qty_to_broker_volume(qty, scale.volume_per_qty), scale.step_volume
+            )
         if volume < scale.min_volume:
             raise ValueError(
                 f"Risk-sized volume {volume} for {signal.symbol} is below "
@@ -1990,6 +2274,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
         self._symbol_props.clear()
+        self._symbol_assets.clear()
+        self._deposit_asset_id = None
+        self._asset_names.clear()
+        if self._asset_names_task is not None:
+            self._asset_names_task.cancel()
+            self._asset_names_task = None
         self._order_id_to_symbol.clear()
         self._execution_queue = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts.clear()
@@ -2318,6 +2608,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         1/100000 of a price unit (123000 means 1.23), where for BUY
         stopLoss = entryPrice - relativeStopLoss and takeProfit
         = entryPrice + relativeTakeProfit (reversed for SELL).
+
+        The broker also rejects a distance finer than the symbol's price precision
+        (``Relative stop loss has invalid precision``), so each distance is floored
+        to the symbol grid of ``10 ** (5 - price_digits)`` units (1 when the symbol
+        is finer than 5 digits), i.e. toward the entry, so the real risk never
+        exceeds the sized risk (docs/live-risk-consistency.md). A take-profit under
+        one tick is sent as one tick (0 would mean "no TP"); a stop-loss under one
+        tick is refused, because widening it would exceed the sized risk.
         """
         reference_price = float(signal.theoretical_price)
         if not math.isfinite(reference_price) or reference_price <= 0:
@@ -2325,31 +2623,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"Invalid reference price for {signal.symbol}: "
                 f"{signal.theoretical_price!r}; refusing to submit."
             )
-        self._scale_for(signal.symbol)
+        symbol_scale = self._scale_for(signal.symbol)
         scale = CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+        # The broker validates a relative distance against the symbol's own price
+        # precision (``Relative stop loss has invalid precision``): on a 2-digit symbol
+        # (ETHUSD, XAUUSD, indices) it must be a multiple of 1000 protocol units, on a
+        # 3-digit one a multiple of 100. Sent unrounded, every such order is rejected.
+        grid = 10 ** max(0, _power_of_ten_exponent(scale) - symbol_scale.price_digits)
 
-        def _distance(price: float) -> int:
-            if math.isnan(price) or math.isinf(price) or price <= 0:
-                raise ValueError(
-                    f"Invalid SL/TP price for {signal.symbol}: {price!r}; "
-                    "refusing to submit."
-                )
-            distance = abs(reference_price - price)
-            if distance <= 0:
-                raise ValueError(
-                    f"SL/TP price {price!r} equals the reference price "
-                    f"{reference_price!r} for {signal.symbol}; refusing to "
-                    "submit a zero-distance SL/TP."
-                )
-            raw = distance * scale
-            if not math.isfinite(raw) or raw < 1:
-                raise ValueError(
-                    f"SL/TP distance for {signal.symbol} resolves to {raw!r} "
-                    f"(below one 1/{scale} price unit); refusing to submit."
-                )
-            # Distance is signed by direction at the protocol level; the value
-            # sent is always the positive magnitude in 1/scale price units.
-            return int(round(raw))
+        def distance(price: float, *, is_stop: bool) -> int:
+            return _relative_distance(
+                signal.symbol, reference_price, price, scale, grid, is_stop=is_stop
+            )
 
         buy = signal.action == "buy"
         stop_outward = reference_price - stop_loss if buy else stop_loss - reference_price
@@ -2362,7 +2647,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if take_profit is None:
             # C1: explicit unbounded policy — stop-only order. cTrader treats
             # a zero relativeTakeProfit as "no take profit".
-            return (_distance(stop_loss), 0)
+            return (distance(stop_loss, is_stop=True), 0)
         take_outward = take_profit - reference_price if buy else reference_price - take_profit
         if take_outward <= 0:
             raise ValueError(
@@ -2370,7 +2655,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 f"{signal.symbol} ({signal.action}): take_profit={take_profit!r}, "
                 f"reference={reference_price!r}; refusing to submit."
             )
-        return (_distance(stop_loss), _distance(take_profit))
+        return (distance(stop_loss, is_stop=True), distance(take_profit, is_stop=False))
 
     async def _submit_new_order_request(self, request: Any) -> Any:
         try:
@@ -2384,7 +2669,310 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         return response
 
-    async def get_balance(self) -> tuple[float, float]:
+    def _handle_spot_event(self, payload: Any) -> None:
+        """Feed a spot event to the pending :meth:`get_quote` for its symbol."""
+        try:
+            symbol_id = int(getattr(payload, "symbolId", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        waiter = self._spot_waiters.get(symbol_id)
+        if waiter is None or waiter.future.done():
+            return
+        # Spot prices are uint64 in 1/100000 of a price unit, like the
+        # relative SL/TP distances (123000 means 1.23).
+        raw_bid = _present_proto_field(payload, "bid")
+        raw_ask = _present_proto_field(payload, "ask")
+        raw_timestamp = _present_proto_field(payload, "timestamp")
+        try:
+            if raw_bid is not None:
+                waiter.bid = float(raw_bid) / CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+            if raw_ask is not None:
+                waiter.ask = float(raw_ask) / CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+            if raw_timestamp:
+                waiter.timestamp = datetime.fromtimestamp(
+                    int(raw_timestamp) / 1000, tz=timezone.utc
+                )
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            waiter.future.set_exception(
+                ValueError(f"cTrader spot event for symbolId {symbol_id} is unreadable: {exc}")
+            )
+            return
+        waiter.received_at = _utc_now()
+        if waiter.bid is not None and waiter.ask is not None:
+            # The broker's spot time when it sent one (subscribeToSpotTimestamp
+            # is requested); otherwise the time this event was received, which
+            # is labelled as such. A spot event is pushed live, so its receive
+            # time bounds its age; it is never an invented time.
+            broker_time = waiter.timestamp
+            waiter.future.set_result(
+                LiveQuote(
+                    bid=waiter.bid,
+                    ask=waiter.ask,
+                    timestamp=broker_time if broker_time is not None else waiter.received_at,
+                    source="ctrader_spot_event",
+                    timestamp_source="broker" if broker_time is not None else "receive",
+                )
+            )
+
+    async def _unsubscribe_spot(self, symbol_id: int) -> None:
+        """Best-effort spot unsubscribe; a failure is logged, never raised.
+
+        Also sent after a failed or timed-out subscribe: a subscription the
+        broker applied but whose response was lost would otherwise block every
+        later subscribe for the symbol (cTrader refuses a second one).
+        """
+        request = self._ProtoOAUnsubscribeSpotsReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.symbolId.append(int(symbol_id))
+        try:
+            await self._send_request_with_refresh_retry(request, timeout_seconds=10)
+        except Exception as exc:
+            logger.warning(
+                "cTrader spot unsubscribe failed",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "symbol_id": int(symbol_id),
+                        "error": str(exc),
+                    }
+                },
+            )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        """Current bid/ask for the #125 entry-deviation gate.
+
+        Subscribes to the symbol's spot stream, takes the first complete
+        bid/ask that arrives after the subscription, then unsubscribes. The
+        quote time is the spot event's broker time, else the time the event
+        was received (``timestamp_source="receive"``). Raises
+        on an unknown symbol, a refused subscription, or no quote within
+        ``quote_timeout_seconds``; it never returns an invented price.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if self._ProtoOASubscribeSpotsReq is None or self._ProtoOAUnsubscribeSpotsReq is None:
+            raise RuntimeError("cTrader spot subscription messages are not loaded")
+        symbol_id = int(await self._resolve_symbol_id(symbol))
+        lock = self._spot_locks.setdefault(symbol_id, asyncio.Lock())
+        async with lock:
+            waiter = _SpotWaiter(future=asyncio.get_running_loop().create_future())
+            self._spot_waiters[symbol_id] = waiter
+            try:
+                request = self._ProtoOASubscribeSpotsReq()
+                request.ctidTraderAccountId = self.ctid_trader_account_id
+                request.symbolId.append(symbol_id)
+                request.subscribeToSpotTimestamp = True
+                try:
+                    await self._send_request_with_refresh_retry(request, timeout_seconds=10)
+                except CTraderApiError as exc:
+                    self._raise_terminal_auth_from_api_error(exc)
+                    raise
+                try:
+                    return await asyncio.wait_for(
+                        waiter.future, timeout=self.quote_timeout_seconds
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(
+                        f"No cTrader spot quote for {symbol} within "
+                        f"{self.quote_timeout_seconds}s"
+                    ) from exc
+            finally:
+                self._spot_waiters.pop(symbol_id, None)
+                await self._unsubscribe_spot(symbol_id)
+
+    async def get_pip_value(self, symbol: str) -> LivePipValue:
+        """Account-currency value of one qty unit per 1.0 price move (#146).
+
+        One qty unit is ``volume_per_qty`` broker volume, and broker volume is
+        in cents of the base asset, so it stands for ``lotSize / 100 / 100``
+        base units (EURUSD: 1,000 EUR). A 1.0 price move on one base unit is
+        one unit of the quote currency, converted into the account's deposit
+        currency with live quotes along the broker's own conversion chain
+        (``ProtoOASymbolsForConversionReq``).
+
+        Each hop uses the side that makes the rate HIGHER (the ask when
+        multiplying, the bid when dividing): a higher pip value sizes smaller,
+        so the spread can only make the loss at the stop smaller than the
+        budget, never larger. The quotes are returned so the daemon can refuse
+        a stale rate.
+
+        Raises (the daemon refuses the entry) when the symbol has no
+        broker-sent ``lotSize`` (the static fallback table is never used for
+        sizing), its assets or the account's deposit asset are unknown, the
+        chain is missing, too long or does not connect, or a quote is unusable.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        upper = str(symbol or "").strip().upper()
+        scale = self._symbol_props.get(upper)
+        if scale is None or scale.source != "broker" or not scale.lot_size_from_broker:
+            raise ValueError(
+                f"No broker lotSize for cTrader symbol {upper!r}; refusing to size an "
+                "entry from the static fallback scale (#146)."
+            )
+        assets = self._symbol_assets.get(upper)
+        if assets is None:
+            raise ValueError(
+                f"cTrader symbol {upper!r} has no base/quote asset ids; cannot convert "
+                "its P&L into the account currency."
+            )
+        quote_asset_id = assets[1]
+        deposit_asset_id = await self._account_deposit_asset_id()
+        # Names are labels only: use what is cached and refresh in the
+        # background, so a slow asset list never delays entry sizing.
+        names = self._asset_names
+        self._schedule_asset_name_refresh()
+        units_per_qty = scale.volume_per_qty / CTRADER_VOLUME_PER_BASE_UNIT
+        if not math.isfinite(units_per_qty) or units_per_qty <= 0:
+            raise ValueError(f"cTrader symbol {upper!r} has no positive volume scale")
+        rate = 1.0
+        conversion_symbols: tuple[str, ...] = ()
+        conversion_quotes: tuple[LiveQuote, ...] = ()
+        if quote_asset_id != deposit_asset_id:
+            rate, conversion_symbols, conversion_quotes = await self._quote_to_deposit_rate(
+                quote_asset_id, deposit_asset_id, names=names
+            )
+        value = units_per_qty * rate
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"cTrader pip value for {upper!r} is not positive: {value!r}")
+        return LivePipValue(
+            value=value,
+            units_per_qty=units_per_qty,
+            conversion_rate=rate,
+            quote_asset=names.get(quote_asset_id, str(quote_asset_id)),
+            account_asset=names.get(deposit_asset_id, str(deposit_asset_id)),
+            source="ctrader_symbol_props",
+            conversion_symbols=conversion_symbols,
+            conversion_quotes=conversion_quotes,
+        )
+
+    async def _account_deposit_asset_id(self) -> int:
+        """The account's deposit (account-currency) asset id, cached per session."""
+        if self._deposit_asset_id is not None:
+            return self._deposit_asset_id
+        trader = await self._fetch_trader()
+        try:
+            deposit = int(getattr(trader, "depositAssetId", 0) or 0)
+        except (TypeError, ValueError):
+            deposit = 0
+        if deposit <= 0:
+            raise ValueError("cTrader trader has no deposit asset id; account currency unknown")
+        self._deposit_asset_id = deposit
+        return deposit
+
+    def _schedule_asset_name_refresh(self) -> None:
+        """Start one background asset-name fetch when no names are cached."""
+        task = self._asset_names_task
+        if self._asset_names or (task is not None and not task.done()):
+            return
+        self._asset_names_task = asyncio.get_running_loop().create_task(self._asset_name_map())
+
+    async def _asset_name_map(self) -> dict[int, str]:
+        """Asset id -> name (e.g. 15 -> "USD"), best-effort, for logs only.
+
+        Names never decide anything: the conversion runs on ids. A failed
+        fetch only leaves ids in the persisted record.
+        """
+        if self._asset_names:
+            return self._asset_names
+        try:
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOAAssetListReq,
+                ProtoOAAssetListRes,
+            )
+
+            request = ProtoOAAssetListReq()
+            request.ctidTraderAccountId = self.ctid_trader_account_id
+            response = await self._send_request_with_refresh_retry(request, timeout_seconds=15)
+            if isinstance(response, ProtoOAAssetListRes):
+                self._asset_names = {
+                    int(asset.assetId): str(asset.name) for asset in response.asset
+                }
+        except Exception as exc:
+            logger.warning(
+                "cTrader asset list unavailable; pip value record keeps asset ids",
+                extra={"data": {"account_id": self.ctid_trader_account_id, "error": str(exc)}},
+            )
+        return self._asset_names
+
+    async def _quote_to_deposit_rate(
+        self, quote_asset_id: int, deposit_asset_id: int, *, names: Mapping[int, str]
+    ) -> tuple[float, tuple[str, ...], tuple[LiveQuote, ...]]:
+        """Deposit-currency value of one unit of ``quote_asset_id`` (#146).
+
+        Walks the broker's conversion chain hop by hop: for a symbol B/Q at
+        price p, 1 B = p Q. Holding B, the next asset is Q (multiply by the
+        ask); holding Q, it is B (divide by the bid). Both sides are the
+        conservative ones (see :meth:`get_pip_value`).
+        """
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOASymbolsForConversionReq,
+            ProtoOASymbolsForConversionRes,
+        )
+
+        label = (
+            f"{names.get(quote_asset_id, quote_asset_id)}->"
+            f"{names.get(deposit_asset_id, deposit_asset_id)}"
+        )
+        request = ProtoOASymbolsForConversionReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.firstAssetId = int(quote_asset_id)
+        request.lastAssetId = int(deposit_asset_id)
+        try:
+            response = await self._send_request_with_refresh_retry(request, timeout_seconds=15)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(response, ProtoOASymbolsForConversionRes):
+            raise RuntimeError(
+                f"Unexpected cTrader conversion response: {type(response).__name__}"
+            )
+        chain = list(response.symbol)
+        if not chain:
+            raise ValueError(f"cTrader has no conversion chain for {label}")
+        if len(chain) > MAX_CONVERSION_HOPS:
+            raise ValueError(
+                f"cTrader conversion chain for {label} has {len(chain)} hops "
+                f"(limit {MAX_CONVERSION_HOPS})"
+            )
+        current = int(quote_asset_id)
+        rate = 1.0
+        symbols: list[str] = []
+        quotes: list[LiveQuote] = []
+        for light in chain:
+            name = str(getattr(light, "symbolName", "") or "").upper()
+            assets = _light_symbol_assets(light)
+            if not name or assets is None:
+                raise ValueError(f"cTrader conversion chain for {label} has an incomplete symbol")
+            base_id, quote_id = assets
+            if current not in (base_id, quote_id):
+                raise ValueError(
+                    f"cTrader conversion chain for {label} does not connect at {name}"
+                )
+            quote = await self.get_quote(name)
+            bid, ask = _conversion_quote_prices(quote, symbol=name)
+            if current == base_id:
+                rate *= ask
+                current = quote_id
+            else:
+                rate /= bid
+                current = base_id
+            symbols.append(name)
+            quotes.append(quote)
+        if current != int(deposit_asset_id):
+            raise ValueError(
+                f"cTrader conversion chain for {label} does not end in the account currency"
+            )
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError(f"cTrader conversion rate for {label} is not positive: {rate!r}")
+        return rate, tuple(symbols), tuple(quotes)
+
+    async def _fetch_trader(self) -> Any:
+        """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""
         self._raise_if_terminal_auth_failed()
         if not self._connected or not self._authenticated:
             await self.connect()
@@ -2402,8 +2990,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise
         if not isinstance(trader_res, self._ProtoOATraderRes):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
+        return trader_res.trader
 
-        trader = trader_res.trader
+    async def get_balance(self) -> tuple[float, float]:
+        trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
         balance = _to_float(getattr(trader, "balance", 0)) / scale
@@ -2615,6 +3205,37 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
+
+    async def working_order_ids(self) -> set[str]:
+        """Ids of every working order: order ids and client order ids.
+
+        Used before sizing an exit, to tell whether an earlier exit is still
+        working (#121). "Working" is :meth:`_is_working_order`, which reads a
+        status it cannot interpret as working - the direction that defers an
+        exit rather than sizing it off a ledger that may lack fills.
+        """
+        reconcile_res = await self._reconcile_state()
+        ids: set[str] = set()
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is not None:
+                ids.add(str(order_id))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            if client_order_id:
+                ids.add(client_order_id)
+        return ids
+
+    def position_qty_tolerance(self, symbol: str) -> float:
+        """Half of one broker volume unit, in qty units, for ``symbol``.
+
+        Positions and fills are whole broker volume units converted by the
+        symbol's ``volume_per_qty``, so anything closer than half a unit is the
+        same position. Raises like :meth:`_scale_for` for an unknown symbol; the
+        caller then falls back to the strict default.
+        """
+        return 0.5 / float(self._scale_for(symbol).volume_per_qty)
 
     async def cancel_open_orders(self) -> ControlOutcome:
         """Cancel every working *detached* order for this cTrader account.

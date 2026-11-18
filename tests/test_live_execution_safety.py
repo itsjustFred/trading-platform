@@ -21,7 +21,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter, is_order_not_submitted
+from live_runner.base_adapter import BaseLiveAdapter, LiveQuote, is_order_not_submitted
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
@@ -73,7 +73,17 @@ def test_position_size_scales_inversely_with_pip_value():
         pip_value=1.0,
         current_exposure=0.0,
     )
-    sized_pip_10 = _engine().calculate_position_size(
+    # A cap of 100 % of balance does not bind for either pip value, so the
+    # comparison sees the raw sizing formula (#146: the cap now counts
+    # notional as size * entry * pip, so the default 20 % would bind both).
+    uncapped = _engine(max_notional_per_trade=1.0)
+    uncapped_pip_1 = uncapped.calculate_position_size(
+        signal=TradeSignal(**signal_kwargs, metadata={}),
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+    sized_pip_10 = uncapped.calculate_position_size(
         signal=TradeSignal(**signal_kwargs, metadata={}),
         account_balance=10_000.0,
         pip_value=10.0,
@@ -82,6 +92,10 @@ def test_position_size_scales_inversely_with_pip_value():
 
     # Notional cap binds: 0.2 * 10k = 2000 / entry 100 = 20 shares.
     assert sized_pip_1.position_size == pytest.approx(20.0)
+    # Uncapped: 1 % of 10k = 100 / (2 * pip). pip 1 -> 50 (notional 5,000);
+    # pip 10 -> 5 (notional 5 * 100 * 10 = 5,000). Dropping `* pip` gives 50,
+    # capped to 10,000 / (100 * 10) = 10.
+    assert uncapped_pip_1.position_size == pytest.approx(50.0)
     assert sized_pip_10.position_size == pytest.approx(5.0)
 
 
@@ -149,6 +163,9 @@ class _PositionsAdapter(BaseLiveAdapter):
     positions: list[dict[str, Any]] = field(default_factory=list)
     submitted_signal: LiveSignal | None = None
     submitted_qty: float | None = None
+    # A double has to prove it is a demo account (`_adapter_is_demo`); without
+    # the flag it is real money and the promotion gate (#165) refuses entries.
+    demo: bool = True
 
     async def connect(self) -> None:
         return None
@@ -166,6 +183,21 @@ class _PositionsAdapter(BaseLiveAdapter):
 
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
+
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: every entry in this module is at 100, so
+        # a quote there passes; the gate itself is pinned in
+        # tests/test_live_sizing_single_resolver.py.
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 class _NoPositionsAdapter(_PositionsAdapter):
@@ -559,7 +591,11 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-123"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-123",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     assert asyncio.run(adapter.submit_order(first, qty=1.0)) == _alpaca_order_id("order-1")
@@ -585,7 +621,11 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 1, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-timeout"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-timeout",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
     submit_calls: list[Any] = []
     lookup_calls: list[str] = []
@@ -631,7 +671,11 @@ def test_alpaca_redelivery_uses_persisted_order_id_without_broker_call(monkeypat
         action="buy",
         theoretical_price=100.0,
         timestamp=datetime(2026, 7, 15, 10, 2, tzinfo=timezone.utc),
-        metadata={"qty": 1.0, "discord_message_id": "discord-persisted"},
+        metadata={
+            "qty": 1.0, "discord_message_id": "discord-persisted",
+            "stop_loss": 95.0,
+            "take_profit": 110.0,
+        },
     )
 
     def _forbidden(*_args, **_kwargs):
@@ -788,102 +832,127 @@ def test_ctrader_volume_rejects_missing_and_below_minimum_qty():
     assert adapter._resolve_order_volume(_signal({"qty": 5.0})) == 5000
 
 
-# ── B-6: exit-only close sums all matching positions ──────────────────────────
+# ── B-6: an exit-only close never sums or guesses across positions ───────────
+#
+# Since #121 every exit-only SELL closes the deployment's own ledger quantity
+# (``live_runner.exit_signals.resolve_exit_order``), capped at the broker
+# position. These pin the broker-book guards that sizing still applies.
 
-def test_exit_only_target_qty_rejects_multiple_matching_positions():
-    from live_runner.daemon import _resolve_exit_only_target_qty
 
+def _patch_exit_ledger(monkeypatch, deployment: LiveDeploymentConfig, qty: float) -> None:
+    """Ledgers without a database: this deployment holds ``qty``, nobody else
+    on the account holds anything, and no earlier exit is still pending."""
+    import live_runner.daemon as daemon
+
+    deployment_id = str(deployment.id)
+    monkeypatch.setattr(
+        daemon,
+        "get_account_net_filled_qty_by_deployment",
+        lambda _account_id, _symbol: {deployment_id: qty},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "list_live_deployment_unfilled_exit_orders",
+        lambda _deployment_id, _symbol: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "list_account_unfilled_exit_orders",
+        lambda _account_id, _symbol, **_kwargs: [],
+        raising=False,
+    )
+
+
+def _exit_only_sell(deployment_id: str = "dep-1", **metadata: Any) -> LiveSignal:
+    return LiveSignal(
+        deployment_id=deployment_id,
+        symbol="EURUSD",
+        action="sell",
+        theoretical_price=1.1,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, **metadata},
+    )
+
+
+def _prepare_exit_only(monkeypatch, positions, *, ledger_qty: float, **metadata: Any):
+    from live_runner.daemon import prepare_order_with_risk
+
+    class _Adapter:
+        async def get_positions(self):
+            return list(positions)
+
+    deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, ledger_qty)
+    signal = _exit_only_sell(str(deployment.id), **metadata)
+    return asyncio.run(prepare_order_with_risk(_Adapter(), deployment, signal))
+
+
+def test_exit_only_rejects_multiple_matching_positions(monkeypatch):
     positions = [
         {"symbol": "EURUSD", "qty": 2.0},
         {"symbol": "eurusd", "qty": 3.5},
     ]
 
-    with pytest.raises(ValueError, match="multiple broker positions"):
-        _resolve_exit_only_target_qty(iter(positions), "EURUSD")
+    with pytest.raises(ValueError, match="2 broker positions"):
+        _prepare_exit_only(monkeypatch, positions, ledger_qty=2.0)
 
 
-def test_exit_only_target_qty_preserves_single_short_position():
-    from live_runner.daemon import _resolve_exit_only_target_qty
+def test_exit_only_preserves_single_short_position(monkeypatch):
+    prepared, qty = _prepare_exit_only(
+        monkeypatch, [{"symbol": "EURUSD", "qty": -0.5}], ledger_qty=-0.5
+    )
 
-    assert _resolve_exit_only_target_qty(
-        iter([{"symbol": "EURUSD", "qty": -0.5}]), "EURUSD"
-    ) == pytest.approx(0.5)
+    assert qty == pytest.approx(0.5)
+    assert prepared.action == "buy"
 
 
-def test_exit_only_close_action_rejects_mixed_books():
-    from live_runner.daemon import _exit_only_close_action
-
-    assert _exit_only_close_action(iter([{"symbol": "EURUSD", "qty": -2.0}]), "EURUSD") == "buy"
-    assert _exit_only_close_action(iter([{"symbol": "EURUSD", "qty": 2.0}]), "EURUSD") == "sell"
-    with pytest.raises(ValueError, match="multiple broker positions"):
-        _exit_only_close_action(
-            iter([{"symbol": "EURUSD", "qty": 2.0}, {"symbol": "EURUSD", "qty": -1.0}]),
-            "EURUSD",
+def test_exit_only_rejects_mixed_books(monkeypatch):
+    with pytest.raises(ValueError, match="2 broker positions"):
+        _prepare_exit_only(
+            monkeypatch,
+            [{"symbol": "EURUSD", "qty": 2.0}, {"symbol": "EURUSD", "qty": -1.0}],
+            ledger_qty=2.0,
         )
 
 
-def test_exit_only_metadata_restamps_action_for_short_book():
-    from live_runner.daemon import _metadata_for_exit_only_order
-
-    class _Adapter:
-        async def get_positions(self):
-            return [{"symbol": "EURUSD", "qty": -2.0}]
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"exit_only": True},
+def test_exit_only_metadata_restamps_action_for_short_book(monkeypatch):
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch, [{"symbol": "EURUSD", "qty": -2.0}], ledger_qty=-2.0
     )
 
-    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+    assert prepared.metadata["explicit_qty"] == pytest.approx(2.0)
+    assert prepared.metadata["risk_sizing_mode"] == "exit_only"
+    assert prepared.metadata["action"] == "buy"
+    assert prepared.metadata["signal_action"] == "sell"
+    assert prepared.action == "buy"
 
-    assert metadata["explicit_qty"] == pytest.approx(2.0)
-    assert metadata["risk_sizing_mode"] == "exit_only"
-    assert metadata["action"] == "buy"
-    assert metadata["signal_action"] == "sell"
 
-
-def test_exit_only_metadata_rejects_multiple_positions():
-    from live_runner.daemon import _metadata_for_exit_only_order
-
-    class _Adapter:
-        async def get_positions(self):
-            return [
+def test_exit_only_metadata_rejects_multiple_positions(monkeypatch):
+    with pytest.raises(ValueError, match="2 broker positions"):
+        _prepare_exit_only(
+            monkeypatch,
+            [
                 {"symbol": "EURUSD", "qty": 1.0, "position_id": 10},
                 {"symbol": "EURUSD", "qty": 2.0, "position_id": 11},
-            ]
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"exit_only": True},
-    )
-
-    with pytest.raises(ValueError, match="multiple broker positions"):
-        asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
-
-
-def test_exit_only_target_qty_rejects_unparseable_rows():
-    from live_runner.daemon import _resolve_exit_only_target_qty
-
-    with pytest.raises(ValueError, match="Invalid qty"):
-        _resolve_exit_only_target_qty(
-            iter([{"symbol": "EURUSD", "qty": "not-a-number"}]), "EURUSD"
+            ],
+            ledger_qty=1.0,
         )
 
 
-def test_exit_only_target_qty_returns_zero_when_no_match():
-    from live_runner.daemon import _resolve_exit_only_target_qty
+def test_exit_only_rejects_unparseable_rows(monkeypatch):
+    with pytest.raises(ValueError, match="invalid broker position quantity"):
+        _prepare_exit_only(
+            monkeypatch, [{"symbol": "EURUSD", "qty": "not-a-number"}], ledger_qty=1.0
+        )
 
-    positions = [{"symbol": "AAPL", "qty": 10.0}]
 
-    assert _resolve_exit_only_target_qty(iter(positions), "EURUSD") == 0.0
+def test_exit_only_without_a_matching_position_closes_nothing(monkeypatch):
+    from live_runner.exit_signals import NothingToExitError
+
+    with pytest.raises(NothingToExitError):
+        _prepare_exit_only(monkeypatch, [{"symbol": "AAPL", "qty": 10.0}], ledger_qty=1.0)
 
 
 # ── B-10: exposure fed to the risk engine is risk-at-stake in balance units ───
@@ -2412,10 +2481,13 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     )
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     saved: list[tuple[LiveExecution, float]] = []
+    save_kwargs: list[dict] = []
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",
-        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+        lambda e, cumulative, **kwargs: (
+            saved.append((e, cumulative)) or save_kwargs.append(kwargs) or e.filled_qty
+        ),
     )
 
     _client = SimpleNamespace(
@@ -2439,6 +2511,8 @@ def test_alpaca_reconcile_backfills_missing_fill(monkeypatch):
     )
     assert str(saved[0][0].signal_id) == signal_id
     assert saved[0][1] == 25.0
+    # #124: the broker's cumulative average goes to the save, which derives the remainder price.
+    assert save_kwargs == [{"cumulative_avg_price": 101.5}]
 
 
 def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
@@ -2473,7 +2547,9 @@ def test_alpaca_reconcile_pages_past_candidate_limit(monkeypatch):
     )
     monkeypatch.setattr(module, "get_live_signal_filled_qty", lambda _signal_id: 0.0)
     monkeypatch.setattr(
-        module, "save_live_execution_up_to_cumulative", lambda execution, _cap: execution.filled_qty
+        module,
+        "save_live_execution_up_to_cumulative",
+        lambda execution, _cap, **_kwargs: execution.filled_qty,
     )
     broker_queries: list[str] = []
     adapter._trading_client = SimpleNamespace(
@@ -2515,10 +2591,13 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
         module, "get_live_signal_filled_qty", lambda _signal_id: 1.0, raising=False
     )
     saved: list[tuple[LiveExecution, float]] = []
+    save_kwargs: list[dict] = []
     monkeypatch.setattr(
         module,
         "save_live_execution_up_to_cumulative",
-        lambda e, cumulative: saved.append((e, cumulative)) or e.filled_qty,
+        lambda e, cumulative, **kwargs: (
+            saved.append((e, cumulative)) or save_kwargs.append(kwargs) or e.filled_qty
+        ),
     )
     adapter._trading_client = SimpleNamespace(
         get_order_by_client_id=lambda _cid: SimpleNamespace(
@@ -2539,6 +2618,7 @@ def test_alpaca_reconcile_backfills_only_missing_partial_fill_delta(monkeypatch)
         f"alpaca:order:{_alpaca_order_id('partial-recovery')}:reconciled:3.0"
     )
     assert saved[0][1] == 3.0
+    assert save_kwargs == [{"cumulative_avg_price": 101.5}]
 
 
 @pytest.mark.parametrize("local_filled_qty", [3.0, 4.0])
@@ -3501,7 +3581,7 @@ def test_ctrader_relative_sl_tp_direction_and_rejections():
     with pytest.raises(ValueError, match="wrong side of the reference price"):
         wrong_side(wrong_side_signal, symbol_id=7)
     nan_signal = _signal("buy", float("nan"), 1.2)
-    with pytest.raises(ValueError, match="Invalid SL/TP price"):
+    with pytest.raises(ValueError, match="Invalid SL price"):
         wrong_side(nan_signal, symbol_id=7)
     zero_distance_signal = _signal("buy", 1.1, 1.2)
     with pytest.raises(ValueError, match="wrong side of the reference price"):
@@ -3624,12 +3704,13 @@ def test_alpaca_build_order_request_fails_closed_without_sl_tp():
         resolve(naked_signal)
 
 
-def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
+def test_exit_only_orders_still_bypass_sizing_but_close_exact_position(monkeypatch):
     """Exit-only must keep its exact-qty path (no risk sizing) and must not be
     blocked by the entry SL/TP guard."""
     from live_runner.daemon import submit_order_with_risk
 
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, 3.0)
     adapter = _PositionsAdapter(
         positions=[{"symbol": "EURUSD", "qty": 3.0}]
     )
@@ -3651,10 +3732,11 @@ def test_exit_only_orders_still_bypass_sizing_but_close_exact_position():
     assert adapter.submitted_signal.action == "sell"
 
 
-def test_exit_only_metadata_discards_untrusted_close_volume() -> None:
+def test_exit_only_metadata_discards_untrusted_close_volume(monkeypatch) -> None:
     from live_runner.daemon import submit_order_with_risk
 
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, 3.0)
     adapter = _PositionsAdapter(positions=[{"symbol": "EURUSD", "qty": 3.0}])
     signal = LiveSignal(
         deployment_id=str(deployment.id),
@@ -3699,12 +3781,13 @@ def test_entry_metadata_discards_raw_broker_volume_but_keeps_risk_qty() -> None:
     assert "ctrader_volume" not in adapter.submitted_signal.metadata
 
 
-def test_exit_only_orders_close_short_positions_with_a_buy():
+def test_exit_only_orders_close_short_positions_with_a_buy(monkeypatch):
     """#76: an exit-only signal on a net-short book must submit a BUY that
     flattens the short magnitude instead of raising 'no long position'."""
     from live_runner.daemon import submit_order_with_risk
 
     deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, -3.0)
     adapter = _PositionsAdapter(
         positions=[{"symbol": "EURUSD", "qty": -3.0}]
     )
@@ -4249,6 +4332,161 @@ def test_ctrader_jpy_relative_sl_tp_uses_fixed_protocol_divisor() -> None:
     assert request.relativeTakeProfit == 10000
 
 
+@pytest.mark.parametrize(
+    ("digits", "grid"),
+    [(2, 1000), (3, 100), (4, 10), (5, 1)],
+)
+def test_ctrader_relative_sl_tp_snaps_to_symbol_price_grid(digits: int, grid: int) -> None:
+    """cTrader rejects a relative distance that is finer than the symbol's price digits
+    (``Relative stop loss has invalid precision``, seen on a demo ETHUSD order), so the
+    sent distance is snapped to the symbol grid: 1000 units at 2 digits, 100 at 3, ..."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0,
+        price_digits=digits,
+        min_volume=1,
+        lot_size=100.0,
+        source="broker",
+    )
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="ETHUSD",
+        action="buy",
+        theoretical_price=1925.50,
+        timestamp=datetime.now(timezone.utc),
+        # 9.62751 below / 9.62749 above: both off-grid below 5 digits.
+        metadata={"qty": 1.0, "stop_loss": 1925.50 - 9.62751, "take_profit": 1925.50 + 9.62749},
+    )
+    request = adapter._build_new_order_request(signal, symbol_id=9)
+    assert request.relativeStopLoss % grid == 0
+    assert request.relativeTakeProfit % grid == 0
+    # Snapping floors toward the entry: never beyond the requested distance, and by
+    # less than one tick short of it.
+    assert 0 <= 962_751 - request.relativeStopLoss < grid
+    assert 0 <= 962_749 - request.relativeTakeProfit < grid
+
+
+def _ethusd_signal(stop_loss: float, take_profit: float | None) -> LiveSignal:
+    metadata: dict = {"qty": 1.0, "stop_loss": stop_loss}
+    if take_profit is not None:
+        metadata["take_profit"] = take_profit
+    else:  # stop-only orders need the explicit unbounded policy
+        metadata["take_profit_policy"] = "unbounded_exit_on_opposite_signal"
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="ETHUSD",
+        action="buy",
+        theoretical_price=1925.50,
+        timestamp=datetime.now(timezone.utc),
+        metadata=metadata,
+    )
+
+
+def _seed_digits(module, adapter, digits: int) -> None:
+    adapter._symbol_props["ETHUSD"] = module.SymbolScale(
+        volume_per_qty=1.0, price_digits=digits, min_volume=1, lot_size=100.0, source="broker"
+    )
+
+
+def test_ctrader_sub_tick_take_profit_is_sent_as_one_tick_never_zero() -> None:
+    """A TP under one tick is sent as one tick, not 0 (0 means 'no TP'). Widening a
+    take-profit does not add risk."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 5.0, 1925.504), symbol_id=9
+    )
+    assert request.relativeTakeProfit == 1000
+
+
+def test_ctrader_sub_tick_stop_loss_is_refused_not_widened() -> None:
+    """The risk engine sized qty from the requested stop distance; widening a sub-tick
+    stop to a full tick would exceed the per-trade risk, so it fails closed."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+        adapter._build_new_order_request(_ethusd_signal(1925.496, 1925.50 + 5.0), symbol_id=9)
+    # Exactly one tick is accepted.
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, 1925.60), symbol_id=9)
+    assert request.relativeStopLoss == 1000
+
+
+@pytest.mark.parametrize("stop", [1925.496, 1925.50 - 0.009])
+def test_ctrader_sub_tick_stop_loss_is_refused_for_each_sub_tick_price(stop: float) -> None:
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="below one tick"):
+        adapter._build_new_order_request(_ethusd_signal(stop, 1925.50 + 5.0), symbol_id=9)
+
+
+def test_ctrader_sub_tick_stop_loss_is_refused_on_stop_only_order() -> None:
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="SL distance .* below one tick"):
+        adapter._build_new_order_request(_ethusd_signal(1925.50 - 0.004, None), symbol_id=9)
+    request = adapter._build_new_order_request(_ethusd_signal(1925.49, None), symbol_id=9)
+    assert request.relativeStopLoss == 1000
+    assert request.relativeTakeProfit == 0
+
+
+@pytest.mark.parametrize(
+    ("stop_ticks", "take_ticks", "expected_stop", "expected_take"),
+    [
+        (1.6, 1.6, 1000, 1000),  # floored toward entry, never widened to 2 ticks
+        (2.5, 2.5, 2000, 2000),
+        (1.0, 1.0, 1000, 1000),  # exactly one tick accepted
+        (2.0, 0.4, 2000, 1000),  # sub-tick TP -> one tick, never 0
+    ],
+)
+def test_ctrader_relative_distances_floor_toward_entry(
+    stop_ticks: float, take_ticks: float, expected_stop: int, expected_take: int
+) -> None:
+    """Rounding must never widen a stop beyond the sized risk (docs/live-risk-consistency.md)."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 0.01 * stop_ticks, 1925.50 + 0.01 * take_ticks), symbol_id=9
+    )
+    assert request.relativeStopLoss == expected_stop
+    assert request.relativeTakeProfit == expected_take
+
+
+def test_ctrader_relative_distance_error_names_the_leg() -> None:
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, 2)
+    with pytest.raises(ValueError, match="TP price"):
+        adapter._build_new_order_request(_ethusd_signal(1925.50 - 5.0, float("nan")), symbol_id=9)
+
+
+@pytest.mark.parametrize(("scale", "exp"), [(100_000, 5), (10, 1), (1, 0)])
+def test_ctrader_price_grid_exponent_requires_power_of_ten(scale: int, exp: int) -> None:
+    from live_runner import ctrader_adapter as module
+
+    assert module._power_of_ten_exponent(scale) == exp
+
+
+@pytest.mark.parametrize("scale", [0, -10, 50_000, 12])
+def test_ctrader_price_grid_exponent_rejects_non_power_of_ten(scale: int) -> None:
+    from live_runner import ctrader_adapter as module
+
+    with pytest.raises(ValueError, match="power of ten"):
+        module._power_of_ten_exponent(scale)
+
+
+@pytest.mark.parametrize("digits", [6, 8, 10])
+def test_ctrader_relative_sl_tp_handles_price_digits_above_five(digits: int) -> None:
+    """Symbols finer than the 1/100000 protocol unit keep grid 1 and int64 fields."""
+    module, adapter = _make_ctrader_request_builder_adapter()
+    _seed_digits(module, adapter, digits)
+    request = adapter._build_new_order_request(
+        _ethusd_signal(1925.50 - 9.62751, 1925.50 + 9.62749), symbol_id=9
+    )
+    assert isinstance(request.relativeStopLoss, int)
+    assert isinstance(request.relativeTakeProfit, int)
+    assert request.relativeStopLoss == 962_751
+    assert request.relativeTakeProfit == 962_749
+
+
 def test_ctrader_xau_order_volume_uses_ounce_scale() -> None:
     """XAU qty 5.0 (0.05 lots = 5 oz) resolves to volume 5, not 5000."""
     _module, adapter = _make_ctrader_adapter()
@@ -4284,37 +4522,24 @@ def test_ctrader_disconnect_clears_symbol_session_state() -> None:
     assert adapter._order_id_to_symbol == {}
 
 
-def test_exit_only_metadata_flows_through_adapter_volume_gate() -> None:
+def test_exit_only_metadata_flows_through_adapter_volume_gate(monkeypatch) -> None:
     """Pre-mortem PM1: daemon exit-only metadata must satisfy the adapter's
     volume gate — producer and consumer share one constant, not two
     spellings."""
-    import asyncio
-
     from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
-    from live_runner.daemon import _metadata_for_exit_only_order
 
     assert EXIT_ONLY_RISK_SIZING_MODE == "exit_only"
 
-    class _Adapter:
-        async def get_positions(self):
-            return [{"symbol": "EURUSD", "qty": 2.0}]
-
-    signal = LiveSignal(
-        deployment_id="dep-1",
-        symbol="EURUSD",
-        action="sell",
-        theoretical_price=1.1,
-        timestamp=datetime.now(timezone.utc),
-        metadata={"exit_only": True},
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch, [{"symbol": "EURUSD", "qty": 2.0}], ledger_qty=2.0
     )
-    metadata = asyncio.run(_metadata_for_exit_only_order(signal, _Adapter(), {}))
+    metadata = prepared.metadata
     assert metadata["risk_sizing_mode"] == EXIT_ONLY_RISK_SIZING_MODE
     assert metadata["qty"] == pytest.approx(2.0)
     assert metadata["explicit_qty"] == pytest.approx(2.0)
 
     _module, adapter = _make_ctrader_adapter()
-    gated = signal.model_copy(update={"metadata": metadata})
-    assert adapter._resolve_order_volume(gated) == 2000
+    assert adapter._resolve_order_volume(prepared) == 2000
 
 
 def test_unbounded_tp_policy_passes_daemon_guard_with_warning(caplog) -> None:
@@ -4725,3 +4950,438 @@ def test_create_live_deployment_validates_against_the_broker_identity(
         database.create_live_deployment(
             deployment.model_copy(update={"id": str(uuid4()), "account_id": "acc-2"})
         )
+
+
+# ── cTrader volume step: risk-sized volume must land on the broker grid ───────
+
+
+def _load_eurusd_demo_props(adapter, *, step_volume: int | None) -> None:
+    """Load EURUSD props as the cTrader demo reports them (2026-11-13).
+
+    lotSize 10_000_000 and minVolume/stepVolume 100_000 are broker volume units
+    (cents of the base currency): one lot is 100_000 EUR, the minimum and the
+    grid are 1_000 EUR.
+    """
+    protobuf = pytest.importorskip("ctrader_open_api.messages.OpenApiMessages_pb2")
+    model = pytest.importorskip("ctrader_open_api.messages.OpenApiModelMessages_pb2")
+    response = protobuf.ProtoOASymbolByIdRes()
+    symbol = model.ProtoOASymbol()
+    symbol.symbolId = 1
+    symbol.digits = 5
+    symbol.pipPosition = 4
+    symbol.lotSize = 10_000_000
+    symbol.minVolume = 100_000
+    if step_volume is not None:
+        symbol.stepVolume = step_volume
+    response.symbol.append(symbol)
+
+    async def _send_request(_request, *, timeout_seconds=15):
+        return response
+
+    adapter._send_request_with_refresh_retry = _send_request
+    asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 1}))
+
+
+def test_ctrader_broker_step_volume_is_cached() -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+
+    scale = adapter._scale_for("EURUSD")
+    assert scale.source == "broker"
+    assert scale.step_volume == 100_000
+
+
+@pytest.mark.parametrize(
+    ("qty", "expected_volume"),
+    [
+        # Demo repro: qty 18.088... sized to volume 1_808_803, which cTrader
+        # rejected with TRADING_BAD_VOLUME ("must be multiple of volume step").
+        (18.08803, 1_800_000),
+        # Exactly the broker minimum is accepted (refusal is strictly below).
+        (1.0, 100_000),
+        (1.0499, 100_000),
+        (1.9999, 100_000),
+        (2.0, 200_000),
+    ],
+)
+def test_ctrader_order_volume_is_floored_to_broker_step(
+    qty: float, expected_volume: int
+) -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+
+    volume = adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": qty}))
+
+    assert volume == expected_volume
+    assert volume % 100_000 == 0
+    # Never rounded up past the risk-sized volume.
+    assert volume <= qty * adapter._scale_for("EURUSD").volume_per_qty
+
+
+def test_ctrader_volume_floored_below_minimum_is_refused_not_upsized() -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+
+    signal = _ctrader_signal("EURUSD", {"qty": 0.9994})
+    with pytest.raises(ValueError, match="below the broker minimum"):
+        adapter._resolve_order_volume(signal)
+
+
+def test_ctrader_new_order_request_volume_is_on_broker_step() -> None:
+    _module, adapter = _make_ctrader_request_builder_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.10504,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"qty": 1.4, "stop_loss": 1.10304, "take_profit": 1.10904},
+    )
+
+    request = adapter._build_new_order_request(signal, symbol_id=1)
+
+    assert request.volume == 100_000
+
+
+def test_ctrader_missing_step_volume_keeps_unrounded_volume() -> None:
+    """No broker grid and no fallback grid: the volume is not altered."""
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=None)
+
+    assert adapter._scale_for("EURUSD").step_volume == 1
+    assert adapter._resolve_order_volume(_ctrader_signal("EURUSD", {"qty": 1.23456})) == 123_456
+
+
+@pytest.mark.parametrize(
+    ("qty", "volume_per_qty", "step", "expected"),
+    [
+        # Demo finding (#184): qty 34.66 rounded UP to 35 and lost $10.09 at the
+        # stop on a $10 risk budget.
+        (34.66, 1.0, 1, 34),
+        (34.66, 1.0, 5, 30),
+        (0.5, 1.0, 1, None),  # floors to 0 -> refused, not rounded up to 1
+        (5.9999, 1000.0, 1, 5999),
+        (5.9999, 1000.0, 1000, 5000),
+        (0.29, 100.0, 1, 29),  # float error must not floor 28.999... to 28
+        (2.0, 1000.0, 1, 2000),
+    ],
+)
+def test_ctrader_entry_volume_never_rounds_risk_up(
+    qty: float, volume_per_qty: float, step: int, expected: int | None
+) -> None:
+    module, _adapter = _make_ctrader_adapter()
+    if expected is None:
+        with pytest.raises(ValueError, match="past the risk budget"):
+            module._qty_to_broker_volume(qty, volume_per_qty)
+        return
+    volume = module._floor_to_volume_step(
+        module._qty_to_broker_volume(qty, volume_per_qty), step
+    )
+    assert volume == expected
+    assert volume <= qty * volume_per_qty * (1 + 1e-9)
+    # Risk at the stop (loss per volume unit * volume) stays within budget.
+    loss_per_unit = 10.0 / (qty * volume_per_qty)
+    assert loss_per_unit * volume <= 10.0 + 1e-9
+
+
+def test_ctrader_sub_unit_qty_with_unit_step_is_refused_not_upsized() -> None:
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=None)  # step falls back to 1
+    signal = _ctrader_signal("EURUSD", {"qty": 0.0004})
+
+    with pytest.raises(ValueError):
+        adapter._resolve_order_volume(signal)
+
+
+def test_ctrader_close_all_sends_full_unfloored_position_volume() -> None:
+    from types import SimpleNamespace
+
+    _module, adapter = _make_ctrader_adapter()
+    _load_eurusd_demo_props(adapter, step_volume=100_000)
+    sent: list[tuple[int, int]] = []
+
+    async def _fetch():
+        # 1_234_567 is off the step grid: a close must still send it whole.
+        return [
+            SimpleNamespace(positionId=7, tradeData=SimpleNamespace(volume=1_234_567))
+        ]
+
+    class _Req:
+        pass
+
+    async def _send(request, *, timeout_seconds=15):
+        sent.append((request.positionId, request.volume))
+        return SimpleNamespace()
+
+    adapter._fetch_open_positions = _fetch
+    adapter._ProtoOAClosePositionReq = _Req
+    adapter.ctid_trader_account_id = 1
+    adapter._send_request_with_refresh_retry = _send
+    adapter._raise_if_order_error_event = lambda _r: None
+
+    asyncio.run(adapter.close_all_positions())
+
+    assert sent == [(7, 1_234_567)]
+
+
+# ── Alpaca bracket entries: whole shares and penny-grid SL/TP ─────────────────
+#
+# Reproduced on Alpaca paper (2026-11-13) through daemon.prepare_order_with_risk:
+#   - TP 369.04400000000004 -> HTTP 422 "sub-penny increment does not fulfill
+#     minimum pricing criteria"
+#   - qty 7.0422 (risk-sized) -> HTTP 422 "fractional orders must have
+#     order_class=simple"
+# With qty 7 and SL/TP 347.75 / 369.04 the same bracket was accepted.
+
+
+def _alpaca_bracket_adapter(monkeypatch):
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    adapter._connected = True
+    submitted: list[Any] = []
+    saved: list[LiveSignal] = []
+
+    def _submit_order(*, order_data):
+        submitted.append(order_data)
+        return SimpleNamespace(id=_alpaca_order_id("bracket-1"))
+
+    adapter._trading_client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
+        submit_order=_submit_order,
+    )
+
+    def _save(signal):
+        saved.append(signal)
+        return str(signal.id), True
+
+    monkeypatch.setattr(module, "save_live_signal", _save)
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda sid, oid: True)
+    return adapter, submitted, saved
+
+
+def _alpaca_entry(action: str, price: float, sl: float, tp: float) -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action=action,
+        theoretical_price=price,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"stop_loss": sl, "take_profit": tp},
+    )
+
+
+def test_alpaca_bracket_entry_floors_qty_and_rounds_levels_toward_entry(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 354.85, 347.75300000000004, 369.04400000000004)
+
+    asyncio.run(adapter.submit_order(signal, qty=7.045195857404557))
+
+    request = submitted[0]
+    assert float(request.qty) == 7.0
+    # Buy: the stop rounds UP (toward the entry, less risk than sized), the
+    # target rounds DOWN (never beyond the requested level).
+    assert float(request.stop_loss.stop_price) == 347.76
+    assert float(request.take_profit.limit_price) == 369.04
+    # The persisted signal records exactly what was submitted.
+    assert saved[0].metadata["qty"] == 7.0
+    assert saved[0].metadata["explicit_qty"] == 7.0
+    assert saved[0].metadata["stop_loss"] == 347.76
+    assert saved[0].metadata["take_profit"] == 369.04
+
+
+def test_alpaca_short_bracket_entry_rounds_levels_toward_entry(monkeypatch):
+    adapter, submitted, _saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("sell", 100.0, 102.0049, 95.0051)
+
+    asyncio.run(adapter.submit_order(signal, qty=3.9))
+
+    request = submitted[0]
+    assert float(request.qty) == 3.0
+    assert float(request.stop_loss.stop_price) == 102.0
+    assert float(request.take_profit.limit_price) == 95.01
+
+
+def test_alpaca_sub_dollar_bracket_uses_four_decimal_tick(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 0.5, 0.480012345, 0.540098765)
+
+    asyncio.run(adapter.submit_order(signal, qty=1000.4))
+
+    request = submitted[0]
+    assert saved[0].metadata["explicit_qty"] == 1000.0
+    assert float(request.stop_loss.stop_price) == 0.4801
+    assert float(request.take_profit.limit_price) == 0.5400
+
+
+def test_alpaca_bracket_entry_below_one_share_is_refused_before_persistence(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 354.85, 347.75, 369.04)
+
+    submission = adapter.submit_order(signal, qty=0.7)
+    with pytest.raises(ValueError, match="below one whole share"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_bracket_level_within_one_tick_of_entry_is_refused(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 99.996, 110.0)
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="within one tick"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_whole_share_on_grid_entry_is_unchanged(monkeypatch):
+    adapter, submitted, _saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 354.85, 347.75, 369.04)
+
+    asyncio.run(adapter.submit_order(signal, qty=7.0))
+
+    request = submitted[0]
+    assert float(request.qty) == 7.0
+    assert float(request.stop_loss.stop_price) == 347.75
+    assert float(request.take_profit.limit_price) == 369.04
+
+
+@pytest.mark.parametrize(
+    ("action", "stop", "take"),
+    [
+        ("buy", 98.0, 95.0),  # take profit below a buy's entry
+        ("buy", 101.0, 110.0),  # stop above a buy's entry
+        ("sell", 102.0, 105.0),  # take profit above a sell's entry
+        ("sell", 99.0, 95.0),  # stop below a sell's entry
+        ("buy", 98.0, 100.0),  # take profit exactly at the entry
+    ],
+)
+def test_alpaca_bracket_level_on_wrong_side_is_refused_before_persistence(
+    monkeypatch, action, stop, take
+):
+    # A wrong-side leg is an instantly marketable order (or a broker 422 after the
+    # signal row was saved, which wedges redelivery); refuse it before either.
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry(action, 100.0, stop, take)
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="wrong side of the entry"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"take_profit": 110.0},  # missing stop
+        {"stop_loss": 95.0},  # missing take profit
+        {"stop_loss": float("nan"), "take_profit": 110.0},
+        {"stop_loss": 95.0, "take_profit": float("inf")},
+        {"stop_loss": -1.0, "take_profit": 110.0},
+    ],
+)
+def test_alpaca_missing_or_invalid_sl_tp_is_refused_before_persistence(monkeypatch, metadata):
+    # Refusing after save_live_signal would wedge redelivery (B-8).
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.0, 110.0).model_copy(update={"metadata": metadata})
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_extended_hours_bracket_is_refused_before_persistence(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.0, 110.0)
+    signal = signal.model_copy(update={"metadata": {**signal.metadata, "extended_hours": True}})
+
+    submission = adapter.submit_order(signal, qty=5.0)
+    with pytest.raises(ValueError, match="Extended-hours"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETHUSD", "BTC-USD", "ETH-USDT"])
+def test_alpaca_crypto_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
+    # Alpaca crypto has no bracket/OTO orders; refuse instead of a post-persist 422.
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 3000.0, 2900.0, 3200.0).model_copy(update={"symbol": symbol})
+
+    submission = adapter.submit_order(signal, qty=11.4)
+    with pytest.raises(ValueError, match="crypto"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+@pytest.mark.parametrize("symbol", ["BTC-EUR", "BTC-GBP", "AAPL261120C00200000", "AAPL!"])
+def test_alpaca_unclassifiable_bracket_entry_is_refused_before_persistence(monkeypatch, symbol):
+    # Fail closed: only a provable US equity may reach a BRACKET submit. A non-CRYPTO_QUOTES
+    # hyphen pair (BTC-EUR) or an option must not persist and then 422 at the broker (B-8).
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 3000.0, 2900.0, 3200.0).model_copy(update={"symbol": symbol})
+
+    submission = adapter.submit_order(signal, qty=11.4)
+    with pytest.raises(ValueError, match="US equity"):
+        asyncio.run(submission)
+
+    assert submitted == []
+    assert saved == []
+
+
+def test_alpaca_unbounded_tp_entry_rounds_stop_and_submits_stop_only_oto(monkeypatch):
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+    signal = _alpaca_entry("buy", 100.0, 95.003, 110.0).model_copy(
+        update={
+            "metadata": {
+                "stop_loss": 95.003,
+                "take_profit_policy": "unbounded_exit_on_opposite_signal",
+            }
+        }
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=2.7))
+
+    request = submitted[0]
+    assert str(getattr(request.order_class, "value", request.order_class)).lower() == "oto"
+    assert float(request.qty) == 2.0
+    assert float(request.stop_loss.stop_price) == 95.01
+    assert getattr(request, "take_profit", None) is None
+    assert saved[0].metadata["stop_loss"] == 95.01
+    assert saved[0].metadata["explicit_qty"] == 2.0
+    assert "take_profit" not in saved[0].metadata
+
+
+def test_alpaca_exit_only_entry_passes_through_normalization_unchanged(monkeypatch):
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    adapter, submitted, saved = _alpaca_bracket_adapter(monkeypatch)
+
+    async def _positions():
+        return [{"symbol": "AAPL", "qty": "10"}]
+
+    monkeypatch.setattr(adapter, "get_positions", _positions)
+    signal = _alpaca_entry("sell", 100.0, 95.0, 110.0).model_copy(
+        update={"metadata": {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}}
+    )
+
+    asyncio.run(adapter.submit_order(signal, qty=3.9))
+
+    request = submitted[0]
+    assert float(request.qty) == 3.9
+    assert getattr(request, "stop_loss", None) is None
+    assert saved[0].metadata == {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}

@@ -11,21 +11,31 @@ import yaml
 from live_runner.account_routing import validate_live_account_routes
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
+from shared.trailing import validate_live_deployment_trailing_override
+
+
+def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
+    configured = (deployment.signal_config or {}).get("timeframe")
+    return str(configured or deployment.timeframe or "").strip()
+
 
 logger = get_logger("live-runner")
 
 _UNEXPANDED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+# One reference: ``${NAME}`` or ``$NAME``. Group 1 or group 2 holds the name.
+# ``[A-Za-z0-9_]`` rather than ``\w``: ``\w`` also matches Unicode letters, which
+# are not valid environment variable names here.
+_ENV_REFERENCE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _expand_env_value(value: str, env: Mapping[str, str]) -> str:
     """Expand ``$VAR``/``${VAR}`` in *value* using *env* (no silent mute)."""
-    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
     def _replace(match: re.Match[str]) -> str:
         key = match.group(1) or match.group(2)
         return str(env.get(key, match.group(0)))
 
-    return pattern.sub(_replace, value)
+    return _ENV_REFERENCE_PATTERN.sub(_replace, value)
 
 
 def expand_env_mapping(payload: Any, env: Mapping[str, str] | None = None) -> Any:
@@ -106,8 +116,17 @@ def parse_live_deployments_config(
     deployments = [LiveDeploymentConfig.model_validate(item) for item in raw_deployments]
     validate_live_account_routes(accounts)
 
-    account_ids = {account.id for account in accounts}
+    account_brokers = {account.id: account.broker for account in accounts}
+    account_ids = set(account_brokers)
     for deployment in deployments:
+        # #150/#167 fail closed: live trailing support is per broker. An
+        # unknown account has no broker, which supports mode "none" only.
+        validate_live_deployment_trailing_override(
+            deployment.signal_config,
+            context=f"live deployment '{deployment.strategy_name}'",
+            broker=account_brokers.get(deployment.account_id),
+            timeframe=_signal_timeframe(deployment),
+        )
         if deployment.account_id not in account_ids:
             logger.warning(
                 "Live deployment references unknown account_id",

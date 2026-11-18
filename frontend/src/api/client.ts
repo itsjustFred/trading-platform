@@ -50,8 +50,14 @@ import type {
   TradeChartResponse,
   BacktestInfo,
   BacktestCapmResponse,
+  BulkDeleteConfirmRequest,
+  BulkDeleteDryRunRequest,
+  BacktestsDeduplicateConfirmResponse,
+  BacktestsDeduplicateDryRunResponse,
   BacktestsDeduplicateResponse,
   BacktestsBulkDeleteResponse,
+  BacktestsRemoveEmptyConfirmResponse,
+  BacktestsRemoveEmptyDryRunResponse,
   BacktestsRemoveEmptyResponse,
   BacktestsCompareResponse,
   BacktestMatrixSummary,
@@ -62,7 +68,11 @@ import type {
   PortfolioSummary,
   PortfoliosQueryParams,
   PortfoliosDuplicatesResponse,
+  PortfoliosDeduplicateConfirmResponse,
+  PortfoliosDeduplicateDryRunResponse,
   PortfoliosDeduplicateResponse,
+  PortfoliosRemoveEmptyConfirmResponse,
+  PortfoliosRemoveEmptyDryRunResponse,
   PortfoliosRemoveEmptyResponse,
   BacktestsDuplicatesResponse,
   BacktestMetadataItem,
@@ -316,14 +326,38 @@ export const getMatrixGrid = (strategyId = "all", tradesLimit = 3) =>
   fetchJSON<MatrixGridOverview>(
     `/grid/${encodeURIComponent(strategyId)}?trades_limit=${Math.max(0, Math.min(20, Math.trunc(tradesLimit)))}`,
   );
-export const deduplicateBacktests = () =>
-  fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
+// Two-phase bulk delete: a dry run returns the exact candidate list and
+// deletes nothing; the confirm call deletes only the ids it is given.
+export function deduplicateBacktests(
+  payload: BulkDeleteDryRunRequest,
+): Promise<BacktestsDeduplicateDryRunResponse>;
+export function deduplicateBacktests(
+  payload: BulkDeleteConfirmRequest,
+): Promise<BacktestsDeduplicateConfirmResponse>;
+export function deduplicateBacktests(
+  payload: BulkDeleteDryRunRequest | BulkDeleteConfirmRequest,
+): Promise<BacktestsDeduplicateResponse> {
+  return fetchJSON<BacktestsDeduplicateResponse>("/backtests/deduplicate", {
     method: "POST",
+    body: JSON.stringify(payload),
   });
-export const removeEmptyBacktests = () =>
-  fetchJSON<BacktestsRemoveEmptyResponse>("/backtests/remove-empty", {
+}
+// Two-phase bulk delete: a dry run returns the exact candidate list and
+// deletes nothing; the confirm call deletes only the ids it is given.
+export function removeEmptyBacktests(
+  payload: BulkDeleteDryRunRequest,
+): Promise<BacktestsRemoveEmptyDryRunResponse>;
+export function removeEmptyBacktests(
+  payload: BulkDeleteConfirmRequest,
+): Promise<BacktestsRemoveEmptyConfirmResponse>;
+export function removeEmptyBacktests(
+  payload: BulkDeleteDryRunRequest | BulkDeleteConfirmRequest,
+): Promise<BacktestsRemoveEmptyResponse> {
+  return fetchJSON<BacktestsRemoveEmptyResponse>("/backtests/remove-empty", {
     method: "POST",
+    body: JSON.stringify(payload),
   });
+}
 export const deleteBacktest = (id: string) =>
   fetchJSON<{ id: string; status: string }>(
     `/backtests/${encodeURIComponent(id)}`,
@@ -600,14 +634,38 @@ export const deletePortfoliosBulk = (ids: string[]) =>
   });
 export const getPortfolioDuplicates = () =>
   fetchJSON<PortfoliosDuplicatesResponse>("/portfolios/duplicates");
-export const deduplicatePortfolios = () =>
-  fetchJSON<PortfoliosDeduplicateResponse>("/portfolios/deduplicate", {
+// Two-phase bulk delete: a dry run returns the exact candidate list and
+// deletes nothing; the confirm call deletes only the ids it is given.
+export function deduplicatePortfolios(
+  payload: BulkDeleteDryRunRequest,
+): Promise<PortfoliosDeduplicateDryRunResponse>;
+export function deduplicatePortfolios(
+  payload: BulkDeleteConfirmRequest,
+): Promise<PortfoliosDeduplicateConfirmResponse>;
+export function deduplicatePortfolios(
+  payload: BulkDeleteDryRunRequest | BulkDeleteConfirmRequest,
+): Promise<PortfoliosDeduplicateResponse> {
+  return fetchJSON<PortfoliosDeduplicateResponse>("/portfolios/deduplicate", {
     method: "POST",
+    body: JSON.stringify(payload),
   });
-export const removeEmptyPortfolios = () =>
-  fetchJSON<PortfoliosRemoveEmptyResponse>("/portfolios/remove-empty", {
+}
+// Two-phase bulk delete: a dry run returns the exact candidate list and
+// deletes nothing; the confirm call deletes only the ids it is given.
+export function removeEmptyPortfolios(
+  payload: BulkDeleteDryRunRequest,
+): Promise<PortfoliosRemoveEmptyDryRunResponse>;
+export function removeEmptyPortfolios(
+  payload: BulkDeleteConfirmRequest,
+): Promise<PortfoliosRemoveEmptyConfirmResponse>;
+export function removeEmptyPortfolios(
+  payload: BulkDeleteDryRunRequest | BulkDeleteConfirmRequest,
+): Promise<PortfoliosRemoveEmptyResponse> {
+  return fetchJSON<PortfoliosRemoveEmptyResponse>("/portfolios/remove-empty", {
     method: "POST",
+    body: JSON.stringify(payload),
   });
+}
 export const comparePortfolios = (ids: string[]) =>
   fetchJSON<{ portfolios: PortfolioDetail[] }>(
     `/portfolios/compare?ids=${ids.join(",")}`,

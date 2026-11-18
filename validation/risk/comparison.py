@@ -18,7 +18,7 @@ from validation.comparison.delta_report import (
     TradeDeltaReport,
 )
 from validation.comparison.matcher import MatchResult, TradeMatcher
-from validation.comparison.tolerances import finite_tolerance
+from validation.comparison.tolerances import abs_pct_diff, finite_tolerance
 from validation.reference import ValidationReference
 from validation.risk.adapter import RiskAdapter
 from validation.risk.fixed_risk import FixedRiskConfig
@@ -29,11 +29,12 @@ logger = logging.getLogger(__name__)
 
 
 def _pct_diff(a: float, b: float) -> float:
-    """Relative difference using the larger magnitude as the risk baseline."""
-    denom = max(abs(a), abs(b))
-    if denom == 0.0:
-        return 0.0 if a == b else 1.0
-    return abs(a - b) / denom
+    """Relative difference against the expected (reference) value (#128).
+
+    The old ``max(|a|, |b|)`` denominator halved real drift (100 -> 200 read
+    as 50%, not 100%). Shares one rule with the readiness validator.
+    """
+    return abs_pct_diff(a, b)
 
 
 def _abs_diff(a: float, b: float) -> float:

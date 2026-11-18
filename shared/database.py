@@ -35,9 +35,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
+from shared.alpaca_symbols import classify_alpaca_symbol
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
+from shared.constants import normalize_symbols
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
+    PRICE_DERIVED,
+    PRICE_DERIVED_UNAVAILABLE,
+    STORED_ROW_CONTEXT,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -53,6 +59,7 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    execution_price_is_usable,
     resolve_defined_stat,
 )
 from shared.models import (
@@ -64,6 +71,14 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
+from shared.trailing import validate_live_deployment_trailing_override
+
+
+def _deployment_trailing_timeframe(deployment: Any) -> str:
+    """The timeframe a deployment signals on (signal_config override, else its own)."""
+    configured = (deployment.signal_config or {}).get("timeframe")
+    return str(configured or deployment.timeframe or "").strip()
+
 
 logger = get_logger("database")
 
@@ -605,6 +620,16 @@ class LiveSignalModel(SQLModel, table=True):
         discord_msg_id = _normalize_optional_id(signal.metadata.get("discord_message_id"))
         broker_order_id = _normalize_optional_id(signal.metadata.get("broker_order_id")) or ""
         idempotency_key = _normalize_optional_id(signal.metadata.get("idempotency_key"))
+        metadata = dict(signal.metadata)
+        if BROKER_ORDER_CONFLICTS_KEY in metadata:
+            # The conflict ledger is the only writer of this key; a producer must not be able
+            # to pre-seed or forge the list of untracked broker orders.
+            logger.warning(
+                "Dropping producer-supplied %s from live signal metadata (signal_id=%s)",
+                BROKER_ORDER_CONFLICTS_KEY,
+                signal.id,
+            )
+            del metadata[BROKER_ORDER_CONFLICTS_KEY]
 
         return cls(
             id=str(signal.id),
@@ -621,7 +646,7 @@ class LiveSignalModel(SQLModel, table=True):
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
             idempotency_key=idempotency_key,
-            metadata_json=signal.metadata,
+            metadata_json=metadata,
         )
 
     def to_live_signal(self) -> LiveSignal:
@@ -651,7 +676,10 @@ class LiveExecutionModel(SQLModel, table=True):
     signal_id: str = Field(foreign_key="live_signals.id", index=True)
     actual_price: float = Field(default=0.0)
     filled_qty: float = Field(default=0.0)
-    commission: float = Field(default=0.0)
+    # NULL is "fee not known yet" and 0.0 a known zero (#124). Nullable with no default, for the
+    # same reason as `actual_price_observed`: a default would fabricate a fee nobody stated.
+    # `_make_live_executions_commission_nullable` relaxes the NOT NULL a legacy table carries.
+    commission: float | None = Field(default=None, nullable=True)
     timestamp: datetime = Field(index=True)
     broker_order_id: str = Field(index=True)
     dedupe_key: str | None = Field(
@@ -662,7 +690,8 @@ class LiveExecutionModel(SQLModel, table=True):
     # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
     # invite reading it as one. Adapters with no such id leave it NULL.
     broker_fill_id: int | None = Field(default=None, nullable=True)
-    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad` or `absent`.
+    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad`,
+    # `absent`, or - for a reconcile remainder - `derived` / `derived_unavailable`.
     # Nullable and with no database default: a row written before this column existed has no
     # verdict, and "no verdict" must not be fabricated into "observed".
     actual_price_observed: str | None = Field(default=None, nullable=True)
@@ -913,11 +942,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             source_type = "discord"
         source_name = source_name if source_name in {"internal", "discord"} else source_type
         source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = [
-            str(symbol).strip().upper()
-            for symbol in (deployment.symbol_filter or [])
-            if str(symbol).strip()
-        ]
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         return cls(
             id=str(deployment.id),
             strategy_name=deployment.strategy_name,
@@ -942,24 +967,30 @@ class LiveDeploymentModel(SQLModel, table=True):
     def to_live_deployment(self) -> LiveDeploymentConfig:
         source_type = str(self.signal_source_type or self.signal_source or "internal").lower()
         source_name = str(self.signal_source or source_type or "internal").lower()
-        return LiveDeploymentConfig(
-            id=self.id,
-            strategy_name=self.strategy_name,
-            account_id=self.account_id,
-            symbols=self.symbols_json or [],
-            timeframe=self.timeframe,
-            status=self.status,
-            stopped_enforced_at=self.stopped_enforced_at,
-            signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
-            signal_source_id=str(self.signal_source_id or "").strip() or None,
-            symbol_filter=[
-                str(symbol).strip().upper()
-                for symbol in (self.symbol_filter_json or [])
-                if str(symbol).strip()
-            ],
-            signal_source=source_name if source_name in {"internal", "discord"} else "internal",
-            signal_config=self.signal_config_json or {},
-            settings=self.settings_json or {},
+        # Rehydrating a stored row must not raise on the write-path trailing
+        # check: one bad row would otherwise break every deployment listing.
+        # See STORED_ROW_CONTEXT in shared/models.py.
+        return LiveDeploymentConfig.model_validate(
+            {
+                "id": self.id,
+                "strategy_name": self.strategy_name,
+                "account_id": self.account_id,
+                "symbols": self.symbols_json or [],
+                "timeframe": self.timeframe,
+                "status": self.status,
+                "stopped_enforced_at": self.stopped_enforced_at,
+                "signal_source_type": (
+                    source_type if source_type in {"internal", "discord"} else "internal"
+                ),
+                "signal_source_id": str(self.signal_source_id or "").strip() or None,
+                "symbol_filter": normalize_symbols(self.symbol_filter_json),
+                "signal_source": (
+                    source_name if source_name in {"internal", "discord"} else "internal"
+                ),
+                "signal_config": self.signal_config_json or {},
+                "settings": self.settings_json or {},
+            },
+            context={STORED_ROW_CONTEXT: True},
         )
 
 
@@ -1795,6 +1826,197 @@ def _add_live_executions_actual_price_observed(connection: Connection) -> None:
         )
 
 
+_COMMISSION_NOT_NULL_RE = re.compile(
+    r"((?:\"commission\"|`commission`|\[commission\]|\bcommission\b)\s+[A-Za-z]+(?:\s*\([^)]*\))?)"
+    r"\s+NOT\s+NULL",
+    flags=re.IGNORECASE,
+)
+
+
+def _make_live_executions_commission_nullable(connection: Connection) -> bool:
+    """Relax ``live_executions.commission`` to nullable and un-fake the Alpaca crypto zeros (#124).
+
+    An unknown fee is NULL and ``0.0`` is reserved for a known zero. SQLite cannot drop a NOT NULL
+    constraint in place, so the table is rebuilt the same way `_migrate_live_signal_deployment_fk`
+    rebuilds `live_signals`: capture the index DDL before anything is dropped, reuse the table's own
+    CREATE text with only the constraint removed (a column-list rebuild loses the PRIMARY KEY and
+    the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
+
+    The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
+    NULL on every Alpaca row whose zero is not a provable known zero: crypto in any accepted
+    spelling (``BTC/USD``, ``BTC-USD``, ``BTCUSD``), an orphan whose signal, deployment or account
+    row is missing (its broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
+    (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
+    ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
+    stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
+    ``CFEE`` from `AlpacaLiveAdapter.backfill_commissions`; older ones stay NULL, which readers
+    report as "net PnL incomplete" - the truth, where ``0.0`` overstated it.
+
+    Returns True when the rebuild ran. No-ops when the column is already nullable or missing.
+    """
+    columns = connection.execute(text("PRAGMA table_info('live_executions')")).fetchall()
+    commission = next((row for row in columns if str(row[1]) == "commission"), None)
+    if commission is None or not int(commission[3]):
+        return False
+
+    index_ddl = [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_executions' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+    ]
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_executions'")
+    ).scalar_one_or_none()
+    if not create_sql:
+        raise RuntimeError("Cannot rebuild live_executions: table definition is missing")
+
+    new_create_sql, relaxed = _COMMISSION_NOT_NULL_RE.subn(r"\1", str(create_sql), count=2)
+    if relaxed != 1:
+        raise RuntimeError(
+            "Cannot safely rebuild live_executions: expected exactly one NOT NULL on commission"
+        )
+    new_create_sql, renamed = re.subn(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\"live_executions\"|`live_executions`|\[live_executions\]|live_executions)",
+        "CREATE TABLE live_executions__commission_new",
+        new_create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if renamed != 1:
+        raise RuntimeError(
+            "Cannot rebuild live_executions: could not address the table in its own CREATE "
+            "statement"
+        )
+
+    column_list = ", ".join(
+        connection.dialect.identifier_preparer.quote(str(row[1])) for row in columns
+    )
+    foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
+    legacy_alter_table_before = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("PRAGMA legacy_alter_table=ON"))
+        connection.execute(text("DROP TABLE IF EXISTS live_executions__commission_new"))
+        connection.execute(text(new_create_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_executions__commission_new ({column_list}) "
+                f"SELECT {column_list} FROM live_executions"
+            )
+        )
+        connection.execute(text("DROP TABLE live_executions"))
+        connection.execute(
+            text("ALTER TABLE live_executions__commission_new RENAME TO live_executions")
+        )
+    finally:
+        connection.execute(text(f"PRAGMA legacy_alter_table={legacy_alter_table_before}"))
+        connection.execute(text(f"PRAGMA foreign_keys={foreign_keys_before}"))
+    for statement in index_ddl:
+        connection.execute(text(statement))
+
+    alpaca_zero_rows = connection.execute(
+        text(
+            "SELECT e.id, s.symbol FROM live_executions e"
+            " LEFT JOIN live_signals s ON s.id = e.signal_id"
+            " LEFT JOIN live_deployments d ON d.id = s.deployment_id"
+            " LEFT JOIN live_accounts a ON a.id = d.account_id"
+            # An orphan (signal/deployment/account row missing) has an undeterminable broker; the
+            # zero is only kept when it is provably an equity, so it joins the Alpaca rows.
+            " WHERE (a.broker IS NULL OR lower(a.broker) = 'alpaca') AND e.commission = 0.0"
+        )
+    ).fetchall()
+    # Classified from the symbol's data, not from a slash (`BTCUSD` is crypto too). Only a provable
+    # equity keeps its zero; crypto and anything undeterminable fail closed to unknown.
+    unfaked_ids = [
+        str(execution_id)
+        for execution_id, symbol in alpaca_zero_rows
+        if classify_alpaca_symbol(symbol) != "us_equity"
+    ]
+    for execution_id in unfaked_ids:
+        connection.execute(
+            text("UPDATE live_executions SET commission = NULL WHERE id = :id"),
+            {"id": execution_id},
+        )
+    unfaked = len(unfaked_ids)
+    logger.info(
+        "Rebuilt live_executions with a nullable commission; %s non-equity Alpaca fill(s) had a "
+        "hard-coded 0.0 commission and are now NULL (unknown), crypto until its CFEE is "
+        "backfilled",
+        unfaked,
+    )
+    return True
+
+
+_CTRADER_COMMISSION_COST_MIGRATION = "ctrader_commission_positive_cost_v1"
+
+
+def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
+    """Convert existing cTrader ``live_executions.commission`` rows to a positive cost (#205).
+
+    Before the sign fix, cTrader rows stored ``ProtoOADeal.commission`` raw: a charge is a NEGATIVE
+    cash flow. The convention is now a positive cost for every broker (net = gross - commission), so
+    each cTrader row becomes ``abs`` of its stored value (maintainer decision 2026-11-16). Only
+    accounts whose broker is ``ctrader`` are touched, NULL (unknown) and zero stay as they are, and
+    a row whose broker cannot be determined (orphan) is left alone.
+
+    ``abs`` is not safe to repeat blindly once the fixed adapter runs: a rebate is stored as a
+    NEGATIVE cost and a second pass would turn it into a charge. So the conversion is recorded in
+    ``schema_data_migrations`` and runs exactly once; ``init_db`` runs on every process start.
+
+    Returns True when the conversion ran. No-ops when it is already recorded.
+    """
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS schema_data_migrations ("
+            "name TEXT NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+    )
+    already_applied = connection.execute(
+        text("SELECT 1 FROM schema_data_migrations WHERE name = :name"),
+        {"name": _CTRADER_COMMISSION_COST_MIGRATION},
+    ).first()
+    if already_applied is not None:
+        return False
+
+    converted = 0
+    # Recorded even when the table is absent: a table created later only ever holds rows from the
+    # fixed adapter, and a converting re-run would turn their rebates into charges.
+    if _table_column_names(connection, "live_executions"):
+        converted = int(
+            connection.execute(
+                text(
+                    "UPDATE live_executions SET commission = abs(commission) "
+                    "WHERE commission < 0 AND signal_id IN ("
+                    "SELECT s.id FROM live_signals s "
+                    "JOIN live_deployments d ON d.id = s.deployment_id "
+                    "JOIN live_accounts a ON a.id = d.account_id "
+                    "WHERE lower(a.broker) = 'ctrader')"
+                )
+            ).rowcount
+            or 0
+        )
+    connection.execute(
+        text("INSERT INTO schema_data_migrations (name, applied_at) VALUES (:name, :now)"),
+        {
+            "name": _CTRADER_COMMISSION_COST_MIGRATION,
+            "now": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info(
+        "Converted %s cTrader live_executions commission(s) from the raw broker sign to a "
+        "positive cost",
+        converted,
+    )
+    return True
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -2210,6 +2432,11 @@ def _migrate_schema() -> None:
         _migrate_live_executions_dedupe_key(connection)
         _add_live_executions_broker_fill_id(connection)
         _add_live_executions_actual_price_observed(connection)
+        # Last: the rebuild copies every column, so the additive ones must already exist.
+        _make_live_executions_commission_nullable(connection)
+        # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
+        # sign the rows hold, so the order is not load-bearing.
+        _migrate_ctrader_commission_to_cost(connection)
 
 
 def _find_existing_live_signal(
@@ -2236,14 +2463,56 @@ def _find_existing_live_signal_by_idempotency_key(
     ).first()
 
 
+# metadata_json key holding broker order ids that conflicted with a signal's tracked id.
+# Reserved for the conflict ledger: producer-supplied values under this key are dropped.
+BROKER_ORDER_CONFLICTS_KEY = "conflicting_broker_order_ids"
+
+
+def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
+    """Return the recorded conflicting ids, tolerating any malformed stored shape."""
+    raw = metadata.get(BROKER_ORDER_CONFLICTS_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning(
+            "Ignoring malformed %s on live signal metadata (type=%s)",
+            BROKER_ORDER_CONFLICTS_KEY,
+            type(raw).__name__,
+        )
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
+    """Log the one duplicate shape that needs no ledger change (shared by both skip paths)."""
+    logger.info(
+        "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
+    )
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
-    """Backfill broker_order_id onto an existing duplicate signal."""
-    # Reconcile broker_order_id: if existing lacks it but new record has it, update
+    """Reconcile a duplicate delivery onto the stored signal and commit.
+
+    Backfills ``broker_order_id`` when the stored row lacks one, and records a different
+    broker order id carried by the duplicate in the conflict list
+    (``conflicting_broker_order_ids``) instead of replacing the tracked id.
+    """
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
-    if new_broker_id and not existing_broker_id:
+    if not new_broker_id or new_broker_id == existing_broker_id:
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # Either a backfill (the stored row has no id) or a conflict (it has a different one). Both
+    # are read-modify-writes on state this session may have loaded before a concurrent duplicate
+    # committed, so take the write lock and re-read before deciding. Without it two redeliveries
+    # with different ids on an empty tracked id would both backfill from a stale empty copy and
+    # the loser's id would land nowhere: a live broker order the ledger never tracks.
+    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    session.refresh(existing)
+    existing_broker_id = (existing.broker_order_id or "").strip()
+    if not existing_broker_id:
         existing.broker_order_id = new_broker_id
         # Also update metadata_json for consistency
         metadata = dict(existing.metadata_json or {})
@@ -2255,16 +2524,33 @@ def _reconcile_existing_live_signal(
             "Updated existing live signal with broker_order_id (discord_message_id=%s)",
             record.discord_message_id,
         )
-    elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
-        logger.warning(
-            "Conflicting broker_order_id for duplicate live signal (signal_id=%s)",
-            existing.id,
-        )
         return
-    else:
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
-        )
+    if new_broker_id == existing_broker_id:
+        # A concurrent duplicate already stored this very id; ends the lock taken above.
+        session.commit()
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # A second, different broker order id for one logical signal: either a second broker
+    # order was placed or the ids were mapped wrongly. Either way a broker order may exist
+    # that the ledger does not track. The stored id is kept (never overwritten), but the
+    # conflicting id is persisted on the signal so operators and reconciliation can find
+    # and resolve it instead of it living only in a log line (issue #126).
+    metadata = dict(existing.metadata_json or {})
+    conflicts = _conflicting_broker_order_ids(metadata)
+    if new_broker_id not in conflicts:
+        conflicts.append(new_broker_id)
+        metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
+        existing.metadata_json = metadata
+        session.add(existing)
+    # Ends the write transaction opened above; a no-op commit when nothing changed.
+    session.commit()
+    logger.error(
+        "Conflicting broker_order_id for duplicate live signal: an untracked broker "
+        "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
+        existing.id,
+        existing_broker_id,
+        new_broker_id,
+    )
 
 
 def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
@@ -2291,7 +2577,30 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             existing = _find_existing_live_signal_by_idempotency_key(
                 session, deployment_id, record.idempotency_key
             )
+            legacy_key = _normalize_optional_id(
+                (record.metadata_json or {}).get("legacy_idempotency_key")
+            )
+            if existing is None and legacy_key and legacy_key != record.idempotency_key:
+                # #127: rows written before the timestamp canonicalisation carry the key of the
+                # verbatim spelling; a replay across the upgrade must still dedupe against them.
+                existing = _find_existing_live_signal_by_idempotency_key(
+                    session, deployment_id, legacy_key
+                )
             if existing is not None:
+                # An identical producer event (same key) is treated as a redelivery. A genuine
+                # re-entry byte-identical to an earlier signal cannot be told apart, and
+                # trading it again on a guess is the worse failure, so it is swallowed - but
+                # never silently: an operator can see which key swallowed which signal.
+                logger.warning(
+                    "Skipping duplicate live signal: idempotency_key=%s already persisted as "
+                    "signal %s (deployment_id=%s, symbol=%s, action=%s); a genuine re-entry "
+                    "with identical producer fields is indistinguishable from a redelivery",
+                    record.idempotency_key,
+                    existing.id,
+                    deployment_id,
+                    record.symbol,
+                    record.action,
+                )
                 _reconcile_existing_live_signal(session, existing, record)
                 return str(existing.id), False
         record_id = str(record.id)
@@ -2316,27 +2625,58 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
                 "Skipping concurrent duplicate live signal (discord_message_id=%s)",
                 discord_msg_id,
             )
+            # The loser may carry a broker id the winner lacks or contradicts; record it the
+            # same way as a sequential duplicate instead of dropping it.
+            _reconcile_existing_live_signal(session, existing, record)
             return str(existing.id), False
     return record_id, True
 
 
 def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
-    """Deterministic dedupe key from fill content (C1).
+    """Deterministic dedupe key for a fill whose caller supplied none (C1, #127).
 
-    A redelivered fill carries identical content, so the key is stable
-    across redeliveries (unlike a random UUID, which would never dedupe).
+    In order of preference:
+
+    1. **The broker's own fill id** (``broker_fill_id``), scoped by signal and order. It is
+       unique per fill by construction, so two genuine partial fills with equal price, quantity
+       and timestamp stay two fills, and a redelivery stays one whatever timestamp precision or
+       zone it arrives with.
+    2. **Fill content**: signal, price, quantity, canonical UTC timestamp and order. A redelivery
+       carries identical content, so the key is stable. The timestamp goes through
+       :func:`shared.fill_keys.canonical_utc_timestamp` - naive/aware/offset spellings of one
+       instant collapse, but precision is never rounded, so fills a microsecond apart differ.
+
+    The content form cannot tell two genuinely distinct fills that agree on every field from one
+    fill delivered twice; only a broker id can. Adapters therefore pass a native key themselves
+    (``ctrader:deal:...``, ``alpaca:exec:...``) and this is the net underneath them.
     """
-    timestamp = execution.timestamp
-    if isinstance(timestamp, datetime):
-        if timestamp.tzinfo:
-            stamp = timestamp.astimezone(timezone.utc).isoformat()
-        else:
-            stamp = timestamp.replace(tzinfo=timezone.utc).isoformat()
-    else:
-        stamp = str(timestamp)
+    fill_id = execution.broker_fill_id
+    if fill_id is not None and int(fill_id) > 0:
+        return f"auto:{execution.signal_id}:fill:{execution.broker_order_id}:{int(fill_id)}"
+    stamp = canonical_utc_timestamp(execution.timestamp)
+    if stamp is None:
+        stamp = str(execution.timestamp)
     return (
         f"auto:{execution.signal_id}:{float(execution.actual_price or 0.0):.8f}:"
         f"{float(execution.filled_qty or 0.0):.8f}:{stamp}:{execution.broker_order_id}"
+    )
+
+
+def _log_dedupe_key_owned_by_other_signal(
+    existing: LiveExecutionModel, incoming_signal_id: str, dedupe_key: str | None
+) -> None:
+    """Shout when a dedupe key already belongs to a different signal (#127, C2).
+
+    The key is unique across the whole table, so a repeat under another signal is not a
+    redelivery of that fill: it is a fill that is about to be dropped (or, worse, merged into
+    someone else's row). Nothing is stored either way; this makes the loss visible.
+    """
+    logger.error(
+        "Dedupe key collision across signals: dedupe_key=%s is already stored for signal %s, "
+        "refusing to treat the fill for signal %s as a redelivery of it; the fill is NOT stored",
+        dedupe_key,
+        existing.signal_id,
+        incoming_signal_id,
     )
 
 
@@ -2352,6 +2692,11 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         .limit(1)
     ).first()
     if existing is not None:
+        if str(existing.signal_id) != str(record.signal_id):
+            _log_dedupe_key_owned_by_other_signal(
+                existing, str(record.signal_id), record.dedupe_key
+            )
+            return False
         logger.info(
             "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
         )
@@ -2371,6 +2716,9 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         ).first()
         if raced is None:
             raise
+        if str(raced.signal_id) != str(record.signal_id):
+            _log_dedupe_key_owned_by_other_signal(raced, str(record.signal_id), record.dedupe_key)
+            return False
         logger.info(
             "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
             record.dedupe_key,
@@ -2397,14 +2745,50 @@ def save_live_execution(execution: LiveExecution) -> bool:
 
 
 def save_live_execution_up_to_cumulative(
-    execution: LiveExecution, broker_cumulative_filled_qty: float
+    execution: LiveExecution,
+    broker_cumulative_filled_qty: float,
+    *,
+    cumulative_avg_price: float | None = None,
 ) -> float:
-    """Atomically persist only the quantity still missing up to a broker cumulative fill."""
+    """Atomically persist only the quantity still missing up to a broker cumulative fill.
+
+    ``cumulative_avg_price`` is for a caller that knows the broker's average over the WHOLE
+    cumulative quantity but not the price of the missing part - Alpaca's ``filled_avg_price`` on a
+    reconciled order (#124). The missing part's price is then derived here, inside the same
+    transaction that reads the local quantity, so a stream fill landing between the caller's read
+    and this write cannot skew it::
+
+        remainder price = (avg * cumulative - sum(local price * qty)) / missing qty
+
+    The derived price is stored as ``derived``. When it cannot be derived honestly - a local leg
+    has no usable price (the formula would silently move that leg's cost onto the remainder), the
+    result is not a finite positive price, or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION``
+    of the average - the QUANTITY is still persisted, at price 0.0 with ``derived_unavailable``
+    (logged): the ledger needs the quantity, and only PnL becomes incomplete. An amendment of an
+    existing key is refused (its stored price would need re-deriving too). Without
+    ``cumulative_avg_price`` the caller's ``actual_price`` and verdict are stored as-is.
+    """
     normalized_signal_id = str(execution.signal_id or "").strip()
     cumulative_qty = float(broker_cumulative_filled_qty or 0.0)
     requested_qty = float(execution.filled_qty or 0.0)
+    if not (math.isfinite(cumulative_qty) and math.isfinite(requested_qty)):
+        # SQLite stores NaN as NULL, so a non-finite quantity can only fail or corrupt the sum.
+        logger.warning(
+            "Refusing to persist live execution for signal %s: non-finite quantity "
+            "(filled_qty=%r, broker cumulative=%r)",
+            normalized_signal_id,
+            execution.filled_qty,
+            broker_cumulative_filled_qty,
+        )
+        return 0.0
     if not normalized_signal_id or cumulative_qty <= 0.0 or requested_qty <= 0.0:
         return 0.0
+    if cumulative_avg_price is not None:
+        cumulative_avg_price = float(cumulative_avg_price)
+        if not (math.isfinite(cumulative_avg_price) and cumulative_avg_price > 0.0):
+            raise ValueError(
+                f"cumulative_avg_price must be finite and positive, got {cumulative_avg_price!r}"
+            )
 
     init_db()
     with get_session() as session:
@@ -2426,6 +2810,23 @@ def save_live_execution_up_to_cumulative(
                 ).one()
                 or 0.0
             )
+            if existing is not None and str(existing.signal_id) != normalized_signal_id:
+                # The key belongs to ANOTHER signal. The amendment below would grow that signal's
+                # row using this signal's cumulative, so it must not run (#127, C2).
+                session.rollback()
+                _log_dedupe_key_owned_by_other_signal(
+                    existing, normalized_signal_id, record.dedupe_key
+                )
+                return 0.0
+            if existing is not None and cumulative_avg_price is not None:
+                session.rollback()
+                logger.warning(
+                    "Refusing to amend live execution %s (dedupe key %s) from a cumulative "
+                    "average price: the stored row's own price would need re-deriving",
+                    existing.id,
+                    existing.dedupe_key,
+                )
+                return 0.0
             if existing is not None:
                 # Same dedupe key. Two very different situations share this branch, and conflating
                 # them loses fills:
@@ -2455,15 +2856,21 @@ def save_live_execution_up_to_cumulative(
                     session.rollback()
                     return 0.0
                 existing.filled_qty = prior_qty + delta
-                if record.commission:
+                if existing.commission is None or record.commission is None:
+                    # A known fee plus an unknown one is unknown (#124): keeping the known part
+                    # would read as the whole fee and overstate net PnL.
+                    existing.commission = None
+                elif record.commission:
                     # Commission was recorded against the first-seen quantity, so only the
                     # incremental slice needs adding. A deal that reports commission per unit is
                     # handled by the caller scaling it, same as the partial-persist path below.
-                    existing.commission = float(existing.commission or 0.0) + float(
+                    existing.commission = float(existing.commission) + float(
                         record.commission
                     ) * (delta / requested_qty)
                 if record.actual_price and not existing.actual_price:
                     existing.actual_price = float(record.actual_price)
+                    # The verdict describes the stored price, so it travels with it.
+                    existing.actual_price_observed = record.actual_price_observed
                 session.add(existing)
                 session.commit()
                 logger.info(
@@ -2476,10 +2883,29 @@ def save_live_execution_up_to_cumulative(
                 )
                 return delta
 
-            persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
+            missing_qty = cumulative_qty - local_filled_qty
+            persisted_qty = min(requested_qty, missing_qty)
             if persisted_qty <= 0.0:
                 session.rollback()
                 return 0.0
+
+            if cumulative_avg_price is not None:
+                remainder_price = _derive_remainder_price(
+                    session,
+                    normalized_signal_id,
+                    cumulative_avg_price=cumulative_avg_price,
+                    cumulative_qty=cumulative_qty,
+                    missing_qty=missing_qty,
+                )
+                # The QUANTITY is recorded either way: exit sizing and duplicate-order protection
+                # read filled quantity, and a fill dropped here would be dropped on every pass,
+                # because the legs that block the price do not change (review of #143).
+                if remainder_price is None:
+                    record.actual_price = 0.0
+                    record.actual_price_observed = PRICE_DERIVED_UNAVAILABLE
+                else:
+                    record.actual_price = remainder_price
+                    record.actual_price_observed = PRICE_DERIVED
 
             record.filled_qty = persisted_qty
             if requested_qty != persisted_qty and record.commission:
@@ -2491,6 +2917,214 @@ def save_live_execution_up_to_cumulative(
         except Exception:
             session.rollback()
             raise
+
+
+#: A derived remainder price must lie within this fraction of the order's own ``filled_avg_price``
+#: (review of #143). The average is a quantity-weighted mean of every fill of the ONE order, and
+#: the orders this platform submits (market and bracket entries) fill within seconds, so a real
+#: fill more than 10% away from its own order's average is implausible. The remainder price is
+#: also an amplifier: any error in a local leg's price or quantity is divided by the (often small)
+#: missing quantity. A result outside the band therefore says a local leg is inconsistent, not that
+#: the market moved - and the cost of a false rejection is bounded: the quantity is still recorded
+#: (`derived_unavailable`), only PnL is reported incomplete.
+REMAINDER_PRICE_MAX_REL_DEVIATION = 0.10
+
+
+def _derive_remainder_price(
+    session: Session,
+    signal_id: str,
+    *,
+    cumulative_avg_price: float,
+    cumulative_qty: float,
+    missing_qty: float,
+) -> float | None:
+    """The price of the quantity a signal is still missing, from the broker's cumulative average.
+
+    ``None`` (logged) when it cannot be derived honestly: a local leg has no usable price (an
+    unusable verdict, or a non-positive or non-finite price - `derived` legs are usable), or the
+    result is not finite and positive, or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION`` of
+    the average. See `save_live_execution_up_to_cumulative`.
+    """
+    legs = session.exec(
+        select(
+            LiveExecutionModel.id,
+            LiveExecutionModel.actual_price,
+            LiveExecutionModel.filled_qty,
+            LiveExecutionModel.actual_price_observed,
+        ).where(LiveExecutionModel.signal_id == signal_id)
+    ).all()
+    local_notional = 0.0
+    for leg_id, price, qty, observed in legs:
+        if not execution_price_is_usable(price, observed):
+            logger.warning(
+                "Reconciled remainder for signal %s gets no price: local execution %s has no "
+                "usable price (actual_price=%r, actual_price_observed=%r), so the remainder price "
+                "cannot be derived from the broker's cumulative average; its quantity is still "
+                "recorded",
+                signal_id,
+                leg_id,
+                price,
+                observed,
+            )
+            return None
+        local_notional += float(price) * float(qty or 0.0)
+    remainder_price = (cumulative_avg_price * cumulative_qty - local_notional) / missing_qty
+    if not (math.isfinite(remainder_price) and remainder_price > 0.0):
+        problem = "is not a finite positive price"
+    elif (
+        abs(remainder_price - cumulative_avg_price)
+        > REMAINDER_PRICE_MAX_REL_DEVIATION * cumulative_avg_price
+    ):
+        problem = (
+            f"is more than {REMAINDER_PRICE_MAX_REL_DEVIATION:.0%} away from the order's own "
+            "average, which says a local leg is inconsistent"
+        )
+    else:
+        return remainder_price
+    logger.warning(
+        "Reconciled remainder for signal %s gets no price: derived remainder price %r %s "
+        "(broker average %r over %r, local notional %r, missing %r); its quantity is still "
+        "recorded",
+        signal_id,
+        remainder_price,
+        problem,
+        cumulative_avg_price,
+        cumulative_qty,
+        local_notional,
+        missing_qty,
+    )
+    return None
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """``value`` as the naive UTC wall time SQLite stores, so bounds compare like with like."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _account_execution_rows_query(account_id: str) -> SelectOfScalar:
+    return (
+        select(LiveExecutionModel, LiveSignalModel)
+        .join(LiveSignalModel, LiveSignalModel.id == LiveExecutionModel.signal_id)
+        .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+        .where(LiveDeploymentModel.account_id == account_id)
+    )
+
+
+def _commission_backfill_row(execution: LiveExecutionModel, signal: LiveSignalModel) -> dict:
+    timestamp = execution.timestamp
+    if timestamp is not None and timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return {
+        "execution_id": str(execution.id),
+        "signal_id": str(execution.signal_id),
+        "deployment_id": str(signal.deployment_id),
+        "symbol": str(signal.symbol or ""),
+        "action": str(signal.action or "").strip().lower(),
+        "actual_price": float(execution.actual_price or 0.0),
+        "filled_qty": float(execution.filled_qty or 0.0),
+        "commission": _optional_commission(execution),
+        "timestamp": timestamp,
+        "broker_order_id": str(execution.broker_order_id or ""),
+    }
+
+
+def list_live_executions_missing_commission(
+    account_id: str, *, since: datetime, until: datetime
+) -> list[dict[str, Any]]:
+    """The account's executions whose commission is still unknown (NULL), in ``[since, until)``.
+
+    Scoped through the signal's deployment to ``account_id``, so it spans every deployment of the
+    account - a broker fee is charged per account, not per deployment (#124).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            _account_execution_rows_query(normalized_account_id)
+            .where(LiveExecutionModel.commission.is_(None))
+            .where(LiveExecutionModel.timestamp >= _naive_utc(since))
+            .where(LiveExecutionModel.timestamp < _naive_utc(until))
+            .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+        ).all()
+    return [_commission_backfill_row(execution, signal) for execution, signal in rows]
+
+
+def list_live_executions_for_broker_orders(
+    account_id: str, broker_order_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Every execution of ``account_id`` recorded against one of ``broker_order_ids``.
+
+    Includes rows whose commission is already known, so a caller can tell a group it may price
+    from one that is partly priced already, and an order this account never recorded from one it
+    did.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    order_ids = sorted({str(item).strip() for item in broker_order_ids if str(item).strip()})
+    if not normalized_account_id or not order_ids:
+        return []
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            _account_execution_rows_query(normalized_account_id)
+            .where(LiveExecutionModel.broker_order_id.in_(order_ids))
+            .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+        ).all()
+    return [_commission_backfill_row(execution, signal) for execution, signal in rows]
+
+
+def apply_live_execution_commissions(account_id: str, commissions: Mapping[str, float]) -> int:
+    """Set the commission of still-unknown executions of one account, all or nothing.
+
+    Every id must belong to ``account_id`` and still have a NULL commission; otherwise nothing is
+    written and 0 is returned (logged). That makes the backfill safe against a concurrent writer and
+    against a stale read: a fee allocated across a group is either applied to the whole group or
+    not at all, and a fee that is already known is never overwritten. Returns the rows updated.
+
+    Raises ValueError on a non-finite or negative commission - a caller bug, not broker data.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    updates: dict[str, float] = {}
+    for execution_id, value in commissions.items():
+        number = float(value)
+        if not (math.isfinite(number) and number >= 0.0):
+            raise ValueError(
+                f"commission for execution {execution_id!r} must be finite and non-negative, "
+                f"got {value!r}"
+            )
+        updates[str(execution_id)] = number
+    if not normalized_account_id or not updates:
+        return 0
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            rows = session.exec(
+                _account_execution_rows_query(normalized_account_id)
+                .where(LiveExecutionModel.id.in_(sorted(updates)))
+                .where(LiveExecutionModel.commission.is_(None))
+            ).all()
+            if len(rows) != len(updates):
+                session.rollback()
+                logger.warning(
+                    "Not applying backfilled commissions for account %s: %s of %s execution(s) "
+                    "are no longer unknown or do not belong to the account",
+                    normalized_account_id,
+                    len(updates) - len(rows),
+                    len(updates),
+                )
+                return 0
+            for execution, _signal in rows:
+                execution.commission = updates[str(execution.id)]
+                session.add(execution)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    return len(updates)
 
 
 def get_live_signal_filled_qty(signal_id: str) -> float:
@@ -2506,6 +3140,230 @@ def get_live_signal_filled_qty(signal_id: str) -> float:
             )
         ).one()
     return float(filled_qty or 0.0)
+
+
+def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
+    """The deployment's own signed net filled quantity for ``symbol`` (#121).
+
+    This is the ledger an exit signal closes against: buy fills count positive,
+    sell fills negative, summed over every signal *this* deployment persisted for
+    the symbol. Another deployment's fills on the same (netted) broker position
+    are not included, so an exit closes only this deployment's share.
+
+    Only fills attributed to one of the deployment's own signals are counted.
+    Fills of broker-side child orders that are not persisted against a signal
+    (for example a bracket's SL/TP leg) are not in the ledger; callers cap the
+    result at the broker position for that reason.
+
+    Fails closed on a stored action other than buy/sell rather than guessing its
+    sign.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for the ledger quantity")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.action)
+        ).all()
+    net = 0.0
+    for action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            net += quantity
+        elif normalized_action == "sell":
+            net -= quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {normalized_deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+    return net
+
+
+def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
+    """Every deployment's signed net filled quantity for ``symbol`` on one account.
+
+    The ledger of each deployment whose ``account_id`` is ``account_id``, whatever
+    its status (a stopped deployment's holdings are still at the broker), as in
+    :func:`get_live_deployment_net_filled_qty`. Deployments without fills for the
+    symbol are absent. An exit compares the sum with the broker position before
+    trusting any one deployment's share of it (#121).
+
+    Fails closed on a stored action other than buy/sell.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for the account ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.deployment_id, LiveSignalModel.action)
+        ).all()
+    ledgers: dict[str, float] = {}
+    for deployment_id, action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            signed = quantity
+        elif normalized_action == "sell":
+            signed = -quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+        key = str(deployment_id)
+        ledgers[key] = ledgers.get(key, 0.0) + signed
+    return ledgers
+
+
+#: A filled quantity this close to the requested one counts as fully filled.
+_EXIT_FILL_TOLERANCE = 1e-9
+
+
+def list_live_deployment_unfilled_exit_orders(
+    deployment_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """This deployment's exit orders for ``symbol`` not known to be fully filled.
+
+    An exit order is a persisted signal whose metadata carries
+    ``risk_sizing_mode == "exit_only"``. It is listed unless its persisted fills
+    reach the quantity it asked for; one without a readable requested quantity
+    is listed too, because it cannot be shown to be done. Whether a listed order
+    is still *working* is the broker's to say - a cancelled or rejected one is
+    listed here as well (#121).
+
+    Each row: ``signal_id``, ``deployment_id``, ``broker_order_id`` (may be
+    empty), ``requested_qty`` (``None`` when unreadable), ``filled_qty`` and
+    ``action`` (``buy``/``sell``, the side the order closes).
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol, deployment_id=normalized_deployment_id
+    )
+
+
+def list_account_unfilled_exit_orders(
+    account_id: str, symbol: str, *, exclude_deployment_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Exit orders for ``symbol`` of every deployment on one account not known to be filled.
+
+    Same rows and meaning as :func:`list_live_deployment_unfilled_exit_orders`,
+    across all deployments whose ``account_id`` is ``account_id`` (whatever their
+    status), optionally leaving out one deployment. Deployments on one account
+    share a netted broker position, so an exit of one is in flight for all of
+    them (#121).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol,
+        account_id=normalized_account_id,
+        exclude_deployment_id=str(exclude_deployment_id or "").strip() or None,
+    )
+
+
+def _list_unfilled_exit_orders(
+    normalized_symbol: str,
+    *,
+    deployment_id: str | None = None,
+    account_id: str | None = None,
+    exclude_deployment_id: str | None = None,
+) -> list[dict[str, Any]]:
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    init_db()
+    with get_session() as session:
+        # Two queries rather than one grouped join: grouping by a JSON column is
+        # not portable across database dialects.
+        signal_query = (
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.action,
+            )
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+        )
+        fill_query = (
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveExecutionModel.signal_id)
+        )
+        if deployment_id is not None:
+            signal_query = signal_query.where(LiveSignalModel.deployment_id == deployment_id)
+            fill_query = fill_query.where(LiveSignalModel.deployment_id == deployment_id)
+        if account_id is not None:
+            signal_query = signal_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+            fill_query = fill_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+        if exclude_deployment_id is not None:
+            signal_query = signal_query.where(
+                LiveSignalModel.deployment_id != exclude_deployment_id
+            )
+            fill_query = fill_query.where(LiveSignalModel.deployment_id != exclude_deployment_id)
+        signals = session.exec(signal_query).all()
+        fills = dict(session.exec(fill_query).all())
+    pending: list[dict[str, Any]] = []
+    for signal_id, signal_deployment_id, broker_order_id, metadata, action in signals:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+            continue
+        filled_qty = float(fills.get(signal_id) or 0.0)
+        requested_qty: float | None
+        try:
+            requested_qty = abs(float(metadata.get("explicit_qty", metadata.get("qty"))))
+        except (TypeError, ValueError):
+            requested_qty = None
+        if requested_qty is not None and not math.isfinite(requested_qty):
+            requested_qty = None
+        if requested_qty is not None and filled_qty >= requested_qty - _EXIT_FILL_TOLERANCE:
+            continue
+        pending.append(
+            {
+                "signal_id": str(signal_id),
+                "deployment_id": str(signal_deployment_id),
+                "broker_order_id": str(broker_order_id or ""),
+                "requested_qty": requested_qty,
+                "filled_qty": filled_qty,
+                "action": str(action or "").strip().lower(),
+            }
+        )
+    return pending
 
 
 def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
@@ -2559,6 +3417,137 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
             return None
         metadata = dict(record.metadata_json or {})
     return metadata
+
+
+#: Page size for the newest-first scan in
+#: :func:`find_latest_filled_live_entry_signals`. The entry signal of an open
+#: position is normally the newest or second-newest filled signal of its symbol.
+_ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
+
+
+def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    return bool(metadata.get("exit_only")) or (
+        str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
+    )
+
+
+def find_latest_filled_live_entry_signals(
+    deployment_ids: list[str],
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Newest filled *entry* signal per symbol among the given deployments.
+
+    This is the persisted half of live trailing-stop state (issue #167): the
+    signal that opened a broker position carries the trailing config
+    (``metadata["trailing_sl_config"]``) the position must be trailed with, so
+    a restarted daemon recovers it from here instead of from process memory.
+
+    - Only signals with at least one persisted fill count: a later signal that
+      was refused or never filled must not displace the one whose position is
+      actually open.
+    - Exit-only signals are skipped: a partial close must not end the trail of
+      the remaining position. Whether a position is still open is the broker's
+      truth and is checked by the caller.
+
+    Returns ``{SYMBOL: {signal_id, deployment_id, symbol, action, timestamp,
+    metadata}}`` (symbol upper-cased, timestamp tz-aware UTC). Symbols without
+    a filled entry signal are absent.
+    """
+    normalized_ids = sorted({str(item).strip() for item in deployment_ids if str(item).strip()})
+    normalized_symbols = sorted(
+        {str(item).strip().upper() for item in symbols if str(item).strip()}
+    )
+    if not normalized_ids or not normalized_symbols:
+        return {}
+
+    init_db()
+    found: dict[str, dict[str, Any]] = {}
+    with get_session() as session:
+        for symbol in normalized_symbols:
+            entry = _newest_filled_entry_signal(session, normalized_ids, symbol)
+            if entry is not None:
+                found[symbol] = entry
+    return found
+
+
+def _newest_filled_entry_signal(
+    session: Any, deployment_ids: list[str], symbol: str
+) -> dict[str, Any] | None:
+    has_fill = (
+        select(LiveExecutionModel.id)
+        .where(LiveExecutionModel.signal_id == LiveSignalModel.id)
+        .where(LiveExecutionModel.filled_qty > 0)
+        .exists()
+    )
+    statement = (
+        select(LiveSignalModel)
+        .where(LiveSignalModel.deployment_id.in_(deployment_ids))
+        .where(func.upper(LiveSignalModel.symbol) == symbol)
+        .where(has_fill)
+        .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+    )
+    offset = 0
+    while True:
+        rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
+        for row in rows:
+            metadata = dict(row.metadata_json or {})
+            if _is_exit_only_signal_metadata(metadata):
+                continue
+            timestamp = row.timestamp
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": symbol,
+                "action": str(row.action or "").strip().lower(),
+                "timestamp": timestamp.astimezone(timezone.utc),
+                "metadata": metadata,
+            }
+        if not rows:
+            return None
+        offset += len(rows)
+
+
+def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
+    """Signals whose duplicate delivery carried a different broker order id.
+
+    Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
+    should be checked against the broker's open orders and positions.
+    """
+    init_db()
+    # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
+    # full table scan; there is no index on the JSON key). The two-argument form of
+    # json_array_length reads the key inside the stored document: it is 0 for any non-array
+    # value (a string, number or object under the key) and NULL when the key is absent, so
+    # only signals holding a non-empty list pass. Unwrapping the value first with
+    # json_extract would hand a stored string to json_array_length as JSON text and raise
+    # "malformed JSON" for the whole query.
+    conflict_count = func.json_array_length(
+        LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
+    )
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveSignalModel)
+            .where(conflict_count > 0)
+            .order_by(LiveSignalModel.timestamp.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+    conflicts: list[dict[str, Any]] = []
+    for row in rows:
+        ids = _conflicting_broker_order_ids(row.metadata_json or {})
+        if not ids:
+            continue
+        conflicts.append(
+            {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": row.symbol,
+                "broker_order_id": row.broker_order_id,
+                "conflicting_broker_order_ids": ids,
+            }
+        )
+    return conflicts
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
@@ -2806,6 +3795,38 @@ def ensure_live_account(
             is_demo=is_demo,
         )
         return current.to_live_account()
+
+
+def register_live_account_if_absent(
+    account_id: str,
+    broker: str,
+    *,
+    name: str = "",
+    ctid: str | None = None,
+    broker_login: str | None = None,
+    is_demo: bool | None = None,
+) -> bool:
+    """Insert the account row only when it does not exist, and never modify an existing one.
+
+    The existence check and the insert share one session, so there is no gap in which another
+    writer can be overwritten: if a row appears before the insert, the insert fails on the primary
+    key and the error propagates, leaving that row exactly as it was. Returns ``True`` when this
+    call created the row.
+    """
+    init_db()
+    with get_session() as session:
+        if session.get(LiveAccountModel, account_id) is not None:
+            return False
+        _create_live_account_record(
+            session,
+            account_id,
+            broker,
+            name=name,
+            ctid=ctid,
+            broker_login=broker_login,
+            is_demo=is_demo,
+        )
+    return True
 
 
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
@@ -3056,18 +4077,14 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
     return signal_source_type, signal_source
 
 
-def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
-    """Uppercase stripped symbol entries, dropping blanks."""
-    return [
-        str(symbol).strip().upper()
-        for symbol in (symbols or [])
-        if str(symbol).strip()
-    ]
-
-
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from risk.live import entry_gate_settings
 
+    # Entry-gate settings (#125) are refused at creation, not first at
+    # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
+    # otherwise sit in the database until the first signal is rejected.
+    entry_gate_settings(deployment.settings)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
@@ -3097,12 +4114,20 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             account_broker_login=account.broker_login or account.ctid or "",
             accounts_env_values=route_env,
         )
+        # #150/#167 fail closed: live trailing support is per broker, and this
+        # is where the deployment's broker is first known.
+        validate_live_deployment_trailing_override(
+            deployment.signal_config,
+            context=f"live deployment '{deployment.strategy_name}'",
+            broker=account.broker,
+            timeframe=_deployment_trailing_timeframe(deployment),
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
         signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
         record.signal_source = signal_source
@@ -3479,6 +4504,15 @@ def update_live_deployment_account(
                     f"Refusing to re-point at unknown account '{account_id}'"
                 )
 
+            # #150/#167 fail closed: the new account may sit on a broker that
+            # cannot execute the deployment's trailing mode.
+            validate_live_deployment_trailing_override(
+                record.to_live_deployment().signal_config,
+                context=f"live deployment '{record.strategy_name}' re-point",
+                broker=account.broker,
+                timeframe=_deployment_trailing_timeframe(record.to_live_deployment()),
+            )
+
             current_status = str(record.status or "").strip().upper()
             if current_status == "ACTIVE":
                 raise ValueError(
@@ -3823,15 +4857,15 @@ def _live_signal_deployment_execution_fields(
         "execution_timestamp": (
             execution.timestamp if execution is not None else None
         ),
-        "actual_price": (
-            float(execution.actual_price or 0.0) if execution is not None else None
+        "actual_price": _optional_execution_price(execution),
+        "actual_price_observed": (
+            execution.actual_price_observed if execution is not None else None
         ),
         "filled_qty": (
             float(execution.filled_qty or 0.0) if execution is not None else None
         ),
-        "commission": (
-            float(execution.commission or 0.0) if execution is not None else None
-        ),
+        # NULL stays None: an unknown fee is not a zero fee (#124).
+        "commission": _optional_commission(execution),
         "broker_order_id": (
             str(execution.broker_order_id or "") if execution is not None else None
         ),
@@ -4042,13 +5076,34 @@ def _scalar_stats_for_save(
     return resolved
 
 
+def _optional_execution_price(execution: LiveExecutionModel | None) -> float | None:
+    """A row's price, or None when it is not a price (see `execution_price_is_usable`)."""
+    if execution is None or not execution_price_is_usable(
+        execution.actual_price, execution.actual_price_observed
+    ):
+        return None
+    return float(execution.actual_price)
+
+
+def _optional_commission(execution: LiveExecutionModel | None) -> float | None:
+    """A row's commission, keeping NULL ("not known yet", #124) distinct from a known 0.0."""
+    if execution is None or execution.commission is None:
+        return None
+    return float(execution.commission)
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
         theoretical = float(signal.theoretical_price or 0.0)
-        actual = float(execution.actual_price or 0.0)
-        slippage = actual - theoretical
-        slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
+        # An unusable price (#124, review of #143) is None, not 0.0: a 0.0 here would read as a
+        # fill at zero and a slippage of -100%.
+        actual = _optional_execution_price(execution)
+        slippage = actual - theoretical if actual is not None else None
+        if slippage is None:
+            slippage_bps = None
+        else:
+            slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
         payload.append(
             {
                 "signal_id": signal.id,
@@ -4061,8 +5116,9 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "actual_price": actual,
                 "slippage": slippage,
                 "slippage_bps": slippage_bps,
+                "actual_price_observed": execution.actual_price_observed,
                 "filled_qty": float(execution.filled_qty or 0.0),
-                "commission": float(execution.commission or 0.0),
+                "commission": _optional_commission(execution),
                 "signal_timestamp": signal.timestamp,
                 "execution_timestamp": execution.timestamp,
                 "broker_order_id": execution.broker_order_id,
@@ -4320,16 +5376,6 @@ def _as_string_list(value: Any) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
-def _safe_stat_number(value: Any, default: float = 0.0) -> float:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return default
-    if math.isnan(numeric):
-        return default
-    return numeric
-
-
 def _stat_number_or_undefined(
     stats: dict[str, Any], key: str, default: float
 ) -> float | None:
@@ -4358,6 +5404,49 @@ def _stat_number_or_undefined(
     return numeric if math.isfinite(numeric) else None
 
 
+def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool:
+    """Whether a stored backtest's account reached zero (#132).
+
+    Artifacts saved after the flag existed carry ``ruined`` in their stats and
+    that is authoritative. Older artifacts carry no such key, and reading that
+    as "not ruined" would let a liquidated legacy run (whose pre-ruin Sharpe can
+    look excellent) reach live deployment selection. For those the persisted
+    equity curve is checked directly: any non-positive equity point means ruin.
+    A legacy artifact with no curve at all keeps the previous reading (not
+    ruined) because there is nothing to derive it from.
+
+    A curve that exists but has a point that cannot be read as a finite number
+    (``None``, text, NaN/inf, a malformed entry) fails closed: that point could
+    have been the liquidation, and this gate guards live deployment, so an
+    unprovable "survived" counts as ruined. A readable non-positive point is
+    ruin regardless of where unreadable points sit.
+    """
+    flag = stats.get("ruined")
+    if isinstance(flag, bool):
+        return flag
+    curve = backtest.equity_curve
+    if not isinstance(curve, list):
+        return False
+    for point in curve:
+        try:
+            equity = float(point.get("equity")) if isinstance(point, dict) else math.nan
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer outside float64 range (10**400) is
+            # stored JSON that cannot be read as an account value. Same rule as
+            # None/text: unable to read it, so unable to prove the account
+            # survived.
+            equity = math.nan
+        if not (math.isfinite(equity) and equity > 0):
+            logger.warning(
+                "Backtest %s predates the ruin flag and its equity curve reaches %s; "
+                "treating it as ruined (non-positive or unreadable)",
+                backtest.id,
+                equity,
+            )
+            return True
+    return False
+
+
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
     data = backtest.data or {}
     stats = backtest.stats or {}
@@ -4380,14 +5469,17 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "timeframe": timeframe,
         "start_date": str(backtest.backtest_start or ""),
         "end_date": str(backtest.backtest_end or ""),
-        "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
-        "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
+        "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
+        "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
-        "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
+        "max_drawdown": _stat_number_or_undefined(stats, "max_drawdown_pct", 0.0),
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),
+        # #132: a ruined run has undefined return metrics; consumers that rank
+        # backtests (live deployment selection) must be able to exclude it.
+        "ruined": _backtest_is_ruined(backtest, stats),
         "created_at": str(backtest.created_at or ""),
         "tags": tags,
     }
