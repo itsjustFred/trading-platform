@@ -29,6 +29,7 @@ from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_param
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.promotion_cli import add_promote_parser
 from runner.stats import merge_canonical_stats
 from runner.universe_provenance import (
     DEFAULT_UNIVERSE_PROVIDER,
@@ -817,6 +818,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep indicator arrays in grid output JSONs",
     )
     matrix_p.set_defaults(func=cmd_matrix)
+
+    # promote (#165): record a promotion to production for real-money accounts.
+    add_promote_parser(subparsers)
 
     return parser
 

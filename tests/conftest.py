@@ -1,17 +1,93 @@
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
+import sys
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
 import pytest
 
-# Keep test runs deterministic regardless of machine/user HOME resolution.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TEST_DATA_DIR = (PROJECT_ROOT / "data").resolve()
+REPO_DATA_DIR = (PROJECT_ROOT / "data").resolve()
 
-os.environ.setdefault("DATA_DIR", str(TEST_DATA_DIR))
-os.environ.setdefault("TRADING_DATA_DIR", str(TEST_DATA_DIR))
+# The suite must never write into the repo's ``data/``: in the main checkout that is the live
+# platform's database, catalog and market data. Every process (the xdist controller and each
+# worker imports this file) gets its own throwaway DATA_DIR, forced rather than ``setdefault`` so
+# an exported DATA_DIR pointing at production cannot leak in either. It is set before any
+# ``shared`` import, because ``shared.constants`` resolves DATA_DIR at import time.
+_SESSION_DATA_DIR = Path(tempfile.mkdtemp(prefix="tp-pytest-data-")).resolve()
+atexit.register(shutil.rmtree, _SESSION_DATA_DIR, ignore_errors=True)
+TEST_DATA_DIR = _SESSION_DATA_DIR
+
+os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
+os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
+
+
+def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
+    """``{relative path: (size, mtime_ns)}`` for every file and directory under ``root``."""
+    snapshot: dict[str, tuple[int, int]] = {}
+    if not root.exists():
+        return snapshot
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in (*dirnames, *filenames):
+            path = Path(dirpath) / name
+            try:
+                stat = path.lstat()
+            except OSError:
+                continue
+            snapshot[path.relative_to(root).as_posix()] = (stat.st_size, stat.st_mtime_ns)
+    return snapshot
+
+
+def diff_snapshots(
+    before: dict[str, tuple[int, int]], after: dict[str, tuple[int, int]]
+) -> list[str]:
+    changes = [f"created: {p}" for p in sorted(after.keys() - before.keys())]
+    changes += [f"deleted: {p}" for p in sorted(before.keys() - after.keys())]
+    modified = sorted(p for p in before.keys() & after.keys() if before[p] != after[p])
+    changes += [f"modified: {p}" for p in modified]
+    return changes
+
+
+_REPO_DATA_BEFORE: dict[str, tuple[int, int]] | None = None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    # Controller only: xdist workers would each snapshot a tree the others are racing against.
+    if hasattr(config, "workerinput"):
+        return
+    global _REPO_DATA_BEFORE
+    _REPO_DATA_BEFORE = snapshot_tree(REPO_DATA_DIR)
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    """Fail the run loudly if the repo's real ``data/`` directory changed during the session.
+
+    Limits, by design: the window is ``pytest_configure`` to here, so writes after the session
+    (atexit handlers, threads still running after the last test) are not seen. The check cannot
+    attribute a change to the suite: any process writing ``data/`` during the run (e.g. a live
+    viewer or daemon in the same checkout) fails it too. The remedy is to stop that process or run
+    the suite elsewhere.
+    """
+    if hasattr(session.config, "workerinput") or _REPO_DATA_BEFORE is None:
+        return
+    changes = diff_snapshots(_REPO_DATA_BEFORE, snapshot_tree(REPO_DATA_DIR))
+    if not changes:
+        return
+    shown = "\n  ".join(changes[:25])
+    more = f"\n  ... and {len(changes) - 25} more" if len(changes) > 25 else ""
+    print(
+        f"\n\nERROR: the repo data directory {REPO_DATA_DIR} changed during the test session:"
+        f"\n  {shown}{more}"
+        "\nTests must write under tmp_path / the session DATA_DIR only. This check cannot tell"
+        " which process made the change: if a running viewer or daemon in this checkout wrote it,"
+        " stop that process or run the suite from a separate checkout.",
+        file=sys.stderr,
+    )
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def _requested_browser_name(item: pytest.Item) -> str:
@@ -75,6 +151,27 @@ def _make_sandbox_db(monkeypatch, tmp_path: Path, *, create_schema: bool):
         yield database, engine, data_dir
     finally:
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _no_jforex_jvm_prewarm():
+    """Keep ``TestClient(app)`` lifespans from starting the JForex JVM.
+
+    The viewer's startup prewarm resolves the JForex SDK classpath and, when no jars are found,
+    *downloads* ~35 jars from Dukascopy over the network into ``DATA_DIR/.jforex-sdk``. Any test
+    that enters the real lifespan would otherwise do that (slow, network-dependent, and into the
+    live data dir before DATA_DIR was isolated). Tests exercising the downloader call its helpers
+    directly and are unaffected.
+
+    Uses its own ``MonkeyPatch`` rather than the ``monkeypatch`` fixture: an autouse fixture that
+    requested it would instantiate it before every test's other fixtures and so delay its undo until
+    after them, which breaks fixtures that assert state restored by their own ``monkeypatch`` use.
+    """
+    from data_tools.downloaders import jforex_dl
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(jforex_dl, "prewarm_jvm", lambda: None)
+        yield
 
 
 @pytest.fixture
@@ -189,3 +286,39 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "Playwright browser binaries not installed. "
             "Run: python -m playwright install firefox"
         )
+
+
+@pytest.fixture(autouse=True)
+def _restore_console_log_streams():
+    """Undo console-stream routing a test triggered (e.g. through a CLI ``main()``).
+
+    ``shared.logging.route_console_logs_to_stderr()`` rebinds the console handlers
+    of every cached logger to the ``sys.stderr`` in effect at the call. Under pytest
+    that is a per-test capture stream which is closed afterwards, so a later test
+    whose CLI reroutes again flushes a closed file (``ValueError: I/O operation on
+    closed file``). Restore the routing global and each console handler's stream
+    without flushing.
+    """
+    from shared import logging as shared_logging
+
+    stream_name = shared_logging._console_stream_name
+    saved = [
+        (handler, handler.stream)
+        for logger in list(shared_logging._loggers.values())
+        for handler in logger.handlers
+        if getattr(handler, "_trading_console", False)
+    ]
+    yield
+    import sys
+
+    shared_logging._console_stream_name = stream_name
+    restored = {id(handler) for handler, _ in saved}
+    for handler, stream in saved:
+        handler.stream = stream
+    # Loggers created during the test may be bound to its (now closed) capture
+    # stream; point them at the real process stream, which never closes.
+    real_stream = getattr(sys, f"__{stream_name}__")
+    for logger in list(shared_logging._loggers.values()):
+        for handler in logger.handlers:
+            if getattr(handler, "_trading_console", False) and id(handler) not in restored:
+                handler.stream = real_stream

@@ -131,8 +131,11 @@ class TradeComparator:
         field_results["entry_time"] = self._compare_time(
             ref.entry_time, act.entry_time, self.config.entry_time_seconds, "entry_time"
         )
-        field_results["exit_time"] = self._compare_time(
-            ref.last_exit_time, act.last_exit_time, self.config.exit_time_seconds, "exit_time"
+        field_results["exit_time"] = self._compare_optional_time(
+            ref.last_exit_time if ref.exits else None,
+            act.last_exit_time if act.exits else None,
+            self.config.exit_time_seconds,
+            "exit_time",
         )
 
         # prices
@@ -221,6 +224,38 @@ class TradeComparator:
             message=f"{field_name} difference is {diff:.3f}s (tolerance {tolerance}s)"
             + (_MATCH_SUFFIX if passed else _MISMATCH_SUFFIX),
         )
+
+    def _compare_optional_time(
+        self,
+        expected: str | None,
+        actual: str | None,
+        tolerance: float,
+        field_name: str,
+    ) -> FieldComparisonResult:
+        """Time comparison where an open trade (no exit time) may be on either side.
+
+        Mirrors ``_compare_optional_pct``: both absent agrees, one absent is a
+        mismatch, and two present times compare within tolerance.
+        """
+        if expected is None and actual is None:
+            return FieldComparisonResult(
+                field=field_name,
+                expected=expected,
+                actual=actual,
+                tolerance=tolerance,
+                passed=True,
+                message=f"{field_name}: both None (match)",
+            )
+        if expected is None or actual is None:
+            return FieldComparisonResult(
+                field=field_name,
+                expected=expected,
+                actual=actual,
+                tolerance=tolerance,
+                passed=False,
+                message=f"{field_name}: expected {expected!r}, got {actual!r} (mismatch)",
+            )
+        return self._compare_time(expected, actual, tolerance, field_name)
 
     def _compare_pct(
         self, expected: float, actual: float, tolerance: float, field_name: str

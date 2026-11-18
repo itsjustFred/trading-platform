@@ -88,7 +88,7 @@ def _read_csv(path: Path) -> list[dict]:
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=";")
-        rows.extend(row for row in reader)
+        rows.extend(reader)
     return rows
 
 

@@ -19,6 +19,16 @@ from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
+from shared.trailing import (
+    REPLAY_SUPPORTED_TRAILING_MODES,
+    TRAILING_MODE_SUPERTREND_FLIP,
+    TRAILING_SL_CONFIG_METADATA_KEY,
+    SupertrendFlipPlan,
+    parse_supertrend_flip_plan,
+    tp1_partial_quantity,
+    validate_trailing_sl_config,
+)
+from signal_bots.ramjet.processor import calculate_supertrend
 from signal_bots.registry import get_signal_processor
 
 logger = logging.getLogger(__name__)
@@ -116,6 +126,61 @@ class ReplaySignal:
         )
 
 
+#: ``supertrend_flip`` phases (#168), in order.
+_FLIP_PHASE_BEFORE_TP1 = "before_tp1"
+_FLIP_PHASE_AWAIT_GREEN = "await_green"
+_FLIP_PHASE_ACTIVE = "active"
+#: Fill convention of the flip leg (the only exit that is not at a level or at
+#: the signal bar's close): decided at the flip bar's close, filled at the next
+#: bar's open. Recorded per trade so the run-level ``signal_exit_fill`` is not
+#: read as covering it.
+FLIP_EXIT_FILL = "next_bar_open"
+
+
+@dataclass(slots=True)
+class _FlipState:
+    """Progress of one ``supertrend_flip`` position through its workflow."""
+
+    plan: SupertrendFlipPlan
+    phase: str = _FLIP_PHASE_BEFORE_TP1
+    #: Set at the close of the first red bar after activation; the remainder
+    #: is then closed at the OPEN of the next bar (next-open fill model).
+    exit_pending: bool = False
+    tp1_time: pd.Timestamp | None = None
+    #: Bar that touched the TP1 level while the whole-share tranche floored to
+    #: zero shares, so TP1 was skipped there (the original bot's answer).
+    tp1_skipped_time: pd.Timestamp | None = None
+    activation_time: pd.Timestamp | None = None
+    flip_bar_time: pd.Timestamp | None = None
+
+    def to_meta(self) -> dict[str, Any]:
+        def iso(value: pd.Timestamp | None) -> str | None:
+            return _to_iso(value) if value is not None else None
+
+        return {
+            "tp1_price": self.plan.tp1_price,
+            "tp1_exit_fraction": self.plan.tp1_exit_fraction,
+            "breakeven_after_tp1": self.plan.breakeven_after_tp1,
+            "supertrend_period": self.plan.supertrend_period,
+            "supertrend_multiplier": self.plan.supertrend_multiplier,
+            "phase": self.phase,
+            "tp1_time": iso(self.tp1_time),
+            "tp1_skipped_time": iso(self.tp1_skipped_time),
+            "activation_time": iso(self.activation_time),
+            "flip_bar_time": iso(self.flip_bar_time),
+            "flip_exit_fill": FLIP_EXIT_FILL,
+        }
+
+
+def _unchecked_window(
+    frame: pd.DataFrame, position: "_OpenPosition", end_timestamp: pd.Timestamp
+) -> pd.DataFrame:
+    """Bars after the position's last checked bar, up to and including ``end_timestamp``."""
+    return frame[
+        (frame["timestamp"] > position.last_checked_at) & (frame["timestamp"] <= end_timestamp)
+    ]
+
+
 @dataclass(slots=True)
 class _OpenPosition:
     symbol: str
@@ -139,6 +204,12 @@ class _OpenPosition:
     trailing_updates: int = 0
     mae: float = 0.0
     mfe: float = 0.0
+    #: ``supertrend_flip`` workflow state; ``None`` for every other mode.
+    flip: _FlipState | None = None
+    #: Exits already taken from this position (TP1 partial). ``quantity`` is
+    #: what is still open; the trade's entry quantity is ``quantity`` plus the
+    #: partial quantities.
+    partial_exits: list[TradeExit] = field(default_factory=list)
 
 
 def _net_pnl_of(trade: Trade) -> float:
@@ -157,6 +228,12 @@ class SignalReplayAdapter:
     handling); bars with NaN OHLC are dropped loudly (count-logged, never
     silently skipped); protective exits settle across ALL open positions per
     signal, not just the signaled symbol.
+
+    Exception (#168): the ``supertrend_flip`` exit fills at the OPEN of the
+    bar after the red flip bar, because the flip is only known at that bar's
+    close. If the flip bar is the last bar of the data the position is closed
+    like every other open position at the end of the data. See
+    :meth:`_check_flip_bar` for the full per-bar ordering.
     """
 
     def __init__(
@@ -255,6 +332,11 @@ class SignalReplayAdapter:
         """
         unrealized = 0.0
         for symbol, position in open_positions.items():
+            # #168: a TP1 partial exit is realized but its trade is not closed
+            # yet; its gross PnL belongs to the balance now (costs are priced
+            # once, when the trade closes — same as the native engine).
+            for partial in position.partial_exits:
+                unrealized += float(partial.pnl or 0.0)
             frame = frames.get(symbol)
             if frame is None or frame.empty:
                 continue
@@ -318,9 +400,31 @@ class SignalReplayAdapter:
             pnl = (exit_price - position.entry_price) * position.quantity
         else:
             pnl = (position.entry_price - exit_price) * position.quantity
+        final_exit = TradeExit(
+            time=_to_iso(exit_time),
+            price=float(exit_price),
+            quantity=float(position.quantity),
+            pnl=float(pnl),
+            reason=exit_reason,
+        )
+        # #168: a position with partial exits becomes ONE trade with all its
+        # exit legs (the Trade model's multi-exit form, as the native engine
+        # records it). Quantity is the entry quantity, PnL the sum over legs,
+        # and fees are priced once at the quantity-weighted average exit price
+        # (exact for the notional model). Without partials every figure is
+        # computed exactly as before.
+        exits = [*position.partial_exits, final_exit]
+        trade_quantity = float(position.quantity)
+        fee_exit_price = float(exit_price)
+        if position.partial_exits:
+            pnl = sum(float(item.pnl or 0.0) for item in exits)
+            trade_quantity = sum(float(item.quantity) for item in exits)
+            fee_exit_price = (
+                sum(float(item.price) * float(item.quantity) for item in exits) / trade_quantity
+            )
 
         risk_amount = float(position.risk_amount or 0.0)
-        gross_notional = position.entry_price * position.quantity
+        gross_notional = position.entry_price * trade_quantity
         pnl_pct = (pnl / gross_notional) * 100.0 if gross_notional > 0 else 0.0
         r_multiple = (pnl / risk_amount) if risk_amount > 0 else None
         signal_price = float(position.signal_entry_price)
@@ -342,7 +446,7 @@ class SignalReplayAdapter:
         fees = round(
             float(
                 fee_model.fee_for_trade(
-                    float(position.entry_price), float(exit_price), float(position.quantity)
+                    float(position.entry_price), fee_exit_price, trade_quantity
                 )
             ),
             2,
@@ -354,18 +458,10 @@ class SignalReplayAdapter:
             direction=position.direction,
             entry_time=_to_iso(position.entry_time),
             entry_price=float(position.entry_price),
-            quantity=float(position.quantity),
-            exits=[
-                TradeExit(
-                    time=_to_iso(exit_time),
-                    price=float(exit_price),
-                    quantity=float(position.quantity),
-                    pnl=float(pnl),
-                    reason=exit_reason,
-                )
-            ],
+            quantity=trade_quantity,
+            exits=exits,
             pnl=float(pnl),
-            position_size=float(position.quantity),
+            position_size=trade_quantity,
             risk_amount=float(position.risk_amount) if position.risk_amount is not None else None,
             risk_percent=(
                 float(position.risk_percent) if position.risk_percent is not None else None
@@ -396,6 +492,11 @@ class SignalReplayAdapter:
                 "final_take_profit": position.take_profit,
                 "trailing_stop_updates": position.trailing_updates,
                 "signal_metadata": position.signal_metadata,
+                **(
+                    {"supertrend_flip": position.flip.to_meta()}
+                    if position.flip is not None
+                    else {}
+                ),
             },
         )
 
@@ -453,13 +554,15 @@ class SignalReplayAdapter:
         frame: pd.DataFrame,
         end_timestamp: pd.Timestamp,
     ) -> Trade | None:
+        if position.flip is not None:
+            return self._process_flip_exits(
+                position=position, frame=frame, end_timestamp=end_timestamp
+            )
         if position.stop_loss is None and position.take_profit is None:
             position.last_checked_at = end_timestamp
             return None
 
-        window = frame[
-            (frame["timestamp"] > position.last_checked_at) & (frame["timestamp"] <= end_timestamp)
-        ]
+        window = _unchecked_window(frame, position, end_timestamp)
         if window.empty:
             position.last_checked_at = end_timestamp
             return None
@@ -472,6 +575,246 @@ class SignalReplayAdapter:
 
         position.last_checked_at = end_timestamp
         return None
+
+    # ── supertrend_flip workflow (#168) ─────────────────────────────────
+
+    def _supertrend_states(
+        self, frame: pd.DataFrame, plan: SupertrendFlipPlan
+    ) -> pd.DataFrame:
+        """Supertrend ``supertrend``/``supertrend_ready`` columns for ``frame``.
+
+        Computed with the RamJet processor's own implementation, once per
+        frame and parameter set. The computation is a forward recursion, so
+        the row of bar ``N`` depends on bars ``0..N`` only: evaluating the
+        whole frame at once is free of lookahead (pinned by a prefix test).
+        """
+        cache: dict[tuple[int, int, float], tuple[pd.DataFrame, pd.DataFrame]] | None
+        cache = getattr(self, "_supertrend_cache", None)
+        if cache is None:
+            cache = {}
+            self._supertrend_cache = cache
+        key = (id(frame), plan.supertrend_period, plan.supertrend_multiplier)
+        cached = cache.get(key)
+        if cached is not None and cached[0] is frame:
+            return cached[1]
+        computed = calculate_supertrend(
+            frame[["open", "high", "low", "close"]],
+            plan.supertrend_period,
+            plan.supertrend_multiplier,
+        )
+        if "supertrend" not in computed.columns or "supertrend_ready" not in computed.columns:
+            raise ValueError("Supertrend computation returned no direction/readiness columns")
+        states = computed[["supertrend", "supertrend_ready"]]
+        cache[key] = (frame, states)
+        return states
+
+    def _process_flip_exits(
+        self,
+        *,
+        position: _OpenPosition,
+        frame: pd.DataFrame,
+        end_timestamp: pd.Timestamp,
+    ) -> Trade | None:
+        """Walk the bars up to ``end_timestamp`` through the flip workflow."""
+        assert position.flip is not None
+        window = _unchecked_window(frame, position, end_timestamp)
+        if window.empty:
+            position.last_checked_at = end_timestamp
+            return None
+        states = self._supertrend_states(frame, position.flip.plan)
+        for index, bar in window.iterrows():
+            trade = self._check_flip_bar(position, bar, int(index), states.loc[index])
+            if trade is not None:
+                return trade
+            position.last_checked_at = pd.Timestamp(bar["timestamp"])
+        position.last_checked_at = end_timestamp
+        return None
+
+    def _check_flip_bar(
+        self,
+        position: _OpenPosition,
+        bar: pd.Series,
+        index: int,
+        supertrend: pd.Series,
+    ) -> Trade | None:
+        """Process one bar of a ``supertrend_flip`` position.
+
+        Chronological order inside the bar:
+
+        1. Open: a flip exit decided at the previous bar's close fills here,
+           at the open. Nothing else is evaluated on this bar.
+        2. Intrabar: before TP1, the stop and the TP1 level go through the
+           adapter's shared same-bar policy (``resolve_same_bar_exit``,
+           stop-first when both are touched — the whole position then stops
+           out and TP1 does not happen). After TP1 only the stop is checked.
+           A stop moved to breakeven on the TP1 bar takes effect from the
+           next bar: inside the TP1 bar the order of the touches is unknown,
+           the same rule the ``percent`` trail follows.
+        3. Close: the Supertrend of this bar (from bars up to and including
+           it) is evaluated once TP1 has happened — from the bar AFTER the
+           TP1 bar, never on the TP1 bar's own close: nothing that happens at
+           or inside the TP1 bar after the TP1 fill may move or trigger the
+           trail. Not ready counts as neither green nor red. Waiting for green:
+           green activates. Active: red marks the exit for the next bar's open.
+        """
+        flip = position.flip
+        assert flip is not None
+        bar_time = pd.Timestamp(bar["timestamp"])
+
+        if flip.exit_pending:
+            open_price = float(bar["open"])
+            self._update_excursions(position, pd.Series({"high": open_price, "low": open_price}))
+            return self._close_position(
+                position,
+                exit_time=bar_time,
+                exit_price=open_price,
+                exit_reason="supertrend_flip",
+                exit_bar_index=index,
+            )
+
+        self._update_excursions(position, bar)
+        high = float(bar["high"])
+        low = float(bar["low"])
+        stop_price = float(position.stop_loss) if position.stop_loss is not None else None
+        if flip.phase == _FLIP_PHASE_BEFORE_TP1:
+            return self._check_flip_bar_before_tp1(
+                position, bar_time=bar_time, index=index, high=high, low=low, stop_price=stop_price
+            )
+        if (
+            resolve_same_bar_exit(
+                direction=position.direction,
+                high=high,
+                low=low,
+                stop_price=stop_price,
+                take_profit_price=None,
+            )
+            == "stop"
+        ):
+            return self._close_flip_at_stop(position, bar_time, index)
+
+        ready = bool(supertrend["supertrend_ready"])
+        if not ready:
+            return None
+        green = bool(supertrend["supertrend"])
+        if flip.phase == _FLIP_PHASE_AWAIT_GREEN:
+            if green:
+                flip.phase = _FLIP_PHASE_ACTIVE
+                flip.activation_time = bar_time
+        elif flip.phase == _FLIP_PHASE_ACTIVE and not green:
+            flip.exit_pending = True
+            flip.flip_bar_time = bar_time
+        return None
+
+    def _check_flip_bar_before_tp1(
+        self,
+        position: _OpenPosition,
+        *,
+        bar_time: pd.Timestamp,
+        index: int,
+        high: float,
+        low: float,
+        stop_price: float | None,
+    ) -> Trade | None:
+        """Intrabar step of a flip position that has not reached TP1 yet."""
+        flip = position.flip
+        assert flip is not None
+        event = resolve_same_bar_exit(
+            direction=position.direction,
+            high=high,
+            low=low,
+            stop_price=stop_price,
+            take_profit_price=flip.plan.tp1_price,
+        )
+        if event == "stop":
+            return self._close_flip_at_stop(position, bar_time, index)
+        if event != "tp":
+            return None
+        trade = self._take_tp1(position, bar_time, index)
+        if trade is not None:
+            return trade
+        # The TP1 bar after the TP1 fill is dead for the workflow: its close is
+        # not read (no activation, no flip) and its range is not checked against
+        # the stop moved on it — the next bar's intrabar pass is the first one
+        # that sees that stop. The Supertrend evaluation starts on the bar after.
+        return None
+
+    def _take_tp1(
+        self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
+    ) -> Trade | None:
+        """Exit the whole-share TP1 tranche at the TP1 price; returns a trade
+        if nothing is left.
+
+        The tranche is ``quantity * tp1_exit_fraction`` floored to whole shares
+        — the original bot's arithmetic (``shared.trailing.tp1_partial_quantity``),
+        so the replay never sells shares the bot would not, and a live TP1
+        tranche order (whole shares only) matches the replayed one.
+        """
+        flip = position.flip
+        assert flip is not None
+        plan = flip.plan
+        exit_quantity = tp1_partial_quantity(position.quantity, plan.tp1_exit_fraction)
+        if exit_quantity <= 0.0:
+            # The original bot skips TP1 here ("No shares to sell at TP1.
+            # Skipping."): no sell, no breakeven stop, and ``tp1_hit`` stays
+            # false, so the Supertrend workflow is never armed. Mirrored: the
+            # position stays in the before-TP1 phase under its ORIGINAL stop,
+            # and the TP1 level keeps being re-checked on the following bars
+            # exactly like the bot re-checks it on every pass. The event is
+            # reported once, at the bar that first reached TP1 and sold
+            # nothing — every later bar only repeats it.
+            if flip.tp1_skipped_time is None:
+                flip.tp1_skipped_time = bar_time
+            return None
+        flip.phase = _FLIP_PHASE_AWAIT_GREEN
+        flip.tp1_time = bar_time
+        if exit_quantity >= float(position.quantity):
+            return self._close_position(
+                position,
+                exit_time=bar_time,
+                exit_price=plan.tp1_price,
+                exit_reason="tp1",
+                exit_bar_index=index,
+            )
+        if position.direction == "LONG":
+            pnl = (plan.tp1_price - position.entry_price) * exit_quantity
+        else:
+            pnl = (position.entry_price - plan.tp1_price) * exit_quantity
+        position.partial_exits.append(
+            TradeExit(
+                time=_to_iso(bar_time),
+                price=float(plan.tp1_price),
+                quantity=exit_quantity,
+                pnl=float(pnl),
+                reason="tp1",
+            )
+        )
+        position.quantity = float(position.quantity) - exit_quantity
+        if plan.breakeven_after_tp1:
+            breakeven = float(position.entry_price)
+            if position.stop_loss is None or abs(breakeven - float(position.stop_loss)) > 1e-12:
+                position.stop_loss = breakeven
+                # trailing_updates counts every stop move, so for a flip position
+                # it is the breakeven move (the only stop move the workflow makes).
+                position.trailing_updates += 1
+        return None
+
+    def _close_flip_at_stop(
+        self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
+    ) -> Trade:
+        flip = position.flip
+        assert flip is not None and position.stop_loss is not None
+        at_breakeven = (
+            flip.phase != _FLIP_PHASE_BEFORE_TP1
+            and flip.plan.breakeven_after_tp1
+            and abs(float(position.stop_loss) - float(position.entry_price)) <= 1e-12
+        )
+        return self._close_position(
+            position,
+            exit_time=bar_time,
+            exit_price=float(position.stop_loss),
+            exit_reason="breakeven_stop" if at_breakeven else "stop_loss",
+            exit_bar_index=index,
+        )
 
     def _apply_signal_processor(
         self,
@@ -540,6 +883,8 @@ class SignalReplayAdapter:
                 merged_fee_params.update(metadata["fee_params"])
             fee_model = resolve_fee_model(merged_fee_params)
         self._active_fee_model = fee_model
+        # #168: per-run Supertrend cache (keyed by frame identity).
+        self._supertrend_cache = {}
         normalized_timeframe = normalize_timeframe(timeframe) or self.default_timeframe
         frames = self._prepare_replay_frames(ohlcv_by_symbol)
         if not frames:
@@ -560,6 +905,34 @@ class SignalReplayAdapter:
             if effective_signal is None:
                 emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
+            # #150 fail closed at signal time: a signal whose trailing mode
+            # replay cannot execute (unknown) is rejected — it is not traded,
+            # instead of being traded with the requested trailing silently
+            # dropped. This aborts the run on purpose: a config error must not
+            # produce a backtest result that silently differs from the
+            # strategy's intent.
+            trailing_cfg = (effective_signal.metadata or {}).get(
+                TRAILING_SL_CONFIG_METADATA_KEY
+            )
+            trailing_mode = validate_trailing_sl_config(
+                trailing_cfg,
+                supported=REPLAY_SUPPORTED_TRAILING_MODES,
+                context=f"signal replay ({effective_signal.symbol})",
+            )
+            # #168: the supertrend_flip workflow needs all of its parameters;
+            # a missing or invalid one rejects the signal the same way.
+            flip_plan = (
+                parse_supertrend_flip_plan(
+                    trailing_cfg,
+                    effective_signal.metadata,
+                    action=effective_signal.action,
+                    take_profit=effective_signal.take_profit,
+                    stop_loss=effective_signal.stop_loss,
+                    context=f"signal replay ({effective_signal.symbol})",
+                )
+                if trailing_mode == TRAILING_MODE_SUPERTREND_FLIP
+                else None
+            )
             # Settle protective exits for ALL open positions up to this
             # signal's fill time (CodeRabbit round): previously only the
             # signaled symbol's position was settled, so a stop-out on another
@@ -678,6 +1051,7 @@ class SignalReplayAdapter:
                 signal_time=effective_signal.timestamp,
                 signal_metadata=dict(effective_signal.metadata),
                 last_checked_at=fill_time,
+                flip=_FlipState(plan=flip_plan) if flip_plan is not None else None,
             )
             open_positions[signal.symbol] = opened
             emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)

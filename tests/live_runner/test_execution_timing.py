@@ -185,8 +185,9 @@ class TestSignalTimestampParsingAndTimeframeRecognition:
         **raises** - and `Z` is the form every broker sends, so deleting the guard would pass
         CI today and fail on an older runtime.
 
-        This is the same `Z`-on-3.11 finding as the market-data bar serialiser in
-        `tests/test_market_data_stream_symbols.py`, in a second module. That is worth
+        This is the same `Z`-on-3.11 finding as the market-data bar serialiser
+        (`live_runner/market_data_stream.py::_serialize_bar_payload`, covered by
+        `tests/test_symbol_class.py`), in a second module. That is worth
         recording as a pattern rather than two coincidences: **`Z`-suffix handling is
         load-bearing by version, and this repo runs two copies of that conversion.**
 

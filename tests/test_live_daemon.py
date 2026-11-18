@@ -840,6 +840,10 @@ def test_stockkit_route_guard_rejects_mismatched_signal_metadata() -> None:
 
 
 class _SignalSubmittingAdapter:
+    # A double has to prove it is a demo account (`_adapter_is_demo`); without
+    # the flag it is real money and the promotion gate (#165) refuses entries.
+    demo = True
+
     def __init__(self) -> None:
         self.submitted: list[object] = []
 
@@ -855,6 +859,21 @@ class _SignalSubmittingAdapter:
 
     async def get_positions(self):
         return []
+
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol):
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:

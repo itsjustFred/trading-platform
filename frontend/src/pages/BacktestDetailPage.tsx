@@ -639,6 +639,28 @@ export function BacktestDetailPage() {
         </div>
       </div>
 
+      {/* #132: equity hit zero, so Sharpe/Sortino/PSR/p-value are undefined. */}
+      {stats?.ruined === true && (
+        <div
+          role="alert"
+          data-testid="ruined-badge"
+          style={{
+            border: "1px solid #f85149",
+            color: "#f85149",
+            borderRadius: "6px",
+            padding: "8px 12px",
+            marginBottom: "12px",
+            fontWeight: 600,
+          }}
+        >
+          RUINED: equity reached zero
+          {typeof stats.ruin_time === "string" && stats.ruin_time
+            ? ` at ${stats.ruin_time}`
+            : ""}
+          . Metrics stop at that point; return ratios are undefined.
+        </div>
+      )}
+
       {/* Stats Grid */}
       {stats && (
         <div
