@@ -386,6 +386,76 @@ def test_fixed_risk_cap_below_min_lot_logs_skip(caplog):  # Issue #151
     assert "below min_lot" in warnings[0].getMessage()
 
 
+def test_fixed_risk_grid_size_ulp_below_min_lot_is_not_skipped():  # Issue #151
+    # A size the cap reduced is re-floored to the grid, and a grid product can
+    # land an ulp below `min_lot`: `3 * 0.3 == 0.8999999999999999 < 0.9`.
+    # The broker accepts that size as `min_lot`, so the trade must happen at
+    # 0.9 — the strict `<` float comparison must not skip it.
+    assert 3 * 0.3 < 0.9, "fixture relies on the float product being below 0.9"
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.3,
+            "min_lot": 0.9,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.0009,  # cap = 100_000 * 0.0009 / 100 = 0.9 units = 3 steps
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(0.9)
+
+
+def test_fixed_risk_grid_size_ulp_below_min_lot_creates_order():  # Issue #151
+    # End-to-end twin of the case above: the capped size is float noise
+    # (one ulp) below min_lot, so a real order must be created at min_lot
+    # instead of the trade being skipped with size 0. Flat prices keep the
+    # fill-time re-size on the same 100.0 entry as the creation-time sizing.
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 00:01", "2024-01-01 00:02"],
+                utc=True,
+            ),
+            "open": [100.0, 100.0, 100.0],
+            "high": [100.5, 100.5, 100.5],
+            "low": [99.5, 99.5, 99.5],
+            "close": [100.0, 100.0, 100.0],
+            "sl_price": [95.0, float("nan"), float("nan")],
+        }
+    )
+
+    def strategy(df, params):
+        entries = pd.Series([True, False, False], index=df.index)
+        exits = pd.Series([False, False, True], index=df.index)
+        return entries, exits, {}, []
+
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.3,
+            "min_lot": 0.9,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.0009,  # cap = 100_000 * 0.0009 / 100 = 0.9 = 3 steps
+    )
+
+    result = engine.run(frame, strategy)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].quantity == pytest.approx(0.9)
+
+
 def test_fixed_risk_prefers_explicit_stop_distance():
     # MT5 parity (strategy-test-audit): lots derive from the strategy's stop
     # distance (e.g. ATR-based), not from |entry - stop|, so fill-price noise

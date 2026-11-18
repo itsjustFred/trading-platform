@@ -354,16 +354,24 @@ class TradeEngine:
                 # A size below `min_lot` after the caps is SKIPPED (size 0),
                 # never raised back up: the caps make it unaffordable at the
                 # minimum, and a max_lot below min_lot admits no valid size.
+                # One exception: a grid product can come out of the floor an
+                # ulp below `min_lot` (`3 * 0.3 == 0.8999999999999999 < 0.9`).
+                # The broker accepts that size as `min_lot`, so with the same
+                # relative tolerance the grid floor uses, snap it up to
+                # `min_lot` and take the trade instead of skipping it.
                 if min_lot > 0 and shares < min_lot:
-                    logger.warning(
+                    if math.isclose(shares, min_lot, rel_tol=1e-9):
+                        shares = min_lot
+                    else:
+                        logger.warning(
                         "Skipping order: fixed-risk size %.6g is below min_lot %.6g after caps "
                         "(size before leverage/exposure cap %.6g, max_lot %.6g)",
                         shares,
                         min_lot,
                         uncapped_shares,
                         max_lot,
-                    )
-                    return 0.0
+                        )
+                        return 0.0
                 return max(shares, 0.0)
 
         pending_positions = sum(

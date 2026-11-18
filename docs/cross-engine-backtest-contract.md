@@ -164,10 +164,13 @@ Implementation:
   `cap_fixed_risk_by_leverage = false`. `max_lot` is floored to `lot_step`
   once, so an off-grid `max_lot` cannot yield an off-grid size. Because the
   leverage/exposure cap is a raw equity/price ratio, a size that the cap
-  reduces is re-floored to `lot_step` afterwards (Issue #151). Any final size
-  below `min_lot` is **skipped** (size 0, no trade, with a WARNING log) — it
-  is never raised back up to `min_lot`, since the caps are what make it
-  unaffordable. A size that no cap reduces is not re-floored.
+  reduces is re-floored to `lot_step` afterwards (Issue #151). A final size
+  within the grid snap band (relative 1e-9) below `min_lot` is snapped up to
+  `min_lot` — that size came out of the grid floor an ulp low (`3 * 0.3 ==
+  0.8999999999999999 < 0.9`) and the broker accepts it as `min_lot`. Any
+  other final size below `min_lot` is **skipped** (size 0, no trade, with a
+  WARNING log) — it is never raised back up to `min_lot`, since the caps are
+  what make it unaffordable. A size that no cap reduces is not re-floored.
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
