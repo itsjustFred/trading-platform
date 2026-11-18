@@ -1,7 +1,7 @@
 name: Agent Pre-Mortem
 # Quoted: an unquoted "#" after a space starts a YAML comment, which dropped
 # the PR number and SHA from display_title.
-run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.event.inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || 'current head' }}"
+run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.event.inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || github.event.inputs.head_sha || 'current head' }}"
 
 # Our own automated, read-only pre-mortem on every push to a PR, using the
 # `.agents/skills/actions-pre-mortem` skill as the system prompt of an opencode
@@ -17,8 +17,9 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # moment a draft becomes ready for review), with a `workflow_dispatch` for a
 # manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has to
 # be re-analysed, e.g. after an infra failure). Its run-name carries the PR
-# number and SHA, so the concurrency group below cancels runs of older commits
-# of the same PR.
+# number and the analysed SHA, so a run of an older commit is recognisable in the
+# run list; the concurrency group below cancels runs of older commits of the same
+# PR.
 #
 # The agent is read-only; this job writes no repo code. It reads the PR diff and
 # its blast radius, writes ranked future-failure scenarios, and produces a
