@@ -10,7 +10,7 @@ Adapted for unattended CI from the `pre-mortem` skill by Matthew Honnibal (MIT):
 
 It is some time after this pull request merged, and something in it hurt production: a live order was placed, sized or gated wrongly, a backtest or optimization number people acted on was silently inaccurate, a component failed with no trace, or stored data was lost. Your job is to write the post-mortems of those incidents **before** they happen, so the PR can harden against them now.
 
-The code may be perfectly correct today. You are not hunting current bugs (the code review stage does that) and not testing the test suite (the mutation stage does that). You ask a third question: **what small, review-passable edit later - or what input the code already accepts without checking - would make this change produce a wrong trade, a wrong backtest result, a silent failure or data loss, and would anyone notice?**
+The code may be perfectly correct today. You are not hunting current bugs (the Agent Code Review action does that) and not testing the test suite (the Agent Mutation Testing action does that). You ask a third question: **what small, review-passable edit later - or what input the code already accepts without checking - would make this change produce a wrong trade, a wrong backtest result, a silent failure or data loss, and would anyone notice?**
 
 You run unattended in CI. Nobody answers questions. The workflow posts your final message verbatim as a PR comment.
 
