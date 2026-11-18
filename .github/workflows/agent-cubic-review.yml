@@ -4,16 +4,19 @@ name: Agent Cubic Review
 # that broke: the superseded-run cancel in agent-code-review.yml).
 run-name: "Agent Cubic Review PR #${{ github.event.pull_request.number || inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || inputs.head_sha || 'current head' }}"
 
-# Stage 5, the last stage of the PR verification pipeline (see the
-# `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review -> Agent Mutation Testing -> Agent Pre-Mortem -> Cubic
+# One of the independent per-push agent workflows (Agent Code Review, Agent
+# Mutation Testing, Agent Pre-Mortem, Agent Cubic Review - see the
+# `platform-pr-verify` skill): each runs by itself on every push to an open PR,
+# none of them starts another, and each upserts one PR comment of its own.
+# (The earlier chain, where the pre-mortem dispatched this workflow on PASS, is
+# abandoned.)
 #
 # Cubic (cubic.dev) is a GitHub App that reviews every PR by itself, on open and
 # on every push; there is nothing to install and no agent to run here. What this
 # workflow adds is the gate: it waits for cubic's review of the analysed head
 # commit, classifies its findings by priority, and writes the commit status
 # `agent/cubic-review`:
-#   pending: waiting for cubic's review (or for the pre-mortem dispatch)
+#   pending: waiting for cubic's review
 #   success: cubic reviewed the head commit and found no P0/P1 finding
 #            (P2/P3 are advisory and do not block), or the PR is a draft and
 #            cubic was not asked to review it (see "Draft PRs" below)
@@ -33,43 +36,42 @@ run-name: "Agent Cubic Review PR #${{ github.event.pull_request.number || inputs
 # earlier commit was red - and a push that leaves the code untouched does not
 # re-raise it.
 #
-# Triggers: `agent-pre-mortem.yml` dispatches it with the PR head SHA when the
-# pre-mortem verdict is PASS, and `ready_for_review` runs it again when a draft
-# PR is marked ready (see "Draft PRs"). The run-name carries the PR number and
-# SHA, so a later push can cancel runs of older commits. A run whose SHA is no
-# longer the PR head stops without doing anything. On PASS it dispatches
-# nothing: this is the last stage, and CodeRabbit is an on-demand second
-# opinion triggered by hand (see the skill).
+# Triggers: `pull_request` itself (opened, a synchronize, a reopen, and the
+# moment a draft becomes ready for review), with a `workflow_dispatch` for a
+# manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has to
+# be re-gated, e.g. after cubic rate-limited the run). The run-name carries the
+# PR number and the analysed SHA, so a run of an older commit is recognisable in
+# the run list; the concurrency group below cancels runs of older commits of the
+# same PR. A run whose SHA is no longer the PR head stops without doing anything.
+# On PASS it starts nothing: CodeRabbit is an on-demand second opinion triggered
+# by hand (see the skill).
 #
 # Draft PRs: cubic does not review drafts, so a run on a draft head writes
 # `success` with the description "skipped: draft PR — cubic reviews only ready
-# PRs" and waits for nothing. Marking the PR ready runs the stage again. That run
-# proceeds only if `agent/pre-mortem` is `success` on the same commit (the verdict
-# that dispatches this stage); otherwise it stops without writing a status and
-# the chain decides.
+# PRs" and waits for nothing. Marking the PR ready runs the workflow again
+# (`ready_for_review`), and by then cubic reviews the head itself.
 #
-# Override (pre-mortem red, findings judged irrelevant): justify each finding in
-# a PR comment, then dispatch by hand:
-#   gh workflow run agent-cubic-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 # Override (cubic red, P0/P1 judged irrelevant): justify each finding in a PR
-# comment; nothing runs after this stage.
+# comment; nothing runs after this workflow, and the `ready-for-human` label
+# carries the decision to the human. A manual rerun of the gate:
+#   gh workflow run agent-cubic-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 #
 # A ready PR that cubic never reviewed (a rate limit, a skipped review) ends
 # as `error` after the wait instead of blocking: the fix is to re-trigger cubic
-# from its review footer ("Re-trigger cubic") and dispatch the stage again.
+# from its review footer ("Re-trigger cubic") and re-run this workflow by hand.
 #
 # Trust model:
 # - The job holds a token only to read reviews and write statuses/comments, and
 #   runs no repo code and no agent. Nothing from the PR is executed.
-# - The workflow file runs from the dispatched ref (the PR branch), like the
-#   PR's copy on pull_request. Accepted for the same reason as in the review
-#   workflow. Fork PRs are skipped.
+# - This workflow file itself is not pinned: on pull_request GitHub runs the
+#   PR's copy. Accepted for the same reason as in the review workflow. Fork PRs
+#   are skipped.
 # - The bot login is matched exactly: the `[bot]` suffix is reserved for GitHub
 #   Apps, so a PR author cannot post a review that this stage counts.
 
 on:
   pull_request:
-    types: [ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -82,11 +84,10 @@ on:
         type: string
 
 concurrency:
-  group: agent-cubic-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: agent-cubic-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 env:
-  PREMORTEM_CONTEXT: agent/pre-mortem
   CUBIC_CONTEXT: agent/cubic-review
   # The review body marker and the bot that posts it. Both are cubic's, not
   # ours; change them here if cubic renames either.
@@ -128,13 +129,13 @@ jobs:
             echo "::error::PR #${INPUT_PR} is not open."
             exit 1
           fi
-          # The SHA the pre-mortem passed must still be the head; otherwise a
-          # newer push has its own pipeline run and this one has nothing to do.
+          # A rerun that names a commit the head moved past is superseded: the
+          # newer push has its own run and this one has nothing to gate. Close
+          # what it marked on the superseded commit, so its stage status ends
+          # terminal instead of pending (only if still pending).
           if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
             echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; superseded, nothing to do."
             echo "current=false" >> "$GITHUB_OUTPUT"
-            # Close what the push marked on the superseded commit, so its stage
-            # status ends terminal instead of pending (only if still pending).
             state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${CUBIC_CONTEXT}\")][0].state")
             if [ "$state" = "pending" ]; then
@@ -143,18 +144,6 @@ jobs:
                 -f description="Superseded: the PR head moved on" > /dev/null
             fi
             exit 0
-          fi
-          # A ready_for_review run is not dispatched by the chain, so it gates only
-          # when the pre-mortem passed on this commit: the verdict that dispatches
-          # this stage. Otherwise the chain decides; nothing is written here.
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ "$(jq -r .draft pr.json)" != "true" ]; then
-            premortem=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$(jq -r .head.sha pr.json)/status" \
-              --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
-            if [ "$premortem" != "success" ]; then
-              echo "::notice::${PREMORTEM_CONTEXT} is ${premortem} on this commit; the chain decides, nothing to do."
-              echo "current=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
           fi
           echo "current=true" >> "$GITHUB_OUTPUT"
           {
@@ -178,7 +167,7 @@ jobs:
 
       # cubic does not review draft PRs, so waiting for it would only end in `error`
       # after 20 minutes. A draft head is a success that says why instead; marking
-      # the PR ready runs this stage again (ready_for_review).
+      # the PR ready runs this workflow again (ready_for_review).
       - name: Skip draft PR
         if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true' && steps.pr.outputs.draft == 'true'
         env:
@@ -214,9 +203,9 @@ jobs:
           fi
 
   # Waits for cubic's review of the head commit and classifies its findings.
-  # Cubic reviews on open and on every push, so by the time the chain reaches
-  # this stage (mutation testing and the pre-mortem run in between) the review
-  # is normally already there; the wait only covers the slow cases.
+  # Cubic reviews on open and on every push, so on a synchronize run the review
+  # of the new head is normally already there or minutes away; the wait only
+  # covers the slow cases (a queued review, a rate limit).
   wait:
     needs: resolve
     if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' && needs.resolve.outputs.draft != 'true' }}
@@ -273,7 +262,7 @@ jobs:
 
       # Priority is cubic's own: `P0:`-`P3:` prefixes inside the review's
       # "Prompt for AI agents" block, which lists the unresolved findings of
-      # that commit. P0/P1 block the pipeline; P2/P3 are advisory.
+      # that commit. P0/P1 block the gate; P2/P3 are advisory.
       - name: Classify cubic findings
         id: classify
         env:
@@ -308,7 +297,8 @@ jobs:
           echo "Cubic: verdict=${verdict} blocking(P0/P1)=${blocking} advisory(P2/P3)=${advisory}"
 
   # Posts the comment and sets the status. Runs no repo code. Also reports a
-  # failed wait as `error`. No dispatch: this is the last stage.
+  # failed wait as `error`. It starts no other workflow: this gate dispatches
+  # nothing, on any verdict.
   post:
     needs: [resolve, wait]
     if: ${{ !cancelled() && (needs.wait.result == 'success' || needs.wait.result == 'failure') }}
@@ -327,13 +317,13 @@ jobs:
       REVIEW_ID: ${{ needs.wait.outputs.review_id }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Report failed cubic stage run
+      - name: Report failed cubic run
         if: needs.wait.result == 'failure'
         run: |
           set -euo pipefail
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$CUBIC_CONTEXT" \
-            -f description="Cubic stage run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+            -f description="Cubic run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
 
       # One comment per PR, identified by a hidden marker and updated in place.
       # Uses the REST API only. A result for a commit that is no longer the PR
@@ -364,7 +354,7 @@ jobs:
                 echo "Cubic reviewed \`${HEAD_SHA}\` and found **${BLOCKING} blocking (P0/P1)** finding(s)."
                 ;;
               *)
-                echo "No cubic review of \`${HEAD_SHA}\` arrived within 20 minutes, so the stage could not run."
+                echo "No cubic review of \`${HEAD_SHA}\` arrived within 20 minutes, so the gate could not run."
                 ;;
             esac
             echo
@@ -375,9 +365,9 @@ jobs:
               echo "Review: ${review_url}"
               echo
             fi
-            echo "P0/P1 findings block this stage; P2/P3 are advisory. Fix them in the PR, or reply in the finding's thread with why it does not apply and resolve the thread."
+            echo "P0/P1 findings block this gate; P2/P3 are advisory. Fix them in the PR, or reply in the finding's thread with why it does not apply and resolve the thread."
             echo
-            echo "If cubic did not review the head commit, re-trigger it from its review footer and re-dispatch this stage."
+            echo "If cubic did not review the head commit, re-trigger it from its review footer and re-run this workflow by hand."
             echo
             echo "---"
             echo "_Cubic is the automatic AI reviewer of the pipeline; CodeRabbit is an on-demand second opinion (see the \`platform-pr-verify\` skill)._"
@@ -423,11 +413,11 @@ jobs:
               -f description="Post step failed; see the run log" > /dev/null
           fi
 
-  # A cancelled run (a hand-cancel, or a newer dispatch for the same PR through
-  # the concurrency group) skips every reporter above, which would leave the
-  # stage `pending` with no signal. This job runs only on cancellation and
-  # turns a still-pending status of the analysed commit into an error. A newer
-  # run that already wrote its final status is not touched (pending only).
+  # A cancelled run (a hand-cancel, or a newer run for the same PR through the
+  # concurrency group) skips every reporter above, which would leave the gate
+  # `pending` with no signal. This job runs only on cancellation and turns a
+  # still-pending status of the analysed commit into an error. A newer run that
+  # already wrote its final status is not touched (pending only).
   report-cancelled:
     needs: [resolve, wait, post]
     if: ${{ cancelled() && (needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha) }}
@@ -441,7 +431,7 @@ jobs:
       HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha || github.event.pull_request.head.sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Report cancelled cubic stage run
+      - name: Report cancelled cubic run
         run: |
           set -euo pipefail
           state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
@@ -449,5 +439,5 @@ jobs:
           if [ "$state" = "pending" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$CUBIC_CONTEXT" \
-              -f description="Cubic stage run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+              -f description="Cubic run cancelled; re-run the workflow" -f target_url="$RUN_URL" > /dev/null
           fi

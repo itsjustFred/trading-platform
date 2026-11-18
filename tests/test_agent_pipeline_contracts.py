@@ -1,19 +1,23 @@
-"""The agent workflows are independent per-push workflows, and the one that reports a verdict
-does it totally.
+"""The agent workflows are independent per-push workflows, and the ones that report a verdict
+do it totally.
 
-The three agent workflows (`agent-code-review.yml`, `agent-mutation-testing.yml`,
-`agent-pre-mortem.yml`) are hand-maintained YAML that each run on their own on every push to a
-PR: none starts another, and each upserts one PR comment of its own. Nothing in CI parses them,
-so a one-word regression - a renamed marker, a dropped trigger, a verdict missing from the
-`case`, a token added to the agent job, a dispatch left behind by an abandoned design - would
-merge silently and either post a red verdict as a green status, run the rules of a commit
-nobody asked about, or strand a status `pending` on a SHA with no error anywhere.
+The four pipeline workflows (`agent-code-review.yml`, `agent-mutation-testing.yml`,
+`agent-pre-mortem.yml`, `agent-cubic-review.yml`) are hand-maintained YAML that each run on
+their own on every push to a PR: none starts another, and each upserts one PR comment of its
+own. Nothing in CI parses them, so a one-word regression - a renamed marker, a dropped
+trigger, a verdict missing from the `case`, a token added to the agent job, a dispatch left
+behind by an abandoned design - would merge silently and either post a red verdict as a green
+status, run the rules of a commit nobody asked about, or strand a status `pending` on a SHA
+with no error anywhere.
 
-The pre-mortem is the only one of the three that reports a result on the commit itself: for the
-analysed SHA it sets the commit status `agent/pre-mortem` and upserts one PR comment.
+Two of them report a result on the commit itself: the pre-mortem sets the commit status
+`agent/pre-mortem`, and the cubic gate sets `agent/cubic-review`. The siblings present as
+comments and are pinned that way, so a chain-era copy-paste of a status write cannot slip in
+unnoticed.
 
 What is pinned here:
-- every agent workflow triggers itself on `pull_request` (opened, synchronize, reopened) with a
+- every pipeline workflow triggers itself on `pull_request` (opened, synchronize, reopened,
+  and, for the two that must run the moment a draft becomes ready, ready_for_review) with a
   concurrency group per PR that cancels superseded runs, and no workflow starts another one -
   no dispatch call, no `workflow_run` or `repository_dispatch` trigger, no `actions: write`;
 - the pre-mortem's verdict map is total (`*)` -> `error`), so no verdict reaches an undeclared
@@ -23,6 +27,9 @@ What is pinned here:
 - the pre-mortem marks the analysed commit pending once, and every path that stops it - a
   cancelled run, a failed run, a failed post step - leaves that context terminal, never
   `pending`; a head that moved keeps its own status but no longer owns the comment;
+- the cubic gate waits only for cubic's own review of the analysed commit, counts P0/P1 as
+  blocking and P2/P3 as advisory, runs no repo code and no agent, and its every stop path
+  leaves its own context terminal too;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
   sibling workflows, whose comments swear to the same guards;
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
@@ -32,7 +39,7 @@ What is pinned here:
   fails the run when HEAD moved or the tree is dirty.
 
 The chain this file used to pin (review -> mutation -> pre-mortem, dispatched stage by stage, on
-the branch `test/agent-pipeline-chain`) is abandoned: the three are independent workflows now.
+the branch `test/agent-pipeline-chain`) is abandoned: the four are independent workflows now.
 The tests that defended the chain were removed rather than rewritten, because the contract they
 pinned no longer exists:
 
@@ -51,8 +58,8 @@ pinned no longer exists:
   `test_every_agent_workflow_is_a_standalone_per_push_workflow` pins instead.
 - `test_a_superseded_or_early_cancelled_run_still_closes_its_status` - pinned the chain's
   "superseded, nothing to do" early exits, which closed *another* stage's context on its
-  behalf. A stage stops no stage but itself now, and the pre-mortem's own stop paths are pinned
-  by `test_every_stop_path_leaves_the_pre_mortem_context_terminal`.
+  behalf. A stage stops no stage but itself now, and the stop paths that are left are pinned by
+  `test_every_stop_path_leaves_the_stage_context_terminal`.
 - `test_a_cancelled_run_clears_its_pending_stage` - pinned the matrix of contexts each chain
   stage owed downstream, which was the chain's shape. Replaced by
   `test_a_cancelled_run_leaves_no_pending_stage_status`, which pins the invariant instead of
@@ -60,17 +67,27 @@ pinned no longer exists:
 - `test_every_agent_workflow_parses_and_declares_its_chain_jobs` - its baseline checks were
   tangled with the chain's (`workflow_dispatch` `pr_number` on every stage). Replaced by
   `test_every_agent_workflow_is_a_standalone_per_push_workflow`.
-- `test_every_stop_path_clears_the_pre_mortem_status` - pinned cross-stage clearing, a review
-  or mutation stop path writing `agent/pre-mortem`. Replaced by the same-context version above.
+- `test_every_stop_path_clears_every_later_stage_status` - pinned cross-stage clearing, a
+  review or mutation stop path writing `agent/pre-mortem`. Replaced by the same-context
+  version above.
+- `test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem_to_cubic` and
+  `test_a_ready_pr_runs_only_when_the_pre_mortem_passed_on_its_head` - pinned the cubic stage
+  as the chain's last stage: dispatched by the pre-mortem's post job on PASS, and gated on the
+  pre-mortem's verdict when a draft became ready. The cubic gate is a per-push workflow now,
+  so the edges it was dispatched on are absent in
+  `test_no_agent_workflow_starts_another_workflow`, and its triggers and its own stop paths are
+  pinned by the cubic tests below.
 
 Every other test in this file was kept and re-scoped to the workflows it is true of: the
 verdict map and regex, the context/marker/title convention, the guard blocks kept in sync, the
-opencode install, the resolve reporter, the head-unchanged and tree-clean guards, and the
-bash-level verdict extraction.
+opencode install, the resolve reporter, the head-unchanged and tree-clean guards, the
+bash-level verdict extraction, and the bash-level cubic classification.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -86,17 +103,28 @@ SKILLS = REPO_ROOT / ".agents" / "skills"
 REVIEW = "agent-code-review.yml"
 MUTATION = "agent-mutation-testing.yml"
 PREMORTEM = "agent-pre-mortem.yml"
+CUBIC = "agent-cubic-review.yml"
 AGENT_WORKFLOWS = (REVIEW, MUTATION, PREMORTEM)
+PIPELINE_WORKFLOWS = (REVIEW, MUTATION, PREMORTEM, CUBIC)
 
-# The workflow that reports its verdict on the commit. The siblings present as comments and are
-# pinned that way below, so a chain-era copy-paste of a status write cannot slip in unnoticed.
-CONTEXT_OWNER = {"agent/pre-mortem": PREMORTEM}
+# The workflows that report their verdict on the commit. The siblings present as comments and
+# are pinned that way below, so a chain-era copy-paste of a status write cannot slip in
+# unnoticed. Each entry maps its context to the env variable the workflow writes it through.
+CONTEXT_OWNER = {
+    "agent/pre-mortem": PREMORTEM,
+    "agent/cubic-review": CUBIC,
+}
+CONTEXT_VAR = {
+    PREMORTEM: "PREMORTEM_CONTEXT",
+    CUBIC: "CUBIC_CONTEXT",
+}
 
 # marker -> the one workflow that owns it, so two comments never overwrite each other.
 MARKERS = {
     "<!-- actions-code-review -->": REVIEW,
     "<!-- actions-mutation-testing -->": MUTATION,
     "<!-- actions-pre-mortem -->": PREMORTEM,
+    "<!-- actions-cubic-review -->": CUBIC,
 }
 
 # The pre-mortem stage's own names: the context it reports (the value CONTEXT_OWNER maps), its
@@ -105,6 +133,14 @@ CONTEXT = "agent/pre-mortem"
 MARKER = "<!-- actions-pre-mortem -->"
 TITLE = "# Pre-Mortem Action"
 SKILL_DIR = "actions-pre-mortem"
+
+# The cubic gate's own names. It runs no agent: cubic reviews the PR itself and the workflow
+# only gates on that review, so it has no skill, no agent job, no model and no verdict regex -
+# its comment title and marker live in the post job that writes the comment.
+CUBIC_CONTEXT = "agent/cubic-review"
+CUBIC_MARKER = "<!-- actions-cubic-review -->"
+CUBIC_TITLE = "# Cubic Review Action"
+CUBIC_SKIP_DESCRIPTION = "skipped: draft PR — cubic reviews only ready PRs"
 
 # Where each workflow takes its free model from. The variables are named after the stage, and
 # all three fall back to the same model and variant, so a repo-wide change is one edit.
@@ -208,6 +244,7 @@ def test_every_agent_workflow_is_a_standalone_per_push_workflow() -> None:
         data = _load(name)
         jobs = data.get("jobs")
         assert isinstance(jobs, dict), f"{name}: jobs is not a mapping"
+
         triggers = _triggers(data)
         events = triggers["pull_request"]["types"]
         for required in ("opened", "synchronize", "reopened"):
@@ -228,8 +265,8 @@ def test_no_agent_workflow_starts_another_workflow() -> None:
     """The abandoned chain connected the stages by hand: a post job ran `gh workflow run`, held
     `actions: write` to allow it, and the next stage took a `workflow_run` trigger. Every one of
     those is now an absence worth pinning - a dispatch that survived a merge would re-run a
-    stage nobody asked for, under rules nobody chose, on a head nobody analysed."""
-    for name in AGENT_WORKFLOWS:
+    stage nobody asked about, under rules nobody chose, on a head nobody analysed."""
+    for name in PIPELINE_WORKFLOWS:
         data = _load(name)
         triggers = _triggers(data)
         for forbidden in ("workflow_run", "repository_dispatch"):
@@ -261,7 +298,8 @@ def test_the_pre_mortem_adds_ready_for_review_and_a_manual_rerun() -> None:
     body = _run(_find_step(resolve, r"^Resolve PR$"))
     assert "INPUT_SHA" in body, "the resolve step ignores the head_sha input"
     assert '!= "$INPUT_SHA"' in body, "a rerun does not check the head it was given"
-    assert "INPUT_PR" in body and "INPUT_SHA" in body, "the inputs reach the shell by env only"
+    assert "INPUT_PR" in body, "the pr_number input does not reach the shell by env"
+    assert "INPUT_SHA" in body, "the head_sha input does not reach the shell by env"
     assert "${{" not in body, "the resolve step interpolates workflow expressions into a shell"
 
 
@@ -314,9 +352,8 @@ def test_the_agent_workflows_share_one_free_model_configuration() -> None:
         ), f"{name}: {env['VARIANT']!r}"
         _job_name, job = _agent_job(_load(name))
         bodies = _job_bodies([job])
-        assert "$MODEL" in bodies and "$VARIANT" in bodies, (
-            f"{name}: the agent is not configured from MODEL/VARIANT"
-        )
+        assert "$MODEL" in bodies, f"{name}: the agent is not configured from MODEL"
+        assert "$VARIANT" in bodies, f"{name}: the agent is not configured from VARIANT"
 
 
 def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
@@ -353,13 +390,13 @@ def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
 
 def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
     """A context typo writes a result under a name nothing reads; a marker two workflows share
-    makes one overwrite the other's comment. The pre-mortem is also the only one of the three
-    that reports a status at all - the siblings present as comments, as
+    makes one overwrite the other's comment. The pre-mortem and the cubic gate are also the
+    only workflows that report a status at all - the siblings present as comments, as
     `.agents/skills/platform-pr-verify` says - so a status write copied into one of them would
     make that comment lie about itself."""
     assert len(set(MARKERS.values())) == len(MARKERS), "two workflows share a comment marker"
     owner_of = {name: context for context, name in CONTEXT_OWNER.items()}
-    for name in AGENT_WORKFLOWS:
+    for name in PIPELINE_WORKFLOWS:
         data = _load(name)
         env = data["env"]
         own_context = owner_of.get(name)
@@ -383,8 +420,14 @@ def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
                 assert marker in poster_body, f"{name}: poster does not carry its own marker"
             else:
                 assert marker not in poster_body, f"{name}: poster references {marker!r}"
-    _job_name, agent = _agent_job(_load(PREMORTEM))
-    assert TITLE in _job_bodies([agent]), "the comment title is not set by the agent job"
+    # The comment titles are set where each comment is written: the pre-mortem's agent job
+    # writes its own comment, the cubic gate posts from its post job.
+    _job_name, premortem_agent = _agent_job(_load(PREMORTEM))
+    assert TITLE in _job_bodies([premortem_agent]), (
+        "the pre-mortem comment title is not set by the agent job"
+    )
+    cubic_poster = _find_step(_load(CUBIC)["jobs"]["post"], r"^Post or update .* comment$")
+    assert CUBIC_TITLE in _run(cubic_poster), "the cubic comment title is unset"
 
 
 def test_the_pre_mortem_marks_the_analysed_commit_pending_once() -> None:
@@ -395,11 +438,11 @@ def test_the_pre_mortem_marks_the_analysed_commit_pending_once() -> None:
     resolve = data["jobs"]["resolve"]
     mark = _find_step(resolve, r"^Mark running$")
     body = _run(mark)
-    assert "-f state=pending" in body and "$PREMORTEM_CONTEXT" in body, "no pending mark"
+    assert "-f state=pending" in body, "no pending mark"
+    assert "$PREMORTEM_CONTEXT" in body, "the pending mark names no context variable"
     assert "steps.pr.outputs.head" in str(mark["env"]["HEAD_SHA"]), "the mark is not on the head"
-    assert "same_repo" in str(mark.get("if", "")) and "number" in str(mark.get("if", "")), (
-        "the mark runs for every PR, including forks"
-    )
+    assert "same_repo" in str(mark.get("if", "")), "the mark runs for every PR, including forks"
+    assert "number" in str(mark.get("if", "")), "the mark runs before the PR is resolved"
     assert _all_run_bodies(data).count("state=pending") == 1, "more than one pending write"
 
 
@@ -410,33 +453,36 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     its own commit, which is the point of asking for it."""
     post = _load(PREMORTEM)["jobs"]["post"]
     body = _run(_find_step(post, r"^Post or update pre-mortem comment$"))
-    assert '"$HEAD_SHA"' in body and ".head.sha" in body, "no head comparison"
+    assert '"$HEAD_SHA"' in body, "no head comparison"
+    assert ".head.sha" in body, "the poster does not read the current head"
     assert "exit 0" in body, "a superseded result does not stop the job"
     assert "not updating the comment" in body, "no reason is logged"
     assert MARKER in body, "the poster carries no marker of its own"
     assert "gh api" in body, "the poster does not use the REST API"
 
 
-def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
-    """The bookkeeping that keeps the stage from stranding `pending`: a resolve failure, a failed
-    agent run, a failed post step and a cancelled run each write `error` for their own context,
-    and each converts a status that is still `pending` rather than overwriting a terminal one.
+@pytest.mark.parametrize("name", [PREMORTEM, CUBIC])
+def test_every_stop_path_leaves_the_stage_context_terminal(name: str) -> None:
+    """The bookkeeping that keeps a stage from stranding `pending`: a resolve failure, a failed
+    run, a failed post step and a cancelled run each write `error` for their own context, and
+    each converts a status that is still `pending` rather than overwriting a terminal one.
     Deleting a reporter, or writing a literal context somewhere, would leave a SHA `pending`
     with no error anywhere - or a typo'd context nothing reads."""
-    data = _load(PREMORTEM)
+    data = _load(name)
     resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
+    context = CONTEXT_VAR[name]
     # The two that report a failure of their own bookkeeping only clear a status that is still
     # pending, so a reporter's failure cannot overwrite a terminal verdict.
     clear_pending_only = ("Report resolve failure", "Report post failure")
     for job, pattern in (
         (resolve, r"^Report resolve failure$"),
-        (post, r"^Report failed pre-mortem run$"),
+        (post, r"^Report failed .* run$"),
         (post, r"^Report post failure$"),
     ):
         step = _find_step(job, pattern)
         body = _run(step)
         assert "state=error" in body, f"{step.get('name')!r} writes no error status"
-        assert "$PREMORTEM_CONTEXT" in body, f"{step.get('name')!r} writes no context variable"
+        assert f"${context}" in body, f"{step.get('name')!r} writes no context variable"
         if step.get("name") in clear_pending_only:
             assert '"$state" = "pending"' in body, (
                 f"{step.get('name')!r} overwrites a terminal status"
@@ -449,7 +495,7 @@ def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
             body = _run(step)
             if "statuses/" not in body:
                 continue
-            assert "$PREMORTEM_CONTEXT" in body, (
+            assert f"${context}" in body, (
                 f"{job_name}/{step.get('name')}: writes a status without the context variable"
             )
             assert not re.search(r'-f context="agent/', body), (
@@ -463,7 +509,7 @@ def test_a_cancelled_run_leaves_no_pending_stage_status() -> None:
     stays `pending` on the SHA with no signal. The reporter only touches a still-pending
     context, so a newer run's terminal verdict survives. A workflow that marks nothing pending
     needs no reporter, which is what keeps this an invariant rather than a chain matrix."""
-    for name in AGENT_WORKFLOWS:
+    for name in (PREMORTEM, CUBIC):
         data = _load(name)
         jobs = data["jobs"]
         if "state=pending" not in _all_run_bodies(data):
@@ -479,20 +525,22 @@ def test_a_cancelled_run_leaves_no_pending_stage_status() -> None:
             f"{name}: reporter does not convert a pending status"
         )
         assert '-z "$state"' not in body, f"{name}: reporter writes where no status exists"
-        assert "$PREMORTEM_CONTEXT" in body, f"{name}: reporter writes no context variable"
+        assert f"${CONTEXT_VAR[name]}" in body, f"{name}: reporter writes no context variable"
 
 
-def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
+@pytest.mark.parametrize("name", [PREMORTEM, CUBIC])
+def test_the_resolve_reporter_falls_back_to_the_resolved_head(name: str) -> None:
     """A first-step failure writes no `head`, yet the run may already have marked the analysed
     commit pending: the reporter then falls back to the commit named by the event, and to the
     dispatch input, so a stranded `pending` still reaches an `error`."""
-    step = _find_step(_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$")
+    step = _find_step(_load(name)["jobs"]["resolve"], r"^Report resolve failure$")
     sha = str(step.get("env", {}).get("HEAD_SHA", ""))
     assert sha.startswith("${{ steps.pr.outputs.head"), (
-        f"the reporter must prefer the resolved head: {sha}"
+        f"{name}: the reporter must prefer the resolved head: {sha}"
     )
-    assert re.search(r"inputs\.head_sha\s*\}\}$", sha), f"no dispatch-input fallback: {sha}"
-    assert step.get("if") == "failure()", f"the reporter is skipped on {step.get('if')!r}"
+    assert "inputs.head_sha" in sha, f"{name}: no dispatch-input fallback: {sha}"
+    assert "github.event.pull_request.head.sha" in sha, f"{name}: no event-head fallback: {sha}"
+    assert step.get("if") == "failure()", f"{name}: the reporter is skipped on {step.get('if')!r}"
 
 
 def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
@@ -626,6 +674,533 @@ def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
         for line in installs:
             assert "--ignore-scripts" in line, f"{name}: npm install without --ignore-scripts"
         assert "node ./postinstall.mjs" in body, f"{name}: opencode's postinstall is not run"
+
+
+# --------------------------------------------------------------------------------------------
+# The cubic gate: a standalone per-push gate on cubic's own review of the PR.
+# --------------------------------------------------------------------------------------------
+
+# Two real cubic review bodies, kept byte for byte as the shapes the classifier has to read:
+# PR #185's review of the agent workflows (one P1) and PR #193's re-review (one P2, the body
+# that says "changes from recent commits"). Their long lines are wrapped across adjacent
+# literals only to stay inside ruff's line limit; concatenated, each body is the review text
+# cubic posted. The synthetic shape below covers the levels they do not (P0, P3) and cubic's
+# "No issues found" body, which lists no violation at all.
+REAL_CUBIC_P1_BODY = (
+    "<!-- cubic:review-summary:start -->\n"
+    "**1 issue found** across 8 files\n"
+    "<!-- cubic:review-summary:end -->\n"
+    "\n"
+    "<details>\n"
+    "<summary>Prompt for AI agents (unresolved issues)</summary>\n"
+    "\n"
+    "```text\n"
+    "\n"
+    "Check if these issues are valid — if so, understand the root cause of each and fix them. "
+    "When an issue isn't valid or won't be fixed in this PR, reply in its thread with the "
+    "reason and then resolve the thread. If appropriate, use sub-agents to investigate and "
+    "fix each issue separately.\n"
+    "\n"
+    "\n"
+    '<file name=".github/workflows/agent-mutation-testing.yml">\n'
+    "\n"
+    '<violation number="1" location=".github/workflows/agent-mutation-testing.yml:415">\n'
+    "P1: The mutation workflow runs from the PR ref, so this token-bearing `post` job is "
+    "PR-controlled; PR-added steps can use `actions: write` to dispatch or cancel workflows. "
+    "Move privileged dispatch logic to a trusted-ref workflow and pass the PR SHA as "
+    "data.</violation>\n"
+    "</file>\n"
+    "```\n"
+    "\n"
+    "</details>\n"
+    "\n"
+    "<sub>**Tip**: Get a Slack DM when cubic finishes reviewing your PRs. "
+    "[Connect Slack](https://www.cubic.dev/settings?tab=integrations&integration=slack"
+    "&utm_source=github)<br /><br />[View guided diff]"
+    "(https://www.cubic.dev/pr/itsjustFred/trading-platform/pull/185?utm_source=github"
+    "&utm_medium=review_footer) | [Turn on auto-fix]"
+    "(https://www.cubic.dev/action/auto-fix/pr/itsjustFred/trading-platform/185"
+    "?returnTo=https%3A%2F%2Fgithub.com%2FitsjustFred%2Ftrading-platform%2Fpull%2F185) | "
+    "[Re-trigger cubic](https://www.cubic.dev/action/re-review/pr/itsjustFred/trading-platform"
+    "/185/ai_pr_review_1794587022913_bed0d7fe-4a29-449c-8590-e487f675c124"
+    "?returnTo=https%3A%2F%2Fgithub.com%2FitsjustFred%2Ftrading-platform%2Fpull%2F185)</sub>\n"
+    "\n"
+    "<!-- cubic:review-post:ai_pr_review_1794587022913_bed0d7fe-4a29-449c-8590-e487f675c124"
+    ":885e6f4abe078d19d4a79a9d74316cb4245366e1:3a8b138a-d997-5f86-bce2-75743e211b61 -->\n"
+)
+
+REAL_CUBIC_P2_BODY = (
+    "<!-- cubic:review-summary:start -->\n"
+    "**1 issue found across 1 file (changes from recent commits).**\n"
+    "<!-- cubic:review-summary:end -->\n"
+    "\n"
+    "<details>\n"
+    "<summary>Prompt for AI agents (unresolved issues)</summary>\n"
+    "\n"
+    "```text\n"
+    "\n"
+    "Check if these issues are valid — if so, understand the root cause of each and fix them. "
+    "When an issue isn't valid or won't be fixed in this PR, reply in its thread with the "
+    "reason and then resolve the thread. If appropriate, use sub-agents to investigate and "
+    "fix each issue separately.\n"
+    "\n"
+    "\n"
+    '<file name="scripts/_cubic_probe.py">\n'
+    "\n"
+    '<violation number="1" location="scripts/_cubic_probe.py:11">\n'
+    "P2: `position_size` divides by the sum of entry and stop instead of the stop distance, "
+    "so an entry of 100 and stop of 95 sizes against 195 rather than 5 and substantially "
+    "under-risks the trade. Use the absolute price difference.</violation>\n"
+    "</file>\n"
+    "```\n"
+    "\n"
+    "</details>\n"
+    "\n"
+    "<sub>Reply with feedback, questions, or to request a fix.<br /><br />[View guided diff]"
+    "(https://www.cubic.dev/pr/itsjustFred/trading-platform/pull/193?utm_source=github"
+    "&utm_medium=review_footer) | [Turn on auto-fix]"
+    "(https://www.cubic.dev/action/auto-fix/pr/itsjustFred/trading-platform/193"
+    "?returnTo=https%3A%2F%2Fgithub.com%2FitsjustFred%2Ftrading-platform%2Fpull%2F193) | "
+    "[Re-trigger cubic](https://www.cubic.dev/action/re-review/pr/itsjustFred/trading-platform"
+    "/193/ai_pr_review_github_delivery_a1c6e09ff5f553669af3a2c82f6fe52a3ecd284bd7f362bff"
+    "33ba7fde10a62c8?returnTo=https%3A%2F%2Fgithub.com%2FitsjustFred%2Ftrading-platform"
+    "%2Fpull%2F193)</sub>\n"
+    "\n"
+    "<!-- cubic:review-post:ai_pr_review_github_delivery_a1c6e09ff5f553669af3a2c82f6fe52a3ecd"
+    "284bd7f362bff33ba7fde10a62c8:9cb7f447993a2ae7d62881883ac6280ade405707"
+    ":f85e2d53-210d-553d-9db6-13e80e2db57b -->\n"
+)
+
+
+def _cubic_body(*violations: str) -> str:
+    """A cubic review body in the shape cubic posts: a summary block and the unresolved
+    findings with their priority prefix inside the AI-agents prompt."""
+    inner = "".join(
+        f'<violation number="1" location="a.py:1">\n{v}\n</violation>\n' for v in violations
+    )
+    return (
+        "<!-- cubic:review-summary:start -->\n**x**\n<!-- cubic:review-summary:end -->\n\n"
+        "<details>\n<summary>Prompt for AI agents (unresolved issues)</summary>\n\n"
+        "```text\n" + inner + "```\n\n</details>\n"
+    )
+
+
+def test_the_cubic_gate_is_a_standalone_per_push_workflow() -> None:
+    """The cubic gate is a workflow of its own, not a stage somebody dispatches: it runs on
+    every push to the PR itself (opened, a synchronize, a reopen, and the moment a draft
+    becomes ready), it cancels only its own superseded runs, and a manual rerun names the PR -
+    and, for an older commit, the SHA - through the dispatch inputs, which reach the shell as
+    env, never interpolated."""
+    data = _load(CUBIC)
+    jobs = data["jobs"]
+    assert isinstance(jobs, dict), f"{CUBIC}: jobs is not a mapping"
+    triggers = _triggers(data)
+    events = triggers["pull_request"]["types"]
+    for required in ("opened", "synchronize", "reopened", "ready_for_review"):
+        assert required in events, f"{CUBIC}: does not run on {required}"
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"pr_number", "head_sha"}, f"{CUBIC}: dispatch inputs {sorted(inputs)}"
+    assert inputs["pr_number"]["required"] is True, "a rerun must name the PR"
+    assert inputs["head_sha"]["required"] is False, "an older commit is optional"
+    assert set(jobs) >= {"resolve", "wait", "post"}, f"{CUBIC}: jobs are {list(jobs)}"
+    concurrency = data["concurrency"]
+    group = str(concurrency["group"])
+    assert group.startswith("agent-cubic-review"), f"{CUBIC}: group {group!r} is not its own"
+    assert "pull_request.number" in group, f"{CUBIC}: group {group!r} is not per PR"
+    assert concurrency["cancel-in-progress"] is True, f"{CUBIC}: keeps superseded runs"
+    resolve = _run(_find_step(jobs["resolve"], r"^Resolve PR$"))
+    assert "INPUT_PR" in resolve, "the resolve step ignores the pr_number input"
+    assert "INPUT_SHA" in resolve, "the resolve step ignores the head_sha input"
+    assert "${{" not in resolve, "the resolve step interpolates workflow expressions into a shell"
+
+
+def test_the_cubic_gate_holds_no_secret_and_runs_no_repo_code() -> None:
+    """The gate reads reviews and writes statuses and one comment; it runs no agent and no
+    repo code, so there is nothing from the PR to sandbox and no checkout to make. The only
+    secret is the default token the API calls need, and each job's permissions are the ones
+    its own steps use - the narrower the better, since the workflow file itself runs from the
+    PR's ref on pull_request."""
+    data = _load(CUBIC)
+    jobs = data["jobs"]
+    for job_name, job in jobs.items():
+        for step in _steps(job):
+            assert not str(step.get("uses", "")).startswith("actions/checkout"), (
+                f"{job_name}/{step.get('name')!r}: checks out the PR's code"
+            )
+    bodies = _all_run_bodies(data)
+    for forbidden in ("opencode", "npm install"):
+        assert forbidden not in bodies, f"the cubic gate runs {forbidden!r}"
+    expected_permissions = {
+        "resolve": {"pull-requests": "read", "statuses": "write"},
+        "wait": {"pull-requests": "read"},
+        "post": {"pull-requests": "write", "statuses": "write"},
+        "report-cancelled": {"statuses": "write"},
+    }
+    for job_name, permissions in expected_permissions.items():
+        assert jobs[job_name].get("permissions") == permissions, (
+            f"{job_name}: permissions are {jobs[job_name].get('permissions')}"
+        )
+    for job_name, job in jobs.items():
+        for step in _steps(job):
+            secrets = [v for v in map(str, _step_env(job, step).values()) if "secrets." in v]
+            for secret in secrets:
+                assert secret == "${{ secrets.GITHUB_TOKEN }}", (
+                    f"{job_name}/{step.get('name')!r}: holds {secret}"
+                )
+
+
+def test_the_cubic_gate_waits_only_for_cubics_own_review_of_the_head() -> None:
+    """cubic reviews the PR itself, and the gate only waits for a review of the analysed
+    commit: the poll is filtered to the cubic bot, the head SHA and cubic's own review-summary
+    marker, so a review of an older or newer commit is not this gate's verdict. The wait is
+    bounded (40 attempts, 30 s apart: 20 minutes), it stops the moment the head moves on, and
+    the poster refuses to overwrite the comment of a head that moved past it."""
+    data = _load(CUBIC)
+    jobs = data["jobs"]
+    for key in ("verdict", "blocking", "advisory", "review_id"):
+        assert key in jobs["wait"].get("outputs", {}), f"the wait job publishes no {key}"
+
+    wait = _run(_find_step(jobs["wait"], r"^Wait for cubic review$"))
+    assert "pulls/${PR_NUMBER}/reviews" in wait, "the wait step does not read PR reviews"
+    assert "commit_id == $sha" in wait, "the wait step accepts a review of another commit"
+    assert "contains($marker)" in wait, "the wait step does not require cubic's summary marker"
+    assert "seq 1 40" in wait, "the wait is not bounded to 40 attempts"
+    assert "sleep 30" in wait, "the wait does not poll every 30 seconds"
+    assert 'if [ "$head" != "$HEAD_SHA" ]' in wait, "the wait step never notices a moved head"
+
+    poster = _run(_find_step(jobs["post"], r"^Post or update cubic-review comment$"))
+    assert "not updating the comment" in poster, "the poster does not guard a moved head"
+    assert "exit 0" in poster, "a moved head does not stop the poster"
+
+
+def _cubic_classify(
+    tmp_path, reviews: list[dict], found: str = "true", superseded: str = "false"
+) -> dict:
+    """Run the cubic workflow's own classification step on ``reviews``."""
+    step = _find_step(_load(CUBIC)["jobs"]["wait"], r"^Classify cubic findings$")
+    (tmp_path / "cubic").mkdir()
+    (tmp_path / "cubic" / "reviews.json").write_text(json.dumps(reviews), encoding="utf-8")
+    out = tmp_path / "github_output"
+    out.write_text("", encoding="utf-8")
+    env = {
+        **os.environ,
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_OUTPUT": str(out),
+        "FOUND": found,
+        "SUPERSEDED": superseded,
+    }
+    subprocess.run(
+        [shutil.which("bash") or "bash", "-c", _run(step)],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=tmp_path,
+        env=env,
+    )
+    return dict(
+        line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if "=" in line
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    ("body", "found", "superseded", "verdict", "blocking", "advisory"),
+    [
+        # Nothing found: cubic's "No issues found" body has no violation block at all.
+        (_cubic_body(), "true", "false", "PASS", "0", "0"),
+        # A P1 blocks; a P2 alone does not.
+        (_cubic_body("P1: a real defect"), "true", "false", "BLOCK", "1", "0"),
+        (_cubic_body("P2: worth a look"), "true", "false", "PASS", "0", "1"),
+        # P0 blocks as well, and the advisory levels are still counted.
+        (
+            _cubic_body("P0: live-trading data loss", "P1: wrong side", "P2: clarity", "P3: nit"),
+            "true",
+            "false",
+            "BLOCK",
+            "2",
+            "2",
+        ),
+        # The real bodies: PR #185's P1 review blocks, PR #193's P2 re-review passes with one
+        # advisory finding.
+        (REAL_CUBIC_P1_BODY, "true", "false", "BLOCK", "1", "0"),
+        (REAL_CUBIC_P2_BODY, "true", "false", "PASS", "0", "1"),
+        # No cubic review of the head commit: the gate could not run, which is an error.
+        (_cubic_body(), "false", "false", "INCOMPLETE", "0", "0"),
+        # The head moved on while waiting: the newer push has its own run.
+        (_cubic_body(), "false", "true", "SUPERSEDED", "0", "0"),
+    ],
+)
+def test_the_cubic_priorities_map_to_the_stage_status(
+    body, found, superseded, verdict, blocking, advisory, tmp_path
+) -> None:
+    """cubic's priorities are the gate: P0/P1 block, P2/P3 are advisory. The classification runs
+    on the newest review of the head commit, and its verdicts must land in the status map the
+    post job applies - a P1 reported as success would be the gate lying. The status mapping is
+    exactly that: P0/P1 failure, P2/P3 success; the rule that a P2 is still handled like a
+    should-fix finding lives in the skill, not in a redder status."""
+    result = _cubic_classify(
+        tmp_path,
+        [{"id": 42, "body": body}] if found == "true" else [],
+        found=found,
+        superseded=superseded,
+    )
+    assert result["verdict"] == verdict
+    assert result["blocking"] == blocking
+    assert result["advisory"] == advisory
+
+    post = _load(CUBIC)["jobs"]["post"]
+    step = _run(_find_step(post, r"^Set status$"))
+    case = re.search(r'case "\$VERDICT" in(.*?)\n\s*esac', step, re.S)
+    assert case, 'the cubic post job has no `case "$VERDICT"` map'
+    pairs = {}
+    for arm, state in re.findall(r"^\s*([A-Z|]+)\)\s*state=(\w+);", case.group(1), re.M):
+        for name in arm.split("|"):
+            pairs[name] = state
+    # The map is total: INCOMPLETE has no arm and must reach the catch-all, which is an error.
+    assert "*) state=error" in re.sub(r"\s+", " ", case.group(1)), "the cubic map is not total"
+    expected_state = {"PASS": "success", "BLOCK": "failure", "SUPERSEDED": "error"}.get(verdict)
+    if expected_state is None:
+        assert verdict not in pairs, f"{verdict} has an arm but is not a documented verdict"
+    else:
+        assert pairs.get(verdict) == expected_state, (
+            f"{verdict} does not map to the documented status: {pairs}"
+        )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_the_cubic_classification_reads_only_the_newest_review_of_the_commit(tmp_path) -> None:
+    """cubic posts a new review on a re-review, and the older one stays. The newest review is
+    the current verdict, as the newest status would be: a re-review that clears the finding must
+    not stay blocked by the body of the review it replaced."""
+    result = _cubic_classify(
+        tmp_path,
+        [
+            {"id": 43, "body": _cubic_body()},
+            {"id": 42, "body": _cubic_body("P1: already fixed")},
+        ],
+    )
+    assert result["verdict"] == "PASS"
+    assert result["blocking"] == "0"
+    assert result["review_id"] == "43"
+
+
+CUBIC_REPO = "itsjustFred/trading-platform"
+CUBIC_PR_NUMBER = 201
+CUBIC_PR_HEAD = "c" * 40
+
+# A `gh` for the cubic workflow's own steps: a shell function, so no executable has to be found
+# on PATH (portable to Git Bash). It logs every call to $GH_LOG, answers GETs of a pull request
+# or of a commit status from the fixture files, and accepts every write without sending it.
+_GH_STUB = r"""gh() {
+  local path jq_expr method src
+  printf '%s\n' "$*" >> "$GH_LOG"
+  [ "${1:-}" = api ] || return 1
+  path=""
+  jq_expr=""
+  method=GET
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --jq) jq_expr=$2; shift 2 ;;
+      --method) method=$2; shift 2 ;;
+      -f|-F) shift 2 ;;
+      -*) shift ;;
+      *) path=$1; shift ;;
+    esac
+  done
+  [ "$method" = GET ] || return 0
+  case "$path" in
+    */pulls/*) src=$GH_PR_JSON ;;
+    */status) src=$GH_STATUS_JSON ;;
+    *) echo "gh stub: unexpected GET $path" >&2; return 1 ;;
+  esac
+  if [ -n "$jq_expr" ]; then jq -r "$jq_expr" "$src"; else cat "$src"; fi
+}
+"""
+
+
+def _cubic_pr_payload(*, draft: bool) -> dict:
+    return {
+        "number": CUBIC_PR_NUMBER,
+        "state": "open",
+        "draft": draft,
+        "base": {"sha": "b" * 40},
+        "head": {
+            "sha": CUBIC_PR_HEAD,
+            "ref": "chore/coderabbit-on-demand",
+            "repo": {"full_name": CUBIC_REPO},
+        },
+    }
+
+
+def _run_cubic_step(
+    root: Path, step_body: str, *, env: dict[str, str], pr: dict, statuses: list[dict]
+) -> tuple[subprocess.CompletedProcess, dict[str, str], str]:
+    """Run one step of the cubic workflow with the stub `gh`. Returns the process, the outputs
+    the step wrote to GITHUB_OUTPUT, and the calls it made to `gh`."""
+    work = root / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    (root / "pr.json").write_text(json.dumps(pr), encoding="utf-8")
+    (root / "status.json").write_text(json.dumps({"statuses": statuses}), encoding="utf-8")
+    (root / "event.json").write_text(json.dumps({"pull_request": pr}), encoding="utf-8")
+    (root / "output").write_text("", encoding="utf-8")
+    (root / "calls.log").write_text("", encoding="utf-8")
+    run_env = {
+        **os.environ,
+        "CUBIC_CONTEXT": str(_load(CUBIC)["env"]["CUBIC_CONTEXT"]),
+        "GH_LOG": str(root / "calls.log"),
+        "GH_PR_JSON": str(root / "pr.json"),
+        "GH_STATUS_JSON": str(root / "status.json"),
+        "GITHUB_OUTPUT": str(root / "output"),
+        "GITHUB_EVENT_PATH": str(root / "event.json"),
+        "GITHUB_REPOSITORY": CUBIC_REPO,
+        "RUNNER_TEMP": str(work),
+        **env,
+    }
+    proc = subprocess.run(
+        [shutil.which("bash") or "bash", "-c", _GH_STUB + "\n" + step_body],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=work,
+        env=run_env,
+    )
+    outputs = dict(
+        line.split("=", 1)
+        for line in (root / "output").read_text(encoding="utf-8").splitlines()
+        if "=" in line
+    )
+    return proc, outputs, (root / "calls.log").read_text(encoding="utf-8")
+
+
+NEEDS_BASH_AND_JQ = pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
+)
+
+
+@NEEDS_BASH_AND_JQ
+def test_a_draft_head_resolves_without_a_call_and_is_written_as_a_success(tmp_path) -> None:
+    """cubic does not review drafts, so a draft's gate must not wait 20 minutes for a review
+    that never comes: the resolve step answers from the event payload alone (no API call, so
+    there is nothing it could gate on), and the draft exit is a success that says why."""
+    jobs = _load(CUBIC)["jobs"]
+    resolve = _run(_find_step(jobs["resolve"], r"^Resolve PR$"))
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path / "resolve",
+        resolve,
+        env={"GITHUB_EVENT_NAME": "pull_request", "INPUT_PR": "", "INPUT_SHA": ""},
+        pr=_cubic_pr_payload(draft=True),
+        statuses=[],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs["current"] == "true"
+    assert outputs["draft"] == "true"
+    assert calls == "", "resolving a draft calls the API, so it could gate on something"
+
+    skip = _run(_find_step(jobs["resolve"], r"^Skip draft PR$"))
+    proc, _outputs, calls = _run_cubic_step(
+        tmp_path / "skip",
+        skip,
+        env={"HEAD_SHA": CUBIC_PR_HEAD},
+        pr=_cubic_pr_payload(draft=True),
+        statuses=[],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert f"repos/{CUBIC_REPO}/statuses/{CUBIC_PR_HEAD}" in calls, (
+        "the skip writes to another commit"
+    )
+    assert "-f state=success" in calls
+    assert "-f context=agent/cubic-review" in calls
+    assert f"-f description={CUBIC_SKIP_DESCRIPTION}" in calls
+    assert "state=error" not in calls, "a draft head is written as an error"
+    assert "state=pending" not in calls, "a draft head is marked running"
+
+
+@NEEDS_BASH_AND_JQ
+def test_a_draft_head_is_never_waited_for_and_is_written_as_a_success() -> None:
+    """The draft exit is a static pin as well as a behaviour: the status the mark-running step
+    writes and the wait job both exclude drafts, so a draft cannot sit `pending` for 20 minutes
+    and end as `error`."""
+    jobs = _load(CUBIC)["jobs"]
+    assert "draft" in _find_step(jobs["resolve"], r"^Mark running$")["if"], (
+        "Mark running does not exclude drafts"
+    )
+    assert "draft" in jobs["wait"]["if"], "the wait job does not exclude drafts"
+    skip = _find_step(jobs["resolve"], r"^Skip draft PR$")
+    assert "draft" in skip["if"], "the skip step runs on ready PRs"
+    assert "state=success" in _run(skip), "the skip step does not write success"
+
+
+@NEEDS_BASH_AND_JQ
+@pytest.mark.parametrize(
+    ("state", "closes"),
+    [
+        # A still-pending status of the superseded commit is closed, so it does not strand.
+        ("pending", True),
+        # A terminal status stands: the reporter converts a pending mark, nothing else.
+        ("failure", False),
+        ("success", False),
+    ],
+)
+def test_a_superseded_rerun_closes_only_its_own_pending_status(state, closes, tmp_path) -> None:
+    """A manual rerun that names a commit the head moved past has nothing to gate: the newer
+    push has its own run. It closes what it marked on that commit - only its own context, and
+    only while it is still `pending` - so no SHA is stranded, and a status another workflow
+    owns is never touched."""
+    stale = "d" * 40
+    resolve = _run(_find_step(_load(CUBIC)["jobs"]["resolve"], r"^Resolve PR$"))
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path,
+        resolve,
+        env={
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "INPUT_PR": str(CUBIC_PR_NUMBER),
+            "INPUT_SHA": stale,
+        },
+        pr=_cubic_pr_payload(draft=False),
+        statuses=[{"context": "agent/cubic-review", "state": state}],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs["current"] == "false", "a superseded rerun still runs the gate"
+    assert CUBIC_PR_HEAD not in calls, "the superseded rerun reads or writes the new head"
+    assert f"repos/{CUBIC_REPO}/commits/{stale}/status" in calls, (
+        "the rerun does not read the status of the commit it was given"
+    )
+    if closes:
+        assert "--method" in calls, "a pending status of the superseded commit is not closed"
+        assert "-f state=error" in calls
+        assert "-f context=agent/cubic-review" in calls
+    else:
+        assert "--method" not in calls, f"a {state} status is overwritten"
+
+
+@NEEDS_BASH_AND_JQ
+@pytest.mark.parametrize("head_sha", ["", CUBIC_PR_HEAD])
+def test_a_dispatch_of_the_current_head_gates_normally(head_sha, tmp_path) -> None:
+    """The manual rerun is how a rate-limited or failed gate runs again: it resolves the PR by
+    number, gates the current head whether or not the SHA is named, and reads no other
+    workflow's status - there is no chain left to wait for."""
+    resolve = _run(_find_step(_load(CUBIC)["jobs"]["resolve"], r"^Resolve PR$"))
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path,
+        resolve,
+        env={
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "INPUT_PR": str(CUBIC_PR_NUMBER),
+            "INPUT_SHA": head_sha,
+        },
+        pr=_cubic_pr_payload(draft=False),
+        statuses=[],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert f"repos/{CUBIC_REPO}/pulls/{CUBIC_PR_NUMBER}" in calls, "the rerun does not read the PR"
+    assert outputs["current"] == "true", "a rerun of the current head does not gate"
+    assert outputs["head"] == CUBIC_PR_HEAD
+    assert outputs["number"] == str(CUBIC_PR_NUMBER)
+    assert outputs["same_repo"] == "true"
+    assert outputs["draft"] == "false"
+    assert "--method" not in calls, "resolving writes a status"
+    assert "/status" not in calls, "the gate reads another workflow's status"
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:

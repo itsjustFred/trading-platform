@@ -1,20 +1,30 @@
 ---
 name: platform-pr-verify
-description: Mandatory verification pipeline for every trading-platform pull request. Reads the SonarCloud check run, the three independent per-push Agent Actions (Code Review, Mutation Testing, Pre-Mortem) and the CodeRabbit CLI results, fixing findings and re-running until every stage passes without relevant findings. Use after pushing a PR, and when watching or babysitting one.
+description: Mandatory verification pipeline for every trading-platform pull request. Reads the SonarCloud check run, the four independent per-push Agent Actions (Code Review, Mutation Testing, Pre-Mortem, Cubic Review) and an on-demand CodeRabbit review, fixing findings and re-running until every stage passes without relevant findings. Use after pushing a PR, and when watching or babysitting one.
 ---
 
-Use this guide as the verification pipeline for the PR. Most stages run in GitHub Actions; your job is to read their results, fix what they find, and run the last stage yourself.
+Use this guide as the verification pipeline for the PR. Every stage runs in GitHub Actions; your job is to read their results, fix what they find, and ask for the on-demand second opinion when it is needed.
 
 ## Stages
 
-The three agent workflows are independent: each one runs by itself on every push to an open PR, none of them starts another, and each upserts one PR comment of its own. SonarCloud runs separately on each push as well. Every push re-runs them all on the new head commit; results of older commits no longer count. Fork PRs get no agent run, and the pre-mortem skips drafts until the PR is ready for review.
+The four agent workflows are independent: each one runs by itself on every push to an open PR, none of them starts another, and each upserts one PR comment of its own. SonarCloud runs separately on each push as well. Every push re-runs them all on the new head commit; results of older commits no longer count. Fork PRs get no agent run, and the cubic gate skips drafts until the PR is ready for review.
 
 1. **SonarCloud** (check run `SonarCloud Code Analysis`, runs on each push). Passes when the quality gate is green. A failure can be acceptable (e.g. Cognitive Complexity too high on an unimportant function, or a rule the user explicitly accepted).
    - Read the PR comment, or list the issues with `sonar list issues --project itsjustFred_trading-platform --pull-request <N> --format toon`. With many issues the output gets large (PR #139: about 190k characters), so filter with `--severities` or redirect to a file and search it instead of reading it whole.
 2. **Agent Code Review** (`.github/workflows/agent-code-review.yml`). A read-only agent hunts logic errors first, then clarity, then spec and repo standards, and posts one comment titled `# Code Review Action` (updated in place on later pushes). It writes no commit status; the comment is the signal.
 3. **Agent Mutation Testing** (`.github/workflows/agent-mutation-testing.yml`). Mutates the PR's changed production Python and posts one comment titled `# Mutation Testing Action` listing survived mutations with the test that would catch each. It writes no commit status either. A mutation that was left in place fails the run instead of posting.
 4. **Agent Pre-Mortem** (`.github/workflows/agent-pre-mortem.yml`, commit status `agent/pre-mortem`). A read-only agent writes the post-mortems of what this change could break later - wrong trade, wrong backtest result, silent failure, data loss - and posts one comment titled `# Pre-Mortem Action` listing ranked scenarios, each with its `file:line`, trigger, impact and mitigation. On the analysed commit the status is `success` = PASS, `failure` = BLOCK or CHANGES-REQUESTED, `error` = INCOMPLETE or the run failed (an infra failure, e.g. the free model's usage limit; re-run the job). A result for a commit that is no longer the head still lands its status on its own commit but leaves the newer comment alone.
-5. **CodeRabbit CLI** (you run it). Only after stages 1-4 all passed on the head commit. Info and trivial findings are allowed. The free tier allows 150 files per review and 3 reviews per hour; when rate-limited, the CLI shows the remaining time. Docs: https://docs.coderabbit.ai/cli
+5. **Cubic** (`.github/workflows/agent-cubic-review.yml`, commit status `agent/cubic-review`). cubic.dev is a GitHub App that reviews every PR by itself, on open and on every push; the workflow gates on that review: it waits (up to 20 minutes) for cubic's review of the head commit, then classifies its findings by cubic's own priority: **P0/P1 block** the gate, **P2/P3 are advisory**. It posts one comment titled `# Cubic Review Action` with the counts and a link to the review. Status: `success` = reviewed, no P0/P1, or skipped because the PR is a draft; `failure` = at least one P0/P1; `error` = no cubic review of the head commit within the wait, the run failed, or not run.
+   - The inline comments are cubic's; each carries its priority in the first line (`P1: ...`) and a "Prompt for AI agents" block. Read them in the PR, not in the gate's comment.
+   - Treat a **P0, P1 or P2 finding like a should-fix finding of the agent code review**: fix it in the PR, or answer it in its thread with why it does not apply and resolve the thread. The status mapping stays what it is (only P0/P1 turn the gate red); this rule is what a P2 or P3 has to clear before the PR is ready for a human, and a real P2 belongs in the same push as the blocking findings.
+   - Draft PRs: cubic does not review drafts, so on a draft head the gate writes `success` with the description "skipped: draft PR — cubic reviews only ready PRs" and waits for nothing. Marking the PR ready (`ready_for_review`) runs the gate again by itself.
+   - A ready commit cubic never reviewed (rate limit, skipped run) ends as `error`, not `failure`: re-trigger cubic from its review footer ("Re-trigger cubic"), then re-run the workflow by hand.
+
+**CodeRabbit** is not a stage. Auto-review is off in the CodeRabbit dashboard; it is an on-demand second opinion. Trigger it with a PR comment `@coderabbitai review` only for:
+- money-path or live-execution changes: `live_runner/`, broker adapters, order sizing/placement, risk gates, the live daemon, anything that can move money;
+- a disagreement between cubic and the agent code review about the same finding, where a third opinion decides.
+
+Read its result as advisory: fix real findings, and do not dismiss one just because another reviewer missed it.
 
 Read the state of the head commit with:
 
@@ -23,23 +33,24 @@ gh api repos/itsjustFred/trading-platform/commits/<head-sha>/status --jq '.statu
 gh api repos/itsjustFred/trading-platform/commits/<head-sha>/check-runs --jq '.check_runs[] | "\(.name): \(.status) \(.conclusion)"'
 ```
 
-Only the pre-mortem writes a commit status; the review and mutation stages present as comments. The bot comments of a PR:
+The pre-mortem and the cubic gate write commit statuses; the code review and mutation stages present as comments. The bot comments of a PR:
 
 ```
 gh api --paginate "repos/itsjustFred/trading-platform/issues/<N>/comments" --jq '.[] | select(.user.login == "github-actions[bot]") | "\(.id)  \(.body[:60])"'
 ```
 
-If you run in T3 Code, use the `watch_pull_request` tool instead of writing a watcher, polling or sleeping; it notifies you when the linked PR changes. All three agent stages start on the same push and run in parallel: the mutation test takes up to 75 minutes, the pre-mortem up to 30, so CodeRabbit usually waits for both.
+If you run in T3 Code, use the `watch_pull_request` tool instead of writing a watcher, polling or sleeping; it notifies you when the linked PR changes. All four agent stages start on the same push and run in parallel: the mutation test takes up to 75 minutes, the pre-mortem up to 30, the cubic wait up to 20, so a CodeRabbit review usually waits for all of them.
 
 ## Fix loop
 
-If a stage fails, fix the issue, push, and read the new result for the new head; only when every stage passed, go on to the CodeRabbit CLI.
+If a stage fails, fix the issue, push, and read the new result for the new head; only when every stage passed, trigger a CodeRabbit review if one is wanted.
 
 - **SonarCloud / Code Review:** fix each relevant finding in the PR (code, tests or docs) and push. The stage re-runs on the new head.
 - **Mutation Testing:** a survived mutation means a missing test case. Add the test the comment proposes (or a better one) to the PR, check locally that it fails on the mutation and passes without it, push.
 - **Pre-Mortem:** a Severe or Moderate scenario is a hardening task. Add the smallest change that stops it - the assertion, invariant, test or comment the scenario names as mitigation - to the PR, push. A scenario judged implausible is an override, not a fix (see below); say why in a PR comment.
-- **CodeRabbit:** fix the findings, push, and read all four stages again before re-running the CLI.
-- Collect the fixes into one push where you can: every push re-runs the three agent workflows and SonarCloud, and costs Actions minutes.
+- **Cubic:** a P0/P1 finding is a blocking defect: fix it, push, and read the new result for the new head. If the finding does not apply, reply in its thread with the reason and resolve the thread; if that leaves the gate red, override it (below). P2/P3 need no action to pass the gate, but they are handled like review should-fixes - fix the real ones in the same push as the blocking findings.
+- **CodeRabbit** (when you triggered it): fix the findings, push, and read every stage again.
+- Collect the fixes into one push where you can: every push re-runs the four agent workflows and SonarCloud, and costs Actions minutes.
 
 The models in the Actions (named in each comment's footer) may be weaker than you. Check every finding against the code before acting on it: fix what is real, and do not dismiss a finding just because the model is small.
 
@@ -48,12 +59,13 @@ The models in the Actions (named in each comment's footer) may be weaker than yo
 If a stage is red but every remaining finding is irrelevant (false positive, out of scope, accepted by the user), the stage may be recorded as overridden - nothing needs to be started by hand, since every push re-runs all of them:
 
 1. Post one PR comment headed `Pipeline override: <stage>` for the head commit. Give each finding its own line with the reason it does not apply. A blanket "findings irrelevant" is not enough; a human reads these reasons before merging.
-2. An agent stage can also be re-run by hand for a specific commit, e.g. the pre-mortem after an infra failure, or for a commit whose run was missed:
+2. An agent stage can also be re-run by hand for a specific commit, e.g. the pre-mortem after an infra failure, the cubic gate after a rate limit, or a commit whose run was missed:
    - `gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>` (omit `head_sha` for the current head).
+   - `gh workflow run agent-cubic-review.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>` (omit `head_sha` for the current head).
    - The review and mutation workflows have no manual trigger; a push re-runs them.
 
 An override applies to the commit it was written for. After a new push, judge the new results again.
 
 ## Done
 
-The loop is done when, on the current head commit, every stage passed or was overridden as above, and the CodeRabbit CLI has no findings beyond info or trivial. Then set the `ready-for-human` label. Any further change to the PR re-runs the agent workflows; remove `ready-for-human` while you work and re-add it once the pipeline passes again.
+The loop is done when, on the current head commit, every stage passed or was overridden as above, cubic has no unresolved P0/P1 finding, and any CodeRabbit review you triggered has no findings beyond info or trivial. Then set the `ready-for-human` label. Any further change to the PR re-runs the agent workflows; remove `ready-for-human` while you work and re-add it once the pipeline passes again.
