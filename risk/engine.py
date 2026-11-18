@@ -6,6 +6,12 @@ from dataclasses import dataclass
 
 from risk.config import RiskConfig
 from risk.models import RiskDecision, SizedOrder, TradeSignal
+from shared.trailing import (
+    RISK_ENGINE_SUPPORTED_TRAILING_MODES,
+    TRAILING_MODE_NONE,
+    validate_trailing_percent,
+    validate_trailing_sl_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +171,11 @@ class RiskEngine:
         - ``config.max_total_exposure``: aggregate open-risk ceiling, fraction.
         - ``config.max_risk_per_trade``: maximum loss on this trade, fraction.
         - ``config.max_notional_per_trade``: default notional ceiling for the
-          resulting position, as a fraction of balance.
+          resulting position, as a fraction of balance. The position's notional
+          is ``position_size * entry_price * pip_value`` in account currency.
+        - ``pip_value``: account-currency P&L of one ``position_size`` unit per
+          1.0 price move (1.0 for shares in the account currency; cTrader
+          EURUSD on a USD account: 1000 per 0.01 lot).
         - ``max_notional_per_trade``: optional caller-specific ceiling, used by
           engines whose leverage policy is independent of the risk config.
 
@@ -346,9 +356,15 @@ class RiskEngine:
         raw_size = risk_amount / (risk_distance * pip)
         position_size = max(0.0, raw_size)
         max_notional = balance * notional_limit
+        # #146: ``pip`` is the account-currency value of one size unit per 1.0
+        # price move, so one unit's notional in account currency is
+        # ``entry_price * pip`` (cTrader EURUSD, USD account: 1.10 * 1000 =
+        # 1,100 USD per 0.01 lot). Comparing ``size * entry_price`` alone made
+        # the cap 1000x too loose there. pip == 1.0 (shares) is unchanged.
+        notional_per_unit = signal.entry_price * pip
         capped_by_notional = False
-        if position_size * signal.entry_price > max_notional:
-            position_size = max_notional / signal.entry_price
+        if position_size * notional_per_unit > max_notional:
+            position_size = max_notional / notional_per_unit
             capped_by_notional = True
         # risk_amount/risk_percent stay the policy figures sizing was asked for
         # (they anchor the validation-reference parity contract); the realized
@@ -400,24 +416,27 @@ class RiskEngine:
         if price <= 0:
             raise ValueError("market_price must be > 0")
 
-        trailing_cfg = signal.metadata.get("trailing_sl_config")
-        if not isinstance(trailing_cfg, dict):
+        # #150 fail closed: an unknown mode, a malformed config, or a mode the
+        # engine cannot execute (e.g. supertrend_flip, which the replay adapter
+        # runs itself as a position workflow, #168) raises — the
+        # old warned no-op traded signals without the trailing they requested.
+        # Executing paths must gate their own supported set BEFORE calling this
+        # (replay: shared.trailing.REPLAY_SUPPORTED_TRAILING_MODES) so the
+        # signal is refused instead of traded untrailed; this check is the
+        # engine's own last line of defence.
+        mode = validate_trailing_sl_config(
+            signal.metadata.get("trailing_sl_config"),
+            supported=RISK_ENGINE_SUPPORTED_TRAILING_MODES,
+            context=f"risk engine trailing for {signal.symbol}",
+        )
+        if mode is None or mode == TRAILING_MODE_NONE:
+            # No trailing requested, or explicit "initial stop only".
             return signal.stop_loss
 
-        mode = str(trailing_cfg.get("mode") or "").strip().lower()
-        if mode != "percent":
-            # C1: unsupported trailing modes (e.g. supertrend_flip) are an
-            # explicit warned no-op — never a silent one.
-            logger.warning(
-                "Unsupported trailing stop mode %r; leaving stop unchanged",
-                mode,
-                extra={"data": {"symbol": signal.symbol, "mode": mode}},
-            )
-            return signal.stop_loss
-
-        percent = float(trailing_cfg.get("percent") or 0.0)
-        if percent <= 0 or percent >= 1:
-            raise ValueError("trailing_sl_config.percent must be between 0 and 1")
+        percent = validate_trailing_percent(
+            signal.metadata["trailing_sl_config"],
+            context=f"risk engine trailing for {signal.symbol}",
+        )
 
         action = signal.action
         current_stop = signal.stop_loss

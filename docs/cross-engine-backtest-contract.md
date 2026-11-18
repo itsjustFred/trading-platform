@@ -73,7 +73,8 @@ no-gate. Engines agree on the boundary semantics (pinned by cross-engine
 conformance tests).
 
 **Signal exit fill convention (A-M1/D4).** A signal exit (not a protective
-level exit) fills at the **trigger bar's close** by default; the convention
+level exit) fills at the **trigger bar's close** by default (exception: the
+`supertrend_flip` leg, filled at the next bar's open, see below); the convention
 is one place — `_prepare_next_open_execution_data` keeps the exit leg
 unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
 `close`/`open`) selects `open` to fill at the exit bar's open instead for
@@ -189,8 +190,16 @@ behavior**, not a bug to be fixed by silently changing one engine:
 | Engine | Model | Meaning |
 |---|---|---|
 | native / vectorbt | next-bar-open | Signal on bar *N* fills at bar *N+1* open; protective exits evaluated per bar (vectorbt: per intrabar sub-bar). |
-| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close; slippage/delay recorded in `trade.meta`. |
+| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close; slippage/delay recorded in `trade.meta`. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
+
+**`supertrend_flip` exit (signal-replay, #168).** The flip leg is a signal exit
+decided at the close of the first red bar after activation and filled at the
+OPEN of the next bar, so a flip on the last bar closes as `end_of_data` at that
+bar's close. This is the only replay exit that is not a level and not a
+same-bar-close fill. The run-level `signal_exit_fill` stays `close` for replay
+(the replay has no `open` model); each flip trade records
+`meta["supertrend_flip"]["flip_exit_fill"] = "next_bar_open"`.
 
 **Pynecore restatement containment.** `_normalize_trade_exits` tightens a
 level-violating exit leg to the recorded protective level:

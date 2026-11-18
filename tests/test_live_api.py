@@ -244,6 +244,16 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": account_id, "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_services",
@@ -438,6 +448,16 @@ def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     import viewer.main as viewer_main_module
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": "ct-1", "broker": "ctrader", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_accounts",
@@ -2780,6 +2800,16 @@ def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatc
     import viewer.main as viewer_main_module
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": "acc-1", "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_services",
@@ -2843,3 +2873,254 @@ def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatc
     response = client.post("/api/live/deployments", json=payload)
     assert response.status_code == 400
     assert "must route to Alpaca account" in response.json()["detail"]
+
+
+def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
+    """#150 nit: the write-path trailing check must surface as a 400, not a 500."""
+    import live_runner.credential_env as credential_env
+    import viewer.main as viewer_main_module
+
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_services",
+        lambda *args, **kwargs: [
+            Service(
+                id="88888888-8888-8888-8888-888888888888",
+                name="RAMJET",
+                type=ServiceType.DISCORD_BOT,
+                status=ServiceStatus.RUNNING,
+                config={
+                    "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
+                    "channel_id": "100000000000000002",
+                },
+                created_at=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_ensure_live_account_for_deployment",
+        lambda account_id: {
+            "id": account_id,
+            "broker": "alpaca",
+            "name": "Labelled paper account",
+            "broker_login": "PA-LABELLED-RAMJET",
+        },
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "create_live_deployment",
+        lambda deployment: deployment,
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = {
+        "strategy_name": "discord::ramjet",
+        "account_id": "acc-1",
+        "symbols": ["AAPL"],
+        "timeframe": "1h",
+        "signal_source_type": "discord",
+        "signal_source_id": "RAMJET",
+        "signal_source": "discord",
+        "signal_config": {
+            "channel_id": "100000000000000002",
+            "signal_processor_config": {"trailing_mode": "supertrend_flip"},
+        },
+    }
+
+    monkeypatch.setattr(
+        credential_env,
+        "load_accounts_env_values",
+        lambda *_args, **_kwargs: {
+            "ALPACA_ACCOUNT_NAME_ACC1": "RamJet",
+            "ALPACA_ACCOUNT_NUMBER_ACC1": "PA-LABELLED-RAMJET",
+        },
+    )
+    response = client.post("/api/live/deployments", json=payload)
+    assert response.status_code == 400
+    assert "trailing" in response.json()["detail"]
+    assert "supertrend_flip" in response.json()["detail"]
+
+
+def _store_backtest(database, backtest_id: str, *, stats: dict, equity_curve: list[dict]) -> None:
+    with database.get_session() as session:
+        session.add(
+            database.BacktestRecord(
+                id=backtest_id,
+                strategies=["demo"],
+                engine="native",
+                stats=stats,
+                equity_curve=equity_curve,
+            )
+        )
+        session.commit()
+
+
+def test_load_backtest_metadata_row_surfaces_ruined(isolated_db):
+    """#132: the stored ruin flag reaches the row that live-deployment selection reads."""
+    database, _engine, _data_dir = isolated_db
+    healthy_curve = [
+        {"time": "2021-01-04", "equity": 100.0},
+        {"time": "2021-01-05", "equity": 90.0},
+    ]
+    _store_backtest(database, "ruined", stats={"ruined": True}, equity_curve=healthy_curve)
+    _store_backtest(database, "healthy", stats={"ruined": False}, equity_curve=healthy_curve)
+
+    assert database.load_backtest_metadata_row("ruined")["ruined"] is True
+    assert database.load_backtest_metadata_row("healthy")["ruined"] is False
+    by_id = {row["id"]: row["ruined"] for row in database.list_backtest_metadata_rows()}
+    assert by_id == {"ruined": True, "healthy": False}
+
+
+def test_legacy_backtest_without_flag_derives_ruin_from_equity_curve(isolated_db):
+    """A pre-#132 artifact has no ``ruined`` key; its stored curve decides, fail-closed."""
+    database, _engine, _data_dir = isolated_db
+    legacy_stats = {"sharpe_ratio": 2.5, "cagr": 0.4}
+    _store_backtest(
+        database,
+        "legacy-ruined",
+        stats=legacy_stats,
+        equity_curve=[
+            {"time": "2021-01-04", "equity": 100.0},
+            {"time": "2021-01-05", "equity": 0.0},
+            {"time": "2021-01-06", "equity": 80.0},
+        ],
+    )
+    _store_backtest(
+        database,
+        "legacy-healthy",
+        stats=legacy_stats,
+        equity_curve=[
+            {"time": "2021-01-04", "equity": 100.0},
+            {"time": "2021-01-05", "equity": 110.0},
+        ],
+    )
+    _store_backtest(database, "legacy-no-curve", stats=legacy_stats, equity_curve=[])
+
+    assert database.load_backtest_metadata_row("legacy-ruined")["ruined"] is True
+    assert database.load_backtest_metadata_row("legacy-healthy")["ruined"] is False
+    assert database.load_backtest_metadata_row("legacy-no-curve")["ruined"] is False
+
+
+def test_explicit_not_ruined_flag_is_authoritative_over_curve(isolated_db):
+    database, _engine, _data_dir = isolated_db
+    _store_backtest(
+        database,
+        "flagged-healthy",
+        stats={"ruined": False},
+        equity_curve=[{"time": "2021-01-04", "equity": 0.0}],
+    )
+
+    assert database.load_backtest_metadata_row("flagged-healthy")["ruined"] is False
+
+
+def test_degenerate_curve_metadata_publishes_null_return_and_drawdown(isolated_db):
+    """A 0.0 placeholder that `undefined_metrics` names must not read as a measurement."""
+    database, _engine, _data_dir = isolated_db
+    _store_backtest(
+        database,
+        "degenerate",
+        stats={
+            "total_return": 0.0,
+            "max_drawdown_pct": 0.0,
+            "undefined_metrics": ["total_return", "max_drawdown_pct"],
+        },
+        equity_curve=[],
+    )
+    _store_backtest(
+        database,
+        "legacy-measured",
+        stats={"total_return": 0.0, "max_drawdown_pct": 0.0},
+        equity_curve=[],
+    )
+
+    row = database.load_backtest_metadata_row("degenerate")
+    assert row["total_return"] is None
+    assert row["max_drawdown"] is None
+    legacy = database.load_backtest_metadata_row("legacy-measured")
+    assert legacy["total_return"] == 0.0
+    assert legacy["max_drawdown"] == 0.0
+
+
+def test_legacy_curve_with_unreadable_point_fails_closed(isolated_db):
+    """An unreadable or non-finite equity point cannot prove the account survived."""
+    database, _engine, _data_dir = isolated_db
+    legacy_stats = {"sharpe_ratio": 2.5}
+    bad_points = (
+        ("none", None),
+        ("text", "n/a"),
+        ("nan", float("nan")),
+        ("inf", float("inf")),
+        # Stored JSON, but outside float64 range: float() raises OverflowError.
+        ("overflow", 10**400),
+    )
+    for backtest_id, bad_equity in bad_points:
+        _store_backtest(
+            database,
+            f"legacy-{backtest_id}",
+            stats=legacy_stats,
+            equity_curve=[
+                {"time": "2021-01-04", "equity": 100.0},
+                {"time": "2021-01-05", "equity": bad_equity},
+            ],
+        )
+        assert database.load_backtest_metadata_row(f"legacy-{backtest_id}")["ruined"] is True
+
+    _store_backtest(
+        database,
+        "legacy-readable-ruin",
+        stats=legacy_stats,
+        equity_curve=[
+            {"time": "2021-01-04", "equity": 100.0},
+            {"time": "2021-01-05", "equity": None},
+            {"time": "2021-01-06", "equity": -5.0},
+        ],
+    )
+    assert database.load_backtest_metadata_row("legacy-readable-ruin")["ruined"] is True
+
+
+def test_ruined_backtest_metadata_publishes_null_cagr(isolated_db):
+    database, _engine, _data_dir = isolated_db
+    _store_backtest(
+        database,
+        "ruined-cagr",
+        stats={"ruined": True, "cagr": None, "undefined_metrics": ["cagr"]},
+        equity_curve=[],
+    )
+
+    assert database.load_backtest_metadata_row("ruined-cagr")["cagr"] is None
+
+
+def test_live_dashboard_passes_unknown_totals_through_as_null(monkeypatch):
+    """A fill with an unusable price makes the account totals None; never a silent 0."""
+    import viewer.main as viewer_main_module
+
+    account = LiveAccountConfig(id="acct-1", broker="alpaca", name="Account One")
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(viewer_main_module, "list_live_accounts", lambda: [account])
+    monkeypatch.setattr(viewer_main_module, "list_live_deployments", lambda: [])
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_live_account_stats_payload",
+        lambda _account_id: {
+            "account_id": _account_id,
+            "current_equity": 10000.0,
+            "current_balance": 9900.0,
+            "total_trades": None,
+            "total_pnl": None,
+            "pnl_complete": False,
+        },
+    )
+
+    async def _fake_trades(_account_id):
+        return {"account_id": _account_id, "deployment_ids": [], "trades": []}
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _fake_trades)
+
+    response = TestClient(viewer_main_module.app).get("/api/live/dashboard")
+
+    assert response.status_code == 200
+    (row,) = response.json()["accounts"]
+    assert row["total_trades"] is None
+    assert row["total_pnl"] is None

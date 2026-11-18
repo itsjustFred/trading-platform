@@ -1,43 +1,76 @@
-"""The agent pipeline's chain must stay a chain, and its verdict map must stay total.
+"""The agent workflows are independent per-push workflows, and the one that reports a verdict
+does it totally.
 
-The four pipeline workflows (`agent-code-review.yml`, `agent-mutation-testing.yml`,
-`agent-pre-mortem.yml`, `agent-cubic-review.yml`) drive each other with hand-maintained YAML:
-one commit status per stage, one comment per stage, a verdict-to-status map in the post job,
-and a dispatch of the next workflow on PASS. Until this file existed nothing in CI parsed
-them, so a one-word regression - a verdict missing from the `case`, a renamed marker, a
-dispatch dropped - would merge silently and either strand a stage `pending` on the head SHA
-with no error anywhere, or report a red verdict as a green status: a gate that says PASS for
-a finding it was shown.
+The three agent workflows (`agent-code-review.yml`, `agent-mutation-testing.yml`,
+`agent-pre-mortem.yml`) are hand-maintained YAML that each run on their own on every push to a
+PR: none starts another, and each upserts one PR comment of its own. Nothing in CI parses them,
+so a one-word regression - a renamed marker, a dropped trigger, a verdict missing from the
+`case`, a token added to the agent job, a dispatch left behind by an abandoned design - would
+merge silently and either post a red verdict as a green status, run the rules of a commit
+nobody asked about, or strand a status `pending` on a SHA with no error anywhere.
 
-The chain branch closed exactly this class of gap four times by hand (its commits
-`fdf92ed`, `4fe3b75`, `55f9af7`, `6c08189`). This test is the mechanical version of those
-fixes: it reads the workflows the CI run is about to execute and pins the invariants their
-comments claim.
+The pre-mortem is the only one of the three that reports a result on the commit itself: for the
+analysed SHA it sets the commit status `agent/pre-mortem` and upserts one PR comment.
 
 What is pinned here:
-- every verdict a skill documents is mapped by the workflow's post job to the documented
-  status, and the map is total (`*)` -> `error`), so no verdict reaches an undeclared state;
-- the verdict regex accepts exactly the verdicts the map can handle - no more, no fewer;
-- contexts, comment markers and comment titles follow the stage convention, and a marker is
-  used by exactly one workflow, so comments never overwrite each other;
-- the dispatch edges are exactly review -> mutation -> pre-mortem -> cubic -> (nothing), and
-  only a dispatching post job holds `actions: write` (the review resolve job also holds it, to
-  cancel superseded downstream runs);
-- the cubic stage gates on a cubic review of the head commit, counts P0/P1 as blocking and
-  P2/P3 as advisory, and runs no repo code;
-- a draft PR's cubic stage writes success without waiting, and a PR marked ready runs the stage
-  again only once the pre-mortem has passed on its head;
+- every agent workflow triggers itself on `pull_request` (opened, synchronize, reopened) with a
+  concurrency group per PR that cancels superseded runs, and no workflow starts another one -
+  no dispatch call, no `workflow_run` or `repository_dispatch` trigger, no `actions: write`;
+- the pre-mortem's verdict map is total (`*)` -> `error`), so no verdict reaches an undeclared
+  state, and its verdict regex accepts exactly the verdicts the skill documents;
+- the status context, the comment marker and the comment title follow the stage convention, a
+  marker belongs to exactly one workflow, and no workflow writes another workflow's context;
+- the pre-mortem marks the analysed commit pending once, and every path that stops it - a
+  cancelled run, a failed run, a failed post step - leaves that context terminal, never
+  `pending`; a head that moved keeps its own status but no longer owns the comment;
+- the free-model variables, the draft and fork skips and the read-only trust model follow the
+  sibling workflows, whose comments swear to the same guards;
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
-  extraction, tree-clean check, head-moved comment guard, strict skill selection) stay
-  identical modulo the names each copy substitutes;
-- the agent job that reads the checkout holds only `contents: read`, keeps no credentials,
-  and fails the run when HEAD moved or the tree is dirty.
+  extraction, fence strip, tree-clean check, the two-level skill selection) stay identical
+  modulo the names each copy substitutes;
+- the agent job that reads the checkout holds only `contents: read`, keeps no credentials, and
+  fails the run when HEAD moved or the tree is dirty.
+
+The chain this file used to pin (review -> mutation -> pre-mortem, dispatched stage by stage, on
+the branch `test/agent-pipeline-chain`) is abandoned: the three are independent workflows now.
+The tests that defended the chain were removed rather than rewritten, because the contract they
+pinned no longer exists:
+
+- `test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem` - pinned the dispatch
+  edges and the `actions: write` a dispatching post job holds. With no chain there are no edges
+  to pin, and the permission that only bought a dispatch must be gone: pinned as an absence in
+  `test_no_agent_workflow_starts_another_workflow`.
+- `test_the_push_marks_every_stage_pending_before_the_chain_starts` - pinned the review
+  workflow's "Mark stages pending", i.e. stage 1 marking the whole chain on a push. No
+  workflow marks another's stage now, so each marks only its own context, which is what the
+  pre-mortem's "Mark running" is pinned against
+  (`test_the_pre_mortem_marks_the_analysed_commit_pending_once`).
+- `test_the_cancel_step_covers_both_downstream_workflows` - pinned the review workflow's
+  "Cancel" step cancelling the downstream runs of an older commit. A superseded run is now
+  cancelled by its own workflow's concurrency group, which
+  `test_every_agent_workflow_is_a_standalone_per_push_workflow` pins instead.
+- `test_a_superseded_or_early_cancelled_run_still_closes_its_status` - pinned the chain's
+  "superseded, nothing to do" early exits, which closed *another* stage's context on its
+  behalf. A stage stops no stage but itself now, and the pre-mortem's own stop paths are pinned
+  by `test_every_stop_path_leaves_the_pre_mortem_context_terminal`.
+- `test_a_cancelled_run_clears_its_pending_stage` - pinned the matrix of contexts each chain
+  stage owed downstream, which was the chain's shape. Replaced by
+  `test_a_cancelled_run_leaves_no_pending_stage_status`, which pins the invariant instead of
+  the matrix: a workflow that marks a status pending owns a reporter that clears it.
+- `test_every_agent_workflow_parses_and_declares_its_chain_jobs` - its baseline checks were
+  tangled with the chain's (`workflow_dispatch` `pr_number` on every stage). Replaced by
+  `test_every_agent_workflow_is_a_standalone_per_push_workflow`.
+- `test_every_stop_path_clears_the_pre_mortem_status` - pinned cross-stage clearing, a review
+  or mutation stop path writing `agent/pre-mortem`. Replaced by the same-context version above.
+
+Every other test in this file was kept and re-scoped to the workflows it is true of: the
+verdict map and regex, the context/marker/title convention, the guard blocks kept in sync, the
+opencode install, the resolve reporter, the head-unchanged and tree-clean guards, and the
+bash-level verdict extraction.
 """
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import shutil
 import subprocess
@@ -53,83 +86,43 @@ SKILLS = REPO_ROOT / ".agents" / "skills"
 REVIEW = "agent-code-review.yml"
 MUTATION = "agent-mutation-testing.yml"
 PREMORTEM = "agent-pre-mortem.yml"
-CUBIC = "agent-cubic-review.yml"
 AGENT_WORKFLOWS = (REVIEW, MUTATION, PREMORTEM)
-CHAIN_WORKFLOWS = (REVIEW, MUTATION, PREMORTEM, CUBIC)
-KNOWN_CONTEXTS = {
-    "agent/code-review",
-    "agent/mutation-testing",
-    "agent/pre-mortem",
-    "agent/cubic-review",
+
+# The workflow that reports its verdict on the commit. The siblings present as comments and are
+# pinned that way below, so a chain-era copy-paste of a status write cannot slip in unnoticed.
+CONTEXT_OWNER = {"agent/pre-mortem": PREMORTEM}
+
+# marker -> the one workflow that owns it, so two comments never overwrite each other.
+MARKERS = {
+    "<!-- actions-code-review -->": REVIEW,
+    "<!-- actions-mutation-testing -->": MUTATION,
+    "<!-- actions-pre-mortem -->": PREMORTEM,
 }
 
-# stage -> (workflow, status context, comment marker, comment title, skill dir, post-job step
-# names for the status map and the comment poster)
-STAGES = {
-    "code-review": (
-        REVIEW,
-        "agent/code-review",
-        "<!-- actions-code-review -->",
-        "# Code Review Action",
-        "actions-code-review",
-        r"^Set status",
-        r"^Post or update review comment$",
-    ),
-    "mutation-testing": (
-        MUTATION,
-        "agent/mutation-testing",
-        "<!-- actions-mutation-testing -->",
-        "# Mutation Testing Action",
-        "actions-mutation-testing",
-        r"^Set status",
-        r"^Post or update mutation-testing comment$",
-    ),
-    "pre-mortem": (
-        PREMORTEM,
-        "agent/pre-mortem",
-        "<!-- actions-pre-mortem -->",
-        "# Pre-Mortem Action",
-        "actions-pre-mortem",
-        r"^Set status",
-        r"^Post or update pre-mortem comment$",
-    ),
-}
+# The pre-mortem stage's own names: the context it reports (the value CONTEXT_OWNER maps), its
+# comment marker and title, and the skill whose verdict line it must not drift from.
+CONTEXT = "agent/pre-mortem"
+MARKER = "<!-- actions-pre-mortem -->"
+TITLE = "# Pre-Mortem Action"
+SKILL_DIR = "actions-pre-mortem"
 
-# The documented verdict -> status map, per stage. INCOMPLETE is the "the run produced no
-# verdict" outcome and is always an `error`, never a `failure`.
+# Where each workflow takes its free model from. The variables are named after the stage, and
+# all three fall back to the same model and variant, so a repo-wide change is one edit.
+FREE_MODEL_VARS = {
+    REVIEW: "REVIEW",
+    MUTATION: "MUTATION",
+    PREMORTEM: "PREMORTEM",
+}
+DEFAULT_MODEL = "opencode/inkling-2-small-free"
+DEFAULT_VARIANT = "max"
+
+# The verdicts the skill documents and the status each must get. INCOMPLETE is "the run produced
+# no verdict" and is always an `error`, never a `failure`.
 VERDICT_STATUS = {
-    "code-review": {
-        "PASS": "success",
-        "BLOCK": "failure",
-        "CHANGES-REQUESTED": "failure",
-        "INCOMPLETE": "error",
-    },
-    "mutation-testing": {"PASS": "success", "GAPS": "failure", "INCOMPLETE": "error"},
-    "pre-mortem": {
-        "PASS": "success",
-        "BLOCK": "failure",
-        "CHANGES-REQUESTED": "failure",
-        "INCOMPLETE": "error",
-    },
-}
-
-# The last stage is not an agent stage: cubic reviews the PR itself and this workflow only
-# gates on its review, so it has no skill, no agent job and no verdict regex. Its status map
-# is pinned separately (test_the_cubic_priorities_map_to_the_stage_status).
-CUBIC_STAGE = (
-    CUBIC,
-    "agent/cubic-review",
-    "<!-- actions-cubic-review -->",
-    "# Cubic Review Action",
-)
-
-# The chain: which workflow each stage dispatches on PASS. The last stage dispatches nothing;
-# CodeRabbit is an on-demand second opinion triggered by hand, not a stage.
-DISPATCHES = {
-    "code-review": MUTATION,
-    "mutation-testing": PREMORTEM,
-    "pre-mortem": CUBIC,
-    "cubic": None,
+    "PASS": "success",
+    "BLOCK": "failure",
+    "CHANGES-REQUESTED": "failure",
+    "INCOMPLETE": "error",
 }
 
 
@@ -169,8 +162,7 @@ def _run(step: dict) -> str:
 
 
 def _agent_job(data: dict) -> tuple[str, dict]:
-    """The job that runs the agent: the one that installs opencode. In the review workflow that
-    is `review`, not the `sonar-gate` job it also owns."""
+    """The job that runs the agent: the one that installs opencode."""
     for job_name, job in data["jobs"].items():
         if any(s.get("name") == "Install opencode" for s in _steps(job)):
             return job_name, job
@@ -181,200 +173,407 @@ def _all_run_bodies(data: dict) -> str:
     return _job_bodies(data["jobs"].values())
 
 
-def _stage_workflow(stage: str) -> str:
-    """The workflow file of a chain stage. The cubic stage is not in STAGES: it has no skill
-    and no agent, so only its workflow name, context, marker and title are shared."""
-    return CUBIC if stage == "cubic" else STAGES[stage][0]
-
-
 def _job_bodies(jobs) -> str:
     return "\n".join(_run(s) for job in jobs for s in _steps(job))
 
 
-def test_every_agent_workflow_parses_and_declares_its_chain_jobs() -> None:
-    """The baseline: a workflow that does not parse cannot run at all, and its post job owns the
-    status, so a workflow without one is not a stage."""
+def _step_env(job: dict, step: dict) -> dict:
+    """The env a step sees: its own, over the job's. The token lives here, so a job that posts
+    declares it once at the job level and its steps inherit it."""
+    env = dict(job.get("env") or {})
+    env.update(step.get("env") or {})
+    return env
+
+
+def _verdict_arms(body: str) -> dict[str, str]:
+    """The verdict -> status pairs the post job's `case` names, and whether the map is total."""
+    case = re.search(r'case "\$VERDICT" in(.*?)\n\s*esac', body, re.S)
+    assert case, 'the post job has no `case "$VERDICT"` map'
+    arms = {}
+    for arm, state in re.findall(r"^\s*([A-Z|-]+)\)\s*state=(\w+)\s*;;", case.group(1), re.M):
+        for verdict in arm.split("|"):
+            arms[verdict] = state
+    assert arms, f"parsed no verdict arms from {case.group(1)!r}"
+    # The map is total: the catch-all is `error`, so a verdict the agent produced is never
+    # left in an undeclared state.
+    assert "*) state=error" in re.sub(r"\s+", " ", case.group(1)), "the map is not total"
+    return arms
+
+
+def test_every_agent_workflow_is_a_standalone_per_push_workflow() -> None:
+    """Each workflow starts itself, on every push to a PR, and cancels only its own superseded
+    runs: the trigger list, the job shape and the concurrency group are the contract, and a
+    workflow that stops running on `synchronize` would silently grade one commit forever."""
     for name in AGENT_WORKFLOWS:
         data = _load(name)
         jobs = data.get("jobs")
         assert isinstance(jobs, dict), f"{name}: jobs is not a mapping"
-        assert "resolve" in jobs, f"{name}: no resolve job in {list(jobs)}"
-        assert "post" in jobs, f"{name}: no post job in {list(jobs)}"
         triggers = _triggers(data)
-        assert "pull_request" in triggers or "workflow_dispatch" in triggers, f"{name}: no trigger"
-        assert "pr_number" in triggers["workflow_dispatch"]["inputs"], f"{name}: no pr_number input"
-        assert isinstance(_agent_job(data)[1], dict), f"{name}: no agent job"
-        assert "verdict" in _agent_job(data)[1].get("outputs", {}), (
-            f"{name}: agent job publishes no verdict"
+        events = triggers["pull_request"]["types"]
+        for required in ("opened", "synchronize", "reopened"):
+            assert required in events, f"{name}: does not run on {required}"
+        # One agent job that produces a comment, and (for the one workflow that reports it)
+        # one job that posts it and sets the status. The chain's shape - a post job that
+        # dispatched the next stage - is gone; what is left is a poster.
+        job_name, agent = _agent_job(data)
+        assert set(jobs) >= {"resolve", job_name, "post"}, f"{name}: jobs are {list(jobs)}"
+        concurrency = data["concurrency"]
+        group = str(concurrency["group"])
+        assert group.startswith(name[: -len(".yml")]), f"{name}: group {group!r} is not its own"
+        assert "pull_request.number" in group, f"{name}: group {group!r} is not per PR"
+        assert concurrency["cancel-in-progress"] is True, f"{name}: keeps superseded runs"
+
+
+def test_no_agent_workflow_starts_another_workflow() -> None:
+    """The abandoned chain connected the stages by hand: a post job ran `gh workflow run`, held
+    `actions: write` to allow it, and the next stage took a `workflow_run` trigger. Every one of
+    those is now an absence worth pinning - a dispatch that survived a merge would re-run a
+    stage nobody asked for, under rules nobody chose, on a head nobody analysed."""
+    for name in AGENT_WORKFLOWS:
+        data = _load(name)
+        triggers = _triggers(data)
+        for forbidden in ("workflow_run", "repository_dispatch"):
+            assert forbidden not in triggers, f"{name}: {forbidden} trigger"
+        bodies = _all_run_bodies(data)
+        for call in ("gh workflow run", "createWorkflowDispatch", "/dispatches"):
+            assert call not in bodies, f"{name}: starts another workflow with {call!r}"
+        for job_name, job in data["jobs"].items():
+            permissions = job.get("permissions") or {}
+            assert permissions.get("actions") != "write", (
+                f"{name}/{job_name}: holds actions: write, which only bought a dispatch"
+            )
+
+
+def test_the_pre_mortem_adds_ready_for_review_and_a_manual_rerun() -> None:
+    """A draft is not pre-mortemed, and the moment it becomes ready is the first run that should
+    happen - so `ready_for_review` is a trigger of its own, not a branch of the others. The
+    `workflow_dispatch` covers what a push cannot: a run that failed for an infra reason, one
+    superseded before it reported, or an older commit that never got a run. Both inputs reach
+    the shell as env, never interpolated."""
+    data = _load(PREMORTEM)
+    triggers = _triggers(data)
+    assert "ready_for_review" in triggers["pull_request"]["types"]
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert inputs["pr_number"]["required"] is True, "a rerun must name the PR"
+    assert inputs["head_sha"]["required"] is False, "an older commit is optional"
+    assert set(inputs) == {"pr_number", "head_sha"}
+    resolve = data["jobs"]["resolve"]
+    body = _run(_find_step(resolve, r"^Resolve PR$"))
+    assert "INPUT_SHA" in body, "the resolve step ignores the head_sha input"
+    assert '!= "$INPUT_SHA"' in body, "a rerun does not check the head it was given"
+    assert "INPUT_PR" in body and "INPUT_SHA" in body, "the inputs reach the shell by env only"
+    assert "${{" not in body, "the resolve step interpolates workflow expressions into a shell"
+
+
+def test_the_pre_mortem_skips_drafts_and_forks() -> None:
+    """The trust model of the read-only stage: fork PRs are skipped outright (no token, no
+    checkout of the fork's code, no status on a SHA the repo cannot write to), drafts are
+    skipped until they are ready, and the agent job holds `contents: read` only. The PR's own
+    text reaches the agent as data - through the metadata JSON a step writes with jq - never
+    interpolated into a shell."""
+    data = _load(PREMORTEM)
+    resolve = data["jobs"]["resolve"]
+    assert "draft" in str(resolve.get("if", "")), "a draft PR is not skipped"
+    agent_name, agent = _agent_job(data)
+    assert agent.get("permissions") == {"contents": "read"}, (
+        f"{agent_name} job permissions are {agent.get('permissions')}"
+    )
+    assert "same_repo" in str(agent.get("if", "")), "fork PRs are not skipped"
+    checkout = next(
+        s for s in _steps(agent) if str(s.get("uses", "")).startswith("actions/checkout")
+    )
+    assert checkout["with"].get("persist-credentials") is False, "checkout keeps credentials"
+    for job_name, job in data["jobs"].items():
+        for step in _steps(job):
+            body = _run(step)
+            if "statuses/" not in body and "issues/" not in body:
+                continue
+            assert job_name != agent_name, (
+                f"the agent job posts a status or a comment ({step.get('name')!r})"
+            )
+            assert "GH_TOKEN" in _step_env(job, step), (
+                f"{job_name}/{step.get('name')}: posts without the repo token"
+            )
+    for step in _steps(agent):
+        assert "secrets." not in str(_step_env(agent, step)) + _run(step), (
+            f"the agent job receives a secret ({step.get('name')!r})"
+        )
+
+
+def test_the_agent_workflows_share_one_free_model_configuration() -> None:
+    """The variables are named after their stage and default to the same model and variant, so
+    a reader can find the pre-mortem's knob next to the siblings' and a repo-wide change is one
+    edit per line."""
+    for name, prefix in FREE_MODEL_VARS.items():
+        env = _load(name)["env"]
+        assert env["MODEL"] == (
+            f"${{{{ vars.{prefix}_MODEL || '{DEFAULT_MODEL}' }}}}"
+        ), f"{name}: {env['MODEL']!r}"
+        assert env["VARIANT"] == (
+            f"${{{{ vars.{prefix}_VARIANT || '{DEFAULT_VARIANT}' }}}}"
+        ), f"{name}: {env['VARIANT']!r}"
+        _job_name, job = _agent_job(_load(name))
+        bodies = _job_bodies([job])
+        assert "$MODEL" in bodies and "$VARIANT" in bodies, (
+            f"{name}: the agent is not configured from MODEL/VARIANT"
         )
 
 
 def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
     """A verdict the post job's `case` does not name falls through to `*)` and is reported as
-    `error` - a stage that could not run, indistinguishable from an agent failure."""
-    for stage, mapping in VERDICT_STATUS.items():
-        skill = (SKILLS / STAGES[stage][4] / "SKILL.md").read_text(encoding="utf-8")
-        verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
-        assert verdicts_line, f"{stage}: the skill documents no verdict line"
-        documented = set(re.findall(r"`([A-Z-]+)`", verdicts_line.group(0)))
-        assert documented == set(mapping), (
-            f"{stage}: skill verdicts {sorted(documented)} != map {sorted(mapping)}"
-        )
-
-        data = _load(STAGES[stage][0])
-        post = data["jobs"]["post"]
-        body = _run(_find_step(post, STAGES[stage][5]))
-        case = re.search(r'case "\$VERDICT" in(.*?)\n\s*esac', body, re.S)
-        assert case, f'{stage}: post job has no `case "$VERDICT"` map'
-        pairs = {}
-        for arm, state in re.findall(r"^\s*([A-Z|-]+)\)\s*state=(\w+)\s*;;", case.group(1), re.M):
-            for verdict in arm.split("|"):
-                pairs[verdict] = state
-        assert pairs, f"{stage}: parsed no verdict arms from {case.group(1)!r}"
-        # The map is total: the catch-all is `error`, and INCOMPLETE reaches it (explicitly or
-        # through the catch-all), so a verdict the agent produced can never go unplaced.
-        assert "*) state=error" in re.sub(r"\s+", " ", case.group(1)), (
-            f"{stage}: the map is not total"
-        )
-        assert pairs.get("INCOMPLETE", "error") == "error", f"{stage}: INCOMPLETE is not an error"
-        explicit = {v: s for v, s in mapping.items() if v != "INCOMPLETE"}
-        assert pairs == explicit, f"{stage}: arms {pairs} != documented {explicit}"
+    `error` - a stage that could not run, indistinguishable from an agent failure; a verdict the
+    map states but the regex drops never reaches it at all. Both are pinned against the skill's
+    own verdict line, so the three cannot drift apart silently. INCOMPLETE is the "the run
+    produced no verdict" outcome and is always an `error`, never a `failure`."""
+    skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
+    assert verdicts_line, f"{SKILL_DIR}: the skill documents no verdict line"
+    documented = set(re.findall(r"`([A-Z-]+)`", verdicts_line.group(0)))
+    assert documented == set(VERDICT_STATUS), (
+        f"skill verdicts {sorted(documented)} != map {sorted(VERDICT_STATUS)}"
+    )
+    post = _load(PREMORTEM)["jobs"]["post"]
+    arms = _verdict_arms(_run(_find_step(post, r"^Set status$")))
+    expected = {v: s for v, s in VERDICT_STATUS.items() if v != "INCOMPLETE"}
+    assert arms == expected, f"status map {arms} != documented {expected}"
 
 
 def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
     """The regex decides what the workflow will post at all: an alternation wider than the map
     accepts a verdict the post job cannot place, and one that is narrower drops a documented
-    verdict on the floor."""
-    for stage, mapping in VERDICT_STATUS.items():
-        data = _load(STAGES[stage][0])
-        m = re.search(r"sed -nE 's/\^Verdict:\[\[:space:\]\]\*\((.*?)\)", _all_run_bodies(data))
-        assert m, f"{stage}: no verdict regex"
-        accepted = set(m.group(1).split("|"))
-        assert accepted == set(mapping), (
-            f"{stage}: regex accepts {sorted(accepted)}, map has {sorted(mapping)}"
-        )
+    verdict on the floor. The trailing annotation is allowed - a verdict line carries the reason
+    and, for this stage, the hand-written sign-off note."""
+    bodies = _all_run_bodies(_load(PREMORTEM))
+    m = re.search(r"sed -nE 's/\^Verdict:\[\[:space:\]\]\*\((.*?)\)", bodies)
+    assert m, "no verdict regex in the pre-mortem workflow"
+    assert set(m.group(1).split("|")) == set(VERDICT_STATUS), (
+        f"regex accepts {sorted(m.group(1).split('|'))}, map has {sorted(VERDICT_STATUS)}"
+    )
 
 
-def test_contexts_markers_and_titles_follow_the_stage_convention() -> None:
-    """A context typo writes a stage's result under a name nothing reads; the markers are how
-    each workflow finds its own comment to update, so they must be unique per stage."""
-    markers = [s[2] for s in STAGES.values()] + [CUBIC_STAGE[2]]
-    assert len(set(markers)) == len(markers), "two stages share a comment marker"
-    stages = dict(STAGES)
-    for stage, (name, context, marker, title, _skill, _map_step, poster_step) in stages.items():
+def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
+    """A context typo writes a result under a name nothing reads; a marker two workflows share
+    makes one overwrite the other's comment. The pre-mortem is also the only one of the three
+    that reports a status at all - the siblings present as comments, as
+    `.agents/skills/platform-pr-verify` says - so a status write copied into one of them would
+    make that comment lie about itself."""
+    assert len(set(MARKERS.values())) == len(MARKERS), "two workflows share a comment marker"
+    owner_of = {name: context for context, name in CONTEXT_OWNER.items()}
+    for name in AGENT_WORKFLOWS:
         data = _load(name)
-        env = data.get("env", {})
-        assert context in env.values(), f"{stage}: {context} is not declared in env"
+        env = data["env"]
+        own_context = owner_of.get(name)
         bodies = _all_run_bodies(data)
-        # Every context the workflow writes must be one it declares (or the `$ctx` loop
-        # variable over declared contexts); a literal typo fails here.
+        # Every context the workflow writes must be its own, through the variable it declares.
         for written in re.findall(r'-f context="([^"$][^"]*)"', bodies):
-            assert written in KNOWN_CONTEXTS, f"{stage}: writes undeclared context {written!r}"
+            assert written == own_context, f"{name}: writes a context it does not own ({written})"
         for var in re.findall(r'-f context="\$([A-Z_]+)"', bodies):
-            assert var in env, f"{stage}: writes context from undeclared variable ${var}"
-        poster = _find_step(data["jobs"]["post"], poster_step)
-        poster_body = _run(poster)
-        others = [s[2] for key, s in stages.items() if key != stage] + [CUBIC_STAGE[2]]
-        assert marker in poster_body, f"{stage}: poster does not carry its own marker"
-        assert not any(other in poster_body for other in others), (
-            f"{stage}: poster references another stage's marker"
-        )
-        assert not any(m in bodies.split(marker)[0] for m in others if m != marker), (
-            f"{stage}: body references another stage's marker"
-        )
-        _job_name, job = _agent_job(data)
-        assert title in _job_bodies([job]), f"{stage}: comment title {title!r} unset"
-
-    # The cubic stage has no agent job: its title and marker live in the post job, which is
-    # also the only job that writes the comment.
-    name, context, marker, title = CUBIC_STAGE
-    data = _load(name)
-    assert context in data["env"].values(), f"cubic: {context} is not declared in env"
-    bodies = _all_run_bodies(data)
-    for written in re.findall(r'-f context="([^"$][^"]*)"', bodies):
-        assert written in KNOWN_CONTEXTS, f"cubic: writes undeclared context {written!r}"
-    for var in re.findall(r'-f context="\$([A-Z_]+)"', bodies):
-        assert var in data["env"], f"cubic: writes context from undeclared variable ${var}"
-    poster = _find_step(data["jobs"]["post"], r"^Post or update cubic-review comment$")
-    poster_body = _run(poster)
-    assert marker in poster_body, "cubic: poster does not carry its own marker"
-    assert title in poster_body, f"cubic: comment title {title!r} unset"
-    others = [s[2] for s in stages.values()]
-    assert not any(other in poster_body for other in others), (
-        "cubic: poster references another stage's marker"
-    )
-    assert not any(m in bodies.split(marker)[0] for m in others), (
-        "cubic: body references another stage's marker"
-    )
-
-
-def test_the_dispatch_chain_is_exactly_review_to_mutation_to_premortem_to_cubic() -> None:
-    """The chain is the contract: a stage that dispatches nothing on PASS ends the pipeline
-    silently, and a stage that dispatches the wrong workflow runs the wrong rules on the code.
-    Only a post job that dispatches may hold `actions: write`; the last stage's must not,
-    because `gh workflow run` is the one write that token buys there. (The review resolve job
-    holds it separately, to cancel superseded downstream runs; that is not pinned here.)"""
-    for stage, target in DISPATCHES.items():
-        data = _load(_stage_workflow(stage))
-        post = data["jobs"]["post"]
-        bodies = _job_bodies([data["jobs"]["post"]])
-        dispatched = set(re.findall(r"gh workflow run (agent-[\w-]+\.yml)", bodies))
-        # Every executed dispatch, in any job (echoed override hints excluded), must be one the
-        # post job makes: a dispatch moved elsewhere would slip past the edge check below.
-        executed = {
-            m
-            for line in _all_run_bodies(data).splitlines()
-            if "gh workflow run" in line and "echo" not in line
-            for m in re.findall(r"gh workflow run (agent-[\w-]+\.yml)", line)
-        }
-        assert executed == dispatched, (
-            f"{stage}: dispatches {sorted(executed - dispatched)} outside the post job"
-        )
-        permissions = post.get("permissions", {})
-        if target is None:
-            assert not dispatched, f"{stage}: dispatches {sorted(dispatched)} but is the last stage"
-            assert "actions" not in permissions, (
-                f"{stage}: holds actions: write but dispatches nothing"
+            assert var in env, f"{name}: writes context from undeclared variable ${var}"
+            assert env[var] == own_context, f"{name}: ${var} is {env[var]!r}, not {own_context!r}"
+        if own_context is None:
+            # The workflows without a status write none: no context, no `statuses/` call.
+            assert not [v for v in map(str, env.values()) if v.startswith("agent/")], (
+                f"{name}: declares a status context"
             )
+            assert "statuses/" not in bodies, f"{name}: writes a commit status"
+        poster = _find_step(data["jobs"]["post"], r"^Post or update .* comment$")
+        poster_body = _run(poster)
+        for marker, owner_name in MARKERS.items():
+            if owner_name == name:
+                assert marker in poster_body, f"{name}: poster does not carry its own marker"
+            else:
+                assert marker not in poster_body, f"{name}: poster references {marker!r}"
+    _job_name, agent = _agent_job(_load(PREMORTEM))
+    assert TITLE in _job_bodies([agent]), "the comment title is not set by the agent job"
+
+
+def test_the_pre_mortem_marks_the_analysed_commit_pending_once() -> None:
+    """A push shows the stage as running from the first commit, and the mark goes to the commit
+    being analysed - not, on a manual rerun, to the PR's current head. One write only: two
+    pending marks would race, and a second one in an agent job would hand the agent a token."""
+    data = _load(PREMORTEM)
+    resolve = data["jobs"]["resolve"]
+    mark = _find_step(resolve, r"^Mark running$")
+    body = _run(mark)
+    assert "-f state=pending" in body and "$PREMORTEM_CONTEXT" in body, "no pending mark"
+    assert "steps.pr.outputs.head" in str(mark["env"]["HEAD_SHA"]), "the mark is not on the head"
+    assert "same_repo" in str(mark.get("if", "")) and "number" in str(mark.get("if", "")), (
+        "the mark runs for every PR, including forks"
+    )
+    assert _all_run_bodies(data).count("state=pending") == 1, "more than one pending write"
+
+
+def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
+    """A rerun of an older commit (an infra failure, a head that moved past it) must not replace
+    the comment of the newer result: the comment is the PR's view of the head, so the poster
+    compares the current head with the analysed SHA first and stops. Its status still lands on
+    its own commit, which is the point of asking for it."""
+    post = _load(PREMORTEM)["jobs"]["post"]
+    body = _run(_find_step(post, r"^Post or update pre-mortem comment$"))
+    assert '"$HEAD_SHA"' in body and ".head.sha" in body, "no head comparison"
+    assert "exit 0" in body, "a superseded result does not stop the job"
+    assert "not updating the comment" in body, "no reason is logged"
+    assert MARKER in body, "the poster carries no marker of its own"
+    assert "gh api" in body, "the poster does not use the REST API"
+
+
+def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
+    """The bookkeeping that keeps the stage from stranding `pending`: a resolve failure, a failed
+    agent run, a failed post step and a cancelled run each write `error` for their own context,
+    and each converts a status that is still `pending` rather than overwriting a terminal one.
+    Deleting a reporter, or writing a literal context somewhere, would leave a SHA `pending`
+    with no error anywhere - or a typo'd context nothing reads."""
+    data = _load(PREMORTEM)
+    resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
+    # The two that report a failure of their own bookkeeping only clear a status that is still
+    # pending, so a reporter's failure cannot overwrite a terminal verdict.
+    clear_pending_only = ("Report resolve failure", "Report post failure")
+    for job, pattern in (
+        (resolve, r"^Report resolve failure$"),
+        (post, r"^Report failed pre-mortem run$"),
+        (post, r"^Report post failure$"),
+    ):
+        step = _find_step(job, pattern)
+        body = _run(step)
+        assert "state=error" in body, f"{step.get('name')!r} writes no error status"
+        assert "$PREMORTEM_CONTEXT" in body, f"{step.get('name')!r} writes no context variable"
+        if step.get("name") in clear_pending_only:
+            assert '"$state" = "pending"' in body, (
+                f"{step.get('name')!r} overwrites a terminal status"
+            )
+            assert '-z "$state"' not in body, (
+                f"{step.get('name')!r} writes a status where none exists"
+            )
+    for job_name, job in data["jobs"].items():
+        for step in _steps(job):
+            body = _run(step)
+            if "statuses/" not in body:
+                continue
+            assert "$PREMORTEM_CONTEXT" in body, (
+                f"{job_name}/{step.get('name')}: writes a status without the context variable"
+            )
+            assert not re.search(r'-f context="agent/', body), (
+                f"{job_name}/{step.get('name')}: writes a literal context"
+            )
+
+
+def test_a_cancelled_run_leaves_no_pending_stage_status() -> None:
+    """A cancelled run - a hand-cancel, or a superseding run through the concurrency group -
+    skips every failure() reporter and the post job, so without a dedicated job the stage
+    stays `pending` on the SHA with no signal. The reporter only touches a still-pending
+    context, so a newer run's terminal verdict survives. A workflow that marks nothing pending
+    needs no reporter, which is what keeps this an invariant rather than a chain matrix."""
+    for name in AGENT_WORKFLOWS:
+        data = _load(name)
+        jobs = data["jobs"]
+        if "state=pending" not in _all_run_bodies(data):
             continue
-        assert dispatched == {target}, (
-            f"{stage}: dispatches {sorted(dispatched)}, want exactly {{{target}}}"
+        job = jobs.get("report-cancelled")
+        assert job is not None, f"{name}: writes a pending status with no cancellation reporter"
+        assert "cancelled()" in str(job.get("if", "")), f"{name}: reporter is not gated"
+        needs = job.get("needs") or []
+        assert "post" in needs, f"{name}: reporter does not wait for the post job"
+        body = _job_bodies([job])
+        assert "state=error" in body, f"{name}: reporter writes no error"
+        assert '[ "$state" = "pending" ]' in body, (
+            f"{name}: reporter does not convert a pending status"
         )
-        assert permissions.get("actions") == "write", f"{stage}: dispatches without actions: write"
-        assert "-f pr_number=" in bodies, f"{stage}: dispatch does not pass the PR number"
-        assert "-f head_sha=" in bodies, f"{stage}: dispatch does not pass the head SHA"
+        assert '-z "$state"' not in body, f"{name}: reporter writes where no status exists"
+        assert "$PREMORTEM_CONTEXT" in body, f"{name}: reporter writes no context variable"
 
 
-def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
+def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
+    """A first-step failure writes no `head`, yet the run may already have marked the analysed
+    commit pending: the reporter then falls back to the commit named by the event, and to the
+    dispatch input, so a stranded `pending` still reaches an `error`."""
+    step = _find_step(_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$")
+    sha = str(step.get("env", {}).get("HEAD_SHA", ""))
+    assert sha.startswith("${{ steps.pr.outputs.head"), (
+        f"the reporter must prefer the resolved head: {sha}"
+    )
+    assert re.search(r"inputs\.head_sha\s*\}\}$", sha), f"no dispatch-input fallback: {sha}"
+    assert step.get("if") == "failure()", f"the reporter is skipped on {step.get('if')!r}"
+
+
+def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
+    """The free Zen models cap usage per period, and hitting the cap fails the run. That is an
+    infra failure, not a pre-mortem result: the run must fail (no comment is posted from it),
+    the post job must report the status as `error`, and the log must name the cause, so the
+    remedy - re-run the job - is the one the sibling workflows document."""
+    data = _load(PREMORTEM)
+    agent = _agent_job(data)[1]
+    body = _run(_find_step(agent, r"^Run pre-mortem agent$"))
+    patterns = re.search(r"grep -qiE '([^']+)'", body)
+    assert patterns, "the agent step does not recognise a usage limit"
+    for known in ("usage limit", "rate.?limit", "quota"):
+        assert known in patterns.group(1), f"{known!r} is not recognised"
+    assert "exit 1" in body, "a usage-limit failure does not fail the run"
+    post = data["jobs"]["post"]
+    report = _find_step(post, r"^Report failed pre-mortem run$")
+    assert "state=error" in _run(report), "a failed run is not reported as an error"
+    assert "needs.premortem.result == 'failure'" in str(post.get("if", "")), (
+        "the post job does not run for a failed agent job"
+    )
+    for poster in (r"^Post or update pre-mortem comment$", r"^Set status$"):
+        assert "needs.premortem.result == 'success'" in str(
+            _find_step(post, poster).get("if", "")
+        ), f"{poster} runs on a failed agent job"
+
+
+def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
+    """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
+    used only while the base has none. A base commit that cannot be read must abort the step -
+    a silent fall-through would run the PR's own rules while the comment says "base branch".
+    An unreachable base is also caught in the mutation workflow's scope step, which fails first,
+    so what is pinned here is the check existing in the agent job, not its exact step."""
+    for name in AGENT_WORKFLOWS:
+        _job_name, job = _agent_job(_load(name))
+        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in _job_bodies([job]), (
+            f"{name}: no hard base-commit check in the agent job"
+        )
+        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in _job_bodies([job]), (
+            f"{name}: does not read the skill from the base branch first"
+        )
+        assert 'cp "$SKILL_PATH"' in _job_bodies([job]), (
+            f"{name}: no fallback to the PR's own copy"
+        )
+    step = _find_step(_agent_job(_load(PREMORTEM))[1], r"^Select skill revision$")
+    body = _run(step)
+    assert "set -euo pipefail" in body, "the selection is not strict"
+    assert "SKILL_SOURCE=base branch" in body, "the selection does not record its source"
+    # Two levels only: a third (the commit the workflow file came from) would analyse an older
+    # commit under rules the branch tip happens to carry.
+    assert "GITHUB_SHA" not in body, "the selection reads a third skill revision"
+    assert body.count("elif") == 1, f"the selection has more than two levels:\n{body}"
+
+
+def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
     """The three workflows duplicate the blocks that decide what gets posted: the summary-line
-    extraction, the verdict prelude, the tree-clean check and the head-moved comment guard.
+    extraction, the fence strip, the head-unchanged and tree-clean check, and the output path.
     Their comments swear a change lands in all copies in the same commit; this test makes that
     true mechanically instead of by memory.
 
-    The per-copy substitutions below are the documented ones (the temp directory, the agent
-    id), applied agent-id first so "pr-review" cannot be eaten by the shorter "review".
-    Anything else that differs is a fork of the gate.
+    The per-copy substitutions below are the documented ones (the temp directory, the agent id),
+    applied agent-id first so "pr-review" cannot be eaten by the shorter "review". A guard that
+    only one copy needs is not here: the pre-mortem's stricter verdict prelude (it tolerates the
+    sign-off note the skill requires) and its head-moved comment guard are pinned separately.
     """
     substitutions = {
         REVIEW: (("pr-review", "<agent>"), ("review", "<stage>")),
         MUTATION: (("pr-mutation", "<agent>"), ("mutation", "<stage>")),
         PREMORTEM: (("pr-premortem", "<agent>"), ("premortem", "<stage>")),
     }
-    guard_tags = (
-        "**Summary:",
-        "git status --porcelain",
-        "not updating the comment",
-        "grep -v '^[[:space:]]*$'",
-    )
+    guard_tags = ("grep -n", 'tail -n "+${start}"', "git status --porcelain", 'out="$RUNNER_TEMP')
 
     def guards(name: str) -> list[str]:
-        data = _load(name)
         out = []
-        for job in data["jobs"].values():
+        for job in _load(name)["jobs"].values():
             for step in _steps(job):
                 for line in _run(step).splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):  # prose, not a guard
+                        continue
                     if any(tag in line for tag in guard_tags):
-                        line = line.strip()
                         for old, new in substitutions[name]:
                             line = line.replace(old, new)
                         out.append(line)
@@ -386,8 +585,6 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
         other_guards = guards(other)
         missing = [g for g in review_guards if g not in other_guards]
         assert not missing, f"{other} is missing the shared guard lines:\n" + "\n".join(missing)
-        # Both directions: a guard line added to one copy only is a fork as well. A stage's own
-        # canned result (mutation testing's "nothing to mutate" summary) is output, not a guard.
         extra = [
             g
             for g in other_guards
@@ -396,196 +593,7 @@ def test_the_duplicated_guard_blocks_stay_in_sync_across_the_copies() -> None:
         assert not extra, f"{other} has guard lines the review copy lacks:\n" + "\n".join(extra)
 
 
-def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
-    """Every `npm install` in the agent jobs passes `--ignore-scripts`, so no dependency's
-    install hook runs on the runner; @opencode/cli's own postinstall (it links the platform
-    binary) is then run by name. SonarCloud rates a plain `npm install` a security issue, and
-    that one rule was what kept the quality gate red on every agent workflow PR."""
-    for name in AGENT_WORKFLOWS:
-        _job_name, job = _agent_job(_load(name))
-        body = _run(_find_step(job, r"^Install opencode$"))
-        installs = [line for line in body.splitlines() if "npm install" in line]
-        assert installs, f"{name}: the install step runs no npm install"
-        for line in installs:
-            assert "--ignore-scripts" in line, f"{name}: npm install without --ignore-scripts"
-        assert "node ./postinstall.mjs" in body, f"{name}: opencode's postinstall is not run"
-
-
-def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
-    """Every stage's resolve reporter clears the resolved head (the commit its own pending mark
-    went to) and falls back to the dispatch input: a first-step failure writes no `head`, yet a
-    push may already have marked the stages pending. No copy may skip the reporter on an
-    empty step output (the review copy once did, stranding all three statuses)."""
-    for name in CHAIN_WORKFLOWS:
-        step = _find_step(_load(name)["jobs"]["resolve"], r"^Report resolve failure")
-        sha = str(step.get("env", {}).get("HEAD_SHA", ""))
-        assert "steps.pr.outputs.head || inputs.head_sha" in sha, (
-            f"{name}: reporter must prefer the resolved head and fall back to the input: {sha}"
-        )
-        assert step.get("if") == "failure()", f"{name}: reporter is skipped on {step.get('if')!r}"
-
-
-def test_every_dispatch_refuses_a_head_that_moved_past_its_sha() -> None:
-    """A dispatch that names head_sha is about that commit. The review override skips the
-    SonarCloud gate, so once the head moves it must refuse instead of reviewing a commit
-    nobody justified; the chained stages stop as superseded. Each copy compares the
-    resolved head with the input before doing anything else."""
-    for name in CHAIN_WORKFLOWS:
-        body = _run(_find_step(_load(name)["jobs"]["resolve"], r"^Resolve PR$"))
-        assert "INPUT_SHA" in body, f"{name}: the resolve step ignores the head_sha input"
-        assert '!= "$INPUT_SHA"' in body, f"{name}: no head-moved check against head_sha"
-
-
-def test_a_cancelled_run_clears_its_pending_stage() -> None:
-    """A cancelled run skips every failure() reporter and the post job, so without a dedicated
-    job a hand-cancel or a superseding run strands the stage `pending` on the head. Every stage
-    owns a job that runs only on cancellation and turns its own and every later still-pending
-    context into an error; the review stage owes all four, since it marks all four on push."""
-    owed = {
-        REVIEW: ("REVIEW_CONTEXT", "MUTATION_CONTEXT", "PREMORTEM_CONTEXT", "CUBIC_CONTEXT"),
-        MUTATION: ("MUTATION_CONTEXT", "PREMORTEM_CONTEXT", "CUBIC_CONTEXT"),
-        PREMORTEM: ("PREMORTEM_CONTEXT", "CUBIC_CONTEXT"),
-        CUBIC: ("CUBIC_CONTEXT",),
-    }
-    for name, contexts in owed.items():
-        jobs = _load(name)["jobs"]
-        job = jobs.get("report-cancelled")
-        assert job is not None, f"{name}: no report-cancelled job"
-        assert "cancelled()" in str(job.get("if", "")), f"{name}: report-cancelled is not gated"
-        needs = job.get("needs", [])
-        assert "post" in needs, f"{name}: report-cancelled does not wait for the post job"
-        body = _job_bodies([job])
-        assert "state=error" in body, f"{name}: report-cancelled writes no error"
-        assert '= "pending"' in body, f"{name}: report-cancelled overwrites final statuses"
-        for ctx in contexts:
-            assert ctx in body, f"{name}: report-cancelled does not clear {ctx}"
-
-
-def test_a_superseded_or_early_cancelled_run_still_closes_its_status() -> None:
-    """Two exits skip every reporter: a chained run that finds the head has moved (it exits 0,
-    deliberately green), and a run cancelled before resolve wrote `head`. In both the push has
-    already marked the analysed commit pending, so the superseded branch closes it itself and
-    the cancellation job falls back to the commit named by the dispatch."""
-    for name, own in (
-        (MUTATION, "PREMORTEM_CONTEXT"),
-        (PREMORTEM, "PREMORTEM_CONTEXT"),
-        (CUBIC, "CUBIC_CONTEXT"),
-    ):
-        data = _load(name)
-        body = _run(_find_step(data["jobs"]["resolve"], r"^Resolve PR$"))
-        superseded = body[body.index("superseded, nothing to do") :]
-        superseded = superseded[: superseded.index("exit 0")]
-        assert "state=error" in superseded, f"{name}: the superseded exit leaves its status"
-        assert own in superseded, f"{name}: superseded exit does not clear {own}"
-    for name in CHAIN_WORKFLOWS:
-        job = _load(name)["jobs"]["report-cancelled"]
-        sha = str(job.get("env", {}).get("HEAD_SHA", ""))
-        assert "inputs.head_sha" in sha, f"{name}: report-cancelled has no dispatch-SHA fallback"
-        assert "inputs.head_sha" in str(job.get("if", "")), (
-            f"{name}: report-cancelled is skipped when resolve wrote no head"
-        )
-
-
-def test_skill_selection_runs_under_strict_mode_in_every_copy() -> None:
-    """Without `set -euo pipefail` an unreachable base commit would not abort the step: the
-    selection would fall through to the PR's own copy of the skill, letting a PR weaken its
-    own review. GitHub's default `bash -eo pipefail` covers `e` and `pipefail`, not `u` - the
-    copies promise the strict form, and the promise is what a reader relies on."""
-    for name in AGENT_WORKFLOWS:
-        _job_name, job = _agent_job(_load(name))
-        step = _find_step(job, r"^Select skill revision$")
-        body = _run(step)
-        assert "set -euo pipefail" in body, f"{name}: skill selection is not strict"
-        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, (
-            f"{name}: no hard base-commit check"
-        )
-
-
-def test_every_stop_path_clears_every_later_stage_status() -> None:
-    """The bookkeeping this PR adds is what keeps the last stage from stranding `pending`.
-
-    The review workflow marks all four stages pending on push, and every path that stops the
-    chain early - SonarCloud red, the SonarCloud gate step itself failing, the review run
-    failing, a verdict that is not PASS, a failed dispatch, a failed post step - must set
-    `agent/cubic-review` to error exactly as it does for the stage that stopped. The mutation
-    and pre-mortem workflows owe the same on their own stop paths, and the cubic workflow owes
-    it for its own status, so deleting any of the reporter steps (or one context out of them)
-    would leave a status `pending` on the head SHA with no error anywhere - the failure the
-    chain branch's last four commits existed to close. The reporters must therefore *exist*, by
-    name, in the resolve and post jobs, and write their stage's context as an error.
-
-    The stage's own starting mark (mutation's, the pre-mortem's and cubic's "Mark running") is
-    the one single-context pending write and is deliberately exempt: it marks the stage that is
-    starting, not a chain that is stopping.
-    """
-    own = {
-        REVIEW: "REVIEW_CONTEXT",
-        MUTATION: "MUTATION_CONTEXT",
-        PREMORTEM: "PREMORTEM_CONTEXT",
-        CUBIC: "CUBIC_CONTEXT",
-    }
-    for name in CHAIN_WORKFLOWS:
-        data = _load(name)
-        resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
-        for job, patterns in (
-            (resolve, (r"^Report resolve failure",)),
-            (post, (r"^Report failed .* run$", r"^Report post failure$")),
-        ):
-            for pattern in patterns:
-                step = _find_step(job, pattern)
-                body = _run(step)
-                assert own[name] in body, f"{name}: {step.get('name')!r} does not clear {own[name]}"
-                assert "state=error" in body, f"{name}: {step.get('name')!r} writes no error status"
-        for job_name, job in data["jobs"].items():
-            for step in _steps(job):
-                body = _run(step)
-                if "state=error" not in body and "state=pending" not in body:
-                    continue
-                contexts = set(re.findall(r"[A-Z][A-Z_]*_CONTEXT", body))
-                assert contexts, (
-                    f"{name}/{job_name}/{step.get('name')}: "
-                    "writes a status with no context variable"
-                )
-                if "state=error" in body or len(contexts) > 1:
-                    # Cubic is the last stage: every stop path strands it, so every error write
-                    # and every multi-context write must clear it.
-                    assert "CUBIC_CONTEXT" in contexts, (
-                        f"{name}/{job_name}/{step.get('name')}: stops the chain for "
-                        f"{sorted(contexts)} without clearing CUBIC_CONTEXT"
-                    )
-                    if len(contexts) > 1:
-                        assert "PREMORTEM_CONTEXT" in contexts, (
-                            f"{name}/{job_name}/{step.get('name')}: stops the chain for "
-                            f"{sorted(contexts)} without clearing PREMORTEM_CONTEXT"
-                        )
-
-
-def test_the_push_marks_every_stage_pending_before_the_chain_starts() -> None:
-    """On a push the review stage marks the whole chain pending, so the PR shows the pipeline
-    as queued behind stage 1 from the first commit; a stage missing from that mark never shows
-    a result at all until it runs."""
-    data = _load(REVIEW)
-    mark = _find_step(data["jobs"]["resolve"], r"^Mark stages pending$")
-    body = _run(mark)
-    for context in ("REVIEW_CONTEXT", "MUTATION_CONTEXT", "PREMORTEM_CONTEXT", "CUBIC_CONTEXT"):
-        assert context in body, f"Mark stages pending does not mark {context}"
-
-
-def test_the_cancel_step_covers_every_downstream_workflow() -> None:
-    """A new push makes the downstream runs of older commits worthless; cancelling only some of
-    them would leave runs of a stale SHA (mutation, pre-mortem, cubic) to spend the same
-    minutes."""
-    data = _load(REVIEW)
-    resolve = data["jobs"]["resolve"]
-    cancel = _find_step(resolve, r"^Cancel")
-    body = _run(cancel)
-    for target in (MUTATION, PREMORTEM, CUBIC):
-        assert target in body, f"the cancel step does not cover {target}"
-    assert cancel.get("if"), "the cancel step must only run on a push"
-    assert "pull_request" in cancel["if"], "the cancel step must only run on a push"
-
-
-def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
+def test_the_agent_jobs_hold_no_token_and_verify_the_tree() -> None:
     """The trust model of the read-only stages: the agent has a shell but no credential, and a
     checkout it modified invalidates the result, so the run must fail instead of posting."""
     for name in AGENT_WORKFLOWS:
@@ -605,362 +613,19 @@ def test_the_agent_job_holds_no_token_and_verifies_the_tree() -> None:
         assert "git status --porcelain" in bodies, f"{name}: no tree-clean guard"
 
 
-def test_the_cubic_stage_is_a_gate_on_cubics_own_review() -> None:
-    """The last stage runs no agent: cubic reviews the PR itself, and the workflow only waits
-    for a review of the analysed commit. It must therefore poll cubic's reviews filtered to the
-    head SHA and the review-summary marker (a review of an older or newer commit is not this
-    stage's verdict), stop waiting when the head moves on, and never check out or run the PR's
-    code - unlike the review, mutation and pre-mortem stages, it has no agent to sandbox."""
-    data = _load(CUBIC)
-    jobs = data["jobs"]
-    assert "wait" in jobs, f"no wait job in {list(jobs)}"
-    for key in ("verdict", "blocking", "advisory", "review_id"):
-        assert key in jobs["wait"].get("outputs", {}), f"the wait job publishes no {key}"
-
-    wait = _run(_find_step(jobs["wait"], r"^Wait for cubic review$"))
-    assert "pulls/${PR_NUMBER}/reviews" in wait, "the wait step does not read PR reviews"
-    assert "commit_id == $sha" in wait, "the wait step accepts a review of another commit"
-    assert "contains($marker)" in wait, "the wait step does not require cubic's summary marker"
-    assert "seq 1 40" in wait and "sleep 30" in wait, "the wait is not bounded to 20 minutes"
-    assert 'if [ "$head" != "$HEAD_SHA" ]' in wait, "the wait step never notices a moved head"
-
-    poster = _run(_find_step(jobs["post"], r"^Post or update cubic-review comment$"))
-    assert "not updating the comment" in poster, "the poster does not guard a moved head"
-
-    bodies = _all_run_bodies(data)
-    assert not any(
-        str(step.get("uses", "")).startswith("actions/checkout")
-        for job in jobs.values()
-        for step in _steps(job)
-    ), "the cubic stage checks out the PR's code"
-    for forbidden in ("opencode", "npm install"):
-        assert forbidden not in bodies, f"the cubic stage runs {forbidden!r}"
-
-
-def _cubic_body(*violations: str) -> str:
-    """A cubic review body in the shape cubic posts: a summary block and the unresolved
-    findings with their priority prefix inside the AI-agents prompt."""
-    inner = "".join(
-        f'<violation number="1" location="a.py:1">\n{v}\n</violation>\n' for v in violations
-    )
-    return (
-        "<!-- cubic:review-summary:start -->\n**x**\n<!-- cubic:review-summary:end -->\n\n"
-        "<details>\n<summary>Prompt for AI agents (unresolved issues)</summary>\n\n"
-        "```text\n" + inner + "```\n\n</details>\n"
-    )
-
-
-def _cubic_classify(
-    tmp_path, reviews: list[dict], found: str = "true", superseded: str = "false"
-) -> dict:
-    """Run the cubic workflow's own classification step on ``reviews``."""
-    step = _find_step(_load(CUBIC)["jobs"]["wait"], r"^Classify cubic findings$")
-    (tmp_path / "cubic").mkdir()
-    (tmp_path / "cubic" / "reviews.json").write_text(json.dumps(reviews), encoding="utf-8")
-    out = tmp_path / "github_output"
-    out.write_text("", encoding="utf-8")
-    env = {
-        **os.environ,
-        "RUNNER_TEMP": str(tmp_path),
-        "GITHUB_OUTPUT": str(out),
-        "FOUND": found,
-        "SUPERSEDED": superseded,
-    }
-    subprocess.run(
-        [shutil.which("bash") or "bash", "-c", _run(step)],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=tmp_path,
-        env=env,
-    )
-    return dict(
-        line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines() if "=" in line
-    )
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-@pytest.mark.parametrize(
-    ("violations", "found", "superseded", "verdict", "blocking", "advisory"),
-    [
-        # Nothing found: cubic's "No issues found" body has no violation block at all.
-        ((), "true", "false", "PASS", "0", "0"),
-        # A P1 blocks; a P2 alone does not.
-        (("P1: a real defect",), "true", "false", "BLOCK", "1", "0"),
-        (("P2: worth a look",), "true", "false", "PASS", "0", "1"),
-        # P0 blocks as well, and the advisory levels are still counted.
-        (
-            ("P0: live-trading data loss", "P1: wrong side", "P2: clarity", "P3: nit"),
-            "true",
-            "false",
-            "BLOCK",
-            "2",
-            "2",
-        ),
-        # No cubic review of the head commit: the stage could not run, which is an error.
-        ((), "false", "false", "INCOMPLETE", "0", "0"),
-        # The head moved on while waiting: the newer push has its own run.
-        ((), "false", "true", "SUPERSEDED", "0", "0"),
-    ],
-)
-def test_the_cubic_priorities_map_to_the_stage_status(
-    violations, found, superseded, verdict, blocking, advisory, tmp_path
-) -> None:
-    """cubic's priorities are the gate: P0/P1 block, P2/P3 are advisory. The classification runs
-    on the newest review of the head commit, and its verdicts must land in the status map the
-    post job applies - a P1 reported as success would be the gate lying."""
-    result = _cubic_classify(
-        tmp_path,
-        [{"id": 42, "body": _cubic_body(*violations)}] if found == "true" else [],
-        found=found,
-        superseded=superseded,
-    )
-    assert result["verdict"] == verdict
-    assert result["blocking"] == blocking
-    assert result["advisory"] == advisory
-
-    post = _load(CUBIC)["jobs"]["post"]
-    body = _run(_find_step(post, r"^Set status$"))
-    case = re.search(r'case "\$VERDICT" in(.*?)\n\s*esac', body, re.S)
-    assert case, 'the cubic post job has no `case "$VERDICT"` map'
-    pairs = {}
-    for arm, state in re.findall(r"^\s*([A-Z|]+)\)\s*state=(\w+);", case.group(1), re.M):
-        for name in arm.split("|"):
-            pairs[name] = state
-    # The map is total: INCOMPLETE has no arm and must reach the catch-all, which is an error.
-    assert "*) state=error" in re.sub(r"\s+", " ", case.group(1)), "the cubic map is not total"
-    expected_state = {"PASS": "success", "BLOCK": "failure", "SUPERSEDED": "error"}.get(verdict)
-    if expected_state is None:
-        assert verdict not in pairs, f"{verdict} has an arm but is not a documented verdict"
-    else:
-        assert pairs.get(verdict) == expected_state, (
-            f"{verdict} does not map to the documented status: {pairs}"
-        )
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_the_cubic_classification_reads_only_the_newest_review_of_the_commit(tmp_path) -> None:
-    """cubic posts a new review on a re-review, and the older one stays. The newest review is
-    the current verdict, as the newest status would be: a re-review that clears the finding must
-    not stay blocked by the body of the review it replaced."""
-    result = _cubic_classify(
-        tmp_path,
-        [
-            {"id": 43, "body": _cubic_body()},
-            {"id": 42, "body": _cubic_body("P1: already fixed")},
-        ],
-    )
-    assert result["verdict"] == "PASS"
-    assert result["blocking"] == "0"
-    assert result["review_id"] == "43"
-
-
-REPO = "itsjustFred/trading-platform"
-PR_NUMBER = 201
-PR_HEAD = "c" * 40
-SKIP_DESCRIPTION = "skipped: draft PR — cubic reviews only ready PRs"
-
-# A `gh` for the cubic workflow's own steps: a shell function, so no executable has to be found
-# on PATH (portable to Git Bash). It logs every call to $GH_LOG, answers GETs of a pull request
-# or of a commit status from the fixture files, and accepts every write without sending it.
-_GH_STUB = r"""gh() {
-  local path jq_expr method src
-  printf '%s\n' "$*" >> "$GH_LOG"
-  [ "${1:-}" = api ] || return 1
-  path=""
-  jq_expr=""
-  method=GET
-  shift
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --jq) jq_expr=$2; shift 2 ;;
-      --method) method=$2; shift 2 ;;
-      -f|-F) shift 2 ;;
-      -*) shift ;;
-      *) path=$1; shift ;;
-    esac
-  done
-  [ "$method" = GET ] || return 0
-  case "$path" in
-    */pulls/*) src=$GH_PR_JSON ;;
-    */status) src=$GH_STATUS_JSON ;;
-    *) echo "gh stub: unexpected GET $path" >&2; return 1 ;;
-  esac
-  if [ -n "$jq_expr" ]; then jq -r "$jq_expr" "$src"; else cat "$src"; fi
-}
-"""
-
-
-def _pr_payload(*, draft: bool) -> dict:
-    return {
-        "number": PR_NUMBER,
-        "state": "open",
-        "draft": draft,
-        "base": {"sha": "b" * 40},
-        "head": {"sha": PR_HEAD, "ref": "chore/coderabbit-on-demand", "repo": {"full_name": REPO}},
-    }
-
-
-def _run_cubic_step(
-    root: Path, step_body: str, *, env: dict[str, str], pr: dict, statuses: list[dict]
-) -> tuple[subprocess.CompletedProcess, dict[str, str], str]:
-    """Run one step of the cubic workflow with the stub `gh`. Returns the process, the outputs
-    the step wrote to GITHUB_OUTPUT, and the calls it made to `gh`."""
-    work = root / "work"
-    work.mkdir(parents=True, exist_ok=True)
-    (root / "pr.json").write_text(json.dumps(pr), encoding="utf-8")
-    (root / "status.json").write_text(json.dumps({"statuses": statuses}), encoding="utf-8")
-    (root / "event.json").write_text(json.dumps({"pull_request": pr}), encoding="utf-8")
-    (root / "output").write_text("", encoding="utf-8")
-    (root / "calls.log").write_text("", encoding="utf-8")
-    cubic_env = _load(CUBIC)["env"]
-    run_env = {
-        **os.environ,
-        "CUBIC_CONTEXT": str(cubic_env["CUBIC_CONTEXT"]),
-        "PREMORTEM_CONTEXT": str(cubic_env["PREMORTEM_CONTEXT"]),
-        "GH_LOG": str(root / "calls.log"),
-        "GH_PR_JSON": str(root / "pr.json"),
-        "GH_STATUS_JSON": str(root / "status.json"),
-        "GITHUB_OUTPUT": str(root / "output"),
-        "GITHUB_EVENT_PATH": str(root / "event.json"),
-        "GITHUB_REPOSITORY": REPO,
-        "RUNNER_TEMP": str(work),
-        **env,
-    }
-    proc = subprocess.run(
-        [shutil.which("bash") or "bash", "-c", _GH_STUB + "\n" + step_body],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=work,
-        env=run_env,
-    )
-    outputs = dict(
-        line.split("=", 1)
-        for line in (root / "output").read_text(encoding="utf-8").splitlines()
-        if "=" in line
-    )
-    return proc, outputs, (root / "calls.log").read_text(encoding="utf-8")
-
-
-def test_the_cubic_stage_runs_again_when_a_draft_becomes_ready() -> None:
-    """cubic does not review drafts, so a draft's dispatch is skipped. Marking the PR ready must
-    run the stage again, and it is the only event that does besides the pre-mortem's dispatch:
-    a push or a reopen is the chain's to re-run."""
-    data = _load(CUBIC)
-    on = _triggers(data)
-    assert on.get("pull_request") == {"types": ["ready_for_review"]}, (
-        f"cubic triggers on {on.get('pull_request')}, want exactly ready_for_review"
-    )
-    assert "workflow_dispatch" in on, "cubic lost the dispatch the pre-mortem sends it"
-    assert "github.event.pull_request.number" in data["concurrency"]["group"], (
-        "a ready run shares no concurrency group with the PR's other cubic runs"
-    )
-
-
-def test_a_draft_head_is_never_waited_for_and_is_written_as_a_success() -> None:
-    """The draft exit is a static pin as well as a behaviour: the status the mark-running step
-    writes and the wait job both exclude drafts, so a draft cannot sit `pending` for 20 minutes
-    and end as `error`."""
-    jobs = _load(CUBIC)["jobs"]
-    assert "draft" in _find_step(jobs["resolve"], r"^Mark running$")["if"], (
-        "Mark running does not exclude drafts"
-    )
-    assert "draft" in jobs["wait"]["if"], "the wait job does not exclude drafts"
-    skip = _find_step(jobs["resolve"], r"^Skip draft PR$")
-    assert "draft" in skip["if"], "the skip step runs on ready PRs"
-    assert "state=success" in _run(skip), "the skip step does not write success"
-
-
-@pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
-)
-def test_a_draft_head_resolves_without_a_call_and_is_written_as_a_success(tmp_path) -> None:
-    jobs = _load(CUBIC)["jobs"]
-    resolve = _run(_find_step(jobs["resolve"], r"^Resolve PR$"))
-    proc, outputs, calls = _run_cubic_step(
-        tmp_path / "resolve",
-        resolve,
-        env={"GITHUB_EVENT_NAME": "pull_request", "INPUT_PR": "", "INPUT_SHA": ""},
-        pr=_pr_payload(draft=True),
-        statuses=[],
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert outputs["current"] == "true" and outputs["draft"] == "true"
-    assert calls == "", "resolving a draft calls the API, so it could gate on something"
-
-    skip = _run(_find_step(jobs["resolve"], r"^Skip draft PR$"))
-    proc, _outputs, calls = _run_cubic_step(
-        tmp_path / "skip", skip, env={"HEAD_SHA": PR_HEAD}, pr=_pr_payload(draft=True), statuses=[]
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert f"repos/{REPO}/statuses/{PR_HEAD}" in calls, "the skip writes to another commit"
-    assert "-f state=success" in calls
-    assert "-f context=agent/cubic-review" in calls
-    assert f"-f description={SKIP_DESCRIPTION}" in calls
-    assert "state=error" not in calls and "state=pending" not in calls
-
-
-@pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
-)
-@pytest.mark.parametrize(
-    ("premortem", "current"),
-    [
-        ("success", "true"),
-        ("pending", "false"),
-        ("failure", "false"),
-        ("error", "false"),
-        (None, "false"),
-    ],
-)
-def test_a_ready_pr_runs_only_when_the_pre_mortem_passed_on_its_head(
-    premortem, current, tmp_path
-) -> None:
-    """A ready_for_review run is not dispatched by the chain. It proceeds only on the verdict that
-    dispatches this stage (the pre-mortem's success on the head); any other state leaves the
-    statuses to the chain, which still reaches this stage when the pre-mortem passes."""
-    resolve = _run(_find_step(_load(CUBIC)["jobs"]["resolve"], r"^Resolve PR$"))
-    statuses = [] if premortem is None else [{"context": "agent/pre-mortem", "state": premortem}]
-    proc, outputs, calls = _run_cubic_step(
-        tmp_path,
-        resolve,
-        env={"GITHUB_EVENT_NAME": "pull_request", "INPUT_PR": "", "INPUT_SHA": ""},
-        pr=_pr_payload(draft=False),
-        statuses=statuses,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert outputs["current"] == current
-    assert f"repos/{REPO}/commits/{PR_HEAD}/status" in calls, "the gate reads another commit"
-    assert "--method" not in calls, "a ready run's resolve writes a status"
-    if current == "true":
-        assert outputs["head"] == PR_HEAD
-        assert outputs["number"] == str(PR_NUMBER)
-        assert outputs["draft"] == "false"
-
-
-@pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
-)
-def test_a_dispatch_is_not_gated_on_the_pre_mortem(tmp_path) -> None:
-    """The override dispatches this stage by hand after a red pre-mortem, so only a ready run
-    waits for the pre-mortem's verdict."""
-    resolve = _run(_find_step(_load(CUBIC)["jobs"]["resolve"], r"^Resolve PR$"))
-    proc, outputs, calls = _run_cubic_step(
-        tmp_path,
-        resolve,
-        env={
-            "GITHUB_EVENT_NAME": "workflow_dispatch",
-            "INPUT_PR": str(PR_NUMBER),
-            "INPUT_SHA": PR_HEAD,
-        },
-        pr=_pr_payload(draft=False),
-        statuses=[{"context": "agent/pre-mortem", "state": "failure"}],
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert outputs["current"] == "true"
-    assert f"repos/{REPO}/pulls/{PR_NUMBER}" in calls
-    assert "/status" not in calls
+def test_opencode_is_installed_without_dependency_lifecycle_scripts() -> None:
+    """Every `npm install` in the agent jobs passes `--ignore-scripts`, so no dependency's
+    install hook runs on the runner; @opencode/cli's own postinstall (it links the platform
+    binary) is then run by name. SonarCloud rates a plain `npm install` a security issue, and
+    that one rule was what kept the quality gate red on every agent workflow PR."""
+    for name in AGENT_WORKFLOWS:
+        _job_name, job = _agent_job(_load(name))
+        body = _run(_find_step(job, r"^Install opencode$"))
+        installs = [line for line in body.splitlines() if "npm install" in line]
+        assert installs, f"{name}: the install step runs no npm install"
+        for line in installs:
+            assert "--ignore-scripts" in line, f"{name}: npm install without --ignore-scripts"
+        assert "node ./postinstall.mjs" in body, f"{name}: opencode's postinstall is not run"
 
 
 def _premortem_verdict(output: str, tmp_path) -> str:
@@ -998,4 +663,8 @@ def _premortem_verdict(output: str, tmp_path) -> str:
     ],
 )
 def test_pre_mortem_verdict_extraction(output: str, expected: str, tmp_path) -> None:
+    """The workflow, not the test, decides what a verdict is: the extraction lines are lifted
+    out of the YAML and run, so a verdict the regex accepts and a run that posts it cannot
+    disagree. The `**Verdict:**` line must be the last non-empty line - a verdict quoted from
+    the diff earlier in the output does not count."""
     assert _premortem_verdict(output, tmp_path) == expected

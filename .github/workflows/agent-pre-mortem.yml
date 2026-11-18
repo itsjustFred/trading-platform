@@ -1,69 +1,67 @@
 name: Agent Pre-Mortem
 # Quoted: an unquoted "#" after a space starts a YAML comment, which dropped
-# the PR number and SHA from display_title (see agent-mutation-testing.yml for
-# what that broke: the superseded-run cancel in agent-code-review.yml).
-run-name: "Agent Pre-Mortem PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha || 'current head' }}"
+# the PR number and SHA from display_title.
+run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.event.inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || github.event.inputs.head_sha || 'current head' }}"
 
-# Stage 4 of the PR verification pipeline (see the `platform-pr-verify` skill):
-#   SonarCloud -> Agent Code Review -> Agent Mutation Testing -> Agent Pre-Mortem (this) -> Cubic
+# Our own automated, read-only pre-mortem on every push to a PR, using the
+# `.agents/skills/actions-pre-mortem` skill as the system prompt of an opencode
+# agent. It is one of three independent agent workflows (Agent Code Review,
+# Agent Mutation Testing, Agent Pre-Mortem) that each run on their own on every
+# push to an open PR: none of them starts another, and each upserts one PR
+# comment of its own. SonarCloud runs separately on each push as well; the
+# `platform-pr-verify` skill reads the four together. (The earlier chain, where
+# review -> mutation -> pre-mortem ran one after the other via dispatches, is
+# abandoned.)
 #
-# Position. On main the pipeline was run by hand in the order SonarCloud ->
-# mutation testing -> pre-mortem -> code review -> CodeRabbit. The chain branch
-# reordered the automated stages: the read-only code review runs first (cheap,
-# and it blocks before the expensive mutation run), mutation testing second,
-# and the pre-mortem takes the slot behind them, as the last agent stage before
-# the automated review gate (cubic, `agent-cubic-review.yml`). That keeps
-# mutation testing ahead of the pre-mortem (the relative order those two had on
-# main), leaves the hardened review -> mutation dispatch untouched, and puts
-# the most speculative stage last: its findings are the ones a human weighs
-# after every blocking gate has passed, next to cubic's.
+# It runs on `pull_request` itself (opened, a synchronize, a reopen, and the
+# moment a draft becomes ready for review), with a `workflow_dispatch` for a
+# manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has to
+# be re-analysed, e.g. after an infra failure). Its run-name carries the PR
+# number and the analysed SHA, so a run of an older commit is recognisable in the
+# run list; the concurrency group below cancels runs of older commits of the same
+# PR.
 #
-# It has no pull_request trigger. `agent-mutation-testing.yml` dispatches it
-# with the PR head SHA when the mutation verdict is PASS. The run-name carries
-# the PR number and SHA, so a later push can cancel runs of older commits (the
-# review workflow's cancel step covers every downstream workflow). A run whose
-# SHA is no longer the PR head stops without doing anything.
-#
-# It runs the `.agents/skills/actions-pre-mortem` skill as the system prompt of
-# a read-only opencode agent, posts (and on later runs updates) one PR comment,
-# and sets the commit status `agent/pre-mortem` on the analysed SHA:
-#   pending: running · success: PASS · failure: BLOCK or CHANGES-REQUESTED
-#   error:   INCOMPLETE or the run failed
-#
-# On PASS it dispatches `agent-cubic-review.yml`, the last stage, which waits
-# for cubic's review of the same SHA and gates on its P0/P1 findings (on a draft
-# PR it writes success without waiting; see that workflow). That is why the post
-# job holds `actions: write`, like the mutation stage's.
-#
-# Override (mutation testing red, findings judged irrelevant): justify each
-# finding in a PR comment, then dispatch by hand. Pass the head SHA as well as the
-# PR number: the resolve-failure reporter clears a pending status for the SHA it
-# is given, and without it a failed run can only warn (head_sha still defaults
-# to the current head):
-#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+# The agent is read-only; this job writes no repo code. It reads the PR diff and
+# its blast radius, writes ranked future-failure scenarios, and produces a
+# machine-checkable verdict. For the analysed SHA the workflow sets the commit
+# status `agent/pre-mortem` (pending while running, success on PASS, failure on
+# BLOCK or CHANGES-REQUESTED, error on INCOMPLETE or a failed run) and upserts
+# one PR comment titled `# Pre-Mortem Action` (hidden marker
+# `<!-- actions-pre-mortem -->`). A result for a commit that is no longer the PR
+# head still lands its status on its own SHA but does not overwrite the comment.
 #
 # opencode's free Zen models need no login and no API key, so this workflow
-# holds no secret besides the default GITHUB_TOKEN of the jobs that run no
-# repo code.
+# holds no secret besides the default GITHUB_TOKEN of the jobs that run no repo
+# code. Those models do cap usage; hitting the cap fails the run, and a failed
+# run is reported as `error`, like any other transient reason a sibling has
+# (re-run the job; the remedy is the one the siblings document).
 #
 # Trust model:
 # - The rules (the skill) are read from the base branch, so a PR cannot weaken
 #   its own run. Only while the base has no skill yet is another copy used, and
 #   the prompt says so.
-# - Like the code review and unlike the mutation testing, this job runs no repo
-#   code: it reads the diff and its blast radius and writes scenarios. The
-#   agent's edit tool and .env reads are denied, but it has a shell, so those
-#   denies are a hint, not a boundary. The real guards: the job holds no token
-#   or secret, and the run fails if HEAD moved or the tree is dirty.
-# - The workflow file runs from the dispatched ref (the PR branch), like the
-#   PR's copy on pull_request. Accepted for the same reason as in the review
-#   workflow. Fork PRs are skipped.
+# - The agent is defined in the runner's global opencode config, outside the
+#   checkout. Its edit tool and .env reads are denied, but it has a shell, so
+#   those denies are a hint, not a boundary. The real guards: the agent job
+#   holds no token or secret, and the run fails if HEAD moved or the tree is
+#   dirty.
+# - This workflow file itself is not pinned: on pull_request GitHub runs the
+#   PR's copy. Accepted, since only collaborators with write access can open
+#   same-repo PRs. Fork PRs are skipped, and drafts (the run is skipped until
+#   the PR is ready for review).
+#
+# Manual rerun (a failed or superseded run, or an older commit that never got
+# one): pass the head SHA as well as the PR number when the analysed commit is
+# not the current head; the comment guard then keeps a newer result in place:
+#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   PREMORTEM_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
 #   PREMORTEM_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -71,12 +69,12 @@ on:
         required: true
         type: number
       head_sha:
-        description: Commit to analyse; the run stops if it is no longer the PR head (default the current head)
+        description: Commit to analyse; the result lands on this commit, and a newer head's comment is not overwritten (default the current head)
         required: false
         type: string
 
 concurrency:
-  group: agent-pre-mortem-${{ inputs.pr_number }}
+  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 env:
@@ -85,25 +83,31 @@ env:
   VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-pre-mortem/SKILL.md
   PREMORTEM_CONTEXT: agent/pre-mortem
-  CUBIC_CONTEXT: agent/cubic-review
 
 jobs:
   # Resolves the PR and writes its metadata (title and body via jq, never via
-  # ${{ }} interpolation into a shell script). Marks the stage running and
-  # stops when the analysed SHA is no longer the PR head.
+  # ${{ }} interpolation into a shell script). On pull_request the event payload
+  # is enough, so the usual path makes no API call and uses no token; the
+  # dispatch path resolves the PR number with the token. Marks the analysed
+  # commit running, and skips drafts. A bookkeeping failure after the mark
+  # would strand the status `pending`; the last step turns it into an error.
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # A manual rerun resolves the PR by number; the pull_request path parses
+    # the event payload and needs no API call. The token writes the status
+    # below, and only for a same-repo PR.
     permissions:
       pull-requests: read
       statuses: write
+    # Drafts are not pre-mortemed: the run resumes when the PR is ready for
+    # review (one of the pull_request types above).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     outputs:
       number: ${{ steps.pr.outputs.number }}
       base: ${{ steps.pr.outputs.base }}
       head: ${{ steps.pr.outputs.head }}
-      head_ref: ${{ steps.pr.outputs.head_ref }}
       same_repo: ${{ steps.pr.outputs.same_repo }}
-      current: ${{ steps.pr.outputs.current }}
     steps:
       - name: Resolve PR
         id: pr
@@ -113,41 +117,37 @@ jobs:
           INPUT_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
-          if [ "$(jq -r .state pr.json)" != "open" ]; then
-            echo "::error::PR #${INPUT_PR} is not open."
-            exit 1
+          head=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+            if [ "$(jq -r .state pr.json)" != "open" ]; then
+              echo "::error::PR #${INPUT_PR} is not open."
+              exit 1
+            fi
+            # A dispatch may name an older commit (a rerun after an infra
+            # failure, or one the head moved past). It is analysed on purpose:
+            # its status lands on that commit, and the comment guard below
+            # keeps a newer result's comment in place.
+            if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
+              echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; analysing the requested commit."
+            fi
           fi
-          # The SHA the mutation stage passed must still be the head; otherwise
-          # a newer push has its own pipeline run and this one has nothing to do.
-          if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
-            echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; superseded, nothing to do."
-            echo "current=false" >> "$GITHUB_OUTPUT"
-            # Close what the push marked on the superseded commit, so its stage
-            # status ends terminal instead of pending (only if still pending).
-            for ctx in "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
-              state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${INPUT_SHA}/status" \
-                --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
-              if [ "$state" = "pending" ]; then
-                gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${INPUT_SHA}" \
-                  -f state=error -f context="$ctx" \
-                  -f description="Superseded: the PR head moved on" > /dev/null
-              fi
-            done
-            exit 0
-          fi
-          echo "current=true" >> "$GITHUB_OUTPUT"
-          jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
+          head=${INPUT_SHA:-$(jq -r .head.sha pr.json)}
+          # The metadata names the commit that is analysed, not the PR's current
+          # head: a manual rerun of an older commit hands the agent a file that
+          # agrees with the prompt instead of a stale SHA.
+          jq --arg head "$head" '{number, title, body, base: .base.sha, head: $head}' pr.json > meta.json
           {
             echo "number=$(jq -r .number pr.json)"
             echo "base=$(jq -r .base.sha pr.json)"
-            echo "head=$(jq -r .head.sha pr.json)"
-            echo "head_ref=$(jq -r .head.ref pr.json)"
+            echo "head=${head}"
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Mark running
-        if: steps.pr.outputs.current == 'true' && steps.pr.outputs.same_repo == 'true'
+        if: steps.pr.outputs.number != '' && steps.pr.outputs.same_repo == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head }}
@@ -158,47 +158,44 @@ jobs:
             -f target_url="$RUN_URL" > /dev/null
 
       - uses: actions/upload-artifact@v4
-        if: steps.pr.outputs.current == 'true'
         with:
           name: agent-pre-mortem-meta
           path: meta.json
           retention-days: 1
 
-      # After "Mark running" a failure here (artifact upload) would leave the
-      # stage `pending` with every later job skipped. The reporter clears the
-      # resolved head and falls back to the dispatch input: a failure of the first
-      # step (before `head` is written) must still leave it a SHA to clear, or the
-      # pending status never reaches an error.
+      # After "Mark running" a failure here (the artifact upload) would leave
+      # the status `pending` with every later job skipped. The reporter clears
+      # the resolved head and falls back to the event or dispatch input: a
+      # failure of the first step (before `head` is written) must still leave
+      # it a SHA to clear, or the pending status never reaches an error.
       - name: Report resolve failure
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The resolved head (the commit "Mark running" marked) first; the
-          # dispatch input when the first step failed before writing `head`.
-          HEAD_SHA: ${{ steps.pr.outputs.head || inputs.head_sha }}
+          # event's head when the payload path failed; the dispatch input last.
+          HEAD_SHA: ${{ steps.pr.outputs.head || github.event.pull_request.head.sha || inputs.head_sha }}
         run: |
           set -euo pipefail
-          # Only a manual dispatch without head_sha whose first step failed (before
-          # the head was resolved and before "Mark running") gets here with no SHA;
-          # this run then marked nothing pending, and the run log is the signal.
+          # A dispatch whose first step failed (a bad PR number) never marked a
+          # status, so with no SHA the run log is the signal.
           if [ -z "$HEAD_SHA" ]; then
-            echo "::warning::No head SHA was named in the dispatch input or resolved; a pending stage status can only be cleared by the next push or dispatch."
+            echo "::warning::No head SHA was resolved from the event or the dispatch input; a pending stage status can only be cleared by a later run."
             exit 0
           fi
-          for ctx in "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
-            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
-            if [ "$state" = "pending" ]; then
-              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-                -f state=error -f context="$ctx" \
-                -f description="Resolve step failed; see the run log" > /dev/null
-            fi
-          done
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Resolve step failed; see the run log" > /dev/null
+          fi
 
   premortem:
     needs: resolve
-    # Fork PRs are not pre-mortemed.
-    if: ${{ needs.resolve.outputs.current == 'true' && needs.resolve.outputs.same_repo == 'true' }}
+    # Fork PRs are not pre-mortemed. A skipped resolve (a draft) skips this
+    # job with it.
+    if: ${{ needs.resolve.outputs.same_repo == 'true' }}
     runs-on: ubuntu-latest
     # The skill stops starting new scenarios at about 20 minutes of work.
     timeout-minutes: 30
@@ -236,13 +233,8 @@ jobs:
           opencode --version
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
-      # skill is not merged yet) the copy from the commit this workflow runs
-      # from, then the PR's own copy.
-      #
-      # Duplicated by hand in agent-code-review.yml and agent-mutation-testing.yml:
-      # skill selection, agent config, verdict parse, tree-clean check and
-      # comment poster. A change to one copy must land in the others in the
-      # same commit.
+      # skill is not merged yet) the PR's own copy - the same two levels, in the
+      # same order, as the sibling workflows.
       - name: Select skill revision
         run: |
           set -euo pipefail
@@ -253,20 +245,17 @@ jobs:
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
-          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
-            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
-            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
           elif [ -f "$SKILL_PATH" ]; then
             cp "$SKILL_PATH" "$skill"
             echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
           else
-            echo "::error::No pre-mortem skill found at base, workflow ref or PR head."
+            echo "::error::No pre-mortem skill found at base or PR head."
             exit 1
           fi
 
       # The agent lives in the global config, not in the checkout. Its system
       # prompt is the skill body (the skill's own frontmatter is dropped). It is
-      # read-only, like the review agent; .env reads stay denied.
+      # read-only; .env reads stay denied.
       - name: Configure pre-mortem agent
         run: |
           conf="$HOME/.config/opencode"
@@ -309,10 +298,20 @@ jobs:
           out="$RUNNER_TEMP/premortem/comment.md"
           # Captured through a variable, never a file the agent can reach: it
           # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
-          # in $out.raw would otherwise be posted as the verdict.
+          # would otherwise be posted as the verdict. stderr goes to a file so
+          # a failed run's reason stays greppable below.
           if ! raw=$(opencode run --standalone --archived --agent pr-premortem \
-            "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}."); then
+            "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}." 2> "$out.stderr"); then
             printf '%s\n' "$raw" > "$out.raw"
+            cat "$out.stderr" >> "$out.raw"
+            # The free Zen models cap usage per period. Hitting the cap is an
+            # infra failure, not a pre-mortem result: the run fails, the post
+            # job reports the status as `error`, and the remedy is to re-run
+            # this job - the same handling a transient failure gets from the
+            # sibling workflows.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached' "$out.stderr"; then
+              echo "::error::opencode free-model usage limit reached - a transient infra failure, not a pre-mortem result. Re-run this job; the stage status is reported as \`error\`."
+            fi
             exit 1
           fi
           printf '%s\n' "$raw" > "$out.raw"
@@ -375,8 +374,8 @@ jobs:
           path: ${{ runner.temp }}/premortem/comment.md
           retention-days: 14
 
-  # Posts the comment, sets the status and, on PASS, dispatches the cubic
-  # stage. Runs no repo code. Also reports a failed pre-mortem run as `error`.
+  # Posts the comment and sets the status. Runs no repo code. Also reports a
+  # failed run (an infra failure, e.g. the free model's usage limit) as `error`.
   post:
     needs: [resolve, premortem]
     if: ${{ !cancelled() && (needs.premortem.result == 'success' || needs.premortem.result == 'failure') }}
@@ -384,17 +383,14 @@ jobs:
     timeout-minutes: 5
     # Verified on PR #178 for the review workflow's identical steps:
     # pull-requests: write is enough for the issues/{n}/comments endpoints on a
-    # pull request; issues: write is not needed. actions: write is for
-    # `gh workflow run agent-cubic-review.yml` below.
+    # pull request; issues: write is not needed.
     permissions:
       pull-requests: write
       statuses: write
-      actions: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ needs.resolve.outputs.number }}
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
-      HEAD_REF: ${{ needs.resolve.outputs.head_ref }}
       VERDICT: ${{ needs.premortem.outputs.verdict }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -405,9 +401,6 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=error -f context="$PREMORTEM_CONTEXT" \
             -f description="Pre-mortem run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-            -f state=error -f context="$CUBIC_CONTEXT" \
-            -f description="Not run: ${PREMORTEM_CONTEXT} failed" > /dev/null
 
       - uses: actions/download-artifact@v4
         if: needs.premortem.result == 'success'
@@ -436,7 +429,7 @@ jobs:
             gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
           fi
 
-      - name: Set status and start cubic review
+      - name: Set status
         if: needs.premortem.result == 'success'
         run: |
           set -euo pipefail
@@ -448,26 +441,9 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state="$state" -f context="$PREMORTEM_CONTEXT" \
             -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
-          if [ "$VERDICT" = "PASS" ]; then
-            # A failed dispatch would otherwise leave agent/cubic-review
-            # `pending` forever on this SHA, with no error anywhere.
-            if ! gh workflow run agent-cubic-review.yml --repo "$GITHUB_REPOSITORY" --ref "$HEAD_REF" \
-              -f pr_number="$PR_NUMBER" -f head_sha="$HEAD_SHA"; then
-              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-                -f state=error -f context="$CUBIC_CONTEXT" \
-                -f description="Not run: dispatch of cubic review failed" > /dev/null
-              echo "::error::Failed to dispatch agent-cubic-review.yml; set ${CUBIC_CONTEXT} to error."
-              exit 1
-            fi
-            echo "Dispatched cubic review for ${HEAD_SHA}."
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-              -f state=error -f context="$CUBIC_CONTEXT" \
-              -f description="Not run: ${PREMORTEM_CONTEXT} is ${VERDICT}. Override: dispatch by hand" > /dev/null
-          fi
 
       # A failure above (artifact download, comment POST/PATCH, status write)
-      # would otherwise leave a stage `pending` on this SHA forever. Only a
+      # would otherwise leave the status `pending` on this SHA forever. Only a
       # still-pending context is touched, so a terminal verdict stands.
       - name: Report post failure
         if: failure()
@@ -475,43 +451,44 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          for ctx in "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
-            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
-            if [ "$state" = "pending" ]; then
-              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-                -f state=error -f context="$ctx" \
-                -f description="Post step failed; see the run log" > /dev/null
-            fi
-          done
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Post step failed; see the run log" > /dev/null
+          fi
 
-  # A cancelled run (a hand-cancel, or a newer dispatch for the same PR through
-  # the concurrency group) skips every reporter above, which would leave the
-  # stage `pending` with no signal. This job runs only on cancellation and
-  # turns a still-pending status of the analysed commit into an error. A newer
-  # run that already wrote its final status is not touched (pending only).
+  # A cancelled run (a hand-cancel, or a superseding run through the
+  # concurrency group) skips every reporter above, which would leave the status
+  # `pending` with no signal. This job runs only on cancellation and turns a
+  # still-pending status of the analysed commit into an error. A newer run that
+  # already wrote its final status is not touched (pending only).
   report-cancelled:
     needs: [resolve, premortem, post]
-    if: ${{ cancelled() && (needs.resolve.outputs.head != '' || inputs.head_sha != '') }}
+    if: ${{ cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       statuses: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # A run cancelled before resolve wrote `head` still names its commit.
-      HEAD_SHA: ${{ needs.resolve.outputs.head || inputs.head_sha }}
+      # The commit the cancelled run analysed; empty when resolve was cancelled
+      # before it resolved the PR, in which case nothing was marked pending.
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report cancelled pre-mortem run
         run: |
           set -euo pipefail
-          for ctx in "$PREMORTEM_CONTEXT" "$CUBIC_CONTEXT"; do
-            state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-              --jq "[.statuses[] | select(.context == \"${ctx}\")][0].state")
-            if [ "$state" = "pending" ]; then
-              gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-                -f state=error -f context="$ctx" \
-                -f description="Pre-mortem run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
-            fi
-          done
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::Resolve wrote no head SHA; this run marked nothing pending."
+            exit 0
+          fi
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Pre-mortem run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+          fi

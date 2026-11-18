@@ -87,13 +87,13 @@
 | `avg_winner` / `avg_loser` | `float` | |
 | `max_drawdown_pct` | `float` | Positive Zahl |
 | `max_drawdown_duration` | `int` | In Perioden |
-| `sharpe_ratio` | `float` | |
-| `sortino_ratio` | `float` | |
-| `calmar_ratio` | `float` | |
-| `cagr` | `float` | |
+| `sharpe_ratio` | `float \| None` | `None` when undefined (e.g. ruined run) |
+| `sortino_ratio` | `float \| None` | `None` when undefined (e.g. ruined run) |
+| `calmar_ratio` | `float \| None` | `None` when undefined (e.g. ruined run) |
+| `cagr` | `float \| None` | `None` when undefined (e.g. ruined run) |
 | `total_return` | `float` | |
 | `psr` | `float \| None` | Probabilistic Sharpe Ratio |
-| `p_value` | `float` | One-sided p-value |
+| `p_value` | `float \| None` | One-sided p-value; `None` when undefined |
 | `extras` | `dict[str, Any]` | Bucket für nicht-standardisierte Kennzahlen |
 
 **Lücke:** `expectancy`, `sqn`, `largest_winner`, `largest_loser`, `recovery_factor` fehlen; können in `extras` landen.

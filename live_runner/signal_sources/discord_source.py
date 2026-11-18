@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import math
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +15,7 @@ from typing import Any
 import requests
 
 from live_runner.credential_env import discord_bot_env_key
+from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
 from live_runner.signal_sources.base_source import BaseSignalSource
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
@@ -49,8 +52,9 @@ class DiscordChannelForbiddenError(RuntimeError):
         self.channel_id = channel_id
 
 
-#: Maximum backfill pages per poll when a gap is detected (B2: bursts beyond
-#: POLL_LIMIT and 429-windows must not lose signals incl. exits).
+#: Maximum forward backfill pages (REST requests) per poll. A gap larger than
+#: this is carried into the next poll instead of being dropped (B2: bursts
+#: beyond POLL_LIMIT and 429-windows must not lose signals incl. exits).
 MAX_BACKFILL_PAGES = 5
 
 #: ``auth_scheme`` values that mean "a Developer Portal BOT token" — sent with
@@ -83,12 +87,44 @@ class DiscordRateLimitError(RuntimeError):
 
 _RAMJET_OVERSOLD_RE = re.compile(r"is now oversold", re.IGNORECASE)
 _BUY_SIGNAL_RE = re.compile(r"buy signal", re.IGNORECASE)
+# A price token never ends on a comma. `\d[\d,]*` used to swallow the clause
+# separator in "BUY AAPL @ 100, stop $95", so "100," failed the thousands check
+# and a well-formed signal was dropped. An internal comma is still captured and
+# still validated: "$12,34" stays malformed instead of shrinking to 12.
+_PRICE_TOKEN = r"\d(?:[\d,]*\d)?(?:\.\d+)?"
 _PRICE_LABEL_RE = re.compile(
-    r"Price:\s*\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)",
+    r"Price:\s*\$\s*(?P<price>" + _PRICE_TOKEN + r")",
     re.IGNORECASE,
 )
-_DOLLAR_PRICE_RE = re.compile(r"\$\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
-_AT_PRICE_RE = re.compile(r"@\s*(?P<price>\d[\d,]*(?:\.\d+)?)")
+_DOLLAR_PRICE_RE = re.compile(r"\$\s*(?P<price>" + _PRICE_TOKEN + r")")
+# "@ 100" and "at 100" / "at $100" (#121 decision 4: the first @/at price is the
+# entry). The lookahead keeps "at 5%" and "at 10:30" from being read as a price.
+# The "at" form is additionally refused after an indicator word (see
+# _NON_PRICE_AT_CONTEXT): "RSI at 28" is an oscillator reading, and sizing risk
+# off it would be a 7x-wrong entry.
+_AT_PRICE_RE = re.compile(
+    r"(?P<marker>@|\bat\b)\s*\$?\s*(?P<price>" + _PRICE_TOKEN + r")"
+    r"(?![\d,.]*(?:\s*%|:\d|\s*(?:am|pm)\b))",
+    re.IGNORECASE,
+)
+_NON_PRICE_AT_CONTEXT = frozenset(
+    {
+        "rsi", "stoch", "stochastic", "macd", "adx", "cci", "mfi", "atr", "vix",
+        "volume", "sma", "ema", "dma", "vwap", "support", "resistance", "level",
+        "levels", "target", "stop", "sl", "tp", "pt", "tgt",
+    }
+)
+# Words that may sit between an indicator and its reading: "RSI now at 28",
+# "VIX is currently sitting at 18". Only these are skipped when looking back
+# for the indicator, so an order between the two ("RSI oversold: BUY AAPL at
+# 190") keeps its real price.
+_INDICATOR_READING_FILLER = frozenset(
+    {
+        "is", "was", "now", "currently", "still", "just", "only", "already",
+        "back", "sits", "sitting", "holding", "hovering", "reading", "reads",
+        "printing", "prints", "stands", "standing", "right", "around", "near",
+    }
+)
 # The mirror of _ACTION_SELL_RE, and the same hazard in the other direction: a
 # buy is the fallback, so an incidental "buy" opens a real position. Matched
 # bare, "could buy here" and - worse - "do not buy" both read as a BUY signal.
@@ -250,6 +286,11 @@ _SKIP_WORDS = {
     "PROFIT",
     "EXIT",
     "ENTRY",
+    # A position side is never a ticker: "Took profit on long AAPL" resolved the
+    # symbol LONG through the "on <ticker>" label (#121).
+    "LONG",
+    "SHORT",
+    "TARGET",
 }
 
 
@@ -265,6 +306,22 @@ def _safe_message_id_int(message_id: str) -> int | None:
         return int(message_id)
     except ValueError:
         return None
+
+
+def _message_sort_key(message: dict[str, Any]) -> tuple[bool, int]:
+    """Chronological snowflake order; a non-numeric (poison) id sorts last."""
+    parsed = _safe_message_id_int(str(message.get("id")))
+    return (parsed is None, parsed or 0)
+
+
+def _newest_numeric_id(page: Iterable[dict[str, Any]]) -> str | None:
+    """Highest numeric message id in ``page``, or ``None`` if none is numeric."""
+    values = [
+        value
+        for value in (_safe_message_id_int(str(m.get("id"))) for m in page)
+        if value is not None
+    ]
+    return str(max(values)) if values else None
 
 
 def _is_discord_auth_error(exc: BaseException | None) -> bool:
@@ -328,9 +385,12 @@ def _extract_bold_symbol(content: str) -> str | None:
 
 
 def _extract_labeled_symbol(content: str) -> str | None:
+    # `(?![A-Za-z])` is load-bearing: without it a longer word was cut to its
+    # first ten letters, so "wait for confirmation" minted the ticker CONFIRMATI
+    # (#121). A word longer than any ticker is not a ticker.
     for pattern in (
-        r"(?:ticker|symbol|stock)\s*[:\-]\s*\**\$?([A-Za-z]{1,10})\**",
-        r"(?:for|on)\s+\**\$?([A-Za-z]{1,10})\**",
+        r"\b(?:ticker|symbol|stock)\s*[:\-]\s*\**\$?([A-Za-z]{1,10})(?![A-Za-z])\**",
+        r"\b(?:for|on)\s+\**\$?([A-Za-z]{1,10})(?![A-Za-z])\**",
     ):
         symbol = _first_normalized_symbol(
             matched.group(1) for matched in re.finditer(pattern, content, re.IGNORECASE)
@@ -376,8 +436,45 @@ def _extract_symbol(content: str) -> str | None:
     return None
 
 
+def _parse_price_token(raw_price: str) -> float | None:
+    """A strictly formed, finite, positive price, or ``None``."""
+    if not _is_well_formed_price_token(raw_price):
+        return None
+    try:
+        price = float(raw_price.replace(",", ""))
+    except ValueError:
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def _at_price_matches(content: str) -> Iterable[re.Match[str]]:
+    """``@``/``at`` price markers, in order, minus indicator readings."""
+    for matched in _AT_PRICE_RE.finditer(content):
+        if matched.group("marker") != "@":
+            preceding = [
+                word.lower()
+                for word in re.findall(r"[A-Za-z]+", content[: matched.start()])
+            ]
+            # Look back past filler ("RSI is currently at 28") to the word the
+            # reading belongs to.
+            while preceding and preceding[-1] in _INDICATOR_READING_FILLER:
+                preceding.pop()
+            if preceding and preceding[-1] in _NON_PRICE_AT_CONTEXT:
+                continue
+        yield matched
+
+
 def _extract_price(content: str) -> float | None:
-    """Extract the first plausible price from a Discord message.
+    """Extract the entry price from a Discord message.
+
+    Precedence (#121 decision 4): an explicit ``Price:`` label (every real bot
+    alert carries one), then the first ``@``/``at`` price, then the first ``$``
+    price. The ``@``/``at`` form used to come last, so in "BUY AAPL @ 100 target
+    $120" the target won and risk was sized off 120. Callers pass the message with
+    its target/stop clauses already removed (:func:`_extract_trade_levels`), so a
+    take profit or stop loss can never be read as the entry.
 
     Thousands separators are normalized to the decimal point they actually are
     ("1,234.56" -> 1234.56); a comma that does not form a strict
@@ -385,20 +482,17 @@ def _extract_price(content: str) -> float | None:
     rejected rather than reinterpreted as a decimal point, which used to turn
     $1,234 into a 1000x-wrong entry price.
     """
-    for matcher in (_PRICE_LABEL_RE, _DOLLAR_PRICE_RE, _AT_PRICE_RE):
-        matched = matcher.search(content)
+    candidates: tuple[re.Match[str] | None, ...] = (
+        _PRICE_LABEL_RE.search(content),
+        next(iter(_at_price_matches(content)), None),
+        _DOLLAR_PRICE_RE.search(content),
+    )
+    for matched in candidates:
         if matched is None:
             continue
-        raw_price = matched.group("price")
-        if not _is_well_formed_price_token(raw_price):
-            continue
-        try:
-            price = float(raw_price.replace(",", ""))
-        except ValueError:
-            continue
-        if price <= 0:
-            continue
-        return price
+        price = _parse_price_token(matched.group("price"))
+        if price is not None:
+            return price
     return None
 
 
@@ -412,6 +506,330 @@ def _is_well_formed_price_token(raw_price: str) -> bool:
     if len(parts[0]) > 3 or not parts[0].isdigit():
         return False
     return all(len(part) == 3 and part.isdigit() for part in parts[1:])
+
+
+# ─── #121: price levels, reports, conditions and exits ───────────────────────
+#
+# Every one of these used to fall through to the buy fallback and open a
+# position: "Exit long AAPL @ 100" was a BUY, "Took profit on long AAPL" a BUY of
+# a ticker called LONG, "Wait for confirmation before you buy AAPL" a BUY of
+# CONFIRMATI, and in "BUY AAPL @ 100 target $120" the target was the entry.
+
+# A level price followed by "%", "R" or "x" is a percentage or a multiple, not a
+# price ("target 2R", "stop 5%"). Such a clause is left in the text, unparsed.
+_LEVEL_PRICE = (
+    r"(?:[:=\-]|@|\bat\b|\bof\b)?\s*\$?\s*(?P<price>" + _PRICE_TOKEN + r")"
+    r"(?![\d,.]*\s*(?:%|[rRxX]\b))"
+)
+_TAKE_PROFIT_CLAUSE_RE = re.compile(
+    r"\b(?:take[\s-]*profit|profit[\s-]*target|price[\s-]*target|target|tgt|tp\d?|pt\d?)\b"
+    r"\s*" + _LEVEL_PRICE,
+    re.IGNORECASE,
+)
+_STOP_LOSS_CLAUSE_RE = re.compile(
+    r"\b(?:stop[\s-]*loss|stop|sl)\b\s*" + _LEVEL_PRICE,
+    re.IGNORECASE,
+)
+
+# An outcome, not an instruction: something already happened to a position.
+# Checked against the whole message, before anything else can claim it.
+_REPORT_RE = re.compile(
+    r"\btook\s+(?:(?:some|the|my|our|a|more)\s+)?profits?\b"
+    r"|\bprofits?\s+(?:taken|booked|locked|secured)\b"
+    r"|\b(?:booked|locked\s+in|secured)\s+(?:(?:some|the|my|our)\s+)?profits?\b"
+    r"|\bstopped\s+out\b"
+    r"|\b(?:target|tgt|tp\d?|pt\d?|stop(?:[\s-]*loss)?|sl)\s+(?:was\s+|got\s+)?"
+    r"(?:hit|reached|tagged|triggered|filled)\b"
+    r"|\bhit\s+(?:(?:the|our|my|its|first|second)\s+)*"
+    r"(?:target|tgt|tp\d?|pt\d?|stop(?:[\s-]*loss)?|sl)\b"
+    # A past-tense full close describes a trade that is over. Acting on it would
+    # be acting on a recap whose timing nobody controls.
+    r"|\b(?:closed|exited)\b"
+    r"|\b(?:was|were|got|been)\s+(?:closed|exited|filled|stopped)\b",
+    re.IGNORECASE,
+)
+# A condition or a hedge: the instruction is not live yet ("wait for
+# confirmation", "if it breaks", "potential long"). Not an entry, and not an exit.
+_CONDITIONAL_RE = re.compile(
+    r"\bwait(?:s|ed|ing)?\b"
+    r"|\bif\b|\bunless\b|\bonce\b|\bwhen(?:ever)?\b|\buntil\b|\btill\b"
+    r"|\bwatch(?:ing)?\s+(?:for|out)\b"
+    r"|\blook(?:s|ing)?\s+(?:for|to)\b"
+    r"|\bpotential(?:ly)?\b|\bpossibl[ey]\b|\bmaybe\b|\bmight\b|\bconsider(?:ing)?\b"
+    r"|\bpending\b|\bplan(?:ning)?\s+to\b"
+    r"|\bbefore\s+(?:(?:you|we|i)\s+)?(?:buy|enter|long|short|sell|add|exit|close)\b",
+    re.IGNORECASE,
+)
+
+# A full close names the action and what it acts on: "Exit long AAPL", "Closing
+# long AAPL at $100", "Close **$AAPL**", "Exit the long position in AAPL". The
+# word after the fillers must be the message's one ticker (checked against
+# _exit_ticker_candidates), so prose such as "into the close" or "close below 95"
+# is never a directive.
+_EXIT_FILLER = (
+    r"(?:out|of|the|my|our|your|entire|whole|full|all|remaining|rest"
+    r"|position|positions|trade|in|on)"
+)
+_FULL_EXIT_DIRECTIVE_RE = re.compile(
+    r"\b(?:exit(?:ing)?|clos(?:e|ing)|flatten(?:ing)?|get(?:ting)?\s+out)\b"
+    r"(?:\s+" + _EXIT_FILLER + r")*"
+    r"(?:\s+(?P<side>long|short)s?\b)?"
+    r"(?:\s+" + _EXIT_FILLER + r")*"
+    r"\s+(?:\*\*\s*)?\$?(?P<ticker>[A-Za-z]{1,10})(?![A-Za-z])",
+    re.IGNORECASE,
+)
+# The quantifiable shapes of "part of the position" (#121 decision 3).
+_FRACTION_RE = re.compile(
+    r"(?<![\d.,/])(?P<num>\d+)\s*/\s*(?P<den>\d+)(?![\d/])"
+    # A signed percentage is a P&L figure ("+5%"), not a size.
+    r"|(?<![\d.,+\-])(?P<pct>\d+(?:\.\d+)?)\s*%"
+    r"|\b(?P<word>half|(?:a|one)\s+third|two\s+thirds|(?:a|one)\s+quarter|three\s+quarters)\b",
+    re.IGNORECASE,
+)
+_WORD_FRACTIONS = {
+    "half": 0.5,
+    "a third": 1 / 3,
+    "one third": 1 / 3,
+    "two thirds": 2 / 3,
+    "a quarter": 0.25,
+    "one quarter": 0.25,
+    "three quarters": 0.75,
+}
+# A partial exit: closing part of the position. Without a fraction it is
+# rejected - "took partials" says some, not how much, and guessing is the one
+# thing an exit must not do.
+_PARTIAL_EXIT_RE = re.compile(
+    r"\b(?:took|take|taking|takes)\s+(?:(?:some|the|a|my|our|more)\s+)?(?:partials?|profits?)\b"
+    r"|\bpartials?\b"
+    r"|\btrim(?:s|med|ming)?\b"
+    r"|\bscal(?:e|ed|es|ing)\s+out\b"
+    r"|\b(?:sell|sold|selling|exit(?:ing)?|clos(?:e|ing))\s+(?:(?:off|another|out|of)\s+)*"
+    r"(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?\s*%|half\b|(?:a|one|two)\s+thirds?\b"
+    r"|(?:a|one|three)\s+quarters?\b)",
+    re.IGNORECASE,
+)
+_PARTIAL_SIDE_RE = re.compile(r"\b(?P<side>long|short)s?\b(?!-)", re.IGNORECASE)
+# Uppercase words that are never the ticker of an exit message when written bare.
+# A "$ON" or "**ON**" still names ON Semiconductor; a bare "ON" is English.
+_EXIT_BARE_SKIP_WORDS = frozenset(
+    {
+        "I", "A", "AN", "IN", "ON", "OF", "TO", "AT", "IT", "IS", "MY", "OUR", "OUT",
+        "THE", "ALL", "AND", "OR", "BY", "UP", "SO", "NO", "OK", "WE", "US",
+        "HALF", "TRIM", "TRIMMED", "PARTIAL", "PARTIALS", "EXITING", "CLOSING",
+        "POSITION", "TP", "SL", "PT", "TGT", "SOLD", "SCALE", "TOOK", "REST",
+        "LONGS", "SHORTS", "FULL", "THIRD", "THIRDS", "QUARTER", "QUARTERS",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _TradeLevels:
+    """A message split into its entry text and its explicit SL/TP levels.
+
+    ``body`` is the message with every target/stop clause blanked out, so no
+    downstream extractor (symbol, entry price, action) can read a level as
+    something else.
+    """
+
+    body: str
+    entry_price: float | None
+    take_profit: float | None
+    stop_loss: float | None
+
+
+def _level_from_clauses(
+    pattern: re.Pattern[str], content: str, *, name: str
+) -> tuple[float | None, list[tuple[int, int]], bool]:
+    """``(value, spans, ok)`` for one level kind; ``ok`` is False on ambiguity."""
+    values: set[float] = set()
+    spans: list[tuple[int, int]] = []
+    for matched in pattern.finditer(content):
+        price = _parse_price_token(matched.group("price"))
+        if price is None:
+            logger.warning(
+                "Discord message rejected: malformed %s price",
+                name,
+                extra={"data": {"clause": matched.group(0)}},
+            )
+            return None, spans, False
+        values.add(price)
+        spans.append(matched.span())
+    if len(values) > 1:
+        logger.warning(
+            "Discord message rejected: more than one %s level",
+            name,
+            extra={"data": {"values": sorted(values)}},
+        )
+        return None, spans, False
+    return (next(iter(values)) if values else None), spans, True
+
+
+def _extract_trade_levels(content: str) -> _TradeLevels | None:
+    """Split the entry from the take-profit and stop-loss levels (#121 decision 4).
+
+    The first ``@``/``at`` price is the entry; ``target``/``TP`` is the take
+    profit and ``stop``/``SL`` the stop loss. Returns ``None`` - reject the
+    message - when a level is malformed or named twice with different values:
+    an ambiguous bracket is not something to pick a side of.
+    """
+    take_profit, tp_spans, tp_ok = _level_from_clauses(
+        _TAKE_PROFIT_CLAUSE_RE, content, name="take-profit"
+    )
+    if not tp_ok:
+        return None
+    stop_loss, sl_spans, sl_ok = _level_from_clauses(
+        _STOP_LOSS_CLAUSE_RE, content, name="stop-loss"
+    )
+    if not sl_ok:
+        return None
+    body = content
+    for start, end in sorted(tp_spans + sl_spans, reverse=True):
+        body = body[:start] + " " * (end - start) + body[end:]
+    return _TradeLevels(
+        body=body,
+        entry_price=_extract_price(body),
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+    )
+
+
+def _levels_contradict_action(
+    action: str, entry: float, *, stop_loss: float | None, take_profit: float | None
+) -> bool:
+    """True when a stated SL/TP lies on the wrong side of the entry."""
+    if action in {"buy", "long"}:
+        return (stop_loss is not None and stop_loss >= entry) or (
+            take_profit is not None and take_profit <= entry
+        )
+    return (stop_loss is not None and stop_loss <= entry) or (
+        take_profit is not None and take_profit >= entry
+    )
+
+
+def _exit_ticker_candidates(content: str) -> set[str]:
+    """Every token in the message that could be the ticker of an exit."""
+    candidates: set[str] = set()
+    for raw in re.findall(r"\$([A-Za-z]{1,10})(?![A-Za-z])", content):
+        normalized = _normalize_symbol_candidate(raw)
+        if normalized:
+            candidates.add(normalized)
+    for raw in re.findall(r"\*\*\s*\$?([A-Za-z]{1,10})\s*\*\*", content):
+        normalized = _normalize_symbol_candidate(raw)
+        if normalized:
+            candidates.add(normalized)
+    for raw in re.findall(r"(?<![A-Za-z$])([A-Z]{1,10})(?![A-Za-z])", content):
+        if raw in _EXIT_BARE_SKIP_WORDS:
+            continue
+        normalized = _normalize_symbol_candidate(raw)
+        if normalized:
+            candidates.add(normalized)
+    return candidates
+
+
+def _parse_fraction(content: str) -> tuple[float | None, bool]:
+    """``(fraction, ok)``. ``ok`` is False when a fraction is present but invalid
+    or when two different fractions are present."""
+    values: set[float] = set()
+    for matched in _FRACTION_RE.finditer(content):
+        if matched.group("num") is not None:
+            denominator = int(matched.group("den"))
+            if denominator == 0:
+                return None, False
+            value = int(matched.group("num")) / denominator
+        elif matched.group("pct") is not None:
+            value = float(matched.group("pct")) / 100.0
+        else:
+            value = _WORD_FRACTIONS[re.sub(r"\s+", " ", matched.group("word").lower())]
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            return None, False
+        values.add(round(value, 9))
+    if len(values) > 1:
+        return None, False
+    return (next(iter(values)) if values else None), True
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedExit:
+    symbol: str
+    fraction: float
+    position_side: str | None
+    remainder: str
+
+
+class _RejectedExit(Exception):
+    """The message is an exit, but not one that can be executed safely."""
+
+
+def _has_exit_directive(body: str) -> bool:
+    """True when the message issues a close, whether or not its ticker is usable.
+
+    :func:`_parse_exit` only accepts a directive whose object is the message's
+    one ticker. "Exit long ON @ 50" names a ticker that is also an English word
+    ("ON", "IT", "A", "SO"), so no exit is parsed - and the message must then be
+    rejected, never handed to the entry parser, which read it as BUY ON / BUY AT.
+
+    A directive counts when it names a side ("Exit long ...", "Close the short
+    ...") or when its object is written like a ticker (upper case, ``$`` or
+    ``**``). Lower-case prose ("exit on close below 95") is not a directive, so
+    an entry that mentions a close still parses.
+    """
+    for matched in _FULL_EXIT_DIRECTIVE_RE.finditer(body):
+        if matched.group("side"):
+            return True
+        ticker = matched.group("ticker")
+        prefix = body[: matched.start("ticker")].rstrip()
+        if ticker.isupper() or prefix.endswith(("$", "**")):
+            return True
+    return False
+
+
+def _parse_exit(body: str) -> _ParsedExit | None:
+    """Classify an exit/close instruction, or ``None`` when the message is none.
+
+    Raises :class:`_RejectedExit` for an exit that names no single ticker, gives
+    an unquantifiable or impossible partial, or mixes a full close with a size.
+    """
+    partial = _PARTIAL_EXIT_RE.search(body)
+    full = None
+    candidates = _exit_ticker_candidates(body)
+    for matched in _FULL_EXIT_DIRECTIVE_RE.finditer(body):
+        ticker = _normalize_symbol_candidate(matched.group("ticker"))
+        if ticker and ticker in candidates:
+            full = matched
+            break
+    if partial is None and full is None:
+        return None
+    if partial is not None and full is not None:
+        raise _RejectedExit("message mixes a partial and a full exit")
+    if len(candidates) != 1:
+        raise _RejectedExit(
+            f"exit names {len(candidates)} tickers ({sorted(candidates)}), not exactly one"
+        )
+    symbol = next(iter(candidates))
+    fraction, fraction_ok = _parse_fraction(body)
+    if not fraction_ok:
+        raise _RejectedExit("exit size is ambiguous or not a fraction in (0, 1]")
+    if partial is not None:
+        if fraction is None:
+            raise _RejectedExit(
+                "partial exit without a quantifiable fraction; refusing to guess"
+            )
+        sides = {
+            matched.group("side").lower() for matched in _PARTIAL_SIDE_RE.finditer(body)
+        }
+        if len(sides) > 1:
+            raise _RejectedExit("partial exit names both a long and a short side")
+        side = next(iter(sides)) if sides else None
+        remainder = _PARTIAL_SIDE_RE.sub(" ", body[: partial.start()] + body[partial.end():])
+        return _ParsedExit(symbol, fraction, side, remainder)
+    assert full is not None
+    if fraction is not None:
+        # "Exit long AAPL 30%": a full close does not carry a size. Only a
+        # message that clearly says "all of it" closes all of it.
+        raise _RejectedExit("full exit carries a size; ambiguous between full and partial")
+    side = full.group("side")
+    remainder = body[: full.start()] + " " + body[full.end():]
+    return _ParsedExit(symbol, 1.0, side.lower() if side else None, remainder)
 
 
 # A negation between here and the action word cancels the instruction.
@@ -709,26 +1127,71 @@ def _parse_trade_signal_from_message(
     if on_author_accepted is not None:
         on_author_accepted()
 
+    rejection = _non_entry_rejection(content)
+    if rejection is not None:
+        _log_parser_rejection(message, rejection)
+        return None
+    levels = _extract_trade_levels(content)
+    if levels is None:
+        _log_parser_rejection(message, "ambiguous or malformed target/stop level")
+        return None
+    body = levels.body
+
+    try:
+        parsed_exit = _parse_exit(body)
+    except _RejectedExit as exc:
+        _log_parser_rejection(message, f"unexecutable exit: {exc}", warning=True)
+        return None
+    if parsed_exit is not None:
+        return _build_exit_signal(
+            message,
+            content,
+            parsed_exit,
+            price=levels.entry_price,
+            default_timeframe=default_timeframe,
+        )
+    if _has_exit_directive(body):
+        # An exit instruction this parser cannot execute is never an entry.
+        _log_parser_rejection(
+            message,
+            "exit directive without an unambiguous ticker (a bare word such as "
+            "ON or IT is not read as a ticker; write $ON); not executed, and "
+            "never read as an entry",
+            warning=True,
+        )
+        return None
+
     signal_type = None
-    if _is_ramjet_signal(content):
+    if _is_ramjet_signal(body):
         # Still subject to the negation guard. This branch sets the action
         # outright, so "oversold buy signal - do not buy this yet" was a long on
         # the RamJet path while the RocketFuel path correctly refused it. Two bots
         # reading the same message in opposite directions is exactly the
         # inconsistency the one shared predicate exists to prevent.
-        if _BUY_NEGATED_RE.search(content):
+        if _BUY_NEGATED_RE.search(body):
             return None
         action = "buy"
         signal_type = "ram_jet_oversold_buy"
     else:
-        signal_type = _detect_rocket_fuel_signal_type(content)
-        action = _resolve_action(content, signal_type=signal_type)
+        signal_type = _detect_rocket_fuel_signal_type(body)
+        action = _resolve_action(body, signal_type=signal_type)
     if action is None:
         return None
 
-    symbol = _extract_symbol(content)
-    price = _extract_price(content)
+    symbol = _extract_symbol(body)
+    price = levels.entry_price
     if not symbol or price is None or price <= 0:
+        return None
+    if _levels_contradict_action(
+        action, price, stop_loss=levels.stop_loss, take_profit=levels.take_profit
+    ):
+        _log_parser_rejection(
+            message,
+            f"{action} levels on the wrong side of the entry "
+            f"(entry={price}, stop_loss={levels.stop_loss}, "
+            f"take_profit={levels.take_profit})",
+            warning=True,
+        )
         return None
 
     metadata = _build_signal_metadata(
@@ -740,6 +1203,84 @@ def _parse_trade_signal_from_message(
     return TradeSignal(
         action=action,
         symbol=symbol,
+        entry_price=float(price),
+        stop_loss=levels.stop_loss,
+        take_profit=levels.take_profit,
+        timeframe=str(metadata["timeframe"]),
+        metadata=metadata,
+    )
+
+
+def _non_entry_rejection(content: str) -> str | None:
+    """Why a message is neither an entry nor an exit, or ``None``.
+
+    Checked on the whole message before any action is inferred: a report or a
+    condition anywhere in it disqualifies all of it. These used to fall through
+    to the buy fallback ("Took profit on long AAPL" opened a long).
+    """
+    if _REPORT_RE.search(content):
+        return "report of a completed trade, not an instruction"
+    if _CONDITIONAL_RE.search(content):
+        return "conditional or hedged instruction, not a live one"
+    return None
+
+
+def _log_parser_rejection(message: Any, reason: str, *, warning: bool = False) -> None:
+    log = logger.warning if warning else logger.info
+    log(
+        "Discord message not traded: %s",
+        reason,
+        extra={
+            "data": {
+                "discord_message_id": str(getattr(message, "id", "")),
+                "discord_channel_id": _resolve_message_channel_id(message),
+            }
+        },
+    )
+
+
+def _build_exit_signal(
+    message: Any,
+    content: str,
+    parsed_exit: _ParsedExit,
+    *,
+    price: float | None,
+    default_timeframe: str,
+) -> TradeSignal | None:
+    """An exit-only signal (#121 decision 1).
+
+    The action is a placeholder - the close side comes from the position at
+    dispatch (``live_runner.exit_signals.resolve_exit_order``) - and is set to the
+    side that would close the named position so nothing downstream can read it as
+    an opening order of the named side. Exits never carry SL/TP levels.
+    """
+    remainder = parsed_exit.remainder
+    if _reads_as_buy_directive(remainder) or _reads_as_sell_directive(remainder):
+        _log_parser_rejection(
+            message, "message mixes an exit with an entry instruction", warning=True
+        )
+        return None
+    if price is None:
+        _log_parser_rejection(
+            message,
+            "exit without a price: a signal needs a positive price, so this exit "
+            "is not executed (add '@ <price>')",
+            warning=True,
+        )
+        return None
+    instruction = ExitInstruction(
+        fraction=parsed_exit.fraction, position_side=parsed_exit.position_side
+    )
+    metadata = _build_signal_metadata(
+        message,
+        content,
+        signal_type="exit" if parsed_exit.fraction >= 1.0 else "partial_exit",
+        default_timeframe=default_timeframe,
+    )
+    metadata.update(exit_intent_metadata(instruction))
+    return TradeSignal(
+        action="buy" if parsed_exit.position_side == "short" else "sell",
+        symbol=parsed_exit.symbol,
         entry_price=float(price),
         stop_loss=None,
         take_profit=None,
@@ -1240,61 +1781,149 @@ class DiscordSignalSource(BaseSignalSource):
 
         return body if isinstance(body, list) else []
 
-    def _page_reaches_cursor(
-        self, messages: list[dict[str, Any]], last_seen: str
-    ) -> bool:
-        """Whether a newest-first page reaches back to the tracked cursor."""
-        if not last_seen:
-            return True
-        last_int = _safe_message_id_int(last_seen)
-        if last_int is None:
-            return True
-        for message in messages:
-            oldest_int = _safe_message_id_int(str(message.get("id")))
-            if oldest_int is not None and oldest_int <= last_int:
-                return True
-        return False
+    def _advance_cursor(self, channel_id: str, newest: str) -> bool:
+        """Move the monotonic cursor forward to ``newest``.
+
+        Returns whether it moved. Within a running process the poll path only
+        advances it to a message that was fetched and emitted, and only ever
+        forward, so it never jumps past history still to be backfilled (startup
+        priming in ``_prime_cursors`` is the documented exception). A non-numeric
+        id (a poison message or a malformed response) cannot anchor the next
+        ``after`` request and reports ``False``.
+        """
+        newest_int = _safe_message_id_int(newest)
+        if newest_int is None:
+            return False
+        last_int = _safe_message_id_int(self._last_seen_message_ids.get(channel_id, ""))
+        if last_int is not None and newest_int <= last_int:
+            return False
+        self._last_seen_message_ids[channel_id] = newest
+        return True
 
     async def _poll_once(self, channel_id: str, *, emit: bool = True) -> None:
-        first_page = await self._fetch_messages(channel_id)
-        if not first_page:
-            return
         seen = self._seen_ids.setdefault(channel_id, set())
         last_seen = self._last_seen_message_ids.get(channel_id, "")
-        # B2: bursts beyond POLL_LIMIT (and 429-windows) must not lose
-        # signals incl. exits — paginate backwards with `before` until a
-        # page overlaps the tracked cursor (bounded by MAX_BACKFILL_PAGES).
-        # A short page proves Discord returned everything (no gap), so only
-        # full pages trigger another fetch — otherwise REST traffic doubles
-        # on every quiet poll straight into the next 429.
-        pages = [first_page]
-        while (
-            len(pages[-1]) >= POLL_LIMIT
-            and not self._page_reaches_cursor(pages[-1], last_seen)
-            and len(pages) <= MAX_BACKFILL_PAGES
-        ):
-            oldest = str(pages[-1][-1].get("id"))
-            if _safe_message_id_int(oldest) is None:
-                break
-            older = await self._fetch_messages(channel_id, before=oldest)
-            if not older:
-                break
-            pages.append(older)
-        # Messages arrive newest-first; iterate oldest page first, reversed,
-        # so the queue receives them in chronological (oldest -> newest) order.
-        for page in reversed(pages):
-            for message in reversed(page):
+        if last_seen and _safe_message_id_int(last_seen) is None:
+            # A non-numeric cursor can never anchor `after=`: Discord would
+            # reject every request and the channel would ingest nothing
+            # forever. Drop it and re-seed from the newest page instead.
+            logger.warning(
+                "Discord cursor is not a numeric snowflake; re-priming",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "last_seen_message_id": last_seen,
+                    }
+                },
+            )
+            self._last_seen_message_ids.pop(channel_id, None)
+            last_seen = ""
+        if not last_seen:
+            # First poll without a cursor (the daemon primes the cursor in
+            # `_prime_cursors` first; this path is a direct/priming-less call).
+            # Keep the historical behaviour: read the newest page and adopt its
+            # newest id, without inventing a cursor to paginate from.
+            first_page = await self._fetch_messages(channel_id)
+            if not first_page:
+                return
+            for message in sorted(first_page, key=_message_sort_key):
                 await self._emit_polled_message(channel_id, message, seen, emit=emit)
-        newest = str(first_page[0].get("id"))
-        self._log_page_gap(channel_id, last_seen, first_page)
-        # B2: poison-message guard — a non-numeric id must never crash the
-        # cursor update into a tight crash loop (seen-set dedupes anyway).
-        newest_int = _safe_message_id_int(newest)
-        last_int = _safe_message_id_int(last_seen)
-        if not last_seen or (
-            newest_int is not None and (last_int is None or newest_int > last_int)
-        ):
-            self._last_seen_message_ids[channel_id] = newest
+            newest = _newest_numeric_id(first_page)
+            if newest is not None:
+                self._advance_cursor(channel_id, newest)
+            self._prune_seen_ids(channel_id, seen)
+            return
+
+        # B2: close the gap by paginating FORWARD from the cursor with `after`.
+        # Discord returns an `after` page holding the messages immediately
+        # after the anchor (the same contract discord.py's
+        # `history(after=...)` pagination relies on; see docs/signal_bots.md).
+        # Each page is emitted in snowflake-id order (the response order is
+        # not relied on) and each full page anchors the next request; a short
+        # page proves the newest message was reached. The per-poll page
+        # bound caps REST traffic and a larger gap is carried into the next
+        # poll, because the cursor advances only to the newest message actually
+        # emitted -- never past unfetched history. A 429 or error raised while
+        # fetching leaves every already-emitted page committed for exactly that
+        # reason.
+        anchor = last_seen
+        pages_fetched = 0
+        while pages_fetched < MAX_BACKFILL_PAGES:
+            page = await self._fetch_messages(channel_id, after=anchor)
+            pages_fetched += 1
+            if not page:
+                break
+            # Order by snowflake id instead of trusting the response order, so
+            # emission is chronological and the cursor is the true newest id
+            # even if Discord (or a proxy) hands the page back the other way
+            # round. A non-numeric (poison) id sorts last and never becomes
+            # the cursor: anchoring on it would re-request the same page on
+            # every poll and stall the channel behind one malformed message.
+            # `after` guarantees every id is above the anchor. A numeric id at
+            # or below it is stale (a server ignoring `after`): never emit it,
+            # since the seen-set may already have pruned it and a re-emit
+            # would be a duplicate trade signal.
+            anchor_int = _safe_message_id_int(anchor)
+            fresh = [
+                m
+                for m in page
+                if (parsed := _safe_message_id_int(str(m.get("id")))) is None
+                or anchor_int is None
+                or parsed > anchor_int
+            ]
+            if len(fresh) < len(page):
+                logger.warning(
+                    "Discord page contained ids at or below the cursor; dropped",
+                    extra={
+                        "data": {
+                            "channel_id": channel_id,
+                            "anchor": anchor,
+                            "dropped": len(page) - len(fresh),
+                        }
+                    },
+                )
+            ordered = sorted(fresh, key=_message_sort_key)
+            for message in ordered:
+                await self._emit_polled_message(channel_id, message, seen, emit=emit)
+            newest_in_page = _newest_numeric_id(fresh)
+            if newest_in_page is None:
+                # Nothing in the page can anchor another request; stop and let
+                # the next poll retry from the last good cursor. A page that is
+                # all non-numeric ids is logged, so a stalled channel is
+                # visible in ops instead of looking idle.
+                if fresh:
+                    logger.warning(
+                        "Discord page has no numeric message id; cursor not advanced",
+                        extra={
+                            "data": {
+                                "bot_name": self.bot_name,
+                                "service_id": self.service_id,
+                                "channel_id": channel_id,
+                                "anchor": anchor,
+                                "page_size": len(page),
+                            }
+                        },
+                    )
+                break
+            if not self._advance_cursor(channel_id, newest_in_page):
+                # The page did not move past the cursor (a server ignoring
+                # `after`): stop instead of looping on the same page.
+                break
+            anchor = newest_in_page
+            if len(page) < POLL_LIMIT:
+                break
+        else:
+            # The bound was reached with a full last page: more may remain. The
+            # cursor stays at the newest emitted id and the gap is carried into
+            # the next poll, so nothing is lost.
+            self._log_backfill_deferred(
+                channel_id,
+                last_seen=last_seen,
+                newest_fetched=anchor,
+                pages_fetched=pages_fetched,
+            )
         self._prune_seen_ids(channel_id, seen)
 
     async def _emit_polled_message(
@@ -1308,12 +1937,10 @@ class DiscordSignalSource(BaseSignalSource):
         message_id = str(message.get("id"))
         if message_id in seen:
             return
-        # Dedupe is the cumulative seen-set's job alone. The monotonic
-        # cursor must NOT filter emits: after a burst larger than
-        # POLL_LIMIT the cursor sits above messages that were never
-        # fetched, and a cursor-based filter would drop them (the exact
-        # bug this class exists to prevent). The cursor only seeds `seen`
-        # at priming time.
+        # Dedupe is the cumulative seen-set's job alone. The monotonic cursor
+        # must NOT filter emits: an `after`-cursor page is newer than the
+        # cursor, and the seen-set also absorbs the boundary message a repeat
+        # page may hand back. The cursor only seeds `seen` at priming time.
         seen.add(message_id)
         if not emit:
             return
@@ -1368,40 +1995,34 @@ class DiscordSignalSource(BaseSignalSource):
         )
         seen.intersection_update(survivors)
 
-    def _log_page_gap(
+    def _log_backfill_deferred(
         self,
         channel_id: str,
+        *,
         last_seen: str,
-        messages: list[dict[str, Any]],
+        newest_fetched: str,
+        pages_fetched: int,
     ) -> None:
-        """Surface skipped history instead of silently skipping it.
+        """Surface a gap larger than the per-poll backfill bound.
 
-        The REST poll fetches at most POLL_LIMIT messages per call. When the
-        page does not reach back to the last seen message, messages between
-        the page boundary and the cursor were never fetched. The snowflake id
-        distance is NOT a message count (ids are not contiguous), so the log
-        reports the boundary ids rather than an invented count; ops can query
-        Discord's audit log for the exact volume if needed.
+        Forward pagination fetches contiguously from the cursor, so no message
+        between ``last_seen`` and ``newest_fetched`` is skipped. When the
+        per-poll page bound is reached while a full page still came back, the
+        remainder is carried into the next poll. Log it so a long drain stays
+        visible in ops instead of looking like a stalled channel.
         """
-        if not last_seen:
-            return
-        oldest = str(messages[-1].get("id"))
-        try:
-            if int(oldest) <= int(last_seen):
-                # The page overlaps history we already tracked: nothing skipped.
-                return
-        except ValueError:
-            return
         logger.warning(
-            "Discord poll gap detected; messages between the last seen id and "
-            "the oldest fetched id were not polled",
+            "Discord backfill reached the per-poll page bound with a full page; "
+            "more messages may remain and are fetched on the next poll",
             extra={
                 "data": {
                     "bot_name": self.bot_name,
                     "service_id": self.service_id,
                     "channel_id": channel_id,
                     "last_seen_message_id": last_seen,
-                    "oldest_fetched_message_id": oldest,
+                    "newest_fetched_message_id": newest_fetched,
+                    "pages_fetched": pages_fetched,
+                    "max_backfill_pages": MAX_BACKFILL_PAGES,
                     "poll_limit": POLL_LIMIT,
                 }
             },
@@ -1447,7 +2068,9 @@ class DiscordSignalSource(BaseSignalSource):
             for message in messages:
                 message_id = str(message.get("id"))
                 seen.add(message_id)
-            self._last_seen_message_ids[channel_id] = str(messages[0].get("id"))
+            newest = _newest_numeric_id(messages)
+            if newest is not None:
+                self._last_seen_message_ids[channel_id] = newest
 
     async def _poll_loop(self) -> None:
         while not self._paused:
