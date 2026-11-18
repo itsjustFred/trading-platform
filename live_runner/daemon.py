@@ -2020,7 +2020,7 @@ async def prepare_order_with_risk(
             },
         )
     metadata["entry_price"] = float(entry_price)
-    metadata["stop_loss"] = float(stop_loss)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+    metadata["stop_loss"] = float(stop_loss)
     metadata["resolved_stop_loss"] = float(stop_loss)
     if take_profit is not None:
         metadata["take_profit"] = float(take_profit)
@@ -4701,7 +4701,11 @@ async def _enforce_stopped_deployments(
                 },
             )
             continue
-        if cancelled.pending_cancel:
+        # ``not cancel_ok`` continued above, and ``cancel_ok`` is
+        # ``cancelled is not None and cancelled.complete``: the outcome is
+        # non-None here. mypy cannot follow that conjunction through the
+        # ``continue``.
+        if cancelled.pending_cancel:  # type: ignore[union-attr]
             passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
             _PENDING_CANCEL_PASSES[deployment_id] = passes
             log = (
@@ -4712,13 +4716,13 @@ async def _enforce_stopped_deployments(
             log(
                 "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
                 "and may yet fill (pass %d). Retrying next tick",
-                sorted(cancelled.pending_cancel),
+                sorted(cancelled.pending_cancel),  # type: ignore[union-attr]  # non-None per cancel_ok
                 passes,
                 extra={
                     "data": {
                         "deployment_id": deployment_id,
                         "account_id": deployment.account_id,
-                        "pending_cancel": sorted(cancelled.pending_cancel),
+                        "pending_cancel": sorted(cancelled.pending_cancel),  # type: ignore[union-attr]  # non-None per cancel_ok
                         "passes": passes,
                     }
                 },

@@ -2433,7 +2433,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     volume=self._resolve_order_volume(signal),
                 )
             else:
-                request = self._build_new_order_request(signal, symbol_id=symbol_id)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+                request = self._build_new_order_request(signal, symbol_id=symbol_id)
         response = await self._submit_new_order_request(request)
 
         order_id = self._extract_order_id_from_payload(response)
@@ -2521,7 +2521,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ),
         )
 
-    async def _resolve_symbol_id(self, symbol: str) -> int | None:
+    async def _resolve_symbol_id(self, symbol: str) -> int:
+        """Resolve a symbol to its broker id, raising when it is unknown.
+
+        The return is declared ``int``, never ``int | None``: both lookup
+        misses raise, so a ``None`` return would be unrepresentable.
+        """
         symbol_id = self._symbol_name_to_id.get(symbol.upper())
         if symbol_id is None:
             await self._authenticate()

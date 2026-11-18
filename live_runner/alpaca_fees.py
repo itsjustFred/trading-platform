@@ -299,7 +299,9 @@ class _Inputs:
     fills_by_pair: dict[str, list[BrokerFill]]
     rows_by_order: dict[str, list[dict[str, Any]]]
     fees: _FeeIndex
-    broken_pairs: dict[str, str]
+    # The value carries the per-pair message: ``_group_problem`` returns it
+    # alongside the (empty) fill list, and ``None`` means "no problem".
+    broken_pairs: dict[str, str | None]
 
 
 def _group_problem(inputs: _Inputs, pair: str, day: date) -> tuple[str | None, list[BrokerFill]]:
@@ -417,7 +419,7 @@ def plan_commission_backfill(
     pairs = {pair_key(row["symbol"]) for row in candidates}
     fills_by_order: dict[str, list[BrokerFill]] = defaultdict(list)
     fills_by_pair: dict[str, list[BrokerFill]] = defaultdict(list)
-    broken_pairs: dict[str, str] = {}
+    broken_pairs: dict[str, str | None] = {}
     for raw in fill_activities:
         raw_pair = pair_key(raw.get("symbol"))
         if raw_pair and raw_pair not in pairs:
@@ -425,7 +427,10 @@ def plan_commission_backfill(
         try:
             fill = parse_fill_activity(raw)
         except ValueError as exc:
-            problem = f"a FILL activity ({raw.get('id')!r}) is unreadable: {exc}"
+            # The same local is also assigned from ``_group_problem`` below, which
+            # returns ``str | None``, so it carries the union from the start
+            # instead of being narrowed to this branch's ``str``.
+            problem: str | None = f"a FILL activity ({raw.get('id')!r}) is unreadable: {exc}"
             for pair in [raw_pair] if raw_pair else pairs:
                 broken_pairs[pair] = problem
             continue

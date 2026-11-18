@@ -578,7 +578,10 @@ class LiveTrailingStopManager:
             )
         if (action == "buy") != (qty > 0):
             return None
-        return dict(trailing_cfg)
+        # ``validate_trailing_sl_config`` returns ``None`` for a ``None`` config
+        # and raises for anything that is not a mapping, so reaching here means
+        # ``trailing_cfg`` is a validated dict; mypy cannot follow that guard.
+        return dict(trailing_cfg)  # type: ignore[arg-type]
 
     # ── one position ─────────────────────────────────────────────────────
 
@@ -733,7 +736,7 @@ class LiveTrailingStopManager:
         if not math.isfinite(entry_price) or entry_price <= 0:
             entry_price = bars[0][1]
         signal = TradeSignal(
-            action=action,
+            action=action,  # type: ignore[arg-type]  # restricted to buy/sell by the guard above
             symbol=symbol,
             entry_price=entry_price,
             stop_loss=current.stop_price,

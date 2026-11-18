@@ -1600,7 +1600,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)
+        account = await asyncio.to_thread(self._trading_client.get_account)  # type: ignore[union-attr]  # connect() establishes the client; mypy cannot follow it
         currency = str(getattr(account, "currency", "") or "").strip().upper()
         if currency != "USD":
             raise ValueError(
@@ -1663,7 +1663,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 limit=1000,
                 sort=Sort.DESC,
             )
-            return self._crypto_data_client.get_crypto_bars(request).df
+            # The alpaca-py response is a ``BarSet`` with a ``.df``; the installed
+            # union also admits a plain dict, which mypy sees instead.
+            return self._crypto_data_client.get_crypto_bars(request).df  # type: ignore[union-attr]
 
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
             if is_crypto:
@@ -1748,7 +1750,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise ValueError("symbol is required for an Alpaca quote")
         if not self._connected or self._historical_data_client is None:
             raise RuntimeError("Alpaca adapter must be connected before requesting a quote")
-        request = StockLatestQuoteRequest(symbol_or_symbols=[normalized_symbol], feed="iex")
+        request = StockLatestQuoteRequest(
+            symbol_or_symbols=[normalized_symbol],
+            feed="iex",  # type: ignore[arg-type]  # "iex" is the wire value get_market_data sends
+        )
         response = await asyncio.to_thread(
             self._historical_data_client.get_stock_latest_quote, request
         )
