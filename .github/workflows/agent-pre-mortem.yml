@@ -134,7 +134,10 @@ jobs:
             fi
           fi
           head=${INPUT_SHA:-$(jq -r .head.sha pr.json)}
-          jq '{number, title, body, base: .base.sha, head: .head.sha}' pr.json > meta.json
+          # The metadata names the commit that is analysed, not the PR's current
+          # head: a manual rerun of an older commit hands the agent a file that
+          # agrees with the prompt instead of a stale SHA.
+          jq --arg head "$head" '{number, title, body, base: .base.sha, head: $head}' pr.json > meta.json
           {
             echo "number=$(jq -r .number pr.json)"
             echo "base=$(jq -r .base.sha pr.json)"
@@ -229,8 +232,8 @@ jobs:
           opencode --version
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
-      # skill is not merged yet) the copy from the commit this workflow runs
-      # from, then the PR's own copy.
+      # skill is not merged yet) the PR's own copy - the same two levels, in the
+      # same order, as the sibling workflows.
       - name: Select skill revision
         run: |
           set -euo pipefail
@@ -241,14 +244,11 @@ jobs:
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
-          elif git cat-file -e "${GITHUB_SHA}:${SKILL_PATH}" 2>/dev/null; then
-            git show "${GITHUB_SHA}:${SKILL_PATH}" > "$skill"
-            echo "SKILL_SOURCE=workflow ref ${GITHUB_REF_NAME} (not on the base branch yet)" >> "$GITHUB_ENV"
           elif [ -f "$SKILL_PATH" ]; then
             cp "$SKILL_PATH" "$skill"
             echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
           else
-            echo "::error::No pre-mortem skill found at base, workflow ref or PR head."
+            echo "::error::No pre-mortem skill found at base or PR head."
             exit 1
           fi
 
