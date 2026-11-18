@@ -99,8 +99,8 @@ MARKERS = {
     "<!-- actions-pre-mortem -->": PREMORTEM,
 }
 
-# The pre-mortem stage: its status context, comment marker, comment title, the skill that
-# documents its verdicts, and the post job steps that own them.
+# The pre-mortem stage's own names: the context it reports (the value CONTEXT_OWNER maps), its
+# comment marker and title, and the skill whose verdict line it must not drift from.
 CONTEXT = "agent/pre-mortem"
 MARKER = "<!-- actions-pre-mortem -->"
 TITLE = "# Pre-Mortem Action"
@@ -323,7 +323,8 @@ def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
     """A verdict the post job's `case` does not name falls through to `*)` and is reported as
     `error` - a stage that could not run, indistinguishable from an agent failure; a verdict the
     map states but the regex drops never reaches it at all. Both are pinned against the skill's
-    own verdict line, so the three cannot drift apart silently."""
+    own verdict line, so the three cannot drift apart silently. INCOMPLETE is the "the run
+    produced no verdict" outcome and is always an `error`, never a `failure`."""
     skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
     assert verdicts_line, f"{SKILL_DIR}: the skill documents no verdict line"
@@ -333,12 +334,8 @@ def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
     )
     post = _load(PREMORTEM)["jobs"]["post"]
     arms = _verdict_arms(_run(_find_step(post, r"^Set status$")))
-    # The map is total: the catch-all is `error`, so a verdict the agent produced is never
-    # left in an undeclared state.
-    assert arms.get("INCOMPLETE", "error") == "error", "INCOMPLETE is not an error"
     expected = {v: s for v, s in VERDICT_STATUS.items() if v != "INCOMPLETE"}
     assert arms == expected, f"status map {arms} != documented {expected}"
-    assert arms.get("INCOMPLETE", "error") == "error", "INCOMPLETE is not an error"
 
 
 def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
@@ -361,10 +358,11 @@ def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
     `.agents/skills/platform-pr-verify` says - so a status write copied into one of them would
     make that comment lie about itself."""
     assert len(set(MARKERS.values())) == len(MARKERS), "two workflows share a comment marker"
+    owner_of = {name: context for context, name in CONTEXT_OWNER.items()}
     for name in AGENT_WORKFLOWS:
         data = _load(name)
         env = data["env"]
-        own_context = CONTEXT if name == PREMORTEM else None
+        own_context = owner_of.get(name)
         bodies = _all_run_bodies(data)
         # Every context the workflow writes must be its own, through the variable it declares.
         for written in re.findall(r'-f context="([^"$][^"]*)"', bodies):
