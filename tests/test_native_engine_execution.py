@@ -456,6 +456,47 @@ def test_fixed_risk_grid_size_ulp_below_min_lot_creates_order():  # Issue #151
     assert result.trades[0].quantity == pytest.approx(0.9)
 
 
+@pytest.mark.parametrize("bad_value", [float("inf"), float("nan")])
+@pytest.mark.parametrize(
+    "key", ["tick_size", "tick_value", "lot_step", "min_lot", "max_lot"]
+)
+def test_fixed_risk_non_finite_sizing_input_is_refused(key, bad_value):  # Issue #151
+    # `inf` crashes the lot-grid floor (`round(inf)`) and `nan` defeats every
+    # comparison guard on the sizing path, so a non-finite sizing parameter
+    # is a config error: refuse it loudly instead of crashing or leaking a
+    # NaN/inf quantity into an order.
+    params = {
+        "fixed_risk_amount": 500.0,
+        "tick_size": 1.0,
+        "tick_value": 1.0,
+        "lot_step": 0.1,
+        "min_lot": 0.1,
+        "max_lot": 100.0,
+        key: bad_value,
+    }
+    engine = _engine(params)
+
+    with pytest.raises(ValueError, match=key):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
+def test_fixed_risk_infinite_risk_amount_is_refused():  # Issue #151
+    engine = _engine({"fixed_risk_amount": float("inf")})
+
+    with pytest.raises(ValueError, match="fixed_risk_amount"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
 def test_fixed_risk_prefers_explicit_stop_distance():
     # MT5 parity (strategy-test-audit): lots derive from the strategy's stop
     # distance (e.g. ATR-based), not from |entry - stop|, so fill-price noise

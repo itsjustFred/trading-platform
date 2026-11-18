@@ -65,6 +65,20 @@ def _floor_to_lot_grid(size: float, lot_step: float) -> float:
     return math.floor(quotient) * lot_step
 
 
+def _require_finite(name: str, value: float) -> float:
+    """Refuse a non-finite fixed-risk sizing parameter (#151).
+
+    ``inf`` crashes the lot-grid floor (``round(inf)``) or leaks into the
+    order quantity, and ``nan`` defeats every guard on the sizing path
+    (``nan`` compares false), so a strategy passing either is a config error,
+    not a silent no-op. Mirrors the finite-config rule of the sibling
+    validator in ``validation/risk/fixed_risk.py``.
+    """
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value}")
+    return value
+
+
 def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     """Order TP candidates: plain ``tp`` first, then ``tpN`` by numeric N (#154)."""
     name = item[0]
@@ -318,11 +332,23 @@ class TradeEngine:
             else:
                 risk_distance = abs(float(entry_price) - float(stop_loss_price))
             if risk_amount > 0 and risk_distance > 0:
-                tick_value = float(self.config.parameters.get("tick_value", 1.0) or 1.0)
-                tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
-                lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
-                min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
-                max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
+                # Non-finite sizing input is a config error, refused loudly.
+                risk_amount = _require_finite("fixed_risk_amount", risk_amount)
+                tick_value = _require_finite(
+                    "tick_value", float(self.config.parameters.get("tick_value", 1.0) or 1.0)
+                )
+                tick_size = _require_finite(
+                    "tick_size", float(self.config.parameters.get("tick_size", 1.0) or 1.0)
+                )
+                lot_step = _require_finite(
+                    "lot_step", float(self.config.parameters.get("lot_step", 0.0) or 0.0)
+                )
+                min_lot = _require_finite(
+                    "min_lot", float(self.config.parameters.get("min_lot", 0.0) or 0.0)
+                )
+                max_lot = _require_finite(
+                    "max_lot", float(self.config.parameters.get("max_lot", 0.0) or 0.0)
+                )
                 shares = (risk_amount / risk_distance) * (tick_size / tick_value)
                 if lot_step > 0:
                     shares = _floor_to_lot_grid(shares, lot_step)
@@ -364,12 +390,12 @@ class TradeEngine:
                         shares = min_lot
                     else:
                         logger.warning(
-                        "Skipping order: fixed-risk size %.6g is below min_lot %.6g after caps "
-                        "(size before leverage/exposure cap %.6g, max_lot %.6g)",
-                        shares,
-                        min_lot,
-                        uncapped_shares,
-                        max_lot,
+                            "Skipping order: fixed-risk size %.6g is below min_lot %.6g after caps "
+                            "(size before leverage/exposure cap %.6g, max_lot %.6g)",
+                            shares,
+                            min_lot,
+                            uncapped_shares,
+                            max_lot,
                         )
                         return 0.0
                 return max(shares, 0.0)

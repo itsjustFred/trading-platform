@@ -171,6 +171,9 @@ Implementation:
   other final size below `min_lot` is **skipped** (size 0, no trade, with a
   WARNING log) — it is never raised back up to `min_lot`, since the caps are
   what make it unaffordable. A size that no cap reduces is not re-floored.
+  Non-finite values for the sizing parameters are refused with a `ValueError`
+  naming the parameter: `inf` would crash the grid floor, and `nan` defeats
+  every guard on the sizing path.
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
