@@ -715,7 +715,7 @@ def _discover_jvm_paths() -> list[str]:
         java_home_path = Path(home)
         if not _is_trusted_java_home(java_home_path):
             continue
-        candidates.extend(jvm_path for jvm_path in _jvm_candidates_from_java_home(home))
+        candidates.extend(_jvm_candidates_from_java_home(home))
 
     # Let JPype try its own platform-specific discovery as a fallback.
     try:
