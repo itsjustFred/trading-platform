@@ -47,3 +47,16 @@ def test_nitro_rejects_sell_signals() -> None:
     market_data = sample_signal_market_data()
     with pytest.raises(ValueError, match="BUY/LONG"):
         processor.process_signal(sell_signal, market_data)
+
+
+@pytest.mark.parametrize("name", ["../x", "doesnotexist", "ramjet/../nitro", ""])
+def test_unknown_processor_ids_never_yield_a_filesystem_path(name: str) -> None:
+    from signal_bots.registry import (
+        get_signal_processor_config_path,
+        get_signal_processor_module_path,
+    )
+
+    with pytest.raises(ValueError, match="Unknown signal processor"):
+        get_signal_processor_module_path(name)
+    with pytest.raises(ValueError, match="Unknown signal processor"):
+        get_signal_processor_config_path(name)

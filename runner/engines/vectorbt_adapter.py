@@ -59,6 +59,7 @@ from shared.models import (
     IndicatorSeries,
     Trade,
     TradeExit,
+    normalize_direction_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -1272,9 +1273,8 @@ def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> 
 
 
 def _normalize_direction_value(value: Any) -> str:
-    if value in ("SHORT", "short", -1):
-        return "SHORT"
-    return "LONG"
+    """Strict per-entry direction mapping; see ``shared.models.normalize_direction_value``."""
+    return normalize_direction_value(value)
 
 
 def _resolve_direction(

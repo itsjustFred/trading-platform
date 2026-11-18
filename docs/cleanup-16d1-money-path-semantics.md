@@ -314,6 +314,36 @@ this code (older persisted artifacts keep their original numbers):
   assumption that they were daily, which overstates hourly bars and understates
   weekly ones with nothing in the payload to say so. Declaring the ratios
   undefined is the only answer that does not publish a guessed number.
+- **Ruin (#132).** The equity curve is cut at the FIRST point (in time order,
+  inclusive) whose equity is `<= 0`, non-finite (NaN/inf), or unreadable
+  (`None`, text that is not a number, an integer outside float64 range -
+  #139/#250): `ruined` is `true` and `ruin_time` is that point's `time` string
+  as given. A non-positive or non-finite account is not a tradeable path, and
+  neither is a value no metric can read, so both fail closed instead of
+  skipping the point and publishing the pre-ruin subset. `total_return` and max
+  drawdown are computed from the truncated curve, so a later "recovery" cannot
+  rescue them. An unreadable point is normalised to NaN in the truncated slice
+  and a readable number stored as text (`"101000"`) is coerced, so downstream
+  arithmetic sees a float and never the raw stored type.
+  `sharpe_ratio`, `sortino_ratio`, `psr`, `p_value`, `cagr` and `calmar_ratio`
+  are published as `null` (not `0.0`) and listed in `undefined_metrics`: a
+  series that ends in ruin has no meaningful risk-adjusted ratio or annualised
+  growth rate, and the old behaviour (dropping returns after the zero)
+  published the ratios of the pre-ruin subset. When the terminating point is
+  non-finite the endpoint figures are unmeasurable too: `total_return`,
+  `total_pnl` (trade-less runs) and `max_drawdown_pct` are `null` and listed in
+  `undefined_metrics` instead of the NaN/inf the endpoint arithmetic produces -
+  which is neither a measurement nor valid JSON. A *finite* ruin keeps them
+  (the endpoint ratio is about -1.0: the final equity is known). Non-ruined
+  runs carry
+  `ruined: false`,
+  `ruin_time: null`. Optimizer trials whose target metric is `null` get the
+  no-trade penalty and can never be selected as best. Backtest metadata rows
+  read `ruined` from the stored stats; artifacts saved before the flag existed
+  (no `ruined` key) are checked against their persisted equity curve, and any
+  non-positive or unreadable point marks them ruined (logged), so the
+  live-deployment gate covers the historical corpus. A legacy artifact with no
+  stored curve cannot be checked and is read as not ruined.
 - A *reconciling* engine curve is compacted to one point per **calendar** day,
   not per observed day. A curve that observed only 01-05, 01-08 and 01-09
   produced three returns for an eight-day window, so a multi-day move was

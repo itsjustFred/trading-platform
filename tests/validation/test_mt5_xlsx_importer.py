@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from shared.broker_clock import DUKASCOPY_MT5_INDEX
 from shared.models import VALID_DIRECTIONS
 from validation.importers._pairing import group_position_fills
 from validation.importers.mt5_xlsx import MT5XLSXImporter
@@ -287,6 +288,101 @@ class TestSourceTimezone:
     def test_to_iso_rejects_unknown_source_timezone(self):
         with pytest.raises(ValueError):
             MT5XLSXImporter._to_iso("2024.01.01 10:00:00", "Not/AZone")
+
+
+@pytest.fixture(scope="module")
+def sp500_on_broker_clock() -> ValidationReference:
+    return MT5XLSXImporter().load(_sp500_path(), broker_clock="dukascopy_mt5_index")
+
+
+@pytest.fixture(scope="module")
+def eurusd_on_broker_clock() -> ValidationReference:
+    return MT5XLSXImporter().load(_eurusd_path(), broker_clock="dukascopy_mt5_forex")
+
+
+class TestBrokerClock:
+    """A report prints server wall time; the broker clock says which UTC that is.
+
+    Reading these reports as Europe/Athens is wrong for index CFDs before 2023-12
+    (fixed UTC+2, no DST) and for both symbols in the US-only DST weeks of the
+    current epoch. The expected UTC values below are the platform artifacts'
+    entry times for the same trades.
+    """
+
+    def test_legacy_index_history_is_fixed_utc_plus_2(self, sp500_on_broker_clock):
+        sp500 = sp500_on_broker_clock
+        # Athens is on EEST (UTC+3) on 2018-03-29 and would read 14:15Z.
+        assert "2018-03-29T15:15:00Z" in {trade.entry_time for trade in sp500.trades}
+        # Athens is on EEST (UTC+3) on 2019-07-16 and would read 15:00Z.
+        assert "2019-07-16T16:00:00Z" in {trade.entry_time for trade in sp500.trades}
+
+    def test_transition_epoch_is_fixed_utc_plus_2_for_both_symbols(
+        self, sp500_on_broker_clock, eurusd_on_broker_clock
+    ):
+        # Athens is on EEST (UTC+3) on 2024-04-01 and would read 14:15Z / 14:45Z.
+        assert "2024-04-01T15:15:00Z" in {
+            trade.entry_time for trade in sp500_on_broker_clock.trades
+        }
+        assert "2024-04-01T15:45:00Z" in {
+            trade.entry_time for trade in eurusd_on_broker_clock.trades
+        }
+
+    def test_current_epoch_follows_the_us_switch_dates(
+        self, sp500_on_broker_clock, eurusd_on_broker_clock
+    ):
+        sp500 = {trade.entry_time for trade in sp500_on_broker_clock.trades}
+        # US-only DST weeks: the broker is already UTC+3, Athens still UTC+2.
+        assert "2025-03-12T14:45:00Z" in sp500
+        assert "2026-03-20T14:00:00Z" in sp500
+        assert "2025-03-13T14:15:00Z" in {
+            trade.entry_time for trade in eurusd_on_broker_clock.trades
+        }
+
+    def test_autumn_2024_late_switch_is_still_utc_plus_3(self, sp500_on_broker_clock):
+        # The US fell back on 2024-11-03; this broker followed a week later.
+        assert "2024-11-05T15:00:00Z" in {
+            trade.entry_time for trade in sp500_on_broker_clock.trades
+        }
+
+    @pytest.mark.parametrize("name", ["", "   "])
+    def test_an_empty_broker_clock_name_is_refused(self, name):
+        from validation.importers.mt5_xlsx import _resolve_report_clock
+
+        with pytest.raises(ValueError, match="empty string"):
+            _resolve_report_clock(name)
+
+    def test_exits_use_the_same_clock(self, sp500_on_broker_clock):
+        # Athens (UTC+3 then) would put this stop at 18:55:40Z; the platform artifact stops
+        # the same trade at 19:55:00Z (MT5 tick fill vs. M1 bar open).
+        trade = next(
+            t for t in sp500_on_broker_clock.trades if t.entry_time == "2024-04-01T15:15:00Z"
+        )
+        assert trade.exits[0].time == "2024-04-01T19:55:40Z"
+
+    def test_raw_metadata_records_the_clock(self, sp500_on_broker_clock):
+        assert sp500_on_broker_clock.raw_metadata["broker_clock"] == "dukascopy_mt5_index"
+        assert sp500_on_broker_clock.raw_metadata["source_timezone"] is None
+
+    def test_source_timezone_and_broker_clock_are_mutually_exclusive(self, importer):
+        path = _sp500_path()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            importer.load(
+                path,
+                source_timezone="Europe/Athens",
+                broker_clock="dukascopy_mt5_index",
+            )
+
+    def test_unknown_broker_clock_is_rejected(self, importer):
+        path = _sp500_path()
+        with pytest.raises(ValueError, match="Unknown broker_clock"):
+            importer.load(path, broker_clock="europe_athens")
+
+    def test_to_iso_refuses_a_server_time_the_clock_skipped(self):
+        # 2024-04-06 02:30 server time never happened on this broker. The clock
+        # refuses it; the loader must not fall back to returning the raw string
+        # as if it were an ISO UTC instant.
+        with pytest.raises(ValueError, match="never shows the server wall time"):
+            MT5XLSXImporter._to_iso("2024.04.06 02:30:00", None, DUKASCOPY_MT5_INDEX)
 
 
 class TestDirectionRequiresTypColumn:

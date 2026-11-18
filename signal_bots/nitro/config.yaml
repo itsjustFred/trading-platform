@@ -18,7 +18,7 @@ nitro:
   tp1_multiplier: 3.0
   tp1_exit_percent: 0.50
 
-  # Supertrend (trailing stop after TP1)
+  # Supertrend (entry-bar context metadata; trailing workflow pending #168)
   supertrend_period: 10
   supertrend_multiplier: 3.0
 

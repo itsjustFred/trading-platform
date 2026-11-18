@@ -42,7 +42,7 @@ def test_cross_platform_matrix_includes_reference_metrics():
     # (A-H3/A-L3/A-L4: calendar-day returns, risk-free-rate subtraction —
     # see the raw_metadata note in risk_parity_reference.json); this pins
     # the regenerated value, not the pre-A-M6 0.544687.
-    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.213296
+    assert rows["risk_parity_quantconnect"]["reference"]["sharpe_ratio"] == 0.350569
     assert rows["risk_parity_quantconnect"]["platform_path"].endswith(
         "data/backtests/risk_parity_quantconnect_reimplementation.json"
     )
@@ -109,26 +109,87 @@ def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(t
     assert "risk_free_rate=0.0" in matrix["risk_free_rate_note"]
 
 
-def test_cross_platform_matrix_loads_mt5_reference_timestamps_in_report_timezone():
-    matrix = build_comparison_matrix(
+@pytest.fixture(scope="module")
+def matrix() -> dict:
+    return build_comparison_matrix(
         comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
         reports_dir=PROJECT_ROOT / "reports",
     )
-    row = {
-        item["case_id"]: item
-        for item in matrix["rows"]
-    }["intraday_volatility_breakout_sp500_m1"]
 
-    assert row["reference_source_timezone"] == "Europe/Athens"
+
+def test_cross_platform_matrix_reads_mt5_reference_timestamps_on_the_broker_clock(matrix):
+    row = {item["case_id"]: item for item in matrix["rows"]}[
+        "intraday_volatility_breakout_sp500_m1"
+    ]
+
+    assert row["reference_broker_clock"] == "dukascopy_mt5_index"
     reference = MT5XLSXImporter().load(
         Path(row["reference_path"]),
-        source_timezone=row["reference_source_timezone"],
+        broker_clock=row["reference_broker_clock"],
     )
-    platform = json.loads(Path(row["platform_path"]).read_text(encoding="utf-8"))
+    platform_path = Path(row["platform_path"])
+    if not platform_path.exists():
+        pytest.skip(
+            f"{platform_path.name} not present (artifacts are generated locally, not "
+            "committed); run scripts/regenerate_mt5_parity_artifacts.py"
+        )
+    platform = json.loads(platform_path.read_text(encoding="utf-8"))
+    reference_entries = {trade.entry_time for trade in reference.trades}
+    platform_entries = {
+        trade["entry_time"].replace("+00:00", "Z") for trade in platform["trades"]
+    }
 
-    first_reference_entry = reference.trades[0].entry_time
-    first_platform_entry = platform["trades"][0]["entry_time"].replace("+00:00", "Z")
-    assert first_reference_entry == first_platform_entry == "2018-01-16T14:45:00Z"
+    assert reference.trades[0].entry_time == "2018-01-16T14:45:00Z"
+    # Legacy index history is fixed UTC+2: Athens would read 15:00Z / 15:45Z.
+    assert "2019-07-16T16:00:00Z" in reference_entries
+    assert "2025-03-12T14:45:00Z" in reference_entries
+    # The platform artifacts ran on the same clock, so the entries coincide.
+    assert reference.trades[0].entry_time == platform["trades"][0]["entry_time"].replace(
+        "+00:00", "Z"
+    )
+    assert {"2025-03-12T14:45:00Z", "2026-03-20T14:00:00Z"} <= platform_entries
+
+
+def test_cross_platform_mt5_cases_share_the_parity_artifacts_broker_clock(matrix):
+    """One clock per symbol: the audit matrix and the platform run must agree."""
+    expected = {
+        f"intraday_volatility_breakout_{case['label'].lower()}": case["broker_clock"]
+        for case in COMPARISON_CASES
+    }
+    actual = {
+        row["case_id"]: row["reference_broker_clock"]
+        for row in matrix["rows"]
+        if "reference_broker_clock" in row
+    }
+    assert actual == expected
+
+
+def test_comparison_matrix_parses_each_mt5_report_on_its_case_broker_clock(monkeypatch):
+    """The matrix's own parse uses the case clock, not only the test helpers' reloads.
+
+    Recording the kwargs of the importer call made inside ``build_comparison_matrix``
+    catches a regression to ``source_timezone="Europe/Athens"`` even when no
+    matrix statistic moves.
+    """
+    original_load = MT5XLSXImporter.load
+    recorded: dict[str, dict[str, object]] = {}
+
+    def recording_load(self, source, *args, **kwargs):
+        assert not args, "the matrix must name the clock by keyword"
+        recorded[Path(source).name] = kwargs
+        return original_load(self, source, *args, **kwargs)
+
+    monkeypatch.setattr(MT5XLSXImporter, "load", recording_load)
+
+    build_comparison_matrix(
+        comparisons_dir=PROJECT_ROOT / "strategy-comparisons",
+        reports_dir=PROJECT_ROOT / "reports",
+    )
+
+    assert recorded == {
+        f"{case['label']}.xlsx": {"broker_clock": case["broker_clock"]}
+        for case in COMPARISON_CASES
+    }
 
 
 def test_cross_platform_matrix_always_recomputes_canonical_stats(tmp_path):

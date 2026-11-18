@@ -30,6 +30,7 @@ class _FakeOrder:
     order_class: str = "simple"
     qty: float = 0.0
     stop_price: float | None = None
+    status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
 
 
@@ -55,7 +56,11 @@ class _FakeTradingClient:
         positions: list[_FakePosition] | None = None,
         close_error: Exception | None = None,
         submit_error: Exception | None = None,
+        cancel_settles: bool = True,
     ) -> None:
+        # Alpaca keeps an accepted cancel in the book as ``pending_cancel`` until
+        # it settles; ``cancel_settles=False`` reproduces that window.
+        self.cancel_settles = cancel_settles
         self.orders = list(orders or [])
         self.positions = list(positions or [])
         self.cancelled: list[str] = []
@@ -65,14 +70,22 @@ class _FakeTradingClient:
         self.submit_error = submit_error
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
-        return list(self.orders)
+        # alpaca-py's server-side default page size is 50.
+        limit = getattr(filter, "limit", None) or 50
+        self.last_order_filter = filter
+        return list(self.orders)[:limit]
 
     def get_all_positions(self):
         return list(self.positions)
 
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancelled.append(order_id)
-        self.orders = [order for order in self.orders if order.id != order_id]
+        if self.cancel_settles:
+            self.orders = [order for order in self.orders if order.id != order_id]
+            return
+        for order in self.orders:
+            if order.id == order_id:
+                order.status = "pending_cancel"
 
     def _reserved_qty(self, symbol: str) -> float:
         position = next((item for item in self.positions if item.symbol == symbol), None)
@@ -116,6 +129,159 @@ def _adapter(client: _FakeTradingClient) -> AlpacaLiveAdapter:
     adapter._connected = True
     adapter._trading_client = client
     return adapter
+
+
+def test_cancel_open_orders_accepts_pending_cancel_as_success() -> None:
+    # Found on paper: a cancel Alpaca accepted was still listed as pending_cancel on
+    # the immediate re-read and came back as failed=(<id>,).
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert client.cancelled == ["entry-1"]
+    assert outcome.failed == ()
+    assert outcome.completed == 1
+    assert outcome.complete is True
+    # ...but the order may still fill in a cancel/fill race, so it is carried out.
+    assert outcome.pending_cancel == ("entry-1",)
+
+
+def test_cancel_open_orders_reports_no_pending_cancel_when_cancels_settle() -> None:
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.complete is True
+    assert outcome.pending_cancel == ()
+
+
+def test_cancel_open_orders_accepts_enum_valued_pending_cancel() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+    original = client.cancel_order_by_id
+
+    def cancel(order_id: str) -> None:
+        original(order_id)
+        for order in client.orders:
+            order.status = SimpleNamespace(value="pending_cancel")  # alpaca-py enum shape
+
+    client.cancel_order_by_id = cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ()
+
+
+def test_cancel_open_orders_still_reports_a_cancel_the_broker_dropped() -> None:
+    # A cancel that was "accepted" but left the order live (status still new) is a
+    # real failure and must keep being reported.
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+    client.cancel_order_by_id = lambda order_id: client.cancelled.append(order_id)  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ("entry-1",)
+    assert outcome.complete is False
+
+
+def test_cancel_open_orders_reports_an_uncancelled_pending_cancel_order() -> None:
+    # An order this sweep never cancelled (it appeared between the two reads) and
+    # that sits in pending_cancel is not vouched for: the sweep is incomplete.
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+    stranger = _FakeOrder("stranger-1", "MSFT", "buy")
+    stranger.status = "pending_cancel"
+    reads = {"n": 0}
+    original_get = client.get_orders
+
+    def get_orders(filter=None):  # noqa: A002 - mirrors alpaca-py
+        reads["n"] += 1
+        result = original_get(filter)
+        return result + [stranger] if reads["n"] > 1 else result
+
+    client.get_orders = get_orders  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert client.cancelled == ["entry-1"]
+    assert outcome.failed == ("stranger-1",)
+    assert outcome.complete is False
+
+
+def test_cancel_open_orders_does_not_excuse_pending_cancel_after_refused_cancel() -> None:
+    client = _FakeTradingClient(orders=[_FakeOrder("entry-1", "AAPL", "buy")])
+
+    def refuse(order_id: str) -> None:
+        client.orders[0].status = "pending_cancel"
+        raise RuntimeError("refused")
+
+    client.cancel_order_by_id = refuse  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert "entry-1" in outcome.failed
+    assert outcome.complete is False
+
+
+def test_cancel_open_orders_treats_refused_recancel_of_pending_cancel_as_pending() -> None:
+    # An order that an earlier pass already cancelled is still pending_cancel. If the
+    # broker refuses the repeat cancel, the order is still on its way out: it is
+    # reported as pending_cancel (fail closed, retried), not as a failed sweep that
+    # hides the cancel that was accepted.
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy", status="pending_cancel")]
+    )
+
+    def refuse(order_id: str) -> None:
+        client.cancelled.append(order_id)
+        raise RuntimeError("422: order is already pending cancel")
+
+    client.cancel_order_by_id = refuse  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert client.cancelled == ["entry-1"]
+    assert outcome.failed == ()
+    assert outcome.unidentified == ()
+    assert outcome.completed == 0
+    assert outcome.pending_cancel == ("entry-1",)
+
+
+def test_cancel_open_orders_accepts_mixed_case_pending_cancel_status() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+    original = client.cancel_order_by_id
+
+    def cancel(order_id: str) -> None:
+        original(order_id)
+        client.orders[0].status = " Pending_Cancel "
+
+    client.cancel_order_by_id = cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ()
+
+
+def test_cancel_open_orders_accepts_dotted_enum_render_of_pending_cancel() -> None:
+    # An enum-like status without ``.value`` renders as ``orderstatus.pending_cancel``.
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")], cancel_settles=False
+    )
+    original = client.cancel_order_by_id
+
+    def cancel(order_id: str) -> None:
+        original(order_id)
+        client.orders[0].status = "OrderStatus.PENDING_CANCEL"
+
+    client.cancel_order_by_id = cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_open_orders())
+
+    assert outcome.failed == ()
 
 
 def test_cancel_open_orders_leaves_attached_sl_tp_alone() -> None:
@@ -593,3 +759,136 @@ def test_broker_write_failure_is_not_marked_as_not_submitted(
     # The broker may have accepted the order before the connection died, so the
     # caller must treat the outcome as unknown and keep its lease.
     assert is_order_not_submitted(raised.value) is False
+
+
+# ─── #121 review: what an exit needs to know before it is sized ──────────────
+
+
+def test_working_order_ids_lists_broker_and_client_order_ids() -> None:
+    """A previous exit is matched by its broker id, or by its client order id
+    (the signal id) when the broker id was never persisted."""
+    client = _FakeTradingClient(
+        orders=[
+            SimpleNamespace(
+                id="o-1", client_order_id="sig-1", symbol="AAPL", side="sell", legs=[]
+            ),
+            _FakeOrder("o-2", "MSFT", "buy"),
+        ]
+    )
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"o-1", "sig-1", "o-2"} <= set(ids)
+
+
+def test_alpaca_working_order_ids_include_nested_legs() -> None:
+    """An exit working only under a bracket leg's id must still be seen."""
+    legs = [
+        SimpleNamespace(id="leg-1", client_order_id="leg-sig-1", legs=[]),
+        SimpleNamespace(id="leg-2", client_order_id="leg-sig-2", legs=[]),
+    ]
+    client = _FakeTradingClient(
+        orders=[
+            SimpleNamespace(
+                id="parent-1",
+                client_order_id="parent-sig",
+                symbol="AAPL",
+                side="buy",
+                legs=legs,
+            )
+        ]
+    )
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"parent-1", "parent-sig", "leg-1", "leg-sig-1", "leg-2", "leg-sig-2"} <= set(ids)
+
+
+def test_alpaca_exit_qty_floor_absorbs_float_noise_but_never_rounds_up() -> None:
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 3.0)]))
+
+    noisy = 2.9999999999999996
+    qty = asyncio.run(adapter._require_exit_position(_exit_signal(noisy), noisy))
+    assert qty == 3.0
+    over = asyncio.run(adapter._require_exit_position(_exit_signal(0.1999999996), 0.1999999996))
+    assert over == pytest.approx(0.199999999, abs=1e-15)
+    assert over <= 0.1999999996
+
+
+def test_working_order_ids_sees_an_exit_beyond_the_default_page_of_50_orders() -> None:
+    orders = [_FakeOrder(f"o-{index}", "MSFT", "buy") for index in range(120)]
+    orders.append(
+        SimpleNamespace(
+            id="exit-1", client_order_id="sig-exit", symbol="AAPL", side="sell", legs=[]
+        )
+    )
+    client = _FakeTradingClient(orders=orders)
+
+    ids = asyncio.run(_adapter(client).working_order_ids())
+
+    assert {"exit-1", "sig-exit"} <= set(ids)
+    assert client.last_order_filter.nested is True
+    assert client.last_order_filter.limit == 500
+
+
+def test_working_order_ids_fails_when_the_order_page_is_full() -> None:
+    client = _FakeTradingClient(
+        orders=[_FakeOrder(f"o-{index}", "MSFT", "buy") for index in range(500)]
+    )
+
+    with pytest.raises(RuntimeError, match="page limit"):
+        asyncio.run(_adapter(client).working_order_ids())
+
+
+def test_working_order_ids_fails_closed_without_an_order_listing() -> None:
+    client = SimpleNamespace()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_adapter(client).working_order_ids())
+
+
+def test_alpaca_position_qty_tolerance_is_below_one_fractional_share_step() -> None:
+    """Alpaca quantities have up to 9 decimals: half a step, never a whole one."""
+    tolerance = _adapter(_FakeTradingClient()).position_qty_tolerance("AAPL")
+
+    assert 0.0 < tolerance < 1e-9
+
+
+# ─── #121 review concern 6: exit quantities round down to 9 decimals ─────────
+
+
+def _exit_signal(qty: float) -> LiveSignal:
+    return LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only", "qty": qty},
+    )
+
+
+def test_alpaca_exit_qty_rounds_down_to_nine_decimals() -> None:
+    """1/3 of a 0.5-share position: 0.1666... closes 0.166666666, never ...667."""
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 0.5)]))
+
+    qty = asyncio.run(adapter._require_exit_position(_exit_signal(0.5 / 3), 0.5 / 3))
+
+    assert qty == pytest.approx(0.166666666, abs=1e-15)
+    assert qty <= 0.5 / 3
+
+
+def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
+    from live_runner.exit_signals import ExitBelowStepError
+
+    adapter = _adapter(_FakeTradingClient(positions=[_FakePosition("AAPL", 0.5)]))
+
+    with pytest.raises(ExitBelowStepError) as excinfo:
+        asyncio.run(adapter._require_exit_position(_exit_signal(4e-10), 4e-10))
+    assert excinfo.value.requested_qty == pytest.approx(4e-10)
+    assert excinfo.value.qty_step == pytest.approx(1e-9)
+
+
+def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
+    adapter = _adapter(_FakeTradingClient())
+    assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
