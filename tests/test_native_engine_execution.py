@@ -456,6 +456,27 @@ def test_fixed_risk_grid_size_ulp_below_min_lot_creates_order():  # Issue #151
     assert result.trades[0].quantity == pytest.approx(0.9)
 
 
+def test_fixed_risk_max_lot_without_lot_step_applies_raw():  # Issue #151
+    # `max_lot` with no `lot_step` needs no grid floor: the cap applies raw
+    # (as before #151), and the floor guard must not divide by a zero step.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "max_lot": 100.0,
+        },
+        max_leverage=10.0,
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(100.0)
+
+
 @pytest.mark.parametrize("bad_value", [float("inf"), float("nan")])
 @pytest.mark.parametrize(
     "key", ["tick_size", "tick_value", "lot_step", "min_lot", "max_lot"]

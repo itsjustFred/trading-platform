@@ -50,13 +50,15 @@ TRADE_ENGINE_MAX_POSITIONS = 5
 
 
 def _floor_to_lot_grid(size: float, lot_step: float) -> float:
-    """Largest multiple of ``lot_step`` at or below ``size`` (#151).
+    """Largest multiple of ``lot_step`` at or below ``size``, up to the snap band (#151).
 
     A quotient within a relative 1e-9 of an integer counts as that integer, so
     float noise (``k * lot_step / lot_step`` can land an ulp below ``k``) never
     drops a whole step. Unlike a fixed absolute epsilon, the tolerance scales
     with the quotient, so large step counts are handled too. Idempotent on
-    grid values.
+    grid values. Because the band is relative, at a quotient of ~1e9 steps or
+    more it reaches a whole step, so the snap can then return a value a full
+    step above ``size``; it never falls more than the band below ``size``.
     """
     quotient = size / lot_step
     nearest = round(quotient)
