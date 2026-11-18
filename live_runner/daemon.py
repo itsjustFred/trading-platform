@@ -2670,11 +2670,11 @@ async def _submit_normalized_discord_signal(
         # other, from sizing to the persisted order (see ``_exit_lock``).
         async with _exit_lock(account_id, live_signal.symbol):
             await _prepare_claim_and_submit_signal(
-                account_id, adapter, deployment, normalized_signal, live_signal, is_exit=True
+                account_id, adapter, deployment, live_signal, is_exit=True
             )
         return
     await _prepare_claim_and_submit_signal(
-        account_id, adapter, deployment, normalized_signal, live_signal, is_exit=False
+        account_id, adapter, deployment, live_signal, is_exit=False
     )
 
 
@@ -2682,7 +2682,6 @@ async def _prepare_claim_and_submit_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
-    normalized_signal: TradeSignal,
     live_signal: LiveSignal,
     *,
     is_exit: bool,

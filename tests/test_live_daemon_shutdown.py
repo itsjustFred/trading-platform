@@ -236,7 +236,8 @@ class _NoopLoop:
 # ─── the stop flag: signals set it ─────────────────────────────────────────────
 
 
-def test_sigterm_handler_sets_the_stop_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+@needs_real_signals
+def test_sigterm_handler_sets_the_stop_flag() -> None:
     """The installed SIGTERM handler must flip the flag AND wake the loop.
 
     Without the ``call_soon_threadsafe`` wake-up the daemon's shutdown wait would
@@ -437,9 +438,39 @@ def test_bind_gives_a_new_run_a_clean_slate() -> None:
 
 
 def test_pending_submission_wakes_the_drain_through_wait() -> None:
-    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
-    assert coordinator.bind(None) is None if False else True  # bind requires a loop
-    assert callable(coordinator.request)
+    """The drain ends on the submission that finishes LAST, and only through the idle event.
+
+    A drain that is still waiting when one of two submissions ends must not
+    report idle (the other order is still on its way to the broker), and it must
+    return before its own timeout once the last one ends - which can only happen
+    because ``end_submission`` wakes it; the timeout would have returned False.
+    """
+
+    async def _probe() -> tuple[bool, bool]:
+        coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+        coordinator.bind(asyncio.get_running_loop())
+        coordinator.begin_submission()
+        coordinator.begin_submission()
+
+        # One of the two submissions ends: the drain must stay open.
+        coordinator.end_submission()
+        drained_early = await coordinator.wait_idle(timeout=0.1)
+
+        # The last one ends while a drain is already blocked on the event.
+        async def _finish_later() -> None:
+            await asyncio.sleep(0.05)
+            coordinator.end_submission()
+
+        finisher = asyncio.create_task(_finish_later())
+        drain = asyncio.create_task(coordinator.wait_idle(timeout=1.0))
+        assert not drain.done(), "the drain must block while a submission is in flight"
+        drained = await asyncio.wait_for(drain, timeout=5)
+        await finisher
+        return drained_early, drained
+
+    drained_early, drained = asyncio.run(_probe())
+    assert drained_early is False, "one submission still in flight must not end the drain"
+    assert drained is True, "the last submission must wake the waiting drain"
 
 
 # ─── the Twisted reactor release (cTrader threads) ──────────────────────────────
@@ -661,7 +692,8 @@ def test_a_failed_cleanup_phase_logs_its_traceback(
     with caplog.at_level("ERROR"):
         assert asyncio.run(_probe()) is False
     failed = [r for r in caplog.records if r.getMessage() == "Shutdown phase failed"]
-    assert failed and failed[0].exc_info is not None
+    assert failed, "the failed phase must be logged"
+    assert failed[0].exc_info is not None, "and with its traceback"
 
 
 def test_a_timed_out_cleanup_phase_is_reported_false_and_cancelled() -> None:

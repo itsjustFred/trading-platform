@@ -468,4 +468,4 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of an in-flight order is unknown: the submission lease is kept, so reconcile the account before sending new signals.
 5. A second signal forces an immediate exit (code `130`) and skips all cleanup.
 
-Shutdown never cancels or closes open orders or positions at the broker; they are left exactly as they were. On systemd set `TimeoutStopSec` above 90 s so the unit is not killed mid-drain. On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
+Shutdown never cancels or closes open orders or positions at the broker; they are left exactly as they were. Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the four cleanup phases, 110 s in total: on systemd set `TimeoutStopSec` above 110 s so the unit is not killed mid-drain. On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
