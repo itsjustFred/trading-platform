@@ -51,11 +51,13 @@ def score_backtest_for_live(row: dict[str, Any]) -> float:
     sharpe = _metric(row, "sharpe_ratio")
     cagr = min(max(_metric(row, "cagr"), -1.0), 1.0)
     psr = min(max(_metric(row, "psr"), 0.0), 1.0)
+    # Payload `max_drawdown` is a fraction (0.25 = 25 %), signed negative by
+    # the stats producer; it is already on the 0..1 penalty scale.
     max_drawdown = abs(_metric(row, "max_drawdown"))
     trade_count = _metric(row, "trade_count")
     if trade_count <= 0:
         return float("-inf")
-    drawdown_penalty = min(max_drawdown, 100.0) / 100.0
+    drawdown_penalty = min(max_drawdown, 1.0)
     return (sharpe / 3.0) + cagr + psr - drawdown_penalty
 
 

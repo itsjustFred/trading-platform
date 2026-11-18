@@ -1,6 +1,7 @@
 """Tests for database migrations and model persistence."""
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1036,3 +1037,170 @@ def test_migrate_schema_parents_smoke_orphans_and_lands_the_foreign_key(legacy_d
     ), "init_db() did not land the deployment_id foreign key on a smoke-only database"
     assert parents == 1, "the smoke orphan's parent was not created"
     assert orphans == 0, "a smoke orphan survived the migration, so the FK was left blocked"
+
+
+def test_backfill_does_not_lose_an_id_when_another_writer_backfilled_first(
+    isolated_db, signal_parent
+) -> None:
+    """Two redeliveries with different ids on an empty tracked id: neither id may vanish."""
+    from shared.database import (
+        _reconcile_existing_live_signal,
+        list_live_signal_broker_order_conflicts,
+    )
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-bf-1", broker_order_id="")
+    )
+    with get_session() as stale_session:
+        stale_existing = stale_session.get(LiveSignalModel, first_id)
+        assert stale_existing is not None
+        assert not (stale_existing.broker_order_id or "").strip()
+        # Another redelivery backfills BRK-BBB and commits while this one holds its empty copy.
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-1", broker_order_id="BRK-BBB")
+        )
+        incoming = LiveSignalModel.from_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-1", broker_order_id="BRK-CCC")
+        )
+        _reconcile_existing_live_signal(stale_session, stale_existing, incoming)
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.broker_order_id == "BRK-BBB"
+        assert row.metadata_json["broker_order_id"] == "BRK-BBB"
+        assert row.metadata_json["conflicting_broker_order_ids"] == ["BRK-CCC"]
+    assert list_live_signal_broker_order_conflicts()[0]["conflicting_broker_order_ids"] == [
+        "BRK-CCC"
+    ]
+
+
+def test_backfill_with_the_id_another_writer_already_stored_is_a_plain_duplicate(
+    isolated_db, signal_parent
+) -> None:
+    from shared.database import _reconcile_existing_live_signal
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-bf-2", broker_order_id="")
+    )
+    with get_session() as stale_session:
+        stale_existing = stale_session.get(LiveSignalModel, first_id)
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-2", broker_order_id="BRK-BBB")
+        )
+        incoming = LiveSignalModel.from_live_signal(
+            _make_live_signal(discord_message_id="ord-bf-2", broker_order_id="BRK-BBB")
+        )
+        _reconcile_existing_live_signal(stale_session, stale_existing, incoming)
+
+    with get_session() as session:
+        row = session.get(LiveSignalModel, first_id)
+        assert row.broker_order_id == "BRK-BBB"
+        assert "conflicting_broker_order_ids" not in row.metadata_json
+    # The write lock was released: another writer can save right away.
+    save_live_signal(_make_live_signal(discord_message_id="ord-bf-3", broker_order_id="BRK-ZZZ"))
+
+
+def test_reconcile_takes_write_lock_before_re_reading(isolated_db, signal_parent) -> None:
+    """The write lock must be taken before the refresh that re-reads the row.
+
+    A competing-commit test cannot observe the lock (its commit lands before the reconcile runs),
+    so record the statement order on the engine: ``BEGIN IMMEDIATE`` has to come before the refresh.
+    """
+    from sqlalchemy import event
+
+    from shared.database import _reconcile_existing_live_signal, get_engine
+
+    first_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-lock-1", broker_order_id="")
+    )
+    events: list[str] = []
+
+    def _record_statement(conn, cursor, statement, parameters, context, executemany) -> None:
+        if statement.strip().upper() == "BEGIN IMMEDIATE":
+            events.append("lock")
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", _record_statement)
+    try:
+        with get_session() as session:
+            existing = session.get(LiveSignalModel, first_id)
+            original_refresh = session.refresh
+
+            def _refresh(instance, *args, **kwargs):
+                events.append("refresh")
+                return original_refresh(instance, *args, **kwargs)
+
+            session.refresh = _refresh
+            incoming = LiveSignalModel.from_live_signal(
+                _make_live_signal(discord_message_id="ord-lock-1", broker_order_id="BRK-NEW")
+            )
+            _reconcile_existing_live_signal(session, existing, incoming)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record_statement)
+
+    assert events == ["lock", "refresh"]
+    with get_session() as session:
+        assert session.get(LiveSignalModel, first_id).broker_order_id == "BRK-NEW"
+
+
+def test_blank_broker_id_redelivery_never_records_a_conflict(isolated_db, signal_parent) -> None:
+    """A blank id means no id: it must not be recorded as a conflict, even against a tracked id."""
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    signal_id, _ = save_live_signal(
+        _make_live_signal(discord_message_id="ord-blank-1", broker_order_id="BRK-1")
+    )
+    save_live_signal(_make_live_signal(discord_message_id="ord-blank-1", broker_order_id=""))
+    with get_session() as session:
+        row = session.get(LiveSignalModel, signal_id)
+        assert row.broker_order_id == "BRK-1"
+        assert "conflicting_broker_order_ids" not in row.metadata_json
+    assert list_live_signal_broker_order_conflicts() == []
+
+
+def test_both_duplicate_skip_paths_log_the_one_shared_line(isolated_db, signal_parent) -> None:
+    """The pre-lock and post-refresh skips log the same line, once per skipped redelivery.
+
+    They share a helper so the two paths cannot drift; attaching to the module logger is needed
+    because the trading loggers set ``propagate = False`` and caplog would see nothing.
+    """
+    from shared.database import _reconcile_existing_live_signal
+    from shared.database import logger as db_logger
+
+    messages: list[str] = []
+
+    class _Recorder(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    handler = _Recorder(level=logging.INFO)
+    db_logger.addHandler(handler)
+    try:
+        # Pre-lock skip: the duplicate carries the id the stored row already tracks.
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-log-1", broker_order_id="BRK-AAA")
+        )
+        messages.clear()
+        save_live_signal(
+            _make_live_signal(discord_message_id="ord-log-1", broker_order_id="BRK-AAA")
+        )
+        assert messages == ["Skipping duplicate live signal (discord_message_id=ord-log-1)"]
+        messages.clear()
+        # Post-refresh skip: the stale copy is empty, but the competing writer stored this id.
+        first_id, _ = save_live_signal(
+            _make_live_signal(discord_message_id="ord-log-2", broker_order_id="")
+        )
+        with get_session() as stale_session:
+            stale_existing = stale_session.get(LiveSignalModel, first_id)
+            save_live_signal(
+                _make_live_signal(discord_message_id="ord-log-2", broker_order_id="BRK-BBB")
+            )
+            incoming = LiveSignalModel.from_live_signal(
+                _make_live_signal(discord_message_id="ord-log-2", broker_order_id="BRK-BBB")
+            )
+            messages.clear()
+            _reconcile_existing_live_signal(stale_session, stale_existing, incoming)
+    finally:
+        db_logger.removeHandler(handler)
+
+    assert messages == ["Skipping duplicate live signal (discord_message_id=ord-log-2)"]

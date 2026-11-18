@@ -942,12 +942,12 @@ export interface BacktestMetadataItem {
   strategy_name: string;
   symbols: string[];
   timeframe: string;
-  total_return: number;
+  total_return: number | null;
   sharpe_ratio: number | null;
   psr: number | null;
   p_value: number | null;
   cagr: number | null;
-  max_drawdown: number;
+  max_drawdown: number | null;
   trade_count: number;
   win_rate: number | null;
   start_date: string;
@@ -1165,7 +1165,7 @@ export interface MaintenanceDeleteItem {
   error?: string;
   journal_pending?: boolean;
   /** Set on `skipped` items of a two-phase bulk delete: why the confirmed id
-   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `not_found`). */
+   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `no_longer_duplicate`, `not_found`, `recheck_failed`). */
   reason?: string;
 }
 

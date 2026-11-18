@@ -338,7 +338,7 @@ def test_smoke_sl_tp_are_on_the_correct_side_and_pass_the_adapter_conversion(act
         assert take_profit < price < stop_loss
 
     signal = SimpleNamespace(symbol="EURUSD", action=action, theoretical_price=price)
-    stub = SimpleNamespace(_scale_for=lambda _symbol: None)
+    stub = SimpleNamespace(_scale_for=lambda _symbol: SimpleNamespace(price_digits=5))
     relative_stop, relative_take = CTraderLiveAdapter._resolve_relative_sl_tp(
         stub, signal, stop_loss, take_profit
     )
@@ -484,7 +484,7 @@ def test_strategy_e2e_worker_signal_carries_live_price_and_sl_tp(monkeypatch) ->
 
     # The captured signal must still satisfy the adapter's own SL/TP guards, i.e. the values that
     # reach the wire are derived from the fetched quote and not just from each other.
-    stub = SimpleNamespace(_scale_for=lambda _symbol: None)
+    stub = SimpleNamespace(_scale_for=lambda _symbol: SimpleNamespace(price_digits=5))
     relative_stop, relative_take = real_adapter_class._resolve_relative_sl_tp(
         stub, signal, metadata["stop_loss"], metadata["take_profit"]
     )

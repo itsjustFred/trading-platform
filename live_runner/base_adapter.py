@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Iterator
 
 from shared.logging import get_logger
@@ -141,6 +142,127 @@ def money_scale(money_digits: int) -> int:
     return 10**money_digits
 
 
+def commission_cost(signed_cash_flow: float) -> float:
+    """``live_executions.commission`` convention: a charge is a POSITIVE cost.
+
+    Net PnL is ``gross - commission`` everywhere (viewer, ``net_pnl``), so every adapter must
+    store what the fill cost as a positive number and a rebate as a negative one. A broker that
+    reports a signed cash flow (cTrader: ``ProtoOADeal.commission`` is negative for a charge)
+    is converted with this helper. ``0`` stays ``0.0`` (never ``-0.0``).
+
+    Raises ``ValueError`` on a non-finite value: ``0.0`` is a KNOWN zero fee, so garbage must not
+    be turned into one. A caller that wants "unknown" handles it before calling (cTrader stores
+    ``0.0`` for an unreadable deal commission and filters it itself).
+    """
+    if not math.isfinite(signed_cash_flow):
+        raise ValueError(f"commission must be finite, got {signed_cash_flow!r}")
+    if not signed_cash_flow:
+        return 0.0
+    return -float(signed_cash_flow)
+
+
+@dataclass(frozen=True)
+class LiveQuote:
+    """A broker top-of-book quote, in price units of the symbol.
+
+    An entry-gate quote (#125) only decides whether a signal may still be
+    submitted and is never a sizing input. A *conversion* quote (#146), carried
+    in :class:`LivePipValue`, is the one sizing input: it converts the quote
+    currency into the account currency. Adapters return what the broker sent;
+    the daemon validates it (finite, positive, not crossed) and fails closed on
+    anything else.
+
+    ``timestamp`` must be timezone-aware. The daemon rejects a quote whose time
+    is missing, invalid, in the future or older than the deployment's
+    ``max_entry_quote_age_seconds``. ``timestamp_source`` says where the time
+    came from: ``"broker"`` (the quote's own time, the default) or
+    ``"receive"`` (the local time the adapter received it, for brokers whose
+    stream does not send a time). Adapters never substitute ``now()`` for a
+    broker time that should have been there. ``source`` names the feed so a
+    persisted quote can be traced back (#134).
+    """
+
+    bid: float
+    ask: float
+    timestamp: datetime | None = None
+    source: str = ""
+    timestamp_source: str = "broker"
+
+
+def validate_live_quote_prices(
+    quote: object, *, symbol: str, label: str = "Broker quote"
+) -> tuple[float, float]:
+    """Validated ``(bid, ask)`` of a broker quote, failing closed (#125, #146).
+
+    One implementation for every layer that turns a broker quote into a number
+    it is willing to gate or size on: the daemon's entry-deviation gate and
+    cTrader's quote->account conversion chain both size real orders from such a
+    quote, and both must refuse the same shapes - a payload that is not a
+    :class:`LiveQuote`, a missing side, a non-numeric side, a non-finite or
+    non-positive side, or a crossed book. Two copies of a safety-value parser
+    drift: one layer gets a fix the other does not, and a quote that sizes an
+    entry is accepted by one and rejected by the other.
+
+    ``label`` names the layer so the refusal still says which one refused.
+    """
+    if not isinstance(quote, LiveQuote):
+        raise ValueError(
+            f"{label} for {symbol}: no usable quote ({type(quote).__name__}); "
+            "refusing to trade on a number the broker did not send."
+        )
+    sides: list[float] = []
+    for name, value in (("bid", quote.bid), ("ask", quote.ask)):
+        if value is None or isinstance(value, bool):
+            raise ValueError(f"{label} for {symbol} is unusable: missing {name} side ({value!r})")
+        try:
+            price = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{label} for {symbol} is unusable: {name} is not numeric ({value!r})"
+            ) from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(
+                f"{label} for {symbol} is unusable: {name} is not positive and finite ({value!r})"
+            )
+        sides.append(price)
+    bid, ask = sides
+    if bid > ask:
+        raise ValueError(f"{label} for {symbol} is crossed: bid={bid!r} > ask={ask!r}")
+    return bid, ask
+
+
+@dataclass(frozen=True)
+class LivePipValue:
+    """What one qty unit of a symbol gains or loses per 1.0 price move (#146).
+
+    ``value`` is the ``pip_value`` the risk engine sizes with: account-currency
+    P&L of ONE adapter qty unit when the price moves by 1.0 (one whole price
+    unit, not one pip), so ``qty = risk_amount / (stop_distance * value)`` and
+    the position's notional is ``qty * price * value``. It is
+    ``units_per_qty * conversion_rate``:
+
+    * ``units_per_qty``: base-asset units one qty unit stands for (cTrader:
+      0.01 lot, e.g. 1,000 EUR for EURUSD; Alpaca: one share).
+    * ``conversion_rate``: account-currency value of one unit of the symbol's
+      quote currency (1.0 when they are the same).
+
+    ``conversion_quotes`` are the live quotes the rate was derived from, one
+    per conversion hop. The daemon checks each one against the deployment's
+    quote-age limit and refuses the entry when one is stale, so a broker that
+    converts must return them. ``source`` names where the figures came from so
+    a persisted signal can be traced back.
+    """
+
+    value: float
+    units_per_qty: float
+    conversion_rate: float
+    quote_asset: str
+    account_asset: str
+    source: str
+    conversion_symbols: tuple[str, ...] = ()
+    conversion_quotes: tuple[LiveQuote, ...] = ()
+
+
 @dataclass(frozen=True)
 class ControlOutcome:
     """What a cancel or flatten sweep actually achieved, including what it did not.
@@ -201,8 +323,32 @@ def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float
     return parsed
 
 
+@dataclass(frozen=True)
+class ProtectiveStop:
+    """One working broker-side stop order that protects an open position.
+
+    ``side`` is the *order* side: a ``sell`` stop protects a long, a ``buy``
+    stop protects a short. ``order_id`` names the order for an amendment and
+    changes when the broker replaces the order.
+    """
+
+    order_id: str
+    symbol: str
+    side: str
+    stop_price: float
+    #: Quantity the stop order covers, when the broker reports it. Informational
+    #: (excluded from equality): an amendment moves the price only, so the caller
+    #: can warn when it differs from the position, never correct it.
+    qty: float | None = field(default=None, compare=False)
+
+
 class BaseLiveAdapter(ABC):
     """Abstract broker adapter for live order routing and fill streaming."""
+
+    #: Broker key as used by ``LiveAccountConfig.broker`` and by the per-broker
+    #: trailing-mode table in ``shared.trailing``. Blank means "unknown", which
+    #: every per-broker lookup treats as the fail-closed baseline.
+    broker_name: str = ""
 
     @abstractmethod
     async def connect(self) -> None:
@@ -226,6 +372,27 @@ class BaseLiveAdapter(ABC):
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""
 
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        """Return the current broker bid/ask for ``symbol``.
+
+        Raises NotImplementedError when the broker cannot provide one. The daemon treats that
+        (and any other failure) as "no quote", which rejects the entry: the deviation gate
+        fails closed rather than submitting an order it could not check.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot provide a live quote")
+
+    async def get_pip_value(self, symbol: str) -> LivePipValue:
+        """Return the account-currency value of one qty unit per 1.0 price move.
+
+        The risk engine divides the risk budget by ``stop_distance * value``,
+        so a wrong value scales the size by the same factor (#146: an implicit
+        1.0 oversized cTrader FX entries ~1000x). It must come from the broker
+        or trusted configuration, never from signal metadata. Raises
+        NotImplementedError when the adapter cannot provide it; the daemon
+        treats that (and any other failure) as "unknown" and refuses the entry.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
+
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
     # Status semantics built on top of these:
@@ -236,6 +403,47 @@ class BaseLiveAdapter(ABC):
     #
     # Adapters that cannot honour a control leave it unsupported so the caller fails loudly
     # instead of reading a silent no-op as "nothing was open".
+
+    # ── Stop amendment (live trailing stops, issue #167) ──────────────────────────────────────
+    #
+    # A trailing stop is executed live by moving the broker-side protective stop. An adapter
+    # may only declare the capability when its amendment can never leave the position without
+    # a stop: either the broker amends in place, or it replaces atomically (the previous stop
+    # keeps working until the replacement is accepted, and stays if it is refused). An adapter
+    # that would have to cancel and re-submit must NOT declare it. Without the capability the
+    # live path refuses every trailing mode except "none" for that adapter.
+
+    @property
+    def supports_stop_amendment(self) -> bool:
+        """Whether this adapter can safely amend a broker-side protective stop."""
+        return False
+
+    async def list_protective_stops(self) -> list[ProtectiveStop]:
+        """Working stop orders on the reducing side of each open position.
+
+        Read from the broker on every call: this is the source of truth a trail continues
+        from, including after a daemon restart.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list protective stops")
+
+    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
+        """Round a computed stop to a price the broker accepts.
+
+        Rounds away from the market (down for a sell stop, up for a buy stop), so the rounded
+        stop is never tighter than the computed one.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot round stop prices")
+
+    async def amend_protective_stop(
+        self, stop: ProtectiveStop, new_stop_price: float
+    ) -> ProtectiveStop:
+        """Move one protective stop to ``new_stop_price`` and return the stop now working.
+
+        Must raise when the broker refuses or the outcome is not confirmed; in that case the
+        previous stop must still be in force. Never cancels before the replacement is
+        confirmed.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot amend protective stops")
 
     @property
     def supports_cancel_orders(self) -> bool:

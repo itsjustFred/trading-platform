@@ -263,25 +263,47 @@ def compute_stats(
         cagr = None
         calmar_ratio = None
 
+        # A non-finite terminating point also makes the drawdown unmeasurable:
+        # the manual loop cannot compare NaN against the peak, so its 0.0 (or an
+        # unbounded value for -inf) is an artefact of the comparison, not a
+        # measurement. A *finite* ruin keeps the measured drawdown - that is the
+        # whole loss, -1.0 at zero equity.
+        if equity_curve and not math.isfinite(float(equity_curve[-1].equity)):
+            undefined_metrics.add("max_drawdown_pct")
+            max_drawdown_pct = None
+
+    # Fail closed on endpoint figures the curve cannot measure. A terminal point
+    # that is non-finite - unreadable (normalised to NaN by `_truncate_at_ruin`),
+    # or stored NaN/inf - makes the endpoint arithmetic NaN/inf. That is not a
+    # measurement, and the app's JSON response refuses NaN/inf, so publishing it
+    # would 500 the artifact page exactly as the unguarded cast did (#139/#250).
+    # Name them in `undefined_metrics` and publish null, the convention every
+    # other uncomputable metric follows. A *finite* ruin keeps its endpoint
+    # ratio (≈ -1.0): there the final equity is known.
+    total_pnl = _finite_or_undefined(total_pnl, "total_pnl", undefined_metrics)
+    total_return = _finite_or_undefined(total_return, "total_return", undefined_metrics)
+
     return BacktestStats(
         total_trades=total_trades,
         winners=win_count,
         losers=loss_count,
         win_rate=round(win_rate, 4),
         profit_factor=round(profit_factor, 4) if profit_factor != float("inf") else None,
-        total_pnl=round(total_pnl, 2),
+        total_pnl=round(total_pnl, 2) if total_pnl is not None else None,
         avg_winner=round(avg_winner, 2),
         avg_loser=round(avg_loser, 2),
         max_consecutive_wins=max_consecutive_wins,
         max_consecutive_losses=max_consecutive_losses,
         avg_holding_bars=round(avg_holding_bars, 1) if avg_holding_bars is not None else None,
-        max_drawdown_pct=round(float(max_drawdown_pct), 6),
+        max_drawdown_pct=(
+            round(float(max_drawdown_pct), 6) if max_drawdown_pct is not None else None
+        ),
         max_drawdown_duration=max_drawdown_duration,
         sharpe_ratio=round(float(sharpe_ratio), 4) if sharpe_ratio is not None else None,
         sortino_ratio=round(float(sortino_ratio), 4) if sortino_ratio is not None else None,
         calmar_ratio=round(float(calmar_ratio), 4) if calmar_ratio is not None else None,
         cagr=round(float(cagr), 6) if cagr is not None else None,
-        total_return=round(float(total_return), 6),
+        total_return=round(float(total_return), 6) if total_return is not None else None,
         psr=round(float(psr), 4) if psr is not None else None,
         p_value=round(float(p_value), 6) if p_value is not None else None,
         extras={
@@ -343,16 +365,60 @@ def _truncate_at_ruin(
     A non-finite equity (NaN/inf) also counts as ruin and fails closed: it is
     not a tradeable account, and silently skipping it would let a corrupt
     curve publish measured-looking ratios and pass the live-deployment gate.
-    The test is ``not (equity > 0)``, which is true for NaN as well.
+    An unreadable equity (``None``, text that is not a number, an integer
+    outside float64 range) is treated the same way: legacy artifacts store the
+    raw value and must not crash the stats path. The test is
+    ``not (equity > 0)``, which is true for NaN as well.
+
+    Every returned point carries a ``float`` equity, whatever the artifact
+    stored: readable text (``"101000"``) is coerced - it is the same number,
+    and leaving the raw type in the curve moves the crash one operation down
+    into ``str / float`` arithmetic - and an unreadable value is normalised to
+    NaN so every downstream reader sees the non-finite point a NaN curve would
+    give, instead of the raw value that broke the cast.
     """
-    ordered = _equity_curve_in_time_order(equity_curve)
+    normalised = [_as_readable_equity_point(point) for point in equity_curve]
+    ordered = _equity_curve_in_time_order(normalised)
     for index, point in enumerate(ordered):
-        equity = float(point.equity)
-        if not (math.isfinite(equity) and equity > 0):
+        if not (math.isfinite(point.equity) and point.equity > 0):
+            # Zero, negative, non-finite or unreadable (NaN above). Keep the
+            # slice inclusive of this point: it is the ruin, so dropping it
+            # would end the metrics on the last readable point.
             return ordered[: index + 1], True, point.time
-    # Not ruined: hand back the curve exactly as given so a healthy run's
-    # metrics do not depend on this sort (only the ruin search needs time order).
-    return equity_curve, False, None
+    # Not ruined: hand back the curve in the order given (only the ruin search
+    # needs time order, and a healthy run's metrics must not depend on the
+    # sort), with each stored equity coerced to the float read above.
+    return normalised, False, None
+
+
+def _as_readable_equity_point(point: EquityPoint) -> EquityPoint:
+    """``point`` with its equity read as a float, NaN when it cannot be read.
+
+    ``EquityPoint.from_dict`` passes the stored value through uncoerced, so a
+    legacy or corrupt artifact can carry ``None``, text, or a JSON integer too
+    large for a float (``10**400``, which raises ``OverflowError``).
+    """
+    try:
+        equity = float(point.equity)
+    except (TypeError, ValueError, OverflowError):
+        equity = math.nan
+    return EquityPoint(time=point.time, equity=equity)
+
+
+def _finite_or_undefined(
+    value: float, metric: str, undefined_metrics: set[str]
+) -> float | None:
+    """``value`` when it is a finite measurement, else ``None`` named undefined.
+
+    Non-finite is absence, not a number: NaN/inf cannot be stored in the stats
+    columns, cannot be rendered by the JSON response, and would read as a
+    measurement to anything that only compares magnitudes.
+    """
+    numeric = float(value)
+    if math.isfinite(numeric):
+        return numeric
+    undefined_metrics.add(metric)
+    return None
 
 
 def _equity_curve_in_time_order(equity_curve: list[EquityPoint]) -> list[EquityPoint]:

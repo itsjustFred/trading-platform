@@ -1,16 +1,20 @@
 """Classify Alpaca symbols as crypto or equity from the symbol itself (#124, review of #143).
 
-Alpaca accepts a crypto pair with or without a slash (``BTC/USD`` and ``BTCUSD``), so a slash is
-not evidence of crypto, and its absence is not evidence of an equity. A signal stored as ``BTCUSD``
+Alpaca accepts a crypto pair with or without a slash (``BTC/USD`` and ``BTCUSD``), and the
+market-data layer also accepts ``BTC-USD``, so a slash is not evidence of crypto, and its absence
+is not evidence of an equity. A signal stored as ``BTCUSD``
 must still be recognised: its fee is a ``CFEE`` to backfill, and a hard-coded ``0.0`` on it was
 never a stated fee.
 
 The rules, deliberately narrow so anything else is ``unknown`` (and readers fail closed):
 
 * ``BASE/QUOTE`` with two alphanumeric parts is crypto - Alpaca uses the slash only for crypto.
-* Without a slash, a symbol of at least six letters that ends in a known quote (``CRYPTO_QUOTES``,
-  longest first) after a base of at least three letters is crypto. Every Alpaca crypto base has at
-  least three letters, and no US equity ticker has six.
+* ``BASE-QUOTE`` is crypto only when the quote is in ``CRYPTO_QUOTES`` and the base has at least
+  three letters. The hyphen is also the share-class separator (``BF-B``), but a share-class suffix
+  is one or two letters and can never be a quote, so the two cannot collide.
+* Without a separator, a symbol of at least six letters that ends in a known quote
+  (``CRYPTO_QUOTES``, longest first) after a base of at least three letters is crypto. Every
+  Alpaca crypto base has at least three letters, and no US equity ticker has six.
 * One to five letters, optionally with a one- or two-letter share-class suffix (``BRK.B``,
   ``BF-B``), is a US equity - including ``USD``, an ETF named like a quote.
 * Everything else (an OCC option symbol, an empty or malformed string) is ``unknown``.
@@ -39,11 +43,21 @@ def _normalize(symbol: Any) -> str:
 
 
 def split_crypto_pair(symbol: Any) -> tuple[str, str] | None:
-    """``(base, quote)`` for a crypto pair in either spelling, else ``None``."""
+    """``(base, quote)`` for a crypto pair in any accepted spelling, else ``None``."""
     text = _normalize(symbol)
     if "/" in text:
         parts = text.split("/")
         if len(parts) == 2 and all(_ALNUM_RE.match(part) for part in parts):
+            return parts[0], parts[1]
+        return None
+    if "-" in text:
+        parts = text.split("-")
+        if (
+            len(parts) == 2
+            and all(_ALNUM_RE.match(part) for part in parts)
+            and parts[1] in CRYPTO_QUOTES
+            and len(parts[0]) >= _MIN_CRYPTO_BASE
+        ):
             return parts[0], parts[1]
         return None
     if len(text) < 2 * _MIN_CRYPTO_BASE or not _ALNUM_RE.match(text):
@@ -56,7 +70,10 @@ def split_crypto_pair(symbol: Any) -> tuple[str, str] | None:
 
 
 def crypto_pair_key(symbol: Any) -> str:
-    """One comparable key for both spellings: ``BTC/USD`` and ``BTCUSD`` are ``BTCUSD``."""
+    """One comparable key for every spelling: ``BTC/USD``, ``BTC-USD``, ``BTCUSD`` -> ``BTCUSD``."""
+    pair = split_crypto_pair(symbol)
+    if pair is not None:
+        return pair[0] + pair[1]
     return _normalize(symbol).replace("/", "")
 
 

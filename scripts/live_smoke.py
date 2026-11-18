@@ -1030,6 +1030,11 @@ async def _ctrader_demo_roundtrip(
 
 
 class _DiscordSmokeAdapter:
+    # This fake never reaches a broker. The daemon treats an adapter that does
+    # not prove it is demo/paper as real money (`_adapter_is_demo`), and the
+    # promotion gate (#165) refuses entries there, so the fake says what it is.
+    demo = True
+
     def __init__(self) -> None:
         self.submitted_signal: Any | None = None
 
@@ -1048,6 +1053,30 @@ class _DiscordSmokeAdapter:
 
     async def get_positions(self) -> list[dict[str, Any]]:
         return []
+
+    async def get_quote(self, symbol: str) -> Any:
+        # #125 entry-deviation gate: quote at the replayed message price.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=190.50,
+            ask=190.50,
+            timestamp=datetime.now(timezone.utc),
+            source="discord-smoke",
+        )
+
+    async def get_pip_value(self, symbol: str) -> Any:
+        # #146: the replayed AAPL entry is a USD share in a USD account.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="discord-smoke",
+        )
 
 
 async def _discord_replay_smoke() -> list[SmokeCheck]:

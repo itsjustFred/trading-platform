@@ -79,11 +79,14 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
+from risk.live import entry_gate_settings
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
+from runner.promotion_gate import StrategyNotPromotedError
 from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
@@ -3420,6 +3423,23 @@ def _duplicate_portfolio_members() -> list[dict[str, Any]]:
     return members
 
 
+def _current_duplicate_member(
+    load_members: Callable[[], list[dict[str, Any]]], item_id: str
+) -> dict[str, Any] | None:
+    """Return ``item_id``'s member entry from a fresh duplicate-group read.
+
+    Used immediately before each confirmed delete. The confirm loop must not
+    act on the dry-run snapshot: if the other members of a group disappear in
+    between, the id may now be the last surviving entry, and deleting it would
+    destroy the group's only copy. ``None`` means it is no longer a duplicate
+    (or no longer exists).
+    """
+    for member in load_members():
+        if str(member["id"]) == item_id:
+            return member
+    return None
+
+
 def _current_backtest_store_mtime_ns() -> int:
     try:
         return int(BACKTEST_DB_PATH.stat().st_mtime_ns)
@@ -3727,6 +3747,12 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _magnitude_or_none(value: object) -> float | None:
+    """Absolute value of a measured metric; ``None`` when it was not measured."""
+    measured = _optional_float(value)
+    return None if measured is None else abs(measured)
+
+
 def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
     win_rate = _normalize_win_rate(meta.get("win_rate"))
     tags = [
@@ -3746,12 +3772,12 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "strategy_slug": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
-        "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "total_return": _optional_float(meta.get("total_return")),
         "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
         "psr": _optional_float(meta.get("psr")),
         "p_value": _optional_float(meta.get("p_value")),
         "cagr": _optional_float(meta.get("cagr")),
-        "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
+        "max_drawdown": _magnitude_or_none(meta.get("max_drawdown")),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
         "start_date": str(meta.get("start_date") or ""),
@@ -9450,8 +9476,11 @@ async def deduplicate_backtests(
     phase 1. Only submitted ids are deleted, and each id is re-checked against
     the criterion first: a member that is no longer in a duplicate group, is
     now the kept newest entry, or no longer exists is reported per item with
-    status ``skipped`` and a ``reason`` and is not deleted. A phase-2 call
-    without ``ids`` deletes nothing and returns HTTP 400.
+    status ``skipped`` and a ``reason`` and is not deleted. If the re-check
+    itself raises, that id is skipped with reason ``recheck_failed`` and the
+    rest of the request continues. ``kept_ids`` is the group snapshot taken
+    when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
     items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
@@ -9490,7 +9519,6 @@ async def deduplicate_backtests(
             detail="dry_run=false requires the id list returned by the dry run",
         )
 
-    member_by_id = {str(member["id"]): member for member in members}
     deleted_ids: list[str] = []
     skipped_ids: list[str] = []
     affected_fingerprints: set[str] = set()
@@ -9501,7 +9529,18 @@ async def deduplicate_backtests(
         if not backtest_id or backtest_id in seen:
             continue
         seen.add(backtest_id)
-        member = member_by_id.get(backtest_id)
+        try:
+            member = _current_duplicate_member(_duplicate_backtest_members, backtest_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Backtest duplicate re-check failed",
+                extra={"data": {"backtest": _log_safe(backtest_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(backtest_id, "recheck_failed"))
+            skipped_ids.append(backtest_id)
+            continue
         if member is None:
             items.append(_bulk_delete_skipped_item(backtest_id, "no_longer_duplicate"))
             skipped_ids.append(backtest_id)
@@ -12091,8 +12130,11 @@ async def deduplicate_portfolios(
     phase 1. Only submitted ids are deleted, and each id is re-checked against
     the criterion first: a portfolio that is no longer in a duplicate group,
     is now the kept newest entry, or no longer exists is reported per item
-    with status ``skipped`` and a ``reason`` and is not deleted. A phase-2
-    call without ``ids`` deletes nothing and returns HTTP 400.
+    with status ``skipped`` and a ``reason`` and is not deleted. If the
+    re-check itself raises, that id is skipped with reason ``recheck_failed``
+    and the rest of the request continues. ``kept_ids`` is the group snapshot
+    taken when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
 
     Deletion is journaled per item, so a failure in the middle leaves earlier
     items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
@@ -12131,7 +12173,6 @@ async def deduplicate_portfolios(
             detail="dry_run=false requires the id list returned by the dry run",
         )
 
-    member_by_id = {str(member["id"]): member for member in members}
     deleted_ids: list[str] = []
     skipped_ids: list[str] = []
     affected_fingerprints: set[str] = set()
@@ -12142,7 +12183,18 @@ async def deduplicate_portfolios(
         if not portfolio_id or portfolio_id in seen:
             continue
         seen.add(portfolio_id)
-        member = member_by_id.get(portfolio_id)
+        try:
+            member = _current_duplicate_member(_duplicate_portfolio_members, portfolio_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Portfolio duplicate re-check failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(portfolio_id, "recheck_failed"))
+            skipped_ids.append(portfolio_id)
+            continue
         if member is None:
             items.append(_bulk_delete_skipped_item(portfolio_id, "no_longer_duplicate"))
             skipped_ids.append(portfolio_id)
@@ -13257,7 +13309,10 @@ async def get_live_dashboard() -> dict[str, Any]:
     }
 
 
-@app.post("/api/live/deployments/ctrader/top5")
+@app.post(
+    "/api/live/deployments/ctrader/top5",
+    responses={409: {"description": "A deployment is refused by the promotion gate (#165)"}},
+)
 async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dict[str, Any]:
     limit = max(1, min(int(payload.limit or 5), 20))
     status = "ACTIVE" if payload.activate else "PAUSED"
@@ -13283,6 +13338,16 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
             detail="No eligible cTrader account or backtest candidates found",
         )
 
+    # Promotion gate (#165), before the dry-run return on purpose: a plan that
+    # could not be deployed must not be presented as deployable.
+    demo_flags: dict[str, bool | None] = {}
+    for deployment in plan:
+        if deployment.account_id not in demo_flags:
+            demo_flags[deployment.account_id] = await _broker_reported_demo_flag(
+                deployment.account_id
+            )
+        _require_promotion_gate(deployment, demo_flag=demo_flags[deployment.account_id])
+
     if payload.dry_run:
         return {
             "status": "planned",
@@ -13302,6 +13367,58 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         "dry_run": False,
         "deployments": created,
     }
+
+
+async def _broker_reported_demo_flag(account_id: str) -> bool | None:
+    """What broker discovery says about ``account_id``: demo, not demo, or unknown.
+
+    The promotion gate's real-money verdict for deployment create and the
+    cTrader top-N deploy (#165). It asks broker discovery directly, bypassing the
+    30 s discovery cache, so a broker that reclassifies the account is seen at
+    once, as activation's re-verification sees it. It never reads the stored
+    account row. ``None`` means discovery failed, did not return the account, or
+    did not assert the flag; the gate treats that as real money.
+    """
+    try:
+        discovered = await asyncio.to_thread(
+            _cached_live_accounts_payload, force_refresh=True
+        )
+    except Exception as exc:
+        logger.warning(
+            "Broker discovery failed; the promotion gate treats the account as real money",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return None
+    for account in discovered:
+        if str(account.get("id") or "") != str(account_id):
+            continue
+        if account.get("is_demo_asserted") is not True:
+            return None
+        return account.get("is_demo") is True
+    return None
+
+
+def _promotion_gate_refusal(
+    deployment: LiveDeploymentConfig, *, demo_flag: bool | None
+) -> str | None:
+    """The promotion gate's refusal for ``deployment``, or None when it passes.
+
+    The single viewer-side call into :func:`enforce_promotion_gate`; create,
+    activate and the cTrader top-N deploy all go through here.
+    """
+    try:
+        enforce_promotion_gate(deployment, real_money=is_real_money(demo_flag))
+    except StrategyNotPromotedError as exc:
+        return str(exc)
+    return None
+
+
+def _require_promotion_gate(
+    deployment: LiveDeploymentConfig, *, demo_flag: bool | None
+) -> None:
+    refusal = _promotion_gate_refusal(deployment, demo_flag=demo_flag)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
 
 
 def _validate_live_deployment_route(
@@ -13343,7 +13460,11 @@ def _validate_live_deployment_route(
         ) from exc
 
 
-@app.post(LIVE_DEPLOYMENTS_PATH, status_code=201)
+@app.post(
+    LIVE_DEPLOYMENTS_PATH,
+    status_code=201,
+    responses={409: {"description": "The deployment is refused by the promotion gate (#165)"}},
+)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
@@ -13418,11 +13539,18 @@ async def create_live_deployment_endpoint(
             signal_config=signal_config_payload,
             settings=payload.settings or {},
         )
+        # #125: refuse invalid entry-gate settings before anything is stored.
+        entry_gate_settings(deployment.settings)
     except ValueError as exc:
-        # Model-level config rejections (e.g. #150 trailing override) are
-        # client errors, not a 500.
+        # Model-level config rejections (e.g. #150 trailing override) and
+        # invalid gate settings are client errors, not a 500.
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     _validate_live_deployment_route(deployment, account_payload)
+    # Promotion gate (#165). A deployment is created ACTIVE, so this is a
+    # deploy action in its own right, not only a record being written.
+    _require_promotion_gate(
+        deployment, demo_flag=await _broker_reported_demo_flag(deployment.account_id)
+    )
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:
@@ -13580,7 +13708,10 @@ async def _reverify_account_against_broker(account_id: str) -> bool:
     return False
 
 
-@app.put("/api/live/deployments/{deployment_id}/status")
+@app.put(
+    "/api/live/deployments/{deployment_id}/status",
+    responses={409: {"description": "Activation is refused by the promotion gate (#165)"}},
+)
 async def update_live_deployment_status_endpoint(
     deployment_id: str,
     payload: LiveDeploymentStatusUpdateRequest,
@@ -13636,7 +13767,15 @@ async def update_live_deployment_status_endpoint(
 
         # Re-verify the account against the broker immediately before arming so
         # a stale identity can never be reused to arm a deployment.
-        if not await _reverify_account_against_broker(deployment.account_id):
+        demo_confirmed = await _reverify_account_against_broker(deployment.account_id)
+        # Promotion gate (#165), on the verdict of that same fresh broker
+        # answer. It is an additional layer: the demo-only block below still
+        # refuses every account the broker did not confirm as demo, promoted or
+        # not, and a refusal names both reasons.
+        promotion_refusal = _promotion_gate_refusal(
+            deployment, demo_flag=True if demo_confirmed else None
+        )
+        if not demo_confirmed:
             await _audit_live_control(
                 action="deployment.status",
                 target_type="live_deployment",
@@ -13647,6 +13786,7 @@ async def update_live_deployment_status_endpoint(
                     "requested_status": requested_status,
                     "reason": "broker could not confirm a demo account",
                     "account_id": str(deployment.account_id or ""),
+                    "promotion_gate": promotion_refusal or "promoted",
                 },
             )
             raise HTTPException(
@@ -13654,8 +13794,27 @@ async def update_live_deployment_status_endpoint(
                 detail=(
                     "Broker could not confirm the account is a demo account; "
                     "refusing to activate"
+                    + (f". {promotion_refusal}" if promotion_refusal else "")
                 ),
             )
+        if promotion_refusal is not None:
+            # Unreachable while the demo-only block above stands (a confirmed
+            # demo account always passes the gate). Kept so that lifting that
+            # block cannot silently lift the promotion gate with it.
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "promotion gate refused the deployment",
+                    "account_id": str(deployment.account_id or ""),
+                    "promotion_gate": promotion_refusal,
+                },
+            )
+            raise HTTPException(status_code=409, detail=promotion_refusal)
 
     # Inventory the leases to account for *before* the write, so a lease that is
     # reaped in the window between the commit and the drain's first poll is still

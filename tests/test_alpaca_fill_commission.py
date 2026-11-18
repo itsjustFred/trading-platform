@@ -618,6 +618,8 @@ def _build_legacy_database(isolated_db_no_schema):
             ("ex-equity", "sig-equity", 0.0, "alpaca:exec:e"),
             ("ex-ctrader", "sig-ctrader", 1.5, "ctrader:deal:1"),
             ("ex-ctrader-zero", "sig-ctrader", 0.0, "ctrader:deal:2"),
+            # Old raw broker sign: a charge is negative (#205).
+            ("ex-ctrader-neg", "sig-ctrader", -3.5, "ctrader:deal:3"),
         ]
         for execution_id, signal_id, commission, key in executions:
             connection.execute(
@@ -651,7 +653,16 @@ def test_legacy_not_null_commission_column_is_migrated_to_nullable(isolated_db_n
         index_names = {
             row[1] for row in connection.execute(text("PRAGMA index_list(live_executions)"))
         }
-    assert set(commissions) == {"ex-crypto", "ex-equity", "ex-ctrader", "ex-ctrader-zero"}
+    assert set(commissions) == {
+        "ex-crypto",
+        "ex-equity",
+        "ex-ctrader",
+        "ex-ctrader-zero",
+        "ex-ctrader-neg",
+    }
+    # The nullable rebuild and the sign conversion compose: the legacy negative charge survives
+    # the table rebuild and becomes a positive cost.
+    assert commissions["ex-ctrader-neg"] == 3.5
     # The 0.0 on an Alpaca crypto row was always the hard-coded fallback, never a stated fee.
     assert commissions["ex-crypto"] is None
     assert commissions["ex-equity"] == 0.0, "an equity 0.0 is a known zero and stays"
@@ -1676,11 +1687,18 @@ def test_alpaca_symbol_classification(symbol, expected):
         ("BTCUSD", ("BTC", "USD")),
         ("SOLUSDT", ("SOL", "USDT")),
         ("ETHBTC", ("ETH", "BTC")),
+        ("BTC-USD", ("BTC", "USD")),
+        ("eth-usdt", ("ETH", "USDT")),
+        ("BRK-B", None),
+        ("BF-B", None),
+        ("BTC-EUR", None),
+        ("BT-USD", None),
+        ("BTC-USD-X", None),
         ("AAPL", None),
         ("AAPL261120C00200000", None),
     ],
 )
-def test_split_crypto_pair_accepts_both_spellings(symbol, pair):
+def test_split_crypto_pair_accepts_every_spelling(symbol, pair):
     from shared.alpaca_symbols import split_crypto_pair
 
     assert split_crypto_pair(symbol) == pair
@@ -1688,6 +1706,18 @@ def test_split_crypto_pair_accepts_both_spellings(symbol, pair):
 
 def test_backfill_prices_a_crypto_signal_stored_without_a_slash(db):
     signal, order_id = _crypto_fill(db, label="no-slash", symbol="BTCUSD")
+    client = FakeActivitiesClient(
+        fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT)],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 1
+    assert _commission(db, signal) == [pytest.approx(75.0)]
+
+
+def test_backfill_prices_a_crypto_signal_stored_with_a_hyphen(db):
+    # The broker reports BTC/USD; the local signal row carries the hyphen spelling.
+    signal, order_id = _crypto_fill(db, label="hyphen", symbol="BTC-USD")
     client = FakeActivitiesClient(
         fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT)],
         cfees=[_cfee(qty="-0.00125")],
@@ -2329,3 +2359,216 @@ def test_plan_refuses_a_zero_quantity_local_order_without_aborting_the_pass():
     (plan,) = plans
     assert plan.problem is not None and "no positive recorded quantity" in plan.problem
     assert plan.commissions == {}
+
+
+# ── a fill is never stored with an invented time (audit of #135) ────────────────────────────────
+
+ORDER_FILLED_AT = datetime(2026, 11, 3, 15, 5, tzinfo=timezone.utc)
+ORDER_UPDATED_AT = datetime(2026, 11, 3, 15, 6, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("bad_stamp", [None, "", "not-a-time", 12345])
+def test_stream_fill_without_a_usable_event_timestamp_uses_the_orders_filled_at(
+    monkeypatch, bad_stamp
+):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id(f"ts-filled-at-{bad_stamp}"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.timestamp = bad_stamp
+    update.order.filled_at = ORDER_FILLED_AT
+    update.order.updated_at = ORDER_UPDATED_AT
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert [row.timestamp for row in saved] == [ORDER_FILLED_AT]
+
+
+def test_stream_fill_falls_back_to_updated_at_when_the_order_has_no_filled_at(monkeypatch):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-updated-at"),
+        asset_class="us_equity",
+        symbol="AAPL",
+        event="partial_fill",
+    )
+    update.timestamp = None
+    update.order.filled_at = None
+    update.order.updated_at = "2026-11-03T15:06:00Z"
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert [row.timestamp for row in saved] == [ORDER_UPDATED_AT]
+
+
+def test_stream_fill_with_no_time_anywhere_is_not_stored_with_now(monkeypatch, live_runner_logs):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-nowhere"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.timestamp = None
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert saved == [], "a fill with an execution id but no time must not get a wall-clock time"
+    assert any("timestamp" in record.getMessage() for record in live_runner_logs.records)
+
+
+def test_stream_fill_keeps_its_own_timestamp_and_dedupe_key(monkeypatch):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-own"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.order.filled_at = ORDER_FILLED_AT
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert saved[0].timestamp == update.timestamp
+    assert saved[0].dedupe_key == f"alpaca:exec:{update.execution_id}"
+
+
+def test_a_stamped_offset_is_stored_as_its_utc_instant(db):
+    # `live_executions.timestamp` is a naive SQLite wall time, so the broker stamp must be
+    # converted to UTC, not stored verbatim: a +02:00 fill written at 17:05 would be ordered
+    # two hours late in PnL, and one at 01:05+02:00 would land on the wrong day.
+    signal = _signal(db)
+    order = _order(
+        signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-offset")
+    )
+    order.filled_at = "2026-11-03T17:05:00+02:00"
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
+
+    assert [row.timestamp for row in _rows(db, signal)] == [ORDER_FILLED_AT.replace(tzinfo=None)]
+
+
+def test_a_stream_fill_stamped_with_another_offset_is_converted_to_utc(monkeypatch):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-offset"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.timestamp = "2026-11-03T17:05:00+02:00"
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert len(saved) == 1
+    assert saved[0].timestamp == ORDER_FILLED_AT, "the event stamp wins, converted to UTC"
+
+
+def test_reconcile_uses_updated_at_when_the_order_has_no_filled_at(db):
+    signal = _signal(db)
+    order = _order(signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-upd"))
+    order.filled_at = None
+    order.updated_at = ORDER_UPDATED_AT
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 1
+
+    assert [row.timestamp for row in _rows(db, signal)] == [ORDER_UPDATED_AT.replace(tzinfo=None)]
+
+
+def test_reconcile_with_no_order_time_persists_nothing_then_retries(db, live_runner_logs):
+    signal = _signal(db)
+    order = _order(signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-none"))
+    order.filled_at = None
+    adapter = _adapter(order)
+
+    assert asyncio.run(adapter.reconcile_executions()) == 0
+    assert _rows(db, signal) == [], "a fill without a broker time must not be stored with now()"
+    assert any("updated_at" in record.getMessage() for record in live_runner_logs.records)
+
+    order.filled_at = ORDER_FILLED_AT
+    assert asyncio.run(adapter.reconcile_executions()) == 1
+    assert [row.timestamp for row in _rows(db, signal)] == [ORDER_FILLED_AT.replace(tzinfo=None)]
+
+
+def test_stream_refusal_logs_the_quantity_that_was_not_stored(monkeypatch, live_runner_logs):
+    saved = _stream_capture(monkeypatch)
+    update = _trade_update(
+        signal_id=str(uuid4()),
+        order_id=_order_id("ts-nowhere-qty"),
+        asset_class="us_equity",
+        symbol="AAPL",
+    )
+    update.timestamp = None
+
+    asyncio.run(_adapter(None)._on_trade_update(update))
+
+    assert saved == []
+    refusals = [
+        record
+        for record in live_runner_logs.records
+        if "no execution row was stored" in record.getMessage()
+    ]
+    assert len(refusals) == 1
+    data = refusals[0].data
+    assert data["filled_qty"] == pytest.approx(float(update.qty))
+    assert data["broker_cumulative_filled_qty"] == pytest.approx(float(update.order.filled_qty))
+    assert "adapter connect" in refusals[0].getMessage(), (
+        "the refusal must say the retry is the next connect: the Alpaca adapter runs "
+        "reconcile_executions on connect only, with no periodic pass to promise"
+    )
+
+
+def test_reconcile_refusal_names_the_connect_that_retries_it(db, live_runner_logs):
+    signal = _signal(db)
+    order = _order(
+        signal, filled_qty="5", filled_avg_price="101.5", order_id=_order_id("rec-connect")
+    )
+    order.filled_at = None
+
+    assert asyncio.run(_adapter(order).reconcile_executions()) == 0
+    assert _rows(db, signal) == []
+    refusals = [
+        record for record in live_runner_logs.records if "updated_at" in record.getMessage()
+    ]
+    assert len(refusals) == 1
+    assert "adapter connect" in refusals[0].getMessage(), (
+        "Alpaca has no reconciliation timer (cTrader does): the log must not promise a pass"
+    )
+
+
+@pytest.mark.parametrize(
+    "date_only",
+    ["2026-11-03", "20261103", "2026-11-03T", "2026-W45", datetime(2026, 11, 3).date()],
+)
+def test_a_date_without_a_time_of_day_is_not_a_fill_timestamp(date_only):
+    from live_runner.alpaca_adapter import _broker_fill_timestamp
+
+    assert _broker_fill_timestamp(date_only) is None
+    assert _broker_fill_timestamp(date_only, "2026-11-03T15:05:00Z") == ORDER_FILLED_AT
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("BTC-USD", "crypto"),
+        ("ETH-USDT", "crypto"),
+        ("BRK-B", "us_equity"),
+        ("BF-B", "us_equity"),
+        ("BTC-EUR", "unknown"),
+    ],
+)
+def test_hyphen_symbols_classify_like_their_slash_spelling(symbol, expected):
+    from shared.alpaca_symbols import classify_alpaca_symbol
+
+    assert classify_alpaca_symbol(symbol) == expected
+
+
+@pytest.mark.parametrize("symbol", ["BTC-USD", "BTC/USD", "btcusd"])
+def test_crypto_pair_key_is_one_key_for_every_spelling(symbol):
+    from shared.alpaca_symbols import crypto_pair_key
+
+    assert crypto_pair_key(symbol) == "BTCUSD"

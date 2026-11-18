@@ -1194,6 +1194,11 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         numeric = float(value)
     except (TypeError, ValueError):
         return default
+    except OverflowError:
+        # A JSON integer outside float64 range (a corrupt artifact), not a
+        # number this platform can price: absence, like any other unreadable
+        # value, never a crash on the endpoint that serves it.
+        return default
     if not math.isfinite(numeric):
         return default
     return numeric
@@ -1450,7 +1455,15 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
 
     cagr_value = _defined_stat_value(raw, "cagr")
     stats = {
-        "net_profit": round(net_total, 2) if result.trades else raw.get("total_pnl", 0),
+        # Same rule as `avg_trade_pnl` below: a no-trade run's net profit comes
+        # from the persisted `total_pnl`, which is null when the curve's
+        # terminating point is unreadable (ruined) - `raw.get` would copy a NaN
+        # or a null straight into a payload the JSON response cannot render.
+        "net_profit": (
+            round(net_total, 2)
+            if result.trades
+            else _safe_float(raw.get("total_pnl"), 0.0)
+        ),
         "net_profit_pct": round(
             (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
             / (result.meta.initial_capital or 100000)
@@ -1463,7 +1476,11 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "sharpe": _defined_stat_value(raw, "sharpe_ratio"),
         "sortino": _defined_stat_value(raw, "sortino_ratio"),
         "calmar": _defined_stat_value(raw, "calmar_ratio"),
-        "max_drawdown_pct": round(raw.get("max_drawdown_pct", 0) * 100, 2),
+        # A non-finite/undefined drawdown (a ruined run whose terminating equity
+        # point is unreadable or NaN, see runner/stats.py) must not reach the
+        # response as NaN: `JSONResponse` refuses it, so the page would 500 one
+        # field after the fix. It resolves to 0.0 like the other absent figures.
+        "max_drawdown_pct": round(_safe_float(raw.get("max_drawdown_pct"), 0.0) * 100, 2),
         "win_rate": round(
             (win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)) * 100,
             1,

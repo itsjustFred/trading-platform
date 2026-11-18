@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import re
+import sys
 import traceback
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -19,6 +20,8 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.credential_env import overlay_process_env, read_accounts_env_file
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
+from live_runner.promotion import enforce_promotion_gate, is_real_money
+from runner.promotion_gate import StrategyNotPromotedError
 from shared.logging import get_logger, route_console_logs_to_stderr
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -48,6 +51,8 @@ class LivePreflightResult:
     accounts: list[LivePreflightAccountResult]
     deployment_errors: list[str] = field(default_factory=list)
     deployment_warnings: list[str] = field(default_factory=list)
+    #: Read-only check of the ACTIVE DB deployments the daemon trades (None when not requested).
+    db_deployments: dict[str, Any] | None = None
 
 
 def _accounts_env_views(accounts_env: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -132,11 +137,71 @@ def _resolve_ctrader_credentials(
     return app_id, app_secret, access_token, refresh_token, demo
 
 
+def _release_twisted_reactor_threads() -> None:
+    """Stop the Twisted reactor's thread pool so the process can exit.
+
+    The cTrader adapter starts the asyncio-backed Twisted reactor with
+    ``startRunning`` and never stops it (the daemon owns it for the process
+    lifetime). Twisted resolves the broker host name through its reactor thread
+    pool, whose worker threads are not daemon threads and are only stopped by
+    the reactor's shutdown event. Without this, a preflight that connected to
+    cTrader printed its result and then hung forever in interpreter shutdown.
+    """
+    # ``installReactor`` stores the reactor instance under this key, so membership
+    # means "a reactor was installed"; importing it here cannot install a new one.
+    if "twisted.internet.reactor" not in sys.modules:
+        return
+    from twisted.internet import reactor
+
+    if getattr(reactor, "threadpool", None) is None:
+        return
+    stop_thread_pool = getattr(reactor, "_stopThreadPool", None)
+    if callable(stop_thread_pool):
+        # The reactor's own shutdown-trigger handler: removes its triggers and
+        # joins the workers. Shutdown never fires here, so it is called directly.
+        stop_thread_pool()
+    else:
+        logger.warning(
+            "Twisted reactor has a thread pool but no _stopThreadPool handler; "
+            "the process may hang at exit. The Twisted private API likely changed."
+        )
+
+
+@contextlib.contextmanager
+def _connectivity_event_loop(enabled: bool) -> Iterator[asyncio.AbstractEventLoop | None]:
+    """One event loop for every account's connectivity check.
+
+    The Twisted reactor binds to the first asyncio loop it is installed on.
+    With one ``asyncio.run`` per account, every cTrader account after the
+    first talked to a closed loop and timed out, so a config with two cTrader
+    accounts always failed preflight for the second one.
+    """
+    if not enabled:
+        yield None
+        return
+    loop = asyncio.new_event_loop()
+    try:
+        yield loop
+    finally:
+        try:
+            _release_twisted_reactor_threads()
+        except Exception:
+            logger.warning(
+                "Releasing Twisted reactor threads failed; the process may hang at exit",
+                exc_info=True,
+            )
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
 def _run_broker_connectivity_check(
     adapter: AlpacaLiveAdapter | CTraderLiveAdapter,
     *,
     broker_label: str,
     errors: list[str],
+    env_values: Mapping[str, str],
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool, float | None, float | None, int | None]:
     connected = False
     balance: float | None = None
@@ -156,9 +221,18 @@ def _run_broker_connectivity_check(
                 await adapter.disconnect()
 
     try:
-        balance, equity, positions_count = asyncio.run(_check())
+        if loop is None:
+            balance, equity, positions_count = asyncio.run(_check())
+        else:
+            balance, equity, positions_count = loop.run_until_complete(_check())
     except Exception as exc:
-        errors.append(f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}")
+        # Broker error text can quote credential values; redact like every other path.
+        errors.append(
+            _redact_values(
+                f"{broker_label} connectivity check failed: {type(exc).__name__}: {exc}",
+                env_values,
+            )
+        )
     return connected, balance, equity, positions_count
 
 
@@ -169,6 +243,7 @@ def _preflight_alpaca_account(
     check_connectivity: bool,
     errors: list[str],
     warnings: list[str],
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool | None, bool | None, float | None, float | None, int | None]:
     credentials = resolve_alpaca_credentials(
         account_id=account.id,
@@ -200,6 +275,8 @@ def _preflight_alpaca_account(
                 adapter,
                 broker_label="Alpaca",
                 errors=errors,
+                env_values=env_values,
+                loop=loop,
             )
     return paper, connected, balance, equity, positions_count
 
@@ -238,6 +315,7 @@ def _preflight_ctrader_account(
     accounts_env_path: Path,
     errors: list[str],
     warnings: list[str],
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> tuple[bool | None, bool | None, float | None, float | None, int | None]:
     credentials = _ctrader_preflight_credentials(env_values, errors)
     demo: bool | None = None
@@ -284,6 +362,8 @@ def _preflight_ctrader_account(
             adapter,
             broker_label="cTrader",
             errors=errors,
+            env_values=env_values,
+            loop=loop,
         )
     return demo, connected, balance, equity, positions_count
 
@@ -294,6 +374,7 @@ def _preflight_account(
     env_values: Mapping[str, str],
     check_connectivity: bool,
     accounts_env_path: Path,
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> LivePreflightAccountResult:
     errors: list[str] = []
     warnings: list[str] = []
@@ -317,6 +398,7 @@ def _preflight_account(
             check_connectivity=check_connectivity,
             errors=errors,
             warnings=warnings,
+            loop=loop,
         )
 
     elif account.broker == "ctrader":
@@ -333,6 +415,7 @@ def _preflight_account(
             accounts_env_path=accounts_env_path,
             errors=errors,
             warnings=warnings,
+            loop=loop,
         )
 
     return LivePreflightAccountResult(
@@ -348,6 +431,17 @@ def _preflight_account(
         errors=errors,
         warnings=warnings,
     )
+
+
+def _account_result_is_real_money(result: LivePreflightAccountResult) -> bool:
+    """Real money unless preflight resolved the account to paper/demo mode.
+
+    Uses the mode preflight itself resolved from the credentials (Alpaca
+    ``paper``, cTrader ``demo``). An account whose mode could not be resolved
+    (missing credentials) is real money.
+    """
+    resolved_demo = result.paper if result.broker == "alpaca" else result.demo
+    return is_real_money(resolved_demo)
 
 
 def _validate_deployments(
@@ -372,6 +466,37 @@ def _validate_deployments(
                 warnings.append(f"{label}: Discord deployment has no channel_id in signal_config.")
 
     return errors, warnings
+
+
+def _promotion_gate_errors(
+    deployments: Sequence[LiveDeploymentConfig],
+    account_results: Sequence[LivePreflightAccountResult],
+    *,
+    strategies_dir: Path | None = None,
+) -> list[str]:
+    """Promotion gate (#165) for every deployment of the config.
+
+    A deployment on an account that preflight did not resolve to paper/demo
+    mode must be promoted to production. A deployment that references an
+    account the config does not define is skipped here: `_validate_deployments`
+    already fails the preflight for it, and there is no account to judge.
+    """
+    results_by_account = {result.account_id: result for result in account_results}
+    errors: list[str] = []
+    for deployment in deployments:
+        account_result = results_by_account.get(deployment.account_id)
+        if account_result is None:
+            continue
+        try:
+            enforce_promotion_gate(
+                deployment,
+                real_money=_account_result_is_real_money(account_result),
+                strategies_dir=strategies_dir,
+            )
+        except StrategyNotPromotedError as exc:
+            errors.append(f"{deployment.strategy_name} ({deployment.account_id}): {exc}")
+    return errors
+
 
 
 # A resolved value this short is treated as a non-secret: redacting it would mangle
@@ -486,6 +611,8 @@ def run_live_preflight(
     accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
     env: Mapping[str, str] | None = None,
     check_connectivity: bool = False,
+    check_db: bool = False,
+    db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
     accounts_env = Path(accounts_env_path)
@@ -525,12 +652,27 @@ def run_live_preflight(
             "Live deployment config invalid",
             extra={"data": {"config_path": str(config), "error": message}},
         )
+        db_report: dict[str, Any] | None = None
+        if check_db:
+            # The YAML is unparseable, so there is nothing to diff the ACTIVE rows against.
+            # Report the miss rather than leaving db_deployments None, which has to keep
+            # meaning "not requested": an inspection that never ran is not a clean one.
+            from live_runner.preflight_db import db_check_skipped_report
+
+            db_report = asdict(
+                db_check_skipped_report(
+                    "The deployment config is invalid, so the ACTIVE DB deployments were "
+                    "not checked.",
+                    db_path=db_path,
+                )
+            )
         return LivePreflightResult(
             ok=False,
             config_path=str(config),
             accounts_env_path=str(accounts_env),
             accounts=[],
             deployment_errors=[message],
+            db_deployments=db_report,
         )
     logger.info(
         "Running live preflight",
@@ -543,18 +685,31 @@ def run_live_preflight(
         },
     )
 
-    account_results = [
-        _preflight_account(
-            account,
-            env_values=env_values,
-            check_connectivity=check_connectivity,
-            accounts_env_path=accounts_env,
-        )
-        for account in accounts
-    ]
+    with _connectivity_event_loop(check_connectivity) as loop:
+        account_results = [
+            _preflight_account(
+                account,
+                env_values=env_values,
+                check_connectivity=check_connectivity,
+                accounts_env_path=accounts_env,
+                loop=loop,
+            )
+            for account in accounts
+        ]
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
+    deployment_errors.extend(_promotion_gate_errors(deployments, account_results))
 
-    ok = all(result.ok for result in account_results) and not deployment_errors
+    db_report: dict[str, Any] | None = None
+    if check_db:
+        from live_runner.preflight_db import run_db_preflight
+
+        db_report = asdict(run_db_preflight(deployments, db_path=db_path))
+
+    ok = (
+        all(result.ok for result in account_results)
+        and not deployment_errors
+        and not (db_report and db_report["errors"])
+    )
     return LivePreflightResult(
         ok=ok,
         config_path=str(config),
@@ -562,6 +717,7 @@ def run_live_preflight(
         accounts=account_results,
         deployment_errors=deployment_errors,
         deployment_warnings=deployment_warnings,
+        db_deployments=db_report,
     )
 
 
@@ -622,7 +778,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Connect to brokers and read balance/positions without placing orders.",
     )
+    parser.add_argument(
+        "--check-db",
+        action="store_true",
+        help=(
+            "Also validate the ACTIVE deployments in the daemon's database (read-only) and "
+            "report how they differ from the YAML."
+        ),
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help=(
+            "SQLite file to check (default: DATABASE_URL or DATA_DIR/backtests.db). Giving it "
+            "implies --check-db."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.db_path is not None:
+        # A named database is a request to validate it; ignoring the flag would print the same
+        # green document as a run that never looked at the DB.
+        args.check_db = True
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
@@ -631,6 +807,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.config,
             accounts_env_path=args.accounts_env,
             check_connectivity=args.check_connectivity,
+            check_db=args.check_db,
+            db_path=args.db_path,
         )
     except Exception as exc:
         # An unhandled failure (e.g. missing or malformed config) must still honour
@@ -646,12 +824,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             crash_log,
             extra={"data": {"config_path": str(args.config)}},
         )
+        db_report: dict[str, Any] | None = None
+        if args.check_db:
+            # The crash came before the DB was read: a requested check that never ran must say
+            # so, not leave db_deployments null (which means "not requested").
+            from live_runner.preflight_db import db_check_skipped_report
+
+            db_report = asdict(
+                db_check_skipped_report(
+                    "Live preflight crashed before the ACTIVE DB deployments were checked.",
+                    db_path=args.db_path,
+                )
+            )
         result = LivePreflightResult(
             ok=False,
             config_path=str(args.config),
             accounts_env_path=str(args.accounts_env),
             accounts=[],
             deployment_errors=[_crash_message(exc, redact=redact)],
+            db_deployments=db_report,
         )
     print(json.dumps(_result_to_jsonable(result), indent=2, sort_keys=True))
     return 0 if result.ok else 1

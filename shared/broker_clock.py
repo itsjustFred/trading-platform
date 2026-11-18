@@ -36,11 +36,17 @@ The conversion produces *naive* server wall-clock timestamps. pandas does not
 reliably accept a custom ``tzinfo`` for vectorised conversion, and a broker
 clock is not a civil time zone anyway; naive wall time is what MT5 itself
 reports (``TimeCurrent()`` carries no zone).
+
+:meth:`BrokerClock.to_utc` goes the other way, for times a broker printed on its
+own clock (tester reports, logs). It is the single place that answers "which UTC
+instant is 16:30 server time on this date", so no caller has to restate the
+epochs or pick an IANA zone that only matches one of them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -121,6 +127,53 @@ class BrokerClock:
         offsets = self.offset_hours(utc)
         return utc.tz_localize(None) + pd.to_timedelta(offsets, unit="h")
 
+    def to_utc(self, timestamps) -> pd.DatetimeIndex:
+        """UTC instants for naive *server wall-clock* ``timestamps``.
+
+        The inverse of :meth:`to_server_time`, for reading times that a broker
+        reported on its own clock (MT5 tester reports and logs print
+        ``TimeCurrent()``, i.e. server wall time, with no zone attached).
+
+        A wall time can be shown twice (an offset step back, e.g. the
+        autumn-2024 late switch on 2024-11-10) or not at all (a step forward,
+        e.g. 2024-04-06 02:00-03:00).  The first occurrence is returned for a
+        repeated hour; a wall time the clock skipped raises ``ValueError``
+        rather than being silently nudged onto a neighbouring instant.
+        """
+        server = _to_server_index(timestamps)
+        result = np.full(len(server), np.datetime64("NaT", "ns"), dtype="datetime64[ns]")
+        unresolved = ~server.isna()
+        for offset in self._possible_offsets(server):
+            if not unresolved.any():
+                break
+            candidate = server - pd.Timedelta(hours=offset)
+            consistent = self.offset_hours(candidate.tz_localize("UTC")) == offset
+            take = consistent & unresolved
+            if take.any():
+                result[take] = candidate[take].to_numpy()
+                unresolved &= ~take
+        if unresolved.any():
+            first = server[unresolved][0]
+            raise ValueError(
+                f"broker clock {self.name!r} never shows the server wall time "
+                f"{first.isoformat(sep=' ')}: the clock skips that hour at a UTC-offset change"
+            )
+        return pd.DatetimeIndex(result, tz="UTC")
+
+    def _possible_offsets(self, server: pd.DatetimeIndex) -> list[float]:
+        """Every server-minus-UTC offset this clock can have in ``server``'s years."""
+        years = tuple(sorted({int(year) for year in pd.DatetimeIndex(server.dropna()).year}))
+        offsets: set[float] = set()
+        for segment in self.segments:
+            if segment.reference_zone.upper() == "UTC":
+                offsets.add(float(segment.shift_hours))
+                continue
+            for base in _reference_zone_offsets(segment.reference_zone, years):
+                offsets.add(base + segment.shift_hours)
+        # Largest offset first: it yields the earliest UTC instant, so the first
+        # consistent candidate is the first occurrence of a repeated server hour.
+        return sorted(offsets, reverse=True)
+
     def weekend_d1_bars(self, timestamps) -> np.ndarray:
         """Whether the broker's D1 history carries weekend bars at each UTC timestamp."""
         utc = _to_utc_index(timestamps)
@@ -139,6 +192,26 @@ def _to_utc_index(timestamps) -> pd.DatetimeIndex:
     index = pd.DatetimeIndex(pd.to_datetime(timestamps, utc=True, errors="coerce"))
     # Nanosecond resolution so that ``asi8`` compares like for like with the segment bounds.
     return index.as_unit("ns")
+
+
+def _to_server_index(timestamps) -> pd.DatetimeIndex:
+    index = pd.DatetimeIndex(pd.to_datetime(timestamps, errors="coerce")).as_unit("ns")
+    if index.tz is not None:
+        raise ValueError(
+            "server wall time carries no zone: pass naive timestamps to BrokerClock.to_utc"
+        )
+    return index
+
+
+@lru_cache(maxsize=None)
+def _reference_zone_offsets(zone: str, years: tuple[int, ...]) -> tuple[float, ...]:
+    """UTC offsets ``zone`` can take in ``years``, probed mid-winter and mid-summer."""
+    offsets: set[float] = set()
+    for year in years:
+        for month in (1, 7):
+            probe = pd.Timestamp(f"{year:04d}-{month:02d}-01 12:00", tz=zone)
+            offsets.add(probe.utcoffset().total_seconds() / 3600.0)
+    return tuple(sorted(offsets))
 
 
 def _utc(value: str) -> pd.Timestamp:

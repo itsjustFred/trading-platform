@@ -37,6 +37,7 @@ from sqlmodel.sql.expression import SelectOfScalar
 
 from shared.alpaca_symbols import classify_alpaca_symbol
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
+from shared.constants import normalize_symbols
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
@@ -70,6 +71,14 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
+from shared.trailing import validate_live_deployment_trailing_override
+
+
+def _deployment_trailing_timeframe(deployment: Any) -> str:
+    """The timeframe a deployment signals on (signal_config override, else its own)."""
+    configured = (deployment.signal_config or {}).get("timeframe")
+    return str(configured or deployment.timeframe or "").strip()
+
 
 logger = get_logger("database")
 
@@ -933,11 +942,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             source_type = "discord"
         source_name = source_name if source_name in {"internal", "discord"} else source_type
         source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = [
-            str(symbol).strip().upper()
-            for symbol in (deployment.symbol_filter or [])
-            if str(symbol).strip()
-        ]
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         return cls(
             id=str(deployment.id),
             strategy_name=deployment.strategy_name,
@@ -978,11 +983,7 @@ class LiveDeploymentModel(SQLModel, table=True):
                     source_type if source_type in {"internal", "discord"} else "internal"
                 ),
                 "signal_source_id": str(self.signal_source_id or "").strip() or None,
-                "symbol_filter": [
-                    str(symbol).strip().upper()
-                    for symbol in (self.symbol_filter_json or [])
-                    if str(symbol).strip()
-                ],
+                "symbol_filter": normalize_symbols(self.symbol_filter_json),
                 "signal_source": (
                     source_name if source_name in {"internal", "discord"} else "internal"
                 ),
@@ -1842,9 +1843,9 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
     the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
 
     The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
-    NULL on every Alpaca row whose zero is not a provable known zero: crypto in either spelling
-    (``BTC/USD``, ``BTCUSD``), an orphan whose signal, deployment or account row is missing (its
-    broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
+    NULL on every Alpaca row whose zero is not a provable known zero: crypto in any accepted
+    spelling (``BTC/USD``, ``BTC-USD``, ``BTCUSD``), an orphan whose signal, deployment or account
+    row is missing (its broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
     (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
     ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
     stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
@@ -1949,6 +1950,69 @@ def _make_live_executions_commission_nullable(connection: Connection) -> bool:
         "hard-coded 0.0 commission and are now NULL (unknown), crypto until its CFEE is "
         "backfilled",
         unfaked,
+    )
+    return True
+
+
+_CTRADER_COMMISSION_COST_MIGRATION = "ctrader_commission_positive_cost_v1"
+
+
+def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
+    """Convert existing cTrader ``live_executions.commission`` rows to a positive cost (#205).
+
+    Before the sign fix, cTrader rows stored ``ProtoOADeal.commission`` raw: a charge is a NEGATIVE
+    cash flow. The convention is now a positive cost for every broker (net = gross - commission), so
+    each cTrader row becomes ``abs`` of its stored value (maintainer decision 2026-11-16). Only
+    accounts whose broker is ``ctrader`` are touched, NULL (unknown) and zero stay as they are, and
+    a row whose broker cannot be determined (orphan) is left alone.
+
+    ``abs`` is not safe to repeat blindly once the fixed adapter runs: a rebate is stored as a
+    NEGATIVE cost and a second pass would turn it into a charge. So the conversion is recorded in
+    ``schema_data_migrations`` and runs exactly once; ``init_db`` runs on every process start.
+
+    Returns True when the conversion ran. No-ops when it is already recorded.
+    """
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS schema_data_migrations ("
+            "name TEXT NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+    )
+    already_applied = connection.execute(
+        text("SELECT 1 FROM schema_data_migrations WHERE name = :name"),
+        {"name": _CTRADER_COMMISSION_COST_MIGRATION},
+    ).first()
+    if already_applied is not None:
+        return False
+
+    converted = 0
+    # Recorded even when the table is absent: a table created later only ever holds rows from the
+    # fixed adapter, and a converting re-run would turn their rebates into charges.
+    if _table_column_names(connection, "live_executions"):
+        converted = int(
+            connection.execute(
+                text(
+                    "UPDATE live_executions SET commission = abs(commission) "
+                    "WHERE commission < 0 AND signal_id IN ("
+                    "SELECT s.id FROM live_signals s "
+                    "JOIN live_deployments d ON d.id = s.deployment_id "
+                    "JOIN live_accounts a ON a.id = d.account_id "
+                    "WHERE lower(a.broker) = 'ctrader')"
+                )
+            ).rowcount
+            or 0
+        )
+    connection.execute(
+        text("INSERT INTO schema_data_migrations (name, applied_at) VALUES (:name, :now)"),
+        {
+            "name": _CTRADER_COMMISSION_COST_MIGRATION,
+            "now": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info(
+        "Converted %s cTrader live_executions commission(s) from the raw broker sign to a "
+        "positive cost",
+        converted,
     )
     return True
 
@@ -2370,6 +2434,9 @@ def _migrate_schema() -> None:
         _add_live_executions_actual_price_observed(connection)
         # Last: the rebuild copies every column, so the additive ones must already exist.
         _make_live_executions_commission_nullable(connection)
+        # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
+        # sign the rows hold, so the order is not load-bearing.
+        _migrate_ctrader_commission_to_cost(connection)
 
 
 def _find_existing_live_signal(
@@ -2416,6 +2483,13 @@ def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
     return [str(item).strip() for item in raw if str(item).strip()]
 
 
+def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
+    """Log the one duplicate shape that needs no ledger change (shared by both skip paths)."""
+    logger.info(
+        "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
+    )
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2425,10 +2499,20 @@ def _reconcile_existing_live_signal(
     broker order id carried by the duplicate in the conflict list
     (``conflicting_broker_order_ids``) instead of replacing the tracked id.
     """
-    # Reconcile broker_order_id: if existing lacks it but new record has it, update
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
-    if new_broker_id and not existing_broker_id:
+    if not new_broker_id or new_broker_id == existing_broker_id:
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # Either a backfill (the stored row has no id) or a conflict (it has a different one). Both
+    # are read-modify-writes on state this session may have loaded before a concurrent duplicate
+    # committed, so take the write lock and re-read before deciding. Without it two redeliveries
+    # with different ids on an empty tracked id would both backfill from a stale empty copy and
+    # the loser's id would land nowhere: a live broker order the ledger never tracks.
+    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    session.refresh(existing)
+    existing_broker_id = (existing.broker_order_id or "").strip()
+    if not existing_broker_id:
         existing.broker_order_id = new_broker_id
         # Also update metadata_json for consistency
         metadata = dict(existing.metadata_json or {})
@@ -2440,37 +2524,33 @@ def _reconcile_existing_live_signal(
             "Updated existing live signal with broker_order_id (discord_message_id=%s)",
             record.discord_message_id,
         )
-    elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
-        # A second, different broker order id for one logical signal: either a second broker
-        # order was placed or the ids were mapped wrongly. Either way a broker order may exist
-        # that the ledger does not track. The stored id is kept (never overwritten), but the
-        # conflicting id is persisted on the signal so operators and reconciliation can find
-        # and resolve it instead of it living only in a log line (issue #126).
-        # Take the write lock before reading the list: the copy loaded earlier in this session
-        # may be stale, and a concurrent duplicate must not commit between our read and write.
-        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        session.refresh(existing)
-        metadata = dict(existing.metadata_json or {})
-        conflicts = _conflicting_broker_order_ids(metadata)
-        if new_broker_id not in conflicts:
-            conflicts.append(new_broker_id)
-            metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
-            existing.metadata_json = metadata
-            session.add(existing)
-        # Ends the write transaction opened above; a no-op commit when nothing changed.
-        session.commit()
-        logger.error(
-            "Conflicting broker_order_id for duplicate live signal: an untracked broker "
-            "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
-            existing.id,
-            existing_broker_id,
-            new_broker_id,
-        )
         return
-    else:
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
-        )
+    if new_broker_id == existing_broker_id:
+        # A concurrent duplicate already stored this very id; ends the lock taken above.
+        session.commit()
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # A second, different broker order id for one logical signal: either a second broker
+    # order was placed or the ids were mapped wrongly. Either way a broker order may exist
+    # that the ledger does not track. The stored id is kept (never overwritten), but the
+    # conflicting id is persisted on the signal so operators and reconciliation can find
+    # and resolve it instead of it living only in a log line (issue #126).
+    metadata = dict(existing.metadata_json or {})
+    conflicts = _conflicting_broker_order_ids(metadata)
+    if new_broker_id not in conflicts:
+        conflicts.append(new_broker_id)
+        metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
+        existing.metadata_json = metadata
+        session.add(existing)
+    # Ends the write transaction opened above; a no-op commit when nothing changed.
+    session.commit()
+    logger.error(
+        "Conflicting broker_order_id for duplicate live signal: an untracked broker "
+        "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
+        existing.id,
+        existing_broker_id,
+        new_broker_id,
+    )
 
 
 def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
@@ -3339,6 +3419,96 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
     return metadata
 
 
+#: Page size for the newest-first scan in
+#: :func:`find_latest_filled_live_entry_signals`. The entry signal of an open
+#: position is normally the newest or second-newest filled signal of its symbol.
+_ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
+
+
+def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    return bool(metadata.get("exit_only")) or (
+        str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
+    )
+
+
+def find_latest_filled_live_entry_signals(
+    deployment_ids: list[str],
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Newest filled *entry* signal per symbol among the given deployments.
+
+    This is the persisted half of live trailing-stop state (issue #167): the
+    signal that opened a broker position carries the trailing config
+    (``metadata["trailing_sl_config"]``) the position must be trailed with, so
+    a restarted daemon recovers it from here instead of from process memory.
+
+    - Only signals with at least one persisted fill count: a later signal that
+      was refused or never filled must not displace the one whose position is
+      actually open.
+    - Exit-only signals are skipped: a partial close must not end the trail of
+      the remaining position. Whether a position is still open is the broker's
+      truth and is checked by the caller.
+
+    Returns ``{SYMBOL: {signal_id, deployment_id, symbol, action, timestamp,
+    metadata}}`` (symbol upper-cased, timestamp tz-aware UTC). Symbols without
+    a filled entry signal are absent.
+    """
+    normalized_ids = sorted({str(item).strip() for item in deployment_ids if str(item).strip()})
+    normalized_symbols = sorted(
+        {str(item).strip().upper() for item in symbols if str(item).strip()}
+    )
+    if not normalized_ids or not normalized_symbols:
+        return {}
+
+    init_db()
+    found: dict[str, dict[str, Any]] = {}
+    with get_session() as session:
+        for symbol in normalized_symbols:
+            entry = _newest_filled_entry_signal(session, normalized_ids, symbol)
+            if entry is not None:
+                found[symbol] = entry
+    return found
+
+
+def _newest_filled_entry_signal(
+    session: Any, deployment_ids: list[str], symbol: str
+) -> dict[str, Any] | None:
+    has_fill = (
+        select(LiveExecutionModel.id)
+        .where(LiveExecutionModel.signal_id == LiveSignalModel.id)
+        .where(LiveExecutionModel.filled_qty > 0)
+        .exists()
+    )
+    statement = (
+        select(LiveSignalModel)
+        .where(LiveSignalModel.deployment_id.in_(deployment_ids))
+        .where(func.upper(LiveSignalModel.symbol) == symbol)
+        .where(has_fill)
+        .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+    )
+    offset = 0
+    while True:
+        rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
+        for row in rows:
+            metadata = dict(row.metadata_json or {})
+            if _is_exit_only_signal_metadata(metadata):
+                continue
+            timestamp = row.timestamp
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": symbol,
+                "action": str(row.action or "").strip().lower(),
+                "timestamp": timestamp.astimezone(timezone.utc),
+                "metadata": metadata,
+            }
+        if not rows:
+            return None
+        offset += len(rows)
+
+
 def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
     """Signals whose duplicate delivery carried a different broker order id.
 
@@ -3907,18 +4077,14 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
     return signal_source_type, signal_source
 
 
-def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
-    """Uppercase stripped symbol entries, dropping blanks."""
-    return [
-        str(symbol).strip().upper()
-        for symbol in (symbols or [])
-        if str(symbol).strip()
-    ]
-
-
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from risk.live import entry_gate_settings
 
+    # Entry-gate settings (#125) are refused at creation, not first at
+    # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
+    # otherwise sit in the database until the first signal is rejected.
+    entry_gate_settings(deployment.settings)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
@@ -3948,12 +4114,20 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             account_broker_login=account.broker_login or account.ctid or "",
             accounts_env_values=route_env,
         )
+        # #150/#167 fail closed: live trailing support is per broker, and this
+        # is where the deployment's broker is first known.
+        validate_live_deployment_trailing_override(
+            deployment.signal_config,
+            context=f"live deployment '{deployment.strategy_name}'",
+            broker=account.broker,
+            timeframe=_deployment_trailing_timeframe(deployment),
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
         signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
         record.signal_source = signal_source
@@ -4329,6 +4503,15 @@ def update_live_deployment_account(
                 raise ValueError(
                     f"Refusing to re-point at unknown account '{account_id}'"
                 )
+
+            # #150/#167 fail closed: the new account may sit on a broker that
+            # cannot execute the deployment's trailing mode.
+            validate_live_deployment_trailing_override(
+                record.to_live_deployment().signal_config,
+                context=f"live deployment '{record.strategy_name}' re-point",
+                broker=account.broker,
+                timeframe=_deployment_trailing_timeframe(record.to_live_deployment()),
+            )
 
             current_status = str(record.status or "").strip().upper()
             if current_status == "ACTIVE":
@@ -5247,7 +5430,11 @@ def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool
     for point in curve:
         try:
             equity = float(point.get("equity")) if isinstance(point, dict) else math.nan
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer outside float64 range (10**400) is
+            # stored JSON that cannot be read as an account value. Same rule as
+            # None/text: unable to read it, so unable to prove the account
+            # survived.
             equity = math.nan
         if not (math.isfinite(equity) and equity > 0):
             logger.warning(

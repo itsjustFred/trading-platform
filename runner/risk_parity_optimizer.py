@@ -144,8 +144,16 @@ def clamp_weight_bounds(min_weight: float, max_weight: float) -> tuple[float, fl
     Risk parity is long-only, so a negative ``min_weight`` or a ``max_weight``
     above 1 is a caller mistake rather than a wider search: clamp it here so no
     caller can hand out-of-range bounds to SLSQP or to the simplex projection.
+
+    Non-finite bounds are refused: ``max(0.0, nan)`` is 0.0 and ``min(1.0, nan)``
+    is 1.0, so a NaN cap would silently become "no cap".
     """
-    return max(0.0, float(min_weight)), min(1.0, float(max_weight))
+    lower_raw, upper_raw = float(min_weight), float(max_weight)
+    if not (math.isfinite(lower_raw) and math.isfinite(upper_raw)):
+        raise ValueError(
+            f"min_weight and max_weight must be finite, got {min_weight!r} and {max_weight!r}"
+        )
+    return max(0.0, lower_raw), min(1.0, upper_raw)
 
 
 def weight_bounds_feasible(lower: float, upper: float, n_assets: int) -> bool:
@@ -188,6 +196,31 @@ def resolve_weight_bounds(
     return lower, upper
 
 
+def inverse_volatility_weights(covariance: np.ndarray) -> np.ndarray:
+    """Inverse-volatility weights: the fallback when the risk-parity solve fails.
+
+    Refuses a non-finite or non-positive variance instead of flooring it.
+    ``1.0 / sqrt(0)`` is inf and ``sqrt(-1)`` is NaN, so a zero-variance (flat,
+    pegged or halted series) or negative-variance (corrupt covariance) asset
+    used to turn into inf/NaN weights, or into one asset pinned at ``max_weight``
+    with the rest holding the remainder - a portfolio nobody chose, reported as
+    computed.
+
+    The runner and the standalone backtest script both call this, so the same
+    covariance cannot give one a hard error and the other a portfolio (#129).
+    Valid runner input stays valid: :func:`shrink_covariance` adds a 1e-10
+    jitter, so its diagonal is positive even for a flat series.
+    """
+    variances = np.diag(np.asarray(covariance, dtype=float))
+    if not np.all(np.isfinite(variances)) or np.any(variances <= 0):
+        raise ValueError(
+            "cannot build the inverse-volatility fallback: every asset needs a "
+            "finite, positive variance (the covariance diagonal)"
+        )
+    inv_vol = 1.0 / np.sqrt(variances)
+    return inv_vol / np.sum(inv_vol)
+
+
 def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float) -> np.ndarray:
     """Euclidean projection onto {w : sum(w) == 1, lower <= w_i <= upper}.
 
@@ -198,6 +231,8 @@ def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float
     whose sum is 1. The caller must have verified that the set is non-empty.
     """
     values = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("weights must be finite before projection onto the capped simplex")
     low = float(np.min(values)) - upper
     high = float(np.max(values)) - lower
     for _ in range(200):
@@ -208,7 +243,18 @@ def _project_to_capped_simplex(values: np.ndarray, *, lower: float, upper: float
             low = tau
         else:
             high = tau
-    return np.clip(values - 0.5 * (low + high), lower, upper)
+    projected = np.clip(values - 0.5 * (low + high), lower, upper)
+    # Fail closed: the projection is the last step before weights reach the caller.
+    # The finiteness half is unreachable while ``values`` and the bounds are
+    # finite, and stays for the NaN-bound case: ``np.clip`` then returns NaN and
+    # ``abs(nan - 1.0) > 1e-9`` is *False*, so the sum test alone would hand the
+    # caller NaN weights - the same "NaN slips through a comparison" trap this
+    # module refuses elsewhere (pinned by test_projection_refuses_non_finite_bounds).
+    if not np.all(np.isfinite(projected)) or abs(float(np.sum(projected)) - 1.0) > 1e-9:
+        raise ValueError(
+            "risk parity projection did not produce finite weights summing to 1"
+        )
+    return projected
 
 
 def solve_risk_parity_weights(
@@ -224,6 +270,8 @@ def solve_risk_parity_weights(
     cov = np.asarray(covariance, dtype=float)
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] == 0:
         raise ValueError("covariance must be a non-empty square matrix")
+    if not np.all(np.isfinite(cov)):
+        raise ValueError("covariance must be finite")
     n_assets = cov.shape[0]
     # #129: fail closed on infeasible bounds instead of silently relaxing them.
     lower, upper = resolve_weight_bounds(min_weight, max_weight, n_assets)
@@ -244,8 +292,10 @@ def solve_risk_parity_weights(
         options={"maxiter": 500, "ftol": 1e-12, "disp": False},
     )
     if not result.success or result.x is None:
-        inv_vol = 1.0 / np.sqrt(np.maximum(np.diag(cov), 1e-12))
-        weights = inv_vol / np.sum(inv_vol)
+        # Shared with the standalone backtest script so both refuse (or accept)
+        # the same covariance instead of flooring variance in one and raising in
+        # the other (#129).
+        weights = inverse_volatility_weights(cov)
     else:
         weights = np.asarray(result.x, dtype=float)
 

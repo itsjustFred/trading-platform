@@ -531,6 +531,10 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -540,6 +544,23 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
+        async def get_quote(self, symbol):
+            # #125 entry-deviation gate: a quote at the signal entry passes.
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test"
+            )
 
     deployments = [
         _deployment_for_test("dep-1", symbols=["AAPL"]),
@@ -599,6 +620,10 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -608,6 +633,23 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
+        async def get_quote(self, symbol):
+            # #125 entry-deviation gate: a quote at the signal entry passes.
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test"
+            )
 
     trusted = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
     trusted.signal_config["trusted_author_ids"] = ["bot-1"]
@@ -662,6 +704,10 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -671,6 +717,23 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
+        async def get_quote(self, symbol):
+            # #125 entry-deviation gate: a quote at the signal entry passes.
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test"
+            )
 
     deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
     deployment.signal_config["trusted_author_ids"] = ["bot-1"]
@@ -1670,6 +1733,23 @@ def test_dispatch_discards_stale_signals() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
+        async def get_quote(self, symbol):
+            # #125 entry-deviation gate: a quote at the signal entry passes.
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test"
+            )
 
     deployment = _deployment_for_test("dep-1", symbols=["AAPL"], channel_id="channel-1")
     deployment.signal_config["trusted_author_ids"] = ["bot-1"]
@@ -4506,6 +4586,10 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
     submitted: list[str] = []
 
     class _Adapter:
+        # A double has to prove it is a demo account (`_adapter_is_demo`); without
+        # the flag it is real money and the promotion gate (#165) refuses entries.
+        demo = True
+
         async def submit_order(self, signal, *, qty: float | None = None):
             submitted.append(str(signal.deployment_id))
             return "order-1"
@@ -4515,6 +4599,23 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
 
         async def get_positions(self):
             return []
+
+        async def get_pip_value(self, symbol):
+            # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+                quote_asset="USD", account_asset="USD", source="test",
+            )
+
+        async def get_quote(self, symbol):
+            # #125 entry-deviation gate: a quote at the signal entry passes.
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test"
+            )
 
     signal = TradeSignal(
         action="buy",

@@ -46,8 +46,42 @@ pro Bot.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
     abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
     nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
-  - **Unterstützt:** Replay-Backtest `none`, `percent`; Live nur `none` (Live-Trailing fehlt
-    noch, #167). `supertrend_flip` ist bekannt, aber bis #168 nirgends ausführbar.
+  - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
+    cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
+    live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
+    nachgezogen und der Stop beim Broker ersetzt; Details und Betriebsgrenzen in
+    `docs/live-deploy-runbook.md` ("Live Trailing Stops"). `supertrend_flip` wird live auf keinem
+    Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
+  - **`supertrend_flip` im Replay (#168):**
+    1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`
+       — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
+       (`int(qty * tp1_exit_percent)`, `shared/trailing.tp1_partial_quantity`). Ergibt sich 0
+       (z. B. 1 Share bei 0.5), wird der Teilausstieg übersprungen, genau wie im Original-Bot:
+       kein Verkauf, kein Einstands-Stop, und der restliche Workflow (Aktivierung, Flip) startet
+       nicht. Die Position bleibt voll unter ihrem ursprünglichen Stop; im Trade-Meta steht
+       dann `supertrend_flip.tp1_skipped_time` (und `tp1_time` bleibt leer).
+    2. Danach Stop auf Einstand (Entry-Preis), wenn `breakeven_after_tp1`; wirksam ab der Kerze
+       nach der TP1-Kerze.
+    3. Aktivierung: erste geschlossene Kerze NACH der TP1-Kerze, deren Supertrend bereit und
+       grün ist. Die TP1-Kerze selbst wird nach dem TP1-Fill nicht mehr ausgewertet — nichts, was
+       in oder an der TP1-Kerze nach dem Fill passiert, darf den Trail bewegen oder auslösen.
+       "Nicht bereit" (Warm-up) zählt weder als grün noch als rot.
+    4. Ausstieg: erste bereite rote Kerze nach der Aktivierung; der Rest wird zum OPEN der
+       folgenden Kerze geschlossen (der Flip ist erst beim Schluss der Flip-Kerze bekannt). Ist die
+       Flip-Kerze die letzte Kerze der Daten, wird die Position wie jede andere am Datenende
+       geschlossen (`end_of_data`).
+    - Ein Signal ohne `stop_loss` wird abgelehnt: vor TP1 ist der Stop der einzige Schutz,
+      der Workflow setzt keinen eigenen.
+    - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
+      `resolve_same_bar_exit`); dann gibt es kein TP1.
+    - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
+      `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
+      Kerzen.
+    - Ein Trade mit mehreren Exits (`tp1`, dann `supertrend_flip`/`breakeven_stop`/`stop_loss`/
+      `end_of_data`); der TP1-Tranche ist auf ganze Shares abgerundet, MFE/MAE werden nach dem
+      Teilausstieg auf den verbleibenden Shares gemessen und die Equity-Kurve bucht die
+      gefloorten Beine. Gebühren einmal zum mengengewichteten Exit-Preis. Fehlende oder ungültige
+      Parameter brechen den Lauf ab (keine erfundenen Defaults). Nur Long-Einstiege.
   - Mit dem Default `none` läuft RamJet bewusst nur mit dem initialen ATR-Stop.
 - **Last-Run:** Über Health-Check-Job validierbar
 
@@ -196,7 +230,10 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Adapter noch einmal (cTrader-Volumen per Floor statt `round()`). Ein Exit
   schließt so nie mehr als den verlangten Anteil bzw. die eigene Menge. Fällt
   er auf 0, wird er ignoriert und auf `WARNING` geloggt, mit `requested_qty`
-  und `qty_step`. Entries runden wie bisher.
+  und `qty_step`. Entries werden ebenfalls nie aufgerundet: der cTrader-Adapter
+  rundet das Entry-Volumen per Floor auf den Broker-`stepVolume` ab
+  (`_floor_to_volume_step`); liegt das Ergebnis unter `minVolume`, wird die
+  Order wie bisher abgelehnt, nie auf das Minimum hochgesetzt.
 - **Ledger-Überhang: Deckelung am Broker + Alert (#121, Entscheidung 2):** Ein
   Exit schließt nur die eigene Ledger-Menge des Deployments, höchstens aber die
   Broker-Position: `Menge = min(eigene Ledger-Menge, Broker-Menge)`, dann der

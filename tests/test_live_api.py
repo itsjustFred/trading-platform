@@ -244,6 +244,16 @@ def test_live_deployments_crud_endpoints(monkeypatch, isolated_db):
     }
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": account_id, "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_services",
@@ -438,6 +448,16 @@ def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     import viewer.main as viewer_main_module
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": "ct-1", "broker": "ctrader", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_accounts",
@@ -2780,6 +2800,16 @@ def test_discord_deployment_routing_uses_the_configured_account_label(monkeypatc
     import viewer.main as viewer_main_module
 
     monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    # The promotion gate (#165) treats an account whose type discovery does not
+    # report as real money. This test is about a demo/paper account, so
+    # discovery says so.
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_cached_live_accounts_payload",
+        lambda *args, **kwargs: [
+            {"id": "acc-1", "broker": "alpaca", "is_demo": True, "is_demo_asserted": True}
+        ],
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_services",
@@ -2895,7 +2925,7 @@ def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
         "signal_source": "discord",
         "signal_config": {
             "channel_id": "100000000000000002",
-            "signal_processor_config": {"trailing_mode": "percent"},
+            "signal_processor_config": {"trailing_mode": "supertrend_flip"},
         },
     }
 
@@ -2910,7 +2940,7 @@ def test_create_rejects_unsupported_trailing_override_with_400(monkeypatch):
     response = client.post("/api/live/deployments", json=payload)
     assert response.status_code == 400
     assert "trailing" in response.json()["detail"]
-    assert "percent" in response.json()["detail"]
+    assert "supertrend_flip" in response.json()["detail"]
 
 
 def _store_backtest(database, backtest_id: str, *, stats: dict, equity_curve: list[dict]) -> None:
@@ -3022,6 +3052,8 @@ def test_legacy_curve_with_unreadable_point_fails_closed(isolated_db):
         ("text", "n/a"),
         ("nan", float("nan")),
         ("inf", float("inf")),
+        # Stored JSON, but outside float64 range: float() raises OverflowError.
+        ("overflow", 10**400),
     )
     for backtest_id, bad_equity in bad_points:
         _store_backtest(
