@@ -492,15 +492,26 @@ def _resolve_optional_float(metadata: Mapping[str, Any], keys: tuple[str, ...]) 
     return None
 
 
-def _to_datetime(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return datetime.now(timezone.utc)
-    return datetime.now(timezone.utc)
+_DATE_TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}")
+
+
+def _broker_fill_timestamp(*candidates: Any) -> datetime | None:
+    """The first usable broker timestamp among ``candidates``, as an aware UTC datetime.
+
+    The caller lists them most to least specific (the fill event's own stamp, then the order's
+    ``filled_at``, then its ``updated_at``). ``None`` when none parses: a missing or malformed
+    stamp is never replaced with the wall clock, because the execution ledger orders and windows
+    PnL by this column and a fabricated time would be stored with nothing to correct it later.
+    """
+    for candidate in candidates:
+        # A string must carry a time of day: ``fromisoformat`` also reads a bare date as midnight,
+        # which would be an invented instant. Alpaca always sends full RFC 3339.
+        if isinstance(candidate, str) and _DATE_TIME_PREFIX.match(candidate.strip()) is None:
+            continue
+        stamp = canonical_utc_timestamp(candidate)
+        if stamp is not None:
+            return datetime.fromisoformat(stamp)
+    return None
 
 
 def _alpaca_fill_dedupe_key(
@@ -809,6 +820,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             "Connected Alpaca live adapter",
             extra={"data": {"account_id": self.account_id, "paper": self.paper}},
         )
+        # This is the ONLY reconciliation trigger on this adapter: Alpaca has no periodic pass
+        # and no `_reconciliation_required` retry queue the way cTrader does
+        # (`ctrader_adapter._run_pending_reconciliation`). Every refusal to store a fill that
+        # lacks a usable timestamp therefore recovers at the next connect, so the warnings
+        # must say so rather than promise a pass.
         try:
             await self.reconcile_executions()
         except Exception as exc:
@@ -885,6 +901,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 },
             )
             return False
+        fill_ts = _broker_fill_timestamp(
+            getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+        )
+        if fill_ts is None:
+            logger.warning(
+                "Alpaca order has filled quantity but neither a usable filled_at nor updated_at; "
+                "not persisting the missed fill with an invented time. reconciliation runs only "
+                "when the adapter connects, so the next adapter connect retries it",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "signal_id": signal_id,
+                        "broker_order_id": broker_order_id,
+                        "filled_at": str(getattr(order, "filled_at", None)),
+                        "updated_at": str(getattr(order, "updated_at", None)),
+                        "missing_filled_qty": missing_filled_qty,
+                    }
+                },
+            )
+            return False
         execution = LiveExecution(
             signal_id=UUID(signal_id),
             # Placeholder: the save derives the remainder's own price from the cumulative average
@@ -895,7 +931,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             actual_price_observed=PRICE_DERIVED,
             filled_qty=missing_filled_qty,
             commission=_known_commission(order),
-            timestamp=_to_datetime(getattr(order, "filled_at", None)),
+            timestamp=fill_ts,
             broker_order_id=broker_order_id,
             dedupe_key=(
                 f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
@@ -2649,7 +2685,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # of day and backfilled, so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)
             raw_fill_ts = getattr(data, "timestamp", None)
-            fill_ts = _to_datetime(raw_fill_ts)
+            fill_ts = _broker_fill_timestamp(
+                raw_fill_ts, getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+            )
 
             execution_id = str(getattr(data, "execution_id", "") or "")
             dedupe_key = _alpaca_fill_dedupe_key(
@@ -2671,6 +2709,26 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             "client_order_id": str(client_order_id),
                             "broker_order_id": broker_order_id,
                             "event": event,
+                        }
+                    },
+                )
+                return
+
+            if fill_ts is None:
+                logger.warning(
+                    "Alpaca fill carries no usable timestamp on the event or its order; no "
+                    "execution row was stored (never an invented time), so the local filled "
+                    "quantity understates the broker's until the next adapter connect runs "
+                    "reconciliation and the order reports a fill time",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "client_order_id": str(client_order_id),
+                            "broker_order_id": broker_order_id,
+                            "event": event,
+                            "execution_id": execution_id,
+                            "filled_qty": filled_qty,
+                            "broker_cumulative_filled_qty": broker_cumulative_filled_qty,
                         }
                     },
                 )

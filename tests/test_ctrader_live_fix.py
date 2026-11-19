@@ -1337,12 +1337,16 @@ def _volume_signal(qty: float, *, exit_only: bool) -> LiveSignal:
     )
 
 
-def test_ctrader_exit_volume_rounds_down_entry_volume_keeps_rounding() -> None:
-    """0.3336 qty = 333.6 volume units: an exit closes 333, never 334."""
+def test_ctrader_exit_and_entry_volume_both_floor_never_round_up() -> None:
+    """0.3336 qty = 333.6 volume units: an exit AND an entry close/size 333, never 334.
+
+    An entry rounded to 334 would put the loss at the stop above the risk budget
+    (#217: entries are floored, not rounded to nearest).
+    """
     adapter = _volume_adapter()
 
     assert adapter._resolve_order_volume(_volume_signal(0.3336, exit_only=True)) == 333
-    assert adapter._resolve_order_volume(_volume_signal(0.3336, exit_only=False)) == 334
+    assert adapter._resolve_order_volume(_volume_signal(0.3336, exit_only=False)) == 333
 
 
 def test_ctrader_exit_volume_rounds_down_to_the_step_volume() -> None:
