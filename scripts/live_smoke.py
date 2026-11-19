@@ -981,15 +981,21 @@ async def _alpaca_crypto_roundtrip(
     timeout_seconds: int,
 ) -> list[SmokeCheck]:
     checks: list[SmokeCheck] = []
+    # An async list comprehension: the iterable handed to ``extend`` is a real
+    # list. A bare ``await`` inside a generator expression turns the genexp
+    # into an async generator, which is not iterable, so ``extend`` would raise
+    # TypeError and no roundtrip account would be checked at all.
     checks.extend(
-        await _run_alpaca_crypto_iteration(
-            env,
-            index=index,
-            symbol=symbol,
-            notional=notional,
-            timeout_seconds=timeout_seconds,
-        )
-        for index in (1, 2, 3)
+        [
+            await _run_alpaca_crypto_iteration(
+                env,
+                index=index,
+                symbol=symbol,
+                notional=notional,
+                timeout_seconds=timeout_seconds,
+            )
+            for index in (1, 2, 3)
+        ]
     )
     return checks
 
