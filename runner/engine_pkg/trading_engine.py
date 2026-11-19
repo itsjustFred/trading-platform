@@ -81,6 +81,39 @@ def _require_finite(name: str, value: float) -> float:
     return value
 
 
+def _sizing_value(name: str, raw: Any, default: float, *, positive: bool = False) -> float:
+    """Resolve a fixed-risk sizing parameter, refusing an unusable value (#151, #170).
+
+    ``None`` -- and an absent key -- means "not configured" and yields
+    ``default``. Anything else is a configured value and has to be usable: a
+    non-numeric raw value, a non-finite one and a negative one are all config
+    errors, never the ``or <default>`` substitution the lot metadata used
+    before. ``tick_value: 0`` read as ``0 or 1.0`` became ``1.0``, which
+    silently erased the tick-value conversion and sized an order on a
+    0.01-tick instrument ~100x too large; a negative ``lot_step``/``min_lot``/
+    ``max_lot`` was dropped by the ``> 0`` gates, so the broker grid and the
+    minimum never applied. Both now raise instead of defaulting.
+
+    With ``positive`` a zero is refused too, for the parameters that divide
+    by the value (``tick_value``, ``tick_size``); without it, zero is the
+    "no grid / no limit" setting the downstream ``> 0`` gates read it as.
+    Zero keeps that meaning -- only the *configured and unusable* values
+    raise, which is the same None-versus-value split the sibling validator in
+    ``validation/risk/fixed_risk.py`` makes.
+    """
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    _require_finite(name, value)
+    if value < 0 or (positive and value == 0):
+        bound = "> 0" if positive else ">= 0"
+        raise ValueError(f"{name} must be {bound}, got {value}")
+    return value
+
+
 def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     """Order TP candidates: plain ``tp`` first, then ``tpN`` by numeric N (#154)."""
     name = item[0]
@@ -322,7 +355,15 @@ class TradeEngine:
             fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
 
         if fixed_risk_amount is not None and stop_loss_price is not None:
-            risk_amount = float(fixed_risk_amount)
+            # #170: resolve -- and thereby validate -- the risk amount here,
+            # BEFORE the `> 0` gate below. `nan > 0` and a negative amount
+            # both compare False, so validating inside that gate (as #151
+            # did) let either one skip the fixed-risk branch and fall through
+            # to `risk_per_trade_pct`: a size computed under a different risk
+            # rule than the config declares, with no error at all.
+            # `0.0` -- and an absent key -- is the documented "off" idiom and
+            # keeps falling through unchanged.
+            risk_amount = _sizing_value("fixed_risk_amount", fixed_risk_amount, 0.0)
             # MT5 parity: when the strategy provides an explicit stop distance
             # (e.g. ATR-based, as the MT5 EA computes lots from the ATR
             # distance at order time), size from it directly instead of
@@ -334,23 +375,20 @@ class TradeEngine:
             else:
                 risk_distance = abs(float(entry_price) - float(stop_loss_price))
             if risk_amount > 0 and risk_distance > 0:
-                # Non-finite sizing input is a config error, refused loudly.
-                risk_amount = _require_finite("fixed_risk_amount", risk_amount)
-                tick_value = _require_finite(
-                    "tick_value", float(self.config.parameters.get("tick_value", 1.0) or 1.0)
+                # The broker grid parameters are only read on this branch, so
+                # they are validated where they are used: an unusable value is
+                # refused instead of silently substituted or dropped.
+                tick_value = _sizing_value(
+                    "tick_value", self.config.parameters.get("tick_value"), 1.0, positive=True
                 )
-                tick_size = _require_finite(
-                    "tick_size", float(self.config.parameters.get("tick_size", 1.0) or 1.0)
+                tick_size = _sizing_value(
+                    "tick_size", self.config.parameters.get("tick_size"), 1.0, positive=True
                 )
-                lot_step = _require_finite(
-                    "lot_step", float(self.config.parameters.get("lot_step", 0.0) or 0.0)
+                lot_step = _sizing_value(
+                    "lot_step", self.config.parameters.get("lot_step"), 0.0
                 )
-                min_lot = _require_finite(
-                    "min_lot", float(self.config.parameters.get("min_lot", 0.0) or 0.0)
-                )
-                max_lot = _require_finite(
-                    "max_lot", float(self.config.parameters.get("max_lot", 0.0) or 0.0)
-                )
+                min_lot = _sizing_value("min_lot", self.config.parameters.get("min_lot"), 0.0)
+                max_lot = _sizing_value("max_lot", self.config.parameters.get("max_lot"), 0.0)
                 shares = (risk_amount / risk_distance) * (tick_size / tick_value)
                 if lot_step > 0:
                     shares = _floor_to_lot_grid(shares, lot_step)

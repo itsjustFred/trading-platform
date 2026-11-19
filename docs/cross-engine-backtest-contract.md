@@ -174,7 +174,16 @@ Implementation:
   what make it unaffordable. A size that no cap reduces is not re-floored.
   Non-finite values for the sizing parameters are refused with a `ValueError`
   naming the parameter: `inf` would crash the grid floor, and `nan` defeats
-  every guard on the sizing path.
+  every guard on the sizing path. The check runs before the `> 0` gate that
+  selects the fixed-risk branch, so a `nan` or `-inf` `fixed_risk_amount`
+  cannot fall through to the `risk_per_trade_pct` path unnoticed, and a
+  negative amount is refused too. A configured `tick_value`/`tick_size` of
+  zero or less is refused as well — `0 or 1.0` used to substitute `1.0` and
+  silently drop that leg of the conversion, oversizing the order — and so is
+  a negative `lot_step`/`min_lot`/`max_lot`, which the `> 0` gates used to
+  discard. An absent key, an explicit `null`, and `0.0` for
+  `fixed_risk_amount` ("off", size from `risk_per_trade_pct`) keep their
+  previous meaning (Issue #170).
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop

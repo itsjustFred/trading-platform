@@ -506,10 +506,182 @@ def test_fixed_risk_non_finite_sizing_input_is_refused(key, bad_value):  # Issue
         )
 
 
-def test_fixed_risk_infinite_risk_amount_is_refused():  # Issue #151
-    engine = _engine({"fixed_risk_amount": float("inf")})
+@pytest.mark.parametrize(
+    "bad_amount", [float("inf"), float("nan"), float("-inf")]
+)
+def test_fixed_risk_non_finite_risk_amount_is_refused(bad_amount):  # Issue #151, #170
+    # #170: `nan > 0` and `-inf > 0` are both False, so validating only
+    # inside the `> 0` gate let a NaN or -inf amount skip the fixed-risk
+    # branch and fall through to `risk_per_trade_pct` — a size computed under
+    # a different risk rule than the config declares, with no error. Refuse
+    # before the gate, for every non-finite spelling.
+    engine = _engine({"fixed_risk_amount": bad_amount})
 
     with pytest.raises(ValueError, match="fixed_risk_amount"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
+def test_fixed_risk_negative_risk_amount_is_refused():  # Issue #170
+    # A negative amount risks a negative sum; it also compares False against
+    # the `> 0` gate, so it too must not fall through to the percentage path.
+    engine = _engine({"fixed_risk_amount": -500.0})
+
+    with pytest.raises(ValueError, match="fixed_risk_amount"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
+def test_fixed_risk_zero_amount_sizes_like_the_percentage_path():
+    # Owner decision: `fixed_risk_amount = 0.0` (and an absent key) is the
+    # documented "off" idiom — the fixed-risk branch is skipped and sizing
+    # falls through to `risk_per_trade_pct`. The #170 guard must not turn
+    # "off" into an error, and "off" must size exactly like "unset".
+    engine = _engine({"fixed_risk_amount": 0.0})
+    unconfigured = _engine()
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+    baseline = unconfigured._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == baseline
+    assert quantity > 0.0
+
+
+@pytest.mark.parametrize("bad_value", [0, 0.0, -1.0])
+def test_fixed_risk_zero_or_negative_tick_value_is_refused(bad_value):  # Issue #170
+    # #170: `tick_value: 0` read as `0 or 1.0` became 1.0, which silently
+    # erased the tick-value conversion: on a 0.01-tick instrument the size
+    # came out ~100x too large instead of the config error it is.
+    engine = _engine({"fixed_risk_amount": 500.0, "tick_value": bad_value})
+
+    with pytest.raises(ValueError, match="tick_value"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
+@pytest.mark.parametrize("bad_value", [0, 0.0, -0.01])
+def test_fixed_risk_zero_or_negative_tick_size_is_refused(bad_value):  # Issue #170
+    # #170: `tick_size: 0` reads as `0 or 1.0` = 1.0, so the tick-size leg of
+    # the conversion vanishes and the same ~100x oversizing is silent.
+    engine = _engine({"fixed_risk_amount": 500.0, "tick_size": bad_value})
+
+    with pytest.raises(ValueError, match="tick_size"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
+@pytest.mark.parametrize("bad_value", [-0.01, -1.0])
+@pytest.mark.parametrize(
+    "key", ["lot_step", "min_lot", "max_lot"]
+)
+def test_fixed_risk_negative_lot_limits_are_refused(key, bad_value):  # Issue #170
+    # #170: a negative grid parameter passed the finite check and was then
+    # silently dropped by the `> 0` gates, so the broker lot step and the
+    # minimum never applied. Zero stays the documented "off" setting; a
+    # configured negative value is a config error.
+    params = {
+        "fixed_risk_amount": 500.0,
+        "tick_size": 1.0,
+        "tick_value": 1.0,
+        "lot_step": 0.1,
+        "min_lot": 0.1,
+        "max_lot": 100.0,
+        key: bad_value,
+    }
+    engine = _engine(params)
+
+    with pytest.raises(ValueError, match=key):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "key", ["tick_size", "tick_value", "lot_step", "min_lot", "max_lot"]
+)
+def test_fixed_risk_null_sizing_parameters_are_not_configured(key):  # Issue #170
+    # An explicit null is "not configured", not a value: the parameter keeps
+    # its default (1.0 for the tick pair, 0.0 = off for the lot grid) and no
+    # error is raised. Only a configured, unusable value is refused.
+    engine = _engine({"fixed_risk_amount": 500.0, key: None})
+    unconfigured = _engine({"fixed_risk_amount": 500.0})
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+    baseline = unconfigured._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(500.0)
+    assert quantity == baseline
+
+
+def test_fixed_risk_tick_conversion_is_not_silently_dropped():
+    # #170: the regression the guard closes. `tick_value: 0` used to size
+    # exactly like `tick_value: 1.0` (500.0 units); it must now refuse, so the
+    # tick-value conversion cannot vanish without an error.
+    dropped = _engine({"fixed_risk_amount": 500.0, "tick_value": 0})
+
+    with pytest.raises(ValueError, match="tick_value"):
+        dropped._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+    honoured = _engine({"fixed_risk_amount": 500.0, "tick_value": 1.0})
+
+    assert honoured._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    ) == pytest.approx(500.0)
+
+
+def test_fixed_risk_non_numeric_sizing_parameter_is_refused():  # Issue #170
+    # A non-numeric value must name the parameter, not surface a bare
+    # `float()` error from deep inside the sizing path.
+    engine = _engine({"fixed_risk_amount": 500.0, "lot_step": "wide"})
+
+    with pytest.raises(ValueError, match="lot_step"):
         engine._calculate_position_size(
             entry_price=100.0,
             stop_loss_price=95.0,
