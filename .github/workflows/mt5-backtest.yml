@@ -115,7 +115,6 @@ jobs:
           }
           "PERIOD_NUM=$($periods[$env:PERIOD_NAME])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CSV_FILE=$($env:CSV_ASSET -replace '\.gz$','')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RUN_STAMP=$(Get-Date -Format 'yyyyMMddTHHmmss')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Get-ComputerInfo -Property WindowsProductName, WindowsVersion | Format-List
           "strategy=$env:STRATEGY ea=$env:EA_FILE csv=$env:CSV_ASSET setfile=$env:SETFILE_ASSET"
           "symbol=$env:SYMBOL base=$env:BASE_SYMBOL period=$env:PERIOD_NAME ($($periods[$env:PERIOD_NAME])) window=$env:FROM_DATE..$env:TO_DATE model=$env:MODEL"
@@ -143,7 +142,6 @@ jobs:
             }
             Write-Host "verified $asset ($actual)"
           }
-          "CSV_SHA=$($expected[$env:CSV_ASSET])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           if ($env:CSV_ASSET -like '*.gz') {
             $gz = [System.IO.File]::OpenRead((Resolve-Path "data/$env:CSV_ASSET"))
@@ -200,7 +198,7 @@ jobs:
           $includeProbe = Join-Path $env:MT5_HOME 'MQL5\Include\Trade\Trade.mqh'
           if (-not (Test-Path $includeProbe)) {
             Write-Host 'MQL5 standard tree missing after install; starting terminal once to unpack it'
-            $warm = Start-Process -FilePath (Join-Path $env:MT5_HOME 'terminal64.exe') -ArgumentList '/portable' -PassThru
+            Start-Process -FilePath (Join-Path $env:MT5_HOME 'terminal64.exe') -ArgumentList '/portable' | Out-Null
             $deadline = (Get-Date).AddSeconds(180)
             while ((Get-Date) -lt $deadline -and -not (Test-Path $includeProbe)) {
               Start-Sleep -Seconds 2

@@ -11,6 +11,13 @@ loaded into a custom symbol, so the tester never needs a connection.
 | `convert_setfile.py` | Turns a Strategy Tester setfile (UTF-16LE + BOM, `name=value\|\|start\|\|step\|\|stop\|\|flag`) into the plain `.set` the tester reads from `MQL5\Profiles\Tester\` — ASCII, no BOM. |
 | `inspect_report.py` | Asserts the produced HTML report names the expected EA and symbol and has trades; optionally dumps the deals to JSON. Reads German and English labels, no third-party deps. |
 
+The tester refuses to start with a bare `[Tester]` section
+(`tester not started because the account is not specified`). It only checks that
+an account is *configured*: the workflow writes placeholder `[Common]`
+credentials, the terminal logs `authorization ... failed (Invalid account)` and
+then runs the test anyway, because the emulated account comes from
+`[Tester]` Deposit/Currency/Leverage and the symbol history is local.
+
 The workflow passes the custom symbol's parameters through
 `MQL5\Files\mt5_ci_import.txt` (key=value) rather than `.ini` script
 parameters, so no argument ever needs quoting through a config line.
