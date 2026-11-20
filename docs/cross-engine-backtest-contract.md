@@ -162,7 +162,57 @@ Implementation:
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` unless
-  `cap_fixed_risk_by_leverage = false`.
+  `cap_fixed_risk_by_leverage = false`. With `lot_step > 0`, `max_lot` is
+  floored to `lot_step` once, so an off-grid `max_lot` cannot yield an
+  off-grid size; the documented exception is no grid at all — with
+  `lot_step` absent, null or zero the native engine has no grid, so
+  `max_lot` applies raw and an off-grid maximum stays off-grid. Because the
+  leverage/exposure cap is a raw equity/price ratio, a size that the cap
+  reduces is re-floored to `lot_step` afterwards (Issue #151). With a grid
+  configured, a final size within the grid snap band (relative 1e-9) below
+  `min_lot` is snapped up to `min_lot` — that size came out of the grid
+  floor an ulp low (`3 * 0.3 == 0.8999999999999999 < 0.9`) and the broker
+  accepts it as `min_lot`. Without a grid there is no such float product,
+  so the exception does not apply: a capped size below `min_lot` is a cap
+  the configured minimum exceeds, and raising it would push the size above
+  the cap. Any other final size below `min_lot` is **skipped** (size 0, no
+  trade, with a WARNING log) — it is never raised back up to `min_lot`,
+  since the caps are what make it unaffordable. A size that no cap reduces
+  is not re-floored. `min_lot` is deliberately honoured **off-grid**: the
+  MT5 parity reference (`scripts/regenerate_mt5_parity_artifacts.py`,
+  `_round_mt5_lots`, .mq5 Z.391-393) applies `max(floored, min_lot)` without
+  a second grid floor (MT5 `MathMax`), so the engine reproduces that rule
+  rather than correcting it; a venue that requires volumes to be exact step
+  multiples would reject such a size, and a config for one must set
+  `min_lot` to a grid multiple. `max_lot` is floored to the grid instead;
+  with `min_lot == max_lot == 0.15` and `lot_step = 0.1` that combination is
+  fail-closed — the cap becomes `0.1`, which is below `min_lot`, and the
+  trade is skipped although the same config without `max_lot` trades `0.15`.
+  Non-finite values for the sizing parameters are refused with a `ValueError`
+  naming the parameter: `inf` would crash the grid floor, and `nan` defeats
+  every guard on the sizing path. `fixed_risk_amount` is resolved — and thereby
+  validated — **before any stop-dependent branch**, so a `nan`, `-inf` or
+  negative amount is refused on **every** path: with a stop, without a stop,
+  and with an unusable stop distance. `nan > 0`, `-inf > 0` and a negative
+  amount all compare False, so a value checked after a branch is chosen is
+  checked too late: on the stopful and the stopless path the trade was then
+  sized by `risk_per_trade_pct` instead — a backtest under a risk rule the
+  config does not declare, with no error at all (the unusable-distance path
+  raised, but named the distance, never the amount). A configured
+  `tick_value`/`tick_size` of zero or less is refused as well — `0 or 1.0`
+  used to substitute `1.0` and silently drop that leg of the conversion,
+  oversizing the order — and so is a negative `lot_step`/`min_lot`/`max_lot`,
+  which the `> 0` gates used to discard. Those are parameters of the
+  fixed-risk conversion, so they are resolved with that branch, before the
+  risk-distance gate: an unusable stop distance is refused too (no risk
+  distance means no size), and reporting which of the two is the config error
+  must not depend on the bar data. An absent key, an explicit `null`, and
+  `0.0` for `fixed_risk_amount` ("off", size from `risk_per_trade_pct`) keep
+  their previous meaning. The order's `equity_proportional_sizing` flag reads
+  the same way, so a `0.0` order is **now** re-scaled by the shared-equity
+  replay like a percentage-sized one: the flag used to read the key's presence
+  instead, and stopped the re-scale for a percentage-sized position (Issue
+  #170).
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop

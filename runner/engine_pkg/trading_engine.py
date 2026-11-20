@@ -49,6 +49,103 @@ logger = logging.getLogger(__name__)
 TRADE_ENGINE_MAX_POSITIONS = 5
 
 
+def _floor_to_lot_grid(size: float, lot_step: float) -> float:
+    """Largest multiple of ``lot_step`` at or below ``size``, up to the snap band (#151).
+
+    A quotient within a relative 1e-9 of an integer counts as that integer, so
+    float noise (``k * lot_step / lot_step`` can land an ulp below ``k``) never
+    drops a whole step. Unlike a fixed absolute epsilon, the tolerance scales
+    with the quotient, so large step counts are handled too. Idempotent on
+    grid values. Because the band is relative, at a quotient of ~1e9 steps or
+    more it reaches a whole step, so the snap can then return a value a full
+    step above ``size``; it never falls more than the band below ``size``.
+    """
+    quotient = size / lot_step
+    nearest = round(quotient)
+    if abs(quotient - nearest) <= 1e-9 * max(1.0, abs(quotient)):
+        return nearest * lot_step
+    return math.floor(quotient) * lot_step
+
+
+def _configured_risk_amount(parameters: dict[str, Any]) -> float:
+    """Resolve (and thereby validate) the declared ``fixed_risk_amount`` (#170).
+
+    Shared by the sizing path and by ``_create_order``, which needs the same
+    answer to decide whether an order may be re-scaled by the shared-equity
+    replay. Both keys (camelCase MT5 spelling) mean the same setting, and
+    ``None`` -- an absent key -- means "not configured". The resolution -- and
+    with it the validation -- always runs on the value, never after a gate
+    selected a branch for it: ``nan > 0`` and a negative amount compare False,
+    so a value checked inside a ``> 0`` gate had already selected the
+    percentage branch before anybody looked at it.
+    """
+    raw = parameters.get("fixed_risk_amount")
+    if raw is None:
+        raw = parameters.get("Fixed_Risk_Amount")
+    return _sizing_value("fixed_risk_amount", raw, 0.0)
+
+
+def _require_finite(name: str, value: float) -> float:
+    """Refuse a non-finite fixed-risk sizing parameter (#151).
+
+    ``inf`` crashes the lot-grid floor (``round(inf)``) or leaks into the
+    order quantity, and ``nan`` defeats every guard on the sizing path
+    (``nan`` compares false), so a strategy passing either is a config error,
+    not a silent no-op. Mirrors the finite-config rule of the sibling
+    validator in ``validation/risk/fixed_risk.py``.
+    """
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value}")
+    return value
+
+
+def _sizing_value(name: str, raw: Any, default: float, *, positive: bool = False) -> float:
+    """Resolve a fixed-risk sizing parameter, refusing an unusable value (#151, #170).
+
+    ``None`` -- and an absent key -- means "not configured" and yields
+    ``default``. Anything else is a configured value and has to be usable: a
+    non-numeric raw value, a non-finite one and a negative one are all config
+    errors, never the ``or <default>`` substitution the lot metadata used
+    before. ``tick_value: 0`` read as ``0 or 1.0`` became ``1.0``, which
+    silently erased the tick-value conversion and sized an order on a
+    0.01-tick instrument ~100x too large; a negative ``lot_step``/``min_lot``/
+    ``max_lot`` was dropped by the ``> 0`` gates, so the broker grid and the
+    minimum never applied. Both now raise instead of defaulting.
+
+    With ``positive`` a zero is refused too, for the parameters that divide
+    by the value (``tick_value``, ``tick_size``); without it, zero is the
+    "no grid / no limit" setting the downstream ``> 0`` gates read it as.
+    Zero keeps that meaning -- only the *configured and unusable* values
+    raise, which is the same None-versus-value split the sibling validator in
+    ``validation/risk/fixed_risk.py`` makes. A boolean is refused like a
+    non-number (``float(True) == 1.0`` would otherwise read ``True`` as a
+    risk amount and ``False`` as a disabled grid), and an oversized value
+    (``float(10**400)`` raises ``OverflowError``) is refused by name rather
+    than escaping as a bare ``OverflowError`` -- both mirror
+    ``BacktestConfig``'s finite-number validator.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{name} must be a number, got {raw!r}")
+    try:
+        value = float(raw)
+    except OverflowError as exc:
+        # `float(10**400)`: name the parameter instead of letting the bare
+        # OverflowError escape (BacktestConfig catches it alongside the
+        # other conversion errors and reports the field name too).
+        raise ValueError(
+            f"{name} is too large to size with, got a {len(str(raw))}-digit value"
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    _require_finite(name, value)
+    if value < 0 or (positive and value == 0):
+        bound = "> 0" if positive else ">= 0"
+        raise ValueError(f"{name} must be {bound}, got {value}")
+    return value
+
+
 def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     """Order TP candidates: plain ``tp`` first, then ``tpN`` by numeric N (#154)."""
     name = item[0]
@@ -285,12 +382,43 @@ class TradeEngine:
             if self._max_position_exposure_pct is None
             else min(self._max_position_exposure_pct, max_leverage)
         )
-        fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
-        if fixed_risk_amount is None:
-            fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
+        # #170: resolve -- and thereby validate -- the declared risk amount
+        # here, BEFORE any stop-dependent branch. `nan > 0`, `-inf > 0` and a
+        # negative amount all compare False, so a value checked after a gate is
+        # checked too late: at the merge base (`risk_amount =
+        # float(fixed_risk_amount)` inside
+        # `if fixed_risk_amount is not None and stop_loss_price is not None`,
+        # then only `if risk_amount > 0 and risk_distance > 0`), an unusable
+        # amount fell through to `risk_per_trade_pct` on two paths -- with a
+        # usable stop distance, and with no stop at all -- a size computed
+        # under a different risk rule than the config declares, with no error
+        # at all. (The third case, a stop exactly at the entry, already
+        # raised, but from `RiskEngine`: "entry_price and stop_loss must
+        # differ" -- it names the distance, never the amount.) Resolving
+        # first refuses the amount on all three, and keeps the right
+        # diagnosis. `0.0` -- and an absent key -- is the documented "off"
+        # idiom and keeps falling through unchanged.
+        risk_amount = _configured_risk_amount(self.config.parameters)
 
-        if fixed_risk_amount is not None and stop_loss_price is not None:
-            risk_amount = float(fixed_risk_amount)
+        if risk_amount > 0 and stop_loss_price is not None:
+            # #170: the tick pair and the broker grid only apply to the
+            # fixed-risk conversion, so they stay with their branch -- but
+            # they are resolved -- and thereby validated -- above the
+            # risk-distance gate below. An unusable stop distance is refused
+            # further down either way (no risk distance = no size); what
+            # resolving here buys is that a configured `tick_value: 0` (or a
+            # negative grid value) is reported as the config error it is,
+            # whatever the bar data does, instead of being reached only when
+            # the distances happen to be usable.
+            tick_value = _sizing_value(
+                "tick_value", self.config.parameters.get("tick_value"), 1.0, positive=True
+            )
+            tick_size = _sizing_value(
+                "tick_size", self.config.parameters.get("tick_size"), 1.0, positive=True
+            )
+            lot_step = _sizing_value("lot_step", self.config.parameters.get("lot_step"), 0.0)
+            min_lot = _sizing_value("min_lot", self.config.parameters.get("min_lot"), 0.0)
+            max_lot = _sizing_value("max_lot", self.config.parameters.get("max_lot"), 0.0)
             # MT5 parity: when the strategy provides an explicit stop distance
             # (e.g. ATR-based, as the MT5 EA computes lots from the ATR
             # distance at order time), size from it directly instead of
@@ -301,25 +429,88 @@ class TradeEngine:
                 risk_distance = float(stop_distance)
             else:
                 risk_distance = abs(float(entry_price) - float(stop_loss_price))
-            if risk_amount > 0 and risk_distance > 0:
-                tick_value = float(self.config.parameters.get("tick_value", 1.0) or 1.0)
-                tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
-                lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
-                min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
-                max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
+            if risk_distance > 0:
                 shares = (risk_amount / risk_distance) * (tick_size / tick_value)
                 if lot_step > 0:
-                    shares = math.floor((shares / lot_step) + 1e-12) * lot_step
+                    shares = _floor_to_lot_grid(shares, lot_step)
                 if min_lot > 0:
                     shares = max(shares, min_lot)
+                # Size the two skip WARNINGs below report as "before caps":
+                # the raw conversion, floored to the grid and raised to
+                # `min_lot`. `uncapped_shares` (below) is the size the
+                # leverage/exposure cap may reduce -- it is captured AFTER
+                # `max_lot`, because max_lot is a broker limit, not a cap the
+                # re-normalisation guard compares against.
+                pre_cap_shares = shares
                 if max_lot > 0:
-                    shares = min(shares, max_lot)
+                    # Issue #151: max_lot is a broker limit too. Floor it once
+                    # to the grid so the cap is a grid value and needs no
+                    # re-normalisation of its own.
+                    max_lot_grid = (
+                        _floor_to_lot_grid(max_lot, lot_step) if lot_step > 0 else max_lot
+                    )
+                    shares = min(shares, max_lot_grid)
+                uncapped_shares = shares
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
                     max_value = self.equity * position_notional_limit
                     shares = min(shares, max_value / entry_price)
                 elif self._max_position_exposure_pct is not None:
                     max_value = self.equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
+                # Issue #151: the leverage/exposure cap is a raw
+                # equity/price ratio, so it can leave a size off the
+                # `lot_step` grid -- a size the broker would reject. Only a
+                # size the cap actually reduced is re-floored: an uncapped
+                # size may legitimately sit off-grid (e.g. raised to an
+                # off-grid `min_lot`) and must stay untouched.
+                if shares < uncapped_shares and lot_step > 0:
+                    shares = _floor_to_lot_grid(shares, lot_step)
+                # A size below `min_lot` after the caps is SKIPPED (size 0),
+                # never raised back up: the caps make it unaffordable at the
+                # minimum, and a max_lot below min_lot admits no valid size.
+                # One exception, and only with a grid (`lot_step > 0`): a grid
+                # product can come out of the floor an ulp below `min_lot`
+                # (`3 * 0.3 == 0.8999999999999999 < 0.9`). The broker accepts
+                # that size as `min_lot`, so with the same relative tolerance
+                # the grid floor uses, snap it up to `min_lot` and take the
+                # trade instead of skipping it. Without a grid there is no
+                # such product to be an ulp low: a capped raw ratio within
+                # the band below `min_lot` is a cap the configured minimum
+                # exceeds, and raising it to `min_lot` would push the size
+                # above the cap that just reduced it -- skip it instead.
+                if min_lot > 0 and shares < min_lot:
+                    if lot_step > 0 and math.isclose(shares, min_lot, rel_tol=1e-9):
+                        shares = min_lot
+                    else:
+                        logger.warning(
+                            "Skipping order: fixed-risk size %.6g is below min_lot %.6g after caps "
+                            "(size before caps %.6g, before the leverage/exposure cap %.6g, "
+                            "max_lot %.6g)",
+                            shares,
+                            min_lot,
+                            pre_cap_shares,
+                            uncapped_shares,
+                            max_lot,
+                        )
+                        return 0.0
+                if shares <= 0.0:
+                    # The caps can floor a size to zero outright: with
+                    # `0 < max_lot < lot_step` the grid floor of the cap is
+                    # 0 (and `min_lot == 0` leaves no lower bound to catch
+                    # it above). The trade is dropped either way -- say so
+                    # with the same WARNING the min_lot skip above logs,
+                    # instead of returning the zero silently.
+                    logger.warning(
+                        "Skipping order: fixed-risk size is zero after caps "
+                        "(size before caps %.6g, before the leverage/exposure cap %.6g, "
+                        "min_lot %.6g, max_lot %.6g, lot_step %.6g)",
+                        pre_cap_shares,
+                        uncapped_shares,
+                        min_lot,
+                        max_lot,
+                        lot_step,
+                    )
+                    return 0.0
                 return max(shares, 0.0)
 
         pending_positions = sum(
@@ -380,6 +571,30 @@ class TradeEngine:
         """
         return resolve_bar_spread(row, self.config.parameters.get("spread_price_col"))
 
+    def _equity_proportional_for_stop(self, stop_loss_price: float | None) -> bool:
+        """A-M4 (D5): may the shared-equity replay re-scale an order sized from this stop?
+
+        Fixed-amount (`fixed_risk_amount`) sizing is absolute-$ and must NOT be
+        re-scaled by the multi-symbol replay; percentage sizing must be. The
+        test is the branch gate of `_calculate_position_size` itself
+        (`risk_amount > 0 and stop_loss_price is not None`), so the flag can
+        never describe a rule the final quantity was not sized by -- at order
+        creation and again at the fill-time re-size, which can select the
+        OTHER branch: a strategy that emits only `stop_distance` has no stop
+        at creation, so its order is percentage-sized there, while the stop
+        synthesized from `stop_distance` at fill sizes the same order by the
+        fixed-amount branch.
+
+        #170: `fixed_risk_amount: 0.0` is the documented "off" idiom, so such
+        an order is percentage-sized and the replay must re-scale it exactly
+        like an absent key; a multi-symbol run must not silently stop
+        re-scaling a percentage-sized position because that key was spelled
+        out. Asking the resolver the sizing path uses keeps the two in step
+        and makes an unusable value raise here too.
+        """
+        risk_amount = _configured_risk_amount(self.config.parameters)
+        return not (risk_amount > 0 and stop_loss_price is not None)
+
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
         stop_loss, tp_levels = self._extract_levels(row)
@@ -437,14 +652,12 @@ class TradeEngine:
         order._sizing_only_stop = stop_loss is None and sizing_only_stop is not None
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
         # proportional), so the shared-equity replay must not re-scale this
-        # order's quantity — it still tracks exposure and credits PnL.
-        fixed_cfg = self.config.parameters.get("fixed_risk_amount")
-        if fixed_cfg is None:
-            fixed_cfg = self.config.parameters.get("Fixed_Risk_Amount")
-        order_equity_proportional = not (
-            fixed_cfg is not None and size_from_stop is not None
-        )
-        order._equity_proportional = order_equity_proportional  # transient, not a dataclass field
+        # order's quantity — it still tracks exposure and credits PnL. The
+        # flag is derived through the same gate the sizing branch uses (see
+        # `_equity_proportional_for_stop`), including the #170
+        # `fixed_risk_amount: 0.0`-is-off read. Transient marker: not an
+        # `Order` dataclass field.
+        order._equity_proportional = self._equity_proportional_for_stop(size_from_stop)
         self.pending_orders.append(order)
 
     def _open_position(self, order: Order, fill_price: float, fill_time: str, i: int) -> None:
@@ -578,6 +791,7 @@ class TradeEngine:
                     )
                     if order.quantity <= 0:
                         continue
+                    order._equity_proportional = self._equity_proportional_for_stop(order.stop_loss)
                 if order.order_type == OrderType.MARKET:
                     sizing_stop = order.stop_loss
                     if sizing_stop is None and getattr(order, "_sizing_only_stop", False):
@@ -624,6 +838,20 @@ class TradeEngine:
                         )
                         if order.quantity <= 0:
                             continue
+                        # A-M4 (D5)/#170: the fill-time re-size can select a
+                        # different sizing branch than the creation-time
+                        # estimate (a `stop_distance`-only order was
+                        # percentage-sized at creation and is re-sized here
+                        # by the absolute-$ fixed-risk branch). Re-derive the
+                        # flag from the stop this re-size actually used, so
+                        # the replay marker always describes the rule the
+                        # final quantity was computed with -- a True flag on
+                        # an absolute-$ position makes the shared-equity
+                        # replay re-scale it on a multi-symbol run (Nx the
+                        # configured risk).
+                        order._equity_proportional = self._equity_proportional_for_stop(
+                            sizing_stop_value
+                        )
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
                 # on the wrong side of the entry (LONG stop >= entry, SHORT
                 # stop <= entry) would produce an instantly-triggered,
