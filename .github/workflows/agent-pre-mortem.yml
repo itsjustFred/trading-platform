@@ -110,15 +110,14 @@ on:
         type: string
 
 concurrency:
-  # Keyed by the analysed commit, not by the PR alone: the documented manual
-  # rerun of an older commit (`-f head_sha=<old-sha>`) must not cancel the run
-  # that is analysing the current head - that run's cancellation reporter would
-  # mark the head `error` and leave it with no analysis at all. A rerun naming
-  # the same commit does cancel a stale run of that commit, which is the only
-  # supersession this group is for; a rerun that omits `head_sha` shares the
-  # `current-head` bucket with the push's run, so it supersedes it instead of
-  # running a second analysis of the same diff beside it (the comment guard keeps
-  # whichever result lands last).
+  # A rerun of an older commit (`-f head_sha=<old-sha>`) must not cancel the run that
+  # is analysing the current head - that run's cancellation reporter would mark the
+  # head `error` and leave it with no analysis at all - so such a rerun keeps a
+  # bucket of its own. A rerun naming the same commit does cancel a stale run of
+  # that commit; a rerun that omits `head_sha` shares the `current-head` bucket
+  # with the push's run, so it supersedes it instead of running a second analysis
+  # of the same diff beside it (the comment guard keeps whichever result lands
+  # last).
   #
   # The bucket carries an analysed commit only when a *dispatch* names one. A push
   # must not carry its head SHA here: every push would then land in a group of its
