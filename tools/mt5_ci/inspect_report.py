@@ -146,16 +146,21 @@ def parse_number(text: str | None) -> float | None:
 
 
 def _find_deals_table(tables: list[list[list[str]]]) -> tuple[list[str], list[list[str]]] | None:
+    """Locate the deals header row and return it with the rows that follow.
+
+    MT5 writes the whole report into one table, so the header is a row in the
+    middle rather than the first row of a table. The header is identified by
+    its column labels (Time + Direction + Price); the Orders table above it has
+    "Open Time" and no Direction column, so it cannot match.
+    """
     for table in tables:
-        if len(table) < 2:
-            continue
-        header = table[0]
-        normalised = [_normalise(cell) for cell in header]
-        has_time = any(n in _label_set(DEAL_COLUMNS["time"]) for n in normalised)
-        has_direction = any(n in _label_set(DEAL_COLUMNS["direction"]) for n in normalised)
-        has_price = any(n in _label_set(DEAL_COLUMNS["price"]) for n in normalised)
-        if has_time and has_direction and has_price:
-            return header, table[1:]
+        for index, row in enumerate(table):
+            normalised = [_normalise(cell) for cell in row]
+            has_time = any(n in _label_set(DEAL_COLUMNS["time"]) for n in normalised)
+            has_direction = any(n in _label_set(DEAL_COLUMNS["direction"]) for n in normalised)
+            has_price = any(n in _label_set(DEAL_COLUMNS["price"]) for n in normalised)
+            if has_time and has_direction and has_price:
+                return row, table[index + 1 :]
     return None
 
 
@@ -182,6 +187,8 @@ def extract_deals(tables: list[list[list[str]]]) -> list[dict[str, Any]]:
             return row[index]
 
         if not cell("time"):
+            continue
+        if cell("type").strip().lower() == "balance":
             continue
         deals.append(
             {

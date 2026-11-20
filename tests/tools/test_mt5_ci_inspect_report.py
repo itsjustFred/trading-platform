@@ -200,3 +200,46 @@ def test_grouped_thousands_are_parsed(tmp_path: Path) -> None:
     assert module.parse_number("45.1%") == 45.1
     assert module.parse_number("") is None
     assert module.parse_number("n/a") is None
+
+
+def test_deals_table_inside_single_report_table(tmp_path: Path) -> None:
+    """MT5 writes the whole report as one table; the deals header is a mid-table row."""
+    module = _load_module()
+    html = (
+        "<html><body><table>"
+        "<tr><td colspan='13'>Strategy Tester Report</td></tr>"
+        "<tr><td colspan='3'>Expert:</td><td colspan='10'>IntradayVolatilityBreakout</td></tr>"
+        "<tr><td colspan='3'>Symbol:</td><td colspan='10'>EURUSD_CI</td></tr>"
+        "<tr><td colspan='3'>Total Trades:</td><td colspan='10'>1</td></tr>"
+        "<tr><td colspan='13'><b>Orders</b></td></tr>"
+        "<tr><td>Open Time</td><td>Order</td><td>Symbol</td><td>Type</td><td>Volume</td>"
+        "<td>Price</td><td>S / L</td><td>T / P</td><td>Time</td><td>State</td><td>Comment</td></tr>"
+        "<tr><td>2026.03.02 16:45:00</td><td>2</td><td>EURUSD_CI</td><td>buy</td><td>4.4</td>"
+        "<td>1.17170</td><td>1.17057</td><td></td><td>2026.03.02 16:45:00</td><td>filled</td>"
+        "<td>Breakout Long</td></tr>"
+        "<tr><td colspan='13'><b>Deals</b></td></tr>"
+        "<tr><td>Time</td><td>Deal</td><td>Symbol</td><td>Type</td><td>Direction</td>"
+        "<td>Volume</td><td>Price</td><td>Order</td><td>Commission</td><td>Swap</td>"
+        "<td>Profit</td><td>Balance</td><td>Comment</td></tr>"
+        "<tr><td>2026.02.20 00:00:00</td><td>1</td><td></td><td>balance</td><td></td>"
+        "<td></td><td></td><td></td><td>0.00</td><td>0.00</td><td>0.00</td>"
+        "<td>100 000.00</td><td></td></tr>"
+        "<tr><td>2026.03.02 16:45:00</td><td>2</td><td>EURUSD_CI</td><td>buy</td><td>in</td>"
+        "<td>4.4</td><td>1.17170</td><td>2</td><td>0.00</td><td>0.00</td><td>0.00</td>"
+        "<td>100 000.00</td><td>Breakout Long</td></tr>"
+        "<tr><td>2026.03.02 17:15:40</td><td>3</td><td>EURUSD_CI</td><td>sell</td><td>out</td>"
+        "<td>4.4</td><td>1.17057</td><td>3</td><td>0.00</td><td>0.00</td><td>-497.20</td>"
+        "<td>99 502.80</td><td>sl 1.17057</td></tr>"
+        "</table></body></html>"
+    )
+    path = _write(tmp_path / "report.htm", html)
+
+    summary = module.summarise(path)
+
+    assert summary["expert"] == "IntradayVolatilityBreakout"
+    assert summary["symbol"] == "EURUSD_CI"
+    assert summary["total_trades_value"] == 1.0
+    # The balance row is not a deal.
+    assert summary["deal_rows"] == 2
+    assert [deal["type"] for deal in summary["deals"]] == ["buy", "sell"]
+    assert module.check(summary, "IntradayVolatilityBreakout", "EURUSD_CI", 1) == []
