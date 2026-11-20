@@ -106,6 +106,15 @@ for label, key in _STAT_LABELS:
     _STAT_LABEL_MAP[label] = key
     _STAT_LABEL_MAP[label.rstrip(" :")] = key
 
+# Drawdown stats carry "pct% (absolute)" or "absolute (pct%)"; map the label
+# key to (percentage key, absolute key).
+_DRAWDOWN_KEYS: dict[str, tuple[str, str]] = {
+    "max_drawdown_pct": ("max_drawdown_pct", "max_drawdown_abs"),
+    "max_drawdown_max": ("max_drawdown_max_pct", "max_drawdown_abs"),
+    "max_drawdown_equity_pct": ("max_drawdown_equity_pct", "max_drawdown_equity_abs"),
+    "max_drawdown_equity_max": ("max_drawdown_equity_max_pct", "max_drawdown_equity_abs"),
+}
+
 
 class MT5HTMLImporter(BaseImporter):
     """Import MT5 Strategy Tester HTML reports (German UI)."""
@@ -334,26 +343,12 @@ class MT5HTMLImporter(BaseImporter):
 
         for table in soup.find_all("table"):
             for tr in table.find_all("tr"):
-                cells = tr.find_all(("td", "th"))
-                if not cells:
-                    continue
-                # Stats can be laid out as label-value pairs across columns
-                for i in range(0, len(cells) - 1, 2):
-                    label = cells[i].get_text(strip=True)
-                    val = cells[i + 1].get_text(strip=True) if (i + 1) < len(cells) else ""
-                    MT5HTMLImporter._apply_stat(label, val, stats)
-                # Also handle 4-column layouts: label, val, label, val
-                if len(cells) == 4:
-                    MT5HTMLImporter._apply_stat(
-                        cells[0].get_text(strip=True),
-                        cells[1].get_text(strip=True),
-                        stats,
-                    )
-                    MT5HTMLImporter._apply_stat(
-                        cells[2].get_text(strip=True),
-                        cells[3].get_text(strip=True),
-                        stats,
-                    )
+                cells = [cell.get_text(strip=True) for cell in tr.find_all(("td", "th"))]
+                # A row holds one or two label/value pairs, and some rows start
+                # with an empty spacer cell (colspan) that shifts every pair,
+                # so scan each adjacent pair instead of a fixed stride.
+                for index in range(len(cells) - 1):
+                    MT5HTMLImporter._apply_stat(cells[index], cells[index + 1], stats)
 
         if "total_pnl" in stats and initial_capital is not None:
             try:
@@ -389,16 +384,15 @@ class MT5HTMLImporter(BaseImporter):
             if losses is not None:
                 stats["losers"] = losses
             return
-        if key in ("max_drawdown_pct", "max_drawdown_max"):
+        drawdown = _DRAWDOWN_KEYS.get(key)
+        if drawdown is not None:
+            pct_key, abs_key = drawdown
             pct = MT5HTMLImporter._extract_first_percent(val)
             if pct is not None:
-                if key == "max_drawdown_pct":
-                    stats["max_drawdown_pct"] = pct
-                else:
-                    stats["max_drawdown_max_pct"] = pct
+                stats[pct_key] = pct
             abs_val = MT5HTMLImporter._extract_parenthesized_number(val)
             if abs_val is not None:
-                stats["max_drawdown_abs"] = abs_val
+                stats[abs_key] = abs_val
             return
 
         parsed = MT5HTMLImporter._coerce_stat(val)

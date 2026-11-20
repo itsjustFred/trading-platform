@@ -424,3 +424,30 @@ class TestEnglishReport:
         assert ref.stats["total_pnl"] == pytest.approx(-1173.41)
         assert ref.stats["profit_factor"] == pytest.approx(0.25)
         assert ref.stats["win_rate"] == pytest.approx(20.0)
+
+    def test_stats_after_a_spacer_cell_are_not_shifted(self):
+        """Rows that start with an empty colspan cell still pair label with value."""
+        ref = self._load()
+        assert ref.stats["max_winner"] == pytest.approx(389.50)
+        assert ref.stats["max_loser"] == pytest.approx(-498.64)
+        assert ref.stats["avg_winner"] == pytest.approx(389.50)
+        assert ref.stats["avg_loser"] == pytest.approx(-390.73)
+        assert ref.stats["avg_consecutive_wins"] == pytest.approx(1)
+        assert ref.stats["avg_consecutive_losses"] == pytest.approx(2)
+
+    def test_equity_drawdowns_are_numbers(self):
+        ref = self._load()
+        assert ref.stats["max_drawdown_equity_pct"] == pytest.approx(1.73)
+        assert ref.stats["max_drawdown_equity_max_pct"] == pytest.approx(1.73)
+        assert ref.stats["max_drawdown_equity_abs"] == pytest.approx(1732.15)
+
+
+class TestGermanReportStats:
+    """The German fixture lays stats out as label, value, label, value."""
+
+    def test_two_pairs_per_row_are_parsed(self):
+        ref = MT5HTMLImporter().load(_sample_path())
+        assert ref.stats["total_trades"] == pytest.approx(5)
+        assert ref.stats["profit_factor"] == pytest.approx(2.15)
+        assert ref.stats["avg_winner"] == pytest.approx(700.00)
+        assert ref.stats["max_drawdown_pct"] == pytest.approx(5.52)
