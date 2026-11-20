@@ -10,6 +10,7 @@ state.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1084,8 +1085,15 @@ def test_a_stop_amendment_is_refused_once_shutdown_was_requested(
     coordinator.request("SIGTERM")
     manager = LiveTrailingStopManager(mutation_gate=daemon._broker_mutation)
 
-    with caplog.at_level("WARNING"):
+    # The ``live-runner`` logger does not propagate, so caplog only sees the
+    # refusal if its handler is attached to that logger directly.
+    live_logger = logging.getLogger("trading.live-runner")
+    live_logger.addHandler(caplog.handler)
+    caplog.set_level(logging.WARNING, logger="trading.live-runner")
+    try:
         live.feed(manager, [103.0])
+    finally:
+        live_logger.removeHandler(caplog.handler)
 
     assert live.client.replace_calls == [], "no amendment may start after the stop flag"
     assert live.client.stop_prices() == [98.0], "the broker-side stop is untouched"
