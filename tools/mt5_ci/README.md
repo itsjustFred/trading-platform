@@ -1,9 +1,11 @@
 # MT5 CI tester tools
 
 Helpers for `.github/workflows/mt5-backtest.yml`, which runs the MetaTrader 5
-Strategy Tester on a GitHub-hosted `windows-latest` runner. No broker account
-and no credentials are involved: the price history is our own CSV export,
-loaded into a custom symbol, so the tester never needs a connection.
+Strategy Tester on a GitHub-hosted `windows-latest` runner. No real broker
+account and no secrets are involved: the price history is our own CSV export,
+loaded into a custom symbol, so the tester never needs a connection. The
+terminal still has to see *some* account configured; the workflow writes
+placeholder `[Common]` values for that, as described below.
 
 | File | Purpose |
 |---|---|
@@ -40,10 +42,16 @@ import status to start with `OK`, and runs `inspect_report.py` with
 
 ## Local use
 
+The reference setfile is a release asset, not part of the checkout:
+
 ```bash
+gh release download mt5-ci-data-v0 --pattern EURUSD_H1_setfile.ini
 python tools/mt5_ci/convert_setfile.py --input EURUSD_H1_setfile.ini --output out.set
 python tools/mt5_ci/inspect_report.py --report report.html \
     --expect-expert IntradayVolatilityBreakout --expect-symbol EURUSD_CI --min-trades 1
 ```
+
+Both tools confine their paths to the current directory; pass `--root DIR`
+(repeatable) when a path legitimately lives elsewhere.
 
 Tests: `python -m pytest tests/tools`.
