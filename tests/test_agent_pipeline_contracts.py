@@ -31,7 +31,8 @@ What is pinned here:
   sibling workflows, whose comments swear to the same guards;
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
   extraction, fence strip, tree-clean check, the two-level skill selection) stay identical
-  modulo the names each copy substitutes;
+  modulo the names each copy substitutes - the selection by a test of its own, which is the
+  only way a copy that is not strict can fail it;
 - the agent job that reads the checkout holds only `contents: read`, keeps no credentials, and
   fails the run when HEAD moved or the tree is dirty.
 
@@ -453,6 +454,23 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     assert "not updating the comment" in body, "no reason is logged"
     assert MARKER in body, "the poster carries no marker of its own"
     assert "gh api" in body, "the poster does not use the REST API"
+    # A second comment carrying the marker (a duplicate from an interrupted run, or one
+    # created outside the workflow) used to be left alone by `tail -n 1`: the stale
+    # `# Pre-Mortem Action` stayed readable next to the current one forever. Every match is
+    # now updated, and the duplicate is logged rather than silently dropped.
+    assert "for id in $existing" in body, "a duplicate marker comment is left stale"
+    assert "::warning::" in body, "a duplicate marker comment is not reported"
+
+
+def test_the_pre_mortem_status_names_the_pr_it_was_written_for() -> None:
+    """`agent/pre-mortem` is one repo-global context, so two open PRs that share a head commit
+    (`feat -> main` and `feat -> release`) both write it from analyses of different diffs, and
+    the last write wins with no record of whose it was. Commit statuses cannot isolate per PR;
+    what they can carry is the PR number in the description, which is the only thing that tells
+    the two verdicts apart for a reader of the head's status."""
+    post = _load(PREMORTEM)["jobs"]["post"]
+    body = _run(_find_step(post, r"^Set status$"))
+    assert "PR #${PR_NUMBER}" in body, "the status description does not name the PR"
 
 
 def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
@@ -561,28 +579,72 @@ def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
 def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
     """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
     used only while the base has none. A base commit that cannot be read must abort the step -
-    a silent fall-through would run the PR's own rules while the comment says "base branch".
-    An unreachable base is also caught in the mutation workflow's scope step, which fails first,
-    so what is pinned here is the check existing in the agent job, not its exact step."""
+    a silent fall-through would run the PR's own rules while the prompt says "base branch", and
+    that is exactly what a step without `set -euo pipefail` does: the base-commit check fails,
+    the `if` on the base skill fails with it, and the `elif` takes the PR's copy.
+
+    The assertions are therefore scoped to the selection step of every copy, not to the agent
+    job as a whole: a base-commit check that lives in some other step (the mutation workflow's
+    scope step) leaves the selection itself able to fall through, which is how the two siblings
+    stayed non-strict while this test passed over them."""
     for name in AGENT_WORKFLOWS:
-        _job_name, job = _agent_job(_load(name))
-        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in _job_bodies([job]), (
-            f"{name}: no hard base-commit check in the agent job"
+        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
+        body = _run(step)
+        assert "set -euo pipefail" in body, f"{name}: the selection is not strict"
+        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, (
+            f"{name}: the selection does not refuse an unreachable base commit"
         )
-        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in _job_bodies([job]), (
+        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in body, (
             f"{name}: does not read the skill from the base branch first"
         )
-        assert 'cp "$SKILL_PATH"' in _job_bodies([job]), (
-            f"{name}: no fallback to the PR's own copy"
+        assert 'cp "$SKILL_PATH"' in body, f"{name}: no fallback to the PR's own copy"
+        assert "SKILL_SOURCE=base branch" in body, f"{name}: records no skill source"
+        # Two levels only: a third (the commit the workflow file came from) would analyse an older
+        # commit under rules the branch tip happens to carry.
+        assert "GITHUB_SHA" not in body, f"{name}: reads a third skill revision"
+        assert body.count("elif") == 1, f"{name}: more than two levels:\n{body}"
+
+
+def test_the_skill_selection_stays_identical_across_the_copies() -> None:
+    """The two-level selection is duplicated in all three workflows, and it is the block that
+    decides whose rules ran. The pre-mortem's copy used to be the strict one and the siblings'
+    were not, and nothing compared the bodies - so the divergence that mattered most was the one
+    the "kept in sync" test never looked at. Here the three bodies are compared line by line
+    after the documented per-copy substitutions (the temp directory, the agent id, the stage and
+    the skill noun in the error line), so the next divergence fails here instead of silently
+    grading a PR under rules it may have weakened."""
+    substitutions = {
+        REVIEW: (("review skill", "<skill>"), ("pr-review", "<agent>"), ("review", "<stage>")),
+        MUTATION: (
+            ("mutation-testing skill", "<skill>"),
+            ("pr-mutation", "<agent>"),
+            ("mutation", "<stage>"),
+        ),
+        PREMORTEM: (
+            ("pre-mortem skill", "<skill>"),
+            ("pr-premortem", "<agent>"),
+            ("premortem", "<stage>"),
+        ),
+    }
+
+    def selection(name: str) -> list[str]:
+        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
+        lines = []
+        for line in _run(step).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):  # prose, not a selection line
+                continue
+            for old, new in substitutions[name]:
+                line = line.replace(old, new)
+            lines.append(line)
+        return lines
+
+    reference = selection(REVIEW)
+    assert reference, "parsed no selection lines out of the review workflow"
+    for other in (MUTATION, PREMORTEM):
+        assert selection(other) == reference, f"{other}: skill selection diverged:\n" + "\n".join(
+            selection(other)
         )
-    step = _find_step(_agent_job(_load(PREMORTEM))[1], r"^Select skill revision$")
-    body = _run(step)
-    assert "set -euo pipefail" in body, "the selection is not strict"
-    assert "SKILL_SOURCE=base branch" in body, "the selection does not record its source"
-    # Two levels only: a third (the commit the workflow file came from) would analyse an older
-    # commit under rules the branch tip happens to carry.
-    assert "GITHUB_SHA" not in body, "the selection reads a third skill revision"
-    assert body.count("elif") == 1, f"the selection has more than two levels:\n{body}"
 
 
 def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
@@ -594,7 +656,10 @@ def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
     The per-copy substitutions below are the documented ones (the temp directory, the agent id),
     applied agent-id first so "pr-review" cannot be eaten by the shorter "review". A guard that
     only one copy needs is not here: the pre-mortem's stricter verdict prelude (it tolerates the
-    sign-off note the skill requires) and its head-moved comment guard are pinned separately.
+    sign-off note the skill requires) and its head-moved comment guard are pinned separately. The
+    two-level skill selection is not one of those exclusions - it is compared by
+    `test_the_skill_selection_stays_identical_across_the_copies`, which is where a copy that is
+    not strict has to fail.
     """
     substitutions = {
         REVIEW: (("pr-review", "<agent>"), ("review", "<stage>")),
