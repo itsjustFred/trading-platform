@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from runner.engine import TradeEngine
+from runner.engine_pkg.trading_engine import _floor_to_lot_grid
 from runner.engines.base import BacktestConfig
 
 # Issue #151: a (lot_step, steps) pair for which `(steps * lot_step) / lot_step`
@@ -459,6 +460,56 @@ def test_fixed_risk_grid_size_ulp_below_min_lot_creates_order():  # Issue #151
 
     assert len(result.trades) == 1
     assert result.trades[0].quantity == pytest.approx(0.9)
+
+
+def test_fixed_risk_cap_within_snap_band_below_min_lot_without_grid_is_skipped():  # Issue #151
+    # #170 follow-up (cubic P2): the min_lot snap-up is a GRID exception. It
+    # exists for a grid product that came out of the floor an ulp below
+    # `min_lot`; without a `lot_step` there is no grid product, and snapping
+    # a capped raw ratio up to `min_lot` would raise the size above the cap
+    # that just reduced it. The leverage cap is crafted one ulp below
+    # `min_lot` (inside the relative band), so the trade is skipped, not
+    # traded at min_lot.
+    cap = math.nextafter(0.9, 0.0)
+    assert math.isclose(cap, 0.9, rel_tol=1e-9), "fixture relies on the cap being in the band"
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "min_lot": 0.9,
+        },
+        max_leverage=cap / 1000.0,  # cap = 100_000 * lev / 100 = one ulp below 0.9
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == 0.0
+
+
+def test_floor_to_lot_grid_never_exceeds_size_by_more_than_the_band():  # Issue #151
+    # #170 follow-up (cubic P2): the snap CAN return a value above `size`
+    # (the grid multiple a float product already represents), and that is
+    # what keeps a cap exact: an on-grid `max_lot` must not floor one whole
+    # lot below itself. Pin the documented bound instead of a strict floor:
+    # the overshoot never exceeds the relative band
+    # (`1e-9 * max(1, |quotient|)`), so a capped value is only ever read as
+    # the grid multiple it already was. A strict floor would instead cut an
+    # on-grid cap by a lot (`25602 * 0.01` -> 256.01, see
+    # `test_fixed_risk_max_lot_on_grid_is_not_floored_below_itself`) and drop
+    # the ulp-low grid products the min_lot snap-up is built on.
+    grid_multiple = _NON_IDEMPOTENT_STEPS * _NON_IDEMPOTENT_LOT_STEP
+    size = math.nextafter(grid_multiple, 0.0)  # one ulp below the grid multiple
+
+    floored = _floor_to_lot_grid(size, _NON_IDEMPOTENT_LOT_STEP)
+
+    assert floored == pytest.approx(grid_multiple)
+    assert floored - size <= 1e-9 * size
 
 
 def test_fixed_risk_max_lot_without_lot_step_applies_raw():  # Issue #151

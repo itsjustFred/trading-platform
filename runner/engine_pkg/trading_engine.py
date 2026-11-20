@@ -468,13 +468,18 @@ class TradeEngine:
                 # A size below `min_lot` after the caps is SKIPPED (size 0),
                 # never raised back up: the caps make it unaffordable at the
                 # minimum, and a max_lot below min_lot admits no valid size.
-                # One exception: a grid product can come out of the floor an
-                # ulp below `min_lot` (`3 * 0.3 == 0.8999999999999999 < 0.9`).
-                # The broker accepts that size as `min_lot`, so with the same
-                # relative tolerance the grid floor uses, snap it up to
-                # `min_lot` and take the trade instead of skipping it.
+                # One exception, and only with a grid (`lot_step > 0`): a grid
+                # product can come out of the floor an ulp below `min_lot`
+                # (`3 * 0.3 == 0.8999999999999999 < 0.9`). The broker accepts
+                # that size as `min_lot`, so with the same relative tolerance
+                # the grid floor uses, snap it up to `min_lot` and take the
+                # trade instead of skipping it. Without a grid there is no
+                # such product to be an ulp low: a capped raw ratio within
+                # the band below `min_lot` is a cap the configured minimum
+                # exceeds, and raising it to `min_lot` would push the size
+                # above the cap that just reduced it -- skip it instead.
                 if min_lot > 0 and shares < min_lot:
-                    if math.isclose(shares, min_lot, rel_tol=1e-9):
+                    if lot_step > 0 and math.isclose(shares, min_lot, rel_tol=1e-9):
                         shares = min_lot
                     else:
                         logger.warning(
