@@ -63,12 +63,6 @@ on:
         description: "Fail the job if the report has fewer trades"
         default: "1"
         required: true
-  # SPIKE: remove before ready — workflow_dispatch only exists once this file
-  # is on the default branch, so the spike branch iterates through this push
-  # trigger. It is limited to that one branch: never PRs, never other branches.
-  push:
-    branches: [feat/mt5-ci-tester-spike]
-
 permissions:
   contents: read
 
