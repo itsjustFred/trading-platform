@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 from collections.abc import Sequence
 from html.parser import HTMLParser
@@ -68,6 +70,9 @@ DEAL_COLUMNS: dict[str, tuple[str, ...]] = {
 
 # The stock EA the tester falls back to when Expert= cannot be resolved.
 FALLBACK_EXPERT_MARKER = "moving average"
+
+# An "Inputs:" row of the report renders each ExpertParameters line as one cell.
+INPUT_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 
 class _TableParser(HTMLParser):
@@ -235,6 +240,23 @@ def extract_deals(tables: list[list[list[str]]]) -> list[dict[str, Any]]:
     return deals
 
 
+def extract_inputs(tables: list[list[list[str]]]) -> dict[str, str]:
+    """Return the EA inputs the tester reported, as ``{name: value}``.
+
+    The report lists the *effective* ExpertParameters under "Inputs:". A run
+    that ignored ``ExpertParameters`` still shows the EA's defaults, so
+    comparing one value is the only way to tell the two apart.
+    """
+    inputs: dict[str, str] = {}
+    for table in tables:
+        for row in table:
+            for cell in row:
+                match = INPUT_LINE.match(cell.strip())
+                if match and match.group(2).strip():
+                    inputs[match.group(1)] = match.group(2).strip()
+    return inputs
+
+
 def summarise(report: Path) -> dict[str, Any]:
     text = decode_report(report.read_bytes())
     parser = _TableParser()
@@ -250,7 +272,21 @@ def summarise(report: Path) -> dict[str, Any]:
     deals = extract_deals(parser.tables)
     summary["deal_rows"] = len(deals)
     summary["deals"] = deals
+    summary["inputs"] = extract_inputs(parser.tables)
     return summary
+
+
+def _values_match(expected: str, actual: str) -> bool:
+    """Compare an input value, numerically when both sides are numbers."""
+    if expected.strip() == actual.strip():
+        return True
+    expected_number = parse_number(expected)
+    actual_number = parse_number(actual)
+    return (
+        expected_number is not None
+        and actual_number is not None
+        and math.isclose(expected_number, actual_number, rel_tol=0.0, abs_tol=1e-9)
+    )
 
 
 def check(
@@ -258,6 +294,7 @@ def check(
     expect_expert: str | None,
     expect_symbol: str | None,
     min_trades: int,
+    expect_inputs: Sequence[str] = (),
 ) -> list[str]:
     """Return a list of human-readable failures (empty means the run is valid)."""
     failures: list[str] = []
@@ -288,6 +325,22 @@ def check(
 
     if not summary.get("deals"):
         failures.append("report has no deals table rows")
+
+    inputs = summary.get("inputs") or {}
+    for item in expect_inputs:
+        key, separator, expected = item.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            failures.append(f"--expect-input {item!r} is not KEY=VALUE")
+            continue
+        actual = inputs.get(key)
+        if actual is None:
+            failures.append(
+                f"report has no input {key!r}: ExpertParameters was not loaded "
+                "(check MQL5\\Profiles\\Tester and the .set file name)"
+            )
+        elif not _values_match(expected, actual):
+            failures.append(f"report input {key}={actual!r}, expected {expected.strip()!r}")
     return failures
 
 
@@ -315,6 +368,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--no-deals", action="store_true", help="omit deal rows from JSON")
     parser.add_argument(
+        "--expect-input",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="assert the tester loaded this ExpertParameters input (repeatable)",
+    )
+    parser.add_argument(
         "--root",
         action="append",
         default=[],
@@ -338,7 +398,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     summary = summarise(report_path)
-    failures = check(summary, args.expect_expert, args.expect_symbol, args.min_trades)
+    failures = check(
+        summary, args.expect_expert, args.expect_symbol, args.min_trades, args.expect_input
+    )
 
     printable = dict(summary)
     if args.no_deals:

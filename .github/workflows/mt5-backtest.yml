@@ -503,9 +503,18 @@ jobs:
             throw 'tester produced no HTML report: the [Tester] section was ignored (missing /portable, BOM, or bad config)'
           }
           Copy-Item -Path $report.FullName -Destination (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report.html') -Force
+          # A report can name our EA and still have run it on its default
+          # inputs (ExpertParameters not found). Pin one value from the .set
+          # we converted so that failure is loud; numeric values compare as
+          # numbers, so 0.25 vs 0.250000 is not a false alarm.
+          $setInputs = Get-Content -Path 'tester.set' | Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_]*=' }
+          if (-not $setInputs) { throw 'tester.set has no input lines' }
+          $pinned = $setInputs | Where-Object { ($_ -split '=', 2)[1] -match '^-?[0-9]+(\.[0-9]+)?$' } | Select-Object -First 1
+          if (-not $pinned) { $pinned = $setInputs | Select-Object -First 1 }
+          Write-Host "pinned input: $pinned"
           python tools/mt5_ci/inspect_report.py --report $report.FullName `
             --expect-expert $env:EA_FILE --expect-symbol $env:SYMBOL `
-            --min-trades ([int]$env:MIN_TRADES) `
+            --min-trades ([int]$env:MIN_TRADES) --expect-input $pinned `
             --json-out (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report_summary.json') `
             --root "$env:GITHUB_WORKSPACE" --root "$env:MT5_HOME"
           if ($LASTEXITCODE -ne 0) { throw "report assertion failed ($LASTEXITCODE)" }

@@ -38,7 +38,9 @@ Each of these still produces a normal-looking report:
 
 The workflow therefore parses the compile log for `0 errors`, requires the
 import status to start with `OK`, and runs `inspect_report.py` with
-`--expect-expert`, `--expect-symbol` and `--min-trades` before uploading.
+`--expect-expert`, `--expect-symbol`, `--min-trades` and one `--expect-input`
+taken from the converted `.set` (a run that ignored `ExpertParameters` keeps
+the EA defaults) before uploading.
 
 ## Local use
 

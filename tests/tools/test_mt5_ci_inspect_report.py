@@ -197,6 +197,49 @@ def test_no_deals_also_applies_to_json_out(tmp_path: Path, capsys) -> None:
     assert payload["deal_rows"] == 2
 
 
+def test_expected_input_proves_expert_parameters_loaded() -> None:
+    """A run that ignored ExpertParameters keeps the EA defaults."""
+    module = _load_module()
+    path = (
+        REPO_ROOT / "tests" / "fixtures" / "validation" / "mt5_html" / "sample_report_en_utf16.htm"
+    )
+
+    summary = module.summarise(path)
+
+    assert summary["inputs"]["ATR_Period"] == "5"
+    assert summary["inputs"]["Entry_Time"] == "16:30"
+    assert module.check(
+        summary,
+        "IntradayVolatilityBreakout",
+        "EURUSD_CI",
+        1,
+        ["ATR_Period=5", "ATR_Multiplier=0.25"],
+    ) == []
+    failures = module.check(summary, "IntradayVolatilityBreakout", "EURUSD_CI", 1, ["ATR_Period=7"])
+    assert any("expected '7'" in failure for failure in failures)
+
+
+def test_missing_expected_input_names_expert_parameters(tmp_path: Path) -> None:
+    module = _load_module()
+    html = (
+        "<html><body><table>"
+        "<tr><td>Expert:</td><td>IntradayVolatilityBreakout</td></tr>"
+        "<tr><td>Symbol:</td><td>EURUSD_CI</td></tr>"
+        "<tr><td>Total Trades:</td><td>1</td></tr>"
+        "<tr><td>Inputs:</td><td>Breakout Parameters=</td></tr>"
+        "<tr><td></td><td>ATR_Period=5</td></tr>"
+        f"</table><table>{DEALS_HEADER}{DEALS_ROWS}</table></body></html>"
+    )
+    path = _write(tmp_path / "report.html", html)
+
+    summary = module.summarise(path)
+    failures = module.check(
+        summary, "IntradayVolatilityBreakout", "EURUSD_CI", 1, ["ATR_Multiplier=0.25"]
+    )
+
+    assert any("ExpertParameters was not loaded" in failure for failure in failures)
+
+
 def test_cli_exits_nonzero_on_assertion(tmp_path: Path, capsys) -> None:
     module = _load_module()
     path = _write(tmp_path / "report.html", _report(trades="0", include_deals=False))
