@@ -347,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if json_out is not None:
         json_out.parent.mkdir(parents=True, exist_ok=True)
-        json_out.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        json_out.write_text(json.dumps(printable, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if failures:
         for failure in failures:

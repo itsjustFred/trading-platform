@@ -182,6 +182,21 @@ def test_cli_writes_json_and_exits_zero(tmp_path: Path, capsys) -> None:
     assert "OK" in capsys.readouterr().err
 
 
+def test_no_deals_also_applies_to_json_out(tmp_path: Path, capsys) -> None:
+    module = _load_module()
+    path = _write(tmp_path / "report.html", _report())
+    out = tmp_path / "summary.json"
+
+    code = module.main(
+        ["--report", str(path), "--json-out", str(out), "--no-deals", "--root", str(tmp_path)]
+    )
+
+    assert code == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "deals" not in payload
+    assert payload["deal_rows"] == 2
+
+
 def test_cli_exits_nonzero_on_assertion(tmp_path: Path, capsys) -> None:
     module = _load_module()
     path = _write(tmp_path / "report.html", _report(trades="0", include_deals=False))
