@@ -1226,6 +1226,149 @@ def _burst_message(i: int) -> dict:
     }
 
 
+class TestIssue232PoisonMessage:
+    """One malformed message must not silence the rest of its page.
+
+    Regression: the seen-set was updated before the message was parsed/queued, so
+    an exception after `seen.add` propagated to `_poll_loop`, aborted the page
+    and left the id in `seen` -- the message was skipped forever and every
+    later message on that page was lost for that poll.
+    """
+
+    def test_parse_error_is_logged_at_error_with_channel_and_message_id(
+        self, monkeypatch, caplog
+    ) -> None:
+        import asyncio
+        import logging
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+
+        def _explode(*_args, **_kwargs):
+            raise ValueError("boom: structurally malformed payload")
+
+        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _explode)
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [_burst_message(1)]
+
+        source._fetch_messages = _fetch
+
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(source._poll_once("channel-1"))
+
+        records = [r for r in caplog.records if "Discord message dropped" in r.getMessage()]
+        assert records, "a dropped signal must be logged at ERROR, not silent"
+        data = getattr(records[0], "data", {})
+        assert data.get("channel_id") == "channel-1"
+        assert data.get("message_id") == "1001"
+        assert data.get("bot_name") == "ramjet"
+        assert data.get("error_type") == "ValueError"
+        # The poison id stays seen so it is not retried forever, and the cursor
+        # still moves past it so the channel is not pinned.
+        assert "1001" in source._seen_ids["channel-1"]
+        assert source._last_seen_message_ids["channel-1"] == "1001"
+        assert source._queue.empty()
+
+    def test_one_bad_message_does_not_lose_the_rest_of_the_page(self, monkeypatch) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        real_parser = ds._parse_trade_signal_from_message
+
+        def _maybe_explode(message, **kwargs):
+            if str(message.id) == "1002":
+                raise RuntimeError("poison payload")
+            return real_parser(message, **kwargs)
+
+        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _maybe_explode)
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [_burst_message(index) for index in (4, 1, 3, 2)]  # ids 1001..1004
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1001", "1003", "1004"]
+        assert source._last_seen_message_ids["channel-1"] == "1004"
+
+    def test_malformed_author_row_is_skipped_not_raised(self, caplog) -> None:
+        import asyncio
+        import logging
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        bad = {**_burst_message(1), "author": "not-a-dict"}
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [bad, _burst_message(2)]
+
+        source._fetch_messages = _fetch
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(source._poll_once("channel-1"))  # must not raise
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1002"]
+        assert any("Discord message dropped" in r.getMessage() for r in caplog.records)
+
+    def test_poison_message_is_not_retried_when_the_page_repeats_it(
+        self, monkeypatch
+    ) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        # The poison row keeps its place at the head of the page (a server that
+        # answers `after=` with a repeat of the boundary row).
+        poison = {**_burst_message(1), "author": "not-a-dict"}
+        attempts: list[str] = []
+        real_parser = ds._parse_trade_signal_from_message
+
+        def _counting_parser(message, **kwargs):
+            attempts.append(str(message.id))
+            if getattr(message, "id", None) == "1001":
+                # The poison row is already inside the parser when it dies on
+                # the malformed author, so it must never be re-parsed.
+                return real_parser(message, **kwargs)
+            raise ValueError("poison")
+
+        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _counting_parser)
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [_burst_message(2), poison] if after == "1000" else [poison]
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert attempts == ["1002"], "a skipped poison message must not be retried"
+        assert source._seen_ids["channel-1"] == {"1001", "1002"}
+        assert source._last_seen_message_ids["channel-1"] == "1002"
+        assert source._queue.qsize() == 0
+
+    def test_cancellation_is_not_swallowed_by_the_per_message_guard(self) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+
+        async def _cancel(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        source._emit_parsed_message = _cancel
+
+        async def _run() -> None:
+            with pytest.raises(asyncio.CancelledError):
+                await source._emit_polled_message(
+                    "channel-1", _burst_message(1), set(), emit=True
+                )
+
+        asyncio.run(_run())
+
+
 class TestIssueB2Backfill:
     def test_burst_beyond_poll_limit_backfills(self) -> None:
         """Bursts > POLL_LIMIT paginate forward instead of losing exits."""

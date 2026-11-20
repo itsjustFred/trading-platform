@@ -1941,9 +1941,46 @@ class DiscordSignalSource(BaseSignalSource):
         # must NOT filter emits: an `after`-cursor page is newer than the
         # cursor, and the seen-set also absorbs the boundary message a repeat
         # page may hand back. The cursor only seeds `seen` at priming time.
+        #
+        # The id is marked before the message is handled so a poison message
+        # (a structurally malformed payload, or a `TradeSignal` that rejects
+        # the message) is skipped exactly once instead of aborting the rest of
+        # its page on every poll until the retention window prunes it. The
+        # failure itself is logged at ERROR with the channel and message id, so
+        # a dropped signal is visible instead of silently lost.
         seen.add(message_id)
         if not emit:
             return
+        try:
+            await self._emit_parsed_message(channel_id, message, message_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Discord message dropped: emission failed",
+                extra={
+                    "data": {
+                        "bot_name": self.bot_name,
+                        "service_id": self.service_id,
+                        "channel_id": channel_id,
+                        "message_id": message_id,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    }
+                },
+            )
+
+    async def _emit_parsed_message(
+        self,
+        channel_id: str,
+        message: dict[str, Any],
+        message_id: str,
+    ) -> None:
+        """Parse one polled message and queue it. Raises on a poison payload.
+
+        Kept separate from :meth:`_emit_polled_message` so that the caller can
+        isolate a single bad message without losing the rest of the page.
+        """
         wrapped = _DiscordMessageAdapter(message)
         parsed = _parse_trade_signal_from_message(
             wrapped,
