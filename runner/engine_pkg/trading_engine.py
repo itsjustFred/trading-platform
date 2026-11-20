@@ -370,15 +370,17 @@ class TradeEngine:
         )
         # #170: resolve -- and thereby validate -- the declared risk amount
         # here, BEFORE any stop-dependent branch. `nan > 0`, `-inf > 0` and a
-        # negative amount all compare False, so validating the value after a
-        # gate (as #151 did -- and the `stop_loss_price is not None` guard
-        # still did on its own) let either one skip the fixed-risk branch and
-        # fall through to `risk_per_trade_pct`: a size computed under a
-        # different risk rule than the config declares, with no error at all.
-        # A configured amount WITH a stop was already refused; the stopless
-        # path silently substituted the risk rule instead. Resolving first
-        # closes both. `0.0` -- and an absent key -- is the documented "off"
-        # idiom and keeps falling through unchanged.
+        # negative amount all compare False, so a value checked after a gate is
+        # checked too late: at the merge base (`risk_amount =
+        # float(fixed_risk_amount)` inside
+        # `if fixed_risk_amount is not None and stop_loss_price is not None`,
+        # then only `if risk_amount > 0 and risk_distance > 0`), EVERY path
+        # with an unusable amount fell through to `risk_per_trade_pct` --
+        # with a stop, without one, and with a degenerate stop distance -- a
+        # size computed under a different risk rule than the config declares,
+        # with no error at all. Resolving first refuses it on all of them.
+        # `0.0` -- and an absent key -- is the documented "off" idiom and
+        # keeps falling through unchanged.
         risk_amount = _configured_risk_amount(self.config.parameters)
 
         if risk_amount > 0 and stop_loss_price is not None:
