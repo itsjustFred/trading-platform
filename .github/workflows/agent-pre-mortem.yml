@@ -18,8 +18,9 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has to
 # be re-analysed, e.g. after an infra failure). Its run-name carries the PR
 # number and the analysed SHA, so a run of an older commit is recognisable in the
-# run list; the concurrency group below cancels runs of older commits of the same
-# PR.
+# run list. The concurrency group below is keyed by that analysed SHA, so a
+# re-dispatch of an older commit runs *beside* the current head's run instead of
+# cancelling it - a rerun of the same commit still supersedes its own stale run.
 #
 # The agent is read-only; this job writes no repo code. It reads the PR diff and
 # its blast radius, writes ranked future-failure scenarios, and produces a
@@ -52,7 +53,10 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 #
 # Manual rerun (a failed or superseded run, or an older commit that never got
 # one): pass the head SHA as well as the PR number when the analysed commit is
-# not the current head; the comment guard then keeps a newer result in place:
+# not the current head; the comment guard then keeps a newer result in place. The
+# SHA must be a full 40-hex SHA that is one of that PR's own commits - a typo or
+# another PR's head is refused, so no foreign diff is ever analysed under this
+# PR's name:
 #   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
@@ -74,7 +78,16 @@ on:
         type: string
 
 concurrency:
-  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  # Keyed by the analysed commit, not by the PR alone: the documented manual
+  # rerun of an older commit (`-f head_sha=<old-sha>`) must not cancel the run
+  # that is analysing the current head - that run's cancellation reporter would
+  # mark the head `error` and leave it with no analysis at all. A rerun naming
+  # the same commit does cancel a stale run of that commit, which is the only
+  # supersession this group is for; a rerun that omits `head_sha` gets the
+  # `current-head` bucket, so it runs beside the push's run of that head rather
+  # than cancelling it (the two analyse the same diff, and the comment guard
+  # keeps whichever result lands last).
+  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ github.event.pull_request.head.sha || inputs.head_sha || 'current-head' }}
   cancel-in-progress: true
 
 env:
@@ -98,7 +111,10 @@ jobs:
     # the event payload and needs no API call. The token writes the status
     # below, and only for a same-repo PR.
     permissions:
+      # `contents: read` reads the PR's commit list, which the head_sha check
+      # below needs; the status write is the only thing this job writes.
       pull-requests: read
+      contents: read
       statuses: write
     # Drafts are not pre-mortemed: the run resumes when the PR is ready for
     # review (one of the pull_request types above).
@@ -129,8 +145,24 @@ jobs:
             # A dispatch may name an older commit (a rerun after an infra
             # failure, or one the head moved past). It is analysed on purpose:
             # its status lands on that commit, and the comment guard below
-            # keeps a newer result's comment in place.
-            if [ -n "$INPUT_SHA" ] && [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ]; then
+            # keeps a newer result's comment in place. What it may not name is a
+            # commit this PR does not contain: that would post a pre-mortem of a
+            # foreign diff on this PR, and would put a verdict on another PR's
+            # gate. So the input is checked, and a check that cannot be made
+            # refuses the run rather than analysing whatever was typed.
+            if [ -n "$INPUT_SHA" ]; then
+              if ! printf '%s' "$INPUT_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+                echo "::error::head_sha must be a full 40-character commit SHA (lowercase hex); got '${INPUT_SHA}'."
+                exit 1
+              fi
+              if [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ] \
+                && ! gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}/commits" \
+                  --jq '.[].sha' | grep -qxF "$INPUT_SHA"; then
+                # Either the SHA is not one of this PR's commits, or the commit
+                # list could not be read at all; both refuse, not analyse.
+                echo "::error::Commit ${INPUT_SHA} is not a commit of PR #${INPUT_PR} (or its commit list could not be read); nothing to analyse."
+                exit 1
+              fi
               echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; analysing the requested commit."
             fi
           fi
@@ -238,9 +270,10 @@ jobs:
       - name: Select skill revision
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/premortem"
           skill="$RUNNER_TEMP/premortem/skill.md"
-          # Refuse when the base commit is unreachable, as the review workflow
-          # does: falling through would run rules the PR may have weakened.
+          # Refuse when the base commit is unreachable, as both siblings do:
+          # falling through would run rules the PR may have weakened.
           git cat-file -e "${BASE_SHA}^{commit}"
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
@@ -422,9 +455,19 @@ jobs:
           marker='<!-- actions-pre-mortem -->'
           { echo "$marker"; cat comment.md; } > body.md
           existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | tail -n 1)
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
           if [ -n "$existing" ]; then
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -F body=@body.md > /dev/null
+            # More than one comment can carry the marker (a duplicate from an
+            # interrupted run, or one created outside the workflow). Patching
+            # only the newest would leave the stale one readable forever, so say
+            # it and update every match with the same current result.
+            count=$(printf '%s\n' "$existing" | grep -c '[0-9]' || true)
+            if [ "$count" -gt 1 ]; then
+              echo "::warning::${count} pre-mortem comments carry the marker; updating all of them with the current result."
+            fi
+            for id in $existing; do
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F body=@body.md > /dev/null
+            done
           else
             gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
           fi
@@ -440,7 +483,7 @@ jobs:
           esac
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state="$state" -f context="$PREMORTEM_CONTEXT" \
-            -f description="Verdict: ${VERDICT}" -f target_url="$RUN_URL" > /dev/null
+            -f description="Verdict: ${VERDICT} (PR #${PR_NUMBER})" -f target_url="$RUN_URL" > /dev/null
 
       # A failure above (artifact download, comment POST/PATCH, status write)
       # would otherwise leave the status `pending` on this SHA forever. Only a

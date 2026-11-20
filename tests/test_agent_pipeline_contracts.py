@@ -14,8 +14,10 @@ analysed SHA it sets the commit status `agent/pre-mortem` and upserts one PR com
 
 What is pinned here:
 - every agent workflow triggers itself on `pull_request` (opened, synchronize, reopened) with a
-  concurrency group per PR that cancels superseded runs, and no workflow starts another one -
-  no dispatch call, no `workflow_run` or `repository_dispatch` trigger, no `actions: write`;
+  concurrency group per PR that cancels superseded runs - the pre-mortem's is keyed by the
+  analysed commit, so a manual rerun of an older commit cannot cancel the current head's run -
+  and no workflow starts another one - no dispatch call, no `workflow_run` or
+  `repository_dispatch` trigger, no `actions: write`;
 - the pre-mortem's verdict map is total (`*)` -> `error`), so no verdict reaches an undeclared
   state, and its verdict regex accepts exactly the verdicts the skill documents;
 - the status context, the comment marker and the comment title follow the stage convention, a
@@ -23,6 +25,8 @@ What is pinned here:
 - the pre-mortem marks the analysed commit pending once, and every path that stops it - a
   cancelled run, a failed run, a failed post step - leaves that context terminal, never
   `pending`; a head that moved keeps its own status but no longer owns the comment;
+- a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
+  so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
   sibling workflows, whose comments swear to the same guards;
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
@@ -222,6 +226,17 @@ def test_every_agent_workflow_is_a_standalone_per_push_workflow() -> None:
         assert group.startswith(name[: -len(".yml")]), f"{name}: group {group!r} is not its own"
         assert "pull_request.number" in group, f"{name}: group {group!r} is not per PR"
         assert concurrency["cancel-in-progress"] is True, f"{name}: keeps superseded runs"
+    # The pre-mortem is the only one with a manual rerun, and it is the one whose group must
+    # name the analysed commit: a PR-keyed group cancels the current head's in-flight run
+    # when an older commit is re-dispatched, and that run's cancellation reporter then marks
+    # the head `error` with no analysis left - a false red on the SHA the PR needs a verdict
+    # for. Keyed by the SHA, a rerun of an older commit runs beside it, while a rerun of the
+    # same commit still supersedes a stale run of that commit; a rerun that omits `head_sha`
+    # shares the `current-head` bucket with its own siblings rather than with the push's run.
+    premortem_group = str(_load(PREMORTEM)["concurrency"]["group"])
+    assert "pull_request.head.sha" in premortem_group and "inputs.head_sha" in premortem_group, (
+        f"the pre-mortem group {premortem_group!r} is not keyed by the analysed commit"
+    )
 
 
 def test_no_agent_workflow_starts_another_workflow() -> None:
@@ -263,6 +278,29 @@ def test_the_pre_mortem_adds_ready_for_review_and_a_manual_rerun() -> None:
     assert '!= "$INPUT_SHA"' in body, "a rerun does not check the head it was given"
     assert "INPUT_PR" in body and "INPUT_SHA" in body, "the inputs reach the shell by env only"
     assert "${{" not in body, "the resolve step interpolates workflow expressions into a shell"
+
+
+def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None:
+    """`head_sha` is the one input a caller types by hand, and it decides which diff is
+    analysed and which commit carries the verdict. A well-formed SHA that belongs to another PR
+    (a typo, a copy-paste, the head of a different open PR) would post a pre-mortem of a foreign
+    diff under this PR's name, and would write a verdict onto another PR's gate - the pre-mortem's
+    own scenario for it. So the shape is checked (a full 40-hex SHA) and, when it is not the PR's
+    current head, that the commit is one of this PR's own via `pulls/N/commits`; either check
+    failing - or a commit list that cannot be read at all - refuses the run instead of
+    analysing whatever was typed."""
+    data = _load(PREMORTEM)
+    resolve = data["jobs"]["resolve"]
+    step = _find_step(resolve, r"^Resolve PR$")
+    body = _run(step)
+    assert "grep -qE" in body and "^[0-9a-f]{40}$" in body, "the head_sha shape is unchecked"
+    assert "grep -qxF" in body, "the PR's commit list is not matched exactly"
+    assert "pulls/${INPUT_PR}/commits" in body, "the head_sha is not checked against the PR"
+    assert body.count("exit 1") >= 2, "a refused head_sha does not stop the run"
+    assert "GH_TOKEN" in _step_env(resolve, step), "the dispatch path reads the API unauthenticated"
+    assert resolve.get("permissions", {}).get("contents") == "read", (
+        "the resolve job cannot read the PR's commit list, so the check cannot be made"
+    )
 
 
 def test_the_pre_mortem_skips_drafts_and_forks() -> None:
