@@ -357,6 +357,11 @@ jobs:
           # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
           # would otherwise be posted as the verdict. stderr goes to a file so
           # a failed run's reason stays greppable below.
+          # Whose rules ran is the one thing the report itself cannot show, and it is the
+          # fallback's whole point: while the base branch has no skill, the PR's own copy
+          # runs. Name it in the log and in the comment footer (below), so a verdict produced
+          # by a PR's own rules is never indistinguishable from one the base produced.
+          echo "::notice::Pre-mortem rules from: ${SKILL_SOURCE}."
           if ! raw=$(opencode run --standalone --archived --agent pr-premortem \
             "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}." 2> "$out.stderr"); then
             printf '%s\n' "$raw" > "$out.raw"
@@ -421,8 +426,8 @@ jobs:
           # (the skill directory's name, not its path), so a reader can map the
           # verdict to the rules that produced it.
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
-          printf '\n\n---\n_Automated pre-mortem using %s with `%s` skill_\n' \
-            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+          printf '\n\n---\n_Automated pre-mortem using %s with `%s` skill (rules from %s)_\n' \
+            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}" >> "$out"
           # Title first, so the comment is recognisable among the other bots'.
           { printf '# Pre-Mortem Action\n\n'; cat "$out"; } > "$out.titled"
           mv "$out.titled" "$out"

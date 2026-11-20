@@ -633,6 +633,23 @@ def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
         ), f"{poster} runs on a failed agent job"
 
 
+def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
+    """The rules come from the base branch, and from the PR itself only while the base has none -
+    a fallback that exists precisely because a PR may weaken its own rules. Which of the two ran
+    is the one thing the report cannot show, so the workflow has to say it: a notice in the run
+    log and the source in the comment footer. Without it a verdict produced by a PR's own copy is
+    indistinguishable from one the base produced, and the provenance gate this workflow exists for
+    has failed silently. This is not a hypothetical ordering: on this very PR the base has no
+    skill, so every run so far is the fallback."""
+    data = _load(PREMORTEM)
+    body = _run(_find_step(_agent_job(data)[1], r"^Run pre-mortem agent$"))
+    assert "::notice::Pre-mortem rules from: ${SKILL_SOURCE}" in body, (
+        "the run log does not name whose rules ran"
+    )
+    assert "skill (rules from %s)" in body, "the comment footer drops the rules' source"
+    assert "${SKILL_SOURCE}" in body, "the footer is not filled from the skill-source variable"
+
+
 def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
     """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
     used only while the base has none. A base commit that cannot be read must abort the step -
