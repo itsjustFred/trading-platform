@@ -325,16 +325,24 @@ def _opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Seri
 def _round_mt5_lots(symbol: str, lots: float) -> float:
     """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max)).
 
-    The floor keeps MT5's ABSOLUTE epsilon (`+ 1e-12`), because this generator
-    is the reference the engine is parity-checked against -- it reproduces the
-    EA, it does not improve on it. The engine's
+    The floor keeps MT5's ABSOLUTE epsilon -- `+ 1e-12` added to the QUOTIENT
+    (`lots / step`), not a relative tolerance -- because this generator is the
+    reference the engine is parity-checked against: it reproduces the EA, it
+    does not improve on it. The engine's
     `runner.engine_pkg.trading_engine._floor_to_lot_grid` snaps with a
-    RELATIVE 1e-9 band instead, so a size whose quotient is more than 1e-12
-    (relative) off an integer step can differ between the two -- e.g.
-    `25602 * 0.01` comes out `256.01` here and `256.02` in the engine. Nothing
-    in the repo feeds lot metadata to the engine yet, so the committed goldens
-    do not shift; whoever wires the first `lot_step` config must decide which
-    of the two rules the goldens are meant to pin.
+    RELATIVE 1e-9 band instead (`1e-9 * max(1, |quotient|)`), so the two rules
+    disagree on exactly the sizes whose quotient is MORE than 1e-12 (absolute)
+    off an integer step while still inside the engine's relative band -- the
+    `k * lot_step` ulp case from step counts of a few thousand and up, e.g.
+    `25602 * 0.01` (quotient `25601.999999999996`, ~4e-12 off an integer)
+    comes out `256.01` here and `256.02` in the engine. The divergence is
+    pinned, not incidental: no committed strategy configures the engine's lot
+    metadata (`lot_step`/`min_lot`/`max_lot`) -- asserted by
+    `test_no_committed_strategy_configures_lot_metadata` -- so the committed
+    goldens do not shift, and the boundary itself is pinned by
+    `test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon`. The
+    first config that wires a `lot_step` must decide which of the two rules
+    its goldens pin (or stay on the absolute-epsilon side of the reference).
     """
     step = MT5_LOT_STEPS.get(symbol, 0.0)
     if step <= 0:
