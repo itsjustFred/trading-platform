@@ -81,6 +81,15 @@ Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
 Portfolio-/Broker-Source-of-Truth. Der früher `qty`/`explicit_qty`-Bypass um die
 komplette Risk-Engine ist entfernt; `size_live_signal_for_submission` size't
 jedes Live-Signal durch `RiskEngine`.
+State-Fail-Closed (#263): eine Broker-Position, deren `qty` nicht lesbar ist
+(nicht numerisch, `nan`/`inf`, fehlend oder Alpacas `qty_unparseable`-Marker),
+wird seit #263 nicht mehr als 0 gezählt - sonst hiesse das „Konto ist flat“ und
+der nächste Entry würde gegen ein leeres Buch sizen, obwohl `max_positions`
+oder `max_total_exposure` schon voll sind. Der Count wirft
+`UnreadableBrokerPositionQtyError`, der Entry wird verweigert (nichts geht an den
+Broker) und ein Operator bekommt einen ERROR-Alert. Exit-Orders sind nicht
+betroffen: sie sizen gegen das eigene Ledger der Deployment, nicht gegen den
+Count.
 
 ## Pip-Value aus dem Broker (#146)
 
