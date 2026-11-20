@@ -9,6 +9,7 @@ from runner.portfolio_optimizer import (
     _compute_correlation_matrix,
     _compute_oos_metrics,
     _normalize_equity_matrix,
+    _normalize_weights,
     _parse_time_to_ts,
     _period_percentage_returns,
     _persist_optimization_result,
@@ -27,6 +28,40 @@ def test_normalize_equity_matrix_uses_each_strategy_baseline() -> None:
     normalized = _normalize_equity_matrix(matrix)
 
     assert normalized == pytest.approx(np.array([[1.0, 1.0], [1.1, 1.0]]))
+
+
+def test_normalize_weights_sums_to_one() -> None:
+    """Every optimized allocation must be a distribution, not a raw score vector.
+
+    The weights are the persisted allocation a promotion decision is read
+    against, so a vector that does not sum to 1.0 would silently restate the
+    exposure the artifact claims.
+    """
+    weights = _normalize_weights(np.array([2.0, 1.0, 1.0]))
+
+    assert weights == pytest.approx(np.array([0.5, 0.25, 0.25]))
+    assert float(weights.sum()) == pytest.approx(1.0)
+
+    single = _normalize_weights(np.array([7.0]))
+
+    assert single == pytest.approx(np.array([1.0]))
+
+
+def test_normalize_weights_prunes_degenerate_trials_instead_of_equal_weighting() -> None:
+    """Zero / non-finite sums raise; they are never promoted to equal-weight.
+
+    A degenerate trial used to fall back to equal-weight, which let a trial
+    carrying no allocation information win the optimisation (#87).
+    """
+    for degenerate in (
+        np.zeros(3),
+        np.array([0.0, 0.0]),
+        np.array([np.nan, 1.0, 1.0]),
+        np.array([np.inf, 1.0]),
+        np.array([-1.0, -2.0]),
+    ):
+        with pytest.raises(ValueError, match="[Dd]egenerate|Non-finite"):
+            _normalize_weights(degenerate)
 
 
 def test_strategy_equity_point_creation() -> None:
