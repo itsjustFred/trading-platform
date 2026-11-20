@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from live_runner.daemon import _untradeable_active_signal_source_reason
 from shared.constants import normalize_symbols, normalize_timeframe
 from shared.models import LiveDeploymentConfig
 
@@ -298,6 +299,15 @@ def diff_db_and_yaml(
 
     for row in db_rows:
         errors.extend(_db_row_errors(row, db_account_ids))
+        reason = _untradeable_active_signal_source_reason(row.signal_source)
+        if reason is not None and row.key not in yaml_active:
+            # A YAML twin the daemon trades is the YAML check's warning
+            # (_validate_deployments); only a row with no YAML twin is missed
+            # there, and reporting both would double-count the same row.
+            warnings.append(
+                f"DB deployment {row.label}: {reason}; it will never trade. "
+                "Stop it or move it to a Discord signal source."
+            )
         if row.key in db_by_key:
             # Not cosmetic drift: the daemon dispatches every ACTIVE match, so this row submits
             # its own order per signal while the YAML describes a single deployment.

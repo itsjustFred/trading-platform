@@ -254,7 +254,7 @@ def test_active_non_discord_deployment_warns_it_will_never_trade():
     assert errors == []
     assert len(warnings) == 1
     assert "internal_strat" in warnings[0]
-    assert "no runner" in warnings[0]
+    assert "no live strategy runner" in warnings[0]
 
 
 def test_non_active_non_discord_deployment_does_not_warn():

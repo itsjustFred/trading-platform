@@ -794,3 +794,48 @@ def test_symbol_filter_is_normalized_on_write_and_on_read(isolated_db) -> None:
     read_back = database.get_live_deployment(str(created.id))
     assert read_back is not None
     assert read_back.symbol_filter == ["AAPL"]
+
+
+# ── ACTIVE rows nothing can trade (#242) ─────────────────────────────────────
+
+
+def test_active_internal_db_row_without_yaml_twin_warns_no_runner(isolated_db) -> None:
+    """A DB-only internal row gets the same no-runner warning the daemon logs."""
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight([], db_path=_db_path(database))
+
+    assert any("no live strategy runner" in w for w in report.warnings), report.warnings
+
+
+def test_active_discord_db_row_does_not_warn_no_runner(isolated_db) -> None:
+    database = isolated_db[0]
+    _seed(database, signal_source="discord", signal_source_id="news-svc")
+
+    report = run_db_preflight(
+        [
+            LiveDeploymentConfig(
+                strategy_name="equity_momentum",
+                account_id="alpaca-paper",
+                symbols=["AAPL"],
+                timeframe="1h",
+                signal_source="discord",
+                signal_source_id="news-svc",
+                signal_config={"channel_id": "123456789012345678"},
+            )
+        ],
+        db_path=_db_path(database),
+    )
+
+    assert not any("no live strategy runner" in w for w in report.warnings), report.warnings
+
+
+def test_internal_db_row_with_yaml_twin_is_not_double_warned(isolated_db) -> None:
+    """The YAML-side check reports it once; the DB diff does not repeat it."""
+    database = isolated_db[0]
+    _seed(database)
+
+    report = run_db_preflight([_yaml_one()], db_path=_db_path(database))
+
+    assert not any("no live strategy runner" in w for w in report.warnings), report.warnings

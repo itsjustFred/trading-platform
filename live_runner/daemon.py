@@ -4804,33 +4804,49 @@ async def _load_db_accounts_and_deployments(
     return accounts, deployments
 
 
+# A deployment nothing can trade (#242): the daemon only runs Discord signals.
+_TRADEABLE_SIGNAL_SOURCES = frozenset({"discord"})
+
+
+def _untradeable_active_signal_source_reason(
+    signal_source: object,
+) -> str | None:
+    """Why an ACTIVE deployment on this signal source can never trade, or None.
+
+    ``live_runner.daemon`` is the single definition: the daemon logs it at startup
+    and the preflights report it, so the three can never disagree about what is
+    untradeable (#242). ``signal_source`` is the value as stored/configured; the
+    empty string is the ``internal`` default the DB column and the models use.
+    """
+    source = str(signal_source or "internal").lower()
+    if source in _TRADEABLE_SIGNAL_SOURCES:
+        return None
+    if source == "internal":
+        return (
+            "signal source 'internal' has no live strategy runner; "
+            "only Discord signals are traded"
+        )
+    return f"signal source '{source}' is neither 'internal' nor 'discord' and has no runner"
+
+
 def _warn_untradeable_active_deployments(
     deployments: Sequence[LiveDeploymentConfig],
 ) -> None:
     """Log ERROR for each ACTIVE deployment no runner can trade (#242).
 
-    The daemon's only signal path is Discord: an ``internal`` deployment has no
-    live strategy runner behind it, so it can be ACTIVE, hold an adapter and an
-    execution listener, and still never place an order. The daemon does not
-    block on this -- the operator restarts or stops the row -- but silence makes
+    An ``internal`` deployment (or any signal source other than ``discord``)
+    has no live strategy runner behind it: it can be ACTIVE, hold an adapter and
+    an execution listener, and still never place an order. The daemon does not
+    block on this -- the operator stops or repoints the row -- but silence makes
     an untradeable ACTIVE deployment look live.
     """
     for deployment in deployments:
         if _normalize_deployment_status(deployment.status) != "ACTIVE":
             continue
-        signal_source = str(deployment.signal_source or "internal").lower()
-        if signal_source == "discord":
+        reason = _untradeable_active_signal_source_reason(deployment.signal_source)
+        if reason is None:
             continue
-        if signal_source != "internal":
-            reason = (
-                f"signal source '{signal_source}' is neither 'internal' nor 'discord' "
-                "and has no runner"
-            )
-        else:
-            reason = (
-                "signal source 'internal' has no live strategy runner; "
-                "only Discord signals are traded"
-            )
+        signal_source = str(deployment.signal_source or "internal").lower()
         logger.error(
             "ACTIVE live deployment cannot trade: %s. It will never place an order; "
             "stop it or move it to a signal source the daemon runs.",

@@ -20,6 +20,7 @@ from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credent
 from live_runner.config_parser import parse_live_deployments_config
 from live_runner.credential_env import overlay_process_env, read_accounts_env_file
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
+from live_runner.daemon import _untradeable_active_signal_source_reason
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from runner.promotion_gate import StrategyNotPromotedError
 from shared.logging import get_logger, route_console_logs_to_stderr
@@ -467,12 +468,12 @@ def _validate_deployments(
         elif str(deployment.status or "").upper() == "ACTIVE":
             # #242: the daemon only trades Discord signals; an ACTIVE row on any
             # other signal source is a deployment that will never place an order.
-            warnings.append(
-                f"{label}: ACTIVE deployment has signal source "
-                f"'{deployment.signal_source or 'internal'}' with no runner; "
-                "the live daemon only trades Discord signals and will never trade it. "
-                "Stop it or move it to a Discord signal source."
-            )
+            reason = _untradeable_active_signal_source_reason(deployment.signal_source)
+            if reason is not None:
+                warnings.append(
+                    f"{label}: ACTIVE deployment has {reason}; the live daemon will "
+                    "never trade it. Stop it or move it to a Discord signal source."
+                )
 
     return errors, warnings
 
