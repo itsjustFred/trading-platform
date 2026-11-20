@@ -172,15 +172,22 @@ Implementation:
   other final size below `min_lot` is **skipped** (size 0, no trade, with a
   WARNING log) — it is never raised back up to `min_lot`, since the caps are
   what make it unaffordable. A size that no cap reduces is not re-floored.
+  `min_lot` is deliberately honoured **off-grid** (a broker minimum need not be
+  a multiple of its own step), while `max_lot` is floored to the grid; with
+  `min_lot == max_lot == 0.15` and `lot_step = 0.1` that combination is
+  fail-closed — the cap becomes `0.1`, which is below `min_lot`, and the trade
+  is skipped although the same config without `max_lot` trades `0.15`.
   Non-finite values for the sizing parameters are refused with a `ValueError`
   naming the parameter: `inf` would crash the grid floor, and `nan` defeats
   every guard on the sizing path. `fixed_risk_amount` is resolved — and thereby
   validated — **before any stop-dependent branch**, so a `nan`, `-inf` or
   negative amount is refused on **every** path: with a stop, without a stop,
   and with an unusable stop distance. `nan > 0`, `-inf > 0` and a negative
-  amount all compare False, so a value checked after a branch is chosen has
-  already let the trade be sized by `risk_per_trade_pct` instead — a backtest
-  under a risk rule the config does not declare. A configured
+  amount all compare False, so a value checked after a branch is chosen is
+  checked too late: on the stopful and the stopless path the trade was then
+  sized by `risk_per_trade_pct` instead — a backtest under a risk rule the
+  config does not declare, with no error at all (the unusable-distance path
+  raised, but named the distance, never the amount). A configured
   `tick_value`/`tick_size` of zero or less is refused as well — `0 or 1.0`
   used to substitute `1.0` and silently drop that leg of the conversion,
   oversizing the order — and so is a negative `lot_step`/`min_lot`/`max_lot`,
@@ -190,9 +197,11 @@ Implementation:
   distance means no size), and reporting which of the two is the config error
   must not depend on the bar data. An absent key, an explicit `null`, and
   `0.0` for `fixed_risk_amount` ("off", size from `risk_per_trade_pct`) keep
-  their previous meaning — "off" is also what an order's
-  `equity_proportional_sizing` flag reads, so such a trade is still re-scaled
-  by the shared-equity replay like a percentage-sized one (Issue #170).
+  their previous meaning. The order's `equity_proportional_sizing` flag reads
+  the same way, so a `0.0` order is **now** re-scaled by the shared-equity
+  replay like a percentage-sized one: the flag used to read the key's presence
+  instead, and stopped the re-scale for a percentage-sized position (Issue
+  #170).
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop

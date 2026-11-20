@@ -374,13 +374,16 @@ class TradeEngine:
         # checked too late: at the merge base (`risk_amount =
         # float(fixed_risk_amount)` inside
         # `if fixed_risk_amount is not None and stop_loss_price is not None`,
-        # then only `if risk_amount > 0 and risk_distance > 0`), EVERY path
-        # with an unusable amount fell through to `risk_per_trade_pct` --
-        # with a stop, without one, and with a degenerate stop distance -- a
-        # size computed under a different risk rule than the config declares,
-        # with no error at all. Resolving first refuses it on all of them.
-        # `0.0` -- and an absent key -- is the documented "off" idiom and
-        # keeps falling through unchanged.
+        # then only `if risk_amount > 0 and risk_distance > 0`), an unusable
+        # amount fell through to `risk_per_trade_pct` on two paths -- with a
+        # usable stop distance, and with no stop at all -- a size computed
+        # under a different risk rule than the config declares, with no error
+        # at all. (The third case, a stop exactly at the entry, already
+        # raised, but from `RiskEngine`: "entry_price and stop_loss must
+        # differ" -- it names the distance, never the amount.) Resolving
+        # first refuses the amount on all three, and keeps the right
+        # diagnosis. `0.0` -- and an absent key -- is the documented "off"
+        # idiom and keeps falling through unchanged.
         risk_amount = _configured_risk_amount(self.config.parameters)
 
         if risk_amount > 0 and stop_loss_price is not None:
@@ -418,6 +421,13 @@ class TradeEngine:
                     shares = _floor_to_lot_grid(shares, lot_step)
                 if min_lot > 0:
                     shares = max(shares, min_lot)
+                # Size the two skip WARNINGs below report as "before caps":
+                # the raw conversion, floored to the grid and raised to
+                # `min_lot`. `uncapped_shares` (below) is the size the
+                # leverage/exposure cap may reduce -- it is captured AFTER
+                # `max_lot`, because max_lot is a broker limit, not a cap the
+                # re-normalisation guard compares against.
+                pre_cap_shares = shares
                 if max_lot > 0:
                     # Issue #151: max_lot is a broker limit too. Floor it once
                     # to the grid so the cap is a grid value and needs no
@@ -455,9 +465,11 @@ class TradeEngine:
                     else:
                         logger.warning(
                             "Skipping order: fixed-risk size %.6g is below min_lot %.6g after caps "
-                            "(size before leverage/exposure cap %.6g, max_lot %.6g)",
+                            "(size before caps %.6g, before the leverage/exposure cap %.6g, "
+                            "max_lot %.6g)",
                             shares,
                             min_lot,
+                            pre_cap_shares,
                             uncapped_shares,
                             max_lot,
                         )
@@ -471,8 +483,9 @@ class TradeEngine:
                     # instead of returning the zero silently.
                     logger.warning(
                         "Skipping order: fixed-risk size is zero after caps "
-                        "(size before leverage/exposure cap %.6g, min_lot %.6g, "
-                        "max_lot %.6g, lot_step %.6g)",
+                        "(size before caps %.6g, before the leverage/exposure cap %.6g, "
+                        "min_lot %.6g, max_lot %.6g, lot_step %.6g)",
+                        pre_cap_shares,
                         uncapped_shares,
                         min_lot,
                         max_lot,

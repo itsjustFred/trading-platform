@@ -323,7 +323,19 @@ def _opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Seri
 
 
 def _round_mt5_lots(symbol: str, lots: float) -> float:
-    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max))."""
+    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max)).
+
+    The floor keeps MT5's ABSOLUTE epsilon (`+ 1e-12`), because this generator
+    is the reference the engine is parity-checked against -- it reproduces the
+    EA, it does not improve on it. The engine's
+    `runner.engine_pkg.trading_engine._floor_to_lot_grid` snaps with a
+    RELATIVE 1e-9 band instead, so a size whose quotient is more than 1e-12
+    (relative) off an integer step can differ between the two -- e.g.
+    `25602 * 0.01` comes out `256.01` here and `256.02` in the engine. Nothing
+    in the repo feeds lot metadata to the engine yet, so the committed goldens
+    do not shift; whoever wires the first `lot_step` config must decide which
+    of the two rules the goldens are meant to pin.
+    """
     step = MT5_LOT_STEPS.get(symbol, 0.0)
     if step <= 0:
         floored = max(lots, 0.0)

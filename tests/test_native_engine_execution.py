@@ -925,6 +925,88 @@ def test_fixed_risk_zero_amount_order_is_not_equity_proportional_without_a_stop(
     assert result.trades[0].meta["equity_proportional_sizing"] is True
 
 
+def test_fixed_risk_exposure_cap_floors_to_lot_step():  # Issue #151
+    # `cap_fixed_risk_by_leverage: false` + a binding
+    # `max_position_exposure_pct` is the OTHER arm of the cap, and it is a raw
+    # equity/price ratio too -- its size has to be re-floored to the grid as
+    # well, and an uncapped size still must not be.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 100.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "cap_fixed_risk_by_leverage": False,
+        },
+        initial_capital=100_000.0,
+        max_position_exposure_pct=0.00049,  # cap = 100_000 * 0.00049 / 100 = 0.49
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    # 0.49 is off the 0.1 grid -- a size no broker accepts.
+    assert quantity == pytest.approx(0.4)
+
+    on_grid = _engine(
+        {
+            "fixed_risk_amount": 100.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "cap_fixed_risk_by_leverage": False,
+        },
+        initial_capital=100_000.0,
+        max_position_exposure_pct=0.0005,  # cap = 0.5, already on the grid
+    )
+
+    assert on_grid._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    ) == pytest.approx(0.5)
+
+
+def test_fixed_risk_max_lot_below_min_lot_logs_the_uncapped_size(caplog):  # Issue #151
+    # The skip must report the size the config asked for, not the size after
+    # the broker band: with `max_lot < min_lot` the value captured before the
+    # leverage/exposure cap is already the truncated `max_lot` grid value, so
+    # the WARNING carries the pre-`max_lot` size as well.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.5,
+            "max_lot": 0.3,
+        },
+        initial_capital=100_000.0,
+        max_leverage=10.0,  # never binds here: the leverage cap is 10,000 units
+    )
+
+    with caplog.at_level(logging.WARNING, logger="runner.engine_pkg.trading_engine"):
+        quantity = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+    assert quantity == 0.0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    # The risk-derived 500 / 1 = 500 units, not the 0.3 max_lot floor.
+    assert "size before caps 500" in message
+    assert "before the leverage/exposure cap 0.3" in message
+
+
 def test_fixed_risk_prefers_explicit_stop_distance():
     # MT5 parity (strategy-test-audit): lots derive from the strategy's stop
     # distance (e.g. ATR-based), not from |entry - stop|, so fill-price noise
