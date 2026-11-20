@@ -695,6 +695,62 @@ def test_fixed_risk_non_numeric_sizing_parameter_is_refused():  # Issue #170
         )
 
 
+def test_fixed_risk_boolean_sizing_parameters_are_refused():  # Issue #170
+    # #170 follow-up: `float(True) == 1.0` and `float(False) == 0.0`, so a
+    # boolean was silently accepted as a numeric setting -- `True` a risk
+    # amount, `False` a disabled grid. BacktestConfig refuses booleans for
+    # its numeric fields; the sizing resolver must do the same, before
+    # `float()` ever sees the value.
+    base = {"fixed_risk_amount": 500.0, "tick_size": 1.0, "tick_value": 1.0}
+    for key in (
+        "fixed_risk_amount",
+        "Fixed_Risk_Amount",
+        "tick_size",
+        "tick_value",
+        "lot_step",
+        "min_lot",
+        "max_lot",
+    ):
+        for bad_bool in (True, False):
+            # The camelCase spelling is only read when `fixed_risk_amount`
+            # is absent, so the alias case must not also set the canonical
+            # key (otherwise the canonical value shadows the boolean).
+            params = dict(base)
+            if key == "Fixed_Risk_Amount":
+                del params["fixed_risk_amount"]
+            params[key] = bad_bool
+            engine = _engine(params)
+            expected = "fixed_risk_amount" if key == "Fixed_Risk_Amount" else key
+
+            with pytest.raises(ValueError, match=expected):
+                engine._calculate_position_size(
+                    entry_price=100.0,
+                    stop_loss_price=95.0,
+                    direction="LONG",
+                    stop_distance=1.0,
+                )
+
+
+def test_fixed_risk_oversized_sizing_parameter_is_refused():  # Issue #170
+    # #170 follow-up: `float(10**400)` raises OverflowError, which escaped
+    # the resolver as a bare OverflowError instead of the parameter-specific
+    # ValueError every other unusable value gets. BacktestConfig catches
+    # OverflowError alongside TypeError/ValueError; the sizing resolver does
+    # the same so the message names the parameter.
+    base = {"fixed_risk_amount": 500.0, "tick_size": 1.0, "tick_value": 1.0}
+    oversized = 10**400
+    for key in ("fixed_risk_amount", "tick_size", "tick_value", "lot_step"):
+        engine = _engine({**base, key: oversized})
+
+        with pytest.raises(ValueError, match=key):
+            engine._calculate_position_size(
+                entry_price=100.0,
+                stop_loss_price=95.0,
+                direction="LONG",
+                stop_distance=1.0,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Issue #170: the same guard on the stopless path (and on the other inputs)
 # ---------------------------------------------------------------------------

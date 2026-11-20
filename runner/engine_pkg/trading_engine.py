@@ -117,12 +117,26 @@ def _sizing_value(name: str, raw: Any, default: float, *, positive: bool = False
     "no grid / no limit" setting the downstream ``> 0`` gates read it as.
     Zero keeps that meaning -- only the *configured and unusable* values
     raise, which is the same None-versus-value split the sibling validator in
-    ``validation/risk/fixed_risk.py`` makes.
+    ``validation/risk/fixed_risk.py`` makes. A boolean is refused like a
+    non-number (``float(True) == 1.0`` would otherwise read ``True`` as a
+    risk amount and ``False`` as a disabled grid), and an oversized value
+    (``float(10**400)`` raises ``OverflowError``) is refused by name rather
+    than escaping as a bare ``OverflowError`` -- both mirror
+    ``BacktestConfig``'s finite-number validator.
     """
     if raw is None:
         return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{name} must be a number, got {raw!r}")
     try:
         value = float(raw)
+    except OverflowError as exc:
+        # `float(10**400)`: name the parameter instead of letting the bare
+        # OverflowError escape (BacktestConfig catches it alongside the
+        # other conversion errors and reports the field name too).
+        raise ValueError(
+            f"{name} is too large to size with, got a {len(str(raw))}-digit value"
+        ) from exc
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a number, got {raw!r}") from exc
     _require_finite(name, value)
