@@ -655,10 +655,9 @@ class TradeEngine:
         # order's quantity — it still tracks exposure and credits PnL. The
         # flag is derived through the same gate the sizing branch uses (see
         # `_equity_proportional_for_stop`), including the #170
-        # `fixed_risk_amount: 0.0`-is-off read.
-        order._equity_proportional = self._equity_proportional_for_stop(  # transient, not a dataclass field
-            size_from_stop
-        )
+        # `fixed_risk_amount: 0.0`-is-off read. Transient marker: not an
+        # `Order` dataclass field.
+        order._equity_proportional = self._equity_proportional_for_stop(size_from_stop)
         self.pending_orders.append(order)
 
     def _open_position(self, order: Order, fill_price: float, fill_time: str, i: int) -> None:
