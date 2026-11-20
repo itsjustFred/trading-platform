@@ -152,14 +152,18 @@ Implementation:
 
 - **Sizing basis (native, vectorbt, pynecore):** the `equity` every sizing
   rule below denominates is **realized cash** — `initial_capital` plus the net
-  PnL of *closed* trades. The mark-to-market equity that feeds the equity
+  PnL of closed trade legs. The mark-to-market equity that feeds the equity
   curve is never a sizing input: an open position's paper profit is not
   spendable and an unrealized drawdown is not a realized loss. Native holds it
   in `TradeEngine._sizing_equity` (decision record D2,
   `docs/cleanup-16d1-money-path-semantics.md`); vectorbt accumulates it inline
   and records it as `trade.meta["risk_math"]["equity_at_entry"]`; pynecore walks
-  the same realized ledger. This is the basis MT5 sizes on too (fixed cash risk
-  per the EA, capital + closed PnL in the repo's MT5 sizing code).
+  the same realized ledger. A partial exit's proceeds enter the basis as soon
+  as the leg closes, less the round-trip fees that still-open position owes
+  until the trade is finalized — so the basis is *net realized cash*, not
+  "`initial_capital` until the whole trade closes" and not gross proceeds.
+  This is the basis MT5 sizes on too (fixed cash risk per the EA, capital +
+  closed PnL in the repo's MT5 sizing code).
   **Documented per-engine divergence:** signal replay sizes on realized cash
   *plus* the mark-to-market PnL of open positions (decision record D9 / F39,
   pinned by `tests/test_portfolio_sharpe_annualization.py::TestReplaySizingEquity`)
