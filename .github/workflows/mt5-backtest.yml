@@ -9,9 +9,6 @@ name: mt5-backtest
 # workflow asserts against.
 
 on:
-  # SPIKE: remove before ready
-  push:
-    branches: [feat/mt5-ci-tester-spike]
   workflow_dispatch:
     inputs:
       strategy:
