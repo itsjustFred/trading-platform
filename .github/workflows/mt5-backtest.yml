@@ -1,0 +1,487 @@
+name: mt5-backtest
+
+# Runs the MT5 Strategy Tester on a GitHub-hosted windows-latest runner and
+# uploads the HTML report as an artifact. No broker account, no credentials:
+# the price history comes from our own CSV export and is loaded into a custom
+# symbol, so the tester never needs a connection.
+#
+# See issue #265 for the background and the known silent failures this
+# workflow asserts against.
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "Strategy directory under strategy-comparisons/"
+        default: intraday_volatility_breakout
+        required: true
+      ea_file:
+        description: "EA source file name (without .mq5)"
+        default: IntradayVolatilityBreakout
+        required: true
+      csv_asset:
+        description: "CSV asset name in the mt5-ci-data-v0 release"
+        default: EURUSD_M1_202602200000_202604021447.csv.gz
+        required: true
+      setfile_asset:
+        description: "Setfile asset name in the mt5-ci-data-v0 release"
+        default: EURUSD_H1_setfile.ini
+        required: true
+      symbol:
+        description: "Custom symbol name to create (max 31 chars)"
+        default: EURUSD_CI
+        required: true
+      base_symbol:
+        description: "Symbol whose contract specs to mimic (EURUSD, USA500, NAS100)"
+        default: EURUSD
+        required: true
+      period:
+        description: "Chart period (M1, M5, M15, M30, H1, H4, D1)"
+        default: H1
+        required: true
+      from:
+        description: "FromDate inside the CSV window (YYYY.MM.DD)"
+        default: "2026.02.20"
+        required: true
+      to:
+        description: "ToDate inside the CSV window (YYYY.MM.DD)"
+        default: "2026.04.02"
+        required: true
+      model:
+        description: "Tester model (0=every tick, 1=1 min OHLC, 2=open prices, 4=real ticks)"
+        default: "1"
+        required: true
+      deposit:
+        description: "Initial deposit"
+        default: "100000"
+        required: true
+      leverage:
+        description: "Account leverage"
+        default: "100"
+        required: true
+      min_trades:
+        description: "Fail the job if the report has fewer trades"
+        default: "1"
+        required: true
+  # SPIKE: remove before ready — workflow_dispatch only exists once this file
+  # is on the default branch, so the spike branch iterates through this push
+  # trigger. It is limited to that one branch: never PRs, never other branches.
+  push:
+    branches: [feat/mt5-ci-tester-spike]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mt5-backtest-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  MT5_HOME: C:\mt5
+  STRATEGY: ${{ inputs.strategy || 'intraday_volatility_breakout' }}
+  EA_FILE: ${{ inputs.ea_file || 'IntradayVolatilityBreakout' }}
+  CSV_ASSET: ${{ inputs.csv_asset || 'EURUSD_M1_202602200000_202604021447.csv.gz' }}
+  SETFILE_ASSET: ${{ inputs.setfile_asset || 'EURUSD_H1_setfile.ini' }}
+  SYMBOL: ${{ inputs.symbol || 'EURUSD_CI' }}
+  BASE_SYMBOL: ${{ inputs.base_symbol || 'EURUSD' }}
+  PERIOD_NAME: ${{ inputs.period || 'H1' }}
+  FROM_DATE: ${{ inputs.from || '2026.02.20' }}
+  TO_DATE: ${{ inputs.to || '2026.04.02' }}
+  MODEL: ${{ inputs.model || '1' }}
+  DEPOSIT: ${{ inputs.deposit || '100000' }}
+  LEVERAGE: ${{ inputs.leverage || '100' }}
+  MIN_TRADES: ${{ inputs.min_trades || '1' }}
+  DATA_RELEASE: mt5-ci-data-v0
+
+jobs:
+  backtest:
+    name: MT5 tester (${{ inputs.symbol || 'EURUSD_CI' }} ${{ inputs.period || 'H1' }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show runner and resolve parameters
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $periods = @{ M1 = 1; M5 = 5; M15 = 15; M30 = 30; H1 = 16385; H4 = 16388; D1 = 16408 }
+          if (-not $periods.ContainsKey($env:PERIOD_NAME)) {
+            throw "Unsupported period '$env:PERIOD_NAME' (use M1, M5, M15, M30, H1, H4, D1)"
+          }
+          "PERIOD_NUM=$($periods[$env:PERIOD_NAME])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CSV_FILE=$($env:CSV_ASSET -replace '\.gz$','')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RUN_STAMP=$(Get-Date -Format 'yyyyMMddTHHmmss')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-ComputerInfo -Property WindowsProductName, WindowsVersion | Format-List
+          "strategy=$env:STRATEGY ea=$env:EA_FILE csv=$env:CSV_ASSET setfile=$env:SETFILE_ASSET"
+          "symbol=$env:SYMBOL base=$env:BASE_SYMBOL period=$env:PERIOD_NAME ($($periods[$env:PERIOD_NAME])) window=$env:FROM_DATE..$env:TO_DATE model=$env:MODEL"
+
+      - name: Download and verify test data
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = "https://github.com/${{ github.repository }}/releases/download/$env:DATA_RELEASE"
+          New-Item -ItemType Directory -Force -Path data | Out-Null
+          foreach ($asset in @($env:CSV_ASSET, $env:SETFILE_ASSET)) {
+            Write-Host "downloading $asset"
+            Invoke-WebRequest -Uri "$base/$asset" -OutFile "data/$asset" -UseBasicParsing
+          }
+          Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile "data/SHA256SUMS" -UseBasicParsing
+
+          $expected = @{}
+          Get-Content -Path data/SHA256SUMS | ForEach-Object {
+            if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$') { $expected[$matches[2]] = $matches[1].ToLower() }
+          }
+          foreach ($asset in @($env:CSV_ASSET, $env:SETFILE_ASSET)) {
+            if (-not $expected.ContainsKey($asset)) { throw "SHA256SUMS has no entry for $asset" }
+            $actual = (Get-FileHash -Algorithm SHA256 -Path "data/$asset").Hash.ToLower()
+            if ($actual -ne $expected[$asset]) {
+              throw "checksum mismatch for $asset`: expected $($expected[$asset]), got $actual"
+            }
+            Write-Host "verified $asset ($actual)"
+          }
+          "CSV_SHA=$($expected[$env:CSV_ASSET])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          if ($env:CSV_ASSET -like '*.gz') {
+            $gz = [System.IO.File]::OpenRead((Resolve-Path "data/$env:CSV_ASSET"))
+            try {
+              $out = [System.IO.File]::Create((Join-Path (Get-Location) "data/$env:CSV_FILE"))
+              try {
+                $gzip = New-Object System.IO.Compression.GZipStream($gz, [System.IO.Compression.CompressionMode]::Decompress)
+                try { $gzip.CopyTo($out) } finally { $gzip.Dispose() }
+              } finally { $out.Dispose() }
+            } finally { $gz.Dispose() }
+            $rows = (Get-Content -Path "data/$env:CSV_FILE" | Measure-Object -Line).Lines
+            Write-Host "decompressed $env:CSV_FILE ($rows lines)"
+            if ($rows -lt 100) { throw "CSV has only $rows lines" }
+          }
+
+      - name: Restore cached MT5 terminal
+        id: terminal-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\mt5-terminal.zip
+          # Only the freshly installed terminal is cached. The zip is created
+          # before the terminal ever starts with an account or our data, so it
+          # cannot contain account or history files.
+          key: mt5-terminal-${{ runner.os }}-v1
+
+      - name: Install MT5 terminal
+        if: steps.terminal-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $installer = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList '/auto' -Wait
+          # mt5setup launches the terminal after installing; close it before
+          # copying so nothing holds the install directory open.
+          Get-Process -Name terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3
+
+          $default = 'C:\Program Files\MetaTrader 5'
+          if (-not (Test-Path (Join-Path $default 'terminal64.exe'))) {
+            $found = Get-ChildItem -Path 'C:\Program Files','C:\Program Files (x86)' -Filter 'terminal64.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $found) { throw 'terminal64.exe not found after mt5setup /auto' }
+            $default = $found.DirectoryName
+          }
+          Write-Host "installed at $default"
+
+          if (Test-Path $env:MT5_HOME) { Remove-Item -Recurse -Force $env:MT5_HOME }
+          Copy-Item -Path $default -Destination $env:MT5_HOME -Recurse -Force
+
+          # A cache must never carry account data. The installer may have
+          # created an empty account file on its post-install launch.
+          foreach ($junk in @('config\accounts.dat','config\accounts.ini','config\common.ini')) {
+            Remove-Item -Path (Join-Path $env:MT5_HOME $junk) -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -Path (Join-Path $env:MT5_HOME 'MQL5\Logs\*') -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path (Join-Path $env:MT5_HOME 'logs\*') -Force -ErrorAction SilentlyContinue
+
+          $zip = Join-Path $env:RUNNER_TEMP 'mt5-terminal.zip'
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path (Join-Path $env:MT5_HOME '*') -DestinationPath $zip -CompressionLevel Optimal
+          $sw.Stop()
+          Write-Host "install + cache archive took $([int]$sw.Elapsed.TotalSeconds)s"
+          "INSTALL_SECONDS=$([int]$sw.Elapsed.TotalSeconds)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Unpack MT5 terminal
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path $env:MT5_HOME)) {
+            New-Item -ItemType Directory -Force -Path $env:MT5_HOME | Out-Null
+            Expand-Archive -Path (Join-Path $env:RUNNER_TEMP 'mt5-terminal.zip') -DestinationPath $env:MT5_HOME -Force
+          }
+          $terminal = Join-Path $env:MT5_HOME 'terminal64.exe'
+          if (-not (Test-Path $terminal)) { throw "terminal64.exe missing in $env:MT5_HOME" }
+          $version = (Get-Item $terminal).VersionInfo
+          Write-Host "terminal build: $($version.ProductVersion) / file $($version.FileVersion)"
+
+      - name: Compile EA
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE "strategy-comparisons\$env:STRATEGY\$env:EA_FILE.mq5"
+          if (-not (Test-Path $src)) { throw "EA source not found: $src" }
+          $destDir = Join-Path $env:MT5_HOME "MQL5\Experts\$env:STRATEGY"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          $copy = Join-Path $destDir "$env:EA_FILE.mq5"
+          Copy-Item -Path $src -Destination $copy -Force
+
+          $log = Join-Path $env:RUNNER_TEMP 'compile_ea.log'
+          $metaeditor = Join-Path $env:MT5_HOME 'metaeditor64.exe'
+          $proc = Start-Process -FilePath $metaeditor -PassThru -Wait -ArgumentList @(
+            "/compile:`"$copy`"",
+            "/log:`"$log`"",
+            "/inc:`"$(Join-Path $env:MT5_HOME 'MQL5\Include')`"",
+            '/portable'
+          )
+          if (Test-Path $log) {
+            $text = [System.IO.File]::ReadAllText($log, [System.Text.Encoding]::Unicode)
+            Write-Host $text
+            Copy-Item -Path $log -Destination (Join-Path $env:GITHUB_WORKSPACE 'compile_ea.log') -Force
+          } else {
+            throw "MetaEditor wrote no log (exit $($proc.ExitCode))"
+          }
+          # MetaEditor exit codes are unreliable; the log is the source of truth.
+          if ($text -notmatch '0 errors') { throw "EA compile failed: see compile_ea.log" }
+          $ex5 = Join-Path $destDir "$env:EA_FILE.ex5"
+          if (-not (Test-Path $ex5)) { throw "compiled EA missing: $ex5" }
+          Write-Host "compiled $ex5"
+
+      - name: Compile custom-symbol import script
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destDir = Join-Path $env:MT5_HOME 'MQL5\Scripts\mt5_ci'
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+          $copy = Join-Path $destDir 'ImportCustomSymbol.mq5'
+          Copy-Item -Path 'tools/mt5_ci/ImportCustomSymbol.mq5' -Destination $copy -Force
+
+          $log = Join-Path $env:RUNNER_TEMP 'compile_import.log'
+          $metaeditor = Join-Path $env:MT5_HOME 'metaeditor64.exe'
+          $proc = Start-Process -FilePath $metaeditor -PassThru -Wait -ArgumentList @(
+            "/compile:`"$copy`"",
+            "/log:`"$log`"",
+            "/inc:`"$(Join-Path $env:MT5_HOME 'MQL5\Include')`"",
+            '/portable'
+          )
+          if (Test-Path $log) {
+            $text = [System.IO.File]::ReadAllText($log, [System.Text.Encoding]::Unicode)
+            Write-Host $text
+            Copy-Item -Path $log -Destination (Join-Path $env:GITHUB_WORKSPACE 'compile_import.log') -Force
+          } else {
+            throw "MetaEditor wrote no log (exit $($proc.ExitCode))"
+          }
+          if ($text -notmatch '0 errors') { throw "import script compile failed: see compile_import.log" }
+          if (-not (Test-Path (Join-Path $destDir 'ImportCustomSymbol.ex5'))) { throw 'compiled import script missing' }
+          Write-Host 'compiled ImportCustomSymbol.ex5'
+
+      - name: Create custom symbol from CSV
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Contract specs per instrument family. The audit README pins these:
+          # EURUSD 1 lot = 100,000 units, indices 1 lot = 1 unit.
+          switch ($env:BASE_SYMBOL) {
+            'EURUSD' {
+              $digits = 5; $point = '0.00001'; $contract = '100000'; $tickValue = '1.0'
+              $base = 'EUR'; $profit = 'USD'; $margin = 'EUR'; $calc = 'forex'
+              $volMin = '0.01'; $volStep = '0.01'; $volMax = '100'
+            }
+            { $_ -in @('USA500','NAS100') } {
+              $digits = 3; $point = '0.001'; $contract = '1'; $tickValue = '0.001'
+              $base = 'USD'; $profit = 'USD'; $margin = 'USD'; $calc = 'cfd'
+              $volMin = '0.01'; $volStep = '0.01'; $volMax = '100'
+            }
+            default { throw "No contract spec for base symbol '$env:BASE_SYMBOL'" }
+          }
+
+          $filesDir = Join-Path $env:MT5_HOME 'MQL5\Files\mt5_ci'
+          New-Item -ItemType Directory -Force -Path $filesDir | Out-Null
+          Copy-Item -Path "data/$env:CSV_FILE" -Destination (Join-Path $filesDir 'rates.csv') -Force
+
+          $params = @(
+            "symbol=$env:SYMBOL",
+            'csv=mt5_ci\rates.csv',
+            "digits=$digits",
+            "point=$point",
+            "contract_size=$contract",
+            "tick_value=$tickValue",
+            "volume_min=$volMin",
+            "volume_step=$volStep",
+            "volume_max=$volMax",
+            "currency_base=$base",
+            "currency_profit=$profit",
+            "currency_margin=$margin",
+            "calc_mode=$calc"
+          ) -join "`r`n"
+          $paramsPath = Join-Path $env:MT5_HOME 'MQL5\Files\mt5_ci_import.txt'
+          [System.IO.File]::WriteAllText($paramsPath, $params + "`r`n", [System.Text.ASCIIEncoding]::new())
+
+          $statusPath = Join-Path $env:MT5_HOME 'MQL5\Files\mt5_ci_import_status.txt'
+          Remove-Item -Path $statusPath -Force -ErrorAction SilentlyContinue
+
+          # No Symbol=/Period= here: the script does not need a specific chart
+          # and the custom symbol does not exist yet at startup.
+          $iniLines = @(
+            '[StartUp]',
+            'Script=mt5_ci\ImportCustomSymbol'
+          )
+          $iniPath = Join-Path $env:RUNNER_TEMP 'import.ini'
+          [System.IO.File]::WriteAllText($iniPath, ($iniLines -join "`r`n") + "`r`n", [System.Text.ASCIIEncoding]::new())
+
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $proc = Start-Process -FilePath (Join-Path $env:MT5_HOME 'terminal64.exe') -PassThru `
+            -ArgumentList @('/portable', "/config:`"$iniPath`"")
+          if (-not $proc.WaitForExit(300000)) {
+            Write-Host 'import terminal did not exit within 5 min; killing it'
+            $proc.Kill()
+            Start-Sleep -Seconds 2
+          }
+          $sw.Stop()
+          Write-Host "import terminal ran $([int]$sw.Elapsed.TotalSeconds)s (exit $($proc.ExitCode))"
+
+          if (-not (Test-Path $statusPath)) {
+            Get-ChildItem -Path (Join-Path $env:MT5_HOME 'logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 60
+            }
+            Get-ChildItem -Path (Join-Path $env:MT5_HOME 'MQL5\Logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 60
+            }
+            throw 'Import script never wrote a status file: the [StartUp] script did not run (no chart/symbol without an account?)'
+          }
+          $status = (Get-Content -Path $statusPath -Raw).Trim()
+          Write-Host "import status: $status"
+          Copy-Item -Path $statusPath -Destination (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_import_status.txt') -Force
+          if ($status -notmatch '^OK ') { throw "custom symbol import failed: $status" }
+
+      - name: Convert setfile to tester .set
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $profiles = Join-Path $env:MT5_HOME 'MQL5\Profiles\Tester'
+          New-Item -ItemType Directory -Force -Path $profiles | Out-Null
+          $setName = "$($env:BASE_SYMBOL.ToLower())_$($env:PERIOD_NAME.ToLower())_ci.set"
+          python tools/mt5_ci/convert_setfile.py --input "data/$env:SETFILE_ASSET" --output (Join-Path $profiles $setName)
+          if ($LASTEXITCODE -ne 0) { throw "convert_setfile.py failed ($LASTEXITCODE)" }
+          Get-Content -Path (Join-Path $profiles $setName) | ForEach-Object { Write-Host $_ }
+          "SET_NAME=$setName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Copy-Item -Path (Join-Path $profiles $setName) -Destination (Join-Path $env:GITHUB_WORKSPACE 'tester.set') -Force
+
+      - name: Run strategy tester
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $reportName = "mt5_ci_$($env:SYMBOL.ToLower())_$($env:PERIOD_NAME.ToLower())"
+          # Expert= is resolved relative to MQL5\Experts and needs backslashes;
+          # a forward slash silently falls back to the Moving Average sample.
+          $expert = "$env:STRATEGY\$env:EA_FILE.ex5"
+          $iniLines = @(
+            '[Tester]',
+            "Expert=$expert",
+            "ExpertParameters=$env:SET_NAME",
+            "Symbol=$env:SYMBOL",
+            "Period=$env:PERIOD_NUM",
+            "Model=$env:MODEL",
+            "FromDate=$env:FROM_DATE",
+            "ToDate=$env:TO_DATE",
+            "Deposit=$env:DEPOSIT",
+            'Currency=USD',
+            "Leverage=$env:LEVERAGE",
+            'Optimization=0',
+            'ForwardMode=0',
+            'Visual=0',
+            "Report=$reportName",
+            'ReplaceReport=1',
+            'ShutdownTerminal=1'
+          )
+          $iniPath = Join-Path $env:RUNNER_TEMP 'tester.ini'
+          # ASCII, no BOM: a BOM makes the terminal ignore the whole file.
+          [System.IO.File]::WriteAllText($iniPath, ($iniLines -join "`r`n") + "`r`n", [System.Text.ASCIIEncoding]::new())
+          Write-Host "--- tester.ini ($iniPath)"
+          Get-Content $iniPath | ForEach-Object { Write-Host $_ }
+          Copy-Item -Path $iniPath -Destination (Join-Path $env:GITHUB_WORKSPACE 'tester.ini') -Force
+
+          Get-ChildItem -Path $env:MT5_HOME -Filter '*.html' -ErrorAction SilentlyContinue | Remove-Item -Force
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $proc = Start-Process -FilePath (Join-Path $env:MT5_HOME 'terminal64.exe') -PassThru `
+            -ArgumentList @('/portable', "/config:`"$iniPath`"")
+          if (-not $proc.WaitForExit(2400000)) {
+            Write-Host 'tester terminal did not exit within 40 min; killing it'
+            $proc.Kill()
+            Start-Sleep -Seconds 2
+          }
+          $sw.Stop()
+          "TESTER_SECONDS=$([int]$sw.Elapsed.TotalSeconds)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "tester ran $([int]$sw.Elapsed.TotalSeconds)s (exit $($proc.ExitCode))"
+
+      - name: Collect logs and report
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          foreach ($dir in @('logs','Tester\logs','MQL5\Logs')) {
+            $path = Join-Path $env:MT5_HOME $dir
+            if (Test-Path $path) {
+              $target = Join-Path 'artifacts' ($dir -replace '\\','_')
+              New-Item -ItemType Directory -Force -Path $target | Out-Null
+              Copy-Item -Path (Join-Path $path '*') -Destination $target -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Get-ChildItem -Path $env:MT5_HOME -Filter '*.html' -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "report: $($_.FullName) ($($_.Length) bytes)"
+            Copy-Item -Path $_.FullName -Destination (Join-Path 'artifacts' $_.Name) -Force
+          }
+          foreach ($file in @('tester.ini','tester.set','compile_ea.log','compile_import.log','mt5_ci_import_status.txt')) {
+            if (Test-Path $file) { Copy-Item -Path $file -Destination (Join-Path 'artifacts' $file) -Force }
+          }
+          Write-Host '--- tester logs (tail)'
+          Get-ChildItem -Path (Join-Path $env:MT5_HOME 'Tester\logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "--- $($_.Name)"; Get-Content $_.FullName -Tail 80
+          }
+
+      - name: Assert report
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $report = Get-ChildItem -Path $env:MT5_HOME -Filter '*.html' -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $report) {
+            throw 'tester produced no HTML report: the [Tester] section was ignored (missing /portable, BOM, or bad config)'
+          }
+          Copy-Item -Path $report.FullName -Destination (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report.html') -Force
+          python tools/mt5_ci/inspect_report.py --report $report.FullName `
+            --expect-expert $env:EA_FILE --expect-symbol $env:SYMBOL `
+            --min-trades ([int]$env:MIN_TRADES) --json-out (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report_summary.json')
+          if ($LASTEXITCODE -ne 0) { throw "report assertion failed ($LASTEXITCODE)" }
+
+      - name: Job summary
+        if: always()
+        run: |
+          $lines = @('### MT5 tester run', '', "symbol: $env:SYMBOL ($env:BASE_SYMBOL)", "period: $env:PERIOD_NAME", "window: $env:FROM_DATE .. $env:TO_DATE", "model: $env:MODEL", '')
+          if ($env:INSTALL_SECONDS) { $lines += "install: $($env:INSTALL_SECONDS)s" }
+          if ($env:TESTER_SECONDS) { $lines += "tester: $($env:TESTER_SECONDS)s" }
+          if (Test-Path 'mt5_ci_report_summary.json') {
+            $summary = Get-Content 'mt5_ci_report_summary.json' -Raw | ConvertFrom-Json
+            $lines += ''
+            $lines += "| field | value |"
+            $lines += "| --- | --- |"
+            foreach ($key in @('expert','symbol','period','total_trades','total_net_profit','profit_factor','bars')) {
+              $lines += "| $key | $($summary.$key) |"
+            }
+          }
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-backtest-${{ env.SYMBOL }}-${{ env.PERIOD_NAME }}-${{ github.run_id }}
+          path: |
+            artifacts/
+            mt5_ci_report.html
+            mt5_ci_report_summary.json
+            tester.ini
+            tester.set
+            compile_ea.log
+            compile_import.log
+            mt5_ci_import_status.txt
+          if-no-files-found: warn
+          retention-days: 14
