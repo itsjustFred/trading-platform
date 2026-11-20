@@ -189,11 +189,11 @@ additional layer under it, not a replacement. Today a promoted strategy on a
 real-money account therefore still cannot trade: preflight passes the gate,
 but the daemon will not keep a non-demo adapter. The viewer's activate path
 re-verifies the account against broker discovery and will not arm the
-deployment. The cTrader top-N deploy with `activate` is different: it creates
-the deployments `ACTIVE` directly, without that re-verification, on any account
-the gate passes. Only the daemon's demo-only block stops their orders. Refusing
-`activate` on a non-demo account there is a maintainer decision, not yet made.
-Lifting the demo-only block is a separate, deliberate step.
+deployment. The cTrader top-N deploy creates its deployments directly, without
+that re-verification, so it never arms a non-demo account either (#261): the
+rows are created `PAUSED` and a maintainer activates them by hand, which is the
+path that re-verifies - and, like every path, only arms an account the broker
+reports as demo. Lifting the demo-only block is a separate, deliberate step.
 
 ### Required evidence and thresholds
 
@@ -303,6 +303,20 @@ source the demo-only block uses there. Unknown means real money.
 The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
+
+### The cTrader top-N deploy never arms a non-demo account (#261)
+
+That endpoint creates its rows in one shot, with no per-deployment
+re-verification of the account; `activate` therefore used to be the only route
+that put an armed deployment on an account the broker does not report as demo.
+With `activate` on a broker-reported demo account the behaviour is unchanged:
+the rows are created `ACTIVE`. On any other account - a reported live account, or
+one the broker could not assert as demo, which fails closed - the rows are
+created `PAUSED` instead, and the response's `paused_as_real_money` plus a
+`WARNING` in the viewer log name each one and say why. The owner activates them
+by hand, through `PUT /api/live/deployments/{id}/status`, which re-verifies the
+account against the broker and still refuses a non-demo one. The dry run reports
+the same: a preview never shows `ACTIVE` rows the deploy would not get.
 
 ## Provisioning and Rotation
 
