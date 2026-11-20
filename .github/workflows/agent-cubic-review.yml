@@ -108,7 +108,10 @@ concurrency:
 env:
   CUBIC_CONTEXT: agent/cubic-review
   # The review body marker and the bot that posts it. Both are cubic's, not
-  # ours; change them here if cubic renames either.
+  # ours; change them here if cubic renames either. So is the summary-line shape
+  # the classifier reads (`**N issue(s) found**` / "No issues found" inside the
+  # marker block): if cubic changes it, no count can be read and every review
+  # becomes an `error` - loud, and never a silent pass.
   CUBIC_MARKER: "cubic:review-summary"
   CUBIC_BOT: "cubic-dev-ai[bot]"
 
