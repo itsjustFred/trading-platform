@@ -63,12 +63,6 @@ on:
         description: "Fail the job if the report has fewer trades"
         default: "1"
         required: true
-  # SPIKE: remove before ready — temporary, so this branch can prove the
-  # --root change end to end. workflow_dispatch only exists once the file is on
-  # the default branch.
-  push:
-    branches: [feat/mt5-ci-tester-spike]
-
 permissions:
   contents: read
 
