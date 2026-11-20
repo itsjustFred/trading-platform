@@ -613,7 +613,12 @@ class MT5HTMLImporter(BaseImporter):
                 (MT5HTMLImporter._to_float(r, col_swap, default=0.0) or 0.0)
                 for r in fills.entries + exit_rows
             )
-            fees = commission + swap
+            # MT5 reports commission and swap signed from the account's point
+            # of view (a cost is negative). The Trade contract defines ``fees``
+            # as a positive cost (net_pnl == pnl - fees), so negate at the
+            # importer boundary. A net swap credit therefore yields a
+            # negative fee. ``meta`` keeps the raw MT5-signed values.
+            fees = -(commission + swap)
 
             exits: list[TradeExit] = []
             for exit_row in exit_rows:
