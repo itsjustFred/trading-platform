@@ -1783,14 +1783,97 @@ async def prepare_exit_intent_order(
     return prepared, float(target_qty)
 
 
+class UnreadableBrokerPositionQtyError(ValueError):
+    """A broker position row whose quantity cannot be read (#263).
+
+    The open-position count gates entries: it drives ``max_positions`` and the
+    risk-at-stake exposure estimate. A row that does not state a finite
+    quantity says nothing about whether the account is flat, so the count has to
+    refuse instead of defaulting it to zero - reading it as "no position"
+    would open a new one on top of a cap that may already be full.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        symbol: str = "",
+        qty: object = None,
+        row_index: int = -1,
+    ) -> None:
+        super().__init__(message)
+        self.symbol = symbol
+        self.qty = qty
+        self.row_index = row_index
+
+    def log_data(self) -> dict[str, object]:
+        """Structured fields for the operator alert (the raw value stringified)."""
+        return {
+            "position_symbol": self.symbol,
+            "position_qty_raw": str(self.qty),
+            "position_row_index": self.row_index,
+        }
+
+
+def _broker_position_qty(position: Mapping[str, object], row_index: int) -> float:
+    """The quantity one broker position row states; a bad value raises (#263).
+
+    ``0.0``/``"0"`` is a *readable* flat row and is fine. Anything else that is
+    not a finite number - a value that cannot be parsed at all, ``nan``/``inf``,
+    a boolean, or a missing/``None`` quantity - raises
+    :class:`UnreadableBrokerPositionQtyError`: the row does not say what it is
+    worth, and "no position" is a guess this path may not make. The exit path
+    already reads a broker quantity the same way
+    (:func:`live_runner.exit_signals.broker_position_qty`).
+
+    Alpaca's adapter marks a row whose REST quantity string it could not parse
+    with ``qty_unparseable`` (its displayed ``qty`` stays the coerced ``0.0``),
+    which is the only thing that tells an unreadable row from a flat one -
+    ``live_runner.trailing_stops`` and the adapter's own flatten path already
+    read that marker, and so does this one.
+    """
+    symbol = str(position.get("symbol") or "").strip().upper()
+
+    def _unreadable(detail: str, raw: object) -> UnreadableBrokerPositionQtyError:
+        return UnreadableBrokerPositionQtyError(
+            f"Broker position for {symbol!r} {detail}; refusing to read the account "
+            "as flat",
+            symbol=symbol,
+            qty=raw,
+            row_index=row_index,
+        )
+
+    if position.get("qty_unparseable"):
+        raw = position.get("qty_raw")
+        raise _unreadable(f"has an unparseable qty ({raw!r})", raw)
+    raw = position.get("qty")
+    if raw is None:
+        raise _unreadable("states no qty", raw)
+    if isinstance(raw, bool):
+        raise _unreadable(f"has a boolean qty ({raw!r})", raw)
+    try:
+        qty = float(raw)
+    # ArithmeticError covers OverflowError and the decimal library's
+    # DecimalException: `float()` raises those rather than a TypeError or
+    # ValueError for an int too large for a float and a Decimal it cannot parse.
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise _unreadable(f"has an unparseable qty ({raw!r})", raw) from exc
+    if not math.isfinite(qty):
+        raise _unreadable(f"has a non-finite qty ({raw!r})", raw)
+    return qty
+
+
 def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
+    """Count the broker positions that carry an open quantity (#263).
+
+    The count feeds the entry gates, so a row this cannot read must stop the
+    count rather than drop out of it: :class:`UnreadableBrokerPositionQtyError`
+    propagates and the caller refuses the entry (see
+    :func:`prepare_order_with_risk`).
+    """
     open_positions_count = 0
-    for position in positions:
-        try:
-            position_qty = float(position.get("qty") or 0.0)
-        except (TypeError, ValueError):
-            position_qty = 0.0
-        if abs(position_qty) > 0:
+    for row_index, position in enumerate(positions):
+        if abs(_broker_position_qty(position, row_index)) > 0:
             open_positions_count += 1
     return open_positions_count
 
@@ -1808,6 +1891,10 @@ async def _broker_exposure_estimate(
     worst-case open risk is ``count * max_risk_per_trade``. The estimate is
     clamped to ``max_total_exposure``: position rows fetched between snapshots
     must not fabricate budget overflow beyond the configured cap.
+
+    Raises :class:`UnreadableBrokerPositionQtyError` when a position row
+    states no readable quantity (#263): an unknown row must not be read as
+    flat, so the caller cannot size an entry against it.
     """
     open_positions_count: int | None = None
     broker_exposure = 0.0
@@ -1861,6 +1948,10 @@ async def prepare_order_with_risk(
     ``None`` (production) the adapter's :meth:`get_pip_value` supplies it from
     broker data, and an entry whose pip value cannot be determined is refused.
     A ``pip_value`` in signal metadata is never read.
+
+    Raises :class:`UnreadableBrokerPositionQtyError` (after an operator alert)
+    when a broker position row states no readable quantity (#263): the entry
+    is refused rather than sized as if the account were flat.
     """
     metadata = dict(signal.metadata or {})
     if is_exit_order(signal.action, metadata):
@@ -1907,9 +1998,32 @@ async def prepare_order_with_risk(
     )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
-    open_positions_count, broker_exposure = await _broker_exposure_estimate(
-        adapter, deployment
-    )
+    try:
+        open_positions_count, broker_exposure = await _broker_exposure_estimate(
+            adapter, deployment
+        )
+    except UnreadableBrokerPositionQtyError as exc:
+        # #263 fail closed on the money path: a broker position whose quantity
+        # cannot be read is not "no position". Taking the entry decision anyway
+        # would size it as though the account were flat, so max_positions and
+        # max_total_exposure would not bind and a new position could open on top
+        # of a cap that is already full. Nothing is submitted and an operator
+        # has to look (ERROR is a Sentry event).
+        logger.error(
+            "ALERT: broker position quantity is unreadable; refusing the entry "
+            "signal because the open-position count cannot be trusted",
+            extra={
+                "data": {
+                    "alert": "broker_position_qty_unreadable",
+                    "account_id": deployment.account_id,
+                    "deployment_id": str(deployment.id),
+                    "signal_symbol": signal.symbol,
+                    "reason": str(exc),
+                    **exc.log_data(),
+                }
+            },
+        )
+        raise
     resolved_balance = await _resolve_account_balance(adapter, account_balance)
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)

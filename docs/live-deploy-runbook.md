@@ -304,6 +304,30 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+## Broker Position Quantity (#263)
+
+Every entry order reads the broker's open positions twice: as a count for
+`max_positions` and as the risk-at-stake estimate for `max_total_exposure`
+(`live_runner.daemon._broker_exposure_estimate`). A position row the platform
+cannot read a quantity from — a value that is not a number, `nan`/`inf`, a
+boolean, a missing or `None` `qty`, or Alpaca's `qty_unparseable` marker — used
+to be counted as zero, which reads as "the account is flat". It now fails
+closed, because sizing an entry against an unknown book could open a position
+on top of a cap that is already full.
+
+- Refusal: `UnreadableBrokerPositionQtyError` from `prepare_order_with_risk`, so
+  the entry takes the same skip-and-log path every other entry refusal does and
+  nothing reaches the broker. Exit-only orders are unaffected: they size
+  against the deployment's own ledger, not the count.
+- Alert: ERROR `ALERT: broker position quantity is unreadable; ...`
+  (`alert=broker_position_qty_unreadable`, with account, deployment, signal
+  symbol, the row's symbol, the raw quantity and its row index) and a Sentry
+  event. There is no automatic retry: each new signal of that deployment refuses
+  the same way while the broker reports an unreadable row.
+- Operator action: read the position on the broker, reconcile the ledgers if
+  the quantity is real, and pause the deployment if the broker keeps reporting
+  a row without a usable quantity.
+
 ## Provisioning and Rotation
 
 Provision the deployment file from `live_deployments.example.yaml` into the
