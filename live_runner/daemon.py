@@ -5587,12 +5587,16 @@ async def _shutdown_cleanup(
     #    here, so the release joins workers that may sit in a stuck broker
     #    request. It runs off the loop under the same deadline, so a release that
     #    does not come back is reported as a failed phase instead of hanging the
-    #    daemon in front of its exit code.
-    ok &= await _bounded(
+    #    daemon in front of its exit code. The abandonment is recorded as well:
+    #    the pool's workers are non-daemon threads, so ``main`` has to leave
+    #    through ``os._exit`` to still report that exit code.
+    if not await _bounded(
         release_twisted_reactor_threads_bounded(cleanup_timeout),
         timeout=cleanup_timeout,
         phase="release_reactor",
-    )
+    ):
+        shutdown.note_abandoned_reactor_release()
+        ok = False
     return ok
 
 
@@ -5790,6 +5794,13 @@ def main() -> None:
     # Flush and close log handlers before exiting; the exit code tells systemd
     # whether the shutdown was clean.
     logging.shutdown()
+    if _SHUTDOWN.reactor_release_abandoned:
+        # The reactor release timed out, so the Twisted pool's worker threads -
+        # which are not daemon threads - may still be alive and interpreter
+        # shutdown would block on them. Leave through os._exit instead: the code
+        # still reaches the service manager, where a hang would be SIGKILLed and
+        # the operator would never learn a broker outcome was left unknown.
+        os._exit(exit_code)
     sys.exit(exit_code)
 
 

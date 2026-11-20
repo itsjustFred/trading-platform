@@ -122,18 +122,22 @@ async def release_twisted_reactor_threads_bounded(timeout: float) -> None:
     signal that tells an operator a broker outcome was left unknown. So the join
     runs on a daemon thread and is only awaited for ``timeout`` (the cleanup-phase
     deadline): a release that does not come back in time raises ``TimeoutError``,
-    which the caller records as a failed phase, and the daemon still exits. The
-    abandoned thread is a daemon thread, so it cannot hold up the interpreter
-    either.
+    which the caller records as a failed phase.
+
+    The abandoned release thread itself is a daemon thread, but the reactor pool
+    workers it was joining are not: a timed-out release can still block the
+    interpreter at exit. That is why the caller also records the abandonment
+    (``ShutdownCoordinator.note_abandoned_reactor_release``) and ``main`` leaves
+    through ``os._exit`` so the exit code still reaches the service manager.
     """
     loop = asyncio.get_running_loop()
     finished: asyncio.Future[None] = loop.create_future()
-    failure: list[Exception] = []
+    failure: list[BaseException] = []
 
     def _release() -> None:
         try:
             release_twisted_reactor_threads()
-        except Exception as exc:  # the verdict must survive anything the release does
+        except BaseException as exc:  # the verdict must survive anything the release does
             failure.append(exc)
         finally:
             try:
@@ -172,10 +176,25 @@ class ShutdownCoordinator:
         self._event: asyncio.Event | None = None
         self._idle: asyncio.Event | None = None
         self._previous_handlers: dict[int, object] = {}
+        self._reactor_release_abandoned = False
 
     @property
     def requested(self) -> bool:
         return self._requested
+
+    @property
+    def reactor_release_abandoned(self) -> bool:
+        """Whether the last run gave up on the reactor release.
+
+        A release that timed out was joining the reactor pool's workers, which
+        are non-daemon threads: the interpreter can block on them at exit, so
+        ``main`` has to leave through ``os._exit`` to still report the code.
+        """
+        return self._reactor_release_abandoned
+
+    def note_abandoned_reactor_release(self) -> None:
+        """Record that the reactor release did not come back before its deadline."""
+        self._reactor_release_abandoned = True
 
     @property
     def reason(self) -> str:
@@ -193,6 +212,7 @@ class ShutdownCoordinator:
         # process-wide and run_daemon marks it requested on every exit path).
         self._requested = False
         self._reason = ""
+        self._reactor_release_abandoned = False
         self._event = asyncio.Event()
         self._idle = asyncio.Event()
         if self._inflight == 0:

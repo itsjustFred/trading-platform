@@ -954,6 +954,9 @@ def test_cleanup_closes_connections_and_never_touches_broker_orders(
     assert scheduler.stopped == 1
     assert adapter.disconnect_calls == 1
     assert adapter.mutation_calls == []
+    # Only a release that was abandoned is recorded: a clean one leaves the
+    # interpreter's normal exit path alone.
+    assert coordinator.reactor_release_abandoned is False
 
 
 def test_a_failed_cleanup_phase_logs_its_traceback(
@@ -1144,6 +1147,46 @@ def test_main_exits_with_the_code_the_daemon_returned(
 
     assert excinfo.value.code == code
     assert flushed == [1], "log handlers must be flushed before the exit code lands"
+
+
+def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out reactor release must not cost the operator the exit code.
+
+    Twisted's pool workers are non-daemon threads, so ``sys.exit`` would block in
+    interpreter shutdown waiting for the very thread the release gave up on. The
+    service manager would then SIGKILL the daemon at ``TimeoutStopSec`` and the
+    ``1`` that says "a broker outcome needs reconciliation" would be lost.
+    """
+    flushed: list[int] = []
+    exited: list[int] = []
+
+    class _Exit(Exception):
+        def __init__(self, code: int) -> None:
+            self.code = code
+
+    def _fake_run(coro: Any) -> int:
+        coro.close()
+        daemon._SHUTDOWN.note_abandoned_reactor_release()
+        return EXIT_CLEANUP_TIMEOUT
+
+    def _exit(code: int) -> None:
+        # os._exit never returns; a stand-in that did would let main fall through
+        # to sys.exit and hide the very difference under test.
+        exited.append(code)
+        raise _Exit(code)
+
+    monkeypatch.setattr(daemon.asyncio, "run", _fake_run)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
+    monkeypatch.setattr(daemon.os, "_exit", _exit)
+
+    with pytest.raises(_Exit) as excinfo:
+        daemon.main()
+
+    assert excinfo.value.code == EXIT_CLEANUP_TIMEOUT
+    assert flushed == [1], "log handlers must be flushed before the process is killed"
+    assert exited == [EXIT_CLEANUP_TIMEOUT], "the exit code must still reach the manager"
 
 
 def test_shutdown_timeouts_are_bounded_by_default() -> None:
@@ -1348,8 +1391,10 @@ def test_a_reactor_release_that_never_returns_cannot_hold_the_shutdown(
     ``Twisted``'s shutdown never fires in the daemon, so the release joins the
     reactor's workers directly and can block for as long as a stuck broker
     request. An unbounded join would keep the process from ever reporting its
-    exit code; the daemon reports the phase, exits non-zero and leaves the pool
-    thread behind (a daemon thread, so the interpreter still exits).
+    exit code; the daemon reports the phase, exits non-zero and records that the
+    release was abandoned - the pool's workers are not daemon threads, so
+    ``main`` then leaves through ``os._exit`` instead of hanging in interpreter
+    shutdown.
     """
     entered = threading.Event()
     leave = threading.Event()
@@ -1392,6 +1437,9 @@ def test_a_reactor_release_that_never_returns_cannot_hold_the_shutdown(
     assert ok is False
     assert elapsed < 5.0, f"the cleanup must not wait past its deadline: {elapsed}"
     assert _timed_out_phases(caplog) == ["release_reactor"]
+    # The pool's workers are non-daemon threads, so an abandoned release can
+    # still block interpreter exit; the run records it for main to act on.
+    assert coordinator.reactor_release_abandoned is True
 
 
 def test_the_exit_codes_are_the_values_the_service_manager_sees() -> None:
