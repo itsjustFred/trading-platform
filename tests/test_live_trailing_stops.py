@@ -217,6 +217,17 @@ def surfaced(monkeypatch) -> list[tuple[str, dict]]:
     return events
 
 
+def _warnings(monkeypatch) -> list[dict]:
+    """Every WARNING the trailing loop logs, as its structured data."""
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        trailing_stops.logger,
+        "warning",
+        lambda message, *a, **kw: logged.append(kw["extra"]["data"]),
+    )
+    return logged
+
+
 # ── the trail itself ─────────────────────────────────────────────────────────
 
 
@@ -493,11 +504,16 @@ def test_position_close_cleans_up_trailing_state(live: _Live, surfaced) -> None:
     assert surfaced == []
 
 
-def test_partial_exit_keeps_trailing_the_remaining_position(live: _Live) -> None:
+def test_a_partial_exit_pauses_the_trail_until_the_stop_matches_the_position(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    warnings = _warnings(monkeypatch)
     manager = LiveTrailingStopManager()
     live.feed(manager, [103.0])
+    assert live.client.stop_prices() == [101.97]
 
-    # Half the position is closed by an exit-only signal; the stop leg stays.
+    # Half the position is closed by an exit-only signal; the stop leg keeps the
+    # entry's quantity (the broker shape #258 is about).
     live.client.positions = [_FakePosition("AAPL", 5)]
     live.add_signal(
         "sell",
@@ -507,8 +523,23 @@ def test_partial_exit_keeps_trailing_the_remaining_position(live: _Live) -> None
     )
     live.feed(manager, [106.0])
 
-    assert live.client.stop_prices() == [104.94]
+    assert len(warnings) == 1
+    assert warnings[0]["stop_qty"] == 10.0
+    assert warnings[0]["position_qty"] == 5.0
+    assert live.client.stop_prices() == [101.97]
     assert manager.tracked_positions() == {(ACCOUNT, "AAPL")}
+    assert surfaced == []
+
+    # The stop is resized to what is held: the trail picks the close it skipped
+    # up (106 * 0.99 = 104.94) and the next one after it.
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=5, stop_price=101.97),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.feed(manager, [107.0])
+
+    assert len(warnings) == 1
+    assert live.client.stop_prices() == [105.93]
 
 
 def test_an_unfilled_later_signal_does_not_displace_the_open_entry(live: _Live) -> None:
@@ -1281,28 +1312,146 @@ def test_a_missing_bar_is_retried_only_while_it_can_still_be_feed_delay(live: _L
     assert manager._schedules[ACCOUNT].retry_at is None
 
 
-def test_a_stop_larger_than_the_position_is_warned_about_once(live: _Live, monkeypatch) -> None:
-    warnings: list[dict] = []
-    monkeypatch.setattr(
-        trailing_stops.logger,
-        "warning",
-        lambda message, *a, **kw: warnings.append(kw["extra"]["data"]),
-    )
+# ── a stop that covers more than the position holds (#258) ──────────────────
+
+
+def test_a_stop_larger_than_the_position_is_left_untrailed(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    warnings = _warnings(monkeypatch)
     live.client.positions = [_FakePosition("AAPL", 6)]
     manager = LiveTrailingStopManager()
 
     live.feed(manager, [100.0, 103.0])
 
+    # Reported once, and nothing is amended: the stop's quantity is not resized,
+    # so the trail touches nothing it has not verified it can move safely.
+    assert len(warnings) == 1
+    assert warnings[0]["symbol"] == "AAPL"
+    assert warnings[0]["stop_order_id"] == "stop-1"
+    assert warnings[0]["stop_qty"] == 10.0
+    assert warnings[0]["position_qty"] == 6.0
+    assert live.client.replace_calls == []
+    assert live.client.stop_prices() == [98.0]
+    # Not even market data is read: there is no stop level to compute.
+    assert live.market_data_calls == 0
+    assert surfaced == []
+
+
+def test_an_oversized_stop_on_a_short_position_is_left_untrailed(
+    isolated_db, surfaced, monkeypatch
+) -> None:
+    database, _engine, _data_dir = isolated_db
+    live = _Live(database, side="sell")
+    live.client.positions = [_FakePosition("AAPL", -6)]
+    warnings = _warnings(monkeypatch)
+
+    live.feed(LiveTrailingStopManager(), [100.0, 96.0])
+
     assert len(warnings) == 1
     assert warnings[0]["stop_qty"] == 10.0
     assert warnings[0]["position_qty"] == 6.0
-    # The price is still trailed; the quantity is deliberately not touched.
+    assert live.client.replace_calls == []
+    assert live.client.stop_prices() == [102.0]
+    assert surfaced == []
+
+
+def test_a_stop_quantity_within_qty_tolerance_is_still_trailed(live: _Live, monkeypatch) -> None:
+    warnings = _warnings(monkeypatch)
+    live.client.positions = [_FakePosition("AAPL", 10.0000000001)]
+
+    live.feed(LiveTrailingStopManager(), [103.0])
+
+    # Broker float dust on the position qty is not an oversized stop.
+    assert warnings == []
+    assert live.client.stop_prices() == [101.97]
+
+
+def test_a_stop_whose_quantity_the_broker_does_not_report_is_still_trailed(
+    isolated_db, monkeypatch
+) -> None:
+    database, _engine, _data_dir = isolated_db
+    live = _Live(database)
+    live.client.orders = [
+        _FakeOrder("stop-1", "AAPL", "sell", order_type="stop", qty=0.0, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    warnings = _warnings(monkeypatch)
+
+    live.feed(LiveTrailingStopManager(), [103.0])
+
+    assert warnings == []
+    assert live.client.stop_prices() == [101.97]
+
+
+def test_an_oversized_stop_is_not_a_failure_and_does_not_block_the_next_pass(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    _warnings(monkeypatch)
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    manager = LiveTrailingStopManager()
+
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2))
+
+    assert surfaced == []
+    trail = manager._trails[(ACCOUNT, "AAPL")]
+    assert trail.outage.failures == 0
+    assert trail.outage.given_up is False
+    assert manager._schedules[ACCOUNT].retry_at is None
+
+
+def test_the_trail_resumes_and_catches_up_once_the_stop_matches_the_position(
+    live: _Live, monkeypatch
+) -> None:
+    _warnings(monkeypatch)
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [100.0, 103.0])
+    assert live.client.replace_calls == []
+
+    # The stop is resized down to what is held: the closes the skip left
+    # unprocessed are all applied, so the pause never loses a trailed peak.
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.feed(manager, [104.0])
+
+    # One amendment per pass, to the target of the newest of the skipped closes
+    # (100 -> 99, 103 -> 101.97, 104 -> 102.96).
+    assert live.client.replace_calls == [("stop-1+", 102.96)]
+    assert live.client.stop_prices() == [102.96]
+
+
+def test_a_second_oversized_stop_is_reported_again(live: _Live, monkeypatch) -> None:
+    warnings = _warnings(monkeypatch)
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [100.0])
+    assert len(warnings) == 1
+
+    # Resized once, then halved again by a second partial exit: the second
+    # mismatch is reported too, not swallowed by the first one's latch.
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=99.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.feed(manager, [103.0])
+    assert len(warnings) == 1
+    assert live.client.stop_prices() == [101.97]
+
+    live.client.positions = [_FakePosition("AAPL", 3)]
+    live.feed(manager, [104.0])
+    assert len(warnings) == 2
+    assert warnings[1]["stop_qty"] == 6.0
+    assert warnings[1]["position_qty"] == 3.0
     assert live.client.stop_prices() == [101.97]
 
 
 def test_a_stop_matching_the_position_does_not_warn(live: _Live, monkeypatch) -> None:
-    warnings: list[object] = []
-    monkeypatch.setattr(trailing_stops.logger, "warning", lambda *a, **kw: warnings.append(a))
+    warnings = _warnings(monkeypatch)
 
     live.feed(LiveTrailingStopManager(), [100.0])
 

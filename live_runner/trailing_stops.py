@@ -34,6 +34,9 @@ Scope limits (deliberate, documented in ``docs/live-deploy-runbook.md``):
 * A position is attributed to the newest *filled entry* signal for its symbol
   among the account's ACTIVE deployments. Exactly one amendable protective
   stop per symbol is required; anything else is reported and left alone.
+* A stop that covers more than the position still holds — a bracket stop leg
+  left at the entry's quantity by a partial exit — is left untrailed: moving
+  its price is verified, resizing it is not (#258).
 """
 from __future__ import annotations
 
@@ -91,6 +94,11 @@ TRAILING_GIVEN_UP_PROBE_SECONDS = 15 * 60
 #: (night, weekend, holiday), not late: the pass waits for the next boundary
 #: instead of hammering the broker every few minutes.
 TRAILING_BAR_GRACE_SECONDS = 900
+#: Slack allowed when comparing a stop order's quantity with the position's.
+#: Alpaca reports fractional quantities as floats (0.000143382 and friends), so
+#: a stop that matches the position to the last of its own digits must not be
+#: mistaken for one that covers more than is held.
+_STOP_QTY_TOLERANCE = 1e-9
 
 EntrySignalLoader = Callable[[list[str], list[str]], dict[str, dict[str, Any]]]
 
@@ -170,7 +178,9 @@ class _Trail:
     signal_id: str
     last_bar_time: datetime | None = None
     outage: _Outage = field(default_factory=_Outage)
-    stop_qty_warned: bool = False
+    #: Whether the last pass found the broker's stop covering more than the
+    #: position holds (#258). Losing it costs one repeated warning at most.
+    stop_qty_oversized: bool = False
 
     @property
     def consecutive_failures(self) -> int:
@@ -616,7 +626,12 @@ class LiveTrailingStopManager:
         current = self._single_stop(stops, symbol, reducing_side)
         context["stop_order_id"] = current.order_id
         context["current_stop"] = current.stop_price
-        self._warn_on_stop_quantity(trail, current, position, context)
+        if self._stop_covers_more_than_held(trail, current, position, context):
+            # #258: the stop's quantity cannot be corrected on an unverified
+            # replace, so nothing is sent to the broker. Not a failure: no
+            # retry, no alert, and no bar is consumed, so the trail catches up
+            # on every close it skipped once the stop matches the position.
+            return False
 
         get_market_data = self._market_data_source(adapter, timeframe)
         frame = await get_market_data(symbol, timeframe=timeframe, limit=TRAILING_BAR_LOOKBACK)
@@ -762,29 +777,40 @@ class LiveTrailingStopManager:
         return symbol_stops[0]
 
     @staticmethod
-    def _warn_on_stop_quantity(
+    def _stop_covers_more_than_held(
         trail: _Trail,
         stop: ProtectiveStop,
         position: Mapping[str, Any],
         context: Mapping[str, Any],
-    ) -> None:
-        """Warn once when the stop covers more than the position still holds.
+    ) -> bool:
+        """Whether the stop covers more than the position holds, and is left untrailed.
 
-        An amendment moves the price only; the stop's quantity is never changed. After a
-        partial exit a bracket stop leg can still be sized to the original entry. What the
-        broker does when it triggers (cap, oversell, reject) is not verified, so this is
-        reported, not corrected.
+        An amendment moves a stop's price; it does not change its quantity. After a
+        partial exit a bracket stop leg can still be sized to the original entry, and
+        what the broker does when such a stop triggers (cap, oversell, reject) has
+        never been observed. Resizing it needs a replace carrying ``qty``, which the
+        paper probe for #258 has not verified, so a stop that covers more than the
+        position holds is left exactly as the broker has it: the price is not moved
+        either, because the trail would otherwise keep amending a stop that cannot
+        sell the position it protects. A stop the broker reports no quantity for is
+        trailed — nothing is known to be wrong with it.
+
+        The result is compared with the previous pass, so the warning is raised on
+        every transition into the mismatch (a second partial exit after a resize is
+        reported again) rather than once per position.
         """
-        if trail.stop_qty_warned or stop.qty is None:
-            return
         held = abs(_position_qty(position))
-        if stop.qty > held + 1e-9:
-            trail.stop_qty_warned = True
+        oversized = stop.qty is not None and stop.qty > held + _STOP_QTY_TOLERANCE
+        if oversized == trail.stop_qty_oversized:
+            return oversized
+        trail.stop_qty_oversized = oversized
+        if oversized:
             logger.warning(
-                "Protective stop quantity exceeds the open position; trailing moves the "
-                "stop price only and does not resize it",
+                "Protective stop quantity exceeds the open position; the stop is left "
+                "untrailed until it is resized to the quantity held",
                 extra={"data": {**context, "stop_qty": stop.qty, "position_qty": held}},
             )
+        return oversized
 
     @staticmethod
     def _new_closed_bars(

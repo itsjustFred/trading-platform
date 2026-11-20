@@ -136,11 +136,20 @@ results stop predicting live behaviour:
   up to 50 closed bars, and cannot move a stop backwards.
 - Cleanup: in-memory progress is dropped as soon as the position is gone at the broker (stop or
   take profit hit, exit signal, manual close) or its deployment is no longer ACTIVE. A partial
-  exit keeps the trail on the remaining quantity.
-- Stop quantity: an amendment moves the price only. After a partial exit a bracket stop leg can
-  still be sized to the original entry; the loop logs a WARNING once per position when the stop
-  covers more than the position holds, but does not resize it. What Alpaca does when such a stop
-  triggers (cap, oversell, reject) has **not** been verified on paper.
+  exit keeps the trail on the remaining quantity — see the stop-quantity rule below for the one
+  case where it pauses.
+- Stop quantity: an amendment moves a stop's price, never its quantity. After a partial exit a
+  bracket stop leg can still be sized to the original entry, and what Alpaca does when such a stop
+  triggers (cap, oversell, reject) has **not** been verified on paper (#258). A stop whose
+  quantity the broker reports as larger than the position holds is therefore left **untrailed**:
+  the loop logs a WARNING (`Protective stop quantity exceeds the open position; the stop is left
+  untrailed until it is resized to the quantity held`, with account, symbol, signal, stop order
+  id, stop quantity and position quantity) on every transition into the mismatch — so a second
+  partial exit after a resize is reported again — and amends nothing. It is not a failure: no
+  retry, no Sentry, no give-up, and no bar is consumed, so the moment the stop is resized to the
+  quantity held (by hand today) the trail resumes and applies every close it skipped (up to 50).
+  A stop the broker reports no quantity for is trailed as usual. Resizing the stop on the trail
+  itself (a replace carrying `qty=`) is the follow-up, gated on the paper probe of #258.
 
 **Limits to know when operating it**
 
@@ -172,6 +181,11 @@ clean-up.
 - Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
   `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
   cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
+- Still **not** covered (#258): a replace that carries `qty=` on that `held` stop leg, and whether
+  the replacement is still visible as a held leg / open order after a second amend. Until that
+  probe runs (a bracket entry, a partial exit, then a trail trigger, in market hours), a stop that
+  covers more than the position holds is left untrailed rather than resized — see "Stop quantity"
+  above.
 
 ## Strategy Promotion Gate (#165)
 
