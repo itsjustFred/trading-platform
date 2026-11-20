@@ -15,10 +15,12 @@ Two properties are load-bearing for correctness and are pinned here:
 * nothing after the stop flag is set may start a new order, because that order
   would be submitted while the connections it needs are being torn down.
 
-Portability: CI runs Windows, where ``os.kill`` cannot deliver SIGINT/SIGTERM to
-the current process (TerminateProcess is uncatchable), so the real-delivery
-tests are skipped there and the same handler is invoked directly - the entry
-point a real signal reaches.
+Portability: CI runs this suite on Linux only (the Windows job builds the wheel and
+runs the wheel smoke test), so the Windows guards protect a local run - and there
+they matter, because on Windows ``os.kill`` cannot deliver SIGINT/SIGTERM to the
+current process (``TerminateProcess`` is uncatchable). Real delivery is therefore
+skipped there and the same handler is invoked directly: the entry point a real
+signal reaches.
 """
 
 from __future__ import annotations

@@ -453,7 +453,7 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 
 Shutdown itself never cancels or closes open orders or positions at the broker; they are left exactly as they were.
 
-Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the six cleanup phases, 150 s in total (`live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS`; `tests/test_shutdown_budget_contract.py` pins that constant, this figure and the generated unit file together). On systemd the stop timeout has to stay above 150 s so the unit is not SIGKILLed mid-drain: `scripts/setup_services.sh` generates `trading-daemon.service` with `TimeoutStopSec=180`. A hand-written unit needs the same, because a daemon that is killed before it finishes never reports its exit code - and a `1` is the operator's only signal that a broker outcome needs reconciliation.
+Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the 6 cleanup phases, 150 s in total (`live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS`; `tests/test_shutdown_budget_contract.py` pins that constant, this figure and the generated unit file together). On systemd the stop timeout has to stay above 150 s so the unit is not SIGKILLed mid-drain: `scripts/setup_services.sh` generates `trading-daemon.service` with `TimeoutStopSec=180`. A hand-written unit needs the same, because a daemon that is killed before it finishes never reports its exit code - and a `1` is the operator's only signal that a broker outcome needs reconciliation.
 
 On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
 
