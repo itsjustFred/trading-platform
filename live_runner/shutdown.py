@@ -12,7 +12,10 @@ Shutdown contract (see ``live_runner.daemon.run_daemon``):
    anything is cancelled.
 3. Broker and signal-source connections are closed and the Twisted reactor's
    thread pool is released so the interpreter can exit.
-4. Exit code 0 on a clean shutdown, non-zero when a cleanup phase timed out.
+4. Exit code 0 on a clean shutdown, non-zero when a cleanup phase timed out or
+   failed. After a non-zero exit the outcome of the broker work that did not
+   finish (an order submission, a stop amendment, a stopped-deployment sweep) is
+   unknown and needs reconciliation.
 5. A second signal forces an immediate exit.
 
 Every step is bounded: the drain gets ``DEFAULT_DRAIN_TIMEOUT_SECONDS`` and each
@@ -120,12 +123,12 @@ async def release_twisted_reactor_threads_bounded(timeout: float) -> None:
     """
     loop = asyncio.get_running_loop()
     finished: asyncio.Future[None] = loop.create_future()
-    failure: list[BaseException] = []
+    failure: list[Exception] = []
 
     def _release() -> None:
         try:
             release_twisted_reactor_threads()
-        except BaseException as exc:  # noqa: BLE001 - the verdict must survive anything
+        except Exception as exc:  # the verdict must survive anything the release does
             failure.append(exc)
         finally:
             try:

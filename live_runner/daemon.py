@@ -5361,14 +5361,21 @@ async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]], *, timeout: floa
         task.cancel()
     if not pending:
         return
-    _, unfinished = await asyncio.wait(pending, timeout=timeout)
+    done, unfinished = await asyncio.wait(pending, timeout=timeout)
+    for task in done:
+        # Retrieve whatever ended the task so a crashed loop is not an unretrieved
+        # exception at interpreter shutdown. A task that was cancelled ends
+        # cancelled, which is not reported.
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            logger.exception("A task ended with an error during shutdown", exc_info=error)
     for task in unfinished:
         # A second cancel: the first was ignored, and this phase is over.
         task.cancel()
     if unfinished:
-        raise TimeoutError(
-            f"{len(unfinished)} task(s) did not finish after being cancelled"
-        )
+        raise TimeoutError(f"{len(unfinished)} task(s) did not finish after being cancelled")
 
 
 async def _shutdown_cleanup(
@@ -5504,8 +5511,10 @@ async def run_daemon(
 ) -> int:
     """Run the daemon until SIGINT/SIGTERM; return the process exit code.
 
-    0 = clean shutdown, ``EXIT_CLEANUP_TIMEOUT`` = a cleanup phase timed out.
-    A crash re-raises as before. See :mod:`live_runner.shutdown` for the contract.
+    0 = clean shutdown, ``EXIT_CLEANUP_TIMEOUT`` = the drain or a cleanup phase
+    timed out or failed, so a broker outcome may be unknown and needs
+    reconciliation. A crash re-raises as before. See :mod:`live_runner.shutdown`
+    for the contract.
     """
     shutdown = shutdown if shutdown is not None else _SHUTDOWN
     global _ACTIVE_SHUTDOWN
