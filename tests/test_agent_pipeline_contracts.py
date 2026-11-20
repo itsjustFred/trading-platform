@@ -41,6 +41,8 @@ What is pinned here:
 - a base retarget re-runs the pre-mortem - `edited` is subscribed for it and only for it, since
   a title or body edit fires the same action and would spend model quota on a verdict that is
   already current;
+- each workflow prints whose rules ran, so a verdict produced by the PR's own skill copy (the
+  fallback while the base branch has none) is never indistinguishable from the base's;
 - a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
   so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
@@ -774,6 +776,23 @@ def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
     )
     assert "skill (rules from %s)" in body, "the comment footer drops the rules' source"
     assert "${SKILL_SOURCE}" in body, "the footer is not filled from the skill-source variable"
+
+
+def test_the_sibling_comments_also_record_whose_rules_ran() -> None:
+    """The same gap the pre-mortem's test above pins, in its two siblings: they record
+    `SKILL_SOURCE` in their `$GITHUB_ENV`, hand it to the agent, and print nothing - a value
+    nothing reads. The fallback it records (the PR's own copy, used while the base branch has
+    no skill) is exactly the case a reader has to be able to see, so the siblings now say it in
+    the same two places: a notice in the run log, and the source in the comment footer. The
+    mutation copy's empty-scope footer is excluded by design: no agent ran, so no rules ran."""
+    for name in (REVIEW, MUTATION):
+        body = _job_bodies([_agent_job(_load(name))[1]])
+        assert re.search(r"::notice::[A-Za-z-]+ rules from: \$\{SKILL_SOURCE\}", body), (
+            f"{name}: the run log does not print whose rules ran"
+        )
+        assert "skill (rules from %s)" in body, (
+            f"{name}: the comment footer drops the rules' source"
+        )
 
 
 def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
