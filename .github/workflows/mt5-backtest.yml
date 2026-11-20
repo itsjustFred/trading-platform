@@ -405,16 +405,13 @@ jobs:
       - name: Run strategy tester
         run: |
           $ErrorActionPreference = 'Stop'
+          $terminal = Join-Path $env:MT5_HOME 'terminal64.exe'
           $reportName = "mt5_ci_$($env:SYMBOL.ToLower())_$($env:PERIOD_NAME.ToLower())"
           # Expert= is resolved relative to MQL5\Experts and needs backslashes;
           # a forward slash silently falls back to the Moving Average sample.
           $expert = "$env:STRATEGY\$env:EA_FILE.ex5"
-          $iniLines = @(
+          $testerLines = @(
             '[Tester]',
-            # Emulated account number. Without it the terminal logs
-            # "tester not started because the account is not specified" and
-            # exits without a report, even though Deposit/Currency are set.
-            "Login=$TESTER_LOGIN",
             "Expert=$expert",
             "ExpertParameters=$env:SET_NAME",
             "Symbol=$env:SYMBOL",
@@ -432,25 +429,52 @@ jobs:
             'ReplaceReport=1',
             'ShutdownTerminal=1'
           )
-          $iniPath = Join-Path $env:RUNNER_TEMP 'tester.ini'
-          # ASCII, no BOM: a BOM makes the terminal ignore the whole file.
-          [System.IO.File]::WriteAllText($iniPath, ($iniLines -join "`r`n") + "`r`n", [System.Text.ASCIIEncoding]::new())
-          Write-Host "--- tester.ini ($iniPath)"
-          Get-Content $iniPath | ForEach-Object { Write-Host $_ }
-          Copy-Item -Path $iniPath -Destination (Join-Path $env:GITHUB_WORKSPACE 'tester.ini') -Force
 
-          Get-ChildItem -Path $env:MT5_HOME -Filter '*.html' -ErrorAction SilentlyContinue | Remove-Item -Force
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          $proc = Start-Process -FilePath (Join-Path $env:MT5_HOME 'terminal64.exe') -PassThru `
-            -ArgumentList @('/portable', "/config:`"$iniPath`"")
-          if (-not $proc.WaitForExit(2400000)) {
-            Write-Host 'tester terminal did not exit within 40 min; killing it'
-            $proc.Kill()
-            Start-Sleep -Seconds 2
+          function Invoke-Tester {
+            param([string[]]$Lines, [string]$Name, [int]$TimeoutSeconds = 2400)
+            $path = Join-Path $env:RUNNER_TEMP "$Name.ini"
+            # ASCII, no BOM: a BOM makes the terminal ignore the whole file.
+            [System.IO.File]::WriteAllText($path, ($Lines -join "`r`n") + "`r`n", [System.Text.ASCIIEncoding]::new())
+            Write-Host "--- $Name.ini"
+            Get-Content $path | ForEach-Object { Write-Host $_ }
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $proc = Start-Process -FilePath $terminal -PassThru -ArgumentList @('/portable', "/config:`"$path`"")
+            if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+              Write-Host "$Name did not exit within $TimeoutSeconds s; killing it"
+              $proc.Kill()
+              Start-Sleep -Seconds 2
+            }
+            $sw.Stop()
+            Write-Host "$Name ran $([int]$sw.Elapsed.TotalSeconds)s (exit $($proc.ExitCode))"
+            Get-ChildItem -Path (Join-Path $env:MT5_HOME 'Tester\logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+              Get-Content $_.FullName -Tail 10 | ForEach-Object { Write-Host "  $_" }
+            }
+            $found = Get-ChildItem -Path $env:MT5_HOME -Filter '*.html' -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            return $found
           }
+
+          Get-ChildItem -Path $env:MT5_HOME -Filter '*.html' -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+          $plainIni = Join-Path $env:RUNNER_TEMP 'tester.ini'
+          [System.IO.File]::WriteAllText($plainIni, ($testerLines -join "`r`n") + "`r`n", [System.Text.ASCIIEncoding]::new())
+          Copy-Item -Path $plainIni -Destination (Join-Path $env:GITHUB_WORKSPACE 'tester.ini') -Force
+
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $report = Invoke-Tester -Lines $testerLines -Name 'tester'
           $sw.Stop()
           "TESTER_SECONDS=$([int]$sw.Elapsed.TotalSeconds)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "tester ran $([int]$sw.Elapsed.TotalSeconds)s (exit $($proc.ExitCode))"
+
+          if (-not $report) {
+            # SPIKE probe (remove with the spike): does the tester only need an
+            # account to be *configured*, or a successfully logged-in one?
+            # These are placeholder values, not credentials: MetaQuotes-Demo is
+            # MetaQuotes' public demo server and this login does not exist.
+            Write-Host 'no report from the bare [Tester] config; probing a configured placeholder account'
+            $probeLines = @('[Common]', 'Login=1000001', 'Password=probe', 'Server=MetaQuotes-Demo') + $testerLines
+            $report = Invoke-Tester -Lines $probeLines -Name 'tester_probe' -TimeoutSeconds 300
+            if ($report) { Write-Host 'PROBE: a configured placeholder account was enough to start the tester' }
+            else { Write-Host 'PROBE: a configured placeholder account was NOT enough to start the tester' }
+          }
 
       - name: Collect logs and report
         if: always()
