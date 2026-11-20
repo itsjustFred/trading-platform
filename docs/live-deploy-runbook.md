@@ -111,6 +111,10 @@ results stop predicting live behaviour:
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
   flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
   flatten never misses a stop that was replaced under it.
+- Shutdown: an amendment that is already in flight when SIGINT/SIGTERM arrives is drained (30 s)
+  before the daemon's loops are cancelled, so the daemon always learns whether the stop moved; a
+  new amendment is refused once the stop flag is set and retried on the next start (the previous
+  broker-side stop stays in force). See "Stopping the daemon" above.
 - Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
   logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
