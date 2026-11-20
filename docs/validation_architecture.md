@@ -167,10 +167,12 @@ trading-platform/
 │   ├── test_report_markdown.py
 │   └── test_paper_readiness.py
 ├── tests/fixtures/validation/
-│   ├── mt5_xlsx/
-│   │   ├── EURUSD_H1.xlsx
-│   │   ├── NAS100_M15.xlsx
-│   │   └── SP500_M1.xlsx
+│   ├── mt5_xlsx/                  # synthetic, from scripts/generate_mt5_xlsx_fixtures.py
+│   │   ├── hedged_partial_open.xlsx
+│   │   ├── position_id_shared.xlsx
+│   │   └── goldens/               # importer output projected for regression pins
+│   │       ├── hedged_partial_open.json
+│   │       └── position_id_shared.json
 │   ├── mt5_html/
 │   │   └── sample_report.html
 │   └── goldens/
