@@ -2634,7 +2634,7 @@ async def _broker_mutation() -> AsyncIterator[bool]:
     """Count one broker mutation on the shutdown ledger for the drain to see.
 
     A broker mutation - a trailing-stop amendment, a stopped deployment's
-    cancel/flatten sweep - has the same two requirements as an order submission,
+    enforcement sweep - has the same two requirements as an order submission,
     and the two share one in-flight ledger (an order submission *is* a broker
     mutation):
 
