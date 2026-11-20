@@ -1,14 +1,18 @@
 """Remove duplicate LiveExecution rows from the live_executions table.
 
-Duplicates are rows sharing the same (signal_id, filled_qty, timestamp). Within a
-duplicate group the fill timestamp is identical, so "oldest" is defined by insertion
-order (SQLite rowid): the first-inserted row is kept, all later rows are deleted.
+Rows are duplicates only when they carry the same identity: the broker's own per-fill id
+(``broker_fill_id``) when it has one, otherwise the execution ``dedupe_key``. Size, price and
+timestamp are evidence about a fill, not its identity: two genuine partial fills of one signal
+can share all three while the broker gave them different fill ids, so grouping on those columns
+deletes a real fill and understates the position (issue #233). Rows with neither key predate the
+identity columns and cannot be proven duplicates, so they are never deleted.
 
-Such duplicates were produced before dedupe_key-based idempotency existed, e.g. when
-a fill was persisted both from the live stream and from a replayed/duplicate event.
+Within a duplicate group the fill timestamp may differ (a redelivery can carry a different
+spelling or precision), so "oldest" is defined by insertion order (SQLite rowid): the
+first-inserted row is kept, all later rows are deleted.
 
-Dry-run discipline: without ``--confirm`` nothing is deleted — the script only
-reports what it would remove.
+Dry-run discipline: without ``--confirm`` nothing is deleted — the script only reports what it
+would remove.
 
 Usage:
     python -m scripts.dedupe_executions                  # report only
@@ -51,28 +55,58 @@ from shared.logging import get_logger
 
 logger = get_logger("scripts.dedupe-executions")
 
-_DUPLICATE_ROWIDS_SQL = """
-SELECT rowid FROM live_executions
-WHERE rowid NOT IN (
-    SELECT MIN(rowid)
+# One identity per row: the broker's fill id when it is a usable positive integer, else the
+# execution dedupe key. `broker_fill_id` wins because it is the broker's own statement of which
+# fill this is; two rows with different fill ids are distinct even if a legacy content-derived
+# dedupe key collides. A NULL identity is a row that predates both columns - never a duplicate.
+_KEYED_EXECUTIONS_CTE = """
+WITH keyed_executions AS (
+    SELECT
+        rowid,
+        CASE
+            WHEN broker_fill_id IS NOT NULL AND broker_fill_id > 0
+                THEN 'fill:' || broker_fill_id
+            WHEN dedupe_key IS NOT NULL AND TRIM(dedupe_key) <> ''
+                THEN 'key:' || TRIM(dedupe_key)
+        END AS identity_key
     FROM live_executions
-    GROUP BY signal_id, filled_qty, timestamp
 )
 """
 
-_DUPLICATE_GROUPS_SQL = """
-SELECT signal_id, filled_qty, timestamp, COUNT(*) AS row_count
-FROM live_executions
-GROUP BY signal_id, filled_qty, timestamp
+_DUPLICATE_ROWIDS_SQL = (
+    _KEYED_EXECUTIONS_CTE
+    + """
+SELECT rowid
+FROM keyed_executions
+WHERE identity_key IS NOT NULL
+  AND rowid NOT IN (
+      SELECT MIN(rowid)
+      FROM keyed_executions
+      WHERE identity_key IS NOT NULL
+      GROUP BY identity_key
+  )
+"""
+)
+
+_DUPLICATE_GROUPS_SQL = (
+    _KEYED_EXECUTIONS_CTE
+    + """
+SELECT identity_key, COUNT(*) AS row_count
+FROM keyed_executions
+WHERE identity_key IS NOT NULL
+GROUP BY identity_key
 HAVING COUNT(*) > 1
 """
+)
 
 
 def dedupe_executions(*, dry_run: bool = False, confirm: bool = False) -> int:
-    """Delete duplicate live_executions rows, keeping the oldest row per group.
+    """Delete duplicate live_executions rows, keeping the oldest row per identity group.
 
-    Rows are only deleted when ``confirm=True`` and ``dry_run`` is not set.
-    Returns the number of rows deleted (or that would be deleted in dry-run).
+    An identity group is the broker's fill id, or the execution dedupe key when the row has no
+    usable fill id. Rows with neither are never deleted. Rows are only deleted when
+    ``confirm=True`` and ``dry_run`` is not set. Returns the number of rows deleted (or that
+    would be deleted in dry-run).
     """
     effective_dry_run = dry_run or not confirm
 
@@ -80,8 +114,7 @@ def dedupe_executions(*, dry_run: bool = False, confirm: bool = False) -> int:
     with get_session() as session:
         groups = session.connection().execute(text(_DUPLICATE_GROUPS_SQL)).fetchall()
         duplicate_rowids = [
-            row[0]
-            for row in session.connection().execute(text(_DUPLICATE_ROWIDS_SQL)).fetchall()
+            row[0] for row in session.connection().execute(text(_DUPLICATE_ROWIDS_SQL)).fetchall()
         ]
 
         if not duplicate_rowids:
@@ -99,13 +132,10 @@ def dedupe_executions(*, dry_run: bool = False, confirm: bool = False) -> int:
                 }
             },
         )
-        for signal_id, filled_qty, timestamp, row_count in groups:
+        for identity_key, row_count in groups:
             logger.info(
-                "Duplicate group: signal_id=%s filled_qty=%s timestamp=%s rows=%d "
-                "(keeping oldest, deleting %d)",
-                signal_id,
-                filled_qty,
-                timestamp,
+                "Duplicate group: identity=%s rows=%d (keeping oldest, deleting %d)",
+                identity_key,
                 row_count,
                 row_count - 1,
             )
