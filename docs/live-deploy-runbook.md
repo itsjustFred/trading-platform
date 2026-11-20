@@ -463,10 +463,10 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 
 `SIGTERM` (systemd stop, `kill`) and `SIGINT` (Ctrl-C) start a graceful shutdown:
 
-1. No new order submissions are accepted (a signal arriving now is logged and dropped before the broker request).
-2. An order submission already in flight is allowed to finish (default 30 s).
+1. No new broker work is accepted. An order submission, a trailing-stop amendment or a STOPPED enforcement sweep that starts now is refused (a signal is logged and dropped before the broker request; a stop amendment leaves the previous broker-side stop in force and the bars unprocessed; a STOPPED sweep leaves the deployment unenforced and is retried).
+2. Broker work already in flight is allowed to finish - all three kinds above - before anything is cancelled (default 30 s for the whole drain). None of them is cancelled out from under the broker request, so the daemon always knows the outcome of what it sent.
 3. Listeners, Discord bots, the scheduler and broker connections are closed (default 20 s per phase).
-4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of an in-flight order is unknown: the submission lease is kept, so reconcile the account before sending new signals.
+4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of the broker work that did not finish is unknown: an order submission keeps its lease (reconcile the account before sending new signals), a stop amendment leaves the broker's own state in force, and a STOPPED sweep is retried.
 5. A second signal forces an immediate exit (code `130`) and skips all cleanup.
 
-Shutdown never cancels or closes open orders or positions at the broker; they are left exactly as they were. Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the four cleanup phases, 110 s in total: on systemd set `TimeoutStopSec` above 110 s so the unit is not killed mid-drain. On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
+Shutdown itself never cancels or closes open orders or positions at the broker; they are left exactly as they were. Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the four cleanup phases, 110 s in total: on systemd set `TimeoutStopSec` above 110 s so the unit is not killed mid-drain. On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
