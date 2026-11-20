@@ -969,6 +969,30 @@ def test_fixed_risk_amount_orders_are_not_equity_proportional():
     assert result.trades[0].meta["equity_proportional_sizing"] is False
 
 
+def test_fixed_risk_stop_distance_only_orders_are_not_equity_proportional():
+    # #170 follow-up (code review should-fix, cross-layer marker): a strategy
+    # that emits a `stop_distance` column but no stop column has no stop at
+    # creation, so the order is percentage-sized and the D5 replay flag
+    # starts True. At fill the stop is synthesized from `stop_distance` and
+    # the SAME order is re-sized by the absolute-$ fixed-risk branch, so the
+    # flag must follow the branch that sized the final quantity -- a True
+    # flag on an absolute-$ position makes the shared-equity replay re-scale
+    # it (Nx the configured risk on a multi-symbol run). Flat prices keep
+    # the fill-time re-size on the same 100.0 entry as creation.
+    frame = _fixed_risk_run_frame()
+    frame["stop_distance"] = [1.0, float("nan"), float("nan")]
+
+    engine = _engine({"fixed_risk_amount": 500.0})
+
+    result = engine.run(frame, _entry_then_exit_strategy)
+
+    assert len(result.trades) == 1
+    # 500 / 1.0 distance * (tick_size 1.0 / tick_value 1.0): the fixed-risk
+    # branch sized it -- the percentage rule would not produce this size.
+    assert result.trades[0].quantity == pytest.approx(500.0)
+    assert result.trades[0].meta["equity_proportional_sizing"] is False
+
+
 def test_fixed_risk_zero_amount_order_is_not_equity_proportional_without_a_stop():
     # Stopless `fixed_risk_amount: 0.0` cannot use fixed-risk sizing at all
     # (there is no risk distance), so the order is percentage-sized and stays

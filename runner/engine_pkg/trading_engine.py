@@ -566,6 +566,30 @@ class TradeEngine:
         """
         return resolve_bar_spread(row, self.config.parameters.get("spread_price_col"))
 
+    def _equity_proportional_for_stop(self, stop_loss_price: float | None) -> bool:
+        """A-M4 (D5): may the shared-equity replay re-scale an order sized from this stop?
+
+        Fixed-amount (`fixed_risk_amount`) sizing is absolute-$ and must NOT be
+        re-scaled by the multi-symbol replay; percentage sizing must be. The
+        test is the branch gate of `_calculate_position_size` itself
+        (`risk_amount > 0 and stop_loss_price is not None`), so the flag can
+        never describe a rule the final quantity was not sized by -- at order
+        creation and again at the fill-time re-size, which can select the
+        OTHER branch: a strategy that emits only `stop_distance` has no stop
+        at creation, so its order is percentage-sized there, while the stop
+        synthesized from `stop_distance` at fill sizes the same order by the
+        fixed-amount branch.
+
+        #170: `fixed_risk_amount: 0.0` is the documented "off" idiom, so such
+        an order is percentage-sized and the replay must re-scale it exactly
+        like an absent key; a multi-symbol run must not silently stop
+        re-scaling a percentage-sized position because that key was spelled
+        out. Asking the resolver the sizing path uses keeps the two in step
+        and makes an unusable value raise here too.
+        """
+        risk_amount = _configured_risk_amount(self.config.parameters)
+        return not (risk_amount > 0 and stop_loss_price is not None)
+
     def _create_order(self, row: pd.Series, i: int, direction: str) -> None:
         entry_price = float(row["close"])
         stop_loss, tp_levels = self._extract_levels(row)
@@ -623,17 +647,13 @@ class TradeEngine:
         order._sizing_only_stop = stop_loss is None and sizing_only_stop is not None
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
         # proportional), so the shared-equity replay must not re-scale this
-        # order's quantity — it still tracks exposure and credits PnL.
-        # #170: the flag has to describe the rule the size was ACTUALLY
-        # computed with. `fixed_risk_amount: 0.0` is the documented "off"
-        # idiom, so such an order is percentage-sized and the replay must
-        # re-scale it exactly like an absent key; a multi-symbol run must not
-        # silently stop re-scaling a percentage-sized position because that
-        # key was spelled out. Asking the resolver the sizing path uses keeps
-        # the two in step and makes an unusable value raise here too.
-        risk_amount = _configured_risk_amount(self.config.parameters)
-        order_equity_proportional = not (risk_amount > 0 and size_from_stop is not None)
-        order._equity_proportional = order_equity_proportional  # transient, not a dataclass field
+        # order's quantity — it still tracks exposure and credits PnL. The
+        # flag is derived through the same gate the sizing branch uses (see
+        # `_equity_proportional_for_stop`), including the #170
+        # `fixed_risk_amount: 0.0`-is-off read.
+        order._equity_proportional = self._equity_proportional_for_stop(  # transient, not a dataclass field
+            size_from_stop
+        )
         self.pending_orders.append(order)
 
     def _open_position(self, order: Order, fill_price: float, fill_time: str, i: int) -> None:
@@ -767,6 +787,7 @@ class TradeEngine:
                     )
                     if order.quantity <= 0:
                         continue
+                    order._equity_proportional = self._equity_proportional_for_stop(order.stop_loss)
                 if order.order_type == OrderType.MARKET:
                     sizing_stop = order.stop_loss
                     if sizing_stop is None and getattr(order, "_sizing_only_stop", False):
@@ -813,6 +834,20 @@ class TradeEngine:
                         )
                         if order.quantity <= 0:
                             continue
+                        # A-M4 (D5)/#170: the fill-time re-size can select a
+                        # different sizing branch than the creation-time
+                        # estimate (a `stop_distance`-only order was
+                        # percentage-sized at creation and is re-sized here
+                        # by the absolute-$ fixed-risk branch). Re-derive the
+                        # flag from the stop this re-size actually used, so
+                        # the replay marker always describes the rule the
+                        # final quantity was computed with -- a True flag on
+                        # an absolute-$ position makes the shared-equity
+                        # replay re-scale it on a multi-symbol run (Nx the
+                        # configured risk).
+                        order._equity_proportional = self._equity_proportional_for_stop(
+                            sizing_stop_value
+                        )
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
                 # on the wrong side of the entry (LONG stop >= entry, SHORT
                 # stop <= entry) would produce an instantly-triggered,
