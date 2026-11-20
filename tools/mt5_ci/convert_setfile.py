@@ -11,6 +11,10 @@ plain set file: ``name=value`` lines, no sections, no optimisation ranges. This
 script performs that conversion and writes ASCII without a BOM (a BOM makes the
 terminal ignore the file).
 
+Both paths are confined to the current directory unless ``--root`` is given
+(repeatable), because the CI job writes into the portable terminal directory
+outside the checkout.
+
 Usage::
 
     python tools/mt5_ci/convert_setfile.py --input EURUSD_H1_setfile.ini \\
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 INPUT_SECTION = "[TesterInputs]"
@@ -35,7 +40,7 @@ class SetfileError(ValueError):
 
 def decode_setfile(raw: bytes) -> str:
     """Decode setfile bytes (UTF-16 with or without BOM, else UTF-8)."""
-    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16")
     try:
         return raw.decode("utf-8-sig")
@@ -46,6 +51,31 @@ def decode_setfile(raw: bytes) -> str:
 def _plain_value(raw_value: str) -> str:
     """Drop the ``||start||step||stop||flag`` optimisation tail."""
     return raw_value.split("||", 1)[0].strip()
+
+
+def _parse_section(line: str, number: int) -> str:
+    """Validate and return a ``[Section]`` header line."""
+    if not line.endswith("]"):
+        raise SetfileError(f"line {number}: malformed section header {line!r}")
+    return line
+
+
+def _parse_entry(line: str, number: int, section: str | None, seen: set[str]) -> str | None:
+    """Return the ``name=value`` line for one entry, or None when it is dropped."""
+    key, sep, value = line.partition("=")
+    key = key.strip()
+    if not sep or not key:
+        raise SetfileError(f"line {number}: expected key=value, got {line!r}")
+    if section in DROPPED_SECTIONS:
+        return None
+    if section != INPUT_SECTION:
+        raise SetfileError(
+            f"line {number}: {key!r} appears outside {INPUT_SECTION} (section={section!r})"
+        )
+    if key in seen:
+        raise SetfileError(f"line {number}: duplicate input {key!r}")
+    seen.add(key)
+    return f"{key}={_plain_value(value)}"
 
 
 def convert(text: str) -> list[str]:
@@ -60,31 +90,17 @@ def convert(text: str) -> list[str]:
         if not line:
             continue
         if line.startswith("["):
-            if not line.endswith("]"):
-                raise SetfileError(f"line {number}: malformed section header {raw_line!r}")
-            section = line
-            if section == INPUT_SECTION:
-                saw_inputs = True
+            section = _parse_section(line, number)
+            saw_inputs = saw_inputs or section == INPUT_SECTION
             continue
         if line.startswith(";"):
             if section not in DROPPED_SECTIONS:
                 lines.append(line)
             continue
 
-        key, sep, value = line.partition("=")
-        key = key.strip()
-        if not sep or not key:
-            raise SetfileError(f"line {number}: expected key=value, got {raw_line!r}")
-        if section in DROPPED_SECTIONS:
-            continue
-        if section != INPUT_SECTION:
-            raise SetfileError(
-                f"line {number}: {key!r} appears outside {INPUT_SECTION} (section={section!r})"
-            )
-        if key in seen:
-            raise SetfileError(f"line {number}: duplicate input {key!r}")
-        seen.add(key)
-        lines.append(f"{key}={_plain_value(value)}")
+        entry = _parse_entry(line, number, section, seen)
+        if entry is not None:
+            lines.append(entry)
 
     if not saw_inputs:
         raise SetfileError(f"no {INPUT_SECTION} section found")
@@ -104,21 +120,52 @@ def write_setfile(lines: list[str], output: Path) -> None:
     output.write_bytes(encoded)
 
 
+def allowed_roots(raw_roots: Sequence[str]) -> tuple[Path, ...]:
+    """Resolve the ``--root`` arguments, defaulting to the current directory."""
+    if not raw_roots:
+        return (Path.cwd().resolve(),)
+    return tuple(Path(root).expanduser().resolve() for root in raw_roots)
+
+
+def resolve_cli_path(raw: Path, roots: Sequence[Path], what: str) -> Path:
+    """Resolve a CLI path and confine it to the allowed roots.
+
+    A crafted ``--input``/``--output`` (``..``, absolute path, symlink escape)
+    must not read or write outside the roots the caller allows, so the value
+    used at the file sink is this resolved path, never the raw argument.
+    """
+    candidate = Path(raw).expanduser().resolve()
+    if not any(candidate == root or root in candidate.parents for root in roots):
+        allowed = ", ".join(str(root) for root in roots)
+        raise SetfileError(f"{what} {str(raw)!r} resolves to {candidate}, outside {allowed}")
+    return candidate
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", required=True, type=Path, help="source setfile (.ini)")
     parser.add_argument("--output", required=True, type=Path, help="destination .set file")
+    parser.add_argument(
+        "--root",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="allowed root for --input/--output (repeatable, default: current directory)",
+    )
     args = parser.parse_args(argv)
 
     try:
-        text = decode_setfile(args.input.read_bytes())
+        roots = allowed_roots(args.root)
+        source = resolve_cli_path(args.input, roots, "--input")
+        destination = resolve_cli_path(args.output, roots, "--output")
+        text = decode_setfile(source.read_bytes())
         lines = convert(text)
-        write_setfile(lines, args.output)
+        write_setfile(lines, destination)
     except (OSError, SetfileError) as exc:
         print(f"convert_setfile: {exc}", file=sys.stderr)
         return 2
 
-    print(f"wrote {args.output} ({len(lines)} lines)")
+    print(f"wrote {destination} ({len(lines)} lines)")
     return 0
 
 

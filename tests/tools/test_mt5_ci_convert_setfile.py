@@ -104,7 +104,9 @@ def test_cli_returns_2_on_missing_inputs_section(tmp_path: Path, capsys) -> None
     source = _write_setfile(tmp_path / "bad.ini", "[Tester]\nExpert=x.ex5\n")
     output = tmp_path / "out.set"
 
-    code = module.main(["--input", str(source), "--output", str(output)])
+    code = module.main(
+        ["--input", str(source), "--output", str(output), "--root", str(tmp_path)]
+    )
 
     assert code == 2
     assert "TesterInputs" in capsys.readouterr().err
@@ -139,9 +141,77 @@ def test_cli_writes_file(tmp_path: Path, capsys) -> None:
     source = _write_setfile(tmp_path / "EURUSD_H1_setfile.ini")
     output = tmp_path / "nested" / "eurusd_h1_ci.set"
 
-    code = module.main(["--input", str(source), "--output", str(output)])
+    code = module.main(
+        ["--input", str(source), "--output", str(output), "--root", str(tmp_path)]
+    )
 
     assert code == 0
     assert output.is_file()
     assert "ATR_Period=5" in output.read_text(encoding="ascii")
     assert "wrote" in capsys.readouterr().out
+
+
+def test_cli_refuses_input_outside_allowed_root(tmp_path: Path, capsys) -> None:
+    """A crafted --input must not read outside the allowed roots (S8707)."""
+    module = _load_module()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = _write_setfile(tmp_path / "outside.ini")
+    output = allowed / "out.set"
+
+    code = module.main(
+        ["--input", str(outside), "--output", str(output), "--root", str(allowed)]
+    )
+
+    assert code == 2
+    assert "outside" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_cli_refuses_output_outside_allowed_root(tmp_path: Path, capsys) -> None:
+    """A crafted --output must not write outside the allowed roots (S8707)."""
+    module = _load_module()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    source = _write_setfile(allowed / "in.ini")
+    outside = tmp_path / "escaped" / "out.set"
+
+    code = module.main(
+        ["--input", str(source), "--output", str(outside), "--root", str(allowed)]
+    )
+
+    assert code == 2
+    assert "outside" in capsys.readouterr().err
+    assert not outside.exists()
+
+
+def test_default_root_is_the_working_directory(tmp_path: Path, monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.chdir(tmp_path)
+
+    roots = module.allowed_roots([])
+
+    assert roots == (tmp_path.resolve(),)
+    assert module.resolve_cli_path(Path("sub/out.set"), roots, "--output") == (
+        tmp_path / "sub" / "out.set"
+    ).resolve()
+    with pytest.raises(module.SetfileError, match="outside"):
+        module.resolve_cli_path(Path("../escape.ini"), roots, "--input")
+
+
+def test_multiple_roots_are_accepted(tmp_path: Path) -> None:
+    """The CI job writes into the portable MT5 directory outside the checkout."""
+    module = _load_module()
+    workspace = tmp_path / "workspace"
+    terminal = tmp_path / "mt5"
+    workspace.mkdir()
+    terminal.mkdir()
+
+    roots = module.allowed_roots([str(workspace), str(terminal)])
+
+    assert module.resolve_cli_path(workspace / "data" / "in.ini", roots, "--input") == (
+        workspace / "data" / "in.ini"
+    ).resolve()
+    assert module.resolve_cli_path(terminal / "MQL5" / "out.set", roots, "--output") == (
+        terminal / "MQL5" / "out.set"
+    ).resolve()
