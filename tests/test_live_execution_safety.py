@@ -3638,6 +3638,31 @@ def test_alpaca_rejects_non_finite_sl_tp_prices():
             adapter._resolve_broker_sl_tp(signal)
 
 
+def test_alpaca_rejects_zero_sl_tp_prices():
+    """A zero bracket price is not a price: it must fail closed, not submit.
+
+    The guard is ``value <= 0``, not ``< 0``: a zero stop or take-profit is a
+    level at the fill's own price, which the broker accepts as an unbounded
+    position instead of a bounded one.
+    """
+    from live_runner import alpaca_adapter as module
+
+    adapter = module.AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True)
+    for name in ("stop_loss", "take_profit"):
+        metadata = {"stop_loss": 95.0, "take_profit": 110.0}
+        metadata[name] = 0.0
+        signal = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata=metadata,
+        )
+        with pytest.raises(ValueError, match=f"Invalid {name} price"):
+            adapter._resolve_broker_sl_tp(signal)
+
+
 @pytest.mark.parametrize(
     "alias", ["stop_loss", "sl_price", "stop_price", "resolved_stop_loss"]
 )
