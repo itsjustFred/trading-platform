@@ -16,10 +16,12 @@ comments and are pinned that way, so a chain-era copy-paste of a status write ca
 unnoticed.
 
 What is pinned here:
-- every pipeline workflow triggers itself on `pull_request` (opened, synchronize, reopened,
+- every agent workflow triggers itself on `pull_request` (opened, synchronize, reopened,
   and, for the two that must run the moment a draft becomes ready, ready_for_review) with a
-  concurrency group per PR that cancels superseded runs, and no workflow starts another one -
-  no dispatch call, no `workflow_run` or `repository_dispatch` trigger, no `actions: write`;
+  concurrency group per PR that cancels superseded runs - the two with a manual rerun are keyed
+  by the analysed commit, so a rerun of an older commit cannot cancel the current head's run -
+  and no workflow starts another one - no dispatch call, no `workflow_run` or
+  `repository_dispatch` trigger, no `actions: write`;
 - the pre-mortem's verdict map is total (`*)` -> `error`), so no verdict reaches an undeclared
   state, and its verdict regex accepts exactly the verdicts the skill documents;
 - the status context, the comment marker and the comment title follow the stage convention, a
@@ -27,14 +29,20 @@ What is pinned here:
 - the pre-mortem marks the analysed commit pending once, and every path that stops it - a
   cancelled run, a failed run, a failed post step - leaves that context terminal, never
   `pending`; a head that moved keeps its own status but no longer owns the comment;
+- a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
+  so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the cubic gate waits only for cubic's own review of the analysed commit, counts P0/P1 as
   blocking and P2/P3 as advisory, runs no repo code and no agent, and its every stop path
   leaves its own context terminal too;
+- the cubic classifier can never call a body it did not read a PASS: the `P0:`-`P3:` tokens it
+  counts have to agree with cubic's own summary line, and an unreadable or disagreeing body is
+  an `error`;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
   sibling workflows, whose comments swear to the same guards;
 - the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
   extraction, fence strip, tree-clean check, the two-level skill selection) stay identical
-  modulo the names each copy substitutes;
+  modulo the names each copy substitutes - the selection by a test of its own, which is the
+  only way a copy that is not strict can fail it;
 - the agent job that reads the checkout holds only `contents: read`, keeps no credentials, and
   fails the run when HEAD moved or the tree is dirty.
 
@@ -259,6 +267,17 @@ def test_every_agent_workflow_is_a_standalone_per_push_workflow() -> None:
         assert group.startswith(name[: -len(".yml")]), f"{name}: group {group!r} is not its own"
         assert "pull_request.number" in group, f"{name}: group {group!r} is not per PR"
         assert concurrency["cancel-in-progress"] is True, f"{name}: keeps superseded runs"
+    # The pre-mortem is the only one with a manual rerun, and it is the one whose group must
+    # name the analysed commit: a PR-keyed group cancels the current head's in-flight run
+    # when an older commit is re-dispatched, and that run's cancellation reporter then marks
+    # the head `error` with no analysis left - a false red on the SHA the PR needs a verdict
+    # for. Keyed by the SHA, a rerun of an older commit runs beside it, while a rerun of the
+    # same commit still supersedes a stale run of that commit; a rerun that omits `head_sha`
+    # shares the `current-head` bucket with its own siblings rather than with the push's run.
+    premortem_group = str(_load(PREMORTEM)["concurrency"]["group"])
+    assert "pull_request.head.sha" in premortem_group and "inputs.head_sha" in premortem_group, (
+        f"the pre-mortem group {premortem_group!r} is not keyed by the analysed commit"
+    )
 
 
 def test_no_agent_workflow_starts_another_workflow() -> None:
@@ -301,6 +320,29 @@ def test_the_pre_mortem_adds_ready_for_review_and_a_manual_rerun() -> None:
     assert "INPUT_PR" in body, "the pr_number input does not reach the shell by env"
     assert "INPUT_SHA" in body, "the head_sha input does not reach the shell by env"
     assert "${{" not in body, "the resolve step interpolates workflow expressions into a shell"
+
+
+def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None:
+    """`head_sha` is the one input a caller types by hand, and it decides which diff is
+    analysed and which commit carries the verdict. A well-formed SHA that belongs to another PR
+    (a typo, a copy-paste, the head of a different open PR) would post a pre-mortem of a foreign
+    diff under this PR's name, and would write a verdict onto another PR's gate - the pre-mortem's
+    own scenario for it. So the shape is checked (a full 40-hex SHA) and, when it is not the PR's
+    current head, that the commit is one of this PR's own via `pulls/N/commits`; either check
+    failing - or a commit list that cannot be read at all - refuses the run instead of
+    analysing whatever was typed."""
+    data = _load(PREMORTEM)
+    resolve = data["jobs"]["resolve"]
+    step = _find_step(resolve, r"^Resolve PR$")
+    body = _run(step)
+    assert "grep -qE" in body and "^[0-9a-f]{40}$" in body, "the head_sha shape is unchecked"
+    assert "grep -qxF" in body, "the PR's commit list is not matched exactly"
+    assert "pulls/${INPUT_PR}/commits" in body, "the head_sha is not checked against the PR"
+    assert body.count("exit 1") >= 2, "a refused head_sha does not stop the run"
+    assert "GH_TOKEN" in _step_env(resolve, step), "the dispatch path reads the API unauthenticated"
+    assert resolve.get("permissions", {}).get("contents") == "read", (
+        "the resolve job cannot read the PR's commit list, so the check cannot be made"
+    )
 
 
 def test_the_pre_mortem_skips_drafts_and_forks() -> None:
@@ -459,6 +501,23 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     assert "not updating the comment" in body, "no reason is logged"
     assert MARKER in body, "the poster carries no marker of its own"
     assert "gh api" in body, "the poster does not use the REST API"
+    # A second comment carrying the marker (a duplicate from an interrupted run, or one
+    # created outside the workflow) used to be left alone by `tail -n 1`: the stale
+    # `# Pre-Mortem Action` stayed readable next to the current one forever. Every match is
+    # now updated, and the duplicate is logged rather than silently dropped.
+    assert "for id in $existing" in body, "a duplicate marker comment is left stale"
+    assert "::warning::" in body, "a duplicate marker comment is not reported"
+
+
+def test_the_pre_mortem_status_names_the_pr_it_was_written_for() -> None:
+    """`agent/pre-mortem` is one repo-global context, so two open PRs that share a head commit
+    (`feat -> main` and `feat -> release`) both write it from analyses of different diffs, and
+    the last write wins with no record of whose it was. Commit statuses cannot isolate per PR;
+    what they can carry is the PR number in the description, which is the only thing that tells
+    the two verdicts apart for a reader of the head's status."""
+    post = _load(PREMORTEM)["jobs"]["post"]
+    body = _run(_find_step(post, r"^Set status$"))
+    assert "PR #${PR_NUMBER}" in body, "the status description does not name the PR"
 
 
 @pytest.mark.parametrize("name", [PREMORTEM, CUBIC])
@@ -571,28 +630,72 @@ def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
 def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
     """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
     used only while the base has none. A base commit that cannot be read must abort the step -
-    a silent fall-through would run the PR's own rules while the comment says "base branch".
-    An unreachable base is also caught in the mutation workflow's scope step, which fails first,
-    so what is pinned here is the check existing in the agent job, not its exact step."""
+    a silent fall-through would run the PR's own rules while the prompt says "base branch", and
+    that is exactly what a step without `set -euo pipefail` does: the base-commit check fails,
+    the `if` on the base skill fails with it, and the `elif` takes the PR's copy.
+
+    The assertions are therefore scoped to the selection step of every copy, not to the agent
+    job as a whole: a base-commit check that lives in some other step (the mutation workflow's
+    scope step) leaves the selection itself able to fall through, which is how the two siblings
+    stayed non-strict while this test passed over them."""
     for name in AGENT_WORKFLOWS:
-        _job_name, job = _agent_job(_load(name))
-        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in _job_bodies([job]), (
-            f"{name}: no hard base-commit check in the agent job"
+        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
+        body = _run(step)
+        assert "set -euo pipefail" in body, f"{name}: the selection is not strict"
+        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, (
+            f"{name}: the selection does not refuse an unreachable base commit"
         )
-        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in _job_bodies([job]), (
+        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in body, (
             f"{name}: does not read the skill from the base branch first"
         )
-        assert 'cp "$SKILL_PATH"' in _job_bodies([job]), (
-            f"{name}: no fallback to the PR's own copy"
+        assert 'cp "$SKILL_PATH"' in body, f"{name}: no fallback to the PR's own copy"
+        assert "SKILL_SOURCE=base branch" in body, f"{name}: records no skill source"
+        # Two levels only: a third (the commit the workflow file came from) would analyse an older
+        # commit under rules the branch tip happens to carry.
+        assert "GITHUB_SHA" not in body, f"{name}: reads a third skill revision"
+        assert body.count("elif") == 1, f"{name}: more than two levels:\n{body}"
+
+
+def test_the_skill_selection_stays_identical_across_the_copies() -> None:
+    """The two-level selection is duplicated in all three workflows, and it is the block that
+    decides whose rules ran. The pre-mortem's copy used to be the strict one and the siblings'
+    were not, and nothing compared the bodies - so the divergence that mattered most was the one
+    the "kept in sync" test never looked at. Here the three bodies are compared line by line
+    after the documented per-copy substitutions (the temp directory, the agent id, the stage and
+    the skill noun in the error line), so the next divergence fails here instead of silently
+    grading a PR under rules it may have weakened."""
+    substitutions = {
+        REVIEW: (("review skill", "<skill>"), ("pr-review", "<agent>"), ("review", "<stage>")),
+        MUTATION: (
+            ("mutation-testing skill", "<skill>"),
+            ("pr-mutation", "<agent>"),
+            ("mutation", "<stage>"),
+        ),
+        PREMORTEM: (
+            ("pre-mortem skill", "<skill>"),
+            ("pr-premortem", "<agent>"),
+            ("premortem", "<stage>"),
+        ),
+    }
+
+    def selection(name: str) -> list[str]:
+        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
+        lines = []
+        for line in _run(step).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):  # prose, not a selection line
+                continue
+            for old, new in substitutions[name]:
+                line = line.replace(old, new)
+            lines.append(line)
+        return lines
+
+    reference = selection(REVIEW)
+    assert reference, "parsed no selection lines out of the review workflow"
+    for other in (MUTATION, PREMORTEM):
+        assert selection(other) == reference, f"{other}: skill selection diverged:\n" + "\n".join(
+            selection(other)
         )
-    step = _find_step(_agent_job(_load(PREMORTEM))[1], r"^Select skill revision$")
-    body = _run(step)
-    assert "set -euo pipefail" in body, "the selection is not strict"
-    assert "SKILL_SOURCE=base branch" in body, "the selection does not record its source"
-    # Two levels only: a third (the commit the workflow file came from) would analyse an older
-    # commit under rules the branch tip happens to carry.
-    assert "GITHUB_SHA" not in body, "the selection reads a third skill revision"
-    assert body.count("elif") == 1, f"the selection has more than two levels:\n{body}"
 
 
 def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
@@ -604,7 +707,10 @@ def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
     The per-copy substitutions below are the documented ones (the temp directory, the agent id),
     applied agent-id first so "pr-review" cannot be eaten by the shorter "review". A guard that
     only one copy needs is not here: the pre-mortem's stricter verdict prelude (it tolerates the
-    sign-off note the skill requires) and its head-moved comment guard are pinned separately.
+    sign-off note the skill requires) and its head-moved comment guard are pinned separately. The
+    two-level skill selection is not one of those exclusions - it is compared by
+    `test_the_skill_selection_stays_identical_across_the_copies`, which is where a copy that is
+    not strict has to fail.
     """
     substitutions = {
         REVIEW: (("pr-review", "<agent>"), ("review", "<stage>")),

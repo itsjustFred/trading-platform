@@ -108,9 +108,13 @@ jobs:
 
       # Review rules: the base branch's skill if it has one. Otherwise (only
       # while the skill is not merged yet) the PR's own copy. Any git failure
-      # other than "no skill at base" stops the job.
+      # other than "no skill at base" stops the job - `set -euo pipefail` is
+      # what makes that true: without it an unreachable base commit falls through
+      # to the `elif` and runs the PR's own rules while the prompt says the rules
+      # came from the base branch.
       - name: Select skill revision
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/review"
           skill="$RUNNER_TEMP/review/skill.md"
           git cat-file -e "${BASE_SHA}^{commit}"
