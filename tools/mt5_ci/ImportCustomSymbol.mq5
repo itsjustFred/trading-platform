@@ -234,7 +234,9 @@ void OnStart()
    {
       // Already present (e.g. from an earlier run in the same portable
       // directory): rebuild it from scratch so properties never leak
-      // between runs.
+      // between runs. A symbol still selected in Market Watch cannot be
+      // deleted, so deselect it first.
+      SymbolSelect(symbol, false);
       if(!CustomSymbolDelete(symbol) || !CustomSymbolCreate(symbol, "mt5_ci", ""))
       {
          WriteStatus(InpStatusFile, StringFormat("FAIL CustomSymbolCreate(%s) error %d", symbol, GetLastError()));
