@@ -28,6 +28,11 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+try:  # imported as a module (tests): the repo root is on sys.path
+    from tools.mt5_ci import _path_guard
+except ImportError:  # executed as a script: its own directory is sys.path[0]
+    import _path_guard
+
 INPUT_SECTION = "[TesterInputs]"
 # Sections whose keys describe the run itself; tester.ini sets them explicitly
 # for the CI run, so they must not be copied into the .set file.
@@ -122,23 +127,17 @@ def write_setfile(lines: list[str], output: Path) -> None:
 
 def allowed_roots(raw_roots: Sequence[str]) -> tuple[Path, ...]:
     """Resolve the ``--root`` arguments, defaulting to the current directory."""
-    if not raw_roots:
-        return (Path.cwd().resolve(),)
-    return tuple(Path(root).expanduser().resolve() for root in raw_roots)
+    return _path_guard.allowed_roots(raw_roots)
 
 
 def resolve_cli_path(raw: Path, roots: Sequence[Path], what: str) -> Path:
-    """Resolve a CLI path and confine it to the allowed roots.
+    """Resolve a CLI path, refusing one outside the allowed roots.
 
     A crafted ``--input``/``--output`` (``..``, absolute path, symlink escape)
     must not read or write outside the roots the caller allows, so the value
     used at the file sink is this resolved path, never the raw argument.
     """
-    candidate = Path(raw).expanduser().resolve()
-    if not any(candidate == root or root in candidate.parents for root in roots):
-        allowed = ", ".join(str(root) for root in roots)
-        raise SetfileError(f"{what} {str(raw)!r} resolves to {candidate}, outside {allowed}")
-    return candidate
+    return _path_guard.resolve_cli_path(raw, roots, what, error=SetfileError)
 
 
 def main(argv: list[str] | None = None) -> int:
