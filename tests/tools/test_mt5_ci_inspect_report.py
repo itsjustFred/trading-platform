@@ -12,6 +12,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "tools" / "mt5_ci" / "inspect_report.py"
 
@@ -151,7 +153,7 @@ def test_zero_trades_fails(tmp_path: Path) -> None:
 def test_missing_report_returns_1(tmp_path: Path, capsys) -> None:
     module = _load_module()
 
-    code = module.main(["--report", str(tmp_path / "absent.html")])
+    code = module.main(["--report", str(tmp_path / "absent.html"), "--root", str(tmp_path)])
 
     assert code == 1
     assert "not found" in capsys.readouterr().err
@@ -172,6 +174,8 @@ def test_cli_writes_json_and_exits_zero(tmp_path: Path, capsys) -> None:
             "EURUSD_CI",
             "--json-out",
             str(out),
+            "--root",
+            str(tmp_path),
         ]
     )
 
@@ -186,7 +190,7 @@ def test_cli_exits_nonzero_on_assertion(tmp_path: Path, capsys) -> None:
     module = _load_module()
     path = _write(tmp_path / "report.html", _report(trades="0", include_deals=False))
 
-    code = module.main(["--report", str(path), "--min-trades", "1"])
+    code = module.main(["--report", str(path), "--min-trades", "1", "--root", str(tmp_path)])
 
     assert code == 1
     assert "FAIL" in capsys.readouterr().err
@@ -243,3 +247,62 @@ def test_deals_table_inside_single_report_table(tmp_path: Path) -> None:
     assert summary["deal_rows"] == 2
     assert [deal["type"] for deal in summary["deals"]] == ["buy", "sell"]
     assert module.check(summary, "IntradayVolatilityBreakout", "EURUSD_CI", 1) == []
+
+
+def test_cli_refuses_report_outside_allowed_root(tmp_path: Path, capsys) -> None:
+    """A crafted --report must not read outside the allowed roots (S8707)."""
+    module = _load_module()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = _write(tmp_path / "outside.html", _report())
+
+    code = module.main(["--report", str(outside), "--root", str(allowed)])
+
+    assert code == 2
+    assert "outside" in capsys.readouterr().err
+
+
+def test_cli_refuses_json_out_outside_allowed_root(tmp_path: Path, capsys) -> None:
+    """A crafted --json-out must not write outside the allowed roots (S8707)."""
+    module = _load_module()
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    report = _write(allowed / "report.html", _report())
+    outside = tmp_path / "escaped" / "summary.json"
+
+    code = module.main(
+        ["--report", str(report), "--json-out", str(outside), "--root", str(allowed)]
+    )
+
+    assert code == 2
+    assert "outside" in capsys.readouterr().err
+    assert not outside.exists()
+
+
+def test_default_root_is_the_working_directory(tmp_path: Path, monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.chdir(tmp_path)
+
+    roots = module.allowed_roots([])
+
+    assert roots == (tmp_path.resolve(),)
+    with pytest.raises(ValueError, match="outside"):
+        module.resolve_cli_path(Path("../escape.html"), roots, "--report")
+
+
+def test_multiple_roots_are_accepted(tmp_path: Path) -> None:
+    """The CI job reads the report from the portable MT5 directory."""
+    module = _load_module()
+    workspace = tmp_path / "workspace"
+    terminal = tmp_path / "mt5"
+    workspace.mkdir()
+    terminal.mkdir()
+
+    roots = module.allowed_roots([str(workspace), str(terminal)])
+
+    assert module.resolve_cli_path(terminal / "report.htm", roots, "--report") == (
+        terminal / "report.htm"
+    ).resolve()
+    assert module.resolve_cli_path(workspace / "summary.json", roots, "--json-out") == (
+        workspace / "summary.json"
+    ).resolve()
