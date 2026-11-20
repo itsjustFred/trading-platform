@@ -107,11 +107,15 @@ jobs:
           opencode --version
 
       # Review rules: the base branch's skill if it has one. Otherwise (only
-      # while the skill is not merged yet) the PR's own copy. Any git failure
-      # other than "no skill at base" stops the job - `set -euo pipefail` is
-      # what makes that true: without it an unreachable base commit falls through
-      # to the `elif` and runs the PR's own rules while the prompt says the rules
-      # came from the base branch.
+      # while the skill is not merged yet) the PR's own copy. A base commit that
+      # cannot be read aborts the step before the `if`, at the standalone
+      # `git cat-file -e`: that check is the guard, because GitHub's default
+      # shell for a `run:` block is already `bash -e {0}` and fail-fast needs no
+      # help - and inside the `if` condition that follows, a failure is a false
+      # branch, not an abort. `set -euo pipefail` adds `pipefail` and `-u` (an
+      # unset variable now fails the step instead of expanding to nothing) and
+      # states the strictness, so it is not the guard and must not be read as
+      # one.
       - name: Select skill revision
         run: |
           set -euo pipefail

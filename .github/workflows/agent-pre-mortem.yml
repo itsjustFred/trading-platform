@@ -25,11 +25,17 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # The agent is read-only; this job writes no repo code. It reads the PR diff and
 # its blast radius, writes ranked future-failure scenarios, and produces a
 # machine-checkable verdict. For the analysed SHA the workflow sets the commit
-# status `agent/pre-mortem` (pending while running, success on PASS, failure on
-# BLOCK or CHANGES-REQUESTED, error on INCOMPLETE or a failed run) and upserts
-# one PR comment titled `# Pre-Mortem Action` (hidden marker
-# `<!-- actions-pre-mortem -->`). A result for a commit that is no longer the PR
-# head still lands its status on its own SHA but does not overwrite the comment.
+# status `agent/pre-mortem`, advisory by decision of 2026-11-20: `pending` while
+# running, `success` for every verdict - PASS, BLOCK and CHANGES-REQUESTED
+# alike - with the verdict named in the description, and `error` for INCOMPLETE
+# or for a failed run. No verdict reports `failure`: the pre-mortem ranks what
+# could break later and a human decides what to harden, so a red status on the
+# commit a PR is built on would block a merge over a judgement the status cannot
+# carry. The ranked scenarios stay in the comment, and the verdict is still the
+# first thing the status description says. It also upserts one PR comment titled
+# `# Pre-Mortem Action` (hidden marker `<!-- actions-pre-mortem -->`). A result
+# for a commit that is no longer the PR head still lands its status on its own
+# SHA but does not overwrite the comment.
 #
 # opencode's free Zen models need no login and no API key, so this workflow
 # holds no secret besides the default GITHUB_TOKEN of the jobs that run no repo
@@ -58,6 +64,11 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # another PR's head is refused, so no foreign diff is ever analysed under this
 # PR's name:
 #   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+# A dispatch can only name a ref that carries this workflow file. This PR is the
+# one that adds it, so until it merges into the default branch the manual rerun is
+# not reachable and a push is the only re-run - every push re-analyses the new
+# head, which is the normal path anyway. After the merge the command above works
+# from any branch.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
 #   PREMORTEM_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
@@ -155,15 +166,28 @@ jobs:
                 echo "::error::head_sha must be a full 40-character commit SHA (lowercase hex); got '${INPUT_SHA}'."
                 exit 1
               fi
-              if [ "$(jq -r .head.sha pr.json)" != "$INPUT_SHA" ] \
-                && ! gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}/commits" \
-                  --jq '.[].sha' | grep -qxF "$INPUT_SHA"; then
-                # Either the SHA is not one of this PR's commits, or the commit
-                # list could not be read at all; both refuse, not analyse.
-                echo "::error::Commit ${INPUT_SHA} is not a commit of PR #${INPUT_PR} (or its commit list could not be read); nothing to analyse."
-                exit 1
+              # Only a dispatch may name a commit other than the head, so the
+              # head is compared first and the commit list is read only when it
+              # has to be. The list is captured before it is matched: under
+              # `set -o pipefail` a `grep -q` that matches exits at once and
+              # closes the pipe, `gh` then dies of SIGPIPE writing the next page,
+              # and the whole pipeline is non-zero - so piping straight into the
+              # match refuses a commit this PR does contain. This PR's own
+              # documented rerun is exactly that case: an older commit sits on
+              # the first page of a commit list that pages at 30.
+              head_now=$(jq -r .head.sha pr.json)
+              if [ "$head_now" != "$INPUT_SHA" ]; then
+                if ! commits=$(gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}/commits" --jq '.[].sha'); then
+                  echo "::error::Could not read the commit list of PR #${INPUT_PR}; refusing to analyse ${INPUT_SHA}."
+                  exit 1
+                fi
+                if ! printf '%s\n' "$commits" | grep -qxF "$INPUT_SHA"; then
+                  echo "::error::Commit ${INPUT_SHA} is not a commit of PR #${INPUT_PR}; nothing to analyse."
+                  exit 1
+                fi
               fi
-              echo "::notice::PR head is $(jq -r .head.sha pr.json), not ${INPUT_SHA}; analysing the requested commit."
+              echo "::notice::PR head is ${head_now}, not ${INPUT_SHA}; analysing the requested commit."
             fi
           fi
           head=${INPUT_SHA:-$(jq -r .head.sha pr.json)}
@@ -337,13 +361,24 @@ jobs:
             "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}." 2> "$out.stderr"); then
             printf '%s\n' "$raw" > "$out.raw"
             cat "$out.stderr" >> "$out.raw"
-            # The free Zen models cap usage per period. Hitting the cap is an
+            # The reason the agent failed is only in stderr, and a file no one
+            # reads is not a diagnosis: a failed run of this job has ended with
+            # a bare "Process completed with exit code 1" and no cause, which
+            # cannot tell a capped free model from a broken prompt. So the
+            # captured output is echoed, bounded so a runaway agent cannot flood
+            # the log, before the classification below reads it.
+            echo "::error::The pre-mortem agent run failed."
+            echo "::group::Agent stdout and stderr (last 4000 bytes)"
+            tail -c 4000 "$out.raw"
+            echo "::endgroup::"
+            # The free Zen models cap usage per period, and a model can be
+            # refused from a region or for a while. Hitting one of those is an
             # infra failure, not a pre-mortem result: the run fails, the post
             # job reports the status as `error`, and the remedy is to re-run
             # this job - the same handling a transient failure gets from the
             # sibling workflows.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached' "$out.stderr"; then
-              echo "::error::opencode free-model usage limit reached - a transient infra failure, not a pre-mortem result. Re-run this job; the stage status is reported as \`error\`."
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|model (is )?(not (found|available|supported))|no provider|unauthorized|forbidden|service unavailable|overloaded' "$out.stderr"; then
+              echo "::error::The pre-mortem agent could not run - the free model was denied, capped or unavailable (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: re-run this job; the stage status is reported as \`error\`."
             fi
             exit 1
           fi
@@ -431,9 +466,23 @@ jobs:
         if: needs.premortem.result == 'failure'
         run: |
           set -euo pipefail
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
-            -f state=error -f context="$PREMORTEM_CONTEXT" \
-            -f description="Pre-mortem run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+          # Pending only, as every other reporter here: another run of this same
+          # commit - the documented side-by-side dispatch of an older commit, or
+          # a rerun of this one - may already have written its final status, and
+          # an infra failure of this run must not replace it. The commit status
+          # API has no conditional write, so the current state of this context is
+          # read first and only a still-pending one is converted.
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
+          if [ "$state" = "pending" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Pre-mortem run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+          else
+            # A terminal status (a verdict of its own, or an earlier error) stands;
+            # say so instead of leaving the run silent about what it did not do.
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state:-unset}', not pending; this failed run did not replace it."
+          fi
 
       - uses: actions/download-artifact@v4
         if: needs.premortem.result == 'success'
@@ -476,14 +525,21 @@ jobs:
         if: needs.premortem.result == 'success'
         run: |
           set -euo pipefail
+          # Advisory, by decision of 2026-11-20: every verdict the agent can
+          # produce is a `success` state, and the verdict is what the description
+          # says. A BLOCK or CHANGES-REQUESTED pre-mortem is a ranked list of
+          # scenarios with a sign-off note, not a mechanical gate - a `failure`
+          # would fail the commit status of the very head a PR is asking to be
+          # reviewed, blocking a merge over a judgement a human makes after
+          # reading the comment. Only a run that could not produce a verdict at
+          # all (INCOMPLETE, or the failed run reported above) is not a success.
           case "$VERDICT" in
-            PASS) state=success ;;
-            BLOCK|CHANGES-REQUESTED) state=failure ;;
+            PASS|BLOCK|CHANGES-REQUESTED) state=success ;;
             *) state=error ;;
           esac
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state="$state" -f context="$PREMORTEM_CONTEXT" \
-            -f description="Verdict: ${VERDICT} (PR #${PR_NUMBER})" -f target_url="$RUN_URL" > /dev/null
+            -f description="Verdict: ${VERDICT} (advisory, see the comment) - PR #${PR_NUMBER}" -f target_url="$RUN_URL" > /dev/null
 
       # A failure above (artifact download, comment POST/PATCH, status write)
       # would otherwise leave the status `pending` on this SHA forever. Only a
