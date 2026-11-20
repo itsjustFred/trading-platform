@@ -1,11 +1,13 @@
 """Remove duplicate LiveExecution rows from the live_executions table.
 
 Rows are duplicates only when they carry the same identity: the broker's own per-fill id
-(``broker_fill_id``) when it has one, otherwise the execution ``dedupe_key``. Size, price and
-timestamp are evidence about a fill, not its identity: two genuine partial fills of one signal
-can share all three while the broker gave them different fill ids, so grouping on those columns
-deletes a real fill and understates the position (issue #233). Rows with neither key predate the
-identity columns and cannot be proven duplicates, so they are never deleted.
+(``broker_fill_id``) when it has one, otherwise the execution ``dedupe_key``, scoped to the same
+``signal_id``. Size, price and timestamp are evidence about a fill, not its identity: two genuine
+partial fills of one signal can share all three while the broker gave them different fill ids, so
+grouping on those columns deletes a real fill and understates the position (issue #233). Rows with
+neither key predate the identity columns and cannot be proven duplicates, so they are never
+deleted. The signal scope keeps a fill id that two accounts' brokers happen to reuse from deleting
+the other account's fill.
 
 Within a duplicate group the fill timestamp may differ (a redelivery can carry a different
 spelling or precision), so "oldest" is defined by insertion order (SQLite rowid): the
@@ -56,18 +58,20 @@ from shared.logging import get_logger
 logger = get_logger("scripts.dedupe-executions")
 
 # One identity per row: the broker's fill id when it is a usable positive integer, else the
-# execution dedupe key. `broker_fill_id` wins because it is the broker's own statement of which
-# fill this is; two rows with different fill ids are distinct even if a legacy content-derived
-# dedupe key collides. A NULL identity is a row that predates both columns - never a duplicate.
+# execution dedupe key, in both cases scoped by signal_id. `broker_fill_id` wins because it is the
+# broker's own statement of which fill this is; two rows with different fill ids are distinct even
+# if a legacy content-derived dedupe key collides. The signal scope is deliberate: broker fill ids
+# are only unique per account, and a cross-account id collision must not delete a live fill. A
+# NULL identity is a row that predates both columns - never a duplicate.
 _KEYED_EXECUTIONS_CTE = """
 WITH keyed_executions AS (
     SELECT
         rowid,
         CASE
             WHEN broker_fill_id IS NOT NULL AND broker_fill_id > 0
-                THEN 'fill:' || broker_fill_id
+                THEN 'fill:' || signal_id || ':' || broker_fill_id
             WHEN dedupe_key IS NOT NULL AND TRIM(dedupe_key) <> ''
-                THEN 'key:' || TRIM(dedupe_key)
+                THEN 'key:' || signal_id || ':' || TRIM(dedupe_key)
         END AS identity_key
     FROM live_executions
 )
@@ -104,9 +108,9 @@ def dedupe_executions(*, dry_run: bool = False, confirm: bool = False) -> int:
     """Delete duplicate live_executions rows, keeping the oldest row per identity group.
 
     An identity group is the broker's fill id, or the execution dedupe key when the row has no
-    usable fill id. Rows with neither are never deleted. Rows are only deleted when
-    ``confirm=True`` and ``dry_run`` is not set. Returns the number of rows deleted (or that
-    would be deleted in dry-run).
+    usable fill id, scoped to the same signal. Rows with neither are never deleted. Rows are only
+    deleted when ``confirm=True`` and ``dry_run`` is not set. Returns the number of rows deleted
+    (or that would be deleted in dry-run).
     """
     effective_dry_run = dry_run or not confirm
 

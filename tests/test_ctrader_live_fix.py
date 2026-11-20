@@ -863,6 +863,49 @@ def test_dedupe_executions_keeps_equal_size_fills_with_distinct_fill_ids(isolate
     assert len(rows) == 2
 
 
+def test_dedupe_executions_scopes_broker_fill_ids_to_their_signal(isolated_db):
+    """A broker fill id reused by another signal (another account) is not a duplicate.
+
+    Broker fill ids are only unique per account, and the codebase already treats a dedupe-key
+    collision across signals as an error rather than a redelivery. Deleting across signals would
+    destroy a live fill when two brokers reuse the same numeric id.
+    """
+    database = isolated_db
+    ts = datetime.now(timezone.utc)
+    signal_ids = []
+    for index in range(2):
+        signal = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0 + index,
+            timestamp=ts,
+            metadata={},
+        )
+        database.save_live_signal(signal)
+        signal_ids.append(signal.id)
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=f"alpaca:exec:{9100 + index}",
+                broker_fill_id=9100,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions(confirm=True) == 0
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2
+    assert {row.signal_id for row in rows} == {str(signal_id) for signal_id in signal_ids}
+
+
 def test_dedupe_executions_never_deletes_rows_without_an_identity_key(isolated_db):
     """#233: a row with neither a dedupe key nor a broker fill id cannot be proven a duplicate.
 
