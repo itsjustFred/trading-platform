@@ -45,21 +45,14 @@ def _report(
     expert: str = "IntradayVolatilityBreakout",
     symbol: str = "EURUSD_CI",
     trades: str = "1",
-    german: bool = False,
     include_deals: bool = True,
 ) -> str:
-    expert_label = "Expertenprogramm:" if german else "Expert:"
+    expert_label = "Expert:"
     symbol_label = "Symbol:"
-    period_label = "Periode:" if german else "Period:"
-    deposit_label = "Ersteinlage:" if german else "Initial Deposit:"
-    trades_label = "Gesamtzahl Trades:" if german else "Total Trades:"
+    period_label = "Period:"
+    deposit_label = "Initial Deposit:"
+    trades_label = "Total Trades:"
     deals_header = DEALS_HEADER
-    if german:
-        deals_header = (
-            "<tr><th>Zeit</th><th>Deal</th><th>Symbol</th><th>Typ</th><th>Richtung</th>"
-            "<th>Volumen</th><th>Preis</th><th>Auftrag</th><th>Kommission</th><th>Swap</th>"
-            "<th>Gewinn</th><th>Kontostand</th><th>Kommentar</th></tr>"
-        )
     deals_table = (
         f"<table>{deals_header}{DEALS_ROWS}</table>" if include_deals else ""
     )
@@ -103,15 +96,18 @@ def test_english_report_summary(tmp_path: Path) -> None:
     assert module.check(summary, "IntradayVolatilityBreakout", "EURUSD_CI", 1) == []
 
 
-def test_german_report_summary(tmp_path: Path) -> None:
+def test_real_german_report_summary() -> None:
+    """The real German report labels the field "Gesamtanzahl Trades"."""
     module = _load_module()
-    path = _write(tmp_path / "report.html", _report(german=True))
+    path = REPO_ROOT / "tests" / "fixtures" / "validation" / "mt5_html" / "sample_report.html"
 
     summary = module.summarise(path)
 
-    assert summary["expert"] == "IntradayVolatilityBreakout"
-    assert summary["total_trades_value"] == 1.0
-    assert module.check(summary, "IntradayVolatilityBreakout", "EURUSD_CI", 1) == []
+    assert summary["expert"] == "ZenomTrader_IntradayVolatilityBreakout"
+    assert summary["symbol"] == "EURUSD"
+    assert summary["total_trades_value"] == 5.0
+    assert summary["deal_rows"] == 5
+    assert module.check(summary, "ZenomTrader", "EURUSD", 1) == []
 
 
 def test_utf16_report_is_decoded(tmp_path: Path) -> None:
@@ -204,6 +200,24 @@ def test_grouped_thousands_are_parsed(tmp_path: Path) -> None:
     assert module.parse_number("45.1%") == 45.1
     assert module.parse_number("") is None
     assert module.parse_number("n/a") is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1.234,56", 1234.56),
+        ("1,173.41", 1173.41),
+        ("-1 173.41", -1173.41),
+        ("1,234,567", 1234567.0),
+        ("1.17000", 1.17),
+        ("-498.64", -498.64),
+    ],
+)
+def test_locale_numbers_are_parsed(raw: str, expected: float) -> None:
+    """Only the grouping separator may be stripped, never the decimal one."""
+    module = _load_module()
+
+    assert module.parse_number(raw) == pytest.approx(expected)
 
 
 def test_deals_table_inside_single_report_table(tmp_path: Path) -> None:

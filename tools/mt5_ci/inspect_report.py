@@ -38,7 +38,7 @@ LABELS: dict[str, tuple[str, ...]] = {
     "period": ("Period", "Periode"),
     "initial_deposit": ("Initial Deposit", "Ersteinlage"),
     "leverage": ("Leverage", "Hebel"),
-    "total_trades": ("Total Trades", "Gesamtzahl Trades"),
+    "total_trades": ("Total Trades", "Gesamtanzahl Trades"),
     "total_deals": ("Total Deals", "Anzahl Deals"),
     "total_net_profit": ("Total Net Profit", "Nettogewinn gesamt"),
     "gross_profit": ("Gross Profit", "Bruttogewinn"),
@@ -137,16 +137,39 @@ def _lookup(pairs: list[tuple[str, str]], key: str) -> str | None:
 
 
 def parse_number(text: str | None) -> float | None:
-    """Parse a report number, tolerating thousands separators and locale."""
+    """Parse a report number, tolerating thousands separators and locale.
+
+    MT5 formats numbers in the terminal UI language: ``1 173.41`` in English,
+    ``1.173,41`` in German. When both separators appear, the right-most one is
+    the decimal separator; a repeated single separator is grouping. Stripping
+    only the grouping separator keeps ``1.234,56`` from collapsing to
+    ``123456``, which a blanket comma-to-dot replacement would do.
+    """
     if not text:
         return None
-    cleaned = text.replace("\u00a0", "").replace(" ", "").replace("%", "")
-    cleaned = cleaned.replace(",", ".")
-    if cleaned.count(".") > 1:
-        # "1.234.567" is grouped thousands, not a decimal.
-        cleaned = cleaned.replace(".", "")
+    cleaned = (
+        text.replace("\u00a0", "")
+        .replace("\u202f", "")
+        .replace(" ", "")
+        .replace("%", "")
+    )
+    sign = ""
+    if cleaned[:1] in ("+", "-"):
+        sign, cleaned = cleaned[0], cleaned[1:]
+    if not cleaned or not all(char.isdigit() or char in ".," for char in cleaned):
+        return None
+
+    dot = cleaned.rfind(".")
+    comma = cleaned.rfind(",")
+    if dot != -1 and comma != -1:
+        decimal, grouping = (".", ",") if dot > comma else (",", ".")
+        cleaned = cleaned.replace(grouping, "").replace(decimal, ".")
+    elif dot != -1 or comma != -1:
+        separator = "." if dot != -1 else ","
+        # "1.234.567" / "1,234,567" are grouped thousands, not decimals.
+        cleaned = cleaned.replace(separator, "" if cleaned.count(separator) > 1 else ".")
     try:
-        return float(cleaned)
+        return float(sign + cleaned)
     except ValueError:
         return None
 
@@ -259,7 +282,7 @@ def check(
 
     trades = summary.get("total_trades_value")
     if trades is None:
-        failures.append("report has no Total Trades/Gesamtzahl Trades field")
+        failures.append("report has no Total Trades/Gesamtanzahl Trades field")
     elif trades < min_trades:
         failures.append(f"report has {int(trades)} trades, expected at least {min_trades}")
 
