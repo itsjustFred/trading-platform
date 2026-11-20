@@ -1045,20 +1045,23 @@ def test_a_loop_task_that_ignores_its_cancel_cannot_hold_the_shutdown(
     for. The timed-out phase is reported (non-zero exit) and abandoned.
     """
     coordinator = _new_coordinator()
-    ignored: list[bool] = []
+    swallowed: list[int] = []
 
     async def _wedged_loop() -> None:
+        # A loop stuck in something it cannot be cancelled out of: the cancel is
+        # only delivered when the coroutine resumes, and this one swallows the
+        # first three. The daemon spends its deadline on it below; the rest is
+        # this test tearing the fake down again.
         while True:
             try:
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
-                if not ignored:
-                    # The first cancel is swallowed - the wedged case.
-                    ignored.append(True)
+                swallowed.append(len(swallowed) + 1)
+                if len(swallowed) <= 3:
                     continue
                 raise
 
-    async def _probe() -> tuple[bool, float]:
+    async def _probe() -> tuple[bool, float, bool]:
         coordinator.bind(asyncio.get_running_loop())
         loop_task = asyncio.create_task(_wedged_loop(), name="wedged-loop")
         await asyncio.sleep(0)
@@ -1076,14 +1079,17 @@ def test_a_loop_task_that_ignores_its_cancel_cannot_hold_the_shutdown(
             cleanup_timeout=0.05,
         )
         elapsed = time.monotonic() - started
-        loop_task.cancel()
-        await asyncio.gather(loop_task, return_exceptions=True)
-        return ok, elapsed
+        abandoned = not loop_task.done()
+        while not loop_task.done():
+            loop_task.cancel()
+            await asyncio.sleep(0.01)
+        return ok, elapsed, abandoned
 
     with caplog.at_level("ERROR"):
-        ok, elapsed = asyncio.run(_probe())
+        ok, elapsed, abandoned = asyncio.run(_probe())
 
-    assert ignored, "the wedged loop really was cancelled first"
+    assert swallowed, "the wedged loop really was cancelled first"
+    assert abandoned, "the phase must give up on it, not wait it out"
     assert ok is False, "a timed-out phase is a failed shutdown"
     assert elapsed < 5.0, f"the cleanup must not wait past its deadline: {elapsed}"
     assert _timed_out_phases(caplog) == ["cancel_loops"]
