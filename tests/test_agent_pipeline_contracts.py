@@ -41,16 +41,19 @@ What is pinned here:
 - a base retarget re-runs the pre-mortem - `edited` is subscribed for it and only for it, since
   a title or body edit fires the same action and would spend model quota on a verdict that is
   already current;
+- the base-commit guard of the skill selection is asserted on its non-comment line, and a copy
+  with that line commented out fails the assertion - the substring check it replaced passed with
+  the guard disabled in all three workflows at once;
 - each workflow prints whose rules ran, so a verdict produced by the PR's own skill copy (the
   fallback while the base branch has none) is never indistinguishable from the base's;
 - a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
   so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
   sibling workflows, whose comments swear to the same guards;
-- the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
-  extraction, fence strip, tree-clean check, the two-level skill selection) stay identical
-  modulo the names each copy substitutes - the selection by a test of its own, which is the
-  only way a copy that is not strict can fail it;
+- the duplicated guard blocks the workflows duplicate (summary-line extraction, fence strip,
+  tree-clean check, the two-level skill selection) stay identical modulo the names each copy
+  substitutes - the selection by a test of its own, which is the only way a copy that is not
+  strict can fail it;
 - the agent job that reads the checkout holds only `contents: read`, keeps no credentials, and
   fails the run when HEAD moved or the tree is dirty.
 
@@ -161,6 +164,13 @@ def _load(name: str) -> dict:
     return data
 
 
+def _parse(text: str) -> dict:
+    """The same parse as `_load`, for a copy of a workflow a test has rewritten in memory."""
+    data = yaml.safe_load(text)
+    assert isinstance(data, dict), "the rewritten workflow did not parse to a mapping"
+    return data
+
+
 def _triggers(data: dict) -> dict:
     # PyYAML reads the YAML 1.1 boolean key `on` as True.
     on = data.get(True) or data.get("on")
@@ -194,6 +204,41 @@ def _agent_job(data: dict) -> tuple[str, dict]:
         if any(s.get("name") == "Install opencode" for s in _steps(job)):
             return job_name, job
     raise AssertionError(f"no agent job in {list(data['jobs'])}")
+
+
+def _selection_lines(job: dict) -> list[str]:
+    """The selection step's executable shell lines: stripped, prose comments dropped.
+
+    A check that only exists on a `#` line is a check that does not run, so what the
+    selection must contain is asserted against these lines rather than against the raw body -
+    a substring over the body is satisfied by a commented-out guard, which is the regression
+    `test_the_base_commit_guard_must_not_be_a_comment_line` pins.
+    """
+    lines = []
+    for line in _run(_find_step(job, r"^Select skill revision$")).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
+
+
+def _strictness_failures(lines: list[str]) -> list[str]:
+    """What a strict skill selection must contain, matched within its executable lines: the
+    standalone base-commit check that refuses an unreachable base instead of falling through to
+    the PR's own rules, the two levels themselves, and the source both levels record. Matching
+    inside the line (a guard written as `git cat-file -e ... 2>/dev/null; then`) keeps the check
+    as strong as the substring it replaces, minus the prose that substring happily matched."""
+    required = (
+        ("set -euo pipefail", "the selection is not strict"),
+        ('git cat-file -e "${BASE_SHA}^{commit}"', "does not refuse an unreachable base commit"),
+        (
+            'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"',
+            "does not read the skill from the base branch first",
+        ),
+        ('cp "$SKILL_PATH"', "no fallback to the PR's own copy"),
+        ("SKILL_SOURCE=base branch", "records no skill source"),
+    )
+    return [message for needle, message in required if not any(needle in line for line in lines)]
 
 
 def _all_run_bodies(data: dict) -> str:
@@ -812,21 +857,41 @@ def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> N
     scope step) leaves the selection itself able to fall through, which is how the two siblings
     stayed non-strict while this test passed over them."""
     for name in AGENT_WORKFLOWS:
-        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
-        body = _run(step)
-        assert "set -euo pipefail" in body, f"{name}: the selection is not strict"
-        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, (
-            f"{name}: the selection does not refuse an unreachable base commit"
-        )
-        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in body, (
-            f"{name}: does not read the skill from the base branch first"
-        )
-        assert 'cp "$SKILL_PATH"' in body, f"{name}: no fallback to the PR's own copy"
-        assert "SKILL_SOURCE=base branch" in body, f"{name}: records no skill source"
+        job = _agent_job(_load(name))[1]
+        body = _run(_find_step(job, r"^Select skill revision$"))
+        # What the selection must contain is matched on its executable lines, not as a
+        # substring of the body: a commented-out guard is not a guard.
+        failures = _strictness_failures(_selection_lines(job))
+        assert not failures, f"{name}: " + "; ".join(failures)
         # Two levels only: a third (the commit the workflow file came from) would analyse an older
         # commit under rules the branch tip happens to carry.
         assert "GITHUB_SHA" not in body, f"{name}: reads a third skill revision"
         assert body.count("elif") == 1, f"{name}: more than two levels:\n{body}"
+
+
+def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
+    """The guard is one shell line, and the cheapest way to delete it is to comment it out -
+    which a substring assertion over the step body cannot see: it passes with the line disabled,
+    and so does the "stays identical" test, which strips `#` lines before it compares. So the
+    guard is commented out in a copy of each workflow here and the same check runs over that
+    copy: it fails. That is what the assertion it replaced claimed to be."""
+    guard = 'git cat-file -e "${BASE_SHA}^{commit}"'
+    for name in AGENT_WORKFLOWS:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        # Every occurrence, not just the first: the mutation copy carries the same line in its
+        # scope step, so a copy with only the selection's line commented out would still be
+        # analysed with a base whose tip it cannot read.
+        mutated = re.sub(rf"(?m)^(\s*){re.escape(guard)}\s*$", rf"\1# {guard}", text)
+        assert mutated.count(f"# {guard}") >= 1, f"{name}: the guard is not a line of its own"
+        assert mutated != text, f"{name}: the base-commit guard is not a line of its own"
+        job = _agent_job(_parse(mutated))[1]
+        assert not any(guard in line for line in _selection_lines(job)), (
+            f"{name}: a commented-out guard is still an executable line"
+        )
+        failures = _strictness_failures(_selection_lines(job))
+        assert any("unreachable base" in message for message in failures), (
+            f"{name}: commenting the guard out does not fail the strictness check: {failures}"
+        )
 
 
 def test_the_skill_selection_stays_identical_across_the_copies() -> None:
