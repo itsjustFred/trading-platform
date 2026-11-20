@@ -53,6 +53,11 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # head that moved past the commit this run analysed - so a reader has to be able
 # to tell a stale verdict from the current one without opening the run log.
 #
+# The pending-to-error conversions the stop paths make are a read-then-write: the
+# commit status API has no conditional write. They are pinned down as far as the
+# API allows and their residual window is stated rather than denied - see the
+# comment on the resolve job's reporter.
+#
 # opencode's free Zen models need no login and no API key, so this workflow
 # holds no secret besides the default GITHUB_TOKEN of the jobs that run no repo
 # code. Those models do cap usage; hitting the cap fails the run, and a failed
@@ -254,6 +259,7 @@ jobs:
           # The resolved head (the commit "Mark running" marked) first; the
           # event's head when the payload path failed; the dispatch input last.
           HEAD_SHA: ${{ steps.pr.outputs.head || github.event.pull_request.head.sha || inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           # A dispatch whose first step failed (a bad PR number) never marked a
@@ -262,12 +268,32 @@ jobs:
             echo "::warning::No head SHA was resolved from the event or the dispatch input; a pending stage status can only be cleared by a later run."
             exit 0
           fi
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
-          if [ "$state" = "pending" ]; then
+          # The conversion is a read-then-write, because the commit status API has no
+          # conditional write: the candidates are pinned down as far as it allows - the
+          # *newest* status of the context (the API's own ordering is not documented, so
+          # it is sorted by creation time here instead of taking `[0]` on faith) and the
+          # run that wrote it - so only this run's own `pending` mark becomes an `error`.
+          # Another run of the same commit (a rerun of it in the same concurrency bucket,
+          # or a dispatch running beside the push's run) keeps whatever it wrote, and a
+          # status this run never wrote is never converted. What the API cannot close is
+          # the window between the read and the write: a run that lands its verdict inside
+          # it can still be overwritten by this one, so this is best effort: no status API
+          # offers a conditional write, and the invariant this file claims is the one the
+          # ownership check buys, not an atomic conversion.
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Resolve step failed; see the run log" > /dev/null
+              -f description="Resolve step failed for ${HEAD_SHA:0:8}; see the run log" > /dev/null
+          else
+            # Either nothing this run wrote is there any more (another run replaced it,
+            # or the mark never happened), or the newest status is another run's. Say so
+            # instead of leaving the run silent about what it did not do.
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}' and was not written by this run; this failure did not replace it."
           fi
 
   premortem:
@@ -502,22 +528,30 @@ jobs:
         if: needs.premortem.result == 'failure'
         run: |
           set -euo pipefail
-          # Pending only, as every other reporter here: another run of this same
-          # commit - the documented side-by-side dispatch of an older commit, or
-          # a rerun of this one - may already have written its final status, and
-          # an infra failure of this run must not replace it. The commit status
-          # API has no conditional write, so the current state of this context is
-          # read first and only a still-pending one is converted.
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
-          if [ "$state" = "pending" ]; then
+          # Pending only, as every other reporter here, and only when this run wrote
+          # that pending mark: another run of this same commit - the documented
+          # side-by-side dispatch of an older commit, or a rerun of this one - may
+          # already have written its final status, and an infra failure of this run
+          # must not replace it. The commit status API has no conditional write, so
+          # what it allows is pinned down instead: the *newest* status of the context
+          # (the API's own ordering is not documented, hence the sort by creation time
+          # rather than `[0]`) and the run that wrote it, so only this run's own
+          # `pending` mark is converted. The read-then-write window between them
+          # cannot be closed by this API, so this is best effort, not an atomic
+          # conversion.
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Pre-mortem run failed; see the run log" -f target_url="$RUN_URL" > /dev/null
+              -f description="Pre-mortem run failed for ${HEAD_SHA:0:8}; see the run log" -f target_url="$RUN_URL" > /dev/null
           else
             # A terminal status (a verdict of its own, or an earlier error) stands;
             # say so instead of leaving the run silent about what it did not do.
-            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state:-unset}', not pending; this failed run did not replace it."
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; this failed run did not replace it."
           fi
 
       - uses: actions/download-artifact@v4
@@ -578,27 +612,35 @@ jobs:
             -f description="Verdict: ${VERDICT} (advisory, see the comment) - head ${HEAD_SHA:0:8} on base ${BASE_SHA:0:8} - PR #${PR_NUMBER}" -f target_url="$RUN_URL" > /dev/null
 
       # A failure above (artifact download, comment POST/PATCH, status write)
-      # would otherwise leave the status `pending` on this SHA forever. Only a
-      # still-pending context is touched, so a terminal verdict stands.
+      # would otherwise leave the status `pending` on this SHA forever. Only this
+      # run's own pending mark is converted, so another run's terminal verdict
+      # stands (as far as the API allows: see the reporter above).
       - name: Report post failure
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
-          if [ "$state" = "pending" ]; then
+          # The same identity-bearing, best-effort conversion the other reporters make:
+          # the newest status of the context, and only when this run wrote it.
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Post step failed; see the run log" > /dev/null
+              -f description="Post step failed for ${HEAD_SHA:0:8}; see the run log" > /dev/null
+          else
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; this failure did not replace it."
           fi
 
   # A cancelled run (a hand-cancel, or a superseding run through the
   # concurrency group) skips every reporter above, which would leave the status
-  # `pending` with no signal. This job runs only on cancellation and turns a
-  # still-pending status of the analysed commit into an error. A newer run that
-  # already wrote its final status is not touched (pending only).
+  # `pending` with no signal. This job runs only on cancellation and turns this
+  # run's own pending mark of the analysed commit into an error. What another run
+  # wrote is not touched.
   report-cancelled:
     needs: [resolve, premortem, post]
     if: ${{ cancelled() }}
@@ -620,10 +662,20 @@ jobs:
             echo "::warning::Resolve wrote no head SHA; this run marked nothing pending."
             exit 0
           fi
-          state=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --jq "[.statuses[] | select(.context == \"${PREMORTEM_CONTEXT}\")][0].state")
-          if [ "$state" = "pending" ]; then
+          # A cancelled run is the case the identity check exists for: what cancelled it
+          # is usually another run of the same commit, which then writes its own status.
+          # The pending mark that is converted is this run's own - the newest status of
+          # the context, and the one this run wrote - and the read-then-write window the
+          # API cannot close is stated as best effort rather than denied.
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Pre-mortem run cancelled; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+              -f description="Pre-mortem run cancelled for ${HEAD_SHA:0:8}; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+          else
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; the cancellation did not replace it."
           fi
