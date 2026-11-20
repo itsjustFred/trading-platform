@@ -204,8 +204,8 @@ jobs:
             while ((Get-Date) -lt $deadline -and -not (Test-Path $includeProbe)) {
               Start-Sleep -Seconds 2
             }
-            Get-Process -Name terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
-            Start-Sleep -Seconds 3
+            Get-Process -Name terminal64,metaeditor64 -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 5
           }
           if (-not (Test-Path $includeProbe)) {
             Get-ChildItem -Path $env:MT5_HOME -Directory | Select-Object Name | Format-Table | Out-String | Write-Host
@@ -215,13 +215,19 @@ jobs:
           Write-Host "MQL5 standard tree ready: $includeProbe"
 
           # A cache must never carry account data. The installer may have
-          # created an empty account file on its post-install launch.
+          # created an empty account file on its post-install launch. Log files
+          # can still be held open by the process we just killed, so every
+          # removal is best effort: a locked log is not a reason to fail.
           foreach ($junk in @('config\accounts.dat','config\accounts.ini','config\common.ini')) {
-            Remove-Item -Path (Join-Path $env:MT5_HOME $junk) -Force -ErrorAction SilentlyContinue
+            try { Remove-Item -Path (Join-Path $env:MT5_HOME $junk) -Force -ErrorAction Stop }
+            catch { Write-Host "could not remove $junk`: $($_.Exception.Message)" }
           }
-          Remove-Item -Path (Join-Path $env:MT5_HOME 'MQL5\Logs\*') -Force -ErrorAction SilentlyContinue
-          Remove-Item -Path (Join-Path $env:MT5_HOME 'logs\*') -Force -ErrorAction SilentlyContinue
-          Remove-Item -Path (Join-Path $env:MT5_HOME 'bases\*') -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($dir in @('MQL5\Logs','logs')) {
+            try { Get-ChildItem -Path (Join-Path $env:MT5_HOME $dir) -Force | Remove-Item -Recurse -Force -ErrorAction Stop }
+            catch { Write-Host "could not clear $dir`: $($_.Exception.Message)" }
+          }
+          try { Remove-Item -Path (Join-Path $env:MT5_HOME 'bases\Custom') -Recurse -Force -ErrorAction Stop }
+          catch { Write-Host "could not clear bases\Custom: $($_.Exception.Message)" }
 
           $zip = Join-Path $env:RUNNER_TEMP 'mt5-terminal.zip'
           if (Test-Path $zip) { Remove-Item -Force $zip }
