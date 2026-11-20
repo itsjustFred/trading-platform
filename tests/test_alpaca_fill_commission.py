@@ -2387,6 +2387,29 @@ def test_group_problem_refuses_a_broken_pair_that_carries_no_reason():
     assert fills == []
 
 
+def test_group_problem_reports_a_stored_broken_pair_reason():
+    """A pair taken out of play with a reason returns that reason, no fills.
+
+    The membership test is the whole guard: without it a broken pair would fall
+    through to the fill checks and the allocator, with its commissions either
+    mis-allocated or silently skipped.
+    """
+    from live_runner.alpaca_fees import _FeeIndex, _group_problem, _Inputs
+
+    inputs = _Inputs(
+        fills_by_order={},
+        fills_by_pair={},
+        rows_by_order={},
+        fees=_FeeIndex(),
+        broken_pairs={"BTC/USD": "an unreadable FILL activity"},
+    )
+
+    problem, fills = _group_problem(inputs, "BTC/USD", date.fromisoformat(TRADE_DAY))
+
+    assert problem == "an unreadable FILL activity"
+    assert fills == []
+
+
 # ── a fill is never stored with an invented time (audit of #135) ────────────────────────────────
 
 ORDER_FILLED_AT = datetime(2026, 11, 3, 15, 5, tzinfo=timezone.utc)
