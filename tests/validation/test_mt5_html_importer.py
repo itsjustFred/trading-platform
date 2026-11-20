@@ -329,3 +329,52 @@ class TestPositionFillClassification:
         assert evidence["orphan_exit_count"] == 1
         assert evidence["residual_positions"][0]["residual_quantity"] == pytest.approx(0.10)
         assert evidence["orphan_exits"][0]["exit_quantity"] == pytest.approx(0.10)
+
+
+class TestEnglishReport:
+    """CI runs an English terminal, so the report is English.
+
+    The fixture is a real Strategy Tester report (build 6327) from the
+    mt5-backtest workflow: UTF-16LE, English labels, and the whole report in a
+    single <table> with the Orders and Deals sections one after the other.
+    """
+
+    def _load(self) -> ValidationReference:
+        return MT5HTMLImporter().load(
+            Path("tests/fixtures/validation/mt5_html/sample_report_en_utf16.htm")
+        )
+
+    def test_meta_is_read_from_english_labels(self):
+        ref = self._load()
+        assert ref.strategy_name == "IntradayVolatilityBreakout"
+        assert ref.symbol == "EURUSD_CI"
+        assert ref.timeframe.lower() == "h1"
+
+    def test_trades_are_reconstructed(self):
+        ref = self._load()
+        assert len(ref.trades) == 5
+        assert [t.direction for t in ref.trades] == [
+            "LONG",
+            "SHORT",
+            "LONG",
+            "LONG",
+            "SHORT",
+        ]
+
+    def test_trade_fields(self):
+        ref = self._load()
+        first = ref.trades[0]
+        assert first.entry_time == "2026-03-02T16:45:00Z"
+        assert first.entry_price == pytest.approx(1.17170)
+        assert first.quantity == pytest.approx(4.4)
+        assert first.stop_loss == pytest.approx(1.17057)
+        assert first.pnl == pytest.approx(-497.20)
+        assert first.exits[0].time == "2026-03-02T17:15:40Z"
+        assert first.exits[0].reason == "stop_loss"
+
+    def test_stats_are_read_from_english_labels(self):
+        ref = self._load()
+        assert ref.stats["total_trades"] == pytest.approx(5)
+        assert ref.stats["total_pnl"] == pytest.approx(-1173.41)
+        assert ref.stats["profit_factor"] == pytest.approx(0.25)
+        assert ref.stats["win_rate"] == pytest.approx(20.0)
