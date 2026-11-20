@@ -24,7 +24,7 @@ from validation.reference import ValidationReference
 
 logger = logging.getLogger(__name__)
 
-# Known German stat labels → canonical keys
+# Known stat labels (German and English) → canonical keys
 _STAT_LABELS = [
     ("Gesamtanzahl Trades", "total_trades"),
     ("Gewonnene Trades (in % von Gesamt)", "winners_with_pct"),
