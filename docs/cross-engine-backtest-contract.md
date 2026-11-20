@@ -150,6 +150,22 @@ Implementation:
 
 ## 4. Sizing
 
+- **Sizing basis (native, vectorbt, pynecore):** the `equity` every sizing
+  rule below denominates is **realized cash** — `initial_capital` plus the net
+  PnL of *closed* trades. The mark-to-market equity that feeds the equity
+  curve is never a sizing input: an open position's paper profit is not
+  spendable and an unrealized drawdown is not a realized loss. Native holds it
+  in `TradeEngine._sizing_equity` (decision record D2,
+  `docs/cleanup-16d1-money-path-semantics.md`); vectorbt accumulates it inline
+  and records it as `trade.meta["risk_math"]["equity_at_entry"]`; pynecore walks
+  the same realized ledger. This is the basis MT5 sizes on too (fixed cash risk
+  per the EA, capital + closed PnL in the repo's MT5 sizing code).
+  **Documented per-engine divergence:** signal replay sizes on realized cash
+  *plus* the mark-to-market PnL of open positions (decision record D9 / F39,
+  pinned by `tests/test_portfolio_sharpe_annualization.py::TestReplaySizingEquity`)
+  — that engine's entries must react to an open drawdown, and its divergence
+  from the realized-only engines is a recorded decision, not an oversight.
+  Do not "align" one side without revisiting the corresponding decision record.
 - **Risk-based sizing** (`risk_per_trade_pct` set): position quantity is
   derived from the *actual* stop distance,
   `qty = (equity × risk_per_trade_pct) / |entry − stop|`, capped by the

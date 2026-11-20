@@ -29,10 +29,43 @@ the price data.
 compounded into the next entry's quantity, and paper drawdown shrank it.
 
 **Decision:** sizing draws on `_sizing_equity = initial_capital + realized_pnl`
-(realized cash only, updated in `_close_partial`). `self.equity` remains the
-mark-to-market *reporting* equity for the curve. Sizing is therefore
-indifferent to open-trade fluctuations: unrealized profit is not spendable,
-and unrealized loss does not shrink new positions.
+(realized cash only). `self.equity` remains the mark-to-market *reporting*
+equity for the curve. Sizing is therefore indifferent to open-trade
+fluctuations: unrealized profit is not spendable, and unrealized loss does not
+shrink new positions. Every sizing input reads that one basis — the risk
+engine's `account_balance`, the notional/leverage caps
+(`_sizing_equity × position_notional_limit`, and the
+`max_position_exposure_pct` arm), the aggregate-exposure denominator
+(`_current_risk_exposure`) and `equity_at_entry`, the recorded basis the
+multi-symbol shared-equity replay (`replay_shared_equity`) divides the
+quantity by — that replay accumulates realized PnL only, so a mark-to-market
+`equity_at_entry` would rescale a realized-cash quantity by a reporting
+denominator. `_sizing_equity` is recomputed by `_refresh_sizing_equity()`
+at every partial close and when a trade is finalized, net of the round-trip
+fees a partly-closed position still owes (`_close_partial` books exit legs
+gross; the exact fee replaces the estimate at finalization).
+
+**Basis parity (#262):** realized cash is also what both reference engines
+size on, so the native engine now matches them rather than diverging:
+
+- **MT5:** the EA's `CalculateLotSize`
+  (`strategy-comparisons/intraday_volatility_breakout/IntradayVolatilityBreakout.mq5:381-395`)
+  sizes from the `Fixed_Risk_Amount` input
+  (`IntradayVolatilityBreakout.mq5:46`) — a fixed cash amount — and never reads
+  the account value at all (no `AccountInfoDouble`/`ACCOUNT_BALANCE`/
+  `ACCOUNT_EQUITY` anywhere in the EA). The repo's MT5 sizing code agrees where
+  it does need a base: `scripts/regenerate_mt5_parity_artifacts.py` computes
+  lots from `fixed_risk_amount` (`_mt5_raw_lots`, line 344) and its stopless
+  fallback uses `equity / entry_price` (line 446) where `equity` starts at the
+  starting capital (line 367) and is credited with a closed trade's PnL at its
+  exit (line 486) — realized cash.
+- **vectorbt:** `runner/engines/vectorbt_adapter.py` seeds
+  `equity = config.initial_capital` (line 403) and credits `pnl - fees` at each
+  close (line 651), so `_size_trade`'s sizing basis is realized cash; its
+  `trade.meta["risk_math"]["equity_at_entry"]` records that same figure.
+
+Neither reference marks open positions to market for sizing, so a change of the
+native engine to mark-to-market sizing would have broken parity with both.
 
 **Scope note:** F21 also flags the hidden per-call sizing protocol
 (`fixed_risk_amount`, `tick_value`, `lot_step`, `min_lot`, `max_lot`,
@@ -42,6 +75,14 @@ interface (see `docs/mt5-backtest-alignment-plan.md`), documented rather than
 removed; only the equity base it reads was wrong and is fixed.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl`.
+The two original scenarios are basis-blind (the first entry fills at the next
+bar's open, so its paper PnL only reaches equity on the bar the second entry is
+sized — *after* that bar's sizing call). The class therefore also pins the
+scenarios where a position is open and already marked when the next entry is
+sized: `test_open_paper_profit_does_not_grow_next_entry`,
+`test_open_paper_loss_does_not_shrink_next_entry`,
+`test_recorded_equity_at_entry_is_the_sizing_basis` and
+`test_aggregate_exposure_denominator_is_realized_cash`.
 
 ## D3 — Engine risk policy is not strategy-configurable (F22)
 
