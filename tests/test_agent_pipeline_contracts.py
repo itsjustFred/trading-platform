@@ -28,17 +28,32 @@ What is pinned here:
   marker belongs to exactly one workflow, and no workflow writes another workflow's context;
 - the pre-mortem marks the analysed commit pending once, and every path that stops it - a
   cancelled run, a failed run, a failed post step, including the reporter of a failed agent run
-  itself - converts a status that is still `pending` and never replaces a terminal one, so a
-  rerun's infra failure cannot erase the verdict of a run that succeeded; a head that moved
-  keeps its own status but no longer owns the comment;
+  itself - converts a `pending` status this run wrote itself and never touches another run's:
+  the commit status API has no conditional write, so the conversion reads the *newest* status of
+  the context (sorted by creation time, since the API's own ordering is undocumented) and the run
+  that wrote it, and what is left - the window between that read and the write - is stated as
+  best effort in the reporters' comments; a head that moved keeps its own status but no longer
+  owns the comment;
+- every result the pre-mortem writes names the diff it was computed against: the analysed base
+  and head, short, in the comment's footer and in every status description, so a verdict left
+  behind by a base retarget, a base branch that moved or a head that moved on cannot be read as
+  the current one;
+- a base retarget re-runs the pre-mortem - `edited` is subscribed for it and only for it, since
+  a title or body edit fires the same action and would spend model quota on a verdict that is
+  already current;
+- the base-commit guard of the skill selection is asserted on its non-comment line, and a copy
+  with that line commented out fails the assertion - the substring check it replaced passed with
+  the guard disabled in all three workflows at once;
+- each workflow prints whose rules ran, so a verdict produced by the PR's own skill copy (the
+  fallback while the base branch has none) is never indistinguishable from the base's;
 - a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
   so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
   sibling workflows, whose comments swear to the same guards;
-- the duplicated guard blocks the workflows' comments swear to keep in sync (summary-line
-  extraction, fence strip, tree-clean check, the two-level skill selection) stay identical
-  modulo the names each copy substitutes - the selection by a test of its own, which is the
-  only way a copy that is not strict can fail it;
+- the duplicated guard blocks the workflows duplicate (summary-line extraction, fence strip,
+  tree-clean check, the two-level skill selection) stay identical modulo the names each copy
+  substitutes - the selection by a test of its own, which is the only way a copy that is not
+  strict can fail it;
 - the agent job that reads the checkout holds only `contents: read`, keeps no credentials, and
   fails the run when HEAD moved or the tree is dirty.
 
@@ -149,6 +164,13 @@ def _load(name: str) -> dict:
     return data
 
 
+def _parse(text: str) -> dict:
+    """The same parse as `_load`, for a copy of a workflow a test has rewritten in memory."""
+    data = yaml.safe_load(text)
+    assert isinstance(data, dict), "the rewritten workflow did not parse to a mapping"
+    return data
+
+
 def _triggers(data: dict) -> dict:
     # PyYAML reads the YAML 1.1 boolean key `on` as True.
     on = data.get(True) or data.get("on")
@@ -182,6 +204,41 @@ def _agent_job(data: dict) -> tuple[str, dict]:
         if any(s.get("name") == "Install opencode" for s in _steps(job)):
             return job_name, job
     raise AssertionError(f"no agent job in {list(data['jobs'])}")
+
+
+def _selection_lines(job: dict) -> list[str]:
+    """The selection step's executable shell lines: stripped, prose comments dropped.
+
+    A check that only exists on a `#` line is a check that does not run, so what the
+    selection must contain is asserted against these lines rather than against the raw body -
+    a substring over the body is satisfied by a commented-out guard, which is the regression
+    `test_the_base_commit_guard_must_not_be_a_comment_line` pins.
+    """
+    lines = []
+    for line in _run(_find_step(job, r"^Select skill revision$")).splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            lines.append(line)
+    return lines
+
+
+def _strictness_failures(lines: list[str]) -> list[str]:
+    """What a strict skill selection must contain, matched within its executable lines: the
+    standalone base-commit check that refuses an unreachable base instead of falling through to
+    the PR's own rules, the two levels themselves, and the source both levels record. Matching
+    inside the line (a guard written as `git cat-file -e ... 2>/dev/null; then`) keeps the check
+    as strong as the substring it replaces, minus the prose that substring happily matched."""
+    required = (
+        ("set -euo pipefail", "the selection is not strict"),
+        ('git cat-file -e "${BASE_SHA}^{commit}"', "does not refuse an unreachable base commit"),
+        (
+            'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"',
+            "does not read the skill from the base branch first",
+        ),
+        ('cp "$SKILL_PATH"', "no fallback to the PR's own copy"),
+        ("SKILL_SOURCE=base branch", "records no skill source"),
+    )
+    return [message for needle, message in required if not any(needle in line for line in lines)]
 
 
 def _all_run_bodies(data: dict) -> str:
@@ -289,6 +346,31 @@ def test_the_pre_mortem_adds_ready_for_review_and_a_manual_rerun() -> None:
     assert '!= "$INPUT_SHA"' in body, "a rerun does not check the head it was given"
     assert "INPUT_PR" in body and "INPUT_SHA" in body, "the inputs reach the shell by env only"
     assert "${{" not in body, "the resolve step interpolates workflow expressions into a shell"
+
+
+def test_a_base_retarget_reruns_the_pre_mortem_and_a_text_edit_does_not() -> None:
+    """A retarget changes base...head, so the diff the last verdict covered no longer exists:
+    a `success` status and a `# Pre-Mortem Action` comment for it are read as current by everyone
+    who looks, and nothing else re-runs the stage - GitHub fires `edited` for a retarget and
+    nothing else, and a base branch that advances on the PR's behalf fires nothing at all. So
+    `edited` is subscribed. A title, body or label edit fires the same action, and re-analysing
+    for it spends model quota on a verdict that is already current, so the run is skipped unless
+    the event carries a changed base - the one part of the payload every retarget has, whichever
+    of `ref`/`sha` GitHub fills inside it. A skipped resolve job skips every job that needs its
+    outputs, so a text edit leaves the existing verdict and comment exactly where they were."""
+    data = _load(PREMORTEM)
+    types = _triggers(data)["pull_request"]["types"]
+    assert "edited" in types, "a base retarget does not re-run the pre-mortem"
+    guard = str(data["jobs"]["resolve"].get("if", ""))
+    assert "draft" in guard, "the draft skip is gone from the resolve guard"
+    assert "github.event.changes.base" in guard, (
+        "an `edited` event re-runs the pre-mortem whatever changed"
+    )
+    # The base-change test is only reached for the `edited` action: every other action leaves
+    # `changes` absent, so a guard without this comparison would skip all of them too.
+    assert "github.event.action != 'edited'" in guard, (
+        "the base-change guard is not scoped to the edited action"
+    )
 
 
 def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None:
@@ -518,10 +600,101 @@ def test_the_pre_mortem_status_names_the_pr_it_was_written_for() -> None:
     assert "PR #${PR_NUMBER}" in body, "the status description does not name the PR"
 
 
+def test_the_comment_and_the_status_record_the_analysed_shas() -> None:
+    """A verdict is current for the diff it was computed against, and that diff is a
+    base...head pair. The pair can move under the verdict - a retarget, a base branch that
+    advanced, or a head that moved past the commit this run analysed - and neither the comment
+    nor the status used to say which pair it was, so a stale verdict read as the current one
+    and the only way to tell was the run log. Both now carry the two SHAs, short so they fit:
+    the description has GitHub's 140 characters to work with and still has to name the verdict,
+    the commit and the PR."""
+    data = _load(PREMORTEM)
+    body = _run(_find_step(_agent_job(data)[1], r"^Run pre-mortem agent$"))
+    lines = body.splitlines()
+    footer_at = next(i for i, line in enumerate(lines) if "skill (rules from %s)" in line)
+    footer = "\n".join(lines[footer_at - 4 : footer_at + 3])
+    assert "${BASE_SHA:0:8}" in footer and "${HEAD_SHA:0:8}" in footer, (
+        "the comment footer does not name the analysed base and head"
+    )
+    assert '>> "$out"' in footer, "the analysed pair is not written to the comment"
+    step = _find_step(data["jobs"]["post"], r"^Set status$")
+    description = re.search(r'-f description="([^"]+)"', _run(step)).group(1)
+    for required in ("${HEAD_SHA:0:8}", "${BASE_SHA:0:8}", "PR #${PR_NUMBER}"):
+        assert required in description, f"the status description drops {required}"
+    # GitHub truncates a status description at 140 characters, and a truncated description
+    # loses the PR number it carries the verdict for.
+    longest = (
+        description.replace("${VERDICT}", "CHANGES-REQUESTED")
+        .replace("${HEAD_SHA:0:8}", "01234567")
+        .replace("${BASE_SHA:0:8}", "01234567")
+        .replace("${PR_NUMBER}", "1234")
+    )
+    assert len(longest) <= 140, f"status description is {len(longest)} chars: {longest!r}"
+
+
+def test_every_error_status_names_the_analysed_commit() -> None:
+    """An `error` that names no SHA is read against whatever commit the reader happens to be
+    looking at: the context is repo-global, two open PRs can share a head commit, and a run of
+    a superseded commit still writes its status. The analysed SHA is what makes the error
+    readable, and it costs nothing in the description."""
+    data = _load(PREMORTEM)
+    reporters = (
+        (data["jobs"]["resolve"], r"^Report resolve failure$"),
+        (data["jobs"]["post"], r"^Report failed pre-mortem run$"),
+        (data["jobs"]["post"], r"^Report post failure$"),
+        (data["jobs"]["report-cancelled"], r"^Report cancelled pre-mortem run$"),
+    )
+    for job, pattern in reporters:
+        body = _run(_find_step(job, pattern))
+        description = re.search(r'-f description="([^"]+)"', body)
+        assert description, f"{pattern} writes no description"
+        assert "${HEAD_SHA:0:8}" in description.group(1), (
+            f"{pattern}: the error status does not name the commit it was written for"
+        )
+
+
+def test_the_pending_conversion_is_identity_bearing() -> None:
+    """Every stop path converts a `pending` status into an `error`, and the commit status API has
+    no conditional write - so the conversion is a read-then-write and two runs of one commit can
+    collide (a rerun of the same SHA in the same concurrency bucket, or a dispatch running
+    beside the push's run). Reading whatever `[0]` happens to be and converting it when it is
+    pending converts a concurrent run's status too, which is how a valid verdict ends up labelled
+    `Pre-mortem run cancelled`. So the candidates are pinned down as far as the API allows - the
+    newest status of the context, sorted by creation time because the API's own ordering is
+    undocumented, and the run that wrote it - and only this run's own `pending` mark is
+    converted. What is left is the window between that read and the write, which no status API
+    can close; the reporters' comments call it best effort rather than claim the invariant."""
+    data = _load(PREMORTEM)
+    reporters = (
+        (data["jobs"]["resolve"], r"^Report resolve failure$"),
+        (data["jobs"]["post"], r"^Report failed pre-mortem run$"),
+        (data["jobs"]["post"], r"^Report post failure$"),
+        (data["jobs"]["report-cancelled"], r"^Report cancelled pre-mortem run$"),
+    )
+    for job, pattern in reporters:
+        body = _run(_find_step(job, pattern))
+        assert "sort_by(.created_at)" in body, (
+            f"{pattern}: reads the first status the API happens to return, not the newest"
+        )
+        assert "--arg ctx" in body and "--arg url" in body, (
+            f"{pattern}: reads the statuses without the context or without this run's URL"
+        )
+        assert "target_url" in body and "startswith($url)" in body, (
+            f"{pattern}: converts a pending mark this run did not write"
+        )
+        assert '"$owner" = "true"' in body, (
+            f"{pattern}: the ownership of the pending mark is not checked"
+        )
+    # The mark has to be attributable in the first place: without the run URL on it, no reporter
+    # could tell its own pending status from another run's.
+    mark = _run(_find_step(data["jobs"]["resolve"], r"^Mark running$"))
+    assert '-f target_url="$RUN_URL"' in mark, "the pending mark names no run"
+
+
 def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
     """The bookkeeping that keeps the stage from stranding `pending`: a resolve failure, a failed
     agent run, a failed post step and a cancelled run each write `error` for their own context,
-    and each converts a status that is still `pending` rather than overwriting a terminal one -
+    and each converts a `pending` status this run wrote itself rather than any still-pending one -
     including the reporter of the failed agent run, whose family (a rerun of the same commit
     that ran beside this one through the concurrency group) is exactly the case where a terminal
     status is already there. Deleting a reporter, or writing a literal context somewhere, would
@@ -567,9 +740,9 @@ def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
 def test_a_cancelled_run_leaves_no_pending_stage_status() -> None:
     """A cancelled run - a hand-cancel, or a superseding run through the concurrency group -
     skips every failure() reporter and the post job, so without a dedicated job the stage
-    stays `pending` on the SHA with no signal. The reporter only touches a still-pending
-    context, so a newer run's terminal verdict survives. A workflow that marks nothing pending
-    needs no reporter, which is what keeps this an invariant rather than a chain matrix."""
+    stays `pending` on the SHA with no signal. The reporter only converts a pending status it
+    wrote itself, so a newer run's terminal verdict survives. A workflow that marks nothing
+    pending needs no reporter, which is what keeps this an invariant rather than a chain matrix."""
     for name in AGENT_WORKFLOWS:
         data = _load(name)
         jobs = data["jobs"]
@@ -650,6 +823,23 @@ def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
     assert "${SKILL_SOURCE}" in body, "the footer is not filled from the skill-source variable"
 
 
+def test_the_sibling_comments_also_record_whose_rules_ran() -> None:
+    """The same gap the pre-mortem's test above pins, in its two siblings: they record
+    `SKILL_SOURCE` in their `$GITHUB_ENV`, hand it to the agent, and print nothing - a value
+    nothing reads. The fallback it records (the PR's own copy, used while the base branch has
+    no skill) is exactly the case a reader has to be able to see, so the siblings now say it in
+    the same two places: a notice in the run log, and the source in the comment footer. The
+    mutation copy's empty-scope footer is excluded by design: no agent ran, so no rules ran."""
+    for name in (REVIEW, MUTATION):
+        body = _job_bodies([_agent_job(_load(name))[1]])
+        assert re.search(r"::notice::[A-Za-z-]+ rules from: \$\{SKILL_SOURCE\}", body), (
+            f"{name}: the run log does not print whose rules ran"
+        )
+        assert "skill (rules from %s)" in body, (
+            f"{name}: the comment footer drops the rules' source"
+        )
+
+
 def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
     """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
     used only while the base has none. A base commit that cannot be read must abort the step -
@@ -667,21 +857,41 @@ def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> N
     scope step) leaves the selection itself able to fall through, which is how the two siblings
     stayed non-strict while this test passed over them."""
     for name in AGENT_WORKFLOWS:
-        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
-        body = _run(step)
-        assert "set -euo pipefail" in body, f"{name}: the selection is not strict"
-        assert 'git cat-file -e "${BASE_SHA}^{commit}"' in body, (
-            f"{name}: the selection does not refuse an unreachable base commit"
-        )
-        assert 'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"' in body, (
-            f"{name}: does not read the skill from the base branch first"
-        )
-        assert 'cp "$SKILL_PATH"' in body, f"{name}: no fallback to the PR's own copy"
-        assert "SKILL_SOURCE=base branch" in body, f"{name}: records no skill source"
+        job = _agent_job(_load(name))[1]
+        body = _run(_find_step(job, r"^Select skill revision$"))
+        # What the selection must contain is matched on its executable lines, not as a
+        # substring of the body: a commented-out guard is not a guard.
+        failures = _strictness_failures(_selection_lines(job))
+        assert not failures, f"{name}: " + "; ".join(failures)
         # Two levels only: a third (the commit the workflow file came from) would analyse an older
         # commit under rules the branch tip happens to carry.
         assert "GITHUB_SHA" not in body, f"{name}: reads a third skill revision"
         assert body.count("elif") == 1, f"{name}: more than two levels:\n{body}"
+
+
+def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
+    """The guard is one shell line, and the cheapest way to delete it is to comment it out -
+    which a substring assertion over the step body cannot see: it passes with the line disabled,
+    and so does the "stays identical" test, which strips `#` lines before it compares. So the
+    guard is commented out in a copy of each workflow here and the same check runs over that
+    copy: it fails. That is what the assertion it replaced claimed to be."""
+    guard = 'git cat-file -e "${BASE_SHA}^{commit}"'
+    for name in AGENT_WORKFLOWS:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        # Every occurrence, not just the first: the mutation copy carries the same line in its
+        # scope step, so a copy with only the selection's line commented out would still be
+        # analysed with a base whose tip it cannot read.
+        mutated = re.sub(rf"(?m)^(\s*){re.escape(guard)}\s*$", rf"\1# {guard}", text)
+        assert mutated.count(f"# {guard}") >= 1, f"{name}: the guard is not a line of its own"
+        assert mutated != text, f"{name}: the base-commit guard is not a line of its own"
+        job = _agent_job(_parse(mutated))[1]
+        assert not any(guard in line for line in _selection_lines(job)), (
+            f"{name}: a commented-out guard is still an executable line"
+        )
+        failures = _strictness_failures(_selection_lines(job))
+        assert any("unreachable base" in message for message in failures), (
+            f"{name}: commenting the guard out does not fail the strictness check: {failures}"
+        )
 
 
 def test_the_skill_selection_stays_identical_across_the_copies() -> None:

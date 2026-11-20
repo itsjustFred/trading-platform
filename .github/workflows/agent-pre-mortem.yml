@@ -13,12 +13,21 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # review -> mutation -> pre-mortem ran one after the other via dispatches, is
 # abandoned.)
 #
-# It runs on `pull_request` itself (opened, a synchronize, a reopen, and the
-# moment a draft becomes ready for review), with a `workflow_dispatch` for a
-# manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has to
-# be re-analysed, e.g. after an infra failure). Its run-name carries the PR
+# It runs on `pull_request` itself (opened, a synchronize, a reopen, the moment a
+# draft becomes ready for review, and a base retarget), with a `workflow_dispatch`
+# for a manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has
+# to be re-analysed, e.g. after an infra failure). Its run-name carries the PR
 # number and the analysed SHA, so a run of an older commit is recognisable in the
-# run list. The concurrency group below is keyed by that analysed SHA, so a
+# run list.
+#
+# `edited` is subscribed for the retarget and nothing else: a retarget changes
+# base...head, so the diff the last verdict covered no longer exists, and GitHub
+# fires no other action for it (a base branch that advances on the PR's behalf
+# does not fire anything at all, which is a limitation of the event, not of this
+# step). A title, body or label edit fires the same action, and re-analysing for it
+# would spend model quota on a verdict that is already current, so the run is
+# skipped unless the event carries a changed base - see the guard on the resolve
+# job. The concurrency group below is keyed by that analysed SHA, so a
 # re-dispatch of an older commit runs *beside* the current head's run instead of
 # cancelling it - a rerun of the same commit still supersedes its own stale run.
 #
@@ -36,6 +45,13 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # `# Pre-Mortem Action` (hidden marker `<!-- actions-pre-mortem -->`). A result
 # for a commit that is no longer the PR head still lands its status on its own
 # SHA but does not overwrite the comment.
+#
+# Every result it writes names the diff it was computed against: the comment's
+# footer and every status description carry the analysed base and head, short so
+# they fit. A verdict is only current for its base...head pair, and both can move
+# under it - a retarget (the trigger above), a base branch that advanced, or a
+# head that moved past the commit this run analysed - so a reader has to be able
+# to tell a stale verdict from the current one without opening the run log.
 #
 # opencode's free Zen models need no login and no API key, so this workflow
 # holds no secret besides the default GITHUB_TOKEN of the jobs that run no repo
@@ -76,7 +92,7 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -128,8 +144,13 @@ jobs:
       contents: read
       statuses: write
     # Drafts are not pre-mortemed: the run resumes when the PR is ready for
-    # review (one of the pull_request types above).
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    # review (one of the pull_request types above). Of the `edited` action only a
+    # base retarget re-runs the stage - `changes.base` is present exactly when the
+    # event changed the base - so a title, body or label edit, which fires the same
+    # action, is skipped. The shape inside `changes.base` is deliberately not read:
+    # GitHub fills `ref`/`sha` differently between retargets, and presence alone is
+    # what the skip needs. A skipped resolve skips every job that needs its outputs.
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && (github.event.action != 'edited' || github.event.changes.base)) }}
     outputs:
       number: ${{ steps.pr.outputs.number }}
       base: ${{ steps.pr.outputs.base }}
@@ -186,8 +207,10 @@ jobs:
                   echo "::error::Commit ${INPUT_SHA} is not a commit of PR #${INPUT_PR}; nothing to analyse."
                   exit 1
                 fi
+                # Only when the input really is another commit: a rerun that names
+                # the current head must not log that it is not the head.
+                echo "::notice::PR head is ${head_now}, not ${INPUT_SHA}; analysing the requested commit."
               fi
-              echo "::notice::PR head is ${head_now}, not ${INPUT_SHA}; analysing the requested commit."
             fi
           fi
           head=${INPUT_SHA:-$(jq -r .head.sha pr.json)}
@@ -422,12 +445,19 @@ jobs:
           # A file, not $GITHUB_OUTPUT: the agent shares this step's
           # environment and could otherwise append its own verdict.
           printf '%s\n' "$verdict" > "$RUNNER_TEMP/premortem/verdict.txt"
-          # Footer: the model, its variant and the skill the rules came from
-          # (the skill directory's name, not its path), so a reader can map the
-          # verdict to the rules that produced it.
+          # Footer: which diff was analysed, then the model, its variant and the skill
+          # the rules came from (the skill directory's name, not its path), so a
+          # reader can map the verdict to the rules that produced it. The pair comes
+          # first because it is the one thing that cannot be re-derived from the
+          # comment: a verdict is current for its base...head and nothing else, and a
+          # retarget, a base branch that moved or a head that moved on can each leave
+          # this comment describing a diff nobody is looking at any more.
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
-          printf '\n\n---\n_Automated pre-mortem using %s with `%s` skill (rules from %s)_\n' \
-            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}" >> "$out"
+          {
+            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+            printf '\n---\n_Automated pre-mortem using %s with `%s` skill (rules from %s)_\n' \
+              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}"
+          } >> "$out"
           # Title first, so the comment is recognisable among the other bots'.
           { printf '# Pre-Mortem Action\n\n'; cat "$out"; } > "$out.titled"
           mv "$out.titled" "$out"
@@ -464,6 +494,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ needs.resolve.outputs.number }}
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
       VERDICT: ${{ needs.premortem.outputs.verdict }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -544,7 +575,7 @@ jobs:
           esac
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state="$state" -f context="$PREMORTEM_CONTEXT" \
-            -f description="Verdict: ${VERDICT} (advisory, see the comment) - PR #${PR_NUMBER}" -f target_url="$RUN_URL" > /dev/null
+            -f description="Verdict: ${VERDICT} (advisory, see the comment) - head ${HEAD_SHA:0:8} on base ${BASE_SHA:0:8} - PR #${PR_NUMBER}" -f target_url="$RUN_URL" > /dev/null
 
       # A failure above (artifact download, comment POST/PATCH, status write)
       # would otherwise leave the status `pending` on this SHA forever. Only a
