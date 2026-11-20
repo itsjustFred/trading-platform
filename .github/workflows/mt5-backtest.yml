@@ -166,7 +166,7 @@ jobs:
           # Only the freshly installed terminal is cached. The zip is created
           # before the terminal ever starts with an account or our data, so it
           # cannot contain account or history files.
-          key: mt5-terminal-${{ runner.os }}-v1
+          key: mt5-terminal-${{ runner.os }}-v2
 
       - name: Install MT5 terminal
         if: steps.terminal-cache.outputs.cache-hit != 'true'
@@ -192,6 +192,28 @@ jobs:
           if (Test-Path $env:MT5_HOME) { Remove-Item -Recurse -Force $env:MT5_HOME }
           Copy-Item -Path $default -Destination $env:MT5_HOME -Recurse -Force
 
+          # The installer ships the binaries; the MQL5 standard tree (Include,
+          # Scripts, Experts, ...) is unpacked by the terminal on first start.
+          # Start it once in portable mode until MQL5\Include\Trade\Trade.mqh
+          # exists, then close it, so the compile step has the standard library.
+          $includeProbe = Join-Path $env:MT5_HOME 'MQL5\Include\Trade\Trade.mqh'
+          if (-not (Test-Path $includeProbe)) {
+            Write-Host 'MQL5 standard tree missing after install; starting terminal once to unpack it'
+            $warm = Start-Process -FilePath (Join-Path $env:MT5_HOME 'terminal64.exe') -ArgumentList '/portable' -PassThru
+            $deadline = (Get-Date).AddSeconds(180)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path $includeProbe)) {
+              Start-Sleep -Seconds 2
+            }
+            Get-Process -Name terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep -Seconds 3
+          }
+          if (-not (Test-Path $includeProbe)) {
+            Get-ChildItem -Path $env:MT5_HOME -Directory | Select-Object Name | Format-Table | Out-String | Write-Host
+            Get-ChildItem -Path (Join-Path $env:MT5_HOME 'MQL5') -ErrorAction SilentlyContinue | Select-Object Name | Format-Table | Out-String | Write-Host
+            throw "MQL5\Include\Trade\Trade.mqh is missing even after a first terminal start"
+          }
+          Write-Host "MQL5 standard tree ready: $includeProbe"
+
           # A cache must never carry account data. The installer may have
           # created an empty account file on its post-install launch.
           foreach ($junk in @('config\accounts.dat','config\accounts.ini','config\common.ini')) {
@@ -199,6 +221,7 @@ jobs:
           }
           Remove-Item -Path (Join-Path $env:MT5_HOME 'MQL5\Logs\*') -Force -ErrorAction SilentlyContinue
           Remove-Item -Path (Join-Path $env:MT5_HOME 'logs\*') -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path (Join-Path $env:MT5_HOME 'bases\*') -Recurse -Force -ErrorAction SilentlyContinue
 
           $zip = Join-Path $env:RUNNER_TEMP 'mt5-terminal.zip'
           if (Test-Path $zip) { Remove-Item -Force $zip }
@@ -218,6 +241,11 @@ jobs:
           if (-not (Test-Path $terminal)) { throw "terminal64.exe missing in $env:MT5_HOME" }
           $version = (Get-Item $terminal).VersionInfo
           Write-Host "terminal build: $($version.ProductVersion) / file $($version.FileVersion)"
+          $includeProbe = Join-Path $env:MT5_HOME 'MQL5\Include\Trade\Trade.mqh'
+          if (-not (Test-Path $includeProbe)) {
+            throw "restored terminal has no MQL5 standard tree ($includeProbe); bump the cache key in this workflow"
+          }
+          Get-ChildItem -Path (Join-Path $env:MT5_HOME 'MQL5') -Directory | Select-Object Name | Format-Table | Out-String | Write-Host
 
       - name: Compile EA
         run: |
