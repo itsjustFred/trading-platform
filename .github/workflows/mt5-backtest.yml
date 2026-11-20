@@ -95,6 +95,7 @@ env:
   DEPOSIT: ${{ inputs.deposit || '100000' }}
   LEVERAGE: ${{ inputs.leverage || '100' }}
   MIN_TRADES: ${{ inputs.min_trades || '1' }}
+  TESTER_LOGIN: "1000001"
   DATA_RELEASE: mt5-ci-data-v0
 
 jobs:
@@ -410,6 +411,10 @@ jobs:
           $expert = "$env:STRATEGY\$env:EA_FILE.ex5"
           $iniLines = @(
             '[Tester]',
+            # Emulated account number. Without it the terminal logs
+            # "tester not started because the account is not specified" and
+            # exits without a report, even though Deposit/Currency are set.
+            "Login=$TESTER_LOGIN",
             "Expert=$expert",
             "ExpertParameters=$env:SET_NAME",
             "Symbol=$env:SYMBOL",
