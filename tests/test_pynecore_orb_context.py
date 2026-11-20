@@ -275,8 +275,9 @@ class TestOrbContextInputContract:
 
     def test_missing_session_clock_is_refused(self):
         frame = pd.DataFrame({"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]})
+        build_trade_context = _load_context_module().build_trade_context
         with pytest.raises(ValueError, match="timestamp"):
-            _load_context_module().build_trade_context(frame, {})
+            build_trade_context(frame, {})
 
     def test_derives_sessions_from_a_datetime_index(self):
         # The same state machine must come out of a tz-aware index, not only of
