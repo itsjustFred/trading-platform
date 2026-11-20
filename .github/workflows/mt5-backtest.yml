@@ -234,7 +234,7 @@ jobs:
           $proc = Start-Process -FilePath $metaeditor -PassThru -Wait -ArgumentList @(
             "/compile:`"$copy`"",
             "/log:`"$log`"",
-            "/inc:`"$(Join-Path $env:MT5_HOME 'MQL5\Include')`"",
+            "/inc:`"$(Join-Path $env:MT5_HOME 'MQL5')`"",
             '/portable'
           )
           if (Test-Path $log) {
@@ -263,7 +263,7 @@ jobs:
           $proc = Start-Process -FilePath $metaeditor -PassThru -Wait -ArgumentList @(
             "/compile:`"$copy`"",
             "/log:`"$log`"",
-            "/inc:`"$(Join-Path $env:MT5_HOME 'MQL5\Include')`"",
+            "/inc:`"$(Join-Path $env:MT5_HOME 'MQL5')`"",
             '/portable'
           )
           if (Test-Path $log) {
