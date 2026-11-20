@@ -79,7 +79,7 @@ WORST_CASE_SHUTDOWN_SECONDS = (
 )
 
 
-def release_twisted_reactor_threads() -> None:
+def release_twisted_reactor_threads(log: logging.Logger | None = None) -> None:
     """Stop the Twisted reactor's thread pool so the process can exit.
 
     The cTrader adapter starts the asyncio-backed Twisted reactor with
@@ -88,7 +88,13 @@ def release_twisted_reactor_threads() -> None:
     pool, whose worker threads are not daemon threads and are only stopped by
     the reactor's shutdown event. Without this, a process that connected to
     cTrader hangs forever in interpreter shutdown.
+
+    ``log`` receives the warning about a reactor whose private shutdown API is
+    gone. It defaults to this module's logger; ``live_runner.preflight`` passes
+    its own so the warning stays in the log an operator reads for preflight.
     """
+    if log is None:
+        log = logger
     # ``installReactor`` stores the reactor instance under this module key, so
     # membership means "a reactor was installed"; importing it here cannot
     # install a new one. The check has to come first: importing
@@ -106,7 +112,7 @@ def release_twisted_reactor_threads() -> None:
         # joins the workers. Shutdown never fires here, so it is called directly.
         stop_thread_pool()
     else:
-        logger.warning(
+        log.warning(
             "Twisted reactor has a thread pool but no _stopThreadPool handler; "
             "the process may hang at exit. The Twisted private API likely changed."
         )

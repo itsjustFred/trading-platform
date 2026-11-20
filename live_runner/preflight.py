@@ -137,7 +137,14 @@ def _resolve_ctrader_credentials(
     return app_id, app_secret, access_token, refresh_token, demo
 
 
-_release_twisted_reactor_threads = release_twisted_reactor_threads
+def _release_twisted_reactor_threads() -> None:
+    """Release the reactor pool, warning through the preflight logger.
+
+    The shared helper lives in ``live_runner.shutdown`` (the daemon uses it
+    too), but its warning is a preflight warning: passing this module's logger
+    keeps it in the ``live-runner`` log where an operator looks for it.
+    """
+    release_twisted_reactor_threads(log=logger)
 
 
 @contextlib.contextmanager
