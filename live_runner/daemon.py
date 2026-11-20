@@ -2799,6 +2799,24 @@ async def _prepare_claim_and_submit_signal(
     # a signal either is refused here or is counted as in flight before any
     # await: the shutdown drain can never miss an order that is about to be sent.
     if not _begin_submission():
+        if is_exit:
+            # A dropped exit leaves this deployment's position open, exactly like
+            # every other refused exit (#121): an operator has to look at it, so
+            # it is an error, not a skipped signal.
+            logger.error(
+                "Exit signal refused before submission: the daemon is shutting "
+                "down; nothing was sent to the broker and the position stays open",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "action": live_signal.action,
+                        "is_exit": True,
+                    }
+                },
+            )
+            return
         logger.warning(
             "Skipping discord signal: daemon is shutting down; nothing was sent to the broker",
             extra={
@@ -2806,6 +2824,7 @@ async def _prepare_claim_and_submit_signal(
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
                     "symbol": live_signal.symbol,
+                    "is_exit": False,
                 }
             },
         )

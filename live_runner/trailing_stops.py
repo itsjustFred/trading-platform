@@ -682,7 +682,15 @@ class LiveTrailingStopManager:
                 # mutation: leave these bars unprocessed so the next pass
                 # recomputes the same target instead of skipping it, and come
                 # back early rather than recording progress that did not
-                # happen.
+                # happen. The broker-side stop stays at the previous level, so
+                # say so: an operator reading the shutdown log has to know the
+                # stop was not moved.
+                logger.warning(
+                    "Trailing-stop amendment refused during shutdown; the "
+                    "broker-side stop stays at its previous level and the bars "
+                    "are retried",
+                    extra={"data": dict(context)},
+                )
                 return True
             logger.info(
                 "Trailed live stop",

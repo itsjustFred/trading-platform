@@ -1069,24 +1069,29 @@ def test_the_daemon_drains_an_amendment_its_own_trailing_loop_started(
 
 
 def test_a_stop_amendment_is_refused_once_shutdown_was_requested(
-    live: _Live, monkeypatch: pytest.MonkeyPatch
+    live: _Live, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A stop amendment must not START once the stop flag is set.
 
     Refusing it is the safe direction: the previous broker-side stop stays in
     force, the bars stay unprocessed, and the next pass recomputes the same
     target. Sending one instead would amend a broker order while the daemon is
-    tearing down the connections it was sent through.
+    tearing down the connections it was sent through. The refusal is logged
+    (the broker-side stop was left where it was), not silently dropped.
     """
     coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
     monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
     coordinator.request("SIGTERM")
     manager = LiveTrailingStopManager(mutation_gate=daemon._broker_mutation)
 
-    live.feed(manager, [103.0])
+    with caplog.at_level("WARNING"):
+        live.feed(manager, [103.0])
 
     assert live.client.replace_calls == [], "no amendment may start after the stop flag"
     assert live.client.stop_prices() == [98.0], "the broker-side stop is untouched"
+    refused = [r for r in caplog.records if "amendment refused" in r.getMessage()]
+    assert refused, "an operator has to see that the broker-side stop was left where it was"
+    assert refused[0].levelname == "WARNING"
 
 
 def test_a_refused_amendment_asks_to_come_back_early(

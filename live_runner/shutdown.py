@@ -89,6 +89,11 @@ def release_twisted_reactor_threads() -> None:
     the reactor's shutdown event. Without this, a process that connected to
     cTrader hangs forever in interpreter shutdown.
     """
+    # ``installReactor`` stores the reactor instance under this module key, so
+    # membership means "a reactor was installed"; importing it here cannot
+    # install a new one. The check has to come first: importing
+    # ``twisted.internet.reactor`` would otherwise start a reactor that nothing
+    # asked for.
     if "twisted.internet.reactor" not in sys.modules:
         return
     from twisted.internet import reactor

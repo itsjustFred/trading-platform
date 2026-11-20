@@ -794,6 +794,48 @@ def test_no_new_submission_starts_after_the_stop_flag(
     assert any("daemon is shutting down" in r.getMessage() for r in caplog.records)
 
 
+def test_a_dropped_exit_is_logged_as_an_error_that_the_position_stays_open(
+    isolated_db_sandbox: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dropped *exit* is an error, like every other refused exit (#121).
+
+    The shutdown gate refuses it before anything reaches the broker, so the
+    position stays open with nothing sent. That is the same operator-visible
+    outcome as the other refused-exit paths, which log at ERROR and say the
+    position stays open; a WARNING saying only "nothing was sent" reads like a
+    skipped entry.
+    """
+    database, _, _ = isolated_db_sandbox
+    deployment = _seed_deployment(database)
+    coordinator = _new_coordinator()
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    coordinator.request("SIGTERM")
+    adapter = _GateAdapter()
+    live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+
+    async def _prepared(*_args: Any, **_kwargs: Any) -> tuple[Any, float]:
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepared)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            daemon._prepare_claim_and_submit_signal(
+                ACCOUNT_ID,
+                adapter,  # type: ignore[arg-type]
+                deployment,
+                live_signal,
+                is_exit=True,
+            )
+        )
+
+    assert adapter.submit_calls == 0, "the gate must refuse before the broker call"
+    refused = [r for r in caplog.records if "position stays open" in r.getMessage()]
+    assert refused, "an operator scanning for refused exits must see the dropped exit"
+    assert refused[0].levelname == "ERROR"
+    assert (getattr(refused[0], "data", None) or {}).get("is_exit") is True
+
+
 def test_cleanup_closes_connections_and_never_touches_broker_orders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
