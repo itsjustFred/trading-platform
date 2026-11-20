@@ -6,6 +6,7 @@ import pytest
 from runner.portfolio_optimizer import (
     StrategyEquityPoint,
     _align_equity_curves,
+    _build_optimization_result,
     _compute_correlation_matrix,
     _compute_oos_metrics,
     _normalize_equity_matrix,
@@ -60,7 +61,7 @@ def test_normalize_weights_prunes_degenerate_trials_instead_of_equal_weighting()
         np.array([np.inf, 1.0]),
         np.array([-1.0, -2.0]),
     ):
-        with pytest.raises(ValueError, match="[Dd]egenerate|Non-finite"):
+        with pytest.raises(ValueError, match=r"[Dd]egenerate|Non-finite"):
             _normalize_weights(degenerate)
 
 
@@ -415,14 +416,25 @@ def test_align_equity_curves_no_overlap_returns_empty() -> None:
     assert result.size == 0
 
 
-def test_normalize_weights_all_zero_falls_back_to_equal() -> None:
-    """#87: degenerate trials are pruned, never promoted to equal-weight."""
-    from runner.portfolio_optimizer import _normalize_weights
+def test_build_optimization_result_rejects_an_unweighted_backtest() -> None:
+    """A backtest with no weight must fail here, not inherit the next one's.
 
-    with pytest.raises(ValueError, match="pruned"):
-        _normalize_weights(np.zeros(4))
-    with pytest.raises(ValueError, match="pruned"):
-        _normalize_weights(np.array([np.nan, 1.0]))
+    The persisted artifact pairs ids and weights by ``strict=True``: dropping the
+    strictness truncated the zip, publishing a mapping that quietly omits a
+    backtest while the ids still line up with the other numbers.
+    """
+    with pytest.raises(ValueError, match=r"shorter"):
+        _build_optimization_result(
+            backtest_ids=["bt-a", "bt-b"],
+            best_weights=np.array([0.5]),
+            sharpe=1.0,
+            max_drawdown=0.1,
+            correlation_matrix=np.eye(2),
+            n_trials=2,
+            train_months=3,
+            test_months=1,
+            oos_metrics=(1.0, 0.01),
+        )
 
 
 def test_normalize_weights_normal_case() -> None:
