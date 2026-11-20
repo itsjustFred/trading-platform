@@ -142,10 +142,13 @@ def test_long_and_short_breakout_both_trade_one_per_day(tmp_path: Path):
     long_entries = [row for row in entries if row["Type"] == "Entry long"]
     assert len(long_entries) == 1
     assert long_entries[0]["Date/Time"] == "2024-01-02T15:30:00+0000", long_entries
-    assert any(
-        row["Signal"] == "trailing_stop" and row["Date/Time"].startswith("2024-01-02")
-        for row in exits
-    ), exits
+    long_exits = [row for row in exits if row["Date/Time"].startswith("2024-01-02")]
+    assert len(long_exits) == 1, long_exits
+    # The reversion calculation names the exit, not just "a trailing stop
+    # exists": the signal bar is 11:00 ET, so the fill is the 11:30 ET bar
+    # (16:30 UTC). A flipped sign on the reversion level exits elsewhere.
+    assert long_exits[0]["Signal"] == "trailing_stop", long_exits[0]
+    assert long_exits[0]["Date/Time"] == "2024-01-02T16:30:00+0000", long_exits[0]
 
     # The second ET day breaks out to the downside instead: the traded flag and
     # the opening range reset with the ET day.
@@ -154,10 +157,14 @@ def test_long_and_short_breakout_both_trade_one_per_day(tmp_path: Path):
     assert {row["Date/Time"] for row in short_entries} == {
         "2024-01-03T15:30:00+0000"
     }, short_entries
-    assert any(
-        row["Signal"] == "trailing_stop" and row["Date/Time"].startswith("2024-01-03")
-        for row in exits
-    ), exits
+    # Same pin on the short side: the LWM reversion level (96.0 * 1.01 = 96.96)
+    # is first exceeded by the 11:00 ET close, so the exit fills on the 11:30 ET
+    # bar (16:30 UTC). A flipped sign fires one bar earlier and lands on a
+    # different timestamp.
+    short_exits = [row for row in exits if row["Date/Time"].startswith("2024-01-03")]
+    assert short_exits, short_exits
+    assert short_exits[-1]["Signal"] == "trailing_stop", short_exits[-1]
+    assert short_exits[-1]["Date/Time"] == "2024-01-03T16:30:00+0000", short_exits[-1]
 
 
 def test_flat_opening_range_and_forced_exit(tmp_path: Path):
