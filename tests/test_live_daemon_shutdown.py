@@ -836,6 +836,82 @@ def test_a_dropped_exit_is_logged_as_an_error_that_the_position_stays_open(
     assert (getattr(refused[0], "data", None) or {}).get("is_exit") is True
 
 
+class _HangingDisconnectAdapter(_GateAdapter):
+    """An adapter whose broker session will not close."""
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        await asyncio.Event().wait()
+
+
+class _FailingDisconnectAdapter(_GateAdapter):
+    """An adapter whose disconnect raises."""
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        raise RuntimeError("socket already gone")
+
+
+def test_one_hung_adapter_disconnect_does_not_leave_the_others_connected() -> None:
+    """The adapter phase disconnects every session concurrently, under one deadline.
+
+    Disconnecting one account after another spent the whole phase budget on the
+    first slow session, leaving the remaining accounts connected - and a timeout
+    also skipped ``active_adapters.clear()``, so the caller still believed they
+    were live.
+    """
+    coordinator = _new_coordinator()
+    hung = _HangingDisconnectAdapter()
+    healthy = _GateAdapter()
+
+    async def _probe() -> tuple[bool, dict[str, Any]]:
+        coordinator.bind(asyncio.get_running_loop())
+        active: dict[str, Any] = {"acc-hung": hung, "acc-ok": healthy}
+        ok = await daemon._shutdown_cleanup(
+            loop_tasks=(),
+            active_listener_tasks={},
+            active_discord_tasks={},
+            active_discord_bot_tasks={},
+            active_discord_bots={},
+            active_adapters=active,
+            scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+            shutdown=coordinator,
+            drain_timeout=1.0,
+            cleanup_timeout=0.1,
+        )
+        return ok, active
+
+    ok, active = asyncio.run(_probe())
+
+    assert healthy.disconnect_calls == 1, "one slow session must not leave the rest connected"
+    assert active == {}, "a timed-out phase must not leave the adapters listed as live"
+    assert ok is False, "a phase that did not finish is not a clean shutdown"
+
+
+def test_a_failed_adapter_disconnect_is_a_failed_phase() -> None:
+    """A session that did not close must not be reported as a clean stop."""
+    coordinator = _new_coordinator()
+    adapter = _FailingDisconnectAdapter()
+
+    async def _probe() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        return await daemon._shutdown_cleanup(
+            loop_tasks=(),
+            active_listener_tasks={},
+            active_discord_tasks={},
+            active_discord_bot_tasks={},
+            active_discord_bots={},
+            active_adapters={"acc-1": adapter},
+            scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+            shutdown=coordinator,
+            drain_timeout=1.0,
+            cleanup_timeout=1.0,
+        )
+
+    assert asyncio.run(_probe()) is False
+    assert adapter.disconnect_calls == 1
+
+
 def test_cleanup_closes_connections_and_never_touches_broker_orders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3472,10 +3472,16 @@ async def _disconnect_adapter(
     *,
     account_id: str,
     reason: str,
-) -> None:
+) -> bool:
+    """Disconnect one adapter. Returns ``False`` if the disconnect failed.
+
+    A failure is logged here and reported to the caller: the deployment sync
+    path only wants the log, while the shutdown counts it as a failed phase (a
+    session that did not close is not a clean stop).
+    """
     disconnect_method = getattr(adapter, "disconnect", None)
     if not callable(disconnect_method):
-        return
+        return True
     try:
         result = disconnect_method()
         if inspect.isawaitable(result):
@@ -3492,6 +3498,8 @@ async def _disconnect_adapter(
                 }
             },
         )
+        return False
+    return True
 
 
 async def _disconnect_inactive_adapters(
@@ -5527,9 +5535,14 @@ async def _shutdown_cleanup(
     # 4. (disconnect_discord, stop_scheduler, disconnect_adapters) Close signal
     #    sources, the scheduler, and every broker connection.
     async def _close_discord_sources() -> None:
+        failures: list[Exception] = []
         for source in list(active_discord_bots.values()):
-            with contextlib.suppress(Exception):
+            try:
                 await source.disconnect(failed=False)
+            except Exception as exc:  # one bot must not skip the others
+                failures.append(exc)
+        if failures:
+            raise failures[0]
 
     ok &= await _bounded(
         _close_discord_sources(), timeout=cleanup_timeout, phase="disconnect_discord"
@@ -5538,10 +5551,31 @@ async def _shutdown_cleanup(
 
     async def _disconnect_all_adapters() -> None:
         # Disconnect only: closes the daemon's own sessions. Orders and
-        # positions at the broker are left untouched.
-        for account_id, adapter in list(active_adapters.items()):
-            await _disconnect_adapter(adapter, account_id=account_id, reason="shutdown")
+        # positions at the broker are left untouched. Concurrently and under the
+        # one phase deadline: disconnecting one account after another meant a
+        # single slow session spent the whole budget and left the rest connected.
+        # The dict is cleared first so a timeout cannot make the caller think the
+        # adapters are still live.
+        adapters = list(active_adapters.items())
         active_adapters.clear()
+        results = await asyncio.gather(
+            *(
+                _disconnect_adapter(adapter, account_id=account_id, reason="shutdown")
+                for account_id, adapter in adapters
+            ),
+            return_exceptions=True,
+        )
+        for (account_id, adapter), result in zip(adapters, results):
+            if isinstance(result, BaseException):
+                raise RuntimeError(
+                    f"adapter disconnect failed for account {account_id} "
+                    f"({type(adapter).__name__}): {result}"
+                ) from result
+            if result is False:
+                raise RuntimeError(
+                    f"adapter disconnect failed for account {account_id} "
+                    f"({type(adapter).__name__})"
+                )
 
     ok &= await _bounded(
         _disconnect_all_adapters(), timeout=cleanup_timeout, phase="disconnect_adapters"
