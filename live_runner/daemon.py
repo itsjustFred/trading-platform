@@ -72,7 +72,7 @@ from live_runner.shutdown import (
     EXIT_CLEANUP_TIMEOUT,
     EXIT_OK,
     ShutdownCoordinator,
-    release_twisted_reactor_threads,
+    release_twisted_reactor_threads_bounded,
 )
 from live_runner.signal_sources import (
     DiscordSignalSource,
@@ -5341,13 +5341,34 @@ async def _bounded(awaitable: Awaitable[object], *, timeout: float, phase: str) 
     return True
 
 
-async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]]) -> None:
-    pending = list(tasks)
+async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]], *, timeout: float) -> None:
+    """Cancel every task and wait for the cancels, at most ``timeout``.
+
+    The wait must carry its own deadline: ``asyncio.gather`` cannot be timed out
+    from outside. A task that ignores its cancellation keeps the gather - and the
+    coroutine awaiting it - alive, so a deadline put on *this* wait never fires.
+    That is exactly the unbounded cleanup the shutdown budget rules out, so the
+    deadline lives in the wait itself: what is still unfinished at the end gets a
+    second cancel and is reported with ``TimeoutError``, which the caller records
+    as a timed-out phase.
+
+    Nothing here sends broker work: the tasks are cancelled, so whatever they
+    were doing stops (a broker request already in flight is drained before this
+    phase, and none can start after the stop flag).
+    """
+    pending = [task for task in tasks if not task.done()]
     for task in pending:
-        if not task.done():
-            task.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+        task.cancel()
+    if not pending:
+        return
+    _, unfinished = await asyncio.wait(pending, timeout=timeout)
+    for task in unfinished:
+        # A second cancel: the first was ignored, and this phase is over.
+        task.cancel()
+    if unfinished:
+        raise TimeoutError(
+            f"{len(unfinished)} task(s) did not finish after being cancelled"
+        )
 
 
 async def _shutdown_cleanup(
@@ -5369,6 +5390,13 @@ async def _shutdown_cleanup(
     order submission, a stop amendment, a stopped-deployment sweep): cancelling
     any of them mid-request would leave the broker outcome unknown. Only after
     it is anything cancelled, and by then no broker request can be started.
+
+    The drain and every one of the ``live_runner.shutdown.CLEANUP_PHASE_COUNT``
+    phases below has its own deadline (``drain_timeout`` / ``cleanup_timeout``),
+    so a shutdown always finishes inside the worst case the runbook documents -
+    including here: a phase that neither completes nor is cancelled is reported
+    and abandoned, never waited for. One phase that overran makes the run report
+    ``False`` and the daemon exit ``EXIT_CLEANUP_TIMEOUT``.
 
     SAFETY: this only stops the daemon and closes its own connections. It must
     never cancel or close broker orders or positions (no ``close_all_positions``,
@@ -5400,25 +5428,36 @@ async def _shutdown_cleanup(
             },
         )
 
-    # 2. Stop the loops that would start new adapters/listeners or poll
-    #    balances. Every broker mutation they could run is either finished or
-    #    refused by the gate, so cancelling them starts no broker request.
-    await _cancel_and_wait(loop_tasks)
+    # 2. (cancel_loops) Stop the loops that would start new adapters/listeners or
+    #    poll balances. Every broker mutation they could run is either finished
+    #    or refused by the gate, so cancelling them starts no broker request.
+    #    Bounded like any other phase: a loop task that ignores its first cancel
+    #    must not hold the shutdown - and with it the exit code - open.
+    #    ``_bounded`` keeps the other phases' contract; the wait inside
+    #    ``_cancel_and_wait`` is what actually bounds this one, because a gather
+    #    cannot be timed out from outside.
+    ok &= await _bounded(
+        _cancel_and_wait(loop_tasks, timeout=cleanup_timeout),
+        timeout=cleanup_timeout,
+        phase="cancel_loops",
+    )
 
-    # 3. Stop listening for signals / executions.
+    # 3. (cancel_listeners) Stop listening for signals / executions.
     ok &= await _bounded(
         _cancel_and_wait(
             [
                 *active_listener_tasks.values(),
                 *active_discord_tasks.values(),
                 *active_discord_bot_tasks.values(),
-            ]
+            ],
+            timeout=cleanup_timeout,
         ),
         timeout=cleanup_timeout,
         phase="cancel_listeners",
     )
 
-    # 4. Close signal sources, the scheduler, and every broker connection.
+    # 4. (disconnect_discord, stop_scheduler, disconnect_adapters) Close signal
+    #    sources, the scheduler, and every broker connection.
     async def _close_discord_sources() -> None:
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
@@ -5438,6 +5477,19 @@ async def _shutdown_cleanup(
 
     ok &= await _bounded(
         _disconnect_all_adapters(), timeout=cleanup_timeout, phase="disconnect_adapters"
+    )
+
+    # 5. (release_reactor) Release the Twisted reactor's thread pool (cTrader) so
+    #    the process can exit. It is a cleanup phase like the others, because it
+    #    is the one that can block for good: the reactor's shutdown never fires
+    #    here, so the release joins workers that may sit in a stuck broker
+    #    request. It runs off the loop under the same deadline, so a release that
+    #    does not come back is reported as a failed phase instead of hanging the
+    #    daemon in front of its exit code.
+    ok &= await _bounded(
+        release_twisted_reactor_threads_bounded(cleanup_timeout),
+        timeout=cleanup_timeout,
+        phase="release_reactor",
     )
     return ok
 
@@ -5572,8 +5624,7 @@ async def run_daemon(
         )
         # The Twisted reactor (cTrader) is process-global and never stopped by
         # the adapter; without this its non-daemon thread pool hangs the exit.
-        with contextlib.suppress(Exception):
-            release_twisted_reactor_threads()
+        # It is now the last phase of the (bounded) cleanup above.
         shutdown.restore_signal_handlers()
         # Only after the cleanup has awaited every in-flight submission's
         # ``_end_submission``: the last submission of this run must still be

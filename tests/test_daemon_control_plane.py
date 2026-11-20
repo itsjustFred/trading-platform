@@ -285,6 +285,120 @@ def test_a_stopped_sweep_is_refused_once_shutdown_was_requested(
     assert any("shutting down" in r.getMessage() for r in caplog.records)
 
 
+class _HoldingOrphanAdapter(_ControlAdapter):
+    """A sweep adapter whose orphaned-protection sweep can be held mid-request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        self.calls.append("orphan")
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return self.orphan
+
+
+class _SignalOnFlattenAdapter(_ControlAdapter):
+    """A sweep adapter that receives the shutdown signal while it flattens.
+
+    The signal lands exactly where a real one does: between the order cancel /
+    flatten the enforcement already ran and the orphaned-protection sweep that
+    follows it, so the sweep is the next thing that would go to the broker.
+    """
+
+    def __init__(self, coordinator: ShutdownCoordinator) -> None:
+        super().__init__()
+        self._coordinator = coordinator
+
+    async def close_all_positions(self) -> ControlOutcome:
+        self.calls.append("flatten")
+        self._coordinator.request("SIGTERM")
+        return self.flatten
+
+
+def test_the_orphan_sweep_after_the_flatten_is_drained_not_cancelled(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain must wait for the orphaned-protection sweep too.
+
+    The enforcement is two broker mutations, not one: after the cancel and the
+    flatten comes the sweep of the protections the flatten detached. A sweep
+    cancelled mid-request could leave a resting protection that still triggers,
+    so it is registered on the same ledger and drained like the rest.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _HoldingOrphanAdapter()
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+
+    async def _probe() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        sweep = asyncio.create_task(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+        await asyncio.wait_for(adapter.entered.wait(), timeout=10)
+        assert coordinator.inflight == 1, "the orphan sweep must be on the drain's ledger"
+        coordinator.request("SIGTERM")
+        cleanup = _drain(coordinator)
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the drain must wait for the running orphan sweep"
+        adapter.release.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        await asyncio.gather(sweep, return_exceptions=True)
+        return ok
+
+    assert asyncio.run(_probe()) is True
+    # The running sweep ran to the end, and only then was the loop cancelled.
+    assert adapter.cancelled is False
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_the_orphan_sweep_is_refused_when_the_signal_lands_before_it(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A signal between the flatten and the orphan sweep must stop that sweep.
+
+    The money-safety part is done (orders cancelled, account flat), but the
+    protections the flatten detached are still resting and can still trigger.
+    Sending one now would mutate broker orders through connections the daemon is
+    tearing down, so it is refused and the deployment is left unenforced: the
+    next start retries the whole enforcement, sweep included.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _SignalOnFlattenAdapter(coordinator)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+
+    assert adapter.calls == ["cancel", "flatten"], "the orphan sweep may not start"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+    assert any("orphaned-protection sweep" in r.getMessage() for r in caplog.records)
+
+
 def test_partial_flatten_does_not_stamp_and_does_not_sweep_orphans(
     isolated_db_sandbox,
 ) -> None:

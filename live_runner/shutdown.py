@@ -15,6 +15,14 @@ Shutdown contract (see ``live_runner.daemon.run_daemon``):
 4. Exit code 0 on a clean shutdown, non-zero when a cleanup phase timed out.
 5. A second signal forces an immediate exit.
 
+Every step is bounded: the drain gets ``DEFAULT_DRAIN_TIMEOUT_SECONDS`` and each
+of the ``CLEANUP_PHASE_COUNT`` cleanup phases its own
+``DEFAULT_CLEANUP_TIMEOUT_SECONDS``, so a whole shutdown fits inside
+``WORST_CASE_SHUTDOWN_SECONDS``. That figure is what the deploy runbook
+documents and what the generated systemd unit's stop timeout has to stay above
+(``scripts/setup_services.sh``); ``tests/test_shutdown_budget_contract.py``
+pins the three together so they cannot drift apart.
+
 Shutdown NEVER cancels, closes or modifies open orders or positions at the
 broker. Positions belong to the strategy's own exit logic and the operator;
 a restart must find the account exactly as the daemon left it. The only
@@ -34,6 +42,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from collections.abc import Callable
 from types import FrameType
 
@@ -46,6 +55,25 @@ DEFAULT_CLEANUP_TIMEOUT_SECONDS = 20.0
 EXIT_OK = 0
 EXIT_CLEANUP_TIMEOUT = 1
 FORCED_EXIT_CODE = 130
+
+# How many bounded cleanup phases run after the drain, in order: the daemon loop
+# cancel, the listener/Discord cancel, the Discord close, the scheduler stop, the
+# adapter disconnect and the Twisted reactor release. Each gets its own
+# ``DEFAULT_CLEANUP_TIMEOUT_SECONDS``, and the shutdown budget the runbook and
+# the systemd unit pin is derived from how many there are - see
+# ``WORST_CASE_SHUTDOWN_SECONDS``.
+CLEANUP_PHASE_COUNT = 6
+
+# The longest a bounded shutdown can take: the drain, then one deadline per
+# cleanup phase. A service manager that stops the daemon (``systemctl stop`` →
+# SIGTERM, then SIGKILL at ``TimeoutStopSec``) must stay above this or it kills
+# the daemon before it can report its exit code, which is the signal an
+# operator needs when a broker outcome was left unknown. Kept here, next to the
+# timeouts, so the number the runbook and the unit file quote is computed rather
+# than retold.
+WORST_CASE_SHUTDOWN_SECONDS = (
+    DEFAULT_DRAIN_TIMEOUT_SECONDS + CLEANUP_PHASE_COUNT * DEFAULT_CLEANUP_TIMEOUT_SECONDS
+)
 
 
 def release_twisted_reactor_threads() -> None:
@@ -74,6 +102,46 @@ def release_twisted_reactor_threads() -> None:
             "Twisted reactor has a thread pool but no _stopThreadPool handler; "
             "the process may hang at exit. The Twisted private API likely changed."
         )
+
+
+async def release_twisted_reactor_threads_bounded(timeout: float) -> None:
+    """Release the Twisted reactor's thread pool off the loop, under a deadline.
+
+    ``release_twisted_reactor_threads`` joins the reactor's workers, so it blocks
+    for as long as a stuck broker request does - and awaiting it inside the
+    shutdown would bound nothing: the one phase that can hang without the deadline
+    is the phase that keeps the process from reaching its exit code, which is the
+    signal that tells an operator a broker outcome was left unknown. So the join
+    runs on a daemon thread and is only awaited for ``timeout`` (the cleanup-phase
+    deadline): a release that does not come back in time raises ``TimeoutError``,
+    which the caller records as a failed phase, and the daemon still exits. The
+    abandoned thread is a daemon thread, so it cannot hold up the interpreter
+    either.
+    """
+    loop = asyncio.get_running_loop()
+    finished: asyncio.Future[None] = loop.create_future()
+    failure: list[BaseException] = []
+
+    def _release() -> None:
+        try:
+            release_twisted_reactor_threads()
+        except BaseException as exc:  # noqa: BLE001 - the verdict must survive anything
+            failure.append(exc)
+        finally:
+            try:
+                loop.call_soon_threadsafe(_finished)
+            except RuntimeError:
+                pass  # the loop closed first; there is nobody left to tell
+
+    def _finished() -> None:
+        if not finished.done():
+            finished.set_result(None)
+
+    threading.Thread(target=_release, name="reactor-release", daemon=True).start()
+    async with asyncio.timeout(timeout):
+        await finished
+    if failure:
+        raise failure[0]
 
 
 def force_exit(code: int = FORCED_EXIT_CODE) -> None:

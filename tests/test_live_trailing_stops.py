@@ -1089,6 +1089,32 @@ def test_a_stop_amendment_is_refused_once_shutdown_was_requested(
     assert live.client.stop_prices() == [98.0], "the broker-side stop is untouched"
 
 
+def test_a_refused_amendment_asks_to_come_back_early(
+    live: _Live, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused amendment must request a retry, not let the pass rest.
+
+    Refused means the amendment never went to the broker, so the bars are left
+    unprocessed and the target is still worth sending. Reporting "no retry"
+    would only let the loop come back on its normal bar slot, leaving the
+    broker-side stop stale through a pass that already knows the better one.
+    """
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    coordinator.request("SIGTERM")
+    manager = LiveTrailingStopManager(mutation_gate=daemon._broker_mutation)
+    live.closes.append(103.0)
+
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2))
+
+    assert live.client.replace_calls == [], "no amendment may start after the stop flag"
+    assert manager._schedules[ACCOUNT].retry_at is not None, "the pass must want a retry"
+    # And the retry happens: a later moment in the same bar slot is due again.
+    calls = live.market_data_calls
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2 + TRAILING_RETRY_INITIAL_SECONDS + 1))
+    assert live.market_data_calls > calls, "the refused amendment must be retried"
+
+
 def test_prepared_order_keeps_the_trailing_config_that_gets_persisted() -> None:
     """The trail reads its config from the persisted (prepared) signal metadata."""
 
@@ -1669,3 +1695,4 @@ def test_persisted_supertrend_flip_entry_is_surfaced_and_never_amended(
     assert live.client.stop_prices() == [98.0]
     assert surfaced, "the unsupported persisted mode must be surfaced"
     assert all("supertrend_flip" in event[1]["error"] for event in surfaced)
+

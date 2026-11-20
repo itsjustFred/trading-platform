@@ -47,6 +47,7 @@ from live_runner.shutdown import (
     FORCED_EXIT_CODE,
     ShutdownCoordinator,
     release_twisted_reactor_threads,
+    release_twisted_reactor_threads_bounded,
 )
 from risk import TradeSignal
 from shared.database import get_live_deployment, list_live_deployment_submission_claims
@@ -561,6 +562,63 @@ def test_release_is_a_noop_without_the_reactor_or_its_thread_pool(
     release_twisted_reactor_threads()
 
 
+# ─── the bounded reactor release: the last cleanup phase ────────────────────────
+
+
+def test_the_bounded_reactor_release_runs_the_release_and_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bounded form still releases the pool - it only adds a deadline."""
+    released: list[str] = []
+    monkeypatch.setattr(
+        shutdown_module, "release_twisted_reactor_threads", lambda: released.append("released")
+    )
+
+    asyncio.run(release_twisted_reactor_threads_bounded(1.0))
+
+    assert released == ["released"]
+
+
+def test_the_bounded_reactor_release_stops_waiting_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release that joins a stuck worker must not be waited out.
+
+    Twisted's pool join is what blocks, so the bounded form raises at the
+    deadline instead: the caller then reports the phase as failed and the daemon
+    still reaches its exit code.
+    """
+    entered = threading.Event()
+    leave = threading.Event()
+
+    def _hang() -> None:
+        entered.set()
+        leave.wait(timeout=30)
+
+    monkeypatch.setattr(shutdown_module, "release_twisted_reactor_threads", _hang)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        asyncio.run(release_twisted_reactor_threads_bounded(0.05))
+    elapsed = time.monotonic() - started
+    leave.set()
+
+    assert entered.is_set(), "the release must really have started"
+    assert elapsed < 5.0, f"the deadline, not the join, decides how long it waits: {elapsed}"
+
+
+def test_the_bounded_reactor_release_surfaces_a_failed_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release that blew up is a failed phase, not a silent success."""
+
+    def _boom() -> None:
+        raise RuntimeError("reactor pool went away")
+
+    monkeypatch.setattr(shutdown_module, "release_twisted_reactor_threads", _boom)
+
+    with pytest.raises(RuntimeError, match="reactor pool went away"):
+        asyncio.run(release_twisted_reactor_threads_bounded(1.0))
+
 
 # ─── the daemon: shutdown drains, then closes its own connections ───────────────
 
@@ -959,3 +1017,138 @@ def test_main_exits_with_the_code_the_daemon_returned(
 def test_shutdown_timeouts_are_bounded_by_default() -> None:
     assert 0 < DEFAULT_DRAIN_TIMEOUT_SECONDS < 300
     assert 0 < DEFAULT_CLEANUP_TIMEOUT_SECONDS < 300
+
+
+# ─── bounded cleanup: no phase may outlive the documented budget ───────────────
+
+
+def _timed_out_phases(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Which cleanup phases reported a timeout, as the cleanup logged them."""
+    return [
+        str((getattr(record, "data", None) or {}).get("phase"))
+        for record in caplog.records
+        if record.getMessage() == "Shutdown phase timed out"
+    ]
+
+
+def test_a_loop_task_that_ignores_its_cancel_cannot_hold_the_shutdown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The loop cancel is bounded, like every other cleanup phase.
+
+    A loop task wedged in a call it cannot be cancelled out of never finishes on
+    cancel. Without a deadline the cleanup would wait for it after the drain, the
+    daemon would never reach its exit code, and the service manager would kill it
+    instead - so the operator loses exactly the signal the bounded shutdown is
+    for. The timed-out phase is reported (non-zero exit) and abandoned.
+    """
+    coordinator = _new_coordinator()
+    ignored: list[bool] = []
+
+    async def _wedged_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                if not ignored:
+                    # The first cancel is swallowed - the wedged case.
+                    ignored.append(True)
+                    continue
+                raise
+
+    async def _probe() -> tuple[bool, float]:
+        coordinator.bind(asyncio.get_running_loop())
+        loop_task = asyncio.create_task(_wedged_loop(), name="wedged-loop")
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        ok = await daemon._shutdown_cleanup(
+            loop_tasks=(loop_task,),
+            active_listener_tasks={},
+            active_discord_tasks={},
+            active_discord_bot_tasks={},
+            active_discord_bots={},
+            active_adapters={},
+            scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+            shutdown=coordinator,
+            drain_timeout=0.05,
+            cleanup_timeout=0.05,
+        )
+        elapsed = time.monotonic() - started
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        return ok, elapsed
+
+    with caplog.at_level("ERROR"):
+        ok, elapsed = asyncio.run(_probe())
+
+    assert ignored, "the wedged loop really was cancelled first"
+    assert ok is False, "a timed-out phase is a failed shutdown"
+    assert elapsed < 5.0, f"the cleanup must not wait past its deadline: {elapsed}"
+    assert _timed_out_phases(caplog) == ["cancel_loops"]
+
+
+def test_a_reactor_release_that_never_returns_cannot_hold_the_shutdown(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reactor release is bounded too - it is the phase that joins workers.
+
+    ``Twisted``'s shutdown never fires in the daemon, so the release joins the
+    reactor's workers directly and can block for as long as a stuck broker
+    request. An unbounded join would keep the process from ever reporting its
+    exit code; the daemon reports the phase, exits non-zero and leaves the pool
+    thread behind (a daemon thread, so the interpreter still exits).
+    """
+    entered = threading.Event()
+    leave = threading.Event()
+
+    class _ReactorModule:
+        class reactor:  # noqa: N801 - mirrors twisted's own lowercase name
+            threadpool = object()
+
+            @staticmethod
+            def _stopThreadPool() -> None:
+                entered.set()
+                leave.wait(timeout=30)
+
+    monkeypatch.setitem(sys.modules, "twisted.internet.reactor", _ReactorModule)
+    monkeypatch.setitem(sys.modules, "twisted.internet", _ReactorModule)
+    coordinator = _new_coordinator()
+
+    async def _probe() -> tuple[bool, float]:
+        coordinator.bind(asyncio.get_running_loop())
+        started = time.monotonic()
+        ok = await daemon._shutdown_cleanup(
+            loop_tasks=(),
+            active_listener_tasks={},
+            active_discord_tasks={},
+            active_discord_bot_tasks={},
+            active_discord_bots={},
+            active_adapters={},
+            scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+            shutdown=coordinator,
+            drain_timeout=0.05,
+            cleanup_timeout=0.05,
+        )
+        return ok, time.monotonic() - started
+
+    with caplog.at_level("ERROR"):
+        ok, elapsed = asyncio.run(_probe())
+    leave.set()
+
+    assert entered.is_set(), "the release must really have started"
+    assert ok is False
+    assert elapsed < 5.0, f"the cleanup must not wait past its deadline: {elapsed}"
+    assert _timed_out_phases(caplog) == ["release_reactor"]
+
+
+def test_the_exit_codes_are_the_values_the_service_manager_sees() -> None:
+    """Pin the numbers themselves: they are the whole message an operator gets.
+
+    ``0`` has to mean "nothing to reconcile" and ``1`` "a broker outcome was left
+    unknown", so an outcome that reconciles to either of them accidentally - a
+    timeout reported as success, for instance - is a money-path defect.
+    """
+    assert EXIT_OK == 0
+    assert EXIT_CLEANUP_TIMEOUT == 1
+    assert EXIT_CLEANUP_TIMEOUT != EXIT_OK
+    assert FORCED_EXIT_CODE == 130

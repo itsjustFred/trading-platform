@@ -43,6 +43,15 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+# Worst-case graceful shutdown: 30 s drain + 20 s per bounded cleanup phase
+# (live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS, six phases), so 150 s.
+# systemd's default TimeoutStopSec is 90 s, which SIGKILLs the daemon before it
+# can finish the drain and report its exit code - the operator's only signal
+# that a broker outcome was left unknown (docs/live-deploy-runbook.md,
+# "Stopping the daemon"). 180 s leaves 30 s of margin over the worst case;
+# tests/test_shutdown_budget_contract.py pins that against the constants.
+TIMEOUT_STOP_SEC=180
+
 cat <<EOF > /etc/systemd/system/trading-daemon.service
 [Unit]
 Description=Trading Live Daemon (Broker + Signal Sources)
@@ -58,6 +67,7 @@ EnvironmentFile=-${PROJECT_ROOT}/.accounts.env
 ExecStart=${PROJECT_ROOT}/.venv/bin/python -m live_runner.daemon
 Restart=always
 RestartSec=5
+TimeoutStopSec=${TIMEOUT_STOP_SEC}
 
 [Install]
 WantedBy=multi-user.target
