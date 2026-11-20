@@ -67,6 +67,24 @@ def _floor_to_lot_grid(size: float, lot_step: float) -> float:
     return math.floor(quotient) * lot_step
 
 
+def _configured_risk_amount(parameters: dict[str, Any]) -> float:
+    """Resolve (and thereby validate) the declared ``fixed_risk_amount`` (#170).
+
+    Shared by the sizing path and by ``_create_order``, which needs the same
+    answer to decide whether an order may be re-scaled by the shared-equity
+    replay. Both keys (camelCase MT5 spelling) mean the same setting, and
+    ``None`` -- an absent key -- means "not configured". The resolution -- and
+    with it the validation -- always runs on the value, never after a gate
+    selected a branch for it: ``nan > 0`` and a negative amount compare False,
+    so a value checked inside a ``> 0`` gate had already selected the
+    percentage branch before anybody looked at it.
+    """
+    raw = parameters.get("fixed_risk_amount")
+    if raw is None:
+        raw = parameters.get("Fixed_Risk_Amount")
+    return _sizing_value("fixed_risk_amount", raw, 0.0)
+
+
 def _require_finite(name: str, value: float) -> float:
     """Refuse a non-finite fixed-risk sizing parameter (#151).
 
@@ -350,20 +368,38 @@ class TradeEngine:
             if self._max_position_exposure_pct is None
             else min(self._max_position_exposure_pct, max_leverage)
         )
-        fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
-        if fixed_risk_amount is None:
-            fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
+        # #170: resolve -- and thereby validate -- the declared risk amount
+        # here, BEFORE any stop-dependent branch. `nan > 0`, `-inf > 0` and a
+        # negative amount all compare False, so validating the value after a
+        # gate (as #151 did -- and the `stop_loss_price is not None` guard
+        # still did on its own) let either one skip the fixed-risk branch and
+        # fall through to `risk_per_trade_pct`: a size computed under a
+        # different risk rule than the config declares, with no error at all.
+        # A configured amount WITH a stop was already refused; the stopless
+        # path silently substituted the risk rule instead. Resolving first
+        # closes both. `0.0` -- and an absent key -- is the documented "off"
+        # idiom and keeps falling through unchanged.
+        risk_amount = _configured_risk_amount(self.config.parameters)
 
-        if fixed_risk_amount is not None and stop_loss_price is not None:
-            # #170: resolve -- and thereby validate -- the risk amount here,
-            # BEFORE the `> 0` gate below. `nan > 0` and a negative amount
-            # both compare False, so validating inside that gate (as #151
-            # did) let either one skip the fixed-risk branch and fall through
-            # to `risk_per_trade_pct`: a size computed under a different risk
-            # rule than the config declares, with no error at all.
-            # `0.0` -- and an absent key -- is the documented "off" idiom and
-            # keeps falling through unchanged.
-            risk_amount = _sizing_value("fixed_risk_amount", fixed_risk_amount, 0.0)
+        if risk_amount > 0 and stop_loss_price is not None:
+            # #170: the tick pair and the broker grid only apply to the
+            # fixed-risk conversion, so they stay with their branch -- but
+            # they are resolved -- and thereby validated -- above the
+            # risk-distance gate below. An unusable stop distance is refused
+            # further down either way (no risk distance = no size); what
+            # resolving here buys is that a configured `tick_value: 0` (or a
+            # negative grid value) is reported as the config error it is,
+            # whatever the bar data does, instead of being reached only when
+            # the distances happen to be usable.
+            tick_value = _sizing_value(
+                "tick_value", self.config.parameters.get("tick_value"), 1.0, positive=True
+            )
+            tick_size = _sizing_value(
+                "tick_size", self.config.parameters.get("tick_size"), 1.0, positive=True
+            )
+            lot_step = _sizing_value("lot_step", self.config.parameters.get("lot_step"), 0.0)
+            min_lot = _sizing_value("min_lot", self.config.parameters.get("min_lot"), 0.0)
+            max_lot = _sizing_value("max_lot", self.config.parameters.get("max_lot"), 0.0)
             # MT5 parity: when the strategy provides an explicit stop distance
             # (e.g. ATR-based, as the MT5 EA computes lots from the ATR
             # distance at order time), size from it directly instead of
@@ -374,21 +410,7 @@ class TradeEngine:
                 risk_distance = float(stop_distance)
             else:
                 risk_distance = abs(float(entry_price) - float(stop_loss_price))
-            if risk_amount > 0 and risk_distance > 0:
-                # The broker grid parameters are only read on this branch, so
-                # they are validated where they are used: an unusable value is
-                # refused instead of silently substituted or dropped.
-                tick_value = _sizing_value(
-                    "tick_value", self.config.parameters.get("tick_value"), 1.0, positive=True
-                )
-                tick_size = _sizing_value(
-                    "tick_size", self.config.parameters.get("tick_size"), 1.0, positive=True
-                )
-                lot_step = _sizing_value(
-                    "lot_step", self.config.parameters.get("lot_step"), 0.0
-                )
-                min_lot = _sizing_value("min_lot", self.config.parameters.get("min_lot"), 0.0)
-                max_lot = _sizing_value("max_lot", self.config.parameters.get("max_lot"), 0.0)
+            if risk_distance > 0:
                 shares = (risk_amount / risk_distance) * (tick_size / tick_value)
                 if lot_step > 0:
                     shares = _floor_to_lot_grid(shares, lot_step)
@@ -438,6 +460,23 @@ class TradeEngine:
                             max_lot,
                         )
                         return 0.0
+                if shares <= 0.0:
+                    # The caps can floor a size to zero outright: with
+                    # `0 < max_lot < lot_step` the grid floor of the cap is
+                    # 0 (and `min_lot == 0` leaves no lower bound to catch
+                    # it above). The trade is dropped either way -- say so
+                    # with the same WARNING the min_lot skip above logs,
+                    # instead of returning the zero silently.
+                    logger.warning(
+                        "Skipping order: fixed-risk size is zero after caps "
+                        "(size before leverage/exposure cap %.6g, min_lot %.6g, "
+                        "max_lot %.6g, lot_step %.6g)",
+                        uncapped_shares,
+                        min_lot,
+                        max_lot,
+                        lot_step,
+                    )
+                    return 0.0
                 return max(shares, 0.0)
 
         pending_positions = sum(
@@ -556,12 +595,15 @@ class TradeEngine:
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
         # proportional), so the shared-equity replay must not re-scale this
         # order's quantity — it still tracks exposure and credits PnL.
-        fixed_cfg = self.config.parameters.get("fixed_risk_amount")
-        if fixed_cfg is None:
-            fixed_cfg = self.config.parameters.get("Fixed_Risk_Amount")
-        order_equity_proportional = not (
-            fixed_cfg is not None and size_from_stop is not None
-        )
+        # #170: the flag has to describe the rule the size was ACTUALLY
+        # computed with. `fixed_risk_amount: 0.0` is the documented "off"
+        # idiom, so such an order is percentage-sized and the replay must
+        # re-scale it exactly like an absent key; a multi-symbol run must not
+        # silently stop re-scaling a percentage-sized position because that
+        # key was spelled out. Asking the resolver the sizing path uses keeps
+        # the two in step and makes an unusable value raise here too.
+        risk_amount = _configured_risk_amount(self.config.parameters)
+        order_equity_proportional = not (risk_amount > 0 and size_from_stop is not None)
         order._equity_proportional = order_equity_proportional  # transient, not a dataclass field
         self.pending_orders.append(order)
 

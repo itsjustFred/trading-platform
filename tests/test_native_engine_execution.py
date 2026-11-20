@@ -152,10 +152,15 @@ def test_fixed_risk_uncapped_path_is_unchanged_by_cap_normalisation():  # Issue 
 
 
 def test_fixed_risk_uncapped_size_is_not_floored_a_second_time():  # Issue #151
-    # Flooring `k * lot_step` twice is not idempotent in floating point: for
-    # this k the quotient `(k * lot_step) / lot_step` lands an ulp below k, so
-    # a second floor would silently drop a whole lot step from a size the cap
-    # never touched. The re-normalisation must only run when the cap binds.
+    # A plain `math.floor` of `k * lot_step / lot_step` loses a step for this
+    # k: the quotient lands an ulp below k. `_floor_to_lot_grid` snaps the
+    # same fixture back to `k * lot_step` (its relative 1e-9 band covers the
+    # ulp), so re-flooring an on-grid uncapped size is idempotent and this
+    # test alone does NOT pin the `shares < uncapped_shares` guard. What the
+    # guard protects is an uncapped size raised to an off-grid `min_lot` --
+    # pinned by `test_fixed_risk_uncapped_size_raised_to_min_lot_is_not_regridded`,
+    # which fails if the guard is deleted. This one stays as the on-grid
+    # regression pin: an uncapped size is returned bit-exact.
     lot_step = _NON_IDEMPOTENT_LOT_STEP
     k = _NON_IDEMPOTENT_STEPS
     assert math.floor((k * lot_step) / lot_step + 1e-12) != k, "fixture must be non-idempotent"
@@ -688,6 +693,236 @@ def test_fixed_risk_non_numeric_sizing_parameter_is_refused():  # Issue #170
             direction="LONG",
             stop_distance=1.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #170: the same guard on the stopless path (and on the other inputs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_amount", [float("nan"), float("-inf")])
+def test_fixed_risk_bad_amount_is_refused_without_a_stop(bad_amount):  # Issue #170
+    # The #151/#170 guard lived behind `stop_loss_price is not None`, so a
+    # strategy that never emits a stop reached `risk_per_trade_pct` instead:
+    # a backtest traded under a risk rule the config does not declare. Resolve
+    # first, so the value is refused on every path.
+    engine = _engine({"fixed_risk_amount": bad_amount})
+
+    with pytest.raises(ValueError, match="fixed_risk_amount"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=None,
+            direction="LONG",
+        )
+
+
+def test_fixed_risk_negative_amount_is_refused_without_a_stop():  # Issue #170
+    # A negative amount is refused too, on the stopless path as well: it
+    # compares False against the `> 0` gate, so before the hoist it silently
+    # selected the percentage branch.
+    engine = _engine({"fixed_risk_amount": -500.0})
+
+    with pytest.raises(ValueError, match="fixed_risk_amount"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=None,
+            direction="LONG",
+        )
+
+
+def test_fixed_risk_bad_amount_is_refused_end_to_end_without_a_stop():  # Issue #170
+    # End-to-end: a stopless strategy with a NaN risk amount must fail loudly,
+    # not run to completion on the percentage rule. Flat prices keep the
+    # fill-time re-size on the same entry as the creation-time sizing.
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                ["2024-01-01 00:00", "2024-01-01 00:01", "2024-01-01 00:02"],
+                utc=True,
+            ),
+            "open": [100.0, 100.0, 100.0],
+            "high": [100.5, 100.5, 100.5],
+            "low": [99.5, 99.5, 99.5],
+            "close": [100.0, 100.0, 100.0],
+        }
+    )
+
+    def strategy(df, params):
+        entries = pd.Series([True, False, False], index=df.index)
+        exits = pd.Series([False, False, True], index=df.index)
+        return entries, exits, {}, []
+
+    engine = _engine({"fixed_risk_amount": float("nan")})
+
+    with pytest.raises(ValueError, match="fixed_risk_amount"):
+        engine.run(frame, strategy)
+
+
+@pytest.mark.parametrize(
+    "order_params",
+    [{}, {"fixed_risk_amount": 0.0}, {"Fixed_Risk_Amount": 0.0}],
+)
+def test_fixed_risk_zero_and_absent_amount_stay_off_without_a_stop(order_params):
+    # #170: `0.0` (and an absent/explicitly-null key) is still the documented
+    # "off" idiom, stop or no stop: the fixed-risk branch is skipped and the
+    # percentage rule sizes the trade. Hoisting the resolution must not turn
+    # "off" into a config error.
+    engine = _engine(order_params)
+    unconfigured = _engine()
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=None,
+        direction="LONG",
+    )
+    baseline = unconfigured._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=None,
+        direction="LONG",
+    )
+
+    assert quantity == baseline
+    assert quantity > 0.0
+
+
+def test_fixed_risk_tick_pair_is_refused_when_the_stop_distance_is_zero():
+    # #170: the same ordering check for the other sizing inputs. A stop exactly
+    # at the entry leaves no risk distance, so the conversion cannot be
+    # computed at all -- and which error you get must not depend on the bar
+    # data: resolving the tick pair with its branch, instead of inside its
+    # innermost gate, names the real config defect (`tick_value: 0`) rather
+    # than the symptom ("entry_price and stop_loss must differ").
+    engine = _engine({"fixed_risk_amount": 500.0, "tick_value": 0.0})
+
+    with pytest.raises(ValueError, match="tick_value"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=100.0,
+            direction="LONG",
+        )
+
+
+def test_fixed_risk_negative_lot_grid_is_refused_when_the_stop_distance_is_zero():
+    # Same check on the broker grid: the `> 0` gates used to discard a
+    # negative `lot_step`, which must not depend on the stop distance either.
+    engine = _engine({"fixed_risk_amount": 500.0, "lot_step": -0.1})
+
+    with pytest.raises(ValueError, match="lot_step"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=100.0,
+            direction="LONG",
+        )
+
+
+def test_fixed_risk_zero_stop_distance_is_refused_not_silently_resized():
+    # Preserved behaviour, pinned: with a stop exactly at the entry there is
+    # no risk distance to convert into shares, and the engine refuses instead
+    # of falling through and sizing under a different risk rule. Only the
+    # unusable-value refusal moved above the distance gate; this refusal did
+    # not change.
+    engine = _engine({"fixed_risk_amount": 500.0})
+
+    with pytest.raises(ValueError, match="must differ"):
+        engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=100.0,
+            direction="LONG",
+        )
+
+
+def test_fixed_risk_max_lot_below_lot_step_skips_trade_with_a_warning(caplog):
+    # `0 < max_lot < lot_step`: the grid floor of the cap is 0, so no size can
+    # be traded. With `min_lot == 0` the min_lot skip above never fires, so the
+    # zero used to be returned silently -- log the drop like the min_lot skip.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.1,
+            "min_lot": 0.0,
+            "max_lot": 0.05,
+        },
+        initial_capital=1_000_000.0,
+        max_leverage=10.0,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="runner.engine_pkg.trading_engine"):
+        quantity = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=95.0,
+            direction="LONG",
+            stop_distance=1.0,
+        )
+
+    assert quantity == 0.0
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "zero after caps" in warnings[0].getMessage()
+
+
+def _fixed_risk_run_frame(stop_price=None):
+    """Three flat bars: one entry on the first, one time exit on the last."""
+    data = {
+        "timestamp": pd.to_datetime(
+            ["2024-01-01 00:00", "2024-01-01 00:01", "2024-01-01 00:02"],
+            utc=True,
+        ),
+        "open": [100.0, 100.0, 100.0],
+        "high": [100.5, 100.5, 100.5],
+        "low": [99.5, 99.5, 99.5],
+        "close": [100.0, 100.0, 100.0],
+    }
+    if stop_price is not None:
+        data["sl_price"] = [stop_price, float("nan"), float("nan")]
+    return pd.DataFrame(data)
+
+
+def _entry_then_exit_strategy(df, params):
+    entries = pd.Series([True, False, False], index=df.index)
+    exits = pd.Series([False, False, True], index=df.index)
+    return entries, exits, {}, []
+
+
+@pytest.mark.parametrize(
+    "order_params", [{}, {"fixed_risk_amount": 0.0}, {"Fixed_Risk_Amount": 0.0}]
+)
+def test_fixed_risk_zero_and_absent_amount_orders_stay_equity_proportional(order_params):
+    # #170 / A-M4 (D5): the order's `equity_proportional_sizing` flag drives
+    # the shared-equity replay. `fixed_risk_amount: 0.0` is "off" -- the order
+    # is percentage-sized, so the replay must re-scale it exactly like an
+    # absent key. A flag that only asked whether the key existed stopped the
+    # multi-symbol replay from re-scaling a percentage-sized position.
+    engine = _engine(order_params)
+
+    result = engine.run(_fixed_risk_run_frame(95.0), _entry_then_exit_strategy)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].meta["equity_proportional_sizing"] is True
+
+
+def test_fixed_risk_amount_orders_are_not_equity_proportional():
+    # A configured, used amount is absolute-$: the replay must keep the
+    # quantity (exposure is still summed, PnL still credited).
+    engine = _engine({"fixed_risk_amount": 500.0})
+
+    result = engine.run(_fixed_risk_run_frame(95.0), _entry_then_exit_strategy)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].meta["equity_proportional_sizing"] is False
+
+
+def test_fixed_risk_zero_amount_order_is_not_equity_proportional_without_a_stop():
+    # Stopless `fixed_risk_amount: 0.0` cannot use fixed-risk sizing at all
+    # (there is no risk distance), so the order is percentage-sized and stays
+    # proportional.
+    engine = _engine({"fixed_risk_amount": 0.0})
+
+    result = engine.run(_fixed_risk_run_frame(), _entry_then_exit_strategy)
+
+    assert len(result.trades) == 1
+    assert result.trades[0].meta["equity_proportional_sizing"] is True
 
 
 def test_fixed_risk_prefers_explicit_stop_distance():
