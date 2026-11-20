@@ -878,14 +878,26 @@ REAL_CUBIC_P2_BODY = (
 )
 
 
-def _cubic_body(*violations: str) -> str:
+def _cubic_body(*violations: str, summary: str | None = None) -> str:
     """A cubic review body in the shape cubic posts: a summary block and the unresolved
-    findings with their priority prefix inside the AI-agents prompt."""
+    findings with their priority prefix inside the AI-agents prompt. The summary line is
+    cubic's own count of those findings - `**No issues found**` when there are none - because
+    that count is what the classifier cross-checks the priority tokens against. Pass
+    ``summary`` to build a body whose summary disagrees with, or cannot be read from, the
+    findings it lists."""
     inner = "".join(
         f'<violation number="1" location="a.py:1">\n{v}\n</violation>\n' for v in violations
     )
+    if summary is None:
+        if not violations:
+            summary = "**No issues found** across 1 file"
+        else:
+            plural = "s" if len(violations) > 1 else ""
+            summary = f"**{len(violations)} issue{plural} found** across 1 file"
     return (
-        "<!-- cubic:review-summary:start -->\n**x**\n<!-- cubic:review-summary:end -->\n\n"
+        "<!-- cubic:review-summary:start -->\n"
+        f"{summary}\n"
+        "<!-- cubic:review-summary:end -->\n\n"
         "<details>\n<summary>Prompt for AI agents (unresolved issues)</summary>\n\n"
         "```text\n" + inner + "```\n\n</details>\n"
     )
@@ -913,6 +925,10 @@ def test_the_cubic_gate_is_a_standalone_per_push_workflow() -> None:
     group = str(concurrency["group"])
     assert group.startswith("agent-cubic-review"), f"{CUBIC}: group {group!r} is not its own"
     assert "pull_request.number" in group, f"{CUBIC}: group {group!r} is not per PR"
+    assert "pull_request.head.sha" in group and "inputs.head_sha" in group, (
+        f"{CUBIC}: group {group!r} is not keyed by the analysed commit, so a rerun of an"
+        " older commit cancels the run grading the current head"
+    )
     assert concurrency["cancel-in-progress"] is True, f"{CUBIC}: keeps superseded runs"
     resolve = _run(_find_step(jobs["resolve"], r"^Resolve PR$"))
     assert "INPUT_PR" in resolve, "the resolve step ignores the pr_number input"
@@ -963,7 +979,7 @@ def test_the_cubic_gate_waits_only_for_cubics_own_review_of_the_head() -> None:
     the poster refuses to overwrite the comment of a head that moved past it."""
     data = _load(CUBIC)
     jobs = data["jobs"]
-    for key in ("verdict", "blocking", "advisory", "review_id"):
+    for key in ("verdict", "blocking", "advisory", "review_id", "reason"):
         assert key in jobs["wait"].get("outputs", {}), f"the wait job publishes no {key}"
 
     wait = _run(_find_step(jobs["wait"], r"^Wait for cubic review$"))
@@ -1182,6 +1198,115 @@ def _run_cubic_step(
 NEEDS_BASH_AND_JQ = pytest.mark.skipif(
     shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
 )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        # cubic's marker, but no summary block at all: not the shape cubic posts, so
+        # nothing about the findings may be inferred from it.
+        ("<!-- cubic:review-summary:start -->\n", "only the start marker"),
+        ("cubic is still reviewing this PR, please check back later.", "a prose body"),
+        ("", "an empty body"),
+        # A summary line no count can be read out of.
+        (_cubic_body("P1: a real defect", summary="**x**"), "an unreadable summary"),
+        (
+            _cubic_body("P1: a real defect", summary="**issues found**"),
+            "a count with no number",
+        ),
+        # A summary line that disagrees with the priority tokens, in both directions.
+        (
+            _cubic_body("P1: a real defect", summary="**2 issues found** across 2 files"),
+            "cubic counts more findings than the body lists",
+        ),
+        (
+            _cubic_body(summary="**3 issues found** across 2 files"),
+            "cubic counts fewer findings than the body lists",
+        ),
+        # A priority level the gate does not know: it would fall out of both counts.
+        (
+            _cubic_body("P4: a level nobody mapped", summary="**1 issue found** across 1 file"),
+            "an unmapped priority level",
+        ),
+        # cubic says there is nothing to fix while the body lists a blocker.
+        (
+            _cubic_body("P0: live-trading data loss", summary="**No issues found** across 1 file"),
+            "a clean summary over a blocking body",
+        ),
+    ],
+)
+def test_a_cubic_body_the_classifier_cannot_read_is_never_a_pass(body, why, tmp_path) -> None:
+    """The fail-open the pre-mortem found: a review whose body the classifier cannot read came
+    out as PASS, because counting `P0:`/`P1:` tokens and finding none is indistinguishable from
+    a clean review. The count is now cross-checked against cubic's own summary line, and the
+    three readings - cubic's count, the priority tokens, and every token being a mapped level -
+    have to agree before anything but an `error` is reported. This is the test that has to fail
+    if that check is dropped: no shape below may ever reach a PASS, and each has to say why it
+    did not."""
+    result = _cubic_classify(tmp_path, [{"id": 42, "body": body}])
+    assert result["verdict"] == "INCOMPLETE", f"{why} produced {result['verdict']}"
+    assert result["reason"], f"{why} is reported with no reason"
+    # An INCOMPLETE gate is an `error`, and the post job is where that happens.
+    status = _run(_find_step(_load(CUBIC)["jobs"]["post"], r"^Set status$"))
+    arm = re.search(r"INCOMPLETE\)\s*state=(\w+)", status)
+    assert arm is None, "INCOMPLETE has an arm of its own instead of the catch-all"
+    assert "*) state=error" in re.sub(r"\s+", " ", status), "the map is not total"
+
+
+@NEEDS_BASH_AND_JQ
+def test_a_ready_transition_starts_a_fresh_wait_on_that_head(tmp_path) -> None:
+    """The draft exit rests on the assumption that cubic does not review drafts, so a draft
+    head is never graded. The moment the PR becomes ready the gate has to wait for that head:
+    `ready_for_review` is a trigger of its own, the wait job runs exactly when the head is
+    current, same-repo and not a draft, and nothing consults the draft run's `success` - which
+    is why a head nobody graded stays red (after the 20-minute wait) rather than inheriting a
+    green it never earned."""
+    data = _load(CUBIC)
+    jobs = data["jobs"]
+    assert "ready_for_review" in _triggers(data)["pull_request"]["types"]
+    wait_if = str(jobs["wait"]["if"])
+    assert "current == 'true'" in wait_if, "the wait job grades a superseded head"
+    assert "same_repo == 'true'" in wait_if, "the wait job grades a fork PR"
+    assert "draft != 'true'" in wait_if, "the wait job grades a draft head"
+    # The draft's success is written by the resolve job alone and read by nothing:
+    # a ready head goes through the full pending -> poll -> verdict path again.
+    for job_name in ("wait", "post"):
+        assert CUBIC_SKIP_DESCRIPTION not in _job_bodies([jobs[job_name]]), (
+            f"{job_name} carries the draft skip forward"
+        )
+    resolve = _run(_find_step(jobs["resolve"], r"^Resolve PR$"))
+    proc, outputs, calls = _run_cubic_step(
+        tmp_path / "ready",
+        resolve,
+        env={"GITHUB_EVENT_NAME": "pull_request", "INPUT_PR": "", "INPUT_SHA": ""},
+        pr=_cubic_pr_payload(draft=False),
+        statuses=[],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert outputs["draft"] == "false", "a ready head still resolves as a draft"
+    assert outputs["current"] == "true", "a ready head does not resolve to the current head"
+
+
+@NEEDS_BASH_AND_JQ
+def test_a_gate_that_could_not_run_names_the_reason_and_the_rerun_hint(tmp_path) -> None:
+    """A cubic timeout and a body the classifier could not read are both `error`, and both
+    have to be actionable from the status alone: the description carries the reason the wait
+    published and the remedy (re-trigger cubic, re-run the workflow), because the alternative
+    is a red status nobody can act on. The comment says the same, with the head it failed on."""
+    data = _load(CUBIC)
+    classify = _run(_find_step(data["jobs"]["wait"], r"^Classify cubic findings$"))
+    assert "reason=" in classify, "the classifier publishes no reason"
+    assert "::error::" in classify, "a gate that could not run says nothing in the log"
+    assert "Re-run jobs" in classify, "the log names no rerun path"
+    status = _run(_find_step(data["jobs"]["post"], r"^Set status$"))
+    assert 'desc="${REASON:-' in status, "the status description drops the reason"
+    assert "re-trigger cubic, re-run this workflow" in status
+    poster = _run(_find_step(data["jobs"]["post"], r"^Post or update cubic-review comment$"))
+    assert "${REASON:-" in poster, "the comment drops the reason"
+    post = data["jobs"]["post"]
+    set_status = _find_step(post, r"^Set status$")
+    assert "REASON" in _step_env(post, set_status), "the reason never reaches the status step"
 
 
 @NEEDS_BASH_AND_JQ

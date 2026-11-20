@@ -21,7 +21,9 @@ run-name: "Agent Cubic Review PR #${{ github.event.pull_request.number || inputs
 #            (P2/P3 are advisory and do not block), or the PR is a draft and
 #            cubic was not asked to review it (see "Draft PRs" below)
 #   failure: cubic found at least one P0/P1 finding
-#   error:   no cubic review arrived within the wait, the run failed, or not run
+#   error:   no cubic review arrived within the wait, the review body could not
+#            be read (an unrecognised shape, or a count that disagrees with
+#            cubic's own summary), the run failed, or the run never happened
 #
 # How completion is detected: cubic submits a PR review whose body carries the
 # `<!-- cubic:review-summary:start -->` block and lists the unresolved findings
@@ -41,15 +43,23 @@ run-name: "Agent Cubic Review PR #${{ github.event.pull_request.number || inputs
 # manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has to
 # be re-gated, e.g. after cubic rate-limited the run). The run-name carries the
 # PR number and the analysed SHA, so a run of an older commit is recognisable in
-# the run list; the concurrency group below cancels runs of older commits of the
-# same PR. A run whose SHA is no longer the PR head stops without doing anything.
+# the run list; the concurrency group below is keyed by that analysed SHA, so a
+# re-dispatch of an older commit runs *beside* the current head's run instead of
+# cancelling it - a rerun of the same commit still supersedes its own stale run.
+# A run whose SHA is no longer the PR head stops without doing anything.
 # On PASS it starts nothing: CodeRabbit is an on-demand second opinion triggered
 # by hand (see the skill).
 #
 # Draft PRs: cubic does not review drafts, so a run on a draft head writes
 # `success` with the description "skipped: draft PR — cubic reviews only ready
 # PRs" and waits for nothing. Marking the PR ready runs the workflow again
-# (`ready_for_review`), and by then cubic reviews the head itself.
+# (`ready_for_review`) with a fresh wait on that head: the draft's `success` is
+# not carried over, the run marks the head `pending` and polls for cubic's review
+# of it. If cubic reviews on `ready_for_review` rather than only on open/push -
+# which its own history suggests it may not, since no draft was ever reviewed -
+# that wait ends in `error` after 20 minutes with the re-run hint in the status
+# description. That is the fail-closed side: a head nobody graded stays red, and
+# the remedy is a re-trigger of cubic plus a manual rerun, never a silent PASS.
 #
 # Override (cubic red, P0/P1 judged irrelevant): justify each finding in a PR
 # comment; nothing runs after this workflow, and the `ready-for-human` label
@@ -84,7 +94,15 @@ on:
         type: string
 
 concurrency:
-  group: agent-cubic-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  # Keyed by the analysed commit, like the pre-mortem's: a manual rerun of an
+  # older commit (after cubic rate-limited the gate, say) must not cancel the
+  # run that is grading the current head - that run's cancellation reporter
+  # would mark the head `error` with no gate running on it at all. A rerun
+  # naming the same commit still supersedes a stale run of that commit, and a
+  # rerun that omits `head_sha` gets the `current-head` bucket, which is a group
+  # of its own: it runs beside the push's run of the same head instead of
+  # cancelling it.
+  group: agent-cubic-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ github.event.pull_request.head.sha || inputs.head_sha || 'current-head' }}
   cancel-in-progress: true
 
 env:
@@ -219,6 +237,7 @@ jobs:
       blocking: ${{ steps.classify.outputs.blocking }}
       advisory: ${{ steps.classify.outputs.advisory }}
       review_id: ${{ steps.classify.outputs.review_id }}
+      reason: ${{ steps.classify.outputs.reason }}
     env:
       PR_NUMBER: ${{ needs.resolve.outputs.number }}
       HEAD_SHA: ${{ needs.resolve.outputs.head }}
@@ -274,27 +293,66 @@ jobs:
           reviews="$RUNNER_TEMP/cubic/reviews.json"
           blocking=0
           advisory=0
+          total=0
+          declared=""
           review_id=""
+          reason=""
           if [ "$SUPERSEDED" = "true" ]; then
             verdict=SUPERSEDED
           elif [ "$FOUND" != "true" ]; then
             verdict=INCOMPLETE
+            reason="No cubic review of this head arrived within the wait"
           else
             review_id=$(jq -r '.[0].id' "$reviews")
             body=$(jq -r '.[0].body' "$reviews")
             # `|| true` keeps a no-match grep from failing the step under
             # `pipefail`; wc still prints the 0.
-            blocking=$(printf '%s\n' "$body" | grep -oE 'P[01]:' | wc -l || true)
-            advisory=$(printf '%s\n' "$body" | grep -oE 'P[23]:' | wc -l || true)
-            if [ "$blocking" -gt 0 ]; then verdict=BLOCK; else verdict=PASS; fi
+            blocking=$(printf '%s\n' "$body" | grep -oE 'P[01]:' | wc -l | tr -d '[:space:]' || true)
+            advisory=$(printf '%s\n' "$body" | grep -oE 'P[23]:' | wc -l | tr -d '[:space:]' || true)
+            total=$(printf '%s\n' "$body" | grep -oE 'P[0-9]:' | wc -l | tr -d '[:space:]' || true)
+            # cubic's own count of the unresolved findings it is asking us to fix,
+            # from the summary block every review of this shape carries.
+            summary=$(printf '%s\n' "$body" \
+              | awk '/cubic:review-summary:start/{on=1;next} /cubic:review-summary:end/{on=0} on')
+            if printf '%s\n' "$summary" | grep -qiE 'no issues? found'; then
+              declared=0
+            else
+              # `|| true` guards a `head` that closes the pipe early on a multi-line summary:
+              # an empty result is an unreadable summary, which is an error, not a pass.
+              declared=$(printf '%s\n' "$summary" \
+                | sed -nE 's/.*\*\*([0-9]+) issues? found.*/\1/p' | head -n 1 || true)
+            fi
+            # The cross-check that keeps this gate closed: a review whose body the
+            # classifier did not fully read must never come out as PASS. Three
+            # readings have to agree - cubic's own count, the number of priority
+            # tokens, and that every one of those tokens is a level this gate knows
+            # (P0-P3, so blocking + advisory covers them) - and any disagreement is
+            # an `error` that names it, not a clean run.
+            if [ -z "$declared" ]; then
+              verdict=INCOMPLETE
+              reason="Cubic review body has no readable summary line"
+            elif [ "$declared" != "$total" ] || [ "$((blocking + advisory))" != "$total" ]; then
+              verdict=INCOMPLETE
+              reason="Cubic reports ${declared} finding(s) but ${total} priority token(s) were read"
+            elif [ "$blocking" -gt 0 ]; then
+              verdict=BLOCK
+            else
+              verdict=PASS
+            fi
           fi
           {
             echo "verdict=$verdict"
             echo "blocking=$blocking"
             echo "advisory=$advisory"
             echo "review_id=$review_id"
+            echo "reason=$reason"
           } >> "$GITHUB_OUTPUT"
           echo "Cubic: verdict=${verdict} blocking(P0/P1)=${blocking} advisory(P2/P3)=${advisory}"
+          # A gate that could not run is not a quiet pass: say so in the log, with the
+          # remedy (re-trigger cubic, then re-run this workflow for this head).
+          if [ "$verdict" = "INCOMPLETE" ]; then
+            echo "::error::${reason}; no verdict for this head. Re-trigger cubic from its review footer (\"Re-trigger cubic\"), then re-run this workflow by hand - \"Re-run jobs\" on this run, or the workflow_dispatch documented in this file's header comment."
+          fi
 
   # Posts the comment and sets the status. Runs no repo code. Also reports a
   # failed wait as `error`. It starts no other workflow: this gate dispatches
@@ -315,6 +373,7 @@ jobs:
       BLOCKING: ${{ needs.wait.outputs.blocking }}
       ADVISORY: ${{ needs.wait.outputs.advisory }}
       REVIEW_ID: ${{ needs.wait.outputs.review_id }}
+      REASON: ${{ needs.wait.outputs.reason }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report failed cubic run
@@ -354,7 +413,9 @@ jobs:
                 echo "Cubic reviewed \`${HEAD_SHA}\` and found **${BLOCKING} blocking (P0/P1)** finding(s)."
                 ;;
               *)
-                echo "No cubic review of \`${HEAD_SHA}\` arrived within 20 minutes, so the gate could not run."
+                # Either cubic never reviewed this head, or its body could not be
+                # read. Both are `error`, and neither is a pass.
+                echo "No verdict could be read for \`${HEAD_SHA}\`: ${REASON:-no cubic review arrived within 20 minutes}."
                 ;;
             esac
             echo
@@ -388,7 +449,11 @@ jobs:
             PASS) state=success; desc="No P0/P1 finding (${ADVISORY} advisory P2/P3)" ;;
             BLOCK) state=failure; desc="${BLOCKING} blocking P0/P1 finding(s) (${ADVISORY} advisory)" ;;
             SUPERSEDED) state=error; desc="Superseded: the PR head moved on" ;;
-            *) state=error; desc="No cubic review of this commit within 20 min; re-trigger it" ;;
+            *) state=error
+               # The reason the gate could not run, and how to run it: the head that
+               # cubic did not review has to stay red, not quietly green.
+               desc="${REASON:-No cubic review of this head}; re-trigger cubic, re-run this workflow"
+               ;;
           esac
           # Status descriptions are limited to 140 characters.
           desc=$(printf '%s' "$desc" | cut -c1-140)
