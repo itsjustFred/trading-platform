@@ -5596,6 +5596,18 @@ async def _shutdown_cleanup(
     return ok
 
 
+async def _start_daemon_services(scheduler: ServiceScheduler) -> None:
+    """The startup work that runs before the daemon's loops exist.
+
+    Kept as one coroutine so ``run_daemon`` can race it against the shutdown
+    waiter: a signal during startup must stop the daemon starting services, not
+    be noticed only after the last startup await returned.
+    """
+    await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
+    await asyncio.to_thread(_recover_failed_services)
+    await scheduler.start()
+
+
 async def run_daemon(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
@@ -5640,56 +5652,79 @@ async def run_daemon(
 
     deployment_snapshot: list[LiveDeploymentConfig] = []
     try:
-        await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
-        await asyncio.to_thread(_recover_failed_services)
-        await scheduler.start()
-
-        sync_task = asyncio.create_task(
-            sync_deployments_loop(
-                active_adapters,
-                active_listener_tasks,
-                active_discord_tasks,
-                accounts_env=accounts_env,
-                deployment_snapshot=deployment_snapshot,
-            ),
-            name="deployment-sync-loop",
-        )
-        service_sync_task = asyncio.create_task(
-            sync_services_loop(
-                active_discord_bots,
-                active_discord_bot_tasks,
-                scheduler,
-                accounts_env=accounts_env,
-            ),
-            name="service-sync-loop",
-        )
-        balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
-        trailing_task = asyncio.create_task(
-            run_trailing_stops_loop(
-                # A stop amendment is a broker mutation the shutdown drain must
-                # wait for, and must not start once the stop flag is set.
-                LiveTrailingStopManager(mutation_gate=_broker_mutation),
-                eligible_adapters=lambda: _trailing_eligible_adapters(active_adapters),
-                current_deployments=lambda: list(deployment_snapshot),
-            ),
-            name="trailing-stops-loop",
-        )
-        commission_task = asyncio.create_task(
-            _backfill_commissions_loop(active_adapters), name="commission-backfill"
-        )
-        loop_tasks = (sync_task, service_sync_task, balance_task, trailing_task, commission_task)
+        # The shutdown waiter is created first so a signal that lands during
+        # startup is acted on immediately: the startup work runs as its own task
+        # and is cancelled, instead of the daemon finishing an unbounded start
+        # before it notices the flag. (A startup thread already running cannot be
+        # interrupted; the second signal's forced exit covers that.)
         stop_waiter = asyncio.create_task(shutdown.wait(), name="shutdown-waiter")
+        startup_task = asyncio.create_task(
+            _start_daemon_services(scheduler), name="daemon-startup"
+        )
+        started, _ = await asyncio.wait(
+            {startup_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if startup_task in started:
+            startup_task.result()  # re-raise a startup crash
+        else:
+            startup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await startup_task
 
-        pending: set[asyncio.Task[None]] = set(loop_tasks)
-        while pending and not shutdown.requested:
-            done, _ = await asyncio.wait(
-                {*pending, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+        if not shutdown.requested:
+            sync_task = asyncio.create_task(
+                sync_deployments_loop(
+                    active_adapters,
+                    active_listener_tasks,
+                    active_discord_tasks,
+                    accounts_env=accounts_env,
+                    deployment_snapshot=deployment_snapshot,
+                ),
+                name="deployment-sync-loop",
             )
-            for task in done:
-                if task is stop_waiter:
-                    continue
-                pending.discard(task)
-                task.result()  # re-raise a crashed loop, exactly like gather did
+            service_sync_task = asyncio.create_task(
+                sync_services_loop(
+                    active_discord_bots,
+                    active_discord_bot_tasks,
+                    scheduler,
+                    accounts_env=accounts_env,
+                ),
+                name="service-sync-loop",
+            )
+            balance_task = asyncio.create_task(
+                _poll_balances(active_adapters), name="balance-poller"
+            )
+            trailing_task = asyncio.create_task(
+                run_trailing_stops_loop(
+                    # A stop amendment is a broker mutation the shutdown drain must
+                    # wait for, and must not start once the stop flag is set.
+                    LiveTrailingStopManager(mutation_gate=_broker_mutation),
+                    eligible_adapters=lambda: _trailing_eligible_adapters(active_adapters),
+                    current_deployments=lambda: list(deployment_snapshot),
+                ),
+                name="trailing-stops-loop",
+            )
+            commission_task = asyncio.create_task(
+                _backfill_commissions_loop(active_adapters), name="commission-backfill"
+            )
+            loop_tasks = (
+                sync_task,
+                service_sync_task,
+                balance_task,
+                trailing_task,
+                commission_task,
+            )
+
+            pending: set[asyncio.Task[None]] = set(loop_tasks)
+            while pending and not shutdown.requested:
+                done, _ = await asyncio.wait(
+                    {*pending, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    if task is stop_waiter:
+                        continue
+                    pending.discard(task)
+                    task.result()  # re-raise a crashed loop, exactly like gather did
         if shutdown.requested:
             logger.info(
                 "Live daemon shutting down",

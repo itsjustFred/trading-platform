@@ -1163,6 +1163,55 @@ def _timed_out_phases(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
+def test_a_signal_during_startup_stops_starting_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal during startup must not wait for the startup to finish.
+
+    Service discovery, recovery and the scheduler start run before the loops
+    exist, so the shutdown waiter had nothing to wake: the daemon finished an
+    unbounded start and only then noticed the flag. The startup now runs
+    alongside the waiter and is cancelled by the first signal, so the bounded
+    cleanup and the exit code are reached.
+    """
+    coordinator = _new_coordinator()
+
+    async def _probe() -> tuple[int, float, bool]:
+        coordinator.bind(asyncio.get_running_loop())
+        entered = asyncio.Event()
+        cancelled: list[bool] = []
+
+        async def _hang(_scheduler: Any) -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        monkeypatch.setattr(daemon, "_start_daemon_services", _hang)
+        task = asyncio.create_task(
+            daemon.run_daemon(
+                accounts_env=ACCOUNTS_ENV,
+                shutdown=coordinator,
+                install_signal_handlers=False,
+                drain_timeout_seconds=0.5,
+                cleanup_timeout_seconds=0.5,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        started = time.monotonic()
+        coordinator.request("SIGTERM")
+        code = await asyncio.wait_for(task, timeout=30)
+        return code, time.monotonic() - started, bool(cancelled)
+
+    code, elapsed, cancelled = asyncio.run(_probe())
+
+    assert cancelled, "the startup work must be cancelled, not waited out"
+    assert elapsed < 5.0, f"the signal, not the startup, decides when it stops: {elapsed}"
+    assert code == EXIT_OK, "nothing was in flight, so there is nothing to reconcile"
+
+
 def test_a_loop_task_that_ignores_its_cancel_cannot_hold_the_shutdown(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
