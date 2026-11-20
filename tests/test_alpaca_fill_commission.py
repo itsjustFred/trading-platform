@@ -2371,7 +2371,7 @@ def test_group_problem_refuses_a_broken_pair_that_carries_no_reason():
     to the allocator with no fills and left its commissions unbackfilled instead
     of reported. Pin the fail-closed branch so that state cannot come back.
     """
-    from live_runner.alpaca_fees import _FeeIndex, _Inputs, _group_problem
+    from live_runner.alpaca_fees import _FeeIndex, _group_problem, _Inputs
 
     inputs = _Inputs(
         fills_by_order={},
