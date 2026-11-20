@@ -162,21 +162,32 @@ Implementation:
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` unless
-  `cap_fixed_risk_by_leverage = false`. `max_lot` is floored to `lot_step`
-  once, so an off-grid `max_lot` cannot yield an off-grid size. Because the
+  `cap_fixed_risk_by_leverage = false`. With `lot_step > 0`, `max_lot` is
+  floored to `lot_step` once, so an off-grid `max_lot` cannot yield an
+  off-grid size; the documented exception is no grid at all — with
+  `lot_step` absent, null or zero the native engine has no grid, so
+  `max_lot` applies raw and an off-grid maximum stays off-grid. Because the
   leverage/exposure cap is a raw equity/price ratio, a size that the cap
-  reduces is re-floored to `lot_step` afterwards (Issue #151). A final size
-  within the grid snap band (relative 1e-9) below `min_lot` is snapped up to
-  `min_lot` — that size came out of the grid floor an ulp low (`3 * 0.3 ==
-  0.8999999999999999 < 0.9`) and the broker accepts it as `min_lot`. Any
-  other final size below `min_lot` is **skipped** (size 0, no trade, with a
-  WARNING log) — it is never raised back up to `min_lot`, since the caps are
-  what make it unaffordable. A size that no cap reduces is not re-floored.
-  `min_lot` is deliberately honoured **off-grid** (a broker minimum need not be
-  a multiple of its own step), while `max_lot` is floored to the grid; with
-  `min_lot == max_lot == 0.15` and `lot_step = 0.1` that combination is
-  fail-closed — the cap becomes `0.1`, which is below `min_lot`, and the trade
-  is skipped although the same config without `max_lot` trades `0.15`.
+  reduces is re-floored to `lot_step` afterwards (Issue #151). With a grid
+  configured, a final size within the grid snap band (relative 1e-9) below
+  `min_lot` is snapped up to `min_lot` — that size came out of the grid
+  floor an ulp low (`3 * 0.3 == 0.8999999999999999 < 0.9`) and the broker
+  accepts it as `min_lot`. Without a grid there is no such float product,
+  so the exception does not apply: a capped size below `min_lot` is a cap
+  the configured minimum exceeds, and raising it would push the size above
+  the cap. Any other final size below `min_lot` is **skipped** (size 0, no
+  trade, with a WARNING log) — it is never raised back up to `min_lot`,
+  since the caps are what make it unaffordable. A size that no cap reduces
+  is not re-floored. `min_lot` is deliberately honoured **off-grid**: the
+  MT5 parity reference (`scripts/regenerate_mt5_parity_artifacts.py`,
+  `_round_mt5_lots`, .mq5 Z.391-393) applies `max(floored, min_lot)` without
+  a second grid floor (MT5 `MathMax`), so the engine reproduces that rule
+  rather than correcting it; a venue that requires volumes to be exact step
+  multiples would reject such a size, and a config for one must set
+  `min_lot` to a grid multiple. `max_lot` is floored to the grid instead;
+  with `min_lot == max_lot == 0.15` and `lot_step = 0.1` that combination is
+  fail-closed — the cap becomes `0.1`, which is below `min_lot`, and the
+  trade is skipped although the same config without `max_lot` trades `0.15`.
   Non-finite values for the sizing parameters are refused with a `ValueError`
   naming the parameter: `inf` would crash the grid floor, and `nan` defeats
   every guard on the sizing path. `fixed_risk_amount` is resolved — and thereby
