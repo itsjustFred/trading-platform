@@ -164,5 +164,14 @@ def test_the_generated_daemon_unit_outlives_the_worst_case_shutdown() -> None:
     # The reviewed value: the worst case plus 30 s for the exit path itself.
     assert seconds == 180.0
     # And the runbook tells the operator the unit file it generates, so a
-    # hand-written unit can be checked against the same number.
-    assert f"TimeoutStopSec={timeout.group(1)}" in _runbook_section("Stopping the daemon")
+    # hand-written unit can be checked against the same number. Compare the whole
+    # number, not a substring: "TimeoutStopSec=180" is also a prefix of the
+    # dangerous "TimeoutStopSec=1800" and of the insufficient "TimeoutStopSec=18".
+    documented = re.search(
+        r"TimeoutStopSec=(\d+(?:\.\d+)?)", _runbook_section("Stopping the daemon")
+    )
+    assert documented is not None, "the runbook must name the unit's TimeoutStopSec"
+    assert float(documented.group(1)) == seconds, (
+        f"the runbook documents TimeoutStopSec={documented.group(1)} but the "
+        f"installer writes {seconds:g}"
+    )

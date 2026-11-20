@@ -256,7 +256,13 @@ def test_sigterm_handler_sets_the_stop_flag() -> None:
         # The handler runs in the main thread; the event is set from the loop.
         await asyncio.wait_for(coordinator.wait(), timeout=5)
 
-    asyncio.run(_deliver())
+    try:
+        asyncio.run(_deliver())
+    finally:
+        # A handler left installed would swallow Ctrl-C for the rest of the
+        # session: pytest would keep running with a stale coordinator instead of
+        # raising KeyboardInterrupt.
+        coordinator.restore_signal_handlers()
     assert coordinator.requested is True
     assert coordinator.reason == "SIGTERM"
 
@@ -272,7 +278,10 @@ def test_sigint_handler_sets_the_stop_flag() -> None:
         os.kill(os.getpid(), signal.SIGINT)
         await asyncio.wait_for(coordinator.wait(), timeout=5)
 
-    asyncio.run(_deliver())
+    try:
+        asyncio.run(_deliver())
+    finally:
+        coordinator.restore_signal_handlers()
     assert coordinator.requested is True
     assert coordinator.reason == "SIGINT"
 
@@ -324,17 +333,20 @@ def test_handler_entry_point_reaches_the_coordinator_in_a_thread() -> None:
     """
     coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
     coordinator.bind(_NoopLoop())
+    # Capture the original handler BEFORE installing: after the install,
+    # ``getsignal`` returns this test's coordinator handler, and re-installing it
+    # in the teardown would put back exactly the handler ``restore`` just removed.
+    previous = signal.getsignal(signal.SIGTERM)
     coordinator.install_signal_handlers()
     assert threading.current_thread() is threading.main_thread()
 
-    previous = signal.getsignal(signal.SIGTERM)
     try:
         os.kill(os.getpid(), signal.SIGTERM)
         # No loop callbacks run here on purpose: the flag must already be set.
         assert coordinator.requested is True
     finally:
         coordinator.restore_signal_handlers()
-        signal.signal(signal.SIGTERM, previous)
+    assert signal.getsignal(signal.SIGTERM) == previous, "the original handler is back"
 
 
 def test_restore_puts_the_previous_handlers_back(monkeypatch: pytest.MonkeyPatch) -> None:
