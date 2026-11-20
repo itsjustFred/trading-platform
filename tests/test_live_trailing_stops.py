@@ -1367,6 +1367,35 @@ def test_a_stop_quantity_within_qty_tolerance_is_still_trailed(live: _Live, monk
     assert live.client.stop_prices() == [101.97]
 
 
+@pytest.mark.parametrize(
+    ("stop_qty", "trailed"),
+    [
+        # Inside the tolerance: a stop that covers more than the position only
+        # by the broker's own float noise is the position's stop. Exactly one
+        # tolerance over still counts as matching (the slack is inclusive).
+        (10.0000000005, True),
+        (10.000000001, True),
+        # Outside it: one more than a ten-thousandth of a unit over is a real
+        # over-coverage, and the stop is left alone.
+        (10.00001, False),
+    ],
+)
+def test_the_qty_tolerance_boundary_is_what_decides(
+    live: _Live, monkeypatch, stop_qty: float, trailed: bool
+) -> None:
+    warnings = _warnings(monkeypatch)
+    live.client.positions = [_FakePosition("AAPL", 10)]
+    live.client.orders = [
+        _FakeOrder("stop-1", "AAPL", "sell", order_type="stop", qty=stop_qty, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+
+    live.feed(LiveTrailingStopManager(), [103.0])
+
+    assert (len(warnings) == 1) is not trailed
+    assert live.client.stop_prices() == ([98.0] if not trailed else [101.97])
+
+
 def test_a_stop_whose_quantity_the_broker_does_not_report_is_still_trailed(
     isolated_db, monkeypatch
 ) -> None:
