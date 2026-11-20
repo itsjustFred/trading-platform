@@ -63,6 +63,12 @@ on:
         description: "Fail the job if the report has fewer trades"
         default: "1"
         required: true
+  # SPIKE: remove before ready — temporary, so this branch can prove the
+  # --root change end to end. workflow_dispatch only exists once the file is on
+  # the default branch.
+  push:
+    branches: [feat/mt5-ci-tester-spike]
+
 permissions:
   contents: read
 
@@ -388,7 +394,11 @@ jobs:
           $profiles = Join-Path $env:MT5_HOME 'MQL5\Profiles\Tester'
           New-Item -ItemType Directory -Force -Path $profiles | Out-Null
           $setName = "$($env:BASE_SYMBOL.ToLower())_$($env:PERIOD_NAME.ToLower())_ci.set"
-          python tools/mt5_ci/convert_setfile.py --input "data/$env:SETFILE_ASSET" --output (Join-Path $profiles $setName)
+          # Both tools confine their paths to --root; the portable terminal
+          # lives outside the checkout, so name both roots explicitly.
+          python tools/mt5_ci/convert_setfile.py --input "data/$env:SETFILE_ASSET" `
+            --output (Join-Path $profiles $setName) `
+            --root "$env:GITHUB_WORKSPACE" --root "$env:MT5_HOME"
           if ($LASTEXITCODE -ne 0) { throw "convert_setfile.py failed ($LASTEXITCODE)" }
           Get-Content -Path (Join-Path $profiles $setName) | ForEach-Object { Write-Host $_ }
           "SET_NAME=$setName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -501,7 +511,9 @@ jobs:
           Copy-Item -Path $report.FullName -Destination (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report.html') -Force
           python tools/mt5_ci/inspect_report.py --report $report.FullName `
             --expect-expert $env:EA_FILE --expect-symbol $env:SYMBOL `
-            --min-trades ([int]$env:MIN_TRADES) --json-out (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report_summary.json')
+            --min-trades ([int]$env:MIN_TRADES) `
+            --json-out (Join-Path $env:GITHUB_WORKSPACE 'mt5_ci_report_summary.json') `
+            --root "$env:GITHUB_WORKSPACE" --root "$env:MT5_HOME"
           if ($LASTEXITCODE -ne 0) { throw "report assertion failed ($LASTEXITCODE)" }
 
       - name: Job summary
