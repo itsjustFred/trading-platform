@@ -1168,9 +1168,12 @@ def test_submit_order_with_risk_refuses_an_entry_when_a_broker_qty_is_unreadable
     # that the unreadable row refuses it first and not as "one open position".
     deployment = _deployment(max_positions=1)
     adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": "abc"}])
+    signal = _live_signal(deployment)
 
+    # One throwing invocation inside the block, so the assertion cannot pass on
+    # a failure to build the signal.
     with pytest.raises(UnreadableBrokerPositionQtyError):
-        asyncio.run(submit_order_with_risk(adapter, deployment, _live_signal(deployment)))
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
 
     assert adapter.submitted_signal is None
     assert adapter.submitted_qty is None
@@ -1181,9 +1184,10 @@ def test_submit_order_with_risk_refuses_an_entry_when_a_broker_qty_is_missing():
 
     deployment = _deployment(max_positions=5)
     adapter = _PositionsAdapter(positions=[{"symbol": "AAPL"}])
+    signal = _live_signal(deployment)
 
     with pytest.raises(UnreadableBrokerPositionQtyError):
-        asyncio.run(submit_order_with_risk(adapter, deployment, _live_signal(deployment)))
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
 
     assert adapter.submitted_signal is None
 
