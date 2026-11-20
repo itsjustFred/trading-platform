@@ -316,6 +316,15 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   der Cursor bleibt stehen, und kommt dauerhaft nur so eine Seite, nimmt der Kanal
   bis zu einem Neustart nichts auf (danach greift das Start-Verhalten unten). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+- **Ein einzelnes kaputtes Message-Objekt verliert nicht die ganze Seite:** Die
+  geparste Nachricht wird pro Nachricht isoliert (`_emit_polled_message`). Wirft
+  das Parsen (z. B. ein strukturell kaputtes `author`-Feld oder ein von
+  `TradeSignal` abgelehnter Preis), wird die Nachricht auf `ERROR` geloggt
+  (`Discord message dropped: emission failed` mit `channel_id`, `message_id` und
+  `error_type`), ihre ID bleibt im Seen-Set (kein Endlos-Retry) und der Poll
+  arbeitet mit dem Rest der Seite weiter. `asyncio.CancelledError` wird nicht
+  verschluckt; Auth-/Channel-Forbidden-/Rate-Limit-Fehler entstehen beim Abruf
+  und behalten ihr bestehendes Verhalten.
   Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
   die N Nachrichten direkt nach der ID, im Array neueste zuerst
   ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
