@@ -207,16 +207,19 @@ def _drain(
     )
 
 
-def test_a_running_stopped_sweep_is_drained_not_cancelled(
+def test_a_running_stopped_enforcement_is_drained_not_cancelled(
     isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The drain must wait for a STOPPED cancel/flatten sweep that is running.
+    """The drain must wait for a STOPPED enforcement that is running.
 
-    The sweep runs inside the deployment sync loop, one of the daemon's loop
-    tasks the shutdown cancels. Cancelling it mid-sweep leaves the account's
-    broker state unknown - an order may still be resting, a position may or may
-    not be closed - so the sweep is registered on the shutdown ledger and the
-    drain waits for it before any task is cancelled.
+    The whole enforcement is one unit of broker work: the cancel, the flatten
+    and the orphaned-protection sweep that follows it. It runs inside the
+    deployment sync loop, one of the daemon's loop tasks the shutdown cancels.
+    Cancelling it between two calls would leave the account half-enforced (an
+    open position after its orders were cancelled, or detached protections
+    still resting after the flatten), so it is registered on the shutdown
+    ledger as a whole and the drain waits for all of it before any task is
+    cancelled.
     """
     database, _, _ = isolated_db_sandbox
     _seed(database)
@@ -235,23 +238,23 @@ def test_a_running_stopped_sweep_is_drained_not_cancelled(
             )
         )
         await asyncio.wait_for(adapter.entered.wait(), timeout=10)
-        assert coordinator.inflight == 1, "the sweep must be on the drain's ledger"
+        assert coordinator.inflight == 1, "the enforcement must be on the drain's ledger"
         coordinator.request("SIGTERM")
         cleanup = _drain(coordinator)
         await asyncio.sleep(0.05)
-        assert not cleanup.done(), "the drain must wait for the running sweep"
+        assert not cleanup.done(), "the drain must wait for the running enforcement"
         adapter.release.set()
         ok = await asyncio.wait_for(cleanup, timeout=30)
         await asyncio.gather(sweep, return_exceptions=True)
         return ok
 
     assert asyncio.run(_probe()) is True
-    # The running cancel was awaited to the end, and the sweeps that had not
-    # started yet are refused: the stop flag is set, so no new broker mutation
-    # may begin. The deployment stays unenforced and is retried.
+    # The running cancel was awaited to the end, and the sweeps that follow it
+    # ran too: the registration was taken before the signal, so nothing drops
+    # them. The deployment is fully enforced and stamped.
     assert adapter.cancelled is False, "the cancel was not cut off mid-request"
-    assert adapter.calls == ["cancel"]
-    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
 
 
 def test_a_stopped_sweep_is_refused_once_shutdown_was_requested(
@@ -328,10 +331,10 @@ def test_the_orphan_sweep_after_the_flatten_is_drained_not_cancelled(
 ) -> None:
     """The drain must wait for the orphaned-protection sweep too.
 
-    The enforcement is two broker mutations, not one: after the cancel and the
-    flatten comes the sweep of the protections the flatten detached. A sweep
-    cancelled mid-request could leave a resting protection that still triggers,
-    so it is registered on the same ledger and drained like the rest.
+    The enforcement is one registered unit, and the sweep of the protections
+    the flatten detached is its last step. A sweep cancelled mid-request could
+    leave a resting protection that still triggers, so the whole enforcement is
+    on the shutdown ledger and the drain waits for the sweep like the rest.
     """
     database, _, _ = isolated_db_sandbox
     _seed(database)
@@ -367,16 +370,18 @@ def test_the_orphan_sweep_after_the_flatten_is_drained_not_cancelled(
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
 
 
-def test_the_orphan_sweep_is_refused_when_the_signal_lands_before_it(
+def test_the_orphan_sweep_runs_when_the_signal_lands_during_the_flatten(
     isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A signal between the flatten and the orphan sweep must stop that sweep.
+    """A signal between the flatten and the orphan sweep must not drop the sweep.
 
     The money-safety part is done (orders cancelled, account flat), but the
     protections the flatten detached are still resting and can still trigger.
-    Sending one now would mutate broker orders through connections the daemon is
-    tearing down, so it is refused and the deployment is left unenforced: the
-    next start retries the whole enforcement, sweep included.
+    Refusing the sweep here would leave them resting while the daemon closes
+    its connections, and a triggered stop with nothing to sell opens a short.
+    The enforcement is one registered unit, so a signal that lands while it is
+    running is drained with it: the sweep runs, the deployment is stamped, and
+    the next tick has nothing left to retry.
     """
     database, _, _ = isolated_db_sandbox
     _seed(database)
@@ -394,9 +399,9 @@ def test_the_orphan_sweep_is_refused_when_the_signal_lands_before_it(
             )
         )
 
-    assert adapter.calls == ["cancel", "flatten"], "the orphan sweep may not start"
-    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
-    assert any("orphaned-protection sweep" in r.getMessage() for r in caplog.records)
+    assert adapter.calls == ["cancel", "flatten", "orphan"], "the sweep may not be dropped"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+    assert not any("shutting down" in r.getMessage() for r in caplog.records)
 
 
 def test_partial_flatten_does_not_stamp_and_does_not_sweep_orphans(
