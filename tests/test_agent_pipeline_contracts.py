@@ -14,10 +14,11 @@ analysed SHA it sets the commit status `agent/pre-mortem` and upserts one PR com
 
 What is pinned here:
 - every agent workflow triggers itself on `pull_request` (opened, synchronize, reopened) with a
-  concurrency group per PR that cancels superseded runs - the pre-mortem's is keyed by the
-  analysed commit, so a manual rerun of an older commit cannot cancel the current head's run -
-  and no workflow starts another one - no dispatch call, no `workflow_run` or
-  `repository_dispatch` trigger, no `actions: write`;
+  concurrency group per PR that cancels superseded runs - the pre-mortem's carries an analysed
+  commit only when a caller names one, so a manual rerun of an older commit cannot cancel the
+  current head's run while two pushes still supersede one another instead of accumulating one
+  30-minute agent session each - and no workflow starts another one - no dispatch call, no
+  `workflow_run` or `repository_dispatch` trigger, no `actions: write`;
 - the pre-mortem's verdict map is total (`*)` -> `error`), so no verdict reaches an undeclared
   state, and its verdict regex accepts exactly the verdicts the skill documents;
 - the verdicts are advisory (decision of 2026-11-20): no verdict reports `failure` on the
@@ -294,15 +295,22 @@ def test_every_agent_workflow_is_a_standalone_per_push_workflow() -> None:
         assert group.startswith(name[: -len(".yml")]), f"{name}: group {group!r} is not its own"
         assert "pull_request.number" in group, f"{name}: group {group!r} is not per PR"
         assert concurrency["cancel-in-progress"] is True, f"{name}: keeps superseded runs"
-    # The pre-mortem is the only one with a manual rerun, and it is the one whose group must
-    # name the analysed commit: a PR-keyed group cancels the current head's in-flight run
-    # when an older commit is re-dispatched, and that run's cancellation reporter then marks
-    # the head `error` with no analysis left - a false red on the SHA the PR needs a verdict
-    # for. Keyed by the SHA, a rerun of an older commit runs beside it, while a rerun of the
-    # same commit still supersedes a stale run of that commit; a rerun that omits `head_sha`
-    # shares the `current-head` bucket with its own siblings rather than with the push's run.
+    # The pre-mortem is the only one with a manual rerun, and it is the one whose bucket must
+    # name an analysed commit - but only a commit a *dispatch* names. A push must not carry
+    # its head SHA: every push would land in a group of its own, so N pushes on one PR would
+    # run N 30-minute agent sessions side by side and exhaust the free model's usage cap, after
+    # which the stage produces no verdict for any PR. A dispatch naming an older commit does
+    # carry it, which is what keeps that rerun from cancelling the current head's in-flight
+    # run (a PR-keyed group would, and its cancellation reporter would then mark the head
+    # `error` with no analysis left). A rerun that omits `head_sha` shares the `current-head`
+    # bucket with the push's run, so it supersedes it instead of doubling the analysis of the
+    # same diff.
     premortem_group = str(_load(PREMORTEM)["concurrency"]["group"])
-    assert "pull_request.head.sha" in premortem_group and "inputs.head_sha" in premortem_group, (
+    assert "pull_request.head.sha" not in premortem_group, (
+        f"the pre-mortem group {premortem_group!r} is keyed by the pushed head, so every push "
+        "runs a session of its own"
+    )
+    assert "inputs.head_sha" in premortem_group and "'current-head'" in premortem_group, (
         f"the pre-mortem group {premortem_group!r} is not keyed by the analysed commit"
     )
 
@@ -765,14 +773,42 @@ def test_a_cancelled_run_leaves_no_pending_stage_status() -> None:
 def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
     """A first-step failure writes no `head`, yet the run may already have marked the analysed
     commit pending: the reporter then falls back to the commit named by the event, and to the
-    dispatch input, so a stranded `pending` still reaches an `error`."""
-    step = _find_step(_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$")
-    sha = str(step.get("env", {}).get("HEAD_SHA", ""))
-    assert sha.startswith("${{ steps.pr.outputs.head"), (
-        f"the reporter must prefer the resolved head: {sha}"
+    dispatch input, so a stranded `pending` still reaches an `error`. The cancellation reporter
+    needs the same chain for the same reason and is pinned with it here - a cancelled job
+    publishes no outputs, so without the fallback a run cancelled after "Mark running" strands
+    the mark on its SHA with nothing but a warning in a log nobody opens."""
+    reporters = (
+        (_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$"),
+        (_load(PREMORTEM)["jobs"]["report-cancelled"], r"^Report cancelled pre-mortem run$"),
     )
-    assert re.search(r"inputs\.head_sha\s*\}\}$", sha), f"no dispatch-input fallback: {sha}"
-    assert step.get("if") == "failure()", f"the reporter is skipped on {step.get('if')!r}"
+    for job, pattern in reporters:
+        step = _find_step(job, pattern)
+        sha = str(_step_env(job, step).get("HEAD_SHA", ""))
+        assert sha.startswith(("${{ needs.resolve.outputs.head", "${{ steps.pr.outputs.head")), (
+            f"{pattern} must prefer the resolved head: {sha}"
+        )
+        assert "github.event.pull_request.head.sha" in sha and re.search(
+            r"inputs\.head_sha\s*\}\}$", sha
+        ), f"{pattern} has no fallback chain to the event's head and the dispatch input: {sha}"
+    resolve_step = _find_step(_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$")
+    assert resolve_step.get("if") == "failure()", (
+        f"the reporter is skipped on {resolve_step.get('if')!r}"
+    )
+
+
+def test_the_cancelled_reporter_skips_a_fork_pr() -> None:
+    """Fork PRs are skipped by the resolve job's `same_repo` guard and by the agent job, and a
+    fork's head commit is not one this repository can write a status for: the reporter's read
+    would 404 on it, so the job fails - fails closed, but with a spurious red job per cancelled
+    fork run. The cancellation reporter therefore checks the same output first and stops."""
+    job = _load(PREMORTEM)["jobs"]["report-cancelled"]
+    step = _find_step(job, r"^Report cancelled pre-mortem run$")
+    same_repo = str(_step_env(job, step).get("SAME_REPO", "")).strip()
+    assert same_repo == "${{ needs.resolve.outputs.same_repo }}", (
+        f"the cancellation reporter cannot tell a fork PR from one it pre-mortemed: {same_repo}"
+    )
+    body = _run(step)
+    assert '[ "$SAME_REPO" = "false" ]' in body, "the cancellation reporter runs for a fork PR"
 
 
 def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
@@ -788,6 +824,39 @@ def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
     for known in ("usage limit", "rate.?limit", "quota"):
         assert known in patterns.group(1), f"{known!r} is not recognised"
     assert "exit 1" in body, "a usage-limit failure does not fail the run"
+    # A transient failure and a misconfiguration need opposite remedies, so they are not one
+    # classifier: "re-run this job" is the fix for a cap, a rate limit or a region refusal,
+    # and a lie for a model or variant that cannot be resolved at all - there the run cannot
+    # succeed until PREMORTEM_MODEL / PREMORTEM_VARIANT changes, and telling an operator to
+    # re-run sends them into a loop while the stage stays `error` for everyone. So the two
+    # classes are separated, and each message names its own remedy.
+    classes = re.findall(r"grep -qiE '([^']+)'", body)
+    assert len(classes) >= 2, (
+        "the failure classifier is one grep, so it cannot tell a cap from a misconfiguration"
+    )
+    transient, misconfigured = classes[0], classes[1]
+    for misconfiguration in ("no provider", "model (is )?(not (found|available|supported))"):
+        assert misconfiguration in misconfigured, (
+            f"{misconfiguration!r} is not classified as a configuration error"
+        )
+    for transient_only in ("usage limit", "not available in your country"):
+        assert transient_only not in misconfigured, (
+            f"{transient_only!r} is classified as a configuration error"
+        )
+    for configured_only in ("no provider", "unknown variant"):
+        assert configured_only not in transient, (
+            f"{configured_only!r} is classified as transient, so a permanent misconfiguration "
+            "would tell the operator to re-run"
+        )
+    errors = [line for line in body.splitlines() if "::error::" in line]
+    rerun = [line for line in errors if "re-run" in line]
+    assert rerun, "no message states the remedy"
+    assert any("PREMORTEM_MODEL" in line for line in errors), (
+        "a misconfiguration does not name the variable that has to change"
+    )
+    assert not any("re-run this job" in line for line in errors if "PREMORTEM_MODEL" in line), (
+        "a misconfiguration is told to re-run, which cannot succeed"
+    )
     # The reason is only in stderr. A failed run has ended with a bare "exit code 1" and no
     # cause, so a capped model and a broken prompt could not be told apart from the log: the
     # captured output is echoed, bounded so a runaway agent cannot flood the log.

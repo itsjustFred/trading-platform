@@ -115,11 +115,20 @@ concurrency:
   # that is analysing the current head - that run's cancellation reporter would
   # mark the head `error` and leave it with no analysis at all. A rerun naming
   # the same commit does cancel a stale run of that commit, which is the only
-  # supersession this group is for; a rerun that omits `head_sha` gets the
-  # `current-head` bucket, so it runs beside the push's run of that head rather
-  # than cancelling it (the two analyse the same diff, and the comment guard
-  # keeps whichever result lands last).
-  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ github.event.pull_request.head.sha || inputs.head_sha || 'current-head' }}
+  # supersession this group is for; a rerun that omits `head_sha` shares the
+  # `current-head` bucket with the push's run, so it supersedes it instead of
+  # running a second analysis of the same diff beside it (the comment guard keeps
+  # whichever result lands last).
+  #
+  # The bucket carries an analysed commit only when a *dispatch* names one. A push
+  # must not carry its head SHA here: every push would then land in a group of its
+  # own, so N pushes on one PR would run N 30-minute agent sessions side by side
+  # and exhaust the free model's usage cap, after which the stage stops producing
+  # a verdict for any PR at all. Keyed on the PR, pushes supersede one another and
+  # only the current head's analysis survives - which is the one the PR actually
+  # needs - while a dispatch of an older commit keeps its own bucket and still runs
+  # beside the push's run, which is the case the whole keying exists for.
+  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ inputs.head_sha || 'current-head' }}
   cancel-in-progress: true
 
 env:
@@ -431,8 +440,20 @@ jobs:
             # job reports the status as `error`, and the remedy is to re-run
             # this job - the same handling a transient failure gets from the
             # sibling workflows.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|model (is )?(not (found|available|supported))|no provider|unauthorized|forbidden|service unavailable|overloaded' "$out.stderr"; then
-              echo "::error::The pre-mortem agent could not run - the free model was denied, capped or unavailable (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: re-run this job; the stage status is reported as \`error\`."
+            # Two causes share this grep and need opposite remedies, so they are classified
+            # separately. A cap, a rate limit, an exhausted quota or a region refusal is
+            # transient - re-running the job is the fix. A model or variant that cannot be
+            # resolved at all (a typo'd PREMORTEM_MODEL, a variant the model does not offer,
+            # no provider for it, a rejected token) is not: the run cannot succeed until the
+            # repository variable changes, and telling an operator to re-run it would send
+            # them into a loop while the stage stays `error` for everyone. So only the first
+            # class says "re-run". A reason in neither class (an `unauthorized` that could be
+            # either) is left to the bare failure and the captured stderr above it, which is
+            # the reason itself - better than guessing for it.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.stderr"; then
+              echo "::error::The pre-mortem agent could not run - the free model was capped, rate-limited or refused by region (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: re-run this job; the stage status is reported as \`error\`."
+            elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
+              echo "::error::The pre-mortem agent could not resolve its model - PREMORTEM_MODEL / PREMORTEM_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes. The stage status is reported as \`error\`."
             fi
             exit 1
           fi
@@ -650,16 +671,30 @@ jobs:
       statuses: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # The commit the cancelled run analysed; empty when resolve was cancelled
-      # before it resolved the PR, in which case nothing was marked pending.
-      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      # The commit the cancelled run analysed, with the resolve reporter's fallback chain
+      # behind it: a job that is cancelled publishes no outputs, yet "Mark running"
+      # inside it may already have written the `pending` mark this job exists to clear - so
+      # an in-flight resolve leaves that mark stranded on its SHA with nothing but a
+      # warning in a log nobody opens. The event's head (or the dispatch input) is what
+      # keeps the mark clearable.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || github.event.pull_request.head.sha || inputs.head_sha }}
+      SAME_REPO: ${{ needs.resolve.outputs.same_repo }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report cancelled pre-mortem run
         run: |
           set -euo pipefail
+          # Fork PRs are never pre-mortemed: the resolve job guards its pending mark and the
+          # agent job on the same `same_repo` output, and a fork's head commit is not one this
+          # repository can write a status for - the read below would 404 on it. A cancelled run
+          # publishes no outputs, so an empty value is left to the ownership check below, which
+          # stops the reporter on anything this run did not write.
+          if [ "$SAME_REPO" = "false" ]; then
+            echo "::notice::A fork PR was not pre-mortemed; nothing was marked pending."
+            exit 0
+          fi
           if [ -z "$HEAD_SHA" ]; then
-            echo "::warning::Resolve wrote no head SHA; this run marked nothing pending."
+            echo "::warning::Resolve wrote no head SHA and the event named none; this run marked nothing pending."
             exit 0
           fi
           # A cancelled run is the case the identity check exists for: what cancelled it
