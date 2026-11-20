@@ -4,7 +4,7 @@
 runs a real backtest over the US500/30m dataset, so its whole module skips
 without that dataset — CI included. The interval guard next to it covers the
 timeframe refusal only. This module closes the remaining gap: it drives the real
-strategy file through the ``pyne`` CLI on synthetic 30m bars and pins the
+strategy file through the ``pyne`` CLI on synthetic bars and pins the
 ET-session state machine the typing work touched (opening-range accumulation,
 long/short breakout, one trade per ET day, forced exit at 15:45 ET).
 
@@ -16,28 +16,27 @@ so a signal on the 10:00 ET bar shows up as a trade row stamped 10:30 ET.
 """
 
 import csv
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+from tests.strategies.pyne_cli import pyne_bin, run_pyne
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STRATEGY_PATH = PROJECT_ROOT / "strategies" / "pynecore_orb" / "pynecore_orb.py"
-STRATEGY_TOML_PATH = STRATEGY_PATH.with_suffix(".toml")
-
-pyne_bin = shutil.which("pyne")
 
 pytestmark = pytest.mark.skipif(
     pyne_bin is None, reason="pyne CLI not on PATH"
 )
 
-# The 30m bar clock the strategy supports: one bar every 30 minutes from 09:00
-# to 16:30 ET (January = EST, UTC-5). 15:45 ET is the forced-exit bar; the bars
-# after it distinguish "closed by the forced exit" from "still open at the end
-# of the data".
+# The bar clock the strategy supports: a 30-minute grid from 09:00 to 16:30 ET
+# (January = EST, UTC-5) PLUS an extra 15:45 ET bar, so the forced-exit branch
+# is reachable on this synthetic clock. A real 30m grid cannot produce those
+# bars - it steps 15:30 ET -> 16:00 ET, and the strategy also allows 15m - and
+# the bars after 15:45 distinguish "closed by the forced exit" from "still open
+# at the end of the data".
 ET_CLOCK = [
     "09:00", "09:30", "10:00", "10:30", "11:00", "11:30", "12:00", "12:30",
     "13:00", "13:30", "14:00", "14:30", "15:00", "15:30", "15:45", "16:00",
@@ -54,7 +53,7 @@ _PRE_OR = (100.0, 150.0, 50.0, 100.0)  # 09:00 ET
 
 
 def _bars(path: Path, days: list[list[tuple[float, float, float, float]]]) -> None:
-    """Write one CSV of 30m bars for each list of ``(open, high, low, close)`` rows."""
+    """Write one CSV of bar rows for each list of ``(open, high, low, close)`` rows."""
     rows: list[tuple[float, float, float, float]] = []
     stamps: list[pd.Timestamp] = []
     for day_index, day in enumerate(days):
@@ -72,33 +71,9 @@ def _bars(path: Path, days: list[list[tuple[float, float, float, float]]]) -> No
 
 
 def _run(bars: Path, workdir: Path) -> list[dict[str, str]]:
-    # Copy the strategy and its .toml: pyne rewrites the sibling .toml with its
-    # own defaults as a side effect — never run it in place.
-    local_strategy = workdir / STRATEGY_PATH.name
-    local_strategy.write_text(STRATEGY_PATH.read_text())
-    if STRATEGY_TOML_PATH.exists():
-        (workdir / STRATEGY_TOML_PATH.name).write_text(STRATEGY_TOML_PATH.read_text())
-    trades = workdir / "trades.csv"
-    result = subprocess.run(
-        [
-            pyne_bin,
-            "--workdir",
-            str(workdir),
-            "run",
-            str(local_strategy),
-            str(bars),
-            "--trade",
-            str(trades),
-            "--strat",
-            str(workdir / "stats.csv"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=180,
-        cwd=str(workdir),
-    )
+    result = run_pyne(STRATEGY_PATH, bars, workdir)
     assert result.returncode == 0, result.stderr[-2000:]
-    with trades.open(newline="") as handle:
+    with (workdir / "trades.csv").open(newline="") as handle:
         return list(csv.DictReader(handle))
 
 
