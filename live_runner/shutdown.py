@@ -2,9 +2,14 @@
 
 Shutdown contract (see ``live_runner.daemon.run_daemon``):
 
-1. The first SIGINT/SIGTERM stops the daemon accepting new signals.
-2. An order submission that is already in flight is allowed to finish, up to a
+1. The first SIGINT/SIGTERM stops the daemon accepting new work: an order
+   submission, a trailing-stop amendment and a STOPPED enforcement sweep are
+   all refused once the flag is set.
+2. Broker work that is already in flight is allowed to finish, up to a
    timeout. Cancelling it mid-request would leave the broker outcome unknown.
+   Every kind of in-flight broker work shares one ledger (the coordinator's
+   in-flight count) so one bounded drain waits for all of them, before
+   anything is cancelled.
 3. Broker and signal-source connections are closed and the Twisted reactor's
    thread pool is released so the interpreter can exit.
 4. Exit code 0 on a clean shutdown, non-zero when a cleanup phase timed out.
@@ -12,7 +17,9 @@ Shutdown contract (see ``live_runner.daemon.run_daemon``):
 
 Shutdown NEVER cancels, closes or modifies open orders or positions at the
 broker. Positions belong to the strategy's own exit logic and the operator;
-a restart must find the account exactly as the daemon left it.
+a restart must find the account exactly as the daemon left it. The only
+broker mutations a shutdown lets run are ones the daemon had already started
+before the flag - and it lets them finish.
 
 Windows: ``SIGINT`` (Ctrl-C / Ctrl-Break) is delivered normally. ``SIGTERM`` is
 defined by the ``signal`` module but Windows has no way to deliver it (service
@@ -78,7 +85,7 @@ def force_exit(code: int = FORCED_EXIT_CODE) -> None:
 
 
 class ShutdownCoordinator:
-    """Shutdown flag, signal handling and in-flight submission accounting."""
+    """Shutdown flag, signal handling and in-flight broker-work accounting."""
 
     def __init__(self, *, force_exit_fn: Callable[[int], None] = force_exit) -> None:
         self._force_exit = force_exit_fn
@@ -100,6 +107,7 @@ class ShutdownCoordinator:
 
     @property
     def inflight(self) -> int:
+        """Broker work currently in flight: submissions and mutations alike."""
         return self._inflight
 
     def bind(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -146,11 +154,15 @@ class ShutdownCoordinator:
     # -- in-flight submission accounting ---------------------------------------------
 
     def begin_submission(self) -> bool:
-        """Register an order submission, or refuse it once shutdown was requested.
+        """Register in-flight broker work, or refuse it once shutdown was requested.
+
+        Covers an order submission and a broker mutation (a trailing-stop
+        amendment, a STOPPED cancel/flatten sweep) alike: both must be awaited
+        by the drain, and neither may start once shutdown was requested.
 
         Synchronous on purpose: the check and the registration happen with no
-        ``await`` between them, so the drain can never miss a submission that
-        passed the gate.
+        ``await`` between them, so the drain can never miss work that passed
+        the gate.
         """
         if self._requested:
             return False
@@ -160,6 +172,7 @@ class ShutdownCoordinator:
         return True
 
     def end_submission(self) -> None:
+        """Unregister in-flight broker work once the broker has answered it."""
         self._inflight = max(0, self._inflight - 1)
         if self._inflight == 0 and self._idle is not None:
             self._idle.set()

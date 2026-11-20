@@ -16,6 +16,7 @@ import pytest
 import live_runner.daemon as daemon
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from live_runner.base_adapter import ControlOutcome, LiveQuote, order_not_submitted
+from live_runner.shutdown import ShutdownCoordinator
 from shared.database import (
     clear_live_deployment_stopped_enforced,
     get_live_deployment,
@@ -154,6 +155,134 @@ def test_complete_sweep_marks_the_deployment_enforced(isolated_db_sandbox) -> No
     assert adapter.calls == ["cancel", "flatten", "orphan"]
     assert DEPLOYMENT_ID in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+class _HoldingAdapter(_ControlAdapter):
+    """A sweep adapter whose order cancel can be held open mid-request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        self.calls.append("cancel")
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return self.cancel
+
+
+class _RecordingScheduler:
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+
+def _drain(
+    coordinator: ShutdownCoordinator,
+    *,
+    loop_tasks: tuple[asyncio.Task[None], ...] = (),
+    drain_timeout: float = 5.0,
+) -> asyncio.Task[bool]:
+    return asyncio.get_running_loop().create_task(
+        daemon._shutdown_cleanup(
+            loop_tasks=loop_tasks,
+            active_listener_tasks={},
+            active_discord_tasks={},
+            active_discord_bot_tasks={},
+            active_discord_bots={},
+            active_adapters={},
+            scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+            shutdown=coordinator,
+            drain_timeout=drain_timeout,
+            cleanup_timeout=5.0,
+        )
+    )
+
+
+def test_a_running_stopped_sweep_is_drained_not_cancelled(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain must wait for a STOPPED cancel/flatten sweep that is running.
+
+    The sweep runs inside the deployment sync loop, one of the daemon's loop
+    tasks the shutdown cancels. Cancelling it mid-sweep leaves the account's
+    broker state unknown - an order may still be resting, a position may or may
+    not be closed - so the sweep is registered on the shutdown ledger and the
+    drain waits for it before any task is cancelled.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _HoldingAdapter()
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+
+    async def _probe() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        sweep = asyncio.create_task(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+        await asyncio.wait_for(adapter.entered.wait(), timeout=10)
+        assert coordinator.inflight == 1, "the sweep must be on the drain's ledger"
+        coordinator.request("SIGTERM")
+        cleanup = _drain(coordinator)
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the drain must wait for the running sweep"
+        adapter.release.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        await asyncio.gather(sweep, return_exceptions=True)
+        return ok
+
+    assert asyncio.run(_probe()) is True
+    # The running cancel was awaited to the end, and the sweeps that had not
+    # started yet are refused: the stop flag is set, so no new broker mutation
+    # may begin. The deployment stays unenforced and is retried.
+    assert adapter.cancelled is False, "the cancel was not cut off mid-request"
+    assert adapter.calls == ["cancel"]
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+def test_a_stopped_sweep_is_refused_once_shutdown_was_requested(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A STOPPED sweep must not start once the stop flag is set.
+
+    The money-safety action still has to happen, but not during teardown: the
+    deployment stays unenforced, so the next daemon start retries the whole
+    sweep instead of leaving a half-done one behind.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter()
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    coordinator.request("SIGTERM")
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+
+    assert adapter.calls == [], "no sweep may start after the stop flag"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+    assert any("shutting down" in r.getMessage() for r in caplog.records)
 
 
 def test_partial_flatten_does_not_stamp_and_does_not_sweep_orphans(

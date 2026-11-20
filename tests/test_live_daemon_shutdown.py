@@ -290,6 +290,28 @@ def test_second_signal_forces_an_immediate_exit(monkeypatch: pytest.MonkeyPatch)
     assert forced == [FORCED_EXIT_CODE]
 
 
+def test_the_default_force_exit_reaches_os_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second signal's production path is ``os._exit``: pin it, it skips cleanup.
+
+    A coordinator built without an injected ``force_exit_fn`` - what ``main()``
+    and every real daemon run use - must terminate the process through
+    ``os._exit`` with the forced-exit code, and only after the logs are flushed.
+    """
+    flushed: list[int] = []
+    exits: list[int] = []
+    monkeypatch.setattr(shutdown_module.logging, "shutdown", lambda: flushed.append(1))
+    monkeypatch.setattr(shutdown_module.os, "_exit", exits.append)
+
+    coordinator = ShutdownCoordinator()
+    coordinator.request("SIGTERM")
+    assert coordinator.request("SIGTERM") is False
+
+    coordinator.handle_signal(signal.SIGINT)
+
+    assert flushed == [1], "log handlers must be flushed before the interpreter is killed"
+    assert exits == [FORCED_EXIT_CODE]
+
+
 @needs_real_signals
 def test_handler_entry_point_reaches_the_coordinator_in_a_thread() -> None:
     """``signal.signal`` (not ``loop.add_signal_handler``) is what makes this work.
@@ -609,6 +631,70 @@ def test_gate_follows_an_injected_coordinator(isolated_db_sandbox: Any) -> None:
     assert adapter.cancelled is False
     # Not interrupted midway: both persistence steps happened.
     assert adapter.writes == ["broker-accepted", "recorded"]
+
+
+def test_the_drain_runs_before_the_listener_tasks_are_cancelled(
+    isolated_db_sandbox: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain must cover the submission a *listener task* owns.
+
+    Order submissions are owned by the listener task that dispatches the
+    signal, not by whoever asked for the shutdown. If the cleanup cancelled the
+    listeners before draining, that submission would be cancelled mid-request:
+    the daemon would never learn whether the order reached the broker. The
+    listener may only be cancelled once its submission has finished.
+    """
+    database, _, _ = isolated_db_sandbox
+    deployment = _seed_deployment(database)
+    coordinator = _new_coordinator()
+    # The order path counts on the coordinator this shutdown drains on.
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _GateAdapter()
+    events: list[str] = []
+
+    async def _listener() -> None:
+        try:
+            await _submit(adapter, deployment)
+            events.append("submitted")
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+
+    async def _probe() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        listener = asyncio.create_task(_listener())
+        await asyncio.wait_for(adapter.entered.wait(), timeout=10)
+        assert coordinator.inflight == 1
+        # The stop flag lands while the listener's order is half-way to the broker.
+        coordinator.request("SIGTERM")
+        cleanup = asyncio.create_task(
+            daemon._shutdown_cleanup(
+                loop_tasks=(),
+                active_listener_tasks={ACCOUNT_ID: listener},
+                active_discord_tasks={},
+                active_discord_bot_tasks={},
+                active_discord_bots={},
+                active_adapters={ACCOUNT_ID: adapter},
+                scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+                shutdown=coordinator,
+                drain_timeout=5.0,
+                cleanup_timeout=5.0,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the clean-up must wait for the listener's submission"
+        assert not listener.done(), "the listener may not be cancelled mid-submission"
+        adapter.release.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        await asyncio.gather(listener, return_exceptions=True)
+        return ok
+
+    assert asyncio.run(_probe()) is True
+    # Not interrupted midway: both persistence steps happened.
+    assert adapter.writes == ["broker-accepted", "recorded"]
+    assert adapter.cancelled is False
+    assert events == ["submitted", "cancelled"], "drained first, cancelled after"
 
 
 def test_no_new_submission_starts_after_the_stop_flag(

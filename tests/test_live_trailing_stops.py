@@ -10,6 +10,7 @@ state.
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from live_runner import daemon, trailing_stops
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from live_runner.base_adapter import BaseLiveAdapter, ProtectiveStop
 from live_runner.ctrader_adapter import CTraderLiveAdapter
+from live_runner.shutdown import EXIT_OK, ShutdownCoordinator
 from live_runner.trailing_stops import (
     TRAILING_RETRY_INITIAL_SECONDS,
     LiveTrailingStopManager,
@@ -89,6 +91,16 @@ class _ReplacingClient(_FakeTradingClient):
             for order in self.orders
             if order.symbol == symbol and order.order_type == "stop"
         ]
+
+
+class _RecordingScheduler:
+    """Scheduler stand-in: the shutdown drain test only observes it was stopped."""
+
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    async def stop(self) -> None:
+        self.stopped += 1
 
 
 def _bars(closes: list[float], *, start: datetime = T0) -> pd.DataFrame:
@@ -921,6 +933,160 @@ def test_trailing_loop_survives_a_failing_tick(monkeypatch, surfaced) -> None:
 
     assert ticks == [0, 1]
     assert "tick blew up" in surfaced[0][1]["error"]
+
+
+# ── shutdown drain: an amendment is broker work the drain must wait for ──────
+
+
+def test_a_running_stop_amendment_is_drained_not_cancelled(
+    live: _Live, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shutdown drain must wait for a running stop amendment.
+
+    The trailing loop runs in one of the daemon's loop tasks, which the shutdown
+    cancels. Cancelling it while it is mid-amendment leaves the broker outcome
+    unknown: the daemon never learns whether the stop moved, and the broker's
+    own state decides what is in force. So the amendment is registered on the
+    shutdown ledger, the drain waits for it, and only then is the loop task
+    cancelled.
+    """
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    manager = LiveTrailingStopManager(mutation_gate=daemon._broker_mutation)
+
+    started = threading.Event()
+    release = threading.Event()
+    replace = live.client.replace_order_by_id
+
+    def _held_replace(order_id, order_data=None):
+        started.set()
+        release.wait(timeout=30)
+        return replace(order_id, order_data)
+
+    live.client.replace_order_by_id = _held_replace  # type: ignore[method-assign]
+    live.closes.append(103.0)
+
+    async def _probe() -> tuple[bool, bool]:
+        coordinator.bind(asyncio.get_running_loop())
+        loop_task = asyncio.create_task(
+            trailing_stops.run_trailing_stops_loop(
+                manager,
+                eligible_adapters=lambda: {ACCOUNT: live.adapter},
+                current_deployments=lambda: [live.deployment],
+                interval_seconds=3600,
+            ),
+            name="trailing-stops-loop",
+        )
+        # The tick's market data and stop listing are synchronous fakes; the
+        # amendment itself is what the test holds open.
+        await asyncio.to_thread(started.wait, 30)
+        assert coordinator.inflight == 1, "the amendment must be on the drain's ledger"
+        coordinator.request("SIGTERM")
+        cleanup = asyncio.create_task(
+            daemon._shutdown_cleanup(
+                loop_tasks=(loop_task,),
+                active_listener_tasks={},
+                active_discord_tasks={},
+                active_discord_bot_tasks={},
+                active_discord_bots={},
+                active_adapters={},
+                scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+                shutdown=coordinator,
+                drain_timeout=5.0,
+                cleanup_timeout=5.0,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the drain must wait for the running amendment"
+        release.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        cancelled = loop_task.cancelled()
+        if not cancelled:
+            await asyncio.gather(loop_task, return_exceptions=True)
+        return ok, cancelled
+
+    ok, cancelled = asyncio.run(_probe())
+    assert ok is True, "an amendment that finished in time is not a shutdown failure"
+    assert cancelled is True, "the loop task is cancelled only after the drain"
+    assert live.client.replace_calls == [("stop-1", 101.97)], "the amendment completed"
+    assert live.client.stop_prices() == [101.97]
+
+
+def test_the_daemon_drains_an_amendment_its_own_trailing_loop_started(
+    live: _Live, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through ``run_daemon``: the wiring itself must drain.
+
+    The trailing loop is one of the daemon's own loop tasks, so a registration
+    that lives only in a test would not save a real shutdown: the loop task is
+    cancelled by the cleanup, and only the drain - running first, on the run's
+    coordinator - keeps that cancellation away from a running amendment.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    replace = live.client.replace_order_by_id
+
+    def _held_replace(order_id, order_data=None):
+        started.set()
+        release.wait(timeout=30)
+        return replace(order_id, order_data)
+
+    live.client.replace_order_by_id = _held_replace  # type: ignore[method-assign]
+    live.closes.append(103.0)
+
+    async def _connect(account_ids, account_lookup, active_adapters, **kwargs):
+        # The sandbox account's adapter instead of a real broker connection.
+        active_adapters[ACCOUNT] = live.adapter
+
+    # No execution listener: the sandbox has no broker to listen to, and this
+    # test is about the trailing loop the daemon starts itself.
+    monkeypatch.setattr(daemon, "_connect_active_accounts", _connect)
+    monkeypatch.setattr(daemon, "_start_missing_tasks", lambda *args, **kwargs: None)
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+
+    async def _probe() -> int:
+        task = asyncio.get_running_loop().create_task(
+            daemon.run_daemon(
+                accounts_env=Path("/nonexistent/accounts.env"),
+                shutdown=coordinator,
+                install_signal_handlers=False,
+                drain_timeout_seconds=5.0,
+                cleanup_timeout_seconds=5.0,
+            )
+        )
+        # The daemon's own trailing loop reaches the amendment on its first tick.
+        await asyncio.to_thread(started.wait, 30)
+        assert coordinator.inflight == 1
+        coordinator.request("SIGTERM")
+        await asyncio.sleep(0.05)
+        assert not task.done(), "the daemon must drain the amendment, not exit past it"
+        release.set()
+        return await asyncio.wait_for(task, timeout=60)
+
+    assert asyncio.run(_probe()) == EXIT_OK
+    assert live.client.replace_calls == [("stop-1", 101.97)], "the amendment completed"
+    assert live.client.stop_prices() == [101.97]
+
+
+def test_a_stop_amendment_is_refused_once_shutdown_was_requested(
+    live: _Live, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop amendment must not START once the stop flag is set.
+
+    Refusing it is the safe direction: the previous broker-side stop stays in
+    force, the bars stay unprocessed, and the next pass recomputes the same
+    target. Sending one instead would amend a broker order while the daemon is
+    tearing down the connections it was sent through.
+    """
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    coordinator.request("SIGTERM")
+    manager = LiveTrailingStopManager(mutation_gate=daemon._broker_mutation)
+
+    live.feed(manager, [103.0])
+
+    assert live.client.replace_calls == [], "no amendment may start after the stop flag"
+    assert live.client.stop_prices() == [98.0], "the broker-side stop is untouched"
 
 
 def test_prepared_order_keeps_the_trailing_config_that_gets_persisted() -> None:

@@ -11,7 +11,7 @@ import re
 import sys
 import uuid
 import weakref
-from collections.abc import Awaitable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -2605,25 +2605,55 @@ async def _prepare_discord_signal_for_submission(
     return normalized_signal
 
 
-# Process-wide shutdown state. Order submissions deep in the listener tasks
-# consult it (``_begin_submission``) without it being threaded through every
-# call; ``run_daemon`` binds it to its loop and drives the shutdown sequence.
+# Process-wide shutdown state. Broker work deep in the listener tasks and the
+# daemon's own loops consults it (``_begin_submission``, ``_broker_mutation``)
+# without it being threaded through every call; ``run_daemon`` binds it to its
+# loop and drives the shutdown sequence.
 _SHUTDOWN = ShutdownCoordinator()
 # The coordinator THIS process actually runs on. It is ``_SHUTDOWN`` in
 # production, and whatever a test injects into ``run_daemon(shutdown=...)``
 # there. The gate and the drain must sit on the same object: a drain that
-# counts a different coordinator's submissions sees an always-zero in-flight
-# count, waits for nothing, and then cancels an order submission that was
-# halfway to the broker - the exact failure graceful shutdown exists to prevent.
+# counts a different coordinator's in-flight work sees an always-zero count,
+# waits for nothing, and then cancels an order submission that was halfway to
+# the broker - the exact failure graceful shutdown exists to prevent.
 _ACTIVE_SHUTDOWN: ShutdownCoordinator = _SHUTDOWN
 
 
 def _begin_submission() -> bool:
+    """Register in-flight broker work (order submission or mutation)."""
     return _ACTIVE_SHUTDOWN.begin_submission()
 
 
 def _end_submission() -> None:
+    """Unregister it once the broker has answered."""
     _ACTIVE_SHUTDOWN.end_submission()
+
+
+@contextlib.asynccontextmanager
+async def _broker_mutation() -> AsyncIterator[bool]:
+    """Count one broker mutation on the shutdown ledger for the drain to see.
+
+    A broker mutation - a trailing-stop amendment, a stopped deployment's
+    cancel/flatten sweep - has the same two requirements as an order submission,
+    and the two share one in-flight ledger (an order submission *is* a broker
+    mutation):
+
+    * it must not START once shutdown was requested (yields ``False``). Sending
+      one would mutate a broker order through connections the daemon is tearing
+      down; the caller skips the mutation instead, which leaves the money-safety
+      action for the next pass or the next start to retry.
+    * one that is already running must be awaited by the shutdown drain. The
+      daemon's loops run in tasks the shutdown cancels, so an unregistered
+      mutation would be cancelled out from under the broker request and the
+      daemon could never say whether the broker applied it.
+    """
+    if not _begin_submission():
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _end_submission()
 
 
 async def _submit_normalized_discord_signal(
@@ -4599,33 +4629,51 @@ async def _enforce_stopped_deployments(
                 )
             continue
 
-        cancel_error: Exception | None = None
-        try:
-            cancelled = (
-                await adapter.cancel_open_orders()
-                if adapter.supports_cancel_orders
-                else None
-            )
-        except NotImplementedError:
-            cancelled = None
-        except Exception as exc:
-            # Still flatten. The cancel failing says nothing about whether the
-            # positions can be closed - the Alpaca flatten cancels its own
-            # per-symbol orders - and leaving exposure open to protect a
-            # cosmetic ordering rule is the wrong trade.
-            cancelled = None
-            cancel_error = exc
-            logger.error(
-                "Failed to cancel open orders for stopped deployment; flattening "
-                "anyway",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
+        # A STOPPED sweep is broker work: the shutdown drain must wait for one
+        # that is running (``_broker_mutation``), and none may start once the
+        # stop flag is set. Refusing it leaves the deployment unenforced, so the
+        # next tick - or the next daemon start - retries the whole sweep.
+        async with _broker_mutation() as may_sweep:
+            if not may_sweep:
+                logger.warning(
+                    "Skipping the STOPPED enforcement sweep: the daemon is "
+                    "shutting down; the deployment stays unenforced and the "
+                    "cancel/flatten is retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+                continue
+            cancel_error: Exception | None = None
+            try:
+                cancelled = (
+                    await adapter.cancel_open_orders()
+                    if adapter.supports_cancel_orders
+                    else None
+                )
+            except NotImplementedError:
+                cancelled = None
+            except Exception as exc:
+                # Still flatten. The cancel failing says nothing about whether
+                # the positions can be closed - the Alpaca flatten cancels its
+                # own per-symbol orders - and leaving exposure open to protect a
+                # cosmetic ordering rule is the wrong trade.
+                cancelled = None
+                cancel_error = exc
+                logger.error(
+                    "Failed to cancel open orders for stopped deployment; "
+                    "flattening anyway",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                            "error": repr(exc),
+                        }
+                    },
+                )
 
         # A partial cancel must not stop the flatten: closing the positions is
         # the money-safety action, and the remaining order is retried on the
@@ -4658,24 +4706,38 @@ async def _enforce_stopped_deployments(
                 },
             )
 
-        try:
-            flattened = (
-                await adapter.close_all_positions() if adapter.supports_flatten else None
-            )
-        except NotImplementedError:
-            flattened = None
-        except Exception as exc:
-            logger.error(
-                "Failed to flatten positions for stopped deployment",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
-            continue
+        async with _broker_mutation() as may_sweep:
+            if not may_sweep:
+                logger.warning(
+                    "Skipping the STOPPED enforcement flatten: the daemon is "
+                    "shutting down; the deployment stays unenforced and is "
+                    "retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+                continue
+            try:
+                flattened = (
+                    await adapter.close_all_positions() if adapter.supports_flatten else None
+                )
+            except NotImplementedError:
+                flattened = None
+            except Exception as exc:
+                logger.error(
+                    "Failed to flatten positions for stopped deployment",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                            "error": repr(exc),
+                        }
+                    },
+                )
+                continue
 
         if flattened is None:
             logger.error(
@@ -4709,24 +4771,38 @@ async def _enforce_stopped_deployments(
         # retries; only an adapter that has no such concept may stamp without
         # one.
         orphan_sweep_unsupported = False
-        try:
-            orphaned = await adapter.cancel_orphaned_protections()
-        except NotImplementedError:
-            orphaned = None
-            orphan_sweep_unsupported = True
-        except Exception as exc:
-            logger.error(
-                "Failed to sweep protections orphaned by the flatten; the account "
-                "is flat but a resting protection could still trigger",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
-            orphaned = None
+        async with _broker_mutation() as may_sweep:
+            if not may_sweep:
+                logger.warning(
+                    "Skipping the STOPPED orphaned-protection sweep: the daemon "
+                    "is shutting down; the deployment stays unenforced and is "
+                    "retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+                continue
+            try:
+                orphaned = await adapter.cancel_orphaned_protections()
+            except NotImplementedError:
+                orphaned = None
+                orphan_sweep_unsupported = True
+            except Exception as exc:
+                logger.error(
+                    "Failed to sweep protections orphaned by the flatten; the "
+                    "account is flat but a resting protection could still trigger",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                            "error": repr(exc),
+                        }
+                    },
+                )
+                orphaned = None
         if orphan_sweep_unsupported:
             logger.warning(
                 "Adapter cannot identify orphaned protections; the account is flat "
@@ -5289,22 +5365,32 @@ async def _shutdown_cleanup(
 ) -> bool:
     """Bounded shutdown sequence. Returns True when every phase completed in time.
 
+    The drain comes first and covers every kind of in-flight broker work (an
+    order submission, a stop amendment, a stopped-deployment sweep): cancelling
+    any of them mid-request would leave the broker outcome unknown. Only after
+    it is anything cancelled, and by then no broker request can be started.
+
     SAFETY: this only stops the daemon and closes its own connections. It must
     never cancel or close broker orders or positions (no ``close_all_positions``,
     ``cancel_open_orders`` or equivalent): they belong to the strategy exits and
-    the operator, and a restart must find the account as it was left.
+    the operator, and a restart must find the account as it was left. The only
+    broker mutations a shutdown lets run are ones the daemon had already started
+    before the stop flag - and it lets them finish.
     """
     ok = True
-    # 1. Stop the loops that would start new adapters/listeners or poll balances.
-    await _cancel_and_wait(loop_tasks)
-
-    # 2. Let an order that is already being sent finish. Listener tasks are still
-    #    running here, so the awaiting submission is not cancelled out from under
-    #    the broker request. New submissions are refused by the shutdown gate.
+    # 1. Let the broker work that is already in flight finish: an order
+    #    submission a listener task owns, a trailing-stop amendment, a stopped
+    #    deployment's cancel/flatten sweep. All three register on the
+    #    coordinator's in-flight ledger, so the drain waits for them here -
+    #    before anything is cancelled. Cancelling one of them would leave the
+    #    broker outcome unknown. Nothing new can start meanwhile: the stop flag
+    #    is set before this runs and the gate refuses new broker work, so the
+    #    ledger can only shrink.
     if not await shutdown.wait_idle(drain_timeout):
         ok = False
         logger.error(
-            "Shutdown timed out waiting for in-flight order submissions; "
+            "Shutdown timed out waiting for in-flight broker work (order "
+            "submissions, stop amendments, stopped-deployment sweeps); "
             "their broker outcome is unknown and needs reconciliation",
             extra={
                 "data": {
@@ -5313,6 +5399,11 @@ async def _shutdown_cleanup(
                 }
             },
         )
+
+    # 2. Stop the loops that would start new adapters/listeners or poll
+    #    balances. Every broker mutation they could run is either finished or
+    #    refused by the gate, so cancelling them starts no broker request.
+    await _cancel_and_wait(loop_tasks)
 
     # 3. Stop listening for signals / executions.
     ok &= await _bounded(
@@ -5419,7 +5510,9 @@ async def run_daemon(
         balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
         trailing_task = asyncio.create_task(
             run_trailing_stops_loop(
-                LiveTrailingStopManager(),
+                # A stop amendment is a broker mutation the shutdown drain must
+                # wait for, and must not start once the stop flag is set.
+                LiveTrailingStopManager(mutation_gate=_broker_mutation),
                 eligible_adapters=lambda: _trailing_eligible_adapters(active_adapters),
                 current_deployments=lambda: list(deployment_snapshot),
             ),

@@ -94,6 +94,13 @@ TRAILING_BAR_GRACE_SECONDS = 900
 
 EntrySignalLoader = Callable[[list[str], list[str]], dict[str, dict[str, Any]]]
 
+#: The daemon's shutdown drain guard for one broker mutation:
+#: ``async with gate() as may_mutate`` registers the mutation so the shutdown
+#: drain waits for it instead of cancelling a request whose broker outcome is
+#: unknown, and refuses it (``may_mutate`` False) once shutdown was requested.
+#: The live daemon injects ``live_runner.daemon._broker_mutation``.
+BrokerMutationGate = Callable[[], contextlib.AbstractAsyncContextManager[bool]]
+
 
 def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:
     """Trailing modes the live path executes through this adapter instance.
@@ -237,9 +244,11 @@ class LiveTrailingStopManager:
         *,
         load_entry_signals: EntrySignalLoader = find_latest_filled_live_entry_signals,
         risk_engine: RiskEngine | None = None,
+        mutation_gate: BrokerMutationGate | None = None,
     ) -> None:
         self._load_entry_signals = load_entry_signals
         self._risk_engine = risk_engine or RiskEngine()
+        self._mutation_gate = mutation_gate
         self._trails: dict[tuple[str, str], _Trail] = {}
         self._schedules: dict[str, _AccountSchedule] = {}
 
@@ -407,6 +416,24 @@ class LiveTrailingStopManager:
             except Exception as exc:
                 needs_retry |= self._record_failure(key, entry, exc, context, moment)
         return needs_retry
+
+    async def _amend_stop(
+        self, adapter: BaseLiveAdapter, current: ProtectiveStop, target: float
+    ) -> ProtectiveStop | None:
+        """Amend the broker-side stop under the shutdown drain guard.
+
+        ``None`` means the daemon refused to start this mutation because it is
+        shutting down; the caller then leaves the bars unprocessed. An amendment
+        that was allowed to start is registered on the shutdown ledger, so the
+        shutdown drain waits for it rather than cancelling a request whose
+        broker outcome is unknown.
+        """
+        if self._mutation_gate is None:
+            return await adapter.amend_protective_stop(current, target)
+        async with self._mutation_gate() as may_mutate:
+            if not may_mutate:
+                return None
+            return await adapter.amend_protective_stop(current, target)
 
     @staticmethod
     async def _read_positions(adapter: BaseLiveAdapter) -> dict[str, Mapping[str, Any]]:
@@ -649,7 +676,14 @@ class LiveTrailingStopManager:
         )
         if improves:
             context["target_stop"] = target
-            amended = await adapter.amend_protective_stop(current, target)
+            amended = await self._amend_stop(adapter, current, target)
+            if amended is None:
+                # The daemon is shutting down and refused to start a broker
+                # mutation: leave these bars unprocessed so the next pass
+                # recomputes the same target instead of skipping it, and come
+                # back early rather than recording progress that did not
+                # happen.
+                return True
             logger.info(
                 "Trailed live stop",
                 extra={
