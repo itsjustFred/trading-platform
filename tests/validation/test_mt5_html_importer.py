@@ -375,3 +375,79 @@ class TestPositionFillClassification:
         assert evidence["orphan_exit_count"] == 1
         assert evidence["residual_positions"][0]["residual_quantity"] == pytest.approx(0.10)
         assert evidence["orphan_exits"][0]["exit_quantity"] == pytest.approx(0.10)
+
+
+class TestEnglishReport:
+    """CI runs an English terminal, so the report is English.
+
+    The fixture is a real Strategy Tester report (build 6327) from the
+    mt5-backtest workflow: UTF-16LE, English labels, and the whole report in a
+    single <table> with the Orders and Deals sections one after the other.
+    """
+
+    def _load(self) -> ValidationReference:
+        return MT5HTMLImporter().load(
+            Path("tests/fixtures/validation/mt5_html/sample_report_en_utf16.htm")
+        )
+
+    def test_meta_is_read_from_english_labels(self):
+        ref = self._load()
+        assert ref.strategy_name == "IntradayVolatilityBreakout"
+        assert ref.symbol == "EURUSD_CI"
+        assert ref.timeframe.lower() == "h1"
+
+    def test_trades_are_reconstructed(self):
+        ref = self._load()
+        assert len(ref.trades) == 5
+        assert [t.direction for t in ref.trades] == [
+            "LONG",
+            "SHORT",
+            "LONG",
+            "LONG",
+            "SHORT",
+        ]
+
+    def test_trade_fields(self):
+        ref = self._load()
+        first = ref.trades[0]
+        assert first.entry_time == "2026-03-02T16:45:00Z"
+        assert first.entry_price == pytest.approx(1.17170)
+        assert first.quantity == pytest.approx(4.4)
+        assert first.stop_loss == pytest.approx(1.17057)
+        assert first.pnl == pytest.approx(-497.20)
+        assert first.exits[0].time == "2026-03-02T17:15:40Z"
+        assert first.exits[0].reason == "stop_loss"
+
+    def test_stats_are_read_from_english_labels(self):
+        ref = self._load()
+        assert ref.stats["total_trades"] == pytest.approx(5)
+        assert ref.stats["total_pnl"] == pytest.approx(-1173.41)
+        assert ref.stats["profit_factor"] == pytest.approx(0.25)
+        assert ref.stats["win_rate"] == pytest.approx(20.0)
+
+    def test_stats_after_a_spacer_cell_are_not_shifted(self):
+        """Rows that start with an empty colspan cell still pair label with value."""
+        ref = self._load()
+        assert ref.stats["max_winner"] == pytest.approx(389.50)
+        assert ref.stats["max_loser"] == pytest.approx(-498.64)
+        assert ref.stats["avg_winner"] == pytest.approx(389.50)
+        assert ref.stats["avg_loser"] == pytest.approx(-390.73)
+        assert ref.stats["avg_consecutive_wins"] == pytest.approx(1)
+        assert ref.stats["avg_consecutive_losses"] == pytest.approx(2)
+
+    def test_equity_drawdowns_are_numbers(self):
+        ref = self._load()
+        assert ref.stats["max_drawdown_equity_pct"] == pytest.approx(1.73)
+        assert ref.stats["max_drawdown_equity_max_pct"] == pytest.approx(1.73)
+        assert ref.stats["max_drawdown_equity_abs"] == pytest.approx(1732.15)
+
+
+class TestGermanReportStats:
+    """The German fixture lays stats out as label, value, label, value."""
+
+    def test_two_pairs_per_row_are_parsed(self):
+        ref = MT5HTMLImporter().load(_sample_path())
+        assert ref.stats["total_trades"] == pytest.approx(5)
+        assert ref.stats["profit_factor"] == pytest.approx(2.15)
+        assert ref.stats["avg_winner"] == pytest.approx(700.00)
+        assert ref.stats["max_drawdown_pct"] == pytest.approx(5.52)

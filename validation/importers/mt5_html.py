@@ -1,4 +1,4 @@
-"""MT5 Strategy Tester HTML importer (German UI)."""
+"""MT5 Strategy Tester HTML importer (German and English UI)."""
 
 from __future__ import annotations
 
@@ -24,11 +24,7 @@ from validation.reference import ValidationReference
 
 logger = logging.getLogger(__name__)
 
-# German labels we scan for when locating tables
-_ORDERS_LABELS = ("Orders", "Order", "Aufträge")
-_TRADES_LABELS = ("Trades", "Deals", "Geschäfte")
-
-# Known German stat labels → canonical keys
+# Known stat labels (German and English) → canonical keys
 _STAT_LABELS = [
     ("Gesamtanzahl Trades", "total_trades"),
     ("Gewonnene Trades (in % von Gesamt)", "winners_with_pct"),
@@ -66,6 +62,42 @@ _STAT_LABELS = [
     ("Größter Verlusttrade", "max_loser"),
     ("Durchschnitt Gewinntrades in Folge", "avg_consecutive_wins"),
     ("Durchschnitt Verlusttrades in Folge", "avg_consecutive_losses"),
+    # English UI (report language follows the terminal UI language; CI runs an
+    # English windows-latest runner).
+    ("Total Trades", "total_trades"),
+    ("Profit Trades (% of total)", "winners_with_pct"),
+    ("Loss Trades (% of total)", "losers_with_pct"),
+    ("Total Net Profit", "total_pnl"),
+    ("Profit Factor", "profit_factor"),
+    ("Sharpe Ratio", "sharpe_ratio"),
+    ("Balance Drawdown Relative", "max_drawdown_pct"),
+    ("Balance Drawdown Absolute", "max_drawdown_abs"),
+    ("Balance Drawdown Maximal", "max_drawdown_max"),
+    ("Equity Drawdown Relative", "max_drawdown_equity_pct"),
+    ("Equity Drawdown Maximal", "max_drawdown_equity_max"),
+    ("Average profit trade", "avg_winner"),
+    ("Average loss trade", "avg_loser"),
+    ("Maximum consecutive wins ($)", "max_consecutive_wins"),
+    ("Maximum consecutive wins (count)", "max_consecutive_wins"),
+    ("Maximum consecutive losses ($)", "max_consecutive_losses"),
+    ("Maximum consecutive losses (count)", "max_consecutive_losses"),
+    ("Average consecutive wins", "avg_consecutive_wins"),
+    ("Average consecutive losses", "avg_consecutive_losses"),
+    ("Gross Profit", "gross_profit"),
+    ("Gross Loss", "gross_loss"),
+    ("Recovery Factor", "recovery_factor"),
+    ("Expected Payoff", "expected_payoff"),
+    ("LR Correlation", "lr_correlation"),
+    ("LR Standard Error", "lr_std_error"),
+    ("Minimal position holding time", "min_holding_time"),
+    ("Maximal position holding time", "max_holding_time"),
+    ("Short Trades (won %)", "sell_positions"),
+    ("Long Trades (won %)", "buy_positions"),
+    ("Total Deals", "total_deals"),
+    ("Largest profit trade", "max_winner"),
+    ("Largest loss trade", "max_loser"),
+    ("Correlation (Profits,MFE)", "corr_profit_mfe"),
+    ("Correlation (Profits,MAE)", "corr_profit_mae"),
 ]
 
 _STAT_LABEL_MAP: dict[str, str] = {}
@@ -73,6 +105,15 @@ for label, key in _STAT_LABELS:
     _STAT_LABEL_MAP[label.rstrip(":")] = key
     _STAT_LABEL_MAP[label] = key
     _STAT_LABEL_MAP[label.rstrip(" :")] = key
+
+# Drawdown stats carry "pct% (absolute)" or "absolute (pct%)"; map the label
+# key to (percentage key, absolute key).
+_DRAWDOWN_KEYS: dict[str, tuple[str, str]] = {
+    "max_drawdown_pct": ("max_drawdown_pct", "max_drawdown_abs"),
+    "max_drawdown_max": ("max_drawdown_max_pct", "max_drawdown_abs"),
+    "max_drawdown_equity_pct": ("max_drawdown_equity_pct", "max_drawdown_equity_abs"),
+    "max_drawdown_equity_max": ("max_drawdown_equity_max_pct", "max_drawdown_equity_abs"),
+}
 
 
 class MT5HTMLImporter(BaseImporter):
@@ -103,7 +144,14 @@ class MT5HTMLImporter(BaseImporter):
             if not path.is_file():
                 raise ValueError(f"MT5 HTML report is not a file: {path}")
 
-            html_text = path.read_text(encoding="utf-8", errors="replace")
+            # The tester writes the report as UTF-16LE with a BOM; older
+            # exports and fixtures are UTF-8. Decode by BOM so neither is
+            # mangled into unreadable labels.
+            raw_bytes = path.read_bytes()
+            if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+                html_text = raw_bytes.decode("utf-16", errors="replace")
+            else:
+                html_text = raw_bytes.decode("utf-8", errors="replace")
             soup = BeautifulSoup(html_text, kwargs.pop("features", "lxml"))
 
             meta = self._parse_meta(soup)
@@ -111,25 +159,20 @@ class MT5HTMLImporter(BaseImporter):
             stats = self._parse_stats(soup, initial_capital=meta.get("initial_capital"))
             raw_metadata = {"parsed_meta": meta, "parsed_stats": stats}
 
-            # Locate Orders and Trades tables
-            orders_table = self._find_table_by_header_keywords(
-                soup,
-                _ORDERS_LABELS,
-                required_cols=["Auftrag"],
-            )
-            trades_table = self._find_table_by_header_keywords(
-                soup,
-                _TRADES_LABELS,
-                required_cols=["Zeit", "Richtung"],
-            )
+            # Locate the Orders and Deals sections. The tester writes one
+            # table for the whole report, so a section starts at its header
+            # row (identified by its columns) and ends at the next row that is
+            # not a data row.
+            orders_rows = self._find_section_rows(soup, "orders")
+            deals_rows = self._find_section_rows(soup, "deals")
 
-            if orders_table is None:
+            if orders_rows is None:
                 raise ValueError("Could not locate 'Orders' table in the HTML report.")
-            if trades_table is None:
+            if deals_rows is None:
                 raise ValueError("Could not locate 'Trades' table in the HTML report.")
 
-            sltp_map = self._build_sltp_map(orders_table)
-            trades, fill_summary = self._build_trades(trades_table, sltp_map, source_timezone)
+            sltp_map = self._build_sltp_map(orders_rows)
+            trades, fill_summary = self._build_trades(deals_rows, sltp_map, source_timezone)
             raw_metadata["position_fills"] = fill_summary
             raw_metadata["open_positions"] = fill_summary
             if fill_summary.get("open_position_count_including_partial"):
@@ -158,58 +201,52 @@ class MT5HTMLImporter(BaseImporter):
     # ── helpers ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _find_table_by_header_keywords(
+    def _find_section_rows(
         soup: BeautifulSoup,
-        keywords: tuple[str, ...],
-        required_cols: list[str] | None = None,
-    ) -> BeautifulSoup | None:
-        """Find the first <table> whose header contains a keyword *and* required columns."""
+        kind: str,
+    ) -> list[list[str]] | None:
+        """Return the header row and data rows of the Orders or Deals section.
+
+        A report is either split into one table per section or written as a
+        single table (current builds). Both are handled by scanning every row
+        for a header row with the section's columns: Orders carry Auftrag/Order plus
+        S / L, Deals carry Richtung/Direction (and no S / L).
+        """
         for table in soup.find_all("table"):
-            thead = table.find("thead")
-            header_row = None
-            if thead:
-                header_row = thead.find("tr")
-            if header_row is None:
-                rows = table.find_all("tr", recursive=False)
-                if not rows:
-                    rows = table.find_all("tr")
-                if rows:
-                    header_row = rows[0]
-            if header_row is None:
-                continue
-
-            header_text = header_row.get_text(separator=" ", strip=True).lower()
-            header_cells = [
-                cell.get_text(strip=True).lower()
-                for cell in header_row.find_all(("td", "th"))
-            ]
-
-            # Also check preceding sibling heading or caption
-            preceding_text = ""
-            prev = table.find_previous_sibling()
-            for _ in range(3):
-                if prev is None:
-                    break
-                tag_name = prev.name or ""
-                if tag_name in ("h1", "h2", "h3", "h4", "caption", "div", "p"):
-                    preceding_text += " " + prev.get_text(separator=" ", strip=True).lower()
-                prev = prev.find_previous_sibling()
-
-            combined = header_text + " " + preceding_text
-            keyword_match = any(kw.lower() in combined for kw in keywords)
-            if not keyword_match:
-                continue
-
-            if required_cols:
-                if not any(req.lower() in header_cells for req in required_cols):
-                    continue
-
-            return table
+            rows = MT5HTMLImporter._table_to_rows(table)
+            for index, header in enumerate(rows):
+                cells = {cell.strip().lower() for cell in header}
+                has_time = bool(cells & {"zeit", "time", "open time"})
+                has_direction = bool(cells & {"richtung", "direction"})
+                has_order = bool(cells & {"auftrag", "order"})
+                has_price = bool(cells & {"preis", "price"})
+                has_sltp = bool(cells & {"s / l", "s/l"})
+                if kind == "orders" and has_order and has_sltp:
+                    return [header] + MT5HTMLImporter._data_rows(rows[index + 1 :], len(header))
+                if (
+                    kind == "deals"
+                    and has_time
+                    and has_direction
+                    and has_price
+                    and not has_sltp
+                ):
+                    return [header] + MT5HTMLImporter._data_rows(rows[index + 1 :], len(header))
         return None
 
     @staticmethod
-    def _table_to_rows(table: BeautifulSoup) -> list[list[str]]:
-        """Convert a <table> to a list of string-tokenised rows."""
+    def _data_rows(rows: list[list[str]], width: int) -> list[list[str]]:
+        """Keep the rows that belong to the section: same width, not empty."""
+        return [
+            row
+            for row in rows
+            if len(row) == width and any(cell.strip() for cell in row)
+        ]
+
+    @staticmethod
+    def _table_to_rows(table: BeautifulSoup | list[list[str]]) -> list[list[str]]:
+        """Convert a <table> (or an already tokenised row list) to rows."""
+        if isinstance(table, list):
+            return [list(row) for row in table]
         rows: list[list[str]] = []
         for tr in table.find_all("tr"):
             cells = tr.find_all(("td", "th"))
@@ -251,19 +288,19 @@ class MT5HTMLImporter(BaseImporter):
     @staticmethod
     def _apply_meta_label(label: str, val: str, meta: dict[str, Any]) -> None:
         """Apply one 'label: value' meta row to the meta dict."""
-        if label == "Expertenprogramm:":
+        if label in ("Expertenprogramm:", "Expert:"):
             meta["strategy_name"] = val if val else "unknown"
         elif label == "Symbol:":
             meta["symbol"] = val
-        elif label == "Periode:":
+        elif label in ("Periode:", "Period:"):
             tf_match = re.search(r"^(\w+)\s*\(", val)
             meta["timeframe"] = tf_match.group(1).lower() if tf_match else val.lower()
-        elif label == "Ersteinlage:":
+        elif label in ("Ersteinlage:", "Initial Deposit:"):
             try:
                 meta["initial_capital"] = float(val.replace(" ", "").replace(",", "."))
             except (ValueError, TypeError):
                 meta["initial_capital"] = None
-        elif label == "Hebel:":
+        elif label in ("Hebel:", "Leverage:"):
             meta["leverage"] = val
 
     @staticmethod
@@ -306,26 +343,12 @@ class MT5HTMLImporter(BaseImporter):
 
         for table in soup.find_all("table"):
             for tr in table.find_all("tr"):
-                cells = tr.find_all(("td", "th"))
-                if not cells:
-                    continue
-                # Stats can be laid out as label-value pairs across columns
-                for i in range(0, len(cells) - 1, 2):
-                    label = cells[i].get_text(strip=True)
-                    val = cells[i + 1].get_text(strip=True) if (i + 1) < len(cells) else ""
-                    MT5HTMLImporter._apply_stat(label, val, stats)
-                # Also handle 4-column layouts: label, val, label, val
-                if len(cells) == 4:
-                    MT5HTMLImporter._apply_stat(
-                        cells[0].get_text(strip=True),
-                        cells[1].get_text(strip=True),
-                        stats,
-                    )
-                    MT5HTMLImporter._apply_stat(
-                        cells[2].get_text(strip=True),
-                        cells[3].get_text(strip=True),
-                        stats,
-                    )
+                cells = [cell.get_text(strip=True) for cell in tr.find_all(("td", "th"))]
+                # A row holds one or two label/value pairs, and some rows start
+                # with an empty spacer cell (colspan) that shifts every pair,
+                # so scan each adjacent pair instead of a fixed stride.
+                for index in range(len(cells) - 1):
+                    MT5HTMLImporter._apply_stat(cells[index], cells[index + 1], stats)
 
         if "total_pnl" in stats and initial_capital is not None:
             try:
@@ -361,16 +384,15 @@ class MT5HTMLImporter(BaseImporter):
             if losses is not None:
                 stats["losers"] = losses
             return
-        if key in ("max_drawdown_pct", "max_drawdown_max"):
+        drawdown = _DRAWDOWN_KEYS.get(key)
+        if drawdown is not None:
+            pct_key, abs_key = drawdown
             pct = MT5HTMLImporter._extract_first_percent(val)
             if pct is not None:
-                if key == "max_drawdown_pct":
-                    stats["max_drawdown_pct"] = pct
-                else:
-                    stats["max_drawdown_max_pct"] = pct
+                stats[pct_key] = pct
             abs_val = MT5HTMLImporter._extract_parenthesized_number(val)
             if abs_val is not None:
-                stats["max_drawdown_abs"] = abs_val
+                stats[abs_key] = abs_val
             return
 
         parsed = MT5HTMLImporter._coerce_stat(val)
@@ -448,7 +470,7 @@ class MT5HTMLImporter(BaseImporter):
         header = rows[0]
         data_rows = rows[1:]
 
-        col_order_id = MT5HTMLImporter._find_col_index(header, ["Auftrag"])
+        col_order_id = MT5HTMLImporter._find_col_index(header, ["Auftrag", "Order"])
         col_sl = MT5HTMLImporter._find_col_index(header, ["S / L", "S/L"])
         col_tp = MT5HTMLImporter._find_col_index(header, ["T / P", "T/P"])
 
@@ -503,17 +525,17 @@ class MT5HTMLImporter(BaseImporter):
         header = rows[0]
         data_rows = rows[1:]
 
-        col_time = MT5HTMLImporter._find_col_index(header, ["Zeit"])
-        col_typ = MT5HTMLImporter._find_col_index(header, ["Typ"])
-        col_direction = MT5HTMLImporter._find_col_index(header, ["Richtung"])
+        col_time = MT5HTMLImporter._find_col_index(header, ["Zeit", "Time"])
+        col_typ = MT5HTMLImporter._find_col_index(header, ["Typ", "Type"])
+        col_direction = MT5HTMLImporter._find_col_index(header, ["Richtung", "Direction"])
         col_symbol = MT5HTMLImporter._find_col_index(header, ["Symbol"])
-        col_volume = MT5HTMLImporter._find_col_index(header, ["Volumen"])
-        col_price = MT5HTMLImporter._find_col_index(header, ["Preis"])
-        col_order_id = MT5HTMLImporter._find_col_index(header, ["Auftrag"])
-        col_commission = MT5HTMLImporter._find_col_index(header, ["Kommission"])
+        col_volume = MT5HTMLImporter._find_col_index(header, ["Volumen", "Volume"])
+        col_price = MT5HTMLImporter._find_col_index(header, ["Preis", "Price"])
+        col_order_id = MT5HTMLImporter._find_col_index(header, ["Auftrag", "Order"])
+        col_commission = MT5HTMLImporter._find_col_index(header, ["Kommission", "Commission"])
         col_swap = MT5HTMLImporter._find_col_index(header, ["Swap"])
-        col_profit = MT5HTMLImporter._find_col_index(header, ["Gewinn"])
-        col_comment = MT5HTMLImporter._find_col_index(header, ["Kommentar"])
+        col_profit = MT5HTMLImporter._find_col_index(header, ["Gewinn", "Profit"])
+        col_comment = MT5HTMLImporter._find_col_index(header, ["Kommentar", "Comment"])
 
         # DV-B42: direction is derived from the Typ column, so it must be
         # present.  Without this check a missing or locale-variant Typ column
@@ -531,7 +553,8 @@ class MT5HTMLImporter(BaseImporter):
         if missing_columns:
             raise ValueError(
                 "Trades table is missing required columns "
-                "(Zeit / Typ / Richtung / Symbol / Volumen / Preis / Gewinn): "
+                "(Zeit|Time / Typ|Type / Richtung|Direction / Symbol / "
+                "Volumen|Volume / Preis|Price / Gewinn|Profit): "
                 + ", ".join(missing_columns)
             )
 
