@@ -906,6 +906,78 @@ def test_dedupe_executions_scopes_broker_fill_ids_to_their_signal(isolated_db):
     assert {row.signal_id for row in rows} == {str(signal_id) for signal_id in signal_ids}
 
 
+def test_dedupe_executions_defaults_to_dry_run_on_real_rows(isolated_db):
+    """Calling the script without arguments must report, never delete (the default is dry-run)."""
+    database = isolated_db
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal)
+
+    ts = datetime.now(timezone.utc)
+    for key in ("legacy:content:3", "legacy:fill:3"):
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=key,
+                broker_fill_id=9001,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions() == 1  # reports the duplicate it would remove
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2  # unchanged
+
+
+def test_dedupe_executions_treats_zero_broker_fill_id_as_missing(isolated_db):
+    """A broker fill id of 0 is "unknown", not an identity shared by every such row."""
+    database = isolated_db
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal)
+
+    ts = datetime.now(timezone.utc)
+    for key in ("legacy:content:4", "legacy:fill:4"):
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=key,
+                broker_fill_id=0,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions(confirm=True) == 0
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2
+
+
 def test_dedupe_executions_never_deletes_rows_without_an_identity_key(isolated_db):
     """#233: a row with neither a dedupe key nor a broker fill id cannot be proven a duplicate.
 
