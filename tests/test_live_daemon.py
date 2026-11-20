@@ -1153,3 +1153,76 @@ def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
     # Gathered: fast completes while slow is still sleeping. Sequential
     # would order slow first (dict order) — or never reach fast at all.
     assert completions and completions[0] == "fast"
+
+
+# ── ACTIVE deployments nothing can trade (#242) ──────────────────────────────
+
+
+def _internal_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        id="22222222-2222-2222-2222-222222222222",
+        strategy_name="internal::ramjet",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status=status,
+        signal_source="internal",
+        signal_source_type="internal",
+        signal_config={},
+    )
+
+
+def test_active_internal_deployment_logs_error_naming_it(monkeypatch) -> None:
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+
+    daemon._warn_untradeable_active_deployments([_internal_deployment()])
+
+    assert len(errors) == 1
+    msg, args, kwargs = errors[0]
+    assert "cannot trade" in msg
+    assert "22222222-2222-2222-2222-222222222222" in str(args)
+    assert "internal" in str(args)
+    data = kwargs["extra"]["data"]
+    assert data["deployment_id"] == "22222222-2222-2222-2222-222222222222"
+    assert data["signal_source"] == "internal"
+    assert "no live strategy runner" in data["untradeable_reason"]
+
+
+def test_active_discord_and_non_active_deployments_are_not_warned(monkeypatch) -> None:
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+
+    daemon._warn_untradeable_active_deployments(
+        [
+            _internal_deployment("PAUSED"),
+            _internal_deployment("STOPPED"),
+            _discord_deployment("ACTIVE"),
+        ]
+    )
+
+    assert errors == []
+
+
+def test_active_unknown_signal_source_is_reported_as_untradeable(monkeypatch) -> None:
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    unknown = _internal_deployment()
+    unknown.signal_source = "webhook"
+
+    daemon._warn_untradeable_active_deployments([unknown])
+
+    assert len(errors) == 1
+    assert "webhook" in str(errors[0][1])

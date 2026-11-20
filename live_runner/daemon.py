@@ -9,7 +9,7 @@ import os
 import re
 import uuid
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -4802,6 +4802,50 @@ async def _load_db_accounts_and_deployments(
                 extra={"data": {"deployment_id": str(deployment.id)}},
             )
     return accounts, deployments
+
+
+def _warn_untradeable_active_deployments(
+    deployments: Sequence[LiveDeploymentConfig],
+) -> None:
+    """Log ERROR for each ACTIVE deployment no runner can trade (#242).
+
+    The daemon's only signal path is Discord: an ``internal`` deployment has no
+    live strategy runner behind it, so it can be ACTIVE, hold an adapter and an
+    execution listener, and still never place an order. The daemon does not
+    block on this -- the operator restarts or stops the row -- but silence makes
+    an untradeable ACTIVE deployment look live.
+    """
+    for deployment in deployments:
+        if _normalize_deployment_status(deployment.status) != "ACTIVE":
+            continue
+        signal_source = str(deployment.signal_source or "internal").lower()
+        if signal_source == "discord":
+            continue
+        if signal_source != "internal":
+            reason = (
+                f"signal source '{signal_source}' is neither 'internal' nor 'discord' "
+                "and has no runner"
+            )
+        else:
+            reason = (
+                "signal source 'internal' has no live strategy runner; "
+                "only Discord signals are traded"
+            )
+        logger.error(
+            "ACTIVE live deployment cannot trade: %s. It will never place an order; "
+            "stop it or move it to a signal source the daemon runs.",
+            f"{deployment.strategy_name} ({deployment.id}, account "
+            f"{deployment.account_id}): {reason}",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "account_id": deployment.account_id,
+                    "strategy_name": deployment.strategy_name,
+                    "signal_source": signal_source,
+                    "untradeable_reason": reason,
+                }
+            },
+        )
 
 
 async def _ensure_adapter_for_active_account(

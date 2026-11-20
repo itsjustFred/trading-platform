@@ -464,6 +464,15 @@ def _validate_deployments(
             channel_id = str(deployment.signal_config.get("channel_id") or "").strip()
             if not channel_id:
                 warnings.append(f"{label}: Discord deployment has no channel_id in signal_config.")
+        elif str(deployment.status or "").upper() == "ACTIVE":
+            # #242: the daemon only trades Discord signals; an ACTIVE row on any
+            # other signal source is a deployment that will never place an order.
+            warnings.append(
+                f"{label}: ACTIVE deployment has signal source "
+                f"'{deployment.signal_source or 'internal'}' with no runner; "
+                "the live daemon only trades Discord signals and will never trade it. "
+                "Stop it or move it to a Discord signal source."
+            )
 
     return errors, warnings
 

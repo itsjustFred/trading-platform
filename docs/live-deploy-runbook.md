@@ -437,6 +437,21 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+### ACTIVE deployments nothing can trade (#242)
+
+The daemon's only signal path is Discord. A deployment whose `signal_source` is `internal` (the default)
+with status `ACTIVE` has no live strategy runner behind it: it still gets a broker adapter and an execution
+listener, so the dashboard and the listener log make it look live, but it will never place an order. The same
+holds for any stored `signal_source` that is neither `internal` nor `discord`.
+
+Every deployment-sync iteration logs this at ERROR, once per affected deployment, with its id, account and
+signal source (`"ACTIVE live deployment cannot trade"`, `untradeable_reason` in the log `data`). The daemon
+does not block or stop: the operator stops the row or moves it to a Discord signal source. `--check-db`
+preflight flags the same rows as warnings, so a clean preflight no longer hides them.
+
+A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
+design, not by accident.
+
 ## Market-data symbol classification (Alpaca, #122)
 
 `live_runner/symbol_class.py` decides which feed a symbol belongs to, by *asset class* and never by string shape alone: a pair is recognised only when its base currency is in `CRYPTO_BASES` and its quote currency is in `CRYPTO_QUOTES` (that quote list is shared with `shared/alpaca_symbols.py`, so fee backfill and market-data routing cannot drift on it). Share-class equities (`BRK.B`, `BF-B`) are equities, exactly as in the fee backfill.
