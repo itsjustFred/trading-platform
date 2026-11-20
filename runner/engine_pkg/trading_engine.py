@@ -499,6 +499,12 @@ class TradeEngine:
             fixed_cfg is not None and size_from_stop is not None
         )
         order._equity_proportional = order_equity_proportional  # transient, not a dataclass field
+        # F21 (D2): the realized-cash basis this quantity was computed from. It
+        # travels with the order because the quantity that survives to the fill
+        # is not always recomputed there — a MARKET order whose only stop is the
+        # sizing fallback keeps its creation-time estimate (D4), so re-reading
+        # the ledger at fill time could record a basis the quantity never saw.
+        order._sizing_equity = float(self._sizing_equity)
         self.pending_orders.append(order)
 
     def _open_position(self, order: Order, fill_price: float, fill_time: str, i: int) -> None:
@@ -511,7 +517,13 @@ class TradeEngine:
         # F21/D2), not the mark-to-market reporting equity: the multi-symbol
         # replay recovers the per-unit coefficient quantity / equity_at_entry
         # from it, and ``replay_shared_equity`` accumulates realized PnL only.
-        position_meta["equity_at_entry"] = round(float(self._sizing_equity), 2)
+        # It is the basis of the quantity that actually survived to this fill —
+        # the fill-time ledger when the order was re-sized at fill, the
+        # creation-time one when a fallback-sized MARKET order kept its
+        # creation-time quantity (D4).
+        position_meta["equity_at_entry"] = round(
+            float(getattr(order, "_sizing_equity", self._sizing_equity)), 2
+        )
         sizing_stop = getattr(order, "_sizing_stop_loss", None)
         if sizing_stop is not None:
             position_meta["sizing_stop_loss"] = float(sizing_stop)
@@ -634,6 +646,9 @@ class TradeEngine:
                         stop_distance=order.stop_distance,
                         exclude_order=order,
                     )
+                    # F21 (D2): the quantity was just recomputed from the
+                    # fill-time ledger, so that is now the basis to record.
+                    order._sizing_equity = float(self._sizing_equity)
                     if order.quantity <= 0:
                         continue
                 if order.order_type == OrderType.MARKET:
@@ -680,6 +695,10 @@ class TradeEngine:
                             stop_distance=order.stop_distance,
                             exclude_order=order,
                         )
+                        # F21 (D2): same as the LIMIT/STOP re-size above — the
+                        # surviving quantity is the fill-time one, so the
+                        # fill-time basis is the one to record.
+                        order._sizing_equity = float(self._sizing_equity)
                         if order.quantity <= 0:
                             continue
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop

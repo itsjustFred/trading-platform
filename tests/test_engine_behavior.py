@@ -268,6 +268,104 @@ class TestSizingEquityExcludesUnrealizedPnl:
                 "equity, not the basis the quantity was computed from"
             )
 
+    def test_recorded_basis_follows_the_surviving_quantity(self):
+        """``equity_at_entry`` must be the basis the surviving quantity was
+        sized from, not whatever the ledger reads at fill time.
+
+        Entry 2 is a fallback-sized MARKET order with no stop, so D4 lets it
+        keep its creation-time quantity (sized at bar 2's close from realized
+        cash 100k). On bar 3 entry 1 stops out (−1,000 realized) *before*
+        entry 2 fills, so the fill-time ledger reads 99k. Recording that would
+        hand the shared-equity replay a coefficient ``quantity / equity_at_entry``
+        that no longer matches the quantity it is re-scaling.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0],
+                "high": [100.5, 100.5, 100.5, 89.5, 89.5, 89.5],
+                "low": [99.5, 99.5, 99.5, 88.0, 88.5, 88.5],
+                "close": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        # Entry 1 carries a real 10-point stop (hit on bar 3); entry 2 has no
+        # stop at all, so it is sized on the 2% fallback and keeps its
+        # creation-time quantity at fill.
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss})
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(100.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over its 10-point stop = 100 shares"
+        )
+        assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 3"
+        second = engine.closed_trades[1]
+        assert second.quantity == pytest.approx(500.0, rel=1e-9), (
+            "entry 2 keeps its creation-time size: 1% of 100k over the 2% "
+            "fallback stop (2.0) = 500 shares"
+        )
+        assert second.meta["equity_at_entry"] == pytest.approx(100_000.0, rel=1e-9), (
+            "the basis must be the one the 500 shares were sized from (100k); "
+            "the fill-time ledger (99k after entry 1's stop) is a different "
+            "number and would corrupt the replay's per-unit coefficient"
+        )
+
+    def test_resized_order_records_its_fill_time_basis(self):
+        """The mirror rule: an order that IS re-sized at fill records the
+        fill-time basis, because that is the ledger its surviving quantity was
+        computed from.
+
+        Entry 2 carries an explicit ``stop_distance`` (5), so its MARKET fill
+        re-sizes it from the fill bar (89) — by which point entry 1 has stopped
+        out on that same bar and the realized basis reads 99k. Its quantity is
+        therefore 1% of 99k over the 5-point stop = 198 shares, and the basis
+        must be 99k (the creation-time 100k would no longer match).
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=7, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0, 89.0],
+                "high": [100.5, 100.5, 100.5, 89.5, 89.5, 89.5, 89.5],
+                "low": [99.5, 99.5, 99.5, 88.0, 88.5, 88.5, 88.5],
+                "close": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0, 89.0],
+                "volume": [1000.0] * 7,
+            }
+        )
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
+        stop_distance = pd.Series(blanks[:2] + [5.0] + blanks[3:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss, "stop_distance": stop_distance})
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        second = engine.closed_trades[1]
+        assert second.quantity == pytest.approx(198.0, rel=1e-9), (
+            "the fill-time re-size uses the realized basis in force on the "
+            "fill bar: 1% of 99k over the 5-point stop = 198 shares"
+        )
+        assert second.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+            "a re-sized order records the basis its quantity was computed "
+            "from (99k at fill), not the creation-time figure (100k)"
+        )
+
     def test_aggregate_exposure_denominator_is_realized_cash(self):
         """The aggregate-exposure fraction must use the realized denominator.
 
