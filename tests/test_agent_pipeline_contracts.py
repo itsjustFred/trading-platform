@@ -20,11 +20,17 @@ What is pinned here:
   `repository_dispatch` trigger, no `actions: write`;
 - the pre-mortem's verdict map is total (`*)` -> `error`), so no verdict reaches an undeclared
   state, and its verdict regex accepts exactly the verdicts the skill documents;
+- the verdicts are advisory (decision of 2026-11-20): no verdict reports `failure` on the
+  analysed commit - PASS, BLOCK and CHANGES-REQUESTED all report `success` with the verdict in
+  the status description and the ranked scenarios in the comment - so a pre-mortem that asks for
+  hardening cannot hold up the head it was asked about;
 - the status context, the comment marker and the comment title follow the stage convention, a
   marker belongs to exactly one workflow, and no workflow writes another workflow's context;
 - the pre-mortem marks the analysed commit pending once, and every path that stops it - a
-  cancelled run, a failed run, a failed post step - leaves that context terminal, never
-  `pending`; a head that moved keeps its own status but no longer owns the comment;
+  cancelled run, a failed run, a failed post step, including the reporter of a failed agent run
+  itself - converts a status that is still `pending` and never replaces a terminal one, so a
+  rerun's infra failure cannot erase the verdict of a run that succeeded; a head that moved
+  keeps its own status but no longer owns the comment;
 - a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
   so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
@@ -121,12 +127,16 @@ FREE_MODEL_VARS = {
 DEFAULT_MODEL = "opencode/inkling-2-small-free"
 DEFAULT_VARIANT = "max"
 
-# The verdicts the skill documents and the status each must get. INCOMPLETE is "the run produced
-# no verdict" and is always an `error`, never a `failure`.
+# The verdicts the skill documents and the status each must get. The pre-mortem is advisory
+# (decision of 2026-11-20): every verdict the agent can produce reports `success` on the
+# analysed commit, and the verdict is what the status description says - a BLOCK is a ranked
+# list of scenarios a human reads and acts on, not a gate that can fail the head under review.
+# Only a run that produced no verdict at all is not a success: INCOMPLETE, the skill's own
+# "inputs missing or unreadable" outcome, is always an `error`, never a `failure`.
 VERDICT_STATUS = {
     "PASS": "success",
-    "BLOCK": "failure",
-    "CHANGES-REQUESTED": "failure",
+    "BLOCK": "success",
+    "CHANGES-REQUESTED": "success",
     "INCOMPLETE": "error",
 }
 
@@ -297,6 +307,19 @@ def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None
     assert "grep -qE" in body and "^[0-9a-f]{40}$" in body, "the head_sha shape is unchecked"
     assert "grep -qxF" in body, "the PR's commit list is not matched exactly"
     assert "pulls/${INPUT_PR}/commits" in body, "the head_sha is not checked against the PR"
+    # The list is captured before it is matched. Under `set -o pipefail` a `grep -q` that matches
+    # exits at the first hit and closes the pipe, `gh` then dies of SIGPIPE writing the next
+    # page, and the whole pipeline is non-zero - so piping straight off `gh api --paginate`
+    # refuses a commit this PR does contain. This PR's own documented rerun is that case: an
+    # older commit sits on the first page of a commit list that pages at 30.
+    assert "commits=$(gh api --paginate" in body, (
+        "the commit list is not captured into a variable before it is matched"
+    )
+    match_line = "printf '%s\\n' \"$commits\" | grep -qxF"
+    assert match_line in body, "the captured list is not what gets matched"
+    assert "--jq '.[].sha' | grep" not in body, (
+        "the commit list is piped straight into grep, so a matching grep -q kills gh with SIGPIPE"
+    )
     assert body.count("exit 1") >= 2, "a refused head_sha does not stop the run"
     assert "GH_TOKEN" in _step_env(resolve, step), "the dispatch path reads the API unauthenticated"
     assert resolve.get("permissions", {}).get("contents") == "read", (
@@ -362,8 +385,8 @@ def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
     """A verdict the post job's `case` does not name falls through to `*)` and is reported as
     `error` - a stage that could not run, indistinguishable from an agent failure; a verdict the
     map states but the regex drops never reaches it at all. Both are pinned against the skill's
-    own verdict line, so the three cannot drift apart silently. INCOMPLETE is the "the run
-    produced no verdict" outcome and is always an `error`, never a `failure`."""
+    own verdict line, so the three cannot drift apart silently. INCOMPLETE is the skill's "inputs
+    missing or unreadable" outcome and is always an `error`, never a `failure`."""
     skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     verdicts_line = re.search(r"^- Verdicts:.*$", skill, re.M)
     assert verdicts_line, f"{SKILL_DIR}: the skill documents no verdict line"
@@ -375,6 +398,29 @@ def test_the_verdict_map_covers_every_verdict_the_skill_documents() -> None:
     arms = _verdict_arms(_run(_find_step(post, r"^Set status$")))
     expected = {v: s for v, s in VERDICT_STATUS.items() if v != "INCOMPLETE"}
     assert arms == expected, f"status map {arms} != documented {expected}"
+
+
+def test_no_verdict_ever_reports_a_blocking_failure() -> None:
+    """The verdict is advisory, by decision of 2026-11-20: BLOCK and CHANGES-REQUESTED must not
+    set `failure` on the analysed commit. The pre-mortem ranks what could break later and asks for
+    a human judgement; a red status would fail the head the PR is asking to be reviewed, blocking
+    a merge over that judgement, and the comment - not the status - is where the scenarios are
+    read. What the status must still carry is the verdict itself: it is the first thing the
+    description says, so a `success` state never hides which verdict produced it. Only a run that
+    produced no verdict (INCOMPLETE, or the infra failure of the run) is not a success."""
+    data = _load(PREMORTEM)
+    arms = _verdict_arms(_run(_find_step(data["jobs"]["post"], r"^Set status$")))
+    assert set(arms) == set(VERDICT_STATUS) - {"INCOMPLETE"}, f"map is {sorted(arms)}"
+    assert "failure" not in arms.values(), (
+        f"a verdict reports `failure` on the analysed commit: {arms}"
+    )
+    for verdict in arms:
+        assert arms[verdict] == "success", f"{verdict} is not a success state"
+    body = _run(_find_step(data["jobs"]["post"], r"^Set status$"))
+    assert '-f description="Verdict: ${VERDICT}' in body, (
+        "the status description drops the verdict, so a success state would hide it"
+    )
+    assert "advisory" in body, "the description does not say the verdict is advisory"
 
 
 def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
@@ -393,9 +439,8 @@ def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
 def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
     """A context typo writes a result under a name nothing reads; a marker two workflows share
     makes one overwrite the other's comment. The pre-mortem is also the only one of the three
-    that reports a status at all - the siblings present as comments, as
-    `.agents/skills/platform-pr-verify` says - so a status write copied into one of them would
-    make that comment lie about itself."""
+    that reports a status at all - the siblings present as comments and write no commit status -
+    so a status write copied into one of them would make that comment lie about itself."""
     assert len(set(MARKERS.values())) == len(MARKERS), "two workflows share a comment marker"
     owner_of = {name: context for context, name in CONTEXT_OWNER.items()}
     for name in AGENT_WORKFLOWS:
@@ -476,14 +521,20 @@ def test_the_pre_mortem_status_names_the_pr_it_was_written_for() -> None:
 def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
     """The bookkeeping that keeps the stage from stranding `pending`: a resolve failure, a failed
     agent run, a failed post step and a cancelled run each write `error` for their own context,
-    and each converts a status that is still `pending` rather than overwriting a terminal one.
-    Deleting a reporter, or writing a literal context somewhere, would leave a SHA `pending`
-    with no error anywhere - or a typo'd context nothing reads."""
+    and each converts a status that is still `pending` rather than overwriting a terminal one -
+    including the reporter of the failed agent run, whose family (a rerun of the same commit
+    that ran beside this one through the concurrency group) is exactly the case where a terminal
+    status is already there. Deleting a reporter, or writing a literal context somewhere, would
+    leave a SHA `pending` with no error anywhere - or a typo'd context nothing reads."""
     data = _load(PREMORTEM)
     resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
-    # The two that report a failure of their own bookkeeping only clear a status that is still
-    # pending, so a reporter's failure cannot overwrite a terminal verdict.
-    clear_pending_only = ("Report resolve failure", "Report post failure")
+    # Every reporter of a stopped run only clears a status that is still pending, so a failure of
+    # one run cannot overwrite the terminal verdict of another run of the same commit.
+    clear_pending_only = (
+        "Report resolve failure",
+        "Report failed pre-mortem run",
+        "Report post failure",
+    )
     for job, pattern in (
         (resolve, r"^Report resolve failure$"),
         (post, r"^Report failed pre-mortem run$"),
@@ -564,6 +615,12 @@ def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
     for known in ("usage limit", "rate.?limit", "quota"):
         assert known in patterns.group(1), f"{known!r} is not recognised"
     assert "exit 1" in body, "a usage-limit failure does not fail the run"
+    # The reason is only in stderr. A failed run has ended with a bare "exit code 1" and no
+    # cause, so a capped model and a broken prompt could not be told apart from the log: the
+    # captured output is echoed, bounded so a runaway agent cannot flood the log.
+    assert "tail -c" in body and "$out.raw" in body, (
+        "the agent's failing output is not echoed, so the run log shows no reason"
+    )
     post = data["jobs"]["post"]
     report = _find_step(post, r"^Report failed pre-mortem run$")
     assert "state=error" in _run(report), "a failed run is not reported as an error"
@@ -580,8 +637,13 @@ def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> N
     """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
     used only while the base has none. A base commit that cannot be read must abort the step -
     a silent fall-through would run the PR's own rules while the prompt says "base branch", and
-    that is exactly what a step without `set -euo pipefail` does: the base-commit check fails,
-    the `if` on the base skill fails with it, and the `elif` takes the PR's copy.
+    that is what a base-commit check outside the `if` is for: GitHub runs a `run:` block with
+    `bash -e {0}`, so that standalone `git cat-file -e` aborts the step there, while a failing
+    command *inside* the `if` condition that follows is only a false branch - which is what lets
+    the `elif` take the PR's copy when the base simply has no skill yet. `set -euo pipefail` adds
+    `pipefail` and `-u` and states the strictness; it is not the guard, and must not be read as
+    one, because deleting the standalone check on that reading would silently run the PR's own
+    rules while the prompt says they came from the base branch.
 
     The assertions are therefore scoped to the selection step of every copy, not to the agent
     job as a whole: a base-commit check that lives in some other step (the mutation workflow's
@@ -650,8 +712,9 @@ def test_the_skill_selection_stays_identical_across_the_copies() -> None:
 def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
     """The three workflows duplicate the blocks that decide what gets posted: the summary-line
     extraction, the fence strip, the head-unchanged and tree-clean check, and the output path.
-    Their comments swear a change lands in all copies in the same commit; this test makes that
-    true mechanically instead of by memory.
+    Nothing forces the three copies to be edited together - the workflow comments do not swear to
+    it - so this test is what makes it true mechanically instead of by memory: a guard changed in
+    one copy and not in the others fails here.
 
     The per-copy substitutions below are the documented ones (the temp directory, the agent id),
     applied agent-id first so "pr-review" cannot be eaten by the shorter "review". A guard that
