@@ -5341,23 +5341,59 @@ async def sync_deployments_loop(
 
 
 async def _bounded(awaitable: Awaitable[object], *, timeout: float, phase: str) -> bool:
-    """Run one cleanup phase with a deadline; never raises. False = failed/timed out."""
-    try:
-        async with asyncio.timeout(timeout):
-            await awaitable
-    except TimeoutError:
+    """Run one cleanup phase with a deadline; never raises. False = failed/timed out.
+
+    The phase runs as its own task and the deadline is a bounded ``wait`` on it,
+    not an ``asyncio.timeout`` around the ``await``: a coroutine that swallows the
+    cancellation the timeout delivers would otherwise keep the cleanup - and with
+    it the exit code - waiting past the documented budget. A phase still running
+    at the deadline is cancelled and abandoned, and its eventual outcome is
+    retrieved so it cannot surface as a stray "never retrieved" warning.
+    """
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        task.add_done_callback(lambda finished: _retrieve_abandoned_phase(finished, phase))
         logger.error(
             "Shutdown phase timed out",
             extra={"data": {"phase": phase, "timeout_seconds": timeout}},
         )
         return False
-    except Exception as exc:
-        logger.exception(
-            "Shutdown phase failed",
-            extra={"data": {"phase": phase, "error": str(exc)}},
+    if task.cancelled():
+        logger.error("Shutdown phase was cancelled", extra={"data": {"phase": phase}})
+        return False
+    error = task.exception()
+    if error is None:
+        return True
+    if isinstance(error, TimeoutError):
+        # The phase bounded its own wait and reported the timeout (this is what
+        # ``_cancel_and_wait`` and the bounded reactor release do), so it is
+        # recorded as a timeout rather than as a crash.
+        logger.error(
+            "Shutdown phase timed out",
+            extra={"data": {"phase": phase, "timeout_seconds": timeout}},
         )
         return False
-    return True
+    logger.error(
+        "Shutdown phase failed",
+        extra={"data": {"phase": phase, "error": str(error)}},
+        exc_info=error,
+    )
+    return False
+
+
+def _retrieve_abandoned_phase(task: asyncio.Task[object], phase: str) -> None:
+    """Retrieve an abandoned phase's outcome; never let it escape silently."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "An abandoned shutdown phase ended with an error",
+            extra={"data": {"phase": phase, "error": str(error)}},
+            exc_info=error,
+        )
 
 
 async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]], *, timeout: float) -> None:
@@ -5381,6 +5417,7 @@ async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]], *, timeout: floa
     if not pending:
         return
     done, unfinished = await asyncio.wait(pending, timeout=timeout)
+    failures: list[BaseException] = []
     for task in done:
         # Retrieve whatever ended the task so a crashed loop is not an unretrieved
         # exception at interpreter shutdown. A task that was cancelled ends
@@ -5389,12 +5426,17 @@ async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]], *, timeout: floa
             continue
         error = task.exception()
         if error is not None:
-            logger.exception("A task ended with an error during shutdown", exc_info=error)
+            logger.error("A task ended with an error during shutdown", exc_info=error)
+            failures.append(error)
     for task in unfinished:
         # A second cancel: the first was ignored, and this phase is over.
         task.cancel()
     if unfinished:
         raise TimeoutError(f"{len(unfinished)} task(s) did not finish after being cancelled")
+    if failures:
+        # A loop or listener that ended in an error while it was being cancelled
+        # did not stop cleanly, so the shutdown must not report a clean exit.
+        raise failures[0]
 
 
 async def _shutdown_cleanup(

@@ -1149,6 +1149,72 @@ def test_a_loop_task_that_ignores_its_cancel_cannot_hold_the_shutdown(
     assert _timed_out_phases(caplog) == ["cancel_loops"]
 
 
+def test_a_cleanup_phase_that_ignores_its_cancel_cannot_hold_the_shutdown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A phase that suppresses the deadline's cancel must still be abandoned.
+
+    ``asyncio.timeout`` can only cancel the coroutine it wraps: a phase that
+    swallows that cancellation and keeps working is never timed out, and the
+    cleanup - with the exit code - waits past the documented budget. The deadline
+    is therefore a bounded wait on the phase's own task, which is abandoned.
+    """
+    swallowed: list[int] = []
+
+    async def _wedged() -> None:
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                swallowed.append(len(swallowed) + 1)
+                if len(swallowed) <= 3:
+                    # Keep working past the deadline, like a phase stuck in a
+                    # call that cannot be interrupted.
+                    await asyncio.sleep(0.3)
+                    continue
+                raise
+
+    async def _probe() -> tuple[bool, float]:
+        started = time.monotonic()
+        ok = await daemon._bounded(_wedged(), timeout=0.05, phase="stop_scheduler")
+        return ok, time.monotonic() - started
+
+    with caplog.at_level("ERROR"):
+        ok, elapsed = asyncio.run(_probe())
+
+    assert swallowed, "the deadline's cancel was really delivered"
+    assert ok is False, "a phase that overran is a failed shutdown"
+    assert elapsed < 0.25, f"the deadline, not the phase, decides: {elapsed}"
+    assert _timed_out_phases(caplog) == ["stop_scheduler"]
+
+
+def test_a_listener_that_crashes_while_being_cancelled_fails_the_phase() -> None:
+    """A task that ends in an error during teardown must not look like a clean stop.
+
+    The cancel is what ends a listener, so a task that ends with an exception
+    instead did not stop the way the shutdown assumes. Retrieving the exception
+    (so asyncio does not warn about it) is not enough: the run would still report
+    ``EXIT_OK`` and the operator would never look.
+    """
+
+    async def _crashing_listener() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError("listener died on the way out") from None
+
+    async def _probe() -> bool:
+        task = asyncio.create_task(_crashing_listener())
+        await asyncio.sleep(0)
+        return await daemon._bounded(
+            daemon._cancel_and_wait([task], timeout=5.0),
+            timeout=5.0,
+            phase="cancel_listeners",
+        )
+
+    assert asyncio.run(_probe()) is False
+
+
 def test_a_reactor_release_that_never_returns_cannot_hold_the_shutdown(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
