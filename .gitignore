@@ -61,6 +61,11 @@ logs/
 !tests/fixtures/*.csv
 !tests/fixtures/validation/quantconnect-reference/*.csv
 !tests/fixtures/*.json
+# The differential real-data slice is downloaded, not committed: the repo is public and
+# vendor market data is licensed to be queried, not redistributed through a cloneable
+# history. Listed *below* the negations above (later rules win) so a local copy produced
+# by `python -m scripts.fetch_differential_slice` cannot be committed by accident.
+tests/fixtures/differential/eurusd_15m_slice.csv
 
 # Node
 node_modules/

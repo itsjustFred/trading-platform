@@ -265,3 +265,45 @@ intrabar resolution (native + vectorbt), sizing from the actual stop (including
 cap behavior), the canonical stats key set per engine, `total_bars` semantics,
 market-entry fill parity, signal-replay's documented same-bar-close exception,
 and the pynecore restatement containment property.
+
+`tests/test_differential_reference_strategies.py` complements the conformance
+suite with differential tests: three textbook strategies (SMA crossover with
+all-in sizing, Donchian breakout with ATR stop/target and fixed-risk sizing,
+RSI mean reversion with a time exit) are run on the native and vectorbt engines
+and compared trade by trade with small independent reference simulators written
+in the test module (synthetic edge-case series and one real EURUSD 15m slice,
+zero and non-zero costs). Known engine deviations are recorded there as
+`xfail(strict=True)` with the exact location and reproducer.
+
+### The real-data slice is downloaded, not committed
+
+The one real slice (600 EURUSD 15m bars: real gaps, a weekend, irregular ranges)
+used to be a committed fixture under `tests/fixtures/differential/`. It is
+generated on demand instead, because this repository is public and vendor market
+data is licensed to be *queried*, not redistributed through a history anyone can
+clone - and because a fixture inside the test tree reads as a source of truth.
+
+```bash
+# writes $DATA_DIR/differential_reference/eurusd_15m_slice.csv
+python -m scripts.fetch_differential_slice
+```
+
+* `DIFFERENTIAL_REAL_SLICE_CSV` overrides that path (CI points it at a path it
+  restores from `actions/cache`, keyed on the fetch script and `data_tools/`).
+* `REQUIRE_REAL_DATA_SLICE=1` turns a missing slice into a test failure. CI sets
+  it, so the real-data scenarios can never be skipped silently; locally a
+  missing slice skips them with a message naming the script.
+* A slice that is present but malformed (wrong row count, non-monotonic stamps,
+  non-finite OHLC, `high < max(open, close)`, `low > min(open, close)`) always
+  fails - see `data_tools/differential_slice.py`, which owns the window, the
+  15m aggregation rules (the platform's own, via `data_tools/resample.py`) and
+  the validation.
+* The committed fixture's provenance was mislabelled: bar for bar it was an
+  **MT5 export**, not Dukascopy bid data, so it could not be regenerated from any
+  downloader. The slice is now fetched from Dukascopy's bid minute candles for
+  the same window; the values therefore differ from the removed file (prices by
+  ~0.0008 on average, volumes more, since Dukascopy reports float volumes where
+  the MT5 export carried integer tick counts). The contract these tests check is
+  engine-versus-reference on one frame, so a different quote series validates
+  the same thing - and `tests/test_differential_slice_contract.py` pins the
+  window, the rules and the CSV schema without a network.

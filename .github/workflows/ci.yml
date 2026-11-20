@@ -18,6 +18,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    env:
+      # The differential real-data slice is downloaded, not committed (see
+      # scripts/fetch_differential_slice.py). Pointing the tests at a cached path
+      # and requiring the slice keeps the scenario from being silently skipped: a
+      # missing slice fails the run instead of quietly narrowing the suite. The path
+      # is absolute so it does not depend on the working directory of the step that
+      # reads it.
+      DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
+      REQUIRE_REAL_DATA_SLICE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,6 +56,22 @@ jobs:
       - name: Lint (advisory)
         continue-on-error: true
         run: uv run --no-sync --no-build ruff check .
+      - name: Restore the differential real-data slice
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
+          # The key hashes the fetch script and the whole data_tools package: the window,
+          # schema and validation (differential_slice.py), the 1m parse (downloaders/),
+          # and the 15m resample rules (resample.py). A change to any of them must
+          # regenerate the slice, not reuse one built under the old rules. A hit means
+          # the download below is skipped entirely, so the network is touched rarely.
+          key: differential-slice-${{ hashFiles('scripts/fetch_differential_slice.py', 'data_tools/**/*.py') }}
+      - name: Fetch the differential real-data slice
+        if: runner.os == 'Linux'
+        run: >-
+          uv run --no-sync --no-build python -m scripts.fetch_differential_slice
+          --skip-if-valid
       - name: Tests
         if: runner.os == 'Linux'
         run: >-
