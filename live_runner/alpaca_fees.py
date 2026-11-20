@@ -300,13 +300,20 @@ class _Inputs:
     rows_by_order: dict[str, list[dict[str, Any]]]
     fees: _FeeIndex
     # The value carries the per-pair message: ``_group_problem`` returns it
-    # alongside the (empty) fill list, and ``None`` means "no problem".
-    broken_pairs: dict[str, str | None]
+    # alongside the (empty) fill list. Every entry is the reason the pair was
+    # taken out of play, so a pair is only "clean" by being absent here.
+    broken_pairs: dict[str, str]
 
 
 def _group_problem(inputs: _Inputs, pair: str, day: date) -> tuple[str | None, list[BrokerFill]]:
     if pair in inputs.broken_pairs:
-        return inputs.broken_pairs[pair], []
+        # Fail closed: a stored ``None`` would read as "no problem" further down
+        # (the caller only skips a pair on a non-None problem), so an entry that
+        # carries no reason still refuses the pair rather than backfilling it.
+        reason = inputs.broken_pairs[pair] or (
+            f"the pair {pair} is broken without a recorded reason"
+        )
+        return reason, []
     group_fills = [fill for fill in inputs.fills_by_pair.get(pair, []) if day in fill.days]
     for fill in group_fills:
         if len(fill.days) > 1:
@@ -419,7 +426,7 @@ def plan_commission_backfill(
     pairs = {pair_key(row["symbol"]) for row in candidates}
     fills_by_order: dict[str, list[BrokerFill]] = defaultdict(list)
     fills_by_pair: dict[str, list[BrokerFill]] = defaultdict(list)
-    broken_pairs: dict[str, str | None] = {}
+    broken_pairs: dict[str, str] = {}
     for raw in fill_activities:
         raw_pair = pair_key(raw.get("symbol"))
         if raw_pair and raw_pair not in pairs:
@@ -427,10 +434,7 @@ def plan_commission_backfill(
         try:
             fill = parse_fill_activity(raw)
         except ValueError as exc:
-            # The same local is also assigned from ``_group_problem`` below, which
-            # returns ``str | None``, so it carries the union from the start
-            # instead of being narrowed to this branch's ``str``.
-            problem: str | None = f"a FILL activity ({raw.get('id')!r}) is unreadable: {exc}"
+            problem = f"a FILL activity ({raw.get('id')!r}) is unreadable: {exc}"
             for pair in [raw_pair] if raw_pair else pairs:
                 broken_pairs[pair] = problem
             continue
@@ -471,9 +475,9 @@ def plan_commission_backfill(
     for pair, day in sorted(groups):
         if not fee_day_is_posted(day, now):
             continue
-        problem, group_fills = _group_problem(inputs, pair, day)
-        if problem is not None:
-            plans.append(GroupPlan(pair, day, {}, problem))
+        group_problem, group_fills = _group_problem(inputs, pair, day)
+        if group_problem is not None:
+            plans.append(GroupPlan(pair, day, {}, group_problem))
             continue
         try:
             plans.append(_allocate(inputs, pair, day, group_fills))

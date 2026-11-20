@@ -2362,6 +2362,31 @@ def test_plan_refuses_a_zero_quantity_local_order_without_aborting_the_pass():
     assert plan.commissions == {}
 
 
+def test_group_problem_refuses_a_broken_pair_that_carries_no_reason():
+    """A broken pair must never read as clean: a reason-less entry fails closed.
+
+    ``broken_pairs`` is ``dict[str, str]`` and production only ever stores a
+    reason, but the consumer (``plan_commission_backfill``) skips a pair only on
+    a non-None problem, so a stored ``None`` would have sent the broken pair on
+    to the allocator with no fills and left its commissions unbackfilled instead
+    of reported. Pin the fail-closed branch so that state cannot come back.
+    """
+    from live_runner.alpaca_fees import _FeeIndex, _Inputs, _group_problem
+
+    inputs = _Inputs(
+        fills_by_order={},
+        fills_by_pair={},
+        rows_by_order={},
+        fees=_FeeIndex(),
+        broken_pairs={"BTC/USD": None},
+    )
+
+    problem, fills = _group_problem(inputs, "BTC/USD", date.fromisoformat(TRADE_DAY))
+
+    assert problem is not None and "BTC/USD" in problem
+    assert fills == []
+
+
 # ── a fill is never stored with an invented time (audit of #135) ────────────────────────────────
 
 ORDER_FILLED_AT = datetime(2026, 11, 3, 15, 5, tzinfo=timezone.utc)
