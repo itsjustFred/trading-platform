@@ -484,6 +484,26 @@ class TestMetricDirection:
         assert values == sorted(values)
         assert values[0] == pytest.approx(0.01)
 
+    def test_top_trials_is_capped_at_the_limit(self):
+        """The payload carries at most `limit` trials, the best of the study.
+
+        The cap is `[:limit]`, not `[:limit + 1]`: an over-long payload published
+        one trial more than the configured limit.
+        """
+        import optuna
+
+        study = optuna.create_study(direction="minimize")
+        for value in (0.5, 0.42, 0.01, 0.9, 0.13, 0.77, 0.05, 0.66, 0.31, 0.24, 0.88, 0.19):
+            trial = study.ask()
+            trial.suggest_float("x", 0.0, 1.0)
+            study.tell(trial, value)
+        payload = optimizer_module._top_trials_payload(study.trials, limit=10, direction="minimize")
+
+        assert len(payload) == 10
+        assert [trial["value"] for trial in payload] == sorted(
+            [0.5, 0.42, 0.01, 0.9, 0.13, 0.77, 0.05, 0.66, 0.31, 0.24, 0.88, 0.19]
+        )[:10]
+
 
 class TestRiskAdjustedObjectiveWiring:
     """C3: the objective return carries the haircut, not the raw metric."""

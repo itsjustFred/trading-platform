@@ -211,6 +211,30 @@ class TestDirectionError:
         assert result.errors > 0
 
 
+class TestMissingRequiredArtifact:
+    def test_missing_required_artifact_is_an_error_level_check(self) -> None:
+        """A missing mandatory artifact fails the gate at severity=error.
+
+        The gate emits a `required_<artifact>` check for each configured
+        mandatory artifact. Downgrading that check to a warning let an
+        incomplete validation run (one artifact never produced) read as
+        READY_WITH_WARNINGS instead of NOT_READY.
+        """
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=None,
+            risk_report=_make_risk_report(),
+            stats=(_make_stats(), _make_stats()),
+            config=ReadinessConfig(require_regression=True),
+        )
+
+        required = {check.name: check for check in result.checks}["required_regression_result"]
+        assert required.passed is False
+        assert required.severity == "error"
+        assert result.level == PaperReadinessLevel.NOT_READY
+        assert result.passed is False
+
+
 class TestPnlError:
     def test_not_ready_on_pnl_error(self) -> None:
         """A PnL mismatch is severity=error → NOT_READY."""

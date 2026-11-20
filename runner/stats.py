@@ -453,7 +453,6 @@ def _equity_curve_in_time_order(equity_curve: list[EquityPoint]) -> list[EquityP
     ]
 
 
-
 def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | None:
     """Convert EquityPoint list to a pandas Series of returns with datetime index."""
     if len(equity_curve) < 2:
