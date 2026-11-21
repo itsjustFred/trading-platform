@@ -3265,7 +3265,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if not key:
                 continue
 
-            symbol_id = int(getattr(order, "symbolId", 0) or 0)
+            # ProtoOAOrder carries symbol, volume and side under tradeData,
+            # not at the message root - reading the root yields an empty,
+            # undiagnosable view for every detached order.
+            trade_data = getattr(order, "tradeData", None)
+            symbol_id = 0
+            volume_raw: Any = 0
+            trade_side_raw: Any = 0
+            if trade_data is not None:
+                try:
+                    symbol_id = int(getattr(trade_data, "symbolId", 0) or 0)
+                except (TypeError, ValueError):
+                    symbol_id = 0
+                volume_raw = getattr(trade_data, "volume", 0)
+                trade_side_raw = getattr(trade_data, "tradeSide", 0)
             symbol = ""
             if symbol_id > 0:
                 symbol = self._symbol_name_for_id(symbol_id)
@@ -3277,14 +3290,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             qty: float | None = None
             if symbol:
                 try:
-                    volume = _to_float(getattr(order, "volume", 0), default=0.0)
+                    volume = _to_float(volume_raw, default=0.0)
                     scale = self._scale_for(symbol)
                     if volume > 0:
                         qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
                 except Exception:
                     qty = None
 
-            trade_side = int(getattr(order, "tradeSide", 0) or 0)
+            try:
+                trade_side = int(trade_side_raw or 0)
+            except (TypeError, ValueError):
+                trade_side = 0
             if trade_side == int(self._ProtoOATradeSide.BUY):
                 side = "buy"
             elif trade_side == int(self._ProtoOATradeSide.SELL):

@@ -1920,7 +1920,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         client = await self._require_trading_client()
         orders = await self._list_open_orders(client, nested=True)
         protection_sides = await self._protection_sides_by_symbol()
-        protected_ids = self._protection_order_ids(orders, protection_sides)
+        protected_ids = self._reconciliation_protection_ids(orders, protection_sides)
         views: list[BrokerOrderView] = []
         seen: set[str] = set()
         for order in orders:
@@ -1957,6 +1957,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         half a step absorbs float summation noise without hiding a real share.
         """
         return 0.5e-9
+
+    @staticmethod
+    def _reconciliation_protection_ids(
+        orders: list[Any], protection_side_by_symbol: dict[str, str]
+    ) -> set[str]:
+        """Ids of working orders that are position protection, not ledger orders.
+
+        Deliberately narrower than the cancel sweep's ``_protection_order_ids``:
+        the sweep spares *any* reduce-side order because a flatten follows it,
+        but reconciliation must still match the orders the ledger expects -
+        and this adapter's exits are market orders, so "reduces a position" alone
+        cannot mean protection here. Protection is a bracket leg nested under a
+        working parent, or a resting (non-market) reduce-side order such as an
+        orphaned take-profit/stop leg. A working market exit stays matchable.
+        """
+        protected: set[str] = set()
+        for order in orders:
+            for leg in _order_legs(order):
+                for attr in ("id", "client_order_id"):
+                    leg_id = _control_order_id(_order_attr(leg, attr))
+                    if leg_id is not None:
+                        protected.add(leg_id)
+            symbol = _order_symbol(order)
+            expected_side = protection_side_by_symbol.get(symbol)
+            raw_side = _order_attr(order, "side", "")
+            side = str(getattr(raw_side, "value", raw_side) or "").strip().lower()
+            if (
+                expected_side
+                and side == expected_side
+                and _order_type(order) != "market"
+            ):
+                for attr in ("id", "client_order_id"):
+                    order_id = _control_order_id(_order_attr(order, attr))
+                    if order_id is not None:
+                        protected.add(order_id)
+        return protected
 
     @staticmethod
     def _protection_order_ids(

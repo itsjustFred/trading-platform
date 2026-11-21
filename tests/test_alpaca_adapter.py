@@ -892,3 +892,47 @@ def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
 def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     adapter = _adapter(_FakeTradingClient())
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
+
+
+def test_reconciliation_orders_do_not_mark_market_exits_as_protection() -> None:
+    """#303: a working exit is a market order; "reduces a position" alone must
+    not mark it protection, or the reconciler reports it missing and halts
+    entries on a healthy account."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder("exit-1", "AAPL", "sell", order_type="market"),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit"),
+            _FakeOrder("sl-1", "AAPL", "sell", order_type="stop", stop_price=90.0),
+            _FakeOrder("entry-1", "MSFT", "buy", order_type="limit"),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    views = {
+        view.order_id: view
+        for view in asyncio.run(_adapter(client).list_reconciliation_orders())
+    }
+
+    assert views["exit-1"].protection is False
+    assert views["tp-1"].protection is True
+    assert views["sl-1"].protection is True
+    assert views["entry-1"].protection is False
+
+
+def test_reconciliation_orders_mark_bracket_legs_as_protection() -> None:
+    legs = [
+        _FakeOrder("leg-tp", "AAPL", "sell", order_type="limit"),
+        _FakeOrder("leg-sl", "AAPL", "sell", order_type="stop", stop_price=90.0),
+    ]
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("parent-1", "AAPL", "buy", order_type="market", legs=legs)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    views = {
+        view.order_id: view
+        for view in asyncio.run(_adapter(client).list_reconciliation_orders())
+    }
+
+    assert views["leg-tp"].protection is True
+    assert views["leg-sl"].protection is True
