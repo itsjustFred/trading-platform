@@ -1,8 +1,10 @@
 """Append-only archive of raw Discord signals (issue #308).
 
-Every Discord message a ``DiscordSignalSource`` evaluates from a trusted
-signal-bot author is recorded once (``discord_signal_received``), and every
-per-deployment trading decision on it is recorded once
+Every Discord message a ``DiscordSignalSource`` polls from a signal channel
+is recorded once (``discord_signal_received``) — parsed or refused, and
+including messages from authors outside the trusted allowlist, which are
+kept for impostor auditing and marked ``author_trusted: false``. Every
+per-deployment trading decision on a parsed signal is recorded once
 (``discord_signal_decision``). The store exists so the signal bots can be
 backtested and meta-labelled later: without it the raw signals only exist in
 the log stream, and only from the day recording starts.
@@ -16,6 +18,11 @@ never rewritten. The repo already keeps file-based stores next to the DB
 ``DATA_DIR / "signals"``), so a directory of append-only files fits the
 existing persistence layout.
 
+Every record carries ``schema_version``; readers of the offline pipeline
+must skip lines that do not parse (a crash mid-write can leave a partial
+line) and deduplicate on ``discord_message_id`` — a daemon restart can
+re-archive recent messages the poll cursor has not yet committed.
+
 The signal path must never block, delay or raise because of the archive:
 ``record()`` only does a bounded ``put_nowait`` and all serialization and
 disk I/O happen on a single daemon writer thread. A full queue drops the
@@ -26,6 +33,7 @@ Set ``TP_SIGNAL_ARCHIVE=0`` (or ``false``/``off``/``no``) to disable.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import threading
@@ -36,6 +44,7 @@ from typing import Any
 
 import pandas as pd
 
+from live_runner.promotion import deployment_signal_processor_name
 from shared import constants as _constants
 from shared.logging import get_logger
 
@@ -112,10 +121,16 @@ class SignalArchive:
 
     def record(self, record: Mapping[str, Any]) -> None:
         """Enqueue one record. Never blocks, never raises."""
-        if not self.enabled or self._closed:
+        if not self.enabled:
             return
         try:
-            self._queue.put_nowait(dict(record))
+            # The closed-check and the put are atomic with close()'s flag
+            # flip: a record can never land behind a point the writer has
+            # already decided is the end of the stream.
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._queue.put_nowait(dict(record))
         except queue.Full:
             self.dropped += 1
             if self.dropped == 1 or self.dropped % 1000 == 0:
@@ -152,6 +167,11 @@ class SignalArchive:
             try:
                 first = self._queue.get(timeout=0.5)
             except queue.Empty:
+                # close() drops its sentinel when the queue is full, so the
+                # sentinel alone cannot end the loop: once closed and drained
+                # the writer exits on its own.
+                if self._closed and self._queue.empty():
+                    return
                 continue
             batch = [first]
             while len(batch) < _WRITER_BATCH:
@@ -180,6 +200,8 @@ class SignalArchive:
                     finally:
                         self._queue.task_done()
                 return
+            if self._closed and self._queue.empty():
+                return
 
     def _write_batch(self, batch: list[Any]) -> None:
         records = [item for item in batch if item is not _SENTINEL]
@@ -199,14 +221,26 @@ class SignalArchive:
             by_day.setdefault(_record_file_for(record).name, []).append(line)
         for name, lines in by_day.items():
             path = archive_dir() / name
+            # One payload, one os.write per file per batch on an O_APPEND fd:
+            # a batch reaches the OS as a single syscall, so a full disk can
+            # only truncate at a line boundary and two daemons cannot
+            # interleave inside a line.
+            payload = "".join(f"{line}\n" for line in lines).encode("utf-8")
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("ab") as handle:
-                    for line in lines:
-                        handle.write(line.encode("utf-8"))
-                        handle.write(b"\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                fd = os.open(
+                    path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644
+                )
+                try:
+                    view = memoryview(payload)
+                    while view:
+                        written = os.write(fd, view)
+                        if written <= 0:
+                            raise OSError("short write on signal archive file")
+                        view = view[written:]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
                 self.written += len(lines)
             except Exception as exc:
                 self.write_errors += len(lines)
@@ -230,15 +264,18 @@ class SignalArchive:
 
     def close(self, timeout: float = 5.0) -> None:
         """Stop accepting records and let the writer drain, best effort."""
+        # The sentinel goes out under the same lock record() checks, so it
+        # always lands behind every accepted record; when the queue is full
+        # it is dropped and the writer exits on `_closed and queue.empty()`.
         with self._state_lock:
             if self._closed:
                 return
             self._closed = True
             thread = self._thread
-        try:
-            self._queue.put_nowait(_SENTINEL)
-        except queue.Full:
-            pass
+            try:
+                self._queue.put_nowait(_SENTINEL)
+            except queue.Full:
+                pass
         if thread is not None:
             thread.join(timeout)
 
@@ -283,7 +320,7 @@ def _finite(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number in (float("inf"), float("-inf")):
+    if not math.isfinite(number):
         return None
     return number
 
@@ -297,6 +334,7 @@ def received_record(
     channel_id: str,
     parsed: Any | None,
     refusal: tuple[str, str | None] | None,
+    author_trusted: bool | None = None,
 ) -> dict[str, Any]:
     """One ``discord_signal_received`` record for a polled Discord message.
 
@@ -353,8 +391,8 @@ def received_record(
 
     return {
         "type": "discord_signal_received",
+        "schema_version": 1,
         "logged_at": logged_at,
-        "received_at": logged_at,
         "message_created_at": created_at if isinstance(created_at, str) else None,
         "bot_name": str(bot_name or ""),
         "account_id": account_id,
@@ -366,6 +404,10 @@ def received_record(
         "discord_author_id": str(author.get("id") or ""),
         "author_username": str(author.get("username") or "") or None,
         "author_is_bot": bool(author.get("bot")),
+        # False marks a message kept for impostor auditing: it is archived
+        # like every other polled message but was refused by the
+        # trusted-author allowlist before parsing.
+        "author_trusted": author_trusted,
         "discord_message_type": message.get("type"),
         "content": content,
         "parse_status": "parsed" if parsed is not None else "rejected",
@@ -461,16 +503,14 @@ class SignalDecisionRecorder:
         signal = self._signal
         metadata = dict(getattr(signal, "metadata", None) or {})
         deployment = self._deployment
-        deployment_config = (
-            getattr(deployment, "signal_config", None)
+        signal_processor = (
+            deployment_signal_processor_name(deployment) or None
             if deployment is not None
             else None
         )
-        signal_processor = None
-        if isinstance(deployment_config, Mapping):
-            signal_processor = deployment_config.get("signal_processor")
         return {
             "type": "discord_signal_decision",
+            "schema_version": 1,
             "logged_at": utcnow_iso(),
             "discord_message_id": metadata.get("discord_message_id"),
             "discord_channel_id": metadata.get("discord_channel_id"),
@@ -573,8 +613,9 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
         true_range = pd.concat(
             [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
         ).max(axis=1)
-        # First bar has no previous close; seed its TR with high - low, the
-        # same convention the signal processors use.
+        # First bar has no previous close; seed its TR with high - low so
+        # atr_14 exists on short frames. The ewm(span=14, adjust=False)
+        # smoothing matches the convention the signal processors use.
         true_range = true_range.fillna(high - low)
         atr = true_range.ewm(span=_ATR_SPAN, adjust=False).mean()
 

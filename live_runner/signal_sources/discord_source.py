@@ -2003,10 +2003,14 @@ class DiscordSignalSource(BaseSignalSource):
             on_author_accepted=self._record_author_accepted,
             outcome_sink=_outcome_sink,
         )
-        # Issue #308: archive every message from a trusted signal-bot author,
-        # parsed or refused. record() is a non-blocking put_nowait; the try
-        # only guards record *construction*, and failures are counted, never
-        # raised into the poll loop.
+        # Issue #308: archive every polled message, parsed or refused —
+        # including authors outside the trusted allowlist, kept for impostor
+        # auditing and marked ``author_trusted: false``. record() is a
+        # non-blocking put_nowait; the try only guards record *construction*,
+        # and failures are counted, never raised into the poll loop.
+        author_trusted = (
+            _resolve_message_author_id(wrapped) in self.trusted_author_ids
+        )
         try:
             signal_archive.get_signal_archive().record(
                 signal_archive.received_record(
@@ -2017,6 +2021,7 @@ class DiscordSignalSource(BaseSignalSource):
                     channel_id=channel_id,
                     parsed=parsed,
                     refusal=refusals[0] if refusals else None,
+                    author_trusted=author_trusted,
                 )
             )
         except Exception as exc:

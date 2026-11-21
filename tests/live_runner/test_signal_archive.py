@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -24,7 +26,7 @@ from risk import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
 
 
-@pytest.fixture()
+@pytest.fixture
 def archive(tmp_path, monkeypatch):
     """A SignalArchive writing into a tmp DATA_DIR."""
     monkeypatch.setattr(sa._constants, "DATA_DIR", tmp_path)
@@ -33,7 +35,7 @@ def archive(tmp_path, monkeypatch):
     arch.close(timeout=2.0)
 
 
-@pytest.fixture()
+@pytest.fixture
 def archive_env(tmp_path, monkeypatch):
     """A tmp-DATA_DIR archive installed as the process singleton.
 
@@ -168,13 +170,16 @@ def test_received_record_parsed_signal() -> None:
         channel_id="chan-1",
         parsed=parsed,
         refusal=None,
+        author_trusted=True,
     )
     assert record["type"] == "discord_signal_received"
+    assert record["schema_version"] == 1
     assert record["discord_message_id"] == "123456789"
     assert record["discord_channel_id"] == "chan-1"
     assert record["discord_author_id"] == "author-1"
     assert record["author_username"] == "ramjet_bot"
     assert record["author_is_bot"] is True
+    assert record["author_trusted"] is True
     assert record["content"].startswith("**$AAPL**")
     assert record["message_created_at"] == "2026-11-21T14:30:00+00:00"
     assert record["parse_status"] == "parsed"
@@ -202,8 +207,10 @@ def test_received_record_refused_signal() -> None:
         channel_id="chan-9",
         parsed=None,
         refusal=("non_entry_rejection", "report of a completed trade, not an instruction"),
+        author_trusted=False,
     )
     assert record["parse_status"] == "rejected"
+    assert record["author_trusted"] is False
     assert record["refusal_reason"] == "non_entry_rejection"
     assert record["refusal_detail"].startswith("report")
     assert record["signal"] is None
@@ -235,12 +242,15 @@ def _signal(**metadata_overrides):
     )
 
 
-def _deployment():
-    return SimpleNamespace(
-        id="dep-1",
-        strategy_name="ramjet-live",
-        signal_config={"signal_processor": "ramjet"},
-    )
+def _deployment(**overrides) -> SimpleNamespace:
+    options = {
+        "id": "dep-1",
+        "strategy_name": "ramjet-live",
+        "signal_config": {"signal_processor": "ramjet"},
+        "settings": {},
+    }
+    options.update(overrides)
+    return SimpleNamespace(**options)
 
 
 def test_decision_recorder_writes_one_record_with_features(archive: SignalArchive) -> None:
@@ -259,6 +269,7 @@ def test_decision_recorder_writes_one_record_with_features(archive: SignalArchiv
     assert len(records) == 1
     record = records[0]
     assert record["type"] == "discord_signal_decision"
+    assert record["schema_version"] == 1
     assert record["outcome"] == "traded"
     assert record["reason"] is None
     assert record["broker_order_id"] == "broker-123"
@@ -287,6 +298,23 @@ def test_decision_recorder_refused(archive: SignalArchive) -> None:
     assert len(records) == 1
     assert records[0]["outcome"] == "refused"
     assert records[0]["reason"] == "symbol_not_covered"
+
+
+def test_decision_recorder_reads_processor_from_settings(archive: SignalArchive) -> None:
+    """Deployments may configure the processor via ``settings``, not only
+    ``signal_config`` — the record must name the processor that actually ran."""
+    record_signal_decision(
+        _signal(),
+        account_id="acc-1",
+        deployment=_deployment(
+            signal_config={}, settings={"signal_processor": "nitro"}
+        ),
+        outcome="refused",
+        reason="symbol_not_covered",
+        archive=archive,
+    )
+    records = _read_records(archive)
+    assert records[0]["signal_processor"] == "nitro"
 
 
 def test_decision_recorder_without_deployment(archive: SignalArchive) -> None:
@@ -369,6 +397,43 @@ def test_market_features_empty_and_malformed() -> None:
     assert market_features_from_frame(bad) == {}
 
 
+def test_writer_exits_when_closed_and_queue_drained(tmp_path, monkeypatch) -> None:
+    """close() drops its sentinel on a full queue; the writer must still exit.
+
+    Regression: the sentinel was the only exit signal, so a full queue at
+    close() left the writer thread alive forever.
+    """
+    monkeypatch.setattr(sa._constants, "DATA_DIR", tmp_path)
+    arch = SignalArchive(queue_size=1)
+    gate = threading.Event()
+    real_write = arch._write_batch
+
+    def _slow_write(batch):
+        gate.wait(5.0)
+        return real_write(batch)
+
+    monkeypatch.setattr(arch, "_write_batch", _slow_write)
+    try:
+        arch.record({"type": "x", "logged_at": "2026-11-21T00:00:00+00:00", "n": 1})
+        # Wait until the writer holds item 1 inside the gated write, then
+        # fill the queue so close()'s sentinel cannot be enqueued.
+        deadline = time.monotonic() + 5.0
+        while not arch._queue.empty() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        arch._queue.put_nowait(
+            {"type": "x", "logged_at": "2026-11-21T00:00:01+00:00", "n": 2}
+        )
+        arch.close(timeout=0.2)
+        gate.set()
+        assert arch._thread is not None
+        arch._thread.join(5.0)
+        assert not arch._thread.is_alive()
+        assert arch.written == 2
+    finally:
+        gate.set()
+        arch.close(timeout=2.0)
+
+
 # -- discord_source integration -------------------------------------------------
 
 
@@ -431,6 +496,8 @@ def test_polled_parsed_signal_is_archived(archive_env: SignalArchive) -> None:
     assert record["discord_message_id"] == "m-parsed"
     assert record["discord_author_id"] == "bot-1"
     assert record["author_username"] == "ramjet_bot"
+    assert record["author_trusted"] is True
+    assert record["schema_version"] == 1
     assert record["account_id"] == "acc-1"
     assert record["bot_name"] == "ramjet"
     assert record["parse_status"] == "parsed"
@@ -478,6 +545,8 @@ def test_polled_untrusted_author_is_archived_as_rejected(archive_env: SignalArch
     assert len(records) == 1
     assert records[0]["refusal_reason"] == "untrusted_author"
     assert records[0]["parse_status"] == "rejected"
+    # Kept for impostor auditing, but marked so offline consumers can filter.
+    assert records[0]["author_trusted"] is False
 
 
 def test_non_emitting_poll_archives_nothing(archive_env: SignalArchive) -> None:
@@ -485,6 +554,17 @@ def test_non_emitting_poll_archives_nothing(archive_env: SignalArchive) -> None:
     _poll(source, [_rest_message("**$AAPL** buy signal\nPrice: $190.50", message_id="m-skip")])
     archive_env.flush(timeout=5.0)
     before = len(_all_records())
+
+    # A FRESH message id: dedup alone must not be what keeps the count flat —
+    # emit=False has to skip the archive for a message never seen before.
+    async def _fetch(channel_id, **_kwargs):
+        return [
+            _rest_message(
+                "**$AAPL** buy signal\nPrice: $190.50", message_id="m-skip-fresh"
+            )
+        ]
+
+    source._fetch_messages = _fetch
     asyncio.run(source._poll_once("channel-1", emit=False))
     archive_env.flush(timeout=5.0)
     assert len(_all_records()) == before
@@ -684,3 +764,32 @@ def test_claim_and_submit_nothing_to_exit_records_ignored(
     assert len(records) == 1
     assert records[0]["outcome"] == "ignored"
     assert records[0]["reason"] == "nothing_to_exit"
+
+
+def test_submit_unexpected_error_records_unknown(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    """An exception on the dispatch path must still leave a decision record."""
+    deployment = _live_deployment()
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(daemon, "_prepare_discord_signal_for_submission", _boom)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        asyncio.run(
+            daemon._submit_normalized_discord_signal(
+                "acc-1",
+                object(),
+                deployment,
+                _trade_signal(),
+                signal_timeframe="1h",
+                wait_enabled=False,
+            )
+        )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
+    assert len(records) == 1
+    assert records[0]["outcome"] == "unknown"
+    assert records[0]["reason"] == "unhandled_error"
+    assert "kaboom" in records[0]["detail"]
