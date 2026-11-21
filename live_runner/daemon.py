@@ -29,6 +29,7 @@ from live_runner.base_adapter import (
     coerce_positive_live_qty,
     is_order_not_submitted,
     is_unbounded_tp,
+    order_not_submitted,
     validate_live_quote_prices,
 )
 from live_runner.credential_env import (
@@ -58,6 +59,7 @@ from live_runner.exit_signals import (
     round_exit_qty_down,
     usable_qty_tolerance,
 )
+from live_runner.pre_submit_caps import enforce_pre_submit_caps
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
@@ -2085,6 +2087,17 @@ async def submit_order_with_risk(
         account_balance=account_balance,
         pip_value=pip_value,
     )
+    # #302: the last check before the broker sees the order, independent of
+    # the sizing code that produced it. Inside order_not_submitted so a
+    # refusal is provably pre-request.
+    with order_not_submitted():
+        await enforce_pre_submit_caps(
+            adapter,
+            deployment,
+            prepared_signal,
+            qty=prepared_qty,
+            risk_config=_risk_config_for_deployment(deployment),
+        )
     return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
@@ -2767,6 +2780,18 @@ async def _prepare_claim_and_submit_signal(
     )
     try:
         try:
+            # #302: the last check before the broker sees the order,
+            # independent of the sizing code that produced it. Inside
+            # order_not_submitted so a refusal is provably pre-request and
+            # the submission lease is released below.
+            with order_not_submitted():
+                await enforce_pre_submit_caps(
+                    adapter,
+                    deployment,
+                    prepared_signal,
+                    qty=prepared_qty,
+                    risk_config=_risk_config_for_deployment(deployment),
+                )
             broker_order_id = await adapter.submit_order(
                 prepared_signal, qty=prepared_qty
             )

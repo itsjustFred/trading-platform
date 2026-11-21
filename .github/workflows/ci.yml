@@ -38,6 +38,7 @@ jobs:
           live_runner/__init__.py
           live_runner/account_discovery.py
           live_runner/ctrader_adapter.py
+          live_runner/pre_submit_caps.py
           scripts/sync_requirements_from_lock.py
           scripts/check_requirements_drift.py
           scripts/matrix_queue_runner.py
