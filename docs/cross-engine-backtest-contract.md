@@ -99,9 +99,11 @@ or `level` (case-insensitive):
   *marketable* side — below the low for a LONG exit, above the high for a
   SHORT exit — the resting order was marketable at the open, so under the
   gap-through-level convention (the same rule as gap-through stops) it
-  fills at the bar's **open** and flags `meta["exit_level_gapped"]`. This
-  applies to every level fill, explicit `level` and vectorbt's legacy
-  implicit `exit_price` alike.
+  fills at the bar's **open** and flags `meta["exit_level_gapped"]`.
+  Direction-specific, like every open fill: a LONG exit sells the bid at
+  the raw open, while a SHORT exit buys the ask at `open + spread` when a
+  spread is configured. This applies to every level fill, explicit `level`
+  and vectorbt's legacy implicit `exit_price` alike.
 - absent or unrecognized — the **legacy fallback** applies per engine:
   vectorbt treats a usable `exit_price` as a level fill; native fills at the
   convention price and ignores `exit_price` (an unrecognized non-empty value

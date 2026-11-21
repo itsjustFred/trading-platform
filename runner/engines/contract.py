@@ -232,7 +232,8 @@ def exit_level_disposition(
       ``meta["exit_level_unreachable"]`` — filling at the level anyway
       would book a fantasy price.
 
-    Missing or non-finite bar extremes fail closed (``unreachable``).
+    Missing, non-finite or inverted (``low > high``) bar extremes fail
+    closed (``unreachable``).
     ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` — an unknown
     direction would invert the classification, so it raises ``ValueError``
     like :func:`resolve_same_bar_exit`.
@@ -245,6 +246,9 @@ def exit_level_disposition(
     except (TypeError, ValueError, OverflowError):
         return EXIT_LEVEL_UNREACHABLE
     if not (math.isfinite(hi) and math.isfinite(lo)):
+        return EXIT_LEVEL_UNREACHABLE
+    if lo > hi:
+        # An inverted range is not a traded range at all: fail closed.
         return EXIT_LEVEL_UNREACHABLE
     if lo <= level <= hi:
         return EXIT_LEVEL_IN_RANGE

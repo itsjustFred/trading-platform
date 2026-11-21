@@ -1069,5 +1069,15 @@ class TestExitOrderContractHelpers:
             c(direction="SHORT", level=107.0, high=high, low=float("nan"))
             == contract.EXIT_LEVEL_UNREACHABLE
         )
+        # An inverted range is not a traded range: fail closed too, never
+        # classify it as a gap (which would fill at the open).
+        assert (
+            c(direction="LONG", level=107.0, high=low, low=high)
+            == contract.EXIT_LEVEL_UNREACHABLE
+        )
+        assert (
+            c(direction="SHORT", level=500.0, high=low, low=high)
+            == contract.EXIT_LEVEL_UNREACHABLE
+        )
         with pytest.raises(ValueError, match="direction"):
             c(direction="SIDEWAYS", level=107.0, high=high, low=low)
