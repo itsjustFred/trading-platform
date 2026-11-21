@@ -726,8 +726,9 @@ class LiveExecutionModel(SQLModel, table=True):
         guard existed (or written around it, e.g. via ``session.add``) with a negative
         cost raises ``ValidationError`` here instead of silently flipping
         ``gross - commission`` net PnL. ``init_db``'s one-time
-        ``_migrate_ctrader_commission_to_cost`` already ``abs``-converted legacy
-        negatives, so this only fires on genuinely corrupt data.
+        ``_migrate_ctrader_commission_to_cost`` ``abs``-converted legacy negatives on
+        resolved cTrader accounts — orphan rows whose broker cannot be determined are
+        skipped — so this fires on corrupt data or such orphans.
         """
         return LiveExecution(
             id=self.id,

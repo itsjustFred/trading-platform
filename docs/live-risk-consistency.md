@@ -231,8 +231,8 @@ als `commission=NULL` („Gebühr unbekannt") plus ERROR-Log gespeichert, damit 
 nicht verloren geht - die eigentliche Rebate-Darstellung ist eine offene
 Maintainer-Entscheidung. `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative
 Werte ebenfalls ab. Der Lese-Pfad (`LiveExecutionModel.to_live_execution`) baut ein
-`LiveExecution` und validiert damit erneut: eine negativ gespeicherte Zeile wirft beim
-Lesen, statt still falsches Net-PnL zu liefern.
+`LiveExecution` und validiert damit erneut; er hat aktuell keine Produktions-Aufrufer -
+die Net-PnL-Reader konsumieren die rohen `live_executions`-Zeilen direkt.
 Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) trugen das rohe negative
 Vorzeichen; `init_db` wandelt sie einmalig per Migration
 (`_migrate_ctrader_commission_to_cost`, `abs` des gespeicherten Werts) in einen positiven

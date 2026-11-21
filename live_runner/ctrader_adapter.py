@@ -530,7 +530,9 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
-def _deal_commission(deal: Any | None) -> float | None:
+def _deal_commission(
+    deal: Any | None, *, rebate_logged: set[int] | None = None
+) -> float | None:
     """A deal's commission in account currency, as a positive cost — or ``None``.
 
     cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
@@ -559,14 +561,21 @@ def _deal_commission(deal: Any | None) -> float | None:
         return 0.0
     cost = commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
     if cost < 0:
-        logger.error(
-            "cTrader deal %s reported a rebate: commission=%r converts to cost=%r, which "
-            "the write guard refuses; storing commission=NULL so the fill is kept and "
-            "net PnL stays flagged incomplete (#285)",
-            _deal_id_or_none(deal),
-            raw,
-            cost,
-        )
+        deal_id = _deal_id_or_none(deal)
+        # ERROR once per deal id per adapter: reconciliation re-reads the same deals on
+        # every pass, and each ERROR is a Sentry event — the anomaly is logged loudly
+        # once, not once per pass.
+        if rebate_logged is None or deal_id is None or deal_id not in rebate_logged:
+            logger.error(
+                "cTrader deal %s reported a rebate: commission=%r converts to cost=%r, which "
+                "the write guard refuses; storing commission=NULL so the fill is kept and "
+                "net PnL stays flagged incomplete (#285)",
+                deal_id,
+                raw,
+                cost,
+            )
+            if rebate_logged is not None and deal_id is not None:
+                rebate_logged.add(deal_id)
         return None
     return cost
 
@@ -853,6 +862,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected_event = asyncio.Event()
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts: dict[int, int] = {}
+        self._rebate_logged_deal_ids: set[int] = set()
         self._unresolved_execution_events: deque[Any] = deque()
         self._reconciliation_required = False
         self._reconciliation_retry_at = 0.0
@@ -2207,7 +2217,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(deal, rebate_logged=self._rebate_logged_deal_ids),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
@@ -3550,7 +3560,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `actual_price` treats a non-answer as a price.
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(deal, rebate_logged=self._rebate_logged_deal_ids),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(

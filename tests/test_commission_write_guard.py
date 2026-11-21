@@ -75,6 +75,8 @@ def test_the_write_guard_itself() -> None:
         validate_commission_cost(True)
     with pytest.raises(ValueError, match="finite"):
         validate_commission_cost("1.5")
+    with pytest.raises(ValueError, match="finite"):
+        validate_commission_cost(10**10000)  # huge int: isfinite would OverflowError
 
 
 @pytest.fixture

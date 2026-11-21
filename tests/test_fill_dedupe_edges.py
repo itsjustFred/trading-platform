@@ -810,6 +810,9 @@ def test_c2_a_ctrader_rebate_fill_is_stored_with_unknown_commission(database, ca
     recovered.moneyDigits = 2
     with caplog.at_level(logging.ERROR):
         assert _reconcile(adapter, signal, ENTRY_ORDER, [recovered], 600_000) == 1
+        # A second reconciliation pass re-reads the same rebate deal: the row is a
+        # duplicate (nothing new stored) and the ERROR is not repeated per pass.
+        assert _reconcile(adapter, signal, ENTRY_ORDER, [recovered], 600_000) == 0
 
     assert _commissions(database) == [None, None]
     assert database.get_live_signal_filled_qty(signal) == pytest.approx(600.0)

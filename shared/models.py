@@ -358,6 +358,14 @@ def execution_price_is_usable(price: Any, verdict: Any) -> bool:
     return math.isfinite(number) and number > 0.0
 
 
+def _commission_input_repr(value: object) -> str:
+    """``repr`` that cannot itself fail: a huge int exceeds the int->str digit limit."""
+    try:
+        return repr(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
 def validate_commission_cost(value: float | None) -> float | None:
     """The ``live_executions.commission`` write guard (#285): a charge is a positive cost.
 
@@ -375,11 +383,17 @@ def validate_commission_cost(value: float | None) -> float | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        raise ValueError(f"commission must be a finite number, got {value!r}")
+        raise ValueError(
+            f"commission must be a finite number, got {_commission_input_repr(value)}"
+        )
     try:
         finite = math.isfinite(value)
-    except TypeError:
-        raise ValueError(f"commission must be a finite number, got {value!r}") from None
+    except (TypeError, OverflowError):
+        # TypeError: not a number at all (e.g. a string). OverflowError: a huge int
+        # too large to convert to float - still not a storable commission.
+        raise ValueError(
+            f"commission must be a finite number, got {_commission_input_repr(value)}"
+        ) from None
     if not finite:
         raise ValueError(f"commission must be finite, got {value!r}")
     if value < 0:
