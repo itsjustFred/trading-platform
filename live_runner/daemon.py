@@ -125,8 +125,9 @@ from shared.models import (
 )
 from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
+    ANY_BROKER,
     TRAILING_SL_CONFIG_METADATA_KEY,
-    validate_live_deployment_trailing_override,
+    validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
 from signal_bots.registry import get_signal_processor
@@ -583,11 +584,8 @@ def _deployment_wait_for_candle_close(
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = deployment.signal_config or {}
-    configured_tf = str(configured.get("timeframe") or deployment.timeframe).strip()
-    if configured_tf:
-        return configured_tf
-    return deployment.timeframe
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:
@@ -4787,16 +4785,33 @@ async def _load_db_accounts_and_deployments(
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
     # #150: a stored deployment whose trailing override live cannot run is still
     # loaded (so it stays listed, stoppable and enforceable), but every signal
-    # it produces is refused by the live gates. Say so loudly at load time.
+    # it produces is refused by the live gates. Say so loudly at load time. The
+    # same holds for a mode that only comes from the bot's own config default:
+    # it is not visible in the deployment's config, so the processor that would
+    # emit it is built here and asked (its config file is a few KB).
+    account_brokers = {account.id: account.broker for account in accounts}
     for deployment in deployments:
         try:
-            validate_live_deployment_trailing_override(
-                deployment.signal_config,
+            validate_live_deployment_trailing_mode(
+                deployment,
                 context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+                broker=account_brokers.get(deployment.account_id, ANY_BROKER),
+                timeframe=_deployment_signal_timeframe(deployment),
             )
         except ValueError as exc:
             logger.error(
                 "Stored live deployment has an unsupported trailing mode; its entry "
+                "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
+        except Exception as exc:
+            # Anything else reading the deployment's trailing mode can raise. It
+            # must not cost the whole deployment list its sync tick: the
+            # signal-time gates still refuse every signal this deployment makes,
+            # so a stored row is surfaced here and traded nowhere.
+            logger.error(
+                "Stored live deployment's trailing mode could not be checked; its entry "
                 "signals will be refused: %s",
                 exc,
                 extra={"data": {"deployment_id": str(deployment.id)}},

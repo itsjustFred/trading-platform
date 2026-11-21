@@ -45,7 +45,11 @@ pro Bot.
   Definition: `shared/trailing.py`.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
     abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
-    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
+    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen. Bei der
+    Deployment-Validierung wird der Modus sowohl aus einem expliziten Override
+    (`signal_config.signal_processor_config.trailing_mode`) als auch aus dem Default der eigenen
+    Bot-Config gelesen — der Prozessor des Deployments wird dafür genauso gebaut wie vom Daemon
+    (`shared/trailing.py: validate_live_deployment_trailing_mode`).
   - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
     cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
     live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay

@@ -10,7 +10,9 @@ Status: credential-gated as of 2026-07-13.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
 - Trailing stops: live support is per broker (see "Live Trailing Stops" below). Alpaca executes
   `none` and `percent`; cTrader executes `none` only. Any other combination is rejected when the
-  deployment is validated and again at signal time, before anything reaches the broker.
+  deployment is validated and again at signal time, before anything reaches the broker — including
+  a mode that only comes from the bot's own config default, which is read from the processor the
+  deployment runs.
 
 ## Live Trailing Stops
 
@@ -75,13 +77,21 @@ results stop predicting live behaviour:
 - Deployment validation: `LiveDeploymentConfig` rejects a `trailing_mode` override no live broker
   executes; `create_live_deployment`, `update_live_deployment_account` (re-point) and the YAML
   parser reject one the deployment's account broker does not execute.
+- Deployment validation, bot default: the mode is a setting of the *bot*
+  (`signal_bots/<bot>/config.yaml`) and the processor emits it with every signal, so a default that
+  the deployment's broker cannot execute is just as fatal. Those three stages build the processor
+  the deployment actually runs (bot config merged with the deployment's
+  `signal_processor_config`, exactly as the daemon builds it) and ask it for the mode
+  (`shared.trailing.validate_live_deployment_trailing_mode`). A deployment that sets
+  the override explicitly is covered by the check above and is not built twice.
 - Signal time: the signal-processor gate and the order-preparation gate both check the mode
   against the adapter that would submit the order (broker table and the adapter's own
   `supports_stop_amendment` flag). A refused signal is not traded; a requested trail is never
   dropped silently.
-- Stored rows: a stored deployment whose trailing override no live broker executes still loads
-  (so it stays listed and can be stopped); the daemon logs an error for it at load and every
-  signal it produces is refused before it reaches the broker.
+- Stored rows: a stored deployment whose trailing override no live broker executes, or whose
+  processor's own default one does not, still loads (so it stays listed and can be stopped); the
+  daemon logs an error for it at load and every signal it produces is refused before it reaches
+  the broker.
 
 **How `percent` is executed (Alpaca)**
 
@@ -102,10 +112,9 @@ results stop predicting live behaviour:
   a session late versus replay. `4h`/`1w` are not served by the adapter at all. Per #150 such an
   entry is refused, not traded untrailed: a `percent` entry on an untrailable timeframe is rejected
   at signal time (processor gate and order-preparation gate), and a deployment that sets
-  `trailing_mode: percent` in `signal_processor_config` is rejected at API create and YAML parse. A
-  deployment whose trailing mode only comes from the signal processor's own default cannot be
-  checked before a signal exists; it is refused at its first entry. Session-aligned daily trailing
-  is a follow-up.
+  `trailing_mode: percent` in `signal_processor_config` is rejected at API create and YAML parse, and
+  so is a `percent` mode that only comes from the bot's own config default. Session-aligned daily
+  trailing is a follow-up.
 - Amendment: the protective stop order is replaced in place (`PATCH /v2/orders/{id}`). The
   previous stop keeps working until the replacement is accepted and stays if it is refused; the
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP

@@ -211,6 +211,42 @@ class LiveDeploymentConfig(BaseModel):
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def signal_timeframe(self) -> str:
+        """The timeframe this deployment signals on, trimmed, with a fallback.
+
+        ``signal_config.timeframe`` when it is not blank, else the deployment's
+        own timeframe. One definition, on the model: deployment validation, the
+        daemon's load path, the trailing loop and the signal-time gates all gate
+        a trailing mode on the timeframe, and three of them used to read a
+        whitespace-only override as "" while the daemon read it as the
+        deployment timeframe — so the same configuration was refused by one
+        stage and accepted by another.
+        """
+        configured = (self.signal_config or {}).get("timeframe")
+        override = str(configured or "").strip()
+        if override:
+            return override
+        return str(self.timeframe or "").strip()
+
+    @property
+    def signal_processor_name(self) -> str:
+        """Registered signal-processor id of this deployment, ``""`` when none.
+
+        One definition, on the model: the daemon's signal-processor gate and the
+        deployment-validation stages (``create_live_deployment``, the YAML
+        parser) resolve the id from the same place, so a processor that cannot
+        be built, or whose own default trailing mode the deployment's broker
+        cannot execute (#150), is caught at deployment validation instead of
+        per signal. The promotion gate hashes this id and is not a trailing
+        gate; it reads the same value through ``live_runner.promotion``.
+        """
+        configured = self.signal_config or {}
+        settings = self.settings or {}
+        return str(
+            configured.get("signal_processor") or settings.get("signal_processor") or ""
+        ).strip().lower()
+
     @model_validator(mode="after")
     def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
         # Issue #150 fail closed, first stage: only the account id is known
