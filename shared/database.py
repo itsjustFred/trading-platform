@@ -131,7 +131,20 @@ def _sqlite_uri_file_path(body: str) -> str:
     authority, separator, path = body[2:].partition("/")
     if authority not in ("", "localhost"):
         return ""
-    return separator + path if separator else ""
+    result = separator + path if separator else ""
+    # On Windows ``file:///C:/x.db`` is the drive path ``C:/x.db``: SQLite drops the leading
+    # slash before a drive letter there, and keeping it would name ``/C:/x.db`` - a file the
+    # engine never opens, so the single-instance lock would sit beside the wrong path. On
+    # POSIX the same spelling is a literal ``/C:`` directory, so the strip is Windows-only.
+    if (
+        os.name == "nt"
+        and len(result) > 2
+        and result[0] == "/"
+        and result[1].isalpha()
+        and result[2] == ":"
+    ):
+        return result[1:]
+    return result
 
 
 def sqlite_url_file(url: str) -> str:

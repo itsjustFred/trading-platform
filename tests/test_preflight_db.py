@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from textwrap import dedent
@@ -459,6 +460,26 @@ def test_resolve_db_path_normalizes_the_sqlite_uri_form(tmp_path: Path, monkeypa
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///file:{path.as_posix()}?uri=true")
 
     assert resolve_db_path() == path
+
+
+def test_sqlite_url_file_strips_the_slash_before_a_windows_drive_letter(monkeypatch) -> None:
+    """``file:///C:/x.db?uri=true`` is ``C:/x.db`` on Windows.
+
+    SQLite drops the leading slash before a drive letter on Windows only; keeping it would
+    resolve the database - and the daemon's single-instance lock beside it - to ``/C:/x.db``,
+    a file the engine never opens.
+    """
+    from shared.database import sqlite_url_file
+
+    monkeypatch.setattr(os, "name", "nt")
+    assert sqlite_url_file("sqlite:///file:///C:/data/live.db?uri=true") == "C:/data/live.db"
+
+
+def test_sqlite_url_file_keeps_the_slash_before_a_drive_letter_on_posix() -> None:
+    """On POSIX ``/C:/x.db`` is a literal absolute path, not a drive letter."""
+    from shared.database import sqlite_url_file
+
+    assert sqlite_url_file("sqlite:///file:///C:/data/live.db?uri=true") == "/C:/data/live.db"
 
 
 def test_resolve_db_path_decodes_a_percent_encoded_url(tmp_path: Path, monkeypatch) -> None:
