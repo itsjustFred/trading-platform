@@ -3621,6 +3621,41 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
     return conflicts
 
 
+def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
+    """Clear the recorded conflicting broker order ids for one signal.
+
+    The way out of a conflict halt (#126): while a conflict stays recorded the daemon
+    keeps the deployment paused, so a resolution cannot be a status write and nothing
+    else. This removes the key from the signal's metadata (and its broker_order_id
+    mirror, which the conflict ledger also maintains) and returns the ids it removed.
+
+    The caller is an explicit operator action - the viewer's resolve endpoint, which
+    requires a confirmation naming the deployment and audits the call. It is not
+    reachable from a signal payload: :meth:`LiveSignalModel.from_live_signal` drops a
+    producer-supplied conflict list, and nothing else writes this key.
+
+    Returns ``[]`` for an unknown signal or one with no recorded conflict, so a caller
+    can tell "nothing to resolve" from "resolved" without reading the row.
+    """
+    normalized = str(signal_id or "").strip()
+    if not normalized:
+        return []
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveSignalModel, normalized)
+        if record is None:
+            return []
+        metadata = dict(record.metadata_json or {})
+        removed = _conflicting_broker_order_ids(metadata)
+        if not removed and BROKER_ORDER_CONFLICTS_KEY not in metadata:
+            return []
+        metadata.pop(BROKER_ORDER_CONFLICTS_KEY, None)
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return removed
+
+
 def deployments_with_broker_order_conflicts(limit: int = 200) -> dict[str, list[dict[str, Any]]]:
     """Unresolved broker order id conflicts, grouped by deployment id.
 

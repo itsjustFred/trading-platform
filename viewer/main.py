@@ -184,6 +184,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
         return []
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
 from shared.models import (
@@ -13965,6 +13966,132 @@ async def update_live_deployment_status_endpoint(
                 },
             )
     return payload
+
+
+@app.post(
+    "/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+    responses={
+        400: {"description": "The resolution carries no reason"},
+        428: {"description": "The control was not confirmed"},
+        404: {"description": "Live deployment not found"},
+    },
+)
+async def resolve_live_deployment_broker_order_conflicts_endpoint(
+    deployment_id: str,
+    payload: LiveControlConfirmation | None = None,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Record that a deployment's broker order id conflicts were reconciled (#126).
+
+    The way out of a conflict halt. While a conflict is recorded the daemon keeps
+    the deployment paused, so a resolution cannot be a status write and nothing
+    else: this clears the recorded ids and reports what it cleared, and the
+    operator then resumes the deployment through the status endpoint (which does
+    its own broker re-verification).
+
+    The confirmation and the reason are required on purpose. Clearing one of these
+    says "there is no untracked broker order any more", which is a statement about
+    the broker, not about the UI; the reason is the evidence of the reconciliation
+    and it goes into the audit trail next to who made it.
+    """
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        deployment_id=deployment_id,
+    )
+    await _require_live_control_confirmation(
+        action="deployment.broker_order_conflict.resolve",
+        deployment_id=deployment_id,
+        confirmation=payload,
+        request=request,
+    )
+    reason = str(payload.reason or "").strip()
+    if not reason:
+        await _audit_live_control(
+            action="deployment.broker_order_conflict.resolve",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no resolution reason supplied"},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Record what you reconciled at the broker in confirmation.reason; "
+                "resolving a conflict says there is no untracked broker order, "
+                "and that has to be attributable."
+            ),
+        )
+    deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if deployment is None:
+        await _audit_live_control(
+            action="deployment.broker_order_conflict.resolve",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "deployment not found", "resolution_reason": reason},
+        )
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+
+    # Inventory the leases before clearing anything: an exit already in flight was
+    # sized against a ledger that has not seen its fill yet, so the operator has to
+    # hear about it while deciding to resume.
+    pending_claims = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+    drain = await _drain_live_deployment_submissions(
+        deployment_id, initial_claims=pending_claims
+    )
+    resolved = await asyncio.to_thread(resolve_broker_order_conflicts, deployment_id)
+
+    await _audit_live_control(
+        action="deployment.broker_order_conflict.resolve",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        request=request,
+        detail={
+            "resolution_reason": reason,
+            "account_id": str(deployment.account_id or ""),
+            "resolved": resolved,
+            "submission_drain_outcome": drain.outcome.value,
+            "in_flight_submissions": drain.in_flight,
+            "expired_unreleased_submissions": drain.expired_unreleased,
+        },
+    )
+    if not drain.complete:
+        logger.error(
+            "Broker order id conflict resolved while submissions were still "
+            "unaccounted for; verify the broker before resuming the deployment",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "submission_drain_outcome": drain.outcome.value,
+                    "in_flight_submissions": drain.in_flight,
+                    "expired_unreleased_submissions": drain.expired_unreleased,
+                }
+            },
+        )
+
+    response: dict[str, Any] = {
+        "deployment_id": deployment_id,
+        "resolved": resolved,
+        "resolved_count": len(resolved),
+        "submission_drain_outcome": drain.outcome.value,
+        "submission_drain_complete": drain.complete,
+        "in_flight_submissions": drain.in_flight,
+        "expired_unreleased_submissions": drain.expired_unreleased,
+    }
+    if not drain.complete:
+        response["warning"] = (
+            "The conflicts are resolved, but submissions were still unaccounted "
+            "for at the broker. Verify the broker before resuming the deployment."
+        )
+    if not resolved:
+        response["warning"] = (
+            "This deployment had no recorded broker order id conflict."
+        )
+    return response
 
 
 @app.put("/api/live/deployments/{deployment_id}/account")

@@ -142,6 +142,43 @@ def test_enforce_reports_a_status_write_it_cannot_make(conflict, monkeypatch, ca
     assert alerts[0].data["deployment_id"] == DEPLOYMENT_ID
 
 
+def test_resolve_clears_the_recordings_so_the_halt_can_be_lifted(
+    conflict, caplog
+) -> None:
+    """The way out: clear the recorded ids, and the halt no longer re-asserts.
+
+    Without this the halt is a dead end - every ACTIVE write would be undone at the
+    next service sync tick and no operator action could recover the deployment.
+    """
+    from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
+
+    signal_id = check_broker_order_conflicts()["conflicts"][0]["signal_id"]
+    cleared = resolve_broker_order_conflicts(DEPLOYMENT_ID)
+
+    assert [row["signal_id"] for row in cleared] == [signal_id]
+    assert cleared[0]["conflicting_broker_order_ids"] == ["BRK-BBB"]
+    assert check_broker_order_conflicts()["status"] == "ok"
+    assert check_broker_order_conflicts()["deployment_ids"] == []
+    # With nothing recorded there is nothing left to enforce, and the halt is the
+    # operator's to lift.
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    assert enforce_broker_order_conflict_halts() == []
+    assert get_live_deployment(DEPLOYMENT_ID).status == "ACTIVE"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_resolve_reports_nothing_when_there_is_no_conflict(isolated_db) -> None:
+    """A resolve on a clean deployment is an empty answer, not a partial one."""
+    from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
+
+    database, _engine, _data_dir = isolated_db
+    seed_live_deployments(database, [DEPLOYMENT_ID])
+    save_live_signal(_signal(discord_message_id="ord-1", broker_order_id="BRK-AAA"))
+
+    assert resolve_broker_order_conflicts(DEPLOYMENT_ID) == []
+    assert check_broker_order_conflicts()["status"] == "ok"
+
+
 def test_the_pause_by_conflict_survives_a_daemon_restart(conflict, caplog) -> None:
     """#126 decision: a paused-by-conflict deployment stays paused across a restart.
 

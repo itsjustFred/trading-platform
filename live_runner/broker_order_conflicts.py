@@ -30,6 +30,7 @@ from typing import Any
 from shared.database import (
     deployments_with_broker_order_conflicts,
     get_live_deployment,
+    resolve_live_signal_broker_order_conflicts,
     update_live_deployment_status,
 )
 from shared.logging import get_logger
@@ -112,6 +113,43 @@ def _deployment_is_paused(deployment_id: str) -> bool:
         # reported by the health read.
         return True
     return str(deployment.status or "").strip().upper() in {"PAUSED", "STOPPED"}
+
+
+def resolve_broker_order_conflicts(deployment_id: str) -> list[dict[str, Any]]:
+    """Clear every recorded conflict for a deployment and return what was cleared.
+
+    The other half of the fail-closed pair (#126): the halt is only re-asserted while
+    a conflict is *recorded*, so an operator who has reconciled the conflicting broker
+    order ids with the broker needs this to get out of the halt. Kept in one function so
+    "resolve" cannot mean "resolve some of them": a deployment left with half a
+    conflict would still be halted, and the operator would not know why.
+
+    The caller is the viewer's resolve endpoint, which confirms and audits the action.
+    Clearing here without that is how a broker order nobody tracks gets forgotten.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return []
+    cleared: list[dict[str, Any]] = []
+    for conflict in deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT).get(
+        normalized, []
+    ):
+        removed = resolve_live_signal_broker_order_conflicts(str(conflict["signal_id"]))
+        if removed:
+            cleared.append({**conflict, "conflicting_broker_order_ids": removed})
+    if cleared:
+        logger.warning(
+            "Broker order id conflict(s) resolved by an operator for deployment %s; "
+            "the deployment can be reactivated once its positions are verified",
+            normalized,
+            extra={
+                "data": {
+                    "deployment_id": normalized,
+                    "resolved": cleared,
+                }
+            },
+        )
+    return cleared
 
 
 def _halt_record(deployment_id: str, conflicts: list[dict[str, Any]]) -> dict[str, Any]:

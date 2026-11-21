@@ -559,6 +559,58 @@ def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):
     assert payload["active_strategies"] == []
 
 
+def test_resolving_broker_order_conflicts_requires_confirmation_and_a_reason(
+    monkeypatch,
+):
+    """#126: clearing a conflict asserts something about the broker, so it is gated."""
+    import viewer.main as viewer_main_module
+
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda _id: LiveDeploymentConfig(
+            id=deployment_id,
+            strategy_name="live_strategy",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", lambda _id: []
+    )
+    cleared: list[str] = []
+
+    def _clear(unused_id):
+        cleared.append(str(unused_id))
+        return []
+
+    monkeypatch.setattr(viewer_main_module, "resolve_broker_order_conflicts", _clear)
+    client = TestClient(viewer_main_module.app)
+    url = f"/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve"
+
+    # No body at all reaches the confirmation gate (428); a body that names no
+    # deployment is malformed rather than unconfirmed (422).
+    assert client.post(url).status_code == 428
+    assert client.post(
+        url,
+        json={"confirmed_deployment_id": deployment_id, "reason": "closed at broker"},
+    ).status_code == 200
+    # A confirmation that names another deployment is refused before anything is
+    # cleared, and so is one that does not say what was reconciled.
+    assert client.post(
+        url,
+        json={"confirmed_deployment_id": "66666666-6666-6666-6666-666666666666", "reason": "x"},
+    ).status_code == 409
+    assert client.post(
+        url,
+        json={"confirmed_deployment_id": deployment_id, "reason": "   "},
+    ).status_code == 400
+    assert cleared == [deployment_id]
+
+
 def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     import viewer.main as viewer_main_module
 
