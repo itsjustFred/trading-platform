@@ -446,8 +446,8 @@ exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lo
 `DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
 exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
 was killed (even `kill -9`) releases it on death and never blocks the next start. The data
-directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` on a
-network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
+directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` - or
+the directory of a SQLite `DATABASE_URL` file - on a network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
 disconnects its broker adapters and then waits - bounded, `WORKER_JOIN_TIMEOUT_SECONDS` = 30s - for
 its in-flight database work, so the lock is never handed on while its own writes are still
 running; if a worker thread is still stuck after the budget the daemon logs CRITICAL and exits 4
