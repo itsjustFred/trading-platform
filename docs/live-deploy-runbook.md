@@ -12,6 +12,28 @@ Status: credential-gated as of 2026-07-13.
   `none` and `percent`; cTrader executes `none` only. Any other combination is rejected when the
   deployment is validated and again at signal time, before anything reaches the broker.
 
+## Ops Alert Channel (#304)
+
+The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
+paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, wired in
+`live_runner/daemon.py` at startup.
+
+- `OPS_ALERT_WEBHOOK_URL` — webhook URL. **Unset disables alerting entirely**; the daemon then
+  behaves exactly as before. There is no other configuration needed to turn it on.
+- `OPS_ALERT_MAX_PER_MINUTE` (default `12`) — alerts per sliding minute; overflow is dropped and
+  the drop count is folded into the next alert that does go out.
+- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — identical alerts inside this window send once.
+
+What is alerted: every `ERROR`/`CRITICAL` record, plus any record carrying `data.alert` (the
+explicit operator-alert marker, e.g. `exit_ledger_mismatch`) at any level. Which specific events
+should page — and whether WARNING-level refusals should join them — is an open maintainer
+decision tracked on the issue; the handler makes that a filter change, not a call-site change.
+
+Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
+webhook drops and counts alerts; it can never block or raise into a trading path. Payloads are
+redacted with the same rules as the JSON log formatter before they leave the process. Only the
+live daemon installs the sink today; other entry points are unaffected.
+
 ## Live Trailing Stops
 
 Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:
