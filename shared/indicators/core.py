@@ -567,8 +567,11 @@ def supertrend(
             band_condition=band_condition,
             first_i=first_i,
         )
-        ready_v = np.zeros(n, dtype=bool)
-        ready_v[first_i:] = ~np.isnan(trend_v[first_i:])
+        ready_v = (
+            (~np.isnan(trend_v))
+            & (~np.isnan(upper_v))
+            & (~np.isnan(lower_v))
+        )
 
     trend = pd.Series(trend_v, index=idx, name="supertrend_trend")
     upper = pd.Series(upper_v, index=idx, name="supertrend_upper")
