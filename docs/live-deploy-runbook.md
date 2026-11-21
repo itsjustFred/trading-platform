@@ -458,3 +458,68 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 ## Commission sign migration (cTrader, #205)
 
 `live_executions.commission` is a positive cost for every broker. The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge, which is indistinguishable from a new-convention rebate and is never converted. Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## Conflicting broker order id on a duplicate signal (#126)
+
+A redelivered or duplicate live signal that carries a **different non-empty**
+`broker_order_id` than the stored one means one of two things: a second broker
+order was placed for one logical signal, or the ids were mapped wrongly. Either
+way a broker order may exist that the ledger does not track, and an untracked
+open position is an unmanaged one. **Fail closed:** the deployment is halted,
+not warned at.
+
+**What the platform does** (`shared/database.py`,
+`live_runner/broker_order_conflicts.py`)
+
+- The tracked id is never overwritten. The conflicting id is recorded on the
+  signal: `live_signals.metadata_json["conflicting_broker_order_ids"]`,
+  deduplicated across redeliveries, in the same transaction as the halt.
+- The **affected deployment** is set to `PAUSED`. The other deployments on the
+  account keep trading, and their positions are untouched. A `STOPPED`
+  deployment is never downgraded (its cancel-and-flatten sweep already ran).
+- `ERROR` log with `alert=live_broker_order_id_conflict` (Sentry turns it into
+  an event), naming the signal, the deployment, the tracked and the conflicting
+  id, and whether this call wrote the halt.
+- Every service sync tick re-applies the halt: a restart, a status write or a
+  row written by an older build cannot leave a conflicted deployment trading
+  again. Re-asserting a halt logs at `INFO`; a new one logs the `ERROR` alert.
+
+**`PAUSED` still allows exits** (maintainer decision, #126). A pause blocks new
+entries and still dispatches exit-only signals, matching `base_adapter.py:226`
+("stop opening new positions"): `ACTIVE` or `PAUSED` for a close, `ACTIVE` alone
+for an entry, checked at the fan-out, the pre-submit re-check and the atomic
+submission claim. `STOPPED` is excluded - its exposure is closed by the stop
+sweeps. This applies to every pause, manual ones included. Consequence: a
+deployment halted for a conflict can still close the position the ledger *does*
+know about; it just cannot add anything.
+
+**Where an operator sees it**
+
+- `GET /api/live/deployments`: `broker_order_conflicts` and
+  `halted_for_broker_order_conflict` per deployment.
+- `GET /api/live/dashboard`: `broker_order_conflicts` (fleet-wide `status`,
+  `deployment_ids`, signal rows). A halted deployment is not in
+  `active_strategies` at all, which is why the conflict has its own block.
+- SQL: `shared.database.list_live_signal_broker_order_conflicts()` (signal rows)
+  and `shared.database.deployments_with_broker_order_conflicts()` (grouped by
+  deployment).
+- Health read: `live_runner.broker_order_conflicts.check_broker_order_conflicts()`
+  → `{"status": "ok" | "error", "deployment_ids": [...], "conflicts": [...]}`.
+
+**How to resolve one**
+
+1. Look the conflicting id up at the broker (open orders and positions). This is
+   a manual step: nothing in the platform queries the broker for the conflicting
+   id yet, so a position nobody tracks has to be found by hand.
+2. Close whatever the ledger does not track, at the broker, and account for it in
+   the ledger if it belongs to this platform.
+3. Record the resolution: `POST
+   /api/live/deployments/{id}/broker-order-conflicts/resolve` with
+   `{"confirmed_deployment_id": id, "reason": "<what you found>"}`. The reason is
+   required and audited; the call clears every recorded conflict for the
+   deployment (a partial clear would still leave it halted) and reports the
+   in-flight submission drain with it.
+4. Resume: `PUT /api/live/deployments/{id}/status` → `ACTIVE`, which does its own
+   broker re-verification. The halt re-asserts at the next tick until step 3 has
+   recorded the resolution, so a resume that does not stick means the conflict is
+   still recorded.

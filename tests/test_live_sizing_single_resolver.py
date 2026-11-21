@@ -981,10 +981,10 @@ def test_discord_path_rejects_deviation_before_claiming(monkeypatch, caplog):
     monkeypatch.setattr(
         daemon,
         "claim_live_deployment_submission",
-        lambda deployment_id, token: claims.append(token) or True,
+        lambda deployment_id, token, **_kwargs: claims.append(token) or True,
     )
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: None)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda deployment: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda deployment, **_k: True)
     deployment = _deployment()
     adapter = _GateAdapter(quote=_quote(bid=97.9, ask=98.0))
 
@@ -1007,10 +1007,12 @@ def test_discord_path_rejects_deviation_before_claiming(monkeypatch, caplog):
 
 def test_discord_path_submits_when_quote_is_close(monkeypatch):
     monkeypatch.setattr(
-        daemon, "claim_live_deployment_submission", lambda deployment_id, token: True
+        daemon,
+        "claim_live_deployment_submission",
+        lambda deployment_id, token, **_kwargs: True,
     )
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: None)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda deployment: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda deployment, **_k: True)
     deployment = _deployment()
     adapter = _GateAdapter(quote=_quote(bid=99.8, ask=99.9))
 

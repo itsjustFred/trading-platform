@@ -257,11 +257,18 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
-- **Bekannte Einschränkung: Exits auf `PAUSED`-Deployments (#126).** Ein Exit
-  wird wie jede Order nur für `ACTIVE`-Deployments zugestellt (Fan-out und
-  Re-Check vor dem Absenden). Auf einem `PAUSED`-Deployment wird „Exit AAPL"
-  verworfen (INFO-Log), die Position bleibt offen. Das Gate ist in #121
-  unverändert; Exits trotz `PAUSED` anzunehmen ist offen (#126).
+- **`PAUSED` nimmt Exits an, aber keine Entries (#126).** Die Status-Gates
+  (Fan-out, Re-Check vor dem Absenden und der atomare Submission-Claim) lassen
+  für einen Exit `ACTIVE` **oder** `PAUSED` zu, für einen Entry nur `ACTIVE`;
+  unterschieden wird einmal pro Signal am geparsten Intent
+  (`live_runner.exit_signals.is_exit_order`). `STOPPED` bleibt ausgeschlossen
+  (STOP macht seine Position über die Cancel/Flatten-Sweeps dicht). Das gilt für
+  jedes Pause, auch ein manuelles. Hintergrund: „stop opening new positions"
+  (`base_adapter.py:226`) darf eine Position, die das Ledger kennt, nicht
+  unbewacht bis zum Stop offen lassen - genau das wäre bei einem Pause durch
+  einen widersprüchlichen `broker_order_id` der Fall (Konflikt-Halt, siehe
+  `docs/live-deploy-runbook.md`). Trailing bleibt dabei unberührt: nur
+  `ACTIVE`-Deployments werden getrailt.
 - **Ein Exit nach dem anderen (pro Account und Symbol):** Ein früherer Exit
   **desselben Deployments** für dasselbe Symbol, der beim Broker noch arbeitet
   (nicht voll gefüllt und in den offenen Orders des Brokers, per Broker- oder

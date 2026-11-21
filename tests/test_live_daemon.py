@@ -1081,8 +1081,9 @@ def test_deployment_with_unknown_status_is_not_traded(monkeypatch) -> None:
     """Deny-by-default: a status outside ACTIVE/PAUSED/STOPPED must not trade.
 
     Pins that _normalize_deployment_status's UNKNOWN fallback keeps
-    _deployment_is_currently_active fail-closed when a new status value
-    appears upstream before live_runner learns about it.
+    _deployment_can_dispatch fail-closed when a new status value
+    appears upstream before live_runner learns about it - for an entry and
+    for an exit alike.
     """
     adapter = _SignalSubmittingAdapter()
     deployment = _discord_deployment("ACTIVE")
