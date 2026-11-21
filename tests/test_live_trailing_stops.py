@@ -19,7 +19,10 @@ import pandas as pd
 import pytest
 
 from live_runner import daemon, trailing_stops
-from live_runner.alpaca_adapter import AlpacaLiveAdapter
+from live_runner.alpaca_adapter import (
+    _ALPACA_HELD_LEG_LOOKUP_LIMIT,
+    AlpacaLiveAdapter,
+)
 from live_runner.base_adapter import BaseLiveAdapter, ProtectiveStop
 from live_runner.ctrader_adapter import CTraderLiveAdapter
 from live_runner.trailing_stops import (
@@ -1009,12 +1012,75 @@ def test_alpaca_never_offers_the_stop_leg_of_an_unfilled_parent() -> None:
     assert asyncio.run(_adapter(client).list_protective_stops()) == []
 
 
-def test_alpaca_refuses_a_full_held_leg_page() -> None:
-    """A full page may have cut off the filled parent that owns the held stop leg."""
+def test_alpaca_pages_back_past_a_full_held_leg_page() -> None:
+    """A full page is a mature account, not a truncated listing.
+
+    The listing is newest-first, so the filled parent that owns the held stop leg can
+    sit behind a page of terminal orders: an account trading one bracket a day fills a
+    500-row page within two years. The lookup pages back until a page comes back not
+    full, and a full page must not be read as "no parent" - the trail would report
+    "no stop" for a position that has one.
+    """
     client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    newest = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
     page = [
-        _FakeOrder(f"old-{index}", "AAPL", "buy", order_type="market", status="canceled")
-        for index in range(499)
+        _FakeOrder(
+            f"old-{index}",
+            "AAPL",
+            "buy",
+            order_type="market",
+            status="canceled",
+            submitted_at=newest - timedelta(seconds=index + 1),
+        )
+        for index in range(_ALPACA_HELD_LEG_LOOKUP_LIMIT)
+    ]
+    pages = {"requests": 0}
+
+    def _two_pages(filter=None):  # noqa: A002 - mirrors alpaca-py
+        if str(filter.status.value).lower() == "open":
+            return list(client.orders)
+        client.all_requests.append(filter)
+        pages["requests"] += 1
+        # Second page: the end of the history, the filled bracket parent on it - and
+        # the boundary row again, as a cursor past the oldest row produces.
+        return [page[-1], client.parent] if pages["requests"] > 1 else page
+
+    client.get_orders = _two_pages  # type: ignore[method-assign]
+
+    (stop,) = asyncio.run(_adapter(client).list_protective_stops())
+
+    assert stop.order_id == "sl-leg"
+    # It asked for a second page, and the cursor is past the oldest row of the first -
+    # never short of it, where the parent we want could be the one order skipped.
+    assert pages["requests"] == 2
+    assert client.all_requests[-1].until == page[-1].submitted_at + timedelta(
+        microseconds=1
+    )
+
+
+def test_alpaca_refuses_a_held_leg_history_past_the_page_budget() -> None:
+    """A history that never runs out cannot be vouched for.
+
+    Twenty full pages is either a history of exactly 10,000 orders or a longer one,
+    and either way the pages past them hold orders this lookup cannot vouch for.
+    Reading a truncated page as complete is the lie this file's other listings
+    refuse to tell, so the lookup fails with it.
+    """
+    client = _HeldLegClient(positions=[_FakePosition("AAPL", 10)])
+    newest = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
+    page = [
+        _FakeOrder(
+            f"old-{index}",
+            "AAPL",
+            "buy",
+            order_type="market",
+            status="canceled",
+            submitted_at=newest - timedelta(seconds=index + 1),
+        )
+        # One row short of a page, so the page plus the parent on it is exactly full:
+        # the rows carry timestamps, so the lookup pages instead of refusing for a
+        # missing one - and every page comes back just as full.
+        for index in range(_ALPACA_HELD_LEG_LOOKUP_LIMIT - 1)
     ]
     client.get_orders = lambda filter=None: (  # type: ignore[method-assign]
         [] if str(filter.status.value).lower() == "open" else [*page, client.parent]
