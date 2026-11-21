@@ -1069,7 +1069,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "85e7e781a66840bf4151d37824830a47475ee1878940937250e6315769186ccc",
+  "indicators_sha256": "a95ae07dc4a7d0b592d4d7b469de0b47179799e00083316180a1bcc5ee550151",
   "n_rows": 900
  },
  "cross_asset_momentum": {
@@ -1178,7 +1178,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "d76b25e0b91429d4395035eac6022f1e701ccdb76f8f9cb7738ff56251368588",
+  "indicators_sha256": "b434a4285d10b652ebc1fd2ec94a359202beadfed6567a03a122956c46166ddb",
   "n_rows": 900
  },
  "ema_crossoiver_conversion_test": {
@@ -1323,7 +1323,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "8110a1cd182ebba676869e9f948415d82afd4ddf9b3ce3b5b134d15048165dd7",
+  "indicators_sha256": "6620178f879f427a56547d5bf0703d00c00bf094b7bb730b782c52b29ebadaf8",
   "n_rows": 900
  },
  "gold_momentum": {
@@ -1468,7 +1468,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "f7edd94dca1e8577ebb0645465edb6face659996afbdd51f50ebe9ed2282d0ce",
+  "indicators_sha256": "34408d4ddb98315ac08cb5447e0782fe319793fc2e94c7d5521cb5d8b42b0ddd",
   "n_rows": 900
  },
  "risk_parity": {
@@ -1577,7 +1577,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "1c44e0dfacd794425ff8a7eb313ba0141447ca9bb484d97e9c37d89d1f847f5d",
+  "indicators_sha256": "bafe9693e805baeb7e1223900ae03b7e381bb854d5fcd52607cf4c993be972b1",
   "n_rows": 900
  },
  "sector_rotation": {
@@ -1686,7 +1686,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "590ee6fec9ba22cde8b7e8ab63afdac17aa4cbb01355e9adc0b0784d3377bcef",
+  "indicators_sha256": "6785f4108e82b225f7bf4eaec8b4f72bd7f9b089c293d0cc5c7f2622f8a4ae85",
   "n_rows": 900
  },
  "stat_arb_pairs": {
@@ -1822,7 +1822,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "2e0b443d1e1a0b0c0c68eb62d32bc89c12e8a26c1dc18041789d31374a985eef",
+  "indicators_sha256": "d17941ff43b8c05c9dd2fff119d450d15c9411e4a014850e13d118a4012ce6b4",
   "n_rows": 900
  },
  "trend_following": {
@@ -1850,7 +1850,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "b5722c248554d1fce223ea4650f66883746642ad066f6199a2054fc7e7fc267e",
+  "indicators_sha256": "3a07247f348b48b91a808f0b89200dd87e549f3460b99ca004b24a65d7d78714",
   "n_rows": 700
  },
  "short_term_reversal": {
@@ -1896,7 +1896,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "c8631ee9ed0501cddab004235f19ed924280a50d8bc9d0f5d16d9f98e6e771dc",
+  "indicators_sha256": "4558b3234597013922160a4efde4fa478be9d5778b8e64f242f4956efa272c8f",
   "n_rows": 260
  },
  "mean_reversion_rsi_bb": {
@@ -1924,7 +1924,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "93233a5b4ae905fc90c53818f8f79ed3f2e703f196bd1877dacd2d9fd6cc6423",
+  "indicators_sha256": "6113605f67baab808b9ca98edd5ad327b2d751ccc3ffae87b8ee09a742ef8368",
   "n_rows": 200
  },
  "volatility_breakout": {
@@ -2514,7 +2514,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "2eb0d74ea5214dc77d60408122514f3500d7832639e83ae844ee5ddd1a80399d",
+  "indicators_sha256": "a170f386e601b36d5910107293c530ff25b98c045921f4daa8c8a3da2b2c2d76",
   "n_rows": 3000
  },
  "qg_30min_es_breakout_strategy": {
@@ -4576,7 +4576,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "b759b8c037ff5a4f8b98b2ac8b22a4f828c6b6969fb60a51716e31438cc05eee",
+  "indicators_sha256": "65f14ea22b4afa1c1dbac1ba48739cdcf6826eea7493fbee1e61db123de7a2fd",
   "n_rows": 3000
  },
  "pine_superosc_vumanchu": {
@@ -4622,7 +4622,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "be352f0595a8b4872c51d4e29549dec80c395c38c738b96279d734ac3a420a04",
+  "indicators_sha256": "930bba4ccc8635dc3c6460dea5a3cbd75ea088414f0c5ef95c8a24f1f5d920f1",
   "n_rows": 800
  },
  "pine_supertrend_dema": {
@@ -4650,7 +4650,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "b6fa17e8306f448959cda055e734fdfa75ed6a62918f09cd891c90b875578628",
+  "indicators_sha256": "15276e3804efc8d9f94c902ba06fbd916fba29e9d2caabc343228b04fc1a90c9",
   "n_rows": 600
  },
  "us100_scalper": {
@@ -4714,7 +4714,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "89f88d124f7902d0080009866679ace66f637881505a9fa685ee5b3ba1dd2294",
+  "indicators_sha256": "e336360fc4e6f53526fd67fc66540ca85e9ff01f8e7cf044ffe5bca5858ba7b5",
   "n_rows": 828
  },
  "intraday_volatility_breakout": {
@@ -4850,7 +4850,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "e5ad2d161515238876fe48e65ccd5795d0908179a2359513a998fe0850587af3",
+  "indicators_sha256": "33e6dd8c9e73451204a21d77bbf26be77eb02dcf84c28a687272947d0b94b7ab",
   "n_rows": 374
  },
  "post_vix_dip_buy": {
@@ -4896,7 +4896,7 @@
     "text": "Exit"
    }
   ],
-  "indicators_sha256": "f6e2254603c3b8345e5f4b7bf4c2b951ccff6a66abff1e36d0d5211276870b11",
+  "indicators_sha256": "ace6cac6c3e27501154a30d9d0f71aec62af58fd51887b5f33dca9c99f37ee32",
   "n_rows": 180
  }
 }

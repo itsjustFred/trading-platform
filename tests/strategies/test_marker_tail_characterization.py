@@ -299,15 +299,26 @@ def _cases() -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _canon_float(x):
+    """Canonical float for hashing: NaN -> None, else 10 significant digits.
+
+    Indicator math (rolling/EWM kernels) legitimately differs in the last
+    ULP across CPU architectures and SIMD paths, so a bit-exact float repr
+    made this hash platform-dependent — green on aarch64, red on ubuntu
+    x86_64 CI — while pinning nothing real. Rounding to 10 significant
+    digits absorbs ULP drift and still fails on any genuine value change.
+    """
+    if isinstance(x, float):
+        if np.isnan(x):
+            return None
+        return float(f"{x:.10g}")
+    return x
+
+
 def _canon(value):
     """Deterministic JSON-able form of an indicators_dict value."""
     if isinstance(value, pd.Series):
-        return {
-            "__series__": [
-                None if isinstance(x, float) and np.isnan(x) else x
-                for x in value.tolist()
-            ]
-        }
+        return {"__series__": [_canon_float(x) for x in value.tolist()]}
     if isinstance(value, tuple):
         return [_canon(x) for x in value]
     if isinstance(value, list):
@@ -317,9 +328,9 @@ def _canon(value):
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, float) and np.isnan(value):
-        return None
+        value = float(value)
+    if isinstance(value, float):
+        return _canon_float(value)
     return value
 
 
@@ -407,7 +418,7 @@ _MIXED_TS_EXPECTED = {
             "text": "Exit",
         },
     ],
-    "indicators_sha256": "b5722c248554d1fce223ea4650f66883746642ad066f6199a2054fc7e7fc267e",
+    "indicators_sha256": "3a07247f348b48b91a808f0b89200dd87e549f3460b99ca004b24a65d7d78714",
 }
 
 
