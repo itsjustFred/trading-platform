@@ -426,8 +426,13 @@ class TestShutdownJoin:
         adapter = _StreamAdapterStub(releases=True)
         _stub_the_daemons_loops(monkeypatch, adapter)
 
-        with pytest.raises(_LoopsStopped):
-            asyncio.run(daemon.run_daemon())
+        try:
+            with pytest.raises(_LoopsStopped):
+                asyncio.run(daemon.run_daemon())
+        finally:
+            # A disconnect regression leaves the stream thread blocked for its whole bound;
+            # release it so the failure surfaces at once instead of after the wait.
+            adapter.release()
 
         assert adapter.disconnect_calls == ["daemon_shutdown"], (
             "the daemon left its broker stream open, so its worker thread could not finish"
@@ -467,15 +472,21 @@ class TestShutdownJoin:
         try:
             with pytest.raises(daemon.WorkerJoinTimeout) as excinfo:
                 loop.run_until_complete(task)
+            # Assert the detach while the loop is still open: ``loop.close()`` sets
+            # ``_default_executor`` to None itself, so the same assertion after close() cannot
+            # fail - it passed even with the detach removed, leaving ``asyncio.run``'s own
+            # executor shutdown to spend its full budget on the thread this join gave up on.
+            assert loop._default_executor is None, (
+                "the loop still carries the executor the join gave up on"
+            )
         finally:
             daemon.logger.removeHandler(capture)
-            loop.close()
+            # Release before close: a loop that still carries the executor would block in
+            # ``close()`` on the stuck stream thread.
             adapter.release()
+            loop.close()
 
         assert "still running" in str(excinfo.value)
-        # The executor is detached: `asyncio.run`'s close returns at once instead of waiting for
-        # the threads this join already gave up on, and the exit path becomes the caller's job.
-        assert loop._default_executor is None
         critical = [r for r in records if r.levelno >= logging.CRITICAL]
         assert any("giving up on its worker threads" in r.getMessage() for r in critical), (
             "an operator saw nothing about the join that never finished"
@@ -530,6 +541,73 @@ class TestExitCodes:
             "the process did not leave immediately after reporting the expired join"
         )
         assert "still running" in capsys.readouterr().err
+
+    def test_the_exit_flush_survives_an_interrupt_and_still_exits(
+        self, monkeypatch: Any
+    ) -> None:
+        """A KeyboardInterrupt inside ``handler.flush()`` must not skip ``os._exit``.
+
+        The flush exists so the CRITICAL line reaches the journal before the process leaves;
+        an interrupt landing mid-flush would otherwise drop the operator straight back into
+        the unbounded interpreter teardown this exit path exists to avoid. The Sentry flush
+        gets the same treatment: ``os._exit`` runs no ``atexit`` hook, so the queued event
+        needs its explicit last chance.
+        """
+        import sentry_sdk
+
+        exits: list[int] = []
+        flushed: list[float] = []
+
+        def _leave_without_returning(code: int) -> None:
+            exits.append(int(code))
+            raise _LeftTheProcess(code)
+
+        class _InterruptingFlush(logging.Handler):
+            def flush(self) -> None:
+                raise KeyboardInterrupt()
+
+        monkeypatch.setattr(os, "_exit", _leave_without_returning)
+        monkeypatch.setattr(sentry_sdk, "flush", lambda timeout=0: flushed.append(timeout))
+        root = logging.getLogger()
+        handler = _InterruptingFlush()
+        root.addHandler(handler)
+        try:
+            with pytest.raises(_LeftTheProcess):
+                daemon_cli._leave_now(daemon_cli.EXIT_WORKER_JOIN_TIMEOUT)
+        finally:
+            root.removeHandler(handler)
+
+        assert exits == [daemon_cli.EXIT_WORKER_JOIN_TIMEOUT]
+        assert flushed == [2], "the queued Sentry event never got its last chance to leave"
+
+    def test_a_keyboard_interrupt_leaves_the_process_at_once(
+        self, monkeypatch: Any
+    ) -> None:
+        """A second Ctrl-C during the worker join must not fall into interpreter teardown.
+
+        The daemon's cleanup has already run - or given up, with the executor detached - by the
+        time the interrupt reaches the CLI, so the process leaves through ``os._exit`` with the
+        conventional SIGINT code instead of letting ``concurrent.futures``' atexit hook join
+        the abandoned threads with no bound.
+        """
+        from live_runner import daemon
+
+        async def _interrupted_daemon(**_kwargs: Any) -> None:
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(daemon, "run_daemon", _interrupted_daemon)
+        exits: list[int] = []
+
+        def _leave_without_returning(code: int) -> None:
+            exits.append(int(code))
+            raise _LeftTheProcess(code)
+
+        monkeypatch.setattr(os, "_exit", _leave_without_returning)
+
+        with pytest.raises(_LeftTheProcess):
+            daemon_cli.main([])
+
+        assert exits == [130]
 
     def test_the_exit_codes_stay_distinct(self) -> None:
         """An operator tells "start over" (3) from "its outcome is unknown" (4)."""
