@@ -8,7 +8,7 @@ Universal backtesting framework — run strategies across multiple engines (vect
 # Clone and setup
 git clone <repo-url> && cd trading-platform
 
-# Install dependencies (the locked environment CI uses: uv sync --frozen --all-extras)
+# Install dependencies (the locked environment; CI runs uv sync --frozen --all-extras)
 uv sync --all-extras
 
 # Alternative without uv: a virtualenv plus a pip install
