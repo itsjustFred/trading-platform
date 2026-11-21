@@ -240,13 +240,112 @@ def _strictness_failures(lines: list[str]) -> list[str]:
         ("set -euo pipefail", "the selection is not strict"),
         ('git cat-file -e "${BASE_SHA}^{commit}"', "does not refuse an unreachable base commit"),
         (
-            'git cat-file -e "${BASE_SHA}:${SKILL_PATH}"',
+            'listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")',
+            "the base path lookup runs as an `if` condition, where a failure is a false branch",
+        ),
+        ('if [ -n "$listing" ]', "the branch is not taken on the lookup's result"),
+        (
+            'git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"',
             "does not read the skill from the base branch first",
         ),
         ('cp "$SKILL_PATH"', "no fallback to the PR's own copy"),
         ("SKILL_SOURCE=base branch", "records no skill source"),
+        ("SKILL_SOURCE=this PR (not on the base branch yet)", "records no fallback source"),
     )
     return [message for needle, message in required if not any(needle in line for line in lines)]
+
+
+# ---- the pre-mortem's skill selection, executed against a real repository ----
+
+needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+
+SKILL_BODY = "---\nname: actions-pre-mortem\n---\n\n# base rules\n"
+
+
+@pytest.fixture
+def probe_repo(tmp_path):
+    """A two-commit repository the selection block can be run against: a base whose skill sits at
+    `SKILL_PATH`, an older commit identical but for that one path, and a working tree (the PR head)
+    of its own."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "probe",
+        "GIT_AUTHOR_EMAIL": "probe@example.invalid",
+        "GIT_COMMITTER_NAME": "probe",
+        "GIT_COMMITTER_EMAIL": "probe@example.invalid",
+    }
+
+    def git(*args: str) -> str:
+        done = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            env={**os.environ, **env},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return done.stdout.strip()
+
+    git("init", "-q", "--initial-branch=base", ".")
+    skill = repo / ".agents/skills/actions-pre-mortem/SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(SKILL_BODY, encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "base with a skill")
+    with_skill = git("rev-parse", "HEAD")
+    # A base that is the same commit with the one path removed: the lookup has to report "no
+    # skill at that path" rather than "nothing to read".
+    git("checkout", "-q", with_skill)
+    skill.unlink()
+    git("add", "-A")
+    git("commit", "-qm", "base without the skill")
+    without_skill = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "head")
+    return {
+        "repo": repo,
+        "with_skill": with_skill,
+        "without_skill": without_skill,
+        "unreachable": "0" * 40,
+    }
+
+
+def _run_selection(probe: dict, tmp_path, *, base: str, skill_path: str | None) -> tuple:
+    """Execute the selection step's own `run:` body, and return (exit status, SKILL_SOURCE, text).
+
+    The body is the workflow's own and the repository is real, so every `git` call in it does what
+    it does in CI: a lookup that is a plain assignment has `errexit` applied to it, and one that
+    is a command in an `if` condition does not - which is the whole difference between the two
+    forms, and the reason the step is run here rather than read.
+    """
+    body = _run(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Select skill revision$"))
+    runner_temp = tmp_path / "premortem"
+    github_env = tmp_path / "github-env"
+    github_env.write_text("", encoding="utf-8")
+    # A set-but-empty SKILL_PATH, which is what a workflow expression resolving to nothing leaves.
+    environment = {**os.environ, "SKILL_PATH": skill_path or ""}
+    environment.update(
+        {
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_ENV": str(github_env),
+            "BASE_SHA": base,
+        }
+    )
+    script = probe["repo"] / "selection.sh"
+    script.write_text(body, encoding="utf-8")
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", str(script)],
+        cwd=probe["repo"],
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    source = ""
+    for line in github_env.read_text(encoding="utf-8").splitlines():
+        if line.startswith("SKILL_SOURCE="):
+            source = line.split("=", 1)[1]
+    written = runner_temp / "premortem" / "skill.md"
+    return result, source, (written.read_text(encoding="utf-8") if written.exists() else "")
 
 
 def _all_run_bodies(data: dict) -> str:
@@ -1530,6 +1629,66 @@ def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
         assert any("unreachable base" in message for message in failures), (
             f"{name}: commenting the guard out does not fail the strictness check: {failures}"
         )
+
+
+@needs_bash
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_the_selection_reads_the_base_skill_when_the_base_has_one(probe_repo, tmp_path) -> None:
+    """The documented first level, executed against a real base commit: the base branch's skill is
+    what runs, and the log and the comment say so."""
+    result, source, written = _run_selection(
+        probe_repo,
+        tmp_path,
+        base=probe_repo["with_skill"],
+        skill_path=".agents/skills/actions-pre-mortem/SKILL.md",
+    )
+    assert result.returncode == 0, f"the selection failed: {result.stderr}"
+    assert source == "base branch", f"SKILL_SOURCE is {source!r}"
+    assert written == SKILL_BODY, f"wrote {written!r}"
+
+
+@needs_bash
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_the_selection_falls_back_to_the_prs_copy_only_when_the_base_has_none(
+    probe_repo, tmp_path
+) -> None:
+    """The documented second level, executed: the PR's own copy runs only when the base has no
+    skill at that path - and the recorded source says so, so a verdict produced by rules the PR
+    chose for itself is never indistinguishable from the base's."""
+    skill_path = ".agents/skills/actions-pre-mortem/SKILL.md"
+    (probe_repo["repo"] / skill_path).write_text("PR's own rules", encoding="utf-8")
+    result, source, written = _run_selection(
+        probe_repo, tmp_path, base=probe_repo["without_skill"], skill_path=skill_path
+    )
+    assert result.returncode == 0, f"the selection failed: {result.stderr}"
+    assert source == "this PR (not on the base branch yet)", f"SKILL_SOURCE is {source!r}"
+    assert written == "PR's own rules", f"wrote {written!r}"
+
+
+@needs_bash
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_the_selection_stops_on_what_it_cannot_read(probe_repo, tmp_path) -> None:
+    """The failures the fail-closed lookup exists for, executed. This is the defect the round
+    found: the path lookup used to be the command inside `if git cat-file -e ... 2>/dev/null`,
+    where a failure is a false branch and not an abort, so *every* `git` error - a missing object,
+    an unreadable repository, a wrong revision syntax - read as "the base has no skill" and the
+    PR's own copy ran under a prompt saying the rules came from the base branch. The head carries
+    its own copy here, so a fall-through would use it silently."""
+    skill_path = ".agents/skills/actions-pre-mortem/SKILL.md"
+    (probe_repo["repo"] / skill_path).write_text("PR's own rules", encoding="utf-8")
+    result, source, _ = _run_selection(
+        probe_repo, tmp_path, base=probe_repo["unreachable"], skill_path=skill_path
+    )
+    assert result.returncode != 0, "an unreachable base commit did not stop the selection"
+    assert not source, f"recorded a skill source on a failure: {source!r}"
+
+    # A set-but-empty SKILL_PATH: the base commit is readable and the path is not one the
+    # repository can carry, which `git cat-file -e "$BASE_SHA:"` as an `if` condition swallowed.
+    result, source, _ = _run_selection(
+        probe_repo, tmp_path, base=probe_repo["with_skill"], skill_path=None
+    )
+    assert result.returncode != 0, "a skill path the repository cannot carry did not stop the job"
+    assert not source, f"recorded a skill source on a failure: {source!r}"
 
 
 def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
