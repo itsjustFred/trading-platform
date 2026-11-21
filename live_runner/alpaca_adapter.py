@@ -2862,7 +2862,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return False
         try:
             order = await asyncio.to_thread(get_order, order_id)
-        except Exception:  # pragma: no cover - fail closed
+        except Exception:  # fail closed: a read that raises proves nothing
             return False
         if _order_status(order) not in _GONE_WITHOUT_EXECUTING:
             return False

@@ -1224,6 +1224,41 @@ def test_a_refused_cancel_is_not_excused_by_a_broker_that_cannot_find_the_order(
     assert any("sl-leg" in item for item in outcome.failed)
 
 
+def test_a_refused_cancel_is_not_excused_when_the_broker_cannot_answer_by_id() -> None:
+    """A read that raises proves nothing either: the refusal stands.
+
+    The orphan sweep's excusal is a read by id, and a broker that answers it with
+    an error - a 503, a dropped connection, a rate limit - has not shown that the
+    order left the book. Excusing the cancel on it would report a clean sweep while
+    the leg still rests, or, in the flatten, close a position whose stop still
+    reserves its quantity.
+    """
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("entry-1", "AAPL", "buy")],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    def _refuse(order_id: str) -> None:
+        client.cancelled.append(order_id)
+        raise RuntimeError("cancel rejected")
+
+    client.cancel_order_by_id = _refuse  # type: ignore[method-assign]
+
+    def _cannot_answer(order_id: str):
+        raise RuntimeError("503: broker unavailable")
+
+    client.get_order_by_id = _cannot_answer  # type: ignore[method-assign]
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._cancel_already_gone(client, "entry-1")) is False
+
+    outcome = asyncio.run(adapter.close_all_positions())
+
+    assert outcome.complete is False
+    assert outcome.failed == ("AAPL:cancel:entry-1:cancel rejected",)
+    assert client.close_calls == []
+
+
 def test_flatten_refuses_a_full_held_leg_page() -> None:
     """A history longer than the page budget cannot be vouched for."""
     client = _FullHeldLegPageClient(positions=[_FakePosition("AAPL", 10.0)])
