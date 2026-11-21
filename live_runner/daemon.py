@@ -139,7 +139,11 @@ from shared.models import (
     ServiceType,
 )
 from shared.sentry import capture_exception, initialize_sentry
-from shared.single_instance import SingleInstanceError, SingleInstanceLock
+from shared.single_instance import (
+    SingleInstanceError,
+    SingleInstanceLock,
+    keep_for_process_lifetime,
+)
 from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
     validate_live_deployment_trailing_override,
@@ -5378,8 +5382,12 @@ async def run_daemon(
         except BaseException:
             # Interrupted mid-join (a signal, a KeyboardInterrupt) with workers still writing.
             # Releasing now would hand the next daemon the overlap this lock exists to prevent,
-            # so the process keeps the lock and the OS releases it when the process dies.
+            # so the process keeps the lock and the OS releases it when the process dies. The lock
+            # is anchored to the process here: the coroutine frame, the task and the traceback that
+            # held the last reference all die with this exception, and garbage collection would
+            # otherwise close the descriptor and release the OS lock while the workers still write.
             joined = False
+            keep_for_process_lifetime(lock)
             raise
         finally:
             if joined:

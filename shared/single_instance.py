@@ -139,6 +139,23 @@ class SingleInstanceLock:
         return handle
 
 
+#: Locks this process keeps for its lifetime. A daemon whose worker join was interrupted leaves its
+#: lock here instead of releasing it: the coroutine frame, the task and the traceback that held the
+#: last reference all die with the exception, and garbage collection would then close the
+#: descriptor and release the OS lock while the workers are still writing.
+_PROCESS_LIFETIME_LOCKS: list[SingleInstanceLock] = []
+
+
+def keep_for_process_lifetime(lock: SingleInstanceLock) -> None:
+    """Anchor ``lock`` for the process's lifetime, so its OS lock cannot be collected away."""
+    _PROCESS_LIFETIME_LOCKS.append(lock)
+
+
+def process_lifetime_locks() -> tuple[SingleInstanceLock, ...]:
+    """The locks anchored for this process's lifetime (diagnostics and tests)."""
+    return tuple(_PROCESS_LIFETIME_LOCKS)
+
+
 def _lock_posix(handle: IO[bytes]) -> None:
     """Exclusive, non-blocking ``flock``; the kernel drops it when this process dies."""
     import fcntl

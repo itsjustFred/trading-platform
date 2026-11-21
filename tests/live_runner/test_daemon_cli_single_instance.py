@@ -28,7 +28,11 @@ from typing import Any
 import pytest
 
 from live_runner import daemon_cli
-from shared.single_instance import SingleInstanceError, SingleInstanceLock
+from shared.single_instance import (
+    SingleInstanceError,
+    SingleInstanceLock,
+    process_lifetime_locks,
+)
 from tests.helpers.lock_holder import await_held, read_holder_line, spawn_holder
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -186,7 +190,7 @@ class TestSingleInstanceGuard:
             """
 
         class _InterruptedJoin:
-            """Runs the submitted work inline, then interrupts the join - a signal landing mid-join."""
+            """Runs the submitted work inline, then interrupts the join - a signal mid-join."""
 
             def submit(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
                 future = concurrent.futures.Future()
@@ -214,10 +218,18 @@ class TestSingleInstanceGuard:
             loop._default_executor = None
             loop.close()
 
-        # The lock was not released in-process: the process must die holding it.
+        # The lock was not released in-process: the process must die holding it, and it must be
+        # anchored to the process rather than to the dying coroutine frame, task and traceback -
+        # garbage collection would otherwise close the descriptor and free the OS lock while the
+        # workers are still writing.
         contender = SingleInstanceLock(daemon.daemon_lock_path())
         with pytest.raises(SingleInstanceError):
             contender.acquire()
+        anchored = [item.lock_path for item in process_lifetime_locks()]
+        assert daemon.daemon_lock_path() in anchored, (
+            "the interrupted-join lock is held only by the dying frame, task and traceback; "
+            f"garbage collection would release it. anchored={anchored}"
+        )
 
     @pytest.mark.timeout(60)
     def test_the_lock_outlives_in_flight_startup_database_work(
