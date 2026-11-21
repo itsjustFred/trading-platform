@@ -10,8 +10,13 @@ Contract (pinned by ``tests/indicators/``):
   defaults: "ATR" and "EMA" mean different things on different parity
   targets (MT5 iATR is an SMA of TR, Pine/QuantConnect ATR is Wilder-RMA,
   the live bots use an EMA span), so a caller must always name the variant.
+  ``first_bar`` (``true_range``/``atr``/``supertrend``) and ``flat``
+  (``rsi``) are required for the same reason: each selects a different
+  legacy edge-case behaviour.
 - Warm-up bars are ``NaN``, never ``0.0``: a zero ATR produces zero-width
-  stops. Parity presets that reproduce a legacy zero-fill say so in their
+  stops. ``min_periods`` defaults to the indicator length/period; legacy
+  copies that emit from bar 0 must pass ``min_periods=0`` explicitly, and
+  parity presets that reproduce a legacy zero-fill say so in their
   docstring and pass the legacy warm-up explicitly.
 - No internal shift: the value at bar ``t`` uses bars ``<= t`` only.
   Callers that act on the *next* bar apply ``lagged(x)`` explicitly.
@@ -27,6 +32,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 #: How a recursive smoother weights history.
 #: - ``"sma"``: plain rolling mean (MT5 ``iATR``, several Pine ports).
@@ -68,7 +74,7 @@ def true_range(
     low: pd.Series,
     close: pd.Series,
     *,
-    first_bar: TrFirstBar = "hl",
+    first_bar: TrFirstBar,
 ) -> pd.Series:
     """True range: ``max(h-l, |h-prev_close|, |l-prev_close|)``.
 
@@ -114,38 +120,53 @@ def _rma_valid(
     ``seed="sma"`` reproduces ``intraday_volatility_breakout._wilder_atr``:
     SMA over the first ``length`` valid values, then
     ``(prev * (n - 1) + x) / n`` stepping only across valid positions.
-    ``seed="first"`` seeds the recursion at the first valid value itself.
+    ``seed="first"`` seeds the recursion at the first valid value itself and
+    emits from that bar — there is no ``length``-bar warm-up for that seed.
     """
     length = max(1, int(length))
-    out = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
+    out_values = np.full(len(values), np.nan)
     valid, positions = _valid_positions(values)
-    if len(valid) < length:
-        return out
     if seed == "sma":
-        previous = float(valid[:length].mean())
-        out.iloc[positions[length - 1]] = previous
+        if len(valid) < length:
+            return pd.Series(
+                out_values, index=values.index, name=values.name, dtype=float
+            )
+        previous = values.iloc[positions[:length]].mean()
+        out_values[positions[length - 1]] = previous
         start = length
     else:
-        previous = float(valid[0])
-        out.iloc[positions[0]] = previous
+        if len(valid) == 0:
+            return pd.Series(
+                out_values, index=values.index, name=values.name, dtype=float
+            )
+        previous = valid[0]
+        out_values[positions[0]] = previous
         start = 1
     for k in range(start, len(valid)):
-        previous = (previous * (length - 1) + float(valid[k])) / length
-        out.iloc[positions[k]] = previous
-    return out
+        position = positions[k]
+        previous = (
+            (previous * (length - 1)) + values.iloc[position]
+        ) / length
+        out_values[position] = previous
+    return pd.Series(
+        out_values, index=values.index, name=values.name, dtype=float
+    )
 
 
 def _sma_valid(values: pd.Series, window: int) -> pd.Series:
     """SMA over the last ``window`` *valid* values (``_mt5_atr`` semantics)."""
     window = max(1, int(window))
-    out = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
+    out_values = np.full(len(values), np.nan)
     valid, positions = _valid_positions(values)
     if len(valid) < window:
-        return out
-    csum = np.concatenate(([0.0], np.cumsum(valid)))
-    means = (csum[window:] - csum[:-window]) / window
-    out.iloc[positions[window - 1 :]] = means
-    return out
+        return pd.Series(
+            out_values, index=values.index, name=values.name, dtype=float
+        )
+    window_means = sliding_window_view(valid, window).mean(axis=1)
+    out_values[positions[window - 1 :]] = window_means
+    return pd.Series(
+        out_values, index=values.index, name=values.name, dtype=float
+    )
 
 
 def _ema_valid(
@@ -158,29 +179,35 @@ def _ema_valid(
     NaN-free input).
     """
     span = max(1, int(span))
-    out = pd.Series(np.nan, index=values.index, name=values.name, dtype=float)
-    valid, positions = _valid_positions(values)
     alpha = 2.0 / (span + 1)
-    need = max(1, int(min_periods)) if min_periods else 1
+    valid, positions = _valid_positions(values)
+    need = span if min_periods is None else max(0, int(min_periods))
+    out_values = np.full(len(values), np.nan)
     if seed == "sma":
         if len(valid) < max(span, need):
-            return out
-        previous = float(valid[:span].mean())
+            return pd.Series(
+                out_values, index=values.index, name=values.name, dtype=float
+            )
+        previous = valid[:span].mean()
         if span >= need:
-            out.iloc[positions[span - 1]] = previous
+            out_values[positions[span - 1]] = previous
         start = span
     else:
         if len(valid) == 0:
-            return out
-        previous = float(valid[0])
+            return pd.Series(
+                out_values, index=values.index, name=values.name, dtype=float
+            )
+        previous = valid[0]
         if need <= 1:
-            out.iloc[positions[0]] = previous
+            out_values[positions[0]] = previous
         start = 1
     for k in range(start, len(valid)):
-        previous = alpha * float(valid[k]) + (1.0 - alpha) * previous
+        previous = alpha * valid[k] + (1.0 - alpha) * previous
         if k + 1 >= need:
-            out.iloc[positions[k]] = previous
-    return out
+            out_values[positions[k]] = previous
+    return pd.Series(
+        out_values, index=values.index, name=values.name, dtype=float
+    )
 
 
 def rma(
@@ -199,16 +226,23 @@ def rma(
     ``seed="sma"`` seeds at the SMA of the first ``length`` values (Pine
     ``ta.rma``); NaN positions are skipped and get NaN output.
     ``skipna=True`` forces the skip-NaN valid-window recursion for both
-    seeds (the ``intraday_volatility_breakout`` contract); under
-    ``skipna`` ``min_periods`` is ignored — the window is defined by the
-    valid positions themselves.
+    seeds (the ``intraday_volatility_breakout`` contract).
+
+    ``min_periods`` defaults to ``length`` for ``seed="first"`` on the
+    pandas ``ewm`` path. It is rejected for ``seed="sma"`` and for
+    ``skipna=True``: those paths define warm-up by the valid positions
+    themselves, so a separate ``min_periods`` would be silently ignored.
     """
     values = _as_float_series(series, series.name)
     length = max(1, int(length))
+    if seed == "sma" and min_periods is not None:
+        raise ValueError("min_periods is not supported for seed='sma'")
+    if skipna and min_periods is not None:
+        raise ValueError("min_periods is not supported with skipna=True")
     if seed == "first" and not skipna:
         return values.ewm(
             alpha=1.0 / length,
-            min_periods=0 if min_periods is None else int(min_periods),
+            min_periods=length if min_periods is None else int(min_periods),
             adjust=False,
         ).mean()
     return _rma_valid(values, length, seed=seed)
@@ -224,16 +258,17 @@ def ema(
 ) -> pd.Series:
     """Exponential moving average ``alpha = 2 / (span + 1)``.
 
-    ``seed="first"`` reproduces ``series.ewm(span=span, adjust=False)``.
-    ``seed="sma"`` seeds at the SMA of the first ``span`` values (Pine
-    ``ta.ema``). ``skipna=True`` uses the valid-window recursion.
+    ``seed="first"`` reproduces ``series.ewm(span=span, adjust=False,
+    min_periods=min_periods)``. ``seed="sma"`` seeds at the SMA of the
+    first ``span`` values (Pine ``ta.ema``). ``skipna=True`` uses the
+    valid-window recursion. ``min_periods`` defaults to ``span``.
     """
     values = _as_float_series(series, series.name)
     span = max(1, int(span))
     if seed == "first" and not skipna:
         return values.ewm(
             span=span,
-            min_periods=0 if min_periods is None else int(min_periods),
+            min_periods=span if min_periods is None else int(min_periods),
             adjust=False,
         ).mean()
     return _ema_valid(values, span, seed=seed, min_periods=min_periods)
@@ -254,17 +289,33 @@ def atr_from_tr(
     selects first-value vs SMA seeding for the recursive smoothers and is
     ignored for ``"sma"``. ``skipna=True`` reproduces the
     ``intraday_volatility_breakout`` valid-window semantics: NaN true-range
-    positions are skipped entirely and produce NaN output.
+    positions are skipped entirely and produce NaN output. ``min_periods``
+    is forwarded to the recursive smoothers; it is rejected wherever the
+    selected path would ignore it (``"sma"`` always, and ``"wilder"`` with
+    ``skipna=True``).
     """
     values = _as_float_series(true_range, "atr")
     period = max(1, int(period))
     if skipna:
         if smoothing == "sma":
+            if min_periods is not None:
+                raise ValueError(
+                    "min_periods is not supported for smoothing='sma'"
+                )
             return _sma_valid(values, period)
         if smoothing == "wilder":
+            if min_periods is not None:
+                raise ValueError(
+                    "min_periods is not supported for smoothing='wilder' "
+                    "with skipna=True"
+                )
             return _rma_valid(values, period, seed=seed)
         return _ema_valid(values, period, seed=seed, min_periods=min_periods)
     if smoothing == "sma":
+        if min_periods is not None:
+            raise ValueError(
+                "min_periods is not supported for smoothing='sma'"
+            )
         return sma(values, period)
     if smoothing == "wilder":
         return rma(values, period, seed=seed, min_periods=min_periods)
@@ -279,7 +330,7 @@ def atr(
     *,
     smoothing: Smoothing,
     seed: Seed,
-    first_bar: TrFirstBar = "hl",
+    first_bar: TrFirstBar,
     min_periods: int | None = None,
     skipna: bool = False,
 ) -> pd.Series:
@@ -305,14 +356,13 @@ def rsi(
     period: int,
     *,
     min_periods: int | None = None,
-    flat: Literal["none", "mask", "fill50"] = "none",
+    flat: Literal["none", "mask", "fill50"],
 ) -> pd.Series:
     """Wilder RSI ``100 - 100 / (1 + avg_gain / avg_loss)``.
 
-    ``min_periods`` is forwarded to the gain/loss ``ewm`` calls: ``None``
-    emits values from the first valid delta (the ``post_vix_dip_buy``
-    variant), ``period`` masks the warm-up to NaN (the ``gold_momentum``
-    and codegen variants).
+    ``min_periods`` is forwarded to the gain/loss ``ewm`` calls and defaults
+    to ``period`` (NaN warm-up). Pass ``0`` for the legacy variants that emit
+    from the first valid delta.
 
     ``flat`` selects the zero-range edge-case handling, which differs
     across the existing copies:
@@ -329,7 +379,7 @@ def rsi(
     delta = values.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
-    mp = 0 if min_periods is None else int(min_periods)
+    mp = period if min_periods is None else int(min_periods)
     avg_gain = gain.ewm(alpha=1.0 / period, min_periods=mp, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, min_periods=mp, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
@@ -355,7 +405,7 @@ SupertrendRule = Literal["pine", "pine_dema", "pine_superosc", "ta"]
 class SupertrendResult:
     """Supertrend output.
 
-    ``trend`` is ``+1`` (up/bullish) or ``-1`` (down/bearish), ``NaN`
+    ``trend`` is ``+1`` (up/bullish) or ``-1`` (down/bearish), ``NaN``
     where the rule leaves the direction undefined. ``upper_band`` is the
     band on the ``hl2 + mult * atr`` side (resistance in an uptrend),
     ``lower_band`` the ``hl2 - mult * atr`` side (support). ``atr`` is the
@@ -370,6 +420,48 @@ class SupertrendResult:
     lower_band: pd.Series
     atr: pd.Series
     ready: pd.Series
+
+
+def _pine_band_step(
+    src_i: float,
+    close_prev: float,
+    lower_prev: float,
+    upper_prev: float,
+    atr_i: float,
+    multiplier: float,
+    band_condition: Literal["same", "cross"],
+) -> tuple[float, float]:
+    """One Pine-style band ratchet step (see :func:`_supertrend_pine`)."""
+    raw_low = src_i - multiplier * atr_i
+    raw_high = src_i + multiplier * atr_i
+    if band_condition == "same":
+        low_ok = close_prev > lower_prev
+        high_ok = close_prev < upper_prev
+    else:
+        low_ok = close_prev > upper_prev
+        high_ok = close_prev < lower_prev
+    lower = (
+        max(raw_low, lower_prev)
+        if low_ok and not np.isnan(lower_prev)
+        else raw_low
+    )
+    upper = (
+        min(raw_high, upper_prev)
+        if high_ok and not np.isnan(upper_prev)
+        else raw_high
+    )
+    return lower, upper
+
+
+def _pine_trend_step(
+    prev_trend: float, close_i: float, lower_prev: float, upper_prev: float
+) -> float:
+    """One Pine-style previous-band flip step."""
+    if prev_trend < 0 and close_i > upper_prev:
+        return 1.0
+    if prev_trend > 0 and close_i < lower_prev:
+        return -1.0
+    return prev_trend
 
 
 def _supertrend_pine(
@@ -402,34 +494,52 @@ def _supertrend_pine(
         if np.isnan(a):
             trend[i] = prev_trend
             continue
-        raw_low = src[i] - multiplier * a
-        raw_high = src[i] + multiplier * a
-        low_prev = lower[i - 1]
-        high_prev = upper[i - 1]
-        if band_condition == "same":
-            low_ok = close[i - 1] > low_prev
-            high_ok = close[i - 1] < high_prev
-        else:
-            low_ok = close[i - 1] > high_prev
-            high_ok = close[i - 1] < low_prev
-        lower[i] = (
-            max(raw_low, low_prev)
-            if low_ok and not np.isnan(low_prev)
-            else raw_low
+        lower[i], upper[i] = _pine_band_step(
+            src[i],
+            close[i - 1],
+            lower[i - 1],
+            upper[i - 1],
+            a,
+            multiplier,
+            band_condition,
         )
-        upper[i] = (
-            min(raw_high, high_prev)
-            if high_ok and not np.isnan(high_prev)
-            else raw_high
+        trend[i] = _pine_trend_step(
+            prev_trend, close[i], lower[i - 1], upper[i - 1]
         )
-        if prev_trend == -1 and close[i] > upper[i - 1]:
-            trend[i] = 1.0
-        elif prev_trend == 1 and close[i] < lower[i - 1]:
-            trend[i] = -1.0
-        else:
-            trend[i] = prev_trend
         prev_trend = trend[i]
     return trend, upper, lower
+
+
+def _ta_next_bands(
+    basic_upper: float,
+    basic_lower: float,
+    upper_prev: float,
+    lower_prev: float,
+    close_prev: float,
+) -> tuple[float, float]:
+    """One RamJet/pandas_ta band ratchet step."""
+    upper = (
+        basic_upper
+        if basic_upper < upper_prev or close_prev > upper_prev
+        else upper_prev
+    )
+    lower = (
+        basic_lower
+        if basic_lower > lower_prev or close_prev < lower_prev
+        else lower_prev
+    )
+    return upper, lower
+
+
+def _ta_trend_step(
+    prev_trend: float, close_i: float, lower_i: float, upper_i: float
+) -> float:
+    """One RamJet/pandas_ta direction step (fail-closed pre-warm-up)."""
+    if np.isnan(close_i) or np.isnan(lower_i) or np.isnan(upper_i):
+        return prev_trend
+    if prev_trend > 0:
+        return 1.0 if close_i > lower_i else -1.0
+    return 1.0 if close_i >= upper_i else -1.0
 
 
 def _supertrend_ta(
@@ -437,12 +547,15 @@ def _supertrend_ta(
     close: np.ndarray,
     atr_values: np.ndarray,
     multiplier: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int | None]:
     """The RamJet/pandas_ta band recursion (fail-closed pre-warm-up).
 
     Returns ``(trend, upper, lower, first_valid_idx)`` where ``trend`` is
     ``+1``/``-1`` and the caller derives ``ready`` from
-    ``first_valid_idx + period``.
+    ``first_valid_idx + period``. ``first_valid_idx`` is ``None`` when no
+    bar has a usable ATR/src pair, in which case ``ready`` must stay
+    all-False. An interior NaN ATR/src carries the previous bands forward;
+    the direction is still evaluated against those carried bands.
     """
     n = len(close)
     basic_upper = src + multiplier * atr_values
@@ -451,35 +564,35 @@ def _supertrend_ta(
     lower = np.full(n, np.nan)
     trend = np.full(n, -1.0)
 
-    first_valid = 0
-    for i in range(n):
-        if not np.isnan(basic_upper[i]):
-            first_valid = i
-            break
+    first_valid = next(
+        (
+            i
+            for i in range(n)
+            if not np.isnan(basic_upper[i]) and not np.isnan(basic_lower[i])
+        ),
+        None,
+    )
+    if first_valid is None:
+        return trend, upper, lower, None
 
-    if n > first_valid:
-        upper[first_valid] = basic_upper[first_valid]
-        lower[first_valid] = basic_lower[first_valid]
-        trend[first_valid] = 1.0 if close[first_valid] >= lower[first_valid] else -1.0
-        for i in range(first_valid + 1, n):
-            if (
-                basic_upper[i] < upper[i - 1]
-                or close[i - 1] > upper[i - 1]
-            ):
-                upper[i] = basic_upper[i]
-            else:
-                upper[i] = upper[i - 1]
-            if (
-                basic_lower[i] > lower[i - 1]
-                or close[i - 1] < lower[i - 1]
-            ):
-                lower[i] = basic_lower[i]
-            else:
-                lower[i] = lower[i - 1]
-            if trend[i - 1] == 1.0:
-                trend[i] = 1.0 if close[i] > lower[i] else -1.0
-            else:
-                trend[i] = 1.0 if close[i] >= upper[i] else -1.0
+    upper[first_valid] = basic_upper[first_valid]
+    lower[first_valid] = basic_lower[first_valid]
+    trend[first_valid] = (
+        1.0 if close[first_valid] >= lower[first_valid] else -1.0
+    )
+    for i in range(first_valid + 1, n):
+        if np.isnan(basic_upper[i]) or np.isnan(basic_lower[i]):
+            upper[i] = upper[i - 1]
+            lower[i] = lower[i - 1]
+        else:
+            upper[i], lower[i] = _ta_next_bands(
+                basic_upper[i],
+                basic_lower[i],
+                upper[i - 1],
+                lower[i - 1],
+                close[i - 1],
+            )
+        trend[i] = _ta_trend_step(trend[i - 1], close[i], lower[i], upper[i])
     return trend, upper, lower, first_valid
 
 
@@ -493,8 +606,8 @@ def supertrend(
     atr_smoothing: Smoothing,
     atr_seed: Seed,
     rule: SupertrendRule,
+    atr_first_bar: TrFirstBar,
     atr: pd.Series | None = None,
-    atr_first_bar: TrFirstBar = "hl",
     atr_min_periods: int | None = None,
     atr_skipna: bool = False,
 ) -> SupertrendResult:
@@ -517,12 +630,15 @@ def supertrend(
     - ``"ta"``: the RamJet/pandas_ta recursion — bands reset when the raw
       band crosses or the previous close is beyond the previous band;
       direction compares the close against the *current* band; pre-warm-up
-      direction is fail-closed down with ``ready=False``.
+      direction is fail-closed down with ``ready=False``. If no bar has a
+      usable ATR/src pair, ``ready`` is all-False; an interior NaN ATR/src
+      carries the previous bands forward.
 
     ``atr`` may carry a precomputed ATR series (index-aligned); when
     ``None`` it is computed from ``high``/``low``/``close`` with the
-    ``atr_*`` arguments. Passing a legacy warm-up (e.g. zero-filled) ATR
-    is how the parity presets reproduce their sources bit-for-bit.
+    ``atr_*`` arguments, including the required ``atr_first_bar`` true-range
+    seed. Passing a legacy warm-up (e.g. zero-filled) ATR is how the parity
+    presets reproduce their sources bit-for-bit.
     """
     period = max(1, int(period))
     multiplier = float(multiplier)
@@ -537,6 +653,8 @@ def supertrend(
         )
     else:
         atr_values = _as_float_series(atr, "atr")
+    if not atr_values.index.equals(close.index):
+        raise ValueError("atr must be index-aligned with close")
 
     idx = close.index
     src = ((high + low) / 2.0).to_numpy(dtype=float)
@@ -548,15 +666,22 @@ def supertrend(
         trend_v, upper_v, lower_v, first_valid = _supertrend_ta(
             src, close_v, atr_v, multiplier
         )
-        ready_v = np.arange(n) >= first_valid + period
+        if first_valid is None:
+            ready_v = np.zeros(n, dtype=bool)
+        else:
+            ready_v = (
+                (np.arange(n) >= first_valid + period)
+                & ~np.isnan(upper_v)
+                & ~np.isnan(lower_v)
+            )
     else:
         band_condition: Literal["same", "cross"] = "same"
         first_i = 1
         if rule in ("pine_dema", "pine_superosc"):
-            # Both loops start one bar after the first valid ATR
-            # (``range(period, ...)`` / ``range(length, ...)``).
-            valid = np.flatnonzero(~np.isnan(atr_v))
-            first_i = int(valid[0]) + 1 if len(valid) else n
+            # Both legacy loops start at ``range(period, ...)`` /
+            # ``range(length, ...)`` regardless of where the first valid
+            # ATR lands; NaN ATR bars leave NaN bands until one is usable.
+            first_i = min(period, n)
             if rule == "pine_dema":
                 band_condition = "cross"
         trend_v, upper_v, lower_v = _supertrend_pine(

@@ -3,11 +3,17 @@ implementation it is meant to replace (issue #317, phase P0).
 
 Each test loads the *current* per-strategy / per-bot function (via
 ``importlib`` for strategy files, which are not packages, and via normal
-imports for ``signal_bots``) and asserts the preset reproduces it on the
-same deterministic OHLCV frame — including the warm-up region where the
-legacy code defines one. Where a legacy function legitimately differs in
-warm-up (``0.0``-filled ATR, bars seeded at index 0), the test compares
-the region both define and documents the difference.
+imports for ``signal_bots``) or execs the real ``codegen_vectorbt`` output,
+and asserts the preset reproduces it on the same deterministic OHLCV frame.
+Every test runs against two fixtures:
+
+- ``clean``: a smooth random walk;
+- ``tick``: prices quantised to a 0.25 tick with flat runs, zero-range
+  bars (zero-width Supertrend bands / denominator-floor coverage), and one
+  interior NaN OHLC row.
+
+``exact=True`` is used only where the legacy copy is itself the same pure
+pandas/NumPy formula; everything else keeps the documented tolerance.
 """
 
 from __future__ import annotations
@@ -19,9 +25,18 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from runner.strategy_ir import (
+    Condition,
+    IndicatorRef,
+    ParameterSpec,
+    ParameterValueType,
+    StrategyIR,
+    generate_vectorbt_strategy_code,
+)
 from shared.indicators import core, presets
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+TICK = 0.25
 
 
 def _load_strategy(relative_path: str, module_name: str):
@@ -33,10 +48,8 @@ def _load_strategy(relative_path: str, module_name: str):
     return module
 
 
-@pytest.fixture(scope="module")
-def ohlcv() -> pd.DataFrame:
-    rng = np.random.default_rng(42)
-    n = 200
+def _clean_frame(n: int = 220, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
     close = 100.0 + np.cumsum(rng.normal(0.0, 1.0, n))
     open_ = close + rng.normal(0.0, 0.3, n)
     high = np.maximum(open_, close) + rng.uniform(0.2, 1.5, n)
@@ -52,22 +65,108 @@ def ohlcv() -> pd.DataFrame:
     )
 
 
+def _quantize(values: np.ndarray) -> np.ndarray:
+    return np.round(values / TICK) * TICK
+
+
+def _tick_frame(n: int = 220, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    close = 100.0 + np.cumsum(rng.normal(0.0, 0.8, n))
+    close = _quantize(close)
+    open_ = close + rng.choice([-TICK, 0.0, TICK], size=n)
+    high = np.maximum(open_, close) + rng.choice(
+        [TICK, 0.5, 0.75, 1.0], size=n
+    )
+    low = np.minimum(open_, close) - rng.choice(
+        [TICK, 0.5, 0.75, 1.0], size=n
+    )
+    idx = pd.date_range("2024-01-01", periods=n, freq="h")
+    df = pd.DataFrame(
+        {
+            "open": pd.Series(_quantize(open_), index=idx),
+            "high": pd.Series(_quantize(high), index=idx),
+            "low": pd.Series(_quantize(low), index=idx),
+            "close": pd.Series(close, index=idx),
+        }
+    )
+
+    # Flat RSI run: constant close for long enough to produce all-zero
+    # gain/loss windows (the 50/100 mask and the fill50 path).
+    flat_price = float(df["close"].iloc[39])
+    df.loc[df.index[40:56], "close"] = flat_price
+    df.loc[df.index[40:56], "open"] = flat_price
+    df.loc[df.index[40:56], "high"] = flat_price + TICK
+    df.loc[df.index[40:56], "low"] = flat_price - TICK
+
+    # Zero-range run: high == low == close for a stretch longer than the
+    # ATR periods used below, so SMA ATR reaches exactly 0.0 and the
+    # Supertrend bands collapse to zero width (denominator-floor path).
+    zero_price = float(df["close"].iloc[118])
+    df.loc[df.index[119:150], ["open", "high", "low", "close"]] = zero_price
+
+    # One interior NaN OHLC row outside the engineered runs.
+    df.loc[df.index[170], ["open", "high", "low", "close"]] = np.nan
+
+    df["high"] = np.maximum(df["high"], df["close"])
+    df["low"] = np.minimum(df["low"], df["close"])
+    return df
+
+
+@pytest.fixture(params=["clean", "tick"], scope="module")
+def ohlcv(request) -> pd.DataFrame:
+    if request.param == "clean":
+        return _clean_frame()
+    return _tick_frame()
+
+
 def _series(frame: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(frame[column], errors="coerce").astype(float)
 
 
 def _assert_series_equal(
-    actual: pd.Series, expected: pd.Series, *, start: int = 0, rtol: float = 1e-9
+    actual: pd.Series,
+    expected: pd.Series,
+    *,
+    start: int = 0,
+    rtol: float = 1e-9,
+    exact: bool = False,
 ) -> None:
     a = pd.to_numeric(actual, errors="coerce").astype(float).iloc[start:]
     e = pd.to_numeric(expected, errors="coerce").astype(float).iloc[start:]
+    kwargs = {"check_names": False}
+    if exact:
+        kwargs["check_exact"] = True
+    else:
+        kwargs.update({"rtol": rtol, "atol": rtol})
     pd.testing.assert_series_equal(
-        a.reset_index(drop=True),
-        e.reset_index(drop=True),
-        check_names=False,
-        rtol=rtol,
-        atol=rtol,
+        a.reset_index(drop=True), e.reset_index(drop=True), **kwargs
     )
+
+
+def _ohlc(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    return (
+        _series(frame, "high"),
+        _series(frame, "low"),
+        _series(frame, "close"),
+    )
+
+
+def _generated_signals(indicator_name: str, window: int):
+    ir = StrategyIR(
+        name="indicator_characterisation",
+        indicators=[IndicatorRef(name=indicator_name, params={"window": window})],
+        entry_conditions=[Condition(expression="crossover")],
+        parameters=[
+            ParameterSpec(
+                name="window",
+                value_type=ParameterValueType.INT,
+                default=window,
+            )
+        ],
+    )
+    namespace: dict = {}
+    exec(compile(generate_vectorbt_strategy_code(ir), "<generated>", "exec"), namespace)
+    return namespace["generate_signals"]
 
 
 # ── ATR: the QuantConnect "Wilder" ewm variant ─────────────────────────
@@ -81,43 +180,32 @@ def test_atr_qc_wilder_matches_strategy_copies(strategy, ohlcv):
     module = _load_strategy(
         f"strategies/{strategy}/{strategy}.py", f"char_{strategy}"
     )
-    legacy = module._wilder_atr(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 14,
-    )
-    preset = presets.atr_qc_wilder(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 14,
-    )
-    _assert_series_equal(preset, legacy)
-
-
-def test_atr_qc_wilder_matches_trend_following_inline(ohlcv):
-    high, low, close = (
-        _series(ohlcv, "high"), _series(ohlcv, "low"), _series(ohlcv, "close")
-    )
-    tr = pd.concat(
-        [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
-        axis=1,
-    ).max(axis=1)
-    legacy = tr.ewm(alpha=1.0 / 20, min_periods=20, adjust=False).mean()
-    preset = presets.atr_qc_wilder(high, low, close, 20)
-    _assert_series_equal(preset, legacy)
-
-
-def test_atr_qc_wilder_matches_stat_arb_pairs_inline(ohlcv):
-    # stat_arb_pairs computes the identical ewm ATR inline when
-    # use_atr_stop is on; same formula as trend_following above.
-    high, low, close = (
-        _series(ohlcv, "high"), _series(ohlcv, "low"), _series(ohlcv, "close")
-    )
-    tr = pd.concat(
-        [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
-        axis=1,
-    ).max(axis=1)
-    legacy = tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
+    high, low, close = _ohlc(ohlcv)
+    legacy = module._wilder_atr(high, low, close, 14)
     preset = presets.atr_qc_wilder(high, low, close, 14)
-    _assert_series_equal(preset, legacy)
+    _assert_series_equal(preset, legacy, exact=True)
+
+
+def test_atr_qc_wilder_matches_trend_following(ohlcv):
+    module = _load_strategy(
+        "strategies/trend_following/trend_following.py", "char_tf"
+    )
+    _, _, indicators, _ = module.generate_signals(ohlcv, {"atr_period": 20})
+    high, low, close = _ohlc(ohlcv)
+    preset = presets.atr_qc_wilder(high, low, close, 20)
+    _assert_series_equal(preset, indicators["ATR"], exact=True)
+
+
+def test_atr_qc_wilder_matches_stat_arb_pairs(ohlcv):
+    module = _load_strategy(
+        "strategies/stat_arb_pairs/stat_arb_pairs.py", "char_sab"
+    )
+    _, _, indicators, _ = module.generate_signals(
+        ohlcv, {"use_atr_stop": True, "atr_period": 14}
+    )
+    high, low, close = _ohlc(ohlcv)
+    preset = presets.atr_qc_wilder(high, low, close, 14)
+    _assert_series_equal(preset, indicators["ATR"], exact=True)
 
 
 # ── ATR: MT5 iATR and the SMA-seeded Wilder (intraday_volatility_breakout)
@@ -129,12 +217,11 @@ def test_atr_mt5_iatr_matches_intraday_volatility_breakout(period, ohlcv):
         "strategies/intraday_volatility_breakout/intraday_volatility_breakout.py",
         "char_ivb",
     )
-    tr = core.true_range(
-        _series(ohlcv, "high"), _series(ohlcv, "low"), _series(ohlcv, "close")
-    )
+    high, low, close = _ohlc(ohlcv)
+    tr = core.true_range(high, low, close, first_bar="hl")
     legacy = module._mt5_atr(tr, period)
     preset = presets.atr_mt5_iatr(tr, period)
-    _assert_series_equal(preset, legacy)
+    _assert_series_equal(preset, legacy, exact=True)
 
 
 @pytest.mark.parametrize("period", [1, 5, 14])
@@ -145,12 +232,11 @@ def test_atr_wilder_sma_seed_matches_intraday_volatility_breakout(
         "strategies/intraday_volatility_breakout/intraday_volatility_breakout.py",
         "char_ivb",
     )
-    tr = core.true_range(
-        _series(ohlcv, "high"), _series(ohlcv, "low"), _series(ohlcv, "close")
-    )
+    high, low, close = _ohlc(ohlcv)
+    tr = core.true_range(high, low, close, first_bar="hl")
     legacy = module._wilder_atr(tr, period)
     preset = presets.atr_wilder_sma_seed(tr, period)
-    _assert_series_equal(preset, legacy)
+    _assert_series_equal(preset, legacy, exact=True)
 
 
 def test_atr_skipna_variants_match_with_interior_nan(ohlcv):
@@ -159,38 +245,22 @@ def test_atr_skipna_variants_match_with_interior_nan(ohlcv):
         "strategies/intraday_volatility_breakout/intraday_volatility_breakout.py",
         "char_ivb",
     )
-    tr = core.true_range(
-        _series(ohlcv, "high"), _series(ohlcv, "low"), _series(ohlcv, "close")
-    )
+    high, low, close = _ohlc(ohlcv)
+    tr = core.true_range(high, low, close, first_bar="hl")
     tr = tr.copy()
     tr.iloc[10] = np.nan
     tr.iloc[50] = np.nan
     for period in (5, 14):
         _assert_series_equal(
-            presets.atr_mt5_iatr(tr, period), module._mt5_atr(tr, period)
+            presets.atr_mt5_iatr(tr, period),
+            module._mt5_atr(tr, period),
+            exact=True,
         )
         _assert_series_equal(
             presets.atr_wilder_sma_seed(tr, period),
             module._wilder_atr(tr, period),
+            exact=True,
         )
-
-
-def test_atr_wilder_sma_seed_matches_custom_swings_calc_atr(ohlcv):
-    module = _load_strategy(
-        "strategies/custom_swings_supertrend/custom_swings_supertrend.py",
-        "char_cs",
-    )
-    period = 12
-    legacy = pd.Series(module._calc_atr(ohlcv, period), index=ohlcv.index)
-    preset = presets.atr_wilder_sma_seed(
-        core.true_range(
-            _series(ohlcv, "high"), _series(ohlcv, "low"),
-            _series(ohlcv, "close"), first_bar="nan",
-        ),
-        period,
-    )
-    # legacy warm-up is 0.0 where the preset emits NaN; identical after.
-    _assert_series_equal(preset.fillna(0.0), legacy)
 
 
 # ── ATR: rolling-mean ("SMA") variants ─────────────────────────────────
@@ -201,12 +271,9 @@ def test_atr_sma_tr_matches_channel_breakout(ohlcv):
         "strategies/channel_breakout/channel_breakout.py", "char_cb"
     )
     _, _, indicators, _ = module.generate_signals(ohlcv, {"atr_period": 14})
-    legacy = indicators["ATR"]
-    preset = presets.atr_sma_tr(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 14,
-    )
-    _assert_series_equal(preset, legacy)
+    high, low, close = _ohlc(ohlcv)
+    preset = presets.atr_sma_tr(high, low, close, 14, tr_first="hl")
+    _assert_series_equal(preset, indicators["ATR"], exact=True)
 
 
 def test_atr_sma_tr_matches_ema_crossover(ohlcv):
@@ -215,61 +282,35 @@ def test_atr_sma_tr_matches_ema_crossover(ohlcv):
         "char_ec",
     )
     _, _, indicators, _ = module.generate_signals(ohlcv, {"atr_period": 14})
-    legacy = indicators["atr_value"]
-    preset = presets.atr_sma_tr(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 14,
-    )
-    _assert_series_equal(preset, legacy)
+    high, low, close = _ohlc(ohlcv)
+    preset = presets.atr_sma_tr(high, low, close, 14, tr_first="hl")
+    _assert_series_equal(preset, indicators["atr_value"], exact=True)
 
 
-def test_atr_sma_tr_zero_seed_matches_pine_dema_supertrend_atr(ohlcv):
-    # _calc_supertrend builds tr via np.zeros (tr[0]=0.0) then
-    # rolling(period).mean(); reproduce that ATR directly.
-    close_v = ohlcv["close"].to_numpy(dtype=float)
-    high_v = ohlcv["high"].to_numpy(dtype=float)
-    low_v = ohlcv["low"].to_numpy(dtype=float)
-    tr = np.zeros(len(close_v))
-    for i in range(1, len(close_v)):
-        tr[i] = max(
-            high_v[i] - low_v[i],
-            abs(high_v[i] - close_v[i - 1]),
-            abs(low_v[i] - close_v[i - 1]),
-        )
-    legacy = pd.Series(tr, index=ohlcv.index).rolling(10).mean()
-    preset = presets.atr_sma_tr(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 10, tr_first="zero",
-    )
-    _assert_series_equal(preset, legacy)
-
-
-# ── ATR: EMA-span variant (live bots) ──────────────────────────────────
+# ── ATR/EMA: EMA-span variant (live bots) ──────────────────────────────
 
 
 def test_atr_ema_span_matches_ramjet(ohlcv):
     from signal_bots.ramjet.processor import RamJetSignalProcessor
 
-    legacy = RamJetSignalProcessor._calculate_atr(ohlcv.copy(), 14)["atr"]
-    preset = presets.atr_ema_span(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 14,
-    )
-    _assert_series_equal(preset, legacy)
+    frame = RamJetSignalProcessor._prepare_market_data(ohlcv)
+    legacy = RamJetSignalProcessor._calculate_atr(frame, 14)["atr"]
+    high, low, close = _ohlc(frame)
+    preset = presets.atr_ema_span(high, low, close, 14)
+    _assert_series_equal(preset, legacy, exact=True)
 
 
 def test_atr_ema_span_matches_rocketfuel(ohlcv):
     from signal_bots.rocketfuel.processor import RocketFuelSignalProcessor
 
-    legacy = RocketFuelSignalProcessor._calculate_atr(ohlcv.copy(), 14)["atr"]
-    preset = presets.atr_ema_span(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 14,
-    )
-    _assert_series_equal(preset, legacy)
+    frame = ohlcv.copy()
+    legacy = RocketFuelSignalProcessor._calculate_atr(frame, 14)["atr"]
+    high, low, close = _ohlc(ohlcv)
+    preset = presets.atr_ema_span(high, low, close, 14)
+    _assert_series_equal(preset, legacy, exact=True)
 
 
-# ── RMA on arbitrary series (volatility_breakout / qg_30min_es) ────────
+# ── RMA/EMA on arbitrary series ────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -283,10 +324,33 @@ def test_rma_first_seed_matches_strategy_copies(strategy, module_attr, ohlcv):
     module = _load_strategy(
         f"strategies/{strategy}/{module_attr}.py", f"char_{module_attr}"
     )
-    series = _series(ohlcv, "close")
-    legacy = module._wilder_rma(series, 9)
-    preset = presets.atr_wilder_rma_first(series, 9)
-    _assert_series_equal(preset, legacy)
+    close = _series(ohlcv, "close")
+    legacy = module._wilder_rma(close, 9)
+    preset = presets.atr_wilder_rma_first(close, 9)
+    _assert_series_equal(preset, legacy, exact=True)
+
+
+def test_ema_first_seed_matches_trend_following(ohlcv):
+    module = _load_strategy(
+        "strategies/trend_following/trend_following.py", "char_tf_ema"
+    )
+    _, _, indicators, _ = module.generate_signals(ohlcv, {"atr_period": 20})
+    close = _series(ohlcv, "close")
+    for label, span in (("EMA_Fast", 20), ("EMA_Mid", 50), ("EMA_Slow", 200)):
+        _assert_series_equal(
+            presets.ema_first_seed(close, span),
+            indicators[label],
+            exact=True,
+        )
+
+
+def test_ema_first_seed_matches_codegen_vectorbt(ohlcv):
+    close = _series(ohlcv, "close")
+    generate = _generated_signals("EMA_Fast", 20)
+    indicators = generate(ohlcv.assign(close=close), {"window": 20})[2]
+    _assert_series_equal(
+        presets.ema_first_seed(close, 20), indicators["EMA_Fast"], exact=True
+    )
 
 
 # ── RSI variants ───────────────────────────────────────────────────────
@@ -298,7 +362,9 @@ def test_rsi_wilder_matches_gold_momentum(ohlcv):
     )
     close = _series(ohlcv, "close")
     _assert_series_equal(
-        presets.rsi_wilder(close, 14), module._wilder_rsi(close, 14)
+        presets.rsi_wilder(close, 14),
+        module._wilder_rsi(close, 14),
+        exact=True,
     )
 
 
@@ -308,22 +374,21 @@ def test_rsi_wilder_masked_matches_post_vix_dip_buy(ohlcv):
     )
     close = _series(ohlcv, "close")
     _assert_series_equal(
-        presets.rsi_wilder_masked(close, 14), module._wilder_rsi(close, 14)
+        presets.rsi_wilder_masked(close, 14),
+        module._wilder_rsi(close, 14),
+        exact=True,
     )
 
 
 def test_rsi_wilder_fill50_matches_codegen_vectorbt(ohlcv):
-    """Replicates the ``_calc_rsi`` source emitted by codegen_vectorbt."""
     close = _series(ohlcv, "close")
-    window = 14
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / window, min_periods=window, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    legacy = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
-    _assert_series_equal(presets.rsi_wilder_fill50(close, window), legacy)
+    generate = _generated_signals("RSI", 14)
+    indicators = generate(ohlcv.assign(close=close), {"window": 14})[2]
+    _assert_series_equal(
+        presets.rsi_wilder_fill50(close, 14),
+        indicators["RSI"],
+        exact=True,
+    )
 
 
 # ── Supertrend variants ────────────────────────────────────────────────
@@ -341,16 +406,20 @@ def test_supertrend_ramjet_matches_fallback(ohlcv):
         )
     from signal_bots.ramjet.processor import RamJetSignalProcessor
 
-    frame = ohlcv.copy()
+    frame = RamJetSignalProcessor._prepare_market_data(ohlcv)
     legacy = RamJetSignalProcessor._calculate_supertrend(frame, 10, 3.0)
-    result = presets.supertrend_ramjet(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 10, 3.0,
+    high, low, close = _ohlc(frame)
+    result = presets.supertrend_ramjet(high, low, close, 10, 3.0)
+    _assert_series_equal(
+        (result.trend == 1).astype(float),
+        legacy["supertrend"].astype(float),
+        exact=True,
     )
-    _assert_series_equal((result.trend == 1).astype(float),
-                         legacy["supertrend"].astype(float))
-    _assert_series_equal(result.ready.astype(float),
-                         legacy["supertrend_ready"].astype(float))
+    _assert_series_equal(
+        result.ready.astype(float),
+        legacy["supertrend_ready"].astype(float),
+        exact=True,
+    )
 
 
 def test_supertrend_custom_swings_matches_bands(ohlcv):
@@ -363,20 +432,28 @@ def test_supertrend_custom_swings_matches_bands(ohlcv):
     trend_arr, up_arr, dn_arr = module._calc_supertrend(
         ohlcv, legacy_atr.to_numpy(), mult
     )
-    result = presets.supertrend_custom_swings(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), period, mult,
+    high, low, close = _ohlc(ohlcv)
+    result = presets.supertrend_custom_swings(high, low, close, period, mult)
+    _assert_series_equal(
+        result.trend,
+        pd.Series(trend_arr, index=ohlcv.index).astype(float),
+        exact=True,
     )
-    _assert_series_equal(result.trend, pd.Series(trend_arr, index=ohlcv.index))
     # legacy band arrays are 0.0-seeded; the preset emits NaN at bar 0
     # (core contract) — identical from bar 1 on.
     _assert_series_equal(
-        result.lower_band, pd.Series(up_arr, index=ohlcv.index), start=1
+        result.lower_band,
+        pd.Series(up_arr, index=ohlcv.index),
+        start=1,
+        exact=True,
     )
     _assert_series_equal(
-        result.upper_band, pd.Series(dn_arr, index=ohlcv.index), start=1
+        result.upper_band,
+        pd.Series(dn_arr, index=ohlcv.index),
+        start=1,
+        exact=True,
     )
-    _assert_series_equal(result.atr, legacy_atr)
+    _assert_series_equal(result.atr, legacy_atr, exact=True)
 
 
 def test_supertrend_pine_dema_matches_bands(ohlcv):
@@ -387,21 +464,25 @@ def test_supertrend_pine_dema_matches_bands(ohlcv):
     trend, lower_band, upper_band = module._calc_supertrend(
         ohlcv, period, mult
     )
-    result = presets.supertrend_pine_dema(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), period, mult,
-    )
+    high, low, close = _ohlc(ohlcv)
+    result = presets.supertrend_pine_dema(high, low, close, period, mult)
     _assert_series_equal(
-        result.trend, pd.Series(trend, index=ohlcv.index).astype(float)
+        result.trend,
+        pd.Series(trend, index=ohlcv.index).astype(float),
+        exact=True,
     )
     # legacy bands are 0.0 before the loop start (bar `period`)
     _assert_series_equal(
-        result.lower_band, pd.Series(lower_band, index=ohlcv.index),
+        result.lower_band,
+        pd.Series(lower_band, index=ohlcv.index),
         start=period,
+        exact=True,
     )
     _assert_series_equal(
-        result.upper_band, pd.Series(upper_band, index=ohlcv.index),
+        result.upper_band,
+        pd.Series(upper_band, index=ohlcv.index),
         start=period,
+        exact=True,
     )
 
 
@@ -411,31 +492,6 @@ def test_superosc_vumanchu_matches_oscillator(ohlcv):
         "char_pso",
     )
     legacy = module._calc_supertrend_osc(ohlcv, 10, 8.0)
-    preset = presets.superosc_vumanchu(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 10, 8.0,
-    )
-    _assert_series_equal(preset, legacy)
-
-
-def test_supertrend_pine_superosc_bands_match(ohlcv):
-    """The band/trend recursion inside ``_calc_supertrend_osc`` is the
-    ``"pine"`` ratchet with a delayed start; the oscillator test above
-    covers it end-to-end, this pins the raw bands too."""
-    module = _load_strategy(
-        "strategies/pine_superosc_vumanchu/pine_superosc_vumanchu.py",
-        "char_pso",
-    )
-    # Recompute the legacy bands by re-running its loop via the public
-    # function is not possible (only the oscillator escapes); instead
-    # assert internal consistency: spt/den reproduce `osc`.
-    result = presets.supertrend_pine_superosc(
-        _series(ohlcv, "high"), _series(ohlcv, "low"),
-        _series(ohlcv, "close"), 10, 8.0,
-    )
-    legacy = module._calc_supertrend_osc(ohlcv, 10, 8.0)
-    spt = result.lower_band.where(result.trend == 1, result.upper_band)
-    den = result.upper_band - result.lower_band
-    den = den.mask(den.abs() < 1e-10, 1e-10)
-    rebuilt = ((_series(ohlcv, "close") - spt) / den).clip(-1, 1)
-    _assert_series_equal(rebuilt, legacy)
+    high, low, close = _ohlc(ohlcv)
+    preset = presets.superosc_vumanchu(high, low, close, 10, 8.0)
+    _assert_series_equal(preset, legacy, exact=True)
