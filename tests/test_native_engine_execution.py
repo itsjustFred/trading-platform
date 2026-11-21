@@ -1,3 +1,5 @@
+from typing import Any
+
 import pandas as pd
 import pytest
 
@@ -522,3 +524,321 @@ def test_native_engine_ignores_non_decimal_tp_suffix_columns():
         pytest.approx(0.5),
         pytest.approx(0.5),
     ]
+
+
+# ─── #237: take_profit / tp_price are ONE level, never two ─────────────────────
+
+
+def test_native_engine_collapses_take_profit_alias_into_a_single_level():
+    """A row carrying both spellings of the plain TP must yield one level (#237).
+
+    Two "tp" levels both read the ``tp_pct`` fraction, so one intended level
+    filled as two take-profit legs. The single level this resolves to keeps
+    that fraction; what the fill does with it is pinned by
+    ``test_native_engine_single_take_profit_level_closes_the_whole_position``.
+    """
+    engine = _engine()
+    row = pd.Series(
+        {"take_profit": 110.0, "tp_price": 110.0, "sl_price": 90.0, "tp_pct": 0.5}
+    )
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(110.0)
+    assert take_profit_levels[0]["fraction"] == pytest.approx(0.5)
+
+
+def test_native_engine_take_profit_alias_prefers_the_canonical_column():
+    """Canonical ``take_profit`` wins over ``tp_price`` (#237).
+
+    The precedence is the one every other resolver in the repo uses
+    (``risk.live._LIVE_TP_KEYS``, the comparison/extraction helpers), so a
+    conflicting row resolves the same level here and in live.
+    """
+    engine = _engine()
+    row = pd.Series({"take_profit": 110.0, "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(110.0)
+
+
+def test_native_engine_take_profit_alias_resolution_ignores_column_order():
+    """The winner must not depend on the signal frame's column order (#237)."""
+    engine = _engine()
+    forward = pd.Series({"take_profit": 110.0, "tp_price": 115.0})
+    reversed_row = pd.Series({"tp_price": 115.0, "take_profit": 110.0})
+
+    _, forward_levels = engine._extract_levels(forward)
+    _, reversed_levels = engine._extract_levels(reversed_row)
+
+    assert forward_levels == reversed_levels
+    assert forward_levels[0]["price"] == pytest.approx(110.0)
+
+
+def test_native_engine_take_profit_alias_falls_back_to_tp_price_when_null():
+    """``tp_price`` is still honoured when ``take_profit`` is absent/null (#237)."""
+    engine = _engine()
+    row = pd.Series({"take_profit": float("nan"), "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(115.0)
+
+
+def test_native_engine_take_profit_alias_does_not_consume_a_fraction_share():
+    """The duplicated alias must not inflate the default-fraction denominator (#237).
+
+    With both columns present the split is over the real levels (plain TP plus
+    ``tp1``/``tp2``), not over a phantom fourth one.
+    """
+    engine = _engine()
+    row = pd.Series(
+        {"take_profit": 110.0, "tp_price": 115.0, "tp1": 105.0, "tp2": 120.0}
+    )
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp", "tp1", "tp2"]
+    assert [level["price"] for level in take_profit_levels] == [110.0, 105.0, 120.0]
+    assert [level["fraction"] for level in take_profit_levels] == [
+        pytest.approx(1.0 / 3.0)
+    ] * 3
+
+
+def _level_frame(bars: int = 5) -> pd.DataFrame:
+    """``bars`` bars whose entry fills next-open and whose bar 2 rallies
+    through every take-profit level these tests use (and no further).
+    """
+    rungs = range(bars)
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [f"2024-01-01 00:{minute:02d}" for minute in rungs], utc=True
+            ),
+            "open": [100.0, 101.0] + [105.0] * (bars - 2),
+            "high": [100.5, 101.5, 112.5] + [105.5] * (bars - 3),
+            "low": [99.5, 100.5, 104.5] + [104.5] * (bars - 3),
+            "close": [100.0, 101.0] + [105.0] * (bars - 2),
+        }
+    )
+
+
+def _run_with_levels(engine: TradeEngine, levels: dict[str, Any], bars: int = 5):
+    """Run ``engine`` over ``_level_frame(bars)`` with ``levels`` on bar 0.
+
+    Each entry is one signal column published on the entry bar only, so the
+    exit legs report which level the engine actually armed.
+    """
+    rungs = range(bars)
+
+    def strategy(df, params):
+        index = df.index
+        entries = pd.Series([i == 0 for i in rungs], index=index)
+        exits = pd.Series([i == bars - 1 for i in rungs], index=index)
+        indicators = {
+            "direction": pd.Series(
+                ["LONG"] + [None] * (bars - 1), index=index, dtype=object
+            )
+        }
+        for name, value in levels.items():
+            series = pd.Series([None] * bars, index=index, dtype=object)
+            series.iloc[0] = value
+            indicators[name] = series
+        return entries, exits, indicators, []
+
+    return engine.run(_level_frame(bars), strategy)
+
+
+def test_native_engine_take_profit_alias_fills_one_take_profit_level():
+    """End to end (#237): the aliased pair is one take-profit level.
+
+    The strategy publishes its single take-profit level under both spellings,
+    with conflicting prices (``take_profit`` 105, ``tp_price`` 112). The
+    duplicate made the engine arm two levels, so bar 2 closed half the
+    position at 105 and the rest at 112 — two take-profit legs for one
+    intended level. The collapsed level fills once, at the canonical price.
+    """
+    result = _run_with_levels(
+        _engine(),
+        {
+            # Both spellings of the SAME level, with conflicting prices.
+            "take_profit": 105.0,
+            "tp_price": 112.0,
+        },
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1, (
+        "one aliased level must fill once, not once per spelling"
+    )
+    assert take_profit_exits[0].price == pytest.approx(105.0)
+    assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
+
+
+# ─── #237 follow-up: a level price that cannot fire arms no level ─────────────
+
+
+def test_native_engine_take_profit_alias_falls_back_when_the_canonical_is_not_usable():
+    """A non-positive canonical price is not a level (live parity, #237).
+
+    ``risk.live.resolve_live_levels`` raises ``take_profit must be > 0``
+    (``risk/live.py``), so a row whose canonical spelling is ``0`` must never
+    win over a usable alias: a LONG take-profit of 0 is reached by every bar
+    (``bar_high >= 0``), and arming it closed the whole position at price 0.
+    """
+    engine = _engine()
+    row = pd.Series({"take_profit": 0.0, "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(115.0)
+
+
+def test_native_engine_take_profit_alias_ignores_a_non_finite_canonical_price():
+    engine = _engine()
+    row = pd.Series({"take_profit": float("inf"), "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["price"] for level in take_profit_levels] == [115.0]
+
+
+def test_native_engine_does_not_arm_a_non_positive_take_profit_level():
+    """With no usable alias the row arms no take-profit level at all."""
+    engine = _engine()
+    row = pd.Series({"take_profit": 0.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert take_profit_levels == []
+
+
+def test_native_engine_does_not_arm_a_non_positive_numbered_take_profit_level():
+    """The same rule for numbered levels: ``tp1: 0`` is not a level."""
+    engine = _engine()
+    row = pd.Series({"tp1": 0.0, "tp2": 120.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp2"]
+    assert [level["price"] for level in take_profit_levels] == [120.0]
+    assert take_profit_levels[0]["fraction"] == pytest.approx(1.0)
+
+
+def test_native_engine_non_positive_take_profit_does_not_close_the_position_at_zero():
+    """End to end (#237): a ``take_profit`` of 0 must not book a fantasy exit.
+
+    A LONG take-profit of 0 is reached by every bar, so arming it closed the
+    whole position at price 0 on the first monitored bar. The alias price is
+    the usable one, and that is the level the exit must fill at.
+    """
+    result = _run_with_levels(
+        _engine(),
+        {
+            "stop_loss": 95.0,
+            # The unusable canonical price plus the usable alias price.
+            "take_profit": 0.0,
+            "tp_price": 112.0,
+        },
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1
+    assert take_profit_exits[0].price == pytest.approx(112.0)
+    assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
+    assert all(leg.price > 0 for leg in trade.exits), "no leg may fill at price 0"
+
+
+def test_native_engine_fixed_risk_amount_never_arms_a_take_profit_at_zero():
+    """End to end (#237): the fixed-amount sizing path books no price-0 exit.
+
+    ``fixed_risk_amount`` sizing returns before the ``TradeSignal`` that
+    validates the level, so the unusable price reached ``_create_order`` and
+    armed a take-profit at 0 — which every bar reaches, closing the whole
+    position at price 0 on the first monitored bar. The alias price is the
+    usable one, so that is the level the exit fills at.
+    """
+    result = _run_with_levels(
+        _engine({"fixed_risk_amount": 500.0}),
+        {
+            "stop_loss": 95.0,
+            "take_profit": 0.0,
+            "tp_price": 112.0,
+        },
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1
+    assert take_profit_exits[0].price == pytest.approx(112.0)
+    assert all(leg.price > 0 for leg in trade.exits), "no leg may fill at price 0"
+
+
+def test_native_engine_single_take_profit_level_closes_the_whole_position():
+    """Characterisation (#237 follow-up): the last pending level flattens.
+
+    The reviewed PR body claimed that collapsing the alias pair stopped a
+    ``tp_pct=0.5`` take-profit from closing the whole position. It does not:
+    the fill loop gives the LAST pending level the remaining quantity, so a
+    lone level — whatever its fraction — closes the position, exactly like the
+    single bracket order a broker holds for it.
+
+    This pins what the engine does so the claim cannot drift again. Making a
+    lone level honour its fraction (and leave the remainder for a later signal
+    exit) is a plain behaviour change to the exit convention, so it is left to
+    a maintainer decision rather than smuggled into the alias fix.
+    """
+    result = _run_with_levels(
+        _engine(),
+        {
+            "stop_loss": 95.0,
+            "take_profit": 112.0,
+            "tp_pct": 0.5,
+        },
+        bars=4,
+    )
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1
+    # The whole position, not the 50 % the fraction asked for.
+    assert take_profit_exits[0].price == pytest.approx(112.0)
+    assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
+    assert trade.exits[-1].reason == "tp", "the position is flat after the take-profit"
+
+
+def test_native_engine_take_profit_alias_ignores_a_malformed_alias_value():
+    """A non-numeric value is not a level, so it cannot shadow the canonical one.
+
+    Converting each spelling during the scan made ``float("bad")`` raise on the
+    low-priority alias before the canonical spelling was ever reached, so which
+    level a conflicting row resolved to still depended on the column order.
+    """
+    engine = _engine()
+    canonical_first = pd.Series({"take_profit": 110.0, "tp_price": "not-a-number"})
+    alias_first = pd.Series({"tp_price": "not-a-number", "take_profit": 110.0})
+
+    for row in (canonical_first, alias_first):
+        _, take_profit_levels = engine._extract_levels(row)
+
+        assert [level["price"] for level in take_profit_levels] == [110.0]
+
+
+def test_native_engine_take_profit_alias_falls_back_from_a_malformed_canonical():
+    engine = _engine()
+    row = pd.Series({"take_profit": "not-a-number", "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["price"] for level in take_profit_levels] == [115.0]
