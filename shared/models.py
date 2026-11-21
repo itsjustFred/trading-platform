@@ -1074,6 +1074,9 @@ class BacktestResult:
         """
         p = Path(path)
         if root is not None:
+            # S8707: the unconfined branch is intentional — CLI callers pass
+            # operator-chosen paths, and only viewer id-derived paths pass
+            # root= to confine the read to their data directory (#230).
             resolved = p.resolve()
             if not resolved.is_relative_to(Path(root).resolve()):
                 raise ValueError(f"Backtest result path escapes root {root}: {path}")

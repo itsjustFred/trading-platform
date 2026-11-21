@@ -248,7 +248,47 @@ def _invalidate_ohlcv_cache(cache_key: tuple[str, str]) -> None:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
-_SAFE_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safe_asset_id(raw_id: object) -> str:
+    """Normalize a client-supplied asset id for file-backed operations.
+
+    Returns an empty string for ids that are blank or that could participate
+    in a path traversal (path separators, ``..`` segments). Ids are only ever
+    joined onto a fixed directory below, and the join is containment-checked
+    again by :func:`_contained_asset_path`.
+    """
+    normalized = str(raw_id or "").strip()
+    if not normalized:
+        return ""
+    if normalized in {".", ".."}:
+        return ""
+    if not _SAFE_ASSET_ID_RE.match(normalized):
+        return ""
+    return normalized
+
+
+def _contained_asset_path(base_dir: Path, asset_id: object, suffix: str) -> Path | None:
+    """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
+
+    The resolved candidate must be contained in the resolved base directory,
+    otherwise ``None`` is returned so the caller never builds a path from
+    raw input. This is the single implementation of the id→path containment
+    contract (#222/#155, #230); ``viewer.main`` aliases it for the FastAPI
+    routes.
+    """
+    normalized = _safe_asset_id(asset_id)
+    if not normalized:
+        return None
+    base = base_dir.resolve()
+    raw_candidate = base_dir / f"{normalized}{suffix}"
+    if raw_candidate.is_symlink():
+        return None
+    candidate = raw_candidate.resolve()
+    if candidate.parent != base:
+        return None
+    return candidate
 
 
 def _contained_backtest_result_path(backtest_id: object) -> Path | None:
@@ -259,21 +299,7 @@ def _contained_backtest_result_path(backtest_id: object) -> Path | None:
     direct child of the resolved ``BACKTESTS_DIR`` with no symlink in the way,
     so an id can never resolve a read outside the backtests tree (#230).
     """
-    normalized = str(backtest_id or "").strip()
-    if (
-        not normalized
-        or normalized in {".", ".."}
-        or _SAFE_RESULT_ID_RE.fullmatch(normalized) is None
-    ):
-        return None
-    base = BACKTESTS_DIR.resolve()
-    raw_candidate = BACKTESTS_DIR / f"{normalized}.trades.json"
-    if raw_candidate.is_symlink():
-        return None
-    candidate = raw_candidate.resolve()
-    if candidate.parent != base:
-        return None
-    return candidate
+    return _contained_asset_path(BACKTESTS_DIR, backtest_id, ".trades.json")
 
 
 def _load_result(backtest_id: str) -> BacktestResult | None:

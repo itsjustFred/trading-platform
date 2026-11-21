@@ -962,7 +962,10 @@ def test_contained_backtest_result_path_refuses_escape(monkeypatch, tmp_path):
     outside = tmp_path / "outside.trades.json"
     _trades_result("outside").save(outside)
     link = backtests_dir / "link.trades.json"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this platform")
     assert core._contained_backtest_result_path("link") is None
 
 
@@ -1039,3 +1042,77 @@ def test_backtest_rename_refuses_an_id_that_escapes_backtests_dir(
         )
     assert exc_info.value.status_code == 400
     assert not (tmp_path / "escape.trades.json").exists()
+
+
+def _spy_backtest_result_load(monkeypatch) -> list[str]:
+    """Record every ``BacktestResult.load`` call; delegate to the real one.
+
+    Patches the classmethod on the shared model, so both viewer loaders
+    (``viewer.core`` and ``viewer.main``) are observed through one spy.
+    """
+    from shared.models import BacktestResult
+
+    calls: list[str] = []
+    real_load = BacktestResult.load.__func__
+
+    def _spy(cls, path, *, root=None):
+        calls.append(str(path))
+        return real_load(cls, path, root=root)
+
+    monkeypatch.setattr(BacktestResult, "load", classmethod(_spy))
+    return calls
+
+
+def test_core_load_result_never_reads_outside_backtests_dir(monkeypatch, tmp_path):
+    """``viewer.core._load_result`` must refuse escape ids before any read (#230).
+
+    A valid artifact is planted at every location the OLD bare
+    ``BACKTESTS_DIR / f"{id}.trades.json"`` join would have resolved to —
+    outside the tree for ``..``/absolute ids, inside it for an id with a
+    space — so a regression to the bare join is caught by the spy, not just
+    by the return value.
+    """
+    from viewer import core
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(core, "BACKTESTS_DIR", backtests_dir)
+    calls = _spy_backtest_result_load(monkeypatch)
+
+    _trades_result("escape").save(tmp_path / "escape.trades.json")
+    absolute_id = str(tmp_path / "abs")
+    _trades_result("abs").save(tmp_path / "abs.trades.json")
+    _trades_result("id name").save(backtests_dir / "id name.trades.json")
+    _trades_result("real").save(backtests_dir / "real.trades.json")
+
+    for bad_id in ("../escape", "..", "a/b", absolute_id, "id name"):
+        assert core._load_result(bad_id) is None, bad_id
+    # The contained id still loads — proving the spy observes real calls.
+    assert core._load_result("real") is not None
+    assert calls == [str((backtests_dir / "real.trades.json").resolve())]
+
+
+def test_main_load_result_never_reads_outside_backtests_dir(monkeypatch, tmp_path):
+    """``viewer.main._load_result`` JSON fallback is contained the same way.
+
+    The SQLite lookup misses (empty test DB), so the JSON fallback is what
+    runs — exactly the path the bare join used to take.
+    """
+    import viewer.main as viewer_app_module
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(viewer_app_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _r: None)
+    calls = _spy_backtest_result_load(monkeypatch)
+
+    _trades_result("escape").save(tmp_path / "escape.trades.json")
+    absolute_id = str(tmp_path / "abs")
+    _trades_result("abs").save(tmp_path / "abs.trades.json")
+    _trades_result("id name").save(backtests_dir / "id name.trades.json")
+    _trades_result("real").save(backtests_dir / "real.trades.json")
+
+    for bad_id in ("../escape", "..", "a/b", absolute_id, "id name"):
+        assert viewer_app_module._load_result(bad_id) is None, bad_id
+    assert viewer_app_module._load_result("real") is not None
+    assert calls == [str((backtests_dir / "real.trades.json").resolve())]
