@@ -210,6 +210,27 @@ Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
 Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
+## Kill Switch (#300)
+
+Vor jedem Entry verweigert `prepare_order_with_risk()` den Order, wenn der Account
+gehalten ist (`live_runner.kill_switch.refuse_entry_while_halted`). Die Prüfung steht
+**nach** dem Exit-Zweig, blockiert also nie das Schließen einer Position, und
+**vor** jedem Broker-Zugriff: ein gehaltener Account kostet keinen Round-Trip.
+
+Der Zustand liegt in `live_kill_switch` (eine Zeile pro Scope: `global` plus eine pro
+Live-Account) und wird bei jedem Entry und auf jedem Tick neu gelesen - kein
+Prozess-Cache, sonst würde ein Neustart den Halt aufheben. Der strengste Modus gewinnt
+(`entries` < `orders` < `flatten`); ein Account-Scope kann einen globalen Halt nie
+aufweichen.
+
+Fail closed heißt hier bewusst die billige Seite: ein unlesbarer Zustand oder ein nicht
+interpretierbarer Modus verwirft Entries und rührt den Broker nicht. Ein leerer Read ist
+nicht von "nichts ist gehalten" zu unterscheiden - die eine Antwort, die ein Kill Switch
+nie zufällig produzieren darf.
+
+Setzen, lift und lesen: `scripts/live_kill_switch.py` (CLI) und
+`/api/live/kill-switch` (Viewer); Betriebsdetails in `docs/live-deploy-runbook.md`.
+
 ## Commission-Vorzeichen (#184 Finding 14)
 
 `live_executions.commission` ist bei **allen** Brokern ein **positiver Kostenwert**

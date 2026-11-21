@@ -437,6 +437,103 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+## Kill Switch (#300)
+
+One operator action halts trading. It is written to the `live_kill_switch` table of the live
+database, so it survives a restart, a redeploy and the daemon being down altogether: the
+daemon reads it again on its first tick after starting.
+
+| Mode | New entries | Working orders | Open positions |
+|------|-------------|----------------|----------------|
+| `entries` | refused | left alone | left alone |
+| `orders` | refused | cancelled | left alone |
+| `flatten` | refused | cancelled | closed, then the protections the flatten orphaned are swept |
+
+Two checkpoints, both fail closed:
+
+- **Before every entry.** `prepare_order_with_risk`, the single chokepoint every entry order of
+  every deployment (Discord and internal alike) passes through. It runs *after* the exit branch
+  there, so a halt never blocks closing a position - trapping an operator in open exposure is
+  the opposite of what the feature is for. It also runs before any broker state is read, so a
+  halted account costs no round-trip.
+- **On every tick.** The deployment-sync loop, so a halt written while nothing was running is
+  enforced by the first tick after a restart. A completed sweep is repeated every
+  `KILL_SWITCH_SWEEP_INTERVAL_SECONDS` (30 s) while the halt stands, because refusing entries
+  stops the daemon opening risk, not a human at the broker.
+
+Fail closed means the cheap failure: a halt state that cannot be read, or a stored mode this
+build cannot interpret, refuses **entries** and sweeps **nothing**. An empty read is
+indistinguishable from "nothing is halted", which is the one answer a kill switch must never
+produce by accident. Nothing is ever liquidated on a database error.
+
+### Scopes
+
+One halt per scope: the reserved `global` scope, plus one scope per live account. The strictest
+halt wins, so a per-account write may only add restriction, never lift a platform-wide one. A
+scope that names no live account is refused - a typo'd halt would look armed while halting
+nothing. `accounts` lists the scopes that exist.
+
+A scope is cleared by stamping `cleared_at` rather than deleting the row, so "who halted this
+account, when, and who lifted it" stays answerable after the incident.
+
+### CLI
+
+```bash
+uv run python -m scripts.live_kill_switch status
+uv run python -m scripts.live_kill_switch accounts
+uv run python -m scripts.live_kill_switch halt --scope global --mode flatten --reason "incident 42"
+uv run python -m scripts.live_kill_switch halt --scope ACC1 --mode orders --actor "Jane Doe"
+uv run python -m scripts.live_kill_switch resume --scope global
+```
+
+`--help` answers without touching the database, and importing the module starts nothing: the
+daemon is never started from here. `status` and `accounts` are read-only. The script carries the
+import-origin guard the other data-mutating scripts carry, so it must be run as
+`python -m scripts.live_kill_switch` from the repository root - a direct `python
+scripts/live_kill_switch.py` is refused rather than halting trading against another tree's
+database.
+
+### Viewer
+
+| Endpoint | Effect |
+|----------|--------|
+| `GET /api/live/kill-switch` | the state the daemon enforces, plus every scope's mode, since, by and reason |
+| `POST /api/live/kill-switch/halt` | halt one scope; `confirmed_scope` required for `orders` and `flatten` |
+| `POST /api/live/kill-switch/resume` | lift the halt on one scope; `confirmed_scope` required |
+
+`entries` is deliberately unconfirmed: it refuses new entries and can cost nothing, so it stays
+one click in an incident. The modes that move money, and resuming trading, are confirmed on the
+server - the API is directly callable, so a dialog in the UI constrains nothing but the UI.
+Every attempt, refused ones included, is attributed in `live_control_audit`
+(`GET /api/live/audit`, or `X-Operator` for the claimant).
+
+### What a halt does not do
+
+- It does not disconnect the adapter. A halted account that still needs a sweep keeps its
+  adapter connected for the sweep - the same retention STOPPED enforcement uses - but only the
+  runnable set gets listener tasks, so retention never grants trading permission.
+- It does not stop the live trailing-stop loop (#167). A `flatten` sweep cancels what the flatten
+  orphaned; an `entries` halt leaves every working order exactly where it is.
+- It does not replace STOPPED. A STOPPED deployment is a deployment-level stop enforced once per
+  transition; the kill switch is an account- or platform-level halt that stays in force until it
+  is lifted.
+- It is not a guarantee about the broker. An account whose halt cannot be enforced (no adapter
+  can be connected, or the broker refuses a cancel) is reported as `unmet` or `without_adapter`
+  in an ERROR every tick, and its entries are still refused. A halt that could not be enforced
+  says so rather than looking clean.
+
+### Verifying
+
+```bash
+uv run python -m scripts.live_kill_switch status        # what is in force right now
+curl -s localhost:5556/api/live/kill-switch | jq .      # same state, from the viewer
+curl -s "localhost:5556/api/live/audit?limit=5" | jq .   # who set or lifted what
+```
+
+In the daemon log: `Enforced a halted account: orders cancelled and positions flattened` for a
+completed sweep, `Halt not fully enforced on this account` for one that fell short, and `Entry
+refused by the kill switch` at the entry gate.
+
 ## Market-data symbol classification (Alpaca, #122)
 
 `live_runner/symbol_class.py` decides which feed a symbol belongs to, by *asset class* and never by string shape alone: a pair is recognised only when its base currency is in `CRYPTO_BASES` and its quote currency is in `CRYPTO_QUOTES` (that quote list is shared with `shared/alpaca_symbols.py`, so fee backfill and market-data routing cannot drift on it). Share-class equities (`BRK.B`, `BF-B`) are equities, exactly as in the fee backfill.
