@@ -79,6 +79,11 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.kill_switch import (
+    KillSwitchMode,
+    kill_switch_payload,
+    read_kill_switch_state,
+)
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
@@ -94,6 +99,7 @@ from shared.database import (
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
+    clear_live_kill_switch,
     create_live_deployment,
     create_service,
     delete_background_task_record,
@@ -105,6 +111,7 @@ from shared.database import (
     get_latest_live_balances,
     get_live_account,
     get_live_deployment,
+    get_live_kill_switch_state,
     get_service,
     init_db,
     list_background_task_records,
@@ -133,6 +140,7 @@ from shared.database import (
     normalize_task_status,
     record_live_control_audit,
     save_result_to_sqlite,
+    set_live_kill_switch,
     update_live_deployment_account,
     update_live_deployment_status,
     update_service_status,
@@ -13897,6 +13905,279 @@ async def update_live_deployment_status_endpoint(
                 },
             )
     return payload
+
+
+# ── Kill switch (#300) ───────────────────────────────────────────────────────
+#
+# The viewer's half of the operator halt. What it writes is the same row the CLI
+# writes and the daemon reads before every entry and on every tick, so a halt
+# from the dashboard holds across a restart exactly like one from a shell.
+
+
+class LiveKillSwitchHaltRequest(BaseModel):
+    """Halt one scope. ``scope`` is 'global' or a live account id."""
+
+    scope: str
+    #: One of the modes `live_runner.kill_switch` defines. Validated here rather
+    #: than left to the database, so a typo is a 400 the UI can show instead of a
+    #: refusal from a layer the caller cannot see.
+    mode: str
+    reason: str = ""
+    #: Required only for the modes that move money: `orders` cancels working
+    #: orders and `flatten` closes positions. A plain `entries` halt refuses new
+    #: entries and can cost nothing, so it must stay one click in an incident -
+    #: a confirmation gate on the emergency control would be the wrong trade.
+    confirmed_scope: str | None = None
+
+
+class LiveKillSwitchResumeRequest(BaseModel):
+    """Lift the halt on one scope. Confirmed, because it re-enables trading."""
+
+    scope: str
+    confirmed_scope: str | None = None
+
+
+async def _require_kill_switch_confirmation(
+    *,
+    action: str,
+    scope: str,
+    confirmed_scope: str | None,
+    request: Request | None,
+) -> None:
+    """Refuse a money-moving kill-switch control that was not confirmed.
+
+    The scope is echoed back, for the same reason the deployment confirmation
+    echoes the deployment id: naming the scope proves the operator confirmed
+    *this* account, which is the mistake that happens when several accounts are
+    stacked in a list. 428 rather than 400, so a caller can tell "you did not
+    confirm this" from "your payload was malformed".
+    """
+    if confirmed_scope is None:
+        await _audit_live_control(
+            action=action,
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no confirmation supplied"},
+        )
+        raise HTTPException(
+            status_code=428,
+            detail=(
+                f"'{action}' in this mode cancels orders and closes positions, so "
+                f"it must be confirmed. Send confirmed_scope='{scope}'."
+            ),
+        )
+    if str(confirmed_scope).strip() != scope:
+        await _audit_live_control(
+            action=action,
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "confirmation named a different scope",
+                "confirmed_scope": str(confirmed_scope),
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Confirmation does not match this scope (confirmed "
+                f"'{confirmed_scope}', requested '{scope}')."
+            ),
+        )
+
+
+async def _kill_switch_details(state: Any) -> list[dict[str, Any]]:
+    """Every halted scope with the history its row carries, for the payload."""
+    details: list[dict[str, Any]] = []
+    for scope in state.halted_scopes():
+        record = await asyncio.to_thread(get_live_kill_switch_state, scope)
+        details.append(
+            {
+                "scope": scope,
+                "mode": (
+                    record.mode
+                    if record is not None
+                    else state.halts[scope].value
+                ),
+                "halted_at": record.halted_at if record is not None else None,
+                "halted_by": record.halted_by if record is not None else "unknown",
+                "reason": record.reason if record is not None else "",
+            }
+        )
+    return details
+
+
+async def _live_kill_switch_state_payload() -> dict[str, Any]:
+    """The halt state as the daemon enforces it, plus each scope's history."""
+    state = await asyncio.to_thread(read_kill_switch_state)
+    return {
+        **kill_switch_payload(state),
+        "halt_details": await _kill_switch_details(state),
+    }
+
+
+@app.get("/api/live/kill-switch")
+async def get_live_kill_switch() -> dict[str, Any]:
+    """The halt state. Read-only: it touches no trading state."""
+    _log_live_endpoint_request("/api/live/kill-switch")
+    return await _live_kill_switch_state_payload()
+
+
+@app.post(
+    "/api/live/kill-switch/halt",
+    responses={
+        400: {"description": "Unknown scope, or a mode this build cannot interpret"},
+        428: {"description": "A money-moving mode was not confirmed"},
+        409: {"description": "The confirmation named a different scope"},
+    },
+)
+async def halt_live_kill_switch(
+    payload: LiveKillSwitchHaltRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Halt one scope. The daemon enforces it on its next tick.
+
+    The scope must name a real account: the database refuses one that does not,
+    because a halt that covers nothing while the dashboard reads it as armed is
+    worse than no halt at all. That refusal is a 400 and it is audited.
+    """
+    scope = str(payload.scope or "").strip()
+    mode = str(payload.mode or "").strip().lower()
+    _log_live_endpoint_request("/api/live/kill-switch/halt", scope=scope, mode=mode)
+    if KillSwitchMode.parse(mode) is None:
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": "unknown mode", "mode": mode},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown kill switch mode '{payload.mode}'; expected one of "
+                f"{', '.join(item.value for item in KillSwitchMode)}"
+            ),
+        )
+    if mode != KillSwitchMode.ENTRIES.value:
+        await _require_kill_switch_confirmation(
+            action="kill_switch.halt",
+            scope=scope,
+            confirmed_scope=payload.confirmed_scope,
+            request=request,
+        )
+    try:
+        halted = await asyncio.to_thread(
+            set_live_kill_switch,
+            scope,
+            mode,
+            actor=_live_control_actor(request),
+            reason=str(payload.reason or ""),
+        )
+    except ValueError as exc:
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": str(exc), "mode": mode},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    await _audit_live_control(
+        action="kill_switch.halt",
+        target_type="live_kill_switch",
+        target_id=halted.scope,
+        request=request,
+        succeeded=True,
+        detail={"mode": halted.mode, "reason": halted.reason},
+    )
+    logger.warning(
+        "Kill switch halt written by the viewer",
+        extra={
+            "data": {
+                "scope": halted.scope,
+                "mode": halted.mode,
+                "actor": _live_control_actor(request),
+                "reason": halted.reason,
+            }
+        },
+    )
+    return {
+        "halted": True,
+        "scope": halted.scope,
+        "mode": halted.mode,
+        "halted_at": halted.halted_at,
+        "halted_by": halted.halted_by,
+        "reason": halted.reason,
+        # Read back rather than echoed: what the daemon enforces is the combined
+        # state (a global halt covers this account too), and a caller that
+        # echoed its own write would report a weaker halt than the one in force.
+        "state": await _live_kill_switch_state_payload(),
+    }
+
+
+@app.post(
+    "/api/live/kill-switch/resume",
+    responses={
+        428: {"description": "The resume was not confirmed"},
+        409: {"description": "The confirmation named a different scope"},
+    },
+)
+async def resume_live_kill_switch(
+    payload: LiveKillSwitchResumeRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Lift the halt on one scope, so the daemon may trade it again.
+
+    Idempotent: resuming a scope that is not halted reports ``lifted: false``
+    rather than failing, because the state the caller wants is the state that
+    results. Confirmed anyway - it is the action that re-enables trading.
+    """
+    scope = str(payload.scope or "").strip()
+    _log_live_endpoint_request("/api/live/kill-switch/resume", scope=scope)
+    await _require_kill_switch_confirmation(
+        action="kill_switch.resume",
+        scope=scope,
+        confirmed_scope=payload.confirmed_scope,
+        request=request,
+    )
+    lifted = await asyncio.to_thread(
+        clear_live_kill_switch, scope, actor=_live_control_actor(request)
+    )
+    await _audit_live_control(
+        action="kill_switch.resume",
+        target_type="live_kill_switch",
+        target_id=scope,
+        request=request,
+        succeeded=lifted,
+        detail={"lifted": lifted},
+    )
+    if not lifted:
+        logger.info(
+            "Kill switch resume found no halt in force",
+            extra={"data": {"scope": scope}},
+        )
+    else:
+        logger.warning(
+            "Kill switch halt lifted by the viewer",
+            extra={
+                "data": {
+                    "scope": scope,
+                    "actor": _live_control_actor(request),
+                }
+            },
+        )
+    return {
+        "halted": False,
+        "lifted": lifted,
+        "scope": scope,
+        "state": await _live_kill_switch_state_payload(),
+    }
 
 
 @app.put("/api/live/deployments/{deployment_id}/account")
