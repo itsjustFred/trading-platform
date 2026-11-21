@@ -690,6 +690,20 @@ class TestExitLevelGapped:
         for result in (native, vectorbt):
             assert result.trades[0].exits[0].price == pytest.approx(108.5)
 
+    def test_gapped_level_with_nan_open_falls_back_to_close(self, tmp_path: Path):
+        # The gap fill prefers the bar's open; a missing open degrades to
+        # the close rather than booking NaN or the unreachable level.
+        frame = _gap_frame()
+        frame.loc[7, "open"] = float("nan")
+        text = _exit_order_type_strategy_text(order_type="level", exit_price=106.0)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_gapped_nan")
+
+        native = _native_result(frame, strategy_fn)
+
+        trade = native.trades[0]
+        assert trade.exits[0].price == pytest.approx(107.0)
+        assert trade.meta.get("exit_level_gapped") is True
+
     def test_gapped_level_via_native_adapter(self, tmp_path: Path):
         # End-to-end through NativeAdapter (OHLCV loaded from data_dir).
         frame = _gap_frame()

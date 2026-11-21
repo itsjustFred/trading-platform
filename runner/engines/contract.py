@@ -234,6 +234,14 @@ def exit_level_disposition(
 
     Missing, non-finite or inverted (``low > high``) bar extremes fail
     closed (``unreachable``).
+
+    ``level`` has limit-order semantics: an untraded-side level is
+    "unreachable" and callers fall back to the market fill. A strategy
+    whose ``exit_price`` is really a *stop* (e.g. a sell stop above the
+    whole bar after a gap down) should use the ``stop_loss`` legs
+    instead — stops fill at their level or the open on a gap-through,
+    which is the behaviour a ``level`` exit deliberately does not
+    reproduce.
     ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` — an unknown
     direction would invert the classification, so it raises ``ValueError``
     like :func:`resolve_same_bar_exit`.

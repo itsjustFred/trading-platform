@@ -102,7 +102,16 @@ or `level` (case-insensitive):
   fills at the bar's **open** and flags `meta["exit_level_gapped"]`.
   Direction-specific, like every open fill: a LONG exit sells the bid at
   the raw open, while a SHORT exit buys the ask at `open + spread` when a
-  spread is configured. This applies to every level fill, explicit `level`
+  spread is configured. With explicit `ask_high`/`ask_low` columns but no
+  `spread_price_col`, reachability is still judged on the ask range while
+  the fill stays the raw open (spread 0) — the same convention every
+  open fill already follows. `level` has **limit-order semantics**: an
+  untraded-side level is "unreachable" and falls back to the market fill.
+  A strategy whose `exit_price` is really a *stop* (e.g. a sell stop
+  above the whole bar after a gap down) should express it through the
+  `stop_loss` legs instead — a stop fills at its level or the open on a
+  gap-through, which is the behaviour `level` deliberately does not
+  reproduce. This applies to every level fill, explicit `level`
   and vectorbt's legacy implicit `exit_price` alike.
 - absent or unrecognized — the **legacy fallback** applies per engine:
   vectorbt treats a usable `exit_price` as a level fill; native fills at the
