@@ -536,7 +536,11 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert result.meta.parameters == {
         "fee_rate": 0.0005,
         "fee_flat_per_trade": 1.0,
+        "slippage": "none",
     }
+    # #130: the run records which slippage model priced its fills — here
+    # the explicit parity opt-out.
+    assert result.meta.data["slippage"]["models"]["PARITY"]["model"] == "none"
     assert [trade.id for trade in result.trades] == [1, 2, 3]
     assert [trade.entry_time for trade in result.trades] == [
         "2024-01-01T03:00:00+00:00",
