@@ -2525,6 +2525,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         the open listing names are not enough. The lookup's 20-page budget bounds the
         history it reads, and it is the one caller that passes ``symbols=None``: these
         helpers have no default scope, so no caller can reach one by omission.
+
+        The cancels are then verified by re-reading the book, as the flatten verifies
+        its own: the broker's acknowledgement is not proof the leg is gone, and Alpaca
+        keeps a cancel it accepted listed as ``pending_cancel`` until it settles - a leg
+        that can still fill. Everything this sweep cancelled that is still resting is
+        reported as a failure, so the sweep is incomplete and the daemon keeps the
+        deployment unenforced instead of stamping it stopped over a leg that can still
+        open a short.
         """
         client = await self._require_trading_client()
         open_orders = await self._list_open_orders(client)
@@ -2539,6 +2547,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        cancelled: list[str] = []
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
@@ -2556,7 +2565,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     continue
                 failed.append(f"{order_id}:{exc}")
                 continue
+            cancelled.append(order_id)
             completed += 1
+        if cancelled:
+            # A held leg is only ever visible under its filled parent, so the
+            # verification has to read the whole working book, not the open
+            # listing: the one order this sweep exists to remove is the one the
+            # open listing cannot show.
+            try:
+                remaining = await self._list_working_book(client, symbols=None)
+            except Exception as exc:
+                failed.append(f"verify:{exc}")
+            else:
+                still_resting = {
+                    _control_order_id(_order_attr(order, "id")) for order in remaining
+                }
+                still_resting.discard(None)
+                failed.extend(
+                    f"{order_id}:still-working"
+                    for order_id in cancelled
+                    if order_id in still_resting
+                )
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
