@@ -280,6 +280,9 @@ the verdict could stand on a file nobody had looked at since the promotion.
   exists: a promotion is then in force only on the machine that recorded it. That
   is the safest reading available -- the alternative would be a path nothing can
   resolve elsewhere, recorded as if it could.
+- The optimizer writes its result to `DATA_DIR/optimizations` (git-ignored), so
+  a machine that trades real money needs that data directory: without the
+  recorded files the promotion is refused there rather than waved through.
 - Ledgers written before #260 record the file *names* only. Such a record cannot
   be re-verified, so it is refused until the promotion is recorded again with the
   current CLI (one command, the same evidence): the new record replaces the old

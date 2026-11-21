@@ -643,7 +643,7 @@ def recorded_evidence_path(path: Path | str) -> str:
     on the machine that recorded it, which is the safest available reading of
     evidence the repository cannot carry.
     """
-    resolved = Path(path).expanduser().resolve()
+    resolved = Path(path).resolve()
     try:
         return resolved.relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
