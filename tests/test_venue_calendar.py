@@ -328,3 +328,154 @@ def test_out_of_session_bars_are_surplus_not_missing(tmp_path: Path):
         symbol="MSFT", timeframe="1d",
         start="2024-01-02", end="2024-01-07", data_dir=tmp_path,
     )
+
+
+# ─── Broker cache writers (fakes only, no broker network) ────────────────────
+
+
+def test_alpaca_exchange_calendar_fetch_uses_injected_session():
+    from data_tools.downloaders.alpaca_dl import fetch_alpaca_exchange_calendar
+
+    calls = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {"date": "2024-07-03", "open": "09:30", "close": "13:00"},
+                {"date": "2024-07-05", "open": "09:30", "close": "16:00"},
+            ]
+
+    class _Session:
+        def get(self, url, **kwargs):
+            calls["url"] = url
+            calls["kwargs"] = kwargs
+            return _Response()
+
+    sessions = fetch_alpaca_exchange_calendar(
+        api_key="k", secret_key="s", start="2024-07-01", end="2024-07-31",
+        session=_Session(),
+    )
+    assert calls["url"].endswith("/v2/calendar")
+    assert calls["kwargs"]["params"] == {"start": "2024-07-01", "end": "2024-07-31"}
+    assert sessions[0]["date"] == "2024-07-03"
+
+
+def test_alpaca_downloader_writes_exchange_calendar_cache(tmp_path: Path, monkeypatch):
+    import data_tools.downloaders.alpaca_dl as alpaca_dl
+    from data_tools.downloaders.alpaca_dl import AlpacaDownloader
+
+    monkeypatch.setattr(
+        alpaca_dl,
+        "fetch_alpaca_exchange_calendar",
+        lambda **kwargs: [
+            {"date": "2024-07-03", "open": "09:30", "close": "13:00"},
+            {"date": "2024-07-05", "open": "09:30", "close": "16:00"},
+        ],
+    )
+    downloader = AlpacaDownloader(api_key="k", secret_key="s")
+    downloader._cache_exchange_calendar(
+        tmp_path, "AAPL", pd.Timestamp("2024-07-01", tz="UTC"),
+        pd.Timestamp("2024-07-31", tz="UTC"),
+    )
+    calendar = load_cached_calendar(
+        data_dir=tmp_path, source="alpaca", symbol="AAPL"
+    )
+    assert isinstance(calendar, ExchangeSessionCalendar)
+    # The early close is preserved in the cached session list.
+    assert calendar.sessions[pd.Timestamp("2024-07-03").date()][1].hour == 13
+
+
+def test_ctrader_adapter_persists_symbol_schedule(tmp_path: Path, monkeypatch):
+    from live_runner import ctrader_adapter
+
+    monkeypatch.setattr(ctrader_adapter, "DATA_DIR", tmp_path)
+
+    class _Interval:
+        def __init__(self, start, end):
+            self.startSecond = start
+            self.endSecond = end
+
+    class _Holiday:
+        holidayDate = 19723  # 2024-01-01
+        isRecurring = False
+
+        def HasField(self, name):
+            return name in {"startSecond", "endSecond"}
+
+        startSecond = 0
+        endSecond = 0
+
+    detail = type(
+        "FakeProtoOASymbol",
+        (),
+        {
+            "schedule": [_Interval(0, 86400)],
+            "holiday": [_Holiday()],
+            "scheduleTimeZone": "Europe/Prague",
+        },
+    )()
+    # Instance attributes, not class attrs, for proto-like access.
+    detail.schedule = [_Interval(0, 86400)]
+    detail.holiday = [_Holiday()]
+    detail.scheduleTimeZone = "Europe/Prague"
+
+    ctrader_adapter.CTraderLiveAdapter._persist_symbol_venue_calendar(
+        object(), detail, "XAUUSD"
+    )
+    calendar = load_cached_calendar(
+        data_dir=tmp_path, source="ctrader", symbol="XAUUSD"
+    )
+    assert isinstance(calendar, BrokerScheduleCalendar)
+    assert calendar.schedule_timezone == "Europe/Prague"
+    assert calendar.intervals == [(0, 86400)]
+    assert len(calendar.holidays) == 1
+
+
+# ─── Live closed-vs-stale (#133) ──────────────────────────────────────────────
+
+
+def _staleness_check(symbol, timeframe, is_crypto, newest, now):
+    from live_runner.alpaca_adapter import AlpacaLiveAdapter
+
+    AlpacaLiveAdapter._raise_if_market_data_stale(
+        symbol, timeframe, is_crypto, newest, now
+    )
+
+
+def test_live_equity_gap_while_market_closed_is_not_stale():
+    # Saturday: NYSE closed; a Friday-close newest bar is legitimate.
+    now = pd.Timestamp("2024-01-06T18:00:00Z")  # Saturday noon ET
+    newest = pd.Timestamp("2024-01-05T20:00:00Z")  # Friday close
+    _staleness_check("AAPL", "1h", False, newest, now)
+
+
+def test_live_equity_gap_while_market_open_is_stale():
+    # Wednesday 15:00 UTC (10:00/11:00 ET): session open; a bar from last week
+    # is a dead feed, not a closed market.
+    now = pd.Timestamp("2024-01-10T15:00:00Z")
+    newest = pd.Timestamp("2024-01-03T20:00:00Z")
+    with pytest.raises(ValueError, match="stale"):
+        _staleness_check("AAPL", "1h", False, newest, now)
+
+
+def test_live_equity_recent_bar_while_open_passes():
+    now = pd.Timestamp("2024-01-10T15:00:00Z")
+    newest = pd.Timestamp("2024-01-10T14:00:00Z")
+    _staleness_check("AAPL", "1h", False, newest, now)
+
+
+def test_live_crypto_never_closed_so_gap_is_stale():
+    # Crypto trades 24/7: a two-day-old 1h bar is always a dead feed.
+    now = pd.Timestamp("2024-01-10T15:00:00Z")
+    newest = pd.Timestamp("2024-01-08T15:00:00Z")
+    with pytest.raises(ValueError, match="stale"):
+        _staleness_check("BTCUSD", "1h", True, newest, now)
+
+
+def test_live_crypto_fresh_bar_passes():
+    now = pd.Timestamp("2024-01-10T15:00:00Z")
+    newest = pd.Timestamp("2024-01-10T10:00:00Z")
+    _staleness_check("BTCUSD", "1h", True, newest, now)

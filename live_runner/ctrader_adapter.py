@@ -32,6 +32,8 @@ from live_runner.base_adapter import (
 )
 from live_runner.credential_env import resolve_env_value
 from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from shared import venue_calendar
+from shared.constants import DATA_DIR
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
     get_live_signal_broker_order_id,
@@ -1523,6 +1525,40 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             if scale is not None:
                 self._symbol_props[name] = scale
+            self._persist_symbol_venue_calendar(detail, name)
+
+    def _persist_symbol_venue_calendar(self, detail: Any, name: str) -> None:
+        """Cache ProtoOASymbol schedule/timezone/holidays as a venue calendar.
+
+        The same ProtoOASymbolById response already carries the broker's
+        session schedule; persisting it lets coverage gates and live checks
+        share one authoritative calendar (#133). Best-effort per symbol.
+        """
+        try:
+            schedule = list(getattr(detail, "schedule", []) or [])
+            holidays = list(getattr(detail, "holiday", []) or [])
+            if not schedule and not holidays:
+                return
+            timezone_name = str(
+                getattr(detail, "scheduleTimeZone", "")
+                or getattr(detail, "schedule_timezone", "")
+                or ""
+            )
+            payload = venue_calendar.ctrader_schedule_payload(
+                symbol=name,
+                schedule=schedule,
+                schedule_timezone=timezone_name,
+                holidays=holidays,
+            )
+            venue_calendar.save_cached_calendar(
+                data_dir=DATA_DIR, source="ctrader", symbol=name, payload=payload
+            )
+        except Exception:
+            logger.warning(
+                "cTrader venue-calendar cache write failed for %s",
+                name,
+                exc_info=True,
+            )
 
     def _extract_order_id_from_payload(self, payload: Any) -> int | None:
         if isinstance(payload, self._ProtoOAExecutionEvent):

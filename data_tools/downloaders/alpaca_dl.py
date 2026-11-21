@@ -18,9 +18,12 @@ import pandas as pd
 
 from data_tools.downloaders.base import Downloader, DownloadResult, SourceMeta
 from data_tools.path_safety import build_dataset_path
+from shared import venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
+
+ALPACA_CALENDAR_URL = "https://data.alpaca.markets/v2/calendar"
 
 TIMEFRAME_MAP: dict[str, str] = {
     "m1": "1m",
@@ -64,6 +67,38 @@ def _to_utc_timestamp(value: str | None) -> pd.Timestamp | None:
 
 def _parse_csv_list(raw: str) -> list[str]:
     return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def fetch_alpaca_exchange_calendar(
+    *,
+    api_key: str,
+    secret_key: str,
+    start: str,
+    end: str,
+    session: Any | None = None,
+) -> list[dict[str, Any]]:
+    """GET ``/v2/calendar`` exchange sessions; ``session`` is injectable.
+
+    Tests pass a fake ``session`` object exposing ``.get`` so no broker
+    network call ever happens under pytest.
+    """
+    import requests
+
+    http = session if session is not None else requests
+    response = http.get(
+        ALPACA_CALENDAR_URL,
+        params={"start": start, "end": end},
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise ValueError("Alpaca /v2/calendar returned a non-list payload")
+    return [item for item in payload if isinstance(item, dict)]
 
 
 class AlpacaDownloader(Downloader):
@@ -290,6 +325,9 @@ class AlpacaDownloader(Downloader):
             .reset_index(drop=True)
         )
         stored = self._merge_and_store_single_file(out_path, combined_new)
+        self._cache_exchange_calendar(
+            output_dir, normalized_symbol, parsed_start, parsed_end
+        )
 
         return DownloadResult(
             symbol=normalized_symbol,
@@ -302,6 +340,54 @@ class AlpacaDownloader(Downloader):
             end=str(stored["timestamp"].iloc[-1]),
             size_bytes=out_path.stat().st_size,
         )
+
+    def _cache_exchange_calendar(
+        self,
+        output_dir: Path,
+        symbol: str,
+        start: pd.Timestamp | None,
+        end: pd.Timestamp | None,
+    ) -> None:
+        """Best-effort ``/v2/calendar`` → ``venue_calendars/alpaca/<SYM>.json``.
+
+        The exchange calendar (session dates, open/close times, early closes)
+        is the authoritative venue model shared by coverage gates and live
+        staleness checks (#133). Failures never fail the download.
+        """
+        try:
+            now = pd.Timestamp.now(tz="UTC")
+            fetch_end = end if end is not None else now
+            fetch_start = (
+                start
+                if start is not None
+                else fetch_end - pd.Timedelta(days=400)
+            )
+            sessions = fetch_alpaca_exchange_calendar(
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+                start=fetch_start.date().isoformat(),
+                end=fetch_end.date().isoformat(),
+            )
+            if not sessions:
+                return
+            payload = venue_calendar.exchange_sessions_payload(
+                source="alpaca",
+                symbol=symbol,
+                sessions=sessions,
+                schedule_timezone="America/New_York",
+            )
+            venue_calendar.save_cached_calendar(
+                data_dir=output_dir,
+                source="alpaca",
+                symbol=symbol,
+                payload=payload,
+            )
+        except Exception:
+            logger.warning(
+                "Alpaca exchange-calendar cache write failed for %s",
+                symbol,
+                exc_info=True,
+            )
 
     def get_source_meta(self) -> SourceMeta:
         return SourceMeta(

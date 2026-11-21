@@ -53,6 +53,8 @@ from shared.database import (
 )
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
+from shared import venue_calendar
+from shared.constants import DATA_DIR
 from shared.models import (
     PRICE_ABSENT,
     PRICE_DERIVED,
@@ -277,6 +279,18 @@ def _alpaca_timeframe(value: str):
         raise ValueError(f"Unsupported Alpaca market-data timeframe: {value!r}")
     amount, unit = units[normalized]
     return TimeFrame(amount=amount, unit=unit), normalized
+
+
+#: Nominal bar spacing per supported market-data timeframe, for the
+#: session-aware staleness limit in ``_raise_if_market_data_stale``.
+_ALPACA_TIMEFRAME_STEP_MINUTES = {
+    "1m": 1.0,
+    "5m": 5.0,
+    "15m": 15.0,
+    "30m": 30.0,
+    "1h": 60.0,
+    "1d": 1440.0,
+}
 
 
 # Markets are closed for most of the calendar. A US equity session is 6.5 hours
@@ -1718,21 +1732,78 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         newest = pd.Timestamp(frame["timestamp"].iloc[-1])
         now = pd.Timestamp.now(tz="UTC")
-        # Intraday bars can legitimately be days old across a market closure: a
-        # Friday close to a Tuesday open is ~89 hours once a holiday Monday is
-        # included, and IEX has no pre/post session to shorten the gap. 72 hours
-        # rejected that valid data; a week still catches a feed that has stopped.
+        self._raise_if_market_data_stale(
+            normalized_symbol, timeframe, is_crypto, newest, now
+        )
+        return frame
+
+    @staticmethod
+    def _raise_if_market_data_stale(
+        symbol: str,
+        timeframe: str,
+        is_crypto: bool,
+        newest: pd.Timestamp,
+        now: pd.Timestamp,
+    ) -> None:
+        """Closed-vs-stale check driven by the venue calendar (#133).
+
+        A bar gap while the market is CLOSED is expected, not stale; the same
+        gap while a session is OPEN means the feed stopped. When the venue
+        cannot be resolved the legacy flat-age rule applies as a fallback.
+        """
         max_age = (
             timedelta(days=7)
             if str(timeframe).strip().lower() == "1d"
             else timedelta(days=5)
         )
-        if newest < now - max_age:
-            raise ValueError(
-                f"Alpaca market data is stale for {normalized_symbol}: "
-                f"newest bar {newest.isoformat()} exceeds {max_age}"
+        try:
+            calendar = venue_calendar.resolve_venue_calendar(
+                symbol=symbol,
+                timeframe=timeframe,
+                asset_class="crypto" if is_crypto else "equity",
+                source="alpaca",
+                data_dir=str(DATA_DIR),
             )
-        return frame
+        except Exception:
+            logger.warning(
+                "Venue calendar resolution failed for %s; using flat staleness age",
+                symbol,
+                exc_info=True,
+            )
+            calendar = None
+        if calendar is None:
+            if newest < now - max_age:
+                raise ValueError(
+                    f"Alpaca market data is stale for {symbol}: "
+                    f"newest bar {newest.isoformat()} exceeds {max_age}"
+                )
+            return
+        state = calendar.session_state(now)
+        if state == "closed":
+            # Legitimate closures (weekends, holidays) can stack to several
+            # days; beyond that the feed itself is presumed dead.
+            if newest < now - timedelta(days=10):
+                raise ValueError(
+                    f"Alpaca market data is stale for {symbol}: "
+                    f"newest bar {newest.isoformat()} is over 10 days old "
+                    "while the venue reports closed"
+                )
+            return
+        step_minutes = _ALPACA_TIMEFRAME_STEP_MINUTES.get(
+            str(timeframe).strip().lower(), 60.0
+        )
+        # While a session is open the newest bar should be at most ~one
+        # trading day behind; three bar-steps floor keeps tiny timeframes
+        # from tripping on ordinary bar jitter.
+        limit_minutes = max(3.0 * step_minutes, 1440.0)
+        trading_age = calendar.trading_minutes_between(newest, now)
+        if trading_age > limit_minutes:
+            raise ValueError(
+                f"Alpaca market data is stale for {symbol}: "
+                f"newest bar {newest.isoformat()} is {trading_age:.0f} "
+                f"trading minutes old while the venue is open "
+                f"(limit {limit_minutes:.0f})"
+            )
 
     async def get_quote(self, symbol: str) -> LiveQuote:
         """Latest top-of-book quote for the #125 entry-deviation gate.
