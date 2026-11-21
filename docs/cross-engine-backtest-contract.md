@@ -241,6 +241,20 @@ canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
 but never remove or overwrite them — a same-named engine key loses the
 collision, so consumers always read the canonical value.
 
+**Sharpe/Sortino convention (#229).** The equity curve is resampled to one
+observation per *observed* day — calendar days the curve carries no point
+for contribute no zero-return observation — and the ratio is annualised
+with the measured observation density (`extras.equity_return_periods_per_year`:
+~252 for a Mon–Fri curve, ~365 for a 24/7 curve, ~52 for weekly). A
+calendar-filled curve that carries explicit flat weekend points measures
+~365 observations/year; the flat days dilute the per-observation ratio by
+the same factor the higher density annualises it, so both curve shapes
+publish the same Sharpe. Cross-platform parity (the MT5 audit matrix in
+`validation/statistics/cross_platform.py`) applies this identical formula
+to both equity curves — ours and the trade-derived imported one — rather
+than comparing against MT5's printed Sharpe-Ratio, which uses MT5's own
+convention; the printed value is kept as `sharpe_ratio_reported`.
+
 ## 7. `total_bars`
 
 Decision Record (Cleanup 16-A, F6): **`meta.total_bars` is the number of bars

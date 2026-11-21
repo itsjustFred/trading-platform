@@ -118,6 +118,15 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
     reference = MT5XLSXImporter().load(case.reference_path, broker_clock=case.broker_clock)
     reference_stats = _normalize_mt5_stats(reference.stats, case.reference_path, reference.raw_metadata)
     platform_stats = _load_platform_stats(case.platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
+    # #229 maintainer decision: Sharpe parity must apply OUR formula to BOTH
+    # equity curves — the platform's and the imported MT5 one — not compare
+    # against MT5's printed Sharpe-Ratio, which uses MT5's own convention.
+    # The printed value stays visible as ``sharpe_ratio_reported`` for audit;
+    # ``sharpe_ratio`` becomes the same-formula recomputation (None when the
+    # trade list cannot support an equity curve — fail closed, never fall
+    # back to the printed ratio).
+    reference_stats["sharpe_ratio_reported"] = reference_stats.get("sharpe_ratio")
+    reference_stats["sharpe_ratio"] = _reference_sharpe_ratio(reference)
     row = _row_payload(
         case_id=case.case_id,
         reference_framework="mt5_xlsx",
@@ -133,10 +142,73 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
                 "through that clock's historical offset segments."
             ),
             "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR.",
+            (
+                "Sharpe parity applies the platform's observed-day, "
+                "measured-density annualisation to both equity curves; the "
+                "MT5 printed Sharpe-Ratio is reported as "
+                "sharpe_ratio_reported and is not the comparison basis."
+            ),
         ],
     )
     row["reference_broker_clock"] = case.broker_clock
     return row
+
+
+def _reference_sharpe_ratio(reference: Any) -> float | None:
+    """Platform Sharpe formula applied to the imported MT5 equity curve.
+
+    The MT5 XLSX report carries no equity graph, so the curve is rebuilt
+    from the trade list: initial capital plus cumulative net PnL booked at
+    each position's last exit — the same realized-equity evidence the trade
+    list is the primary carrier of. ``compute_stats`` then applies the
+    identical observed-day return series and measured-density annualisation
+    used for the platform artifact, which is what makes the two Sharpes
+    comparable (#229).
+    """
+    from runner.stats import compute_stats
+    from shared.models import EquityPoint
+    from validation.reference import resolve_initial_capital
+
+    initial_capital = resolve_initial_capital(reference)
+    exits: list[tuple[pd.Timestamp, float]] = []
+    for trade in reference.trades:
+        if not trade.exits:
+            continue
+        exit_ts = pd.to_datetime(str(trade.exits[-1].time), utc=True, errors="coerce")
+        if pd.isna(exit_ts):
+            continue
+        if trade.net_pnl is not None:
+            pnl = float(trade.net_pnl)
+        else:
+            pnl = float(trade.pnl or 0.0) - float(trade.fees or 0.0)
+        if not math.isfinite(pnl):
+            continue
+        exits.append((pd.Timestamp(exit_ts), pnl))
+    if len(exits) < 2:
+        return None
+    exits.sort(key=lambda item: item[0])
+
+    start_candidates = []
+    for trade in reference.trades:
+        entry_ts = pd.to_datetime(str(trade.entry_time), utc=True, errors="coerce")
+        if not pd.isna(entry_ts):
+            start_candidates.append(pd.Timestamp(entry_ts))
+    start = min(start_candidates) if start_candidates else exits[0][0]
+
+    points = [EquityPoint(time=start.isoformat(), equity=float(initial_capital))]
+    equity = float(initial_capital)
+    for exit_ts, pnl in exits:
+        equity += pnl
+        points.append(EquityPoint(time=exit_ts.isoformat(), equity=equity))
+
+    stats = compute_stats(
+        [],
+        initial_capital=initial_capital,
+        equity_curve=points,
+        risk_free_rate=REFERENCE_RISK_FREE_RATE,
+    )
+    sharpe = _safe_float(stats.get("sharpe_ratio"))
+    return sharpe
 
 
 def _build_json_reference_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:

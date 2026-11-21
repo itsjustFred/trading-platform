@@ -1,13 +1,17 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES
 from scripts.regenerate_qc_risk_parity_artifact import DEFAULT_OUTPUT as QC_RISK_PARITY_OUTPUT
-from shared.models import BacktestMeta, BacktestResult, EquityPoint
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from validation.importers.mt5_xlsx import MT5XLSXImporter
-from validation.statistics.cross_platform import build_comparison_matrix
+from validation.statistics.cross_platform import (
+    _reference_sharpe_ratio,
+    build_comparison_matrix,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -267,6 +271,95 @@ def test_cross_platform_matrix_ignores_malformed_qc_attribution_stats(tmp_path):
     platform = rows["risk_parity_quantconnect"]["platform"]
     assert platform["win_rate"] == pytest.approx(0.0)
     assert platform["net_profit"] == pytest.approx(0.0)
+
+
+def _mt5_like_reference(trades: list[Trade], printed_sharpe: float = 1.2345):
+    return SimpleNamespace(
+        trades=trades,
+        settings={},
+        raw_metadata={"parsed_meta": {"initial_capital": 100_000.0}},
+        stats={"sharpe_ratio": printed_sharpe},
+    )
+
+
+def _mt5_trade(exit_day: str, pnl: float) -> Trade:
+    return Trade(
+        id=1,
+        symbol="EURUSD",
+        direction="LONG",
+        entry_time=f"{exit_day}T08:00:00Z",
+        entry_price=1.1,
+        quantity=1.0,
+        exits=[
+            TradeExit(
+                time=f"{exit_day}T16:00:00Z",
+                price=1.1,
+                quantity=1.0,
+                pnl=pnl,
+            )
+        ],
+        pnl=pnl,
+        net_pnl=pnl,
+    )
+
+
+def test_reference_sharpe_uses_platform_formula_on_imported_curve():
+    """#229: the MT5 side of the parity check runs OUR formula on the
+    trade-derived equity curve, not MT5's printed Sharpe-Ratio."""
+    trades = [
+        _mt5_trade(f"2024-01-{day:02d}", pnl)
+        for day, pnl in [
+            (2, 500.0),
+            (3, -200.0),
+            (4, 300.0),
+            (5, 400.0),
+            (8, -100.0),
+            (9, 600.0),
+            (10, 200.0),
+            (11, -50.0),
+            (12, 350.0),
+            (15, 250.0),
+        ]
+    ]
+    reference = _mt5_like_reference(trades)
+
+    sharpe = _reference_sharpe_ratio(reference)
+
+    assert sharpe is not None
+    # Same-formula check: rebuilding the curve by hand and running
+    # compute_stats gives the identical number.
+    from runner.stats import compute_stats
+    from shared.models import EquityPoint
+
+    equity = 100_000.0
+    points = [EquityPoint(time="2024-01-02T08:00:00+00:00", equity=equity)]
+    for trade in trades:
+        equity += float(trade.net_pnl)
+        points.append(
+            EquityPoint(time=trade.exits[-1].time, equity=equity)
+        )
+    expected = compute_stats(
+        [], initial_capital=100_000.0, equity_curve=points
+    )["sharpe_ratio"]
+    assert sharpe == pytest.approx(expected, abs=1e-4)
+
+
+def test_reference_sharpe_fails_closed_without_enough_exits():
+    reference = _mt5_like_reference([_mt5_trade("2024-01-02", 100.0)])
+
+    assert _reference_sharpe_ratio(reference) is None
+
+
+def test_mt5_row_reports_printed_sharpe_separately_from_the_comparison(matrix):
+    """The matrix keeps MT5's printed ratio for audit but compares the
+    same-formula recomputation."""
+    row = {item["case_id"]: item for item in matrix["rows"]}[
+        "intraday_volatility_breakout_sp500_m1"
+    ]
+
+    assert row["reference"]["sharpe_ratio_reported"] is not None
+    assert row["reference"]["sharpe_ratio"] is not None
+    assert any("sharpe_ratio_reported" in note for note in row["notes"])
 
 
 def test_regenerator_outputs_match_cross_platform_matrix_paths():
