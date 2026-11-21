@@ -1192,6 +1192,57 @@ def test_prepare_stamps_receipt_at_first_contact_when_source_missing(
     assert live_signal.metadata["received_at_local"] == prepared.received_at_local
 
 
+class _PassthroughSignalProcessor:
+    """A registered-processor stand-in: echoes the raw signal unchanged."""
+
+    def process_signal(self, *, raw_signal, market_data):
+        return SimpleNamespace(
+            action=raw_signal["action"],
+            symbol=raw_signal["symbol"],
+            entry_price=raw_signal["entry_price"],
+            stop_loss=None,
+            take_profit=None,
+            timeframe=raw_signal["timeframe"],
+            metadata={},
+        )
+
+
+def test_signal_processor_path_preserves_receipt_stamp(db, monkeypatch) -> None:
+    """#337 blocker: ``_apply_signal_processor`` rebuilds the TradeSignal, so it
+    must carry ``received_at_local`` itself - otherwise every entry on a
+    deployment with a signal processor AND ``wait_for_candle_close`` falls back
+    to the post-wait conversion stamp, silently reviving the bundle-19
+    regression."""
+    deployment = _receipt_deployment().model_copy(
+        update={"signal_config": {"signal_processor": "ramjet"}}
+    )
+    receipt = datetime.now(timezone.utc).isoformat()
+    trade_signal = _receipt_test_signal(receipt, with_source_stamp=True)
+    # _build_processor_market_data refuses to fabricate OHLCV: give the
+    # processor path real rows to work on.
+    trade_signal.metadata["market_data"] = [{"close": 1.0}, {"close": 2.0}]
+
+    monkeypatch.setattr(
+        daemon,
+        "get_signal_processor",
+        lambda _name, _config: _PassthroughSignalProcessor(),
+    )
+    prepared, clock = _prepare_with_advanced_wait(
+        monkeypatch, trade_signal, deployment
+    )
+    assert prepared is not None
+    assert prepared.received_at_local == receipt
+    assert clock["now"] > datetime.fromisoformat(receipt)
+
+    live_signal = daemon._trade_signal_to_live_signal(prepared, deployment)
+    assert live_signal.metadata["received_at_local"] == receipt
+    db.save_live_signal(live_signal)
+    row = _signal_row(db, live_signal)
+    assert row.message_received_at.replace(tzinfo=timezone.utc) == datetime.fromisoformat(
+        receipt
+    )
+
+
 def test_projection_exception_stores_nulls_and_warns(db, monkeypatch) -> None:
     """#337 should-fix: the safety net must degrade to all-NULL columns, keep
     ``save_live_signal`` succeeding, and log the exception - not just a bare
@@ -1249,6 +1300,20 @@ def test_exit_fill_without_snapshot_is_not_flagged_missing(db) -> None:
     assert row["signal_delay_bps"] is None
     assert row["execution_slippage_bps"] is None
     assert row["spread_bps"] is None
+
+
+def test_exit_only_risk_sizing_mode_is_not_flagged_missing(db) -> None:
+    """#337 cubic: ``risk_sizing_mode == "exit_only"`` alone also marks a
+    reduce-only fill (``_is_exit_only_signal_metadata``), so a missing quote
+    snapshot on it is expected, not a gap."""
+    signal = _signal(
+        metadata={"risk_sizing_mode": "exit_only"}, action="sell"
+    )
+    db.save_live_signal(signal)
+    db.save_live_execution(_execution(signal, price=99.8))
+
+    row = _serialized(db, signal)
+    assert row["quote_snapshot_missing"] is None
 
 
 def test_refusal_log_precedes_rejection_persist(monkeypatch) -> None:
@@ -1323,9 +1388,17 @@ def test_rejection_persist_uses_one_shared_deadline(monkeypatch) -> None:
         timeouts.append(timeout)
         return await real_wait_for(awaitable, timeout=timeout)
 
+    def _slow_metadata_lookup(*_a, **_k):
+        # Burn real time inside the worker thread so the shared deadline is
+        # measurably smaller for the second lookup.
+        import time
+
+        time.sleep(0.4)
+        return None
+
     monkeypatch.setattr(asyncio, "wait_for", _spy)
     monkeypatch.setattr(
-        daemon_mod, "get_live_signal_metadata", lambda *_a, **_k: None
+        daemon_mod, "get_live_signal_metadata", _slow_metadata_lookup
     )
     monkeypatch.setattr(
         daemon_mod, "save_live_signal_rejection", lambda *_a, **_k: True
@@ -1339,4 +1412,7 @@ def test_rejection_persist_uses_one_shared_deadline(monkeypatch) -> None:
 
     assert len(timeouts) == 2
     assert 0 < timeouts[0] <= 5.0
-    assert 0 < timeouts[1] <= timeouts[0]
+    # The first lookup consumed ~0.4s of the one shared deadline, so the
+    # rejection write must get strictly less - two independent timeout=5.0
+    # calls would both record ~5.0 and fail this.
+    assert timeouts[1] < timeouts[0] - 0.2

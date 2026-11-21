@@ -5568,7 +5568,7 @@ def _live_slippage_decomposition(
     quote_price = _usable_quote_price(signal.entry_quote_price)
     has_snapshot = bid is not None and ask is not None and quote_price is not None
     metadata = signal.metadata_json or {}
-    is_exit = bool(metadata.get("exit_only")) or str(
+    is_exit = _is_exit_only_signal_metadata(metadata) or str(
         metadata.get("signal_intent") or ""
     ) == "exit"
     result: dict[str, Any] = {
