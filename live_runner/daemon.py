@@ -12,7 +12,7 @@ import weakref
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -178,7 +178,7 @@ def _is_terminal_discord_runtime_error(exc: BaseException) -> bool:
     )
 
 
-def _is_terminal_ctrader_runtime_error(exc: BaseException) -> bool:
+def _is_terminal_ctrader_runtime_error(exc: BaseException | str) -> bool:
     if isinstance(exc, CTraderAuthTerminalError):
         return True
     message = str(exc).strip().lower()
@@ -470,7 +470,7 @@ def _block_ctrader_account(account_id: str, exc: BaseException | str) -> None:
 
 
 def _coerce_live_float(
-    value: object,
+    value: Any,
     *,
     field_name: str,
     minimum: float | None = None,
@@ -489,7 +489,7 @@ def _coerce_live_float(
 
 
 def _coerce_live_int(
-    value: object,
+    value: Any,
     *,
     field_name: str,
     minimum: int | None = None,
@@ -1787,7 +1787,10 @@ def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> i
     open_positions_count = 0
     for position in positions:
         try:
-            position_qty = float(position.get("qty") or 0.0)
+            # Broker JSON: the qty is whatever the adapter put there (str, int,
+            # float or garbage), so `float()` is the parse and its TypeError/
+            # ValueError is the "cannot read this position" signal, not a type bug.
+            position_qty = float(position.get("qty") or 0.0)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             position_qty = 0.0
         if abs(position_qty) > 0:
@@ -2169,6 +2172,7 @@ def _trade_signal_to_live_signal(
     # action to SELL. The TradeSignal Literal gates construction today, but a
     # future loosening (e.g. adding "close") must not silently become a live
     # short — reject it here with a structured reason.
+    live_action: Literal["buy", "sell"]
     if signal.action in {"buy", "long"}:
         live_action = "buy"
     elif signal.action in {"sell", "short"}:
@@ -3301,14 +3305,14 @@ def _create_adapter_for_account(
             )
             return None
     if account.broker == "ctrader":
-        credentials = _resolve_ctrader_credentials(env_values)
-        if credentials is None:
+        ctrader_credentials = _resolve_ctrader_credentials(env_values)
+        if ctrader_credentials is None:
             logger.warning(
                 "Missing cTrader credentials for account",
                 extra={"data": {"account_id": account.id}},
             )
             return None
-        app_id, app_secret, access_token, refresh_token, demo = credentials
+        app_id, app_secret, access_token, refresh_token, demo = ctrader_credentials
         account_identifier = ctrader_account_identifier(account)
         try:
             return CTraderLiveAdapter(
@@ -4058,7 +4062,7 @@ async def _poll_balances(
         async def _poll_one(account_id: str, adapter: BaseLiveAdapter) -> None:
             try:
                 await asyncio.wait_for(
-                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),
+                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),  # noqa: B023 - _poll_one is gathered and awaited within this loop iteration
                     timeout=BALANCE_POLL_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -4701,7 +4705,11 @@ async def _enforce_stopped_deployments(
                 },
             )
             continue
-        if cancelled.pending_cancel:
+        # ``not cancel_ok`` continued above, and ``cancel_ok`` is
+        # ``cancelled is not None and cancelled.complete``: the outcome is
+        # non-None here. mypy cannot follow that conjunction through the
+        # ``continue``.
+        if cancelled.pending_cancel:  # type: ignore[union-attr]
             passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
             _PENDING_CANCEL_PASSES[deployment_id] = passes
             log = (
@@ -4712,13 +4720,13 @@ async def _enforce_stopped_deployments(
             log(
                 "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
                 "and may yet fill (pass %d). Retrying next tick",
-                sorted(cancelled.pending_cancel),
+                sorted(cancelled.pending_cancel),  # type: ignore[union-attr]  # non-None per cancel_ok
                 passes,
                 extra={
                     "data": {
                         "deployment_id": deployment_id,
                         "account_id": deployment.account_id,
-                        "pending_cancel": sorted(cancelled.pending_cancel),
+                        "pending_cancel": sorted(cancelled.pending_cancel),  # type: ignore[union-attr]  # non-None per cancel_ok
                         "passes": passes,
                     }
                 },
@@ -4773,7 +4781,7 @@ async def _enforce_stopped_deployments(
                 "data": {
                     "deployment_id": deployment_id,
                     "account_id": deployment.account_id,
-                    "cancelled": cancelled.describe(),
+                    "cancelled": cancelled.describe(),  # type: ignore[union-attr]  # non-None per cancel_ok
                     "flattened": flattened.describe(),
                 }
             },
@@ -4944,7 +4952,11 @@ async def _connect_active_accounts(
         ),
         return_exceptions=True,
     )
-    for account_id, result in zip(sorted(account_ids), results):
+    # `results` is one entry per `account_ids` element: `asyncio.gather`
+    # returns one result per awaitable it was given, in order. `strict=True`
+    # turns "the two got out of step" into an error instead of into weights
+    # read off the wrong account.
+    for account_id, result in zip(sorted(account_ids), results, strict=True):
         if isinstance(result, asyncio.CancelledError):
             raise result
         if isinstance(result, BaseException):

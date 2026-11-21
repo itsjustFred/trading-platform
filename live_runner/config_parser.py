@@ -70,8 +70,7 @@ def assert_no_unexpanded_env(payload: Any, *, context: str = "live deployment co
             for item in node:
                 _walk(item)
         elif isinstance(node, str):
-            for match in _UNEXPANDED_ENV_PATTERN.findall(node):
-                leftovers.append(match)
+            leftovers.extend(_UNEXPANDED_ENV_PATTERN.findall(node))
 
     _walk(payload)
     if leftovers:

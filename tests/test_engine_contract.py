@@ -88,17 +88,15 @@ def _deterministic_ohlcv(
     # up, flat, down, flat, ... (periods / 80 cycles). Flat phases sit strictly
     # between the trend legs so SMA(5)/SMA(20) fully re-converges and the next
     # trend leg produces a fresh crossover.
-    for cycle in range(max(1, periods // 80)):
+    for _ in range(max(1, periods // 80)):
         for _ in range(30):
             price += 0.5
             closes.append(price)
-        for _ in range(20):
-            closes.append(price)
+        closes.extend(price for _ in range(20))
         for _ in range(30):
             price -= 0.5
             closes.append(price)
-        for _ in range(20):
-            closes.append(price)
+        closes.extend(price for _ in range(20))
     closes = closes[:periods]
     timestamps = pd.date_range(start, periods=periods, freq=freq, tz="UTC")
     return pd.DataFrame(
@@ -1327,7 +1325,7 @@ def main(
         CLI then cuts at midnight, the pyne backtest window is a strict subset
         of the native/vectorbt window for the same configuration.
         """
-        strategy_path, captured = self._run_pyne_dispatch(tmp_path)
+        _strategy_path, captured = self._run_pyne_dispatch(tmp_path)
 
         cmd = captured["cmd"]
         end_bound = cmd[cmd.index("--to") + 1]
@@ -1348,7 +1346,7 @@ def main(
         must pass an aware UTC start-of-day instant (both bounds aware = host
         TZ irrelevant).
         """
-        strategy_path, captured = self._run_pyne_dispatch(tmp_path)
+        _strategy_path, captured = self._run_pyne_dispatch(tmp_path)
 
         cmd = captured["cmd"]
         start_bound = cmd[cmd.index("--from") + 1]
@@ -1506,7 +1504,9 @@ class TestFillContract:
         vectorbt = VectorbtAdapter().run(cfg, STRATEGY_PATH)
 
         assert len(native.trades) == len(vectorbt.trades)
-        for native_trade, vectorbt_trade in zip(native.trades, vectorbt.trades):
+        # `len(...) == len(...)` is asserted on the line above, so the strict zip
+        # is the loop's own restatement of that same invariant.
+        for native_trade, vectorbt_trade in zip(native.trades, vectorbt.trades, strict=True):
             assert pd.Timestamp(native_trade.entry_time) == pd.Timestamp(vectorbt_trade.entry_time)
             assert native_trade.entry_price == pytest.approx(vectorbt_trade.entry_price, rel=1e-9)
 

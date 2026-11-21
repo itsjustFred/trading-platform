@@ -139,8 +139,10 @@ def test_no_max_abs_relative_denominator_left_in_validation() -> None:
     offenders = []
     for path in (REPO_ROOT / "validation").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        for lineno in _max_abs_denominator_lines(text):
-            offenders.append(f"{path.relative_to(REPO_ROOT)}:{lineno}")
+        offenders.extend(
+            f"{path.relative_to(REPO_ROOT)}:{lineno}"
+            for lineno in _max_abs_denominator_lines(text)
+        )
     assert not offenders, (
         "tolerance-gate relative deviations must use the reference magnitude; "
         "max(abs(a), abs(b)) denominators remain at:\n" + "\n".join(offenders)

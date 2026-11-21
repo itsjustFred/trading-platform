@@ -1101,9 +1101,10 @@ def test_long_weekend_closure_does_not_fail_coverage(tmp_path):
     from data_tools.auto_download import DataRequirement, analyze_ohlcv_coverage
 
     root = tmp_path / "data"
-    stamps = list(
-        pd.date_range("2024-03-06 00:00", "2024-03-08 21:00", freq="1h", tz="UTC")
-    ) + [pd.Timestamp("2024-03-11 22:00", tz="UTC")]
+    stamps = [
+        *pd.date_range("2024-03-06 00:00", "2024-03-08 21:00", freq="1h", tz="UTC"),
+        pd.Timestamp("2024-03-11 22:00", tz="UTC"),
+    ]
     # AAPL, not the metal this used to use. The shape asserted here - closed
     # Friday 21:00 UTC, no bars until Monday - is a *US equity* weekend, and the
     # calendar that excuses it models US equities. On GOLD1 the same fixture is
@@ -1497,9 +1498,10 @@ def test_a_four_day_fx_hole_fails_coverage_end_to_end(tmp_path):
     root = tmp_path / "data"
     # Friday 21:00 UTC, then nothing until Tuesday 22:00 - a 24/5 FX venue that
     # was open the whole time in between.
-    stamps = list(
-        pd.date_range("2026-01-16 15:00", "2026-01-16 21:00", freq="1h", tz="UTC")
-    ) + [pd.Timestamp("2026-01-20 22:00", tz="UTC")]
+    stamps = [
+        *pd.date_range("2026-01-16 15:00", "2026-01-16 21:00", freq="1h", tz="UTC"),
+        pd.Timestamp("2026-01-20 22:00", tz="UTC"),
+    ]
     _write_series(root / "ohlcv" / "EURUSD", "1h.parquet", stamps)
 
     report = analyze_ohlcv_coverage(

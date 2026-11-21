@@ -451,8 +451,8 @@ def _validate_max_workers(max_workers: Any) -> int:
     """Validate the grid fan-out width (C3)."""
     try:
         workers = int(1 if max_workers is None else max_workers)
-    except (TypeError, ValueError):
-        raise ValueError(f"max_workers must be an integer, got {max_workers!r}.")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"max_workers must be an integer, got {max_workers!r}.") from exc
     if workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {workers}.")
     if workers > 64:
@@ -766,6 +766,7 @@ def run_one_backtest(
     try:
         proc = subprocess.run(
             cmd,
+            check=False,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

@@ -157,7 +157,12 @@ def test_iter_alpaca_credentials_share_adapter_block_semantics():
     blocks = _alpaca_credential_blocks(env, indexes)
 
     by_key = {block["key"]: block for block in discovered}
-    by_adapter_key = {f"ACC{index}": block for index, block in zip(indexes, blocks)}
+    # `strict=True` is the point of this test: the two lists must stay
+    # index-aligned, and a block that fails to build would otherwise shift
+    # every later adapter key onto the wrong credentials.
+    by_adapter_key = {
+        f"ACC{index}": block for index, block in zip(indexes, blocks, strict=True)
+    }
 
     assert by_key["ACC1"]["paper"] is False
     assert by_adapter_key["ACC1"]["paper"] is False

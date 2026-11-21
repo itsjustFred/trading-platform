@@ -260,7 +260,7 @@ class TestOrderTypeSizingSemantics:
         return engine, frame
 
     def test_limit_order_is_resized_to_trigger_price_at_fill(self):
-        engine, frame = self._limit_order_engine(limit_price=100.5)
+        engine, _frame = self._limit_order_engine(limit_price=100.5)
         assert engine.closed_trades, "limit order must fill"
         trade = engine.closed_trades[0]
         # C1: explicit risk sizing (1% of 100k = 1000 risk, 2% fallback stop

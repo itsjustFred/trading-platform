@@ -88,7 +88,10 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
     composite = pd.Series(0.0, index=df.index)
-    for lookback, weight in zip(lookbacks, weights):
+    # `strict=True` is a real invariant here: a shorter `weights` than
+    # `lookbacks` used to drop the longest legs silently, which both loses a
+    # signal leg and leaves the composite's weights not summing to one.
+    for lookback, weight in zip(lookbacks, weights, strict=True):
         composite += close.pct_change(lookback).fillna(0) * weight
 
     vol = close.pct_change().rolling(vol_window).std() * np.sqrt(252)
@@ -170,27 +173,27 @@ def generate_signals(df: pd.DataFrame, params: dict):
         exit_times = pd.to_datetime(
             df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
         ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#22c55e",
+                "text": "Entry",
+            }
+            for ts in entry_times.iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#ef4444",
+                "text": "Exit",
+            }
+            for ts in exit_times.iloc[:30]
+        )
 
     return entries, exits, indicators_dict, drawings

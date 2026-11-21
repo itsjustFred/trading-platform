@@ -607,17 +607,17 @@ def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index
     full-bar MAE as if it were a bug in the clamp.
     """
     records = []
-    for index in range(25):
-        records.append(
-            {
-                "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
-                "open": 100.0,
-                "high": 130.0 if index == 10 else 101.0,
-                "low": 70.0 if index == 10 else 99.0,
-                "close": 100.0,
-                "volume": 1000,
-            }
-        )
+    records.extend(
+        {
+            "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
+            "open": 100.0,
+            "high": 130.0 if index == 10 else 101.0,
+            "low": 70.0 if index == 10 else 99.0,
+            "close": 100.0,
+            "volume": 1000,
+        }
+        for index in range(25)
+    )
     data = pd.DataFrame.from_records(records)
 
     def strategy_fn(df: pd.DataFrame, params: dict):

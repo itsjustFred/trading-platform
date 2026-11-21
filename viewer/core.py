@@ -1412,7 +1412,7 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
 
     sampled.append(float(values[-1]))
     if len(sampled) > normalized_limit:
-        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+        sampled = [*sampled[: normalized_limit - 1], float(values[-1])]
     return sampled
 
 
@@ -1898,7 +1898,11 @@ def _signature_default_params(gen_sig_func: ast.FunctionDef) -> dict:
         if val is not None:
             kwargs_params[name] = val
     # also check kwonly args
-    for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults):
+    # `ast` pads `kw_defaults` with `None` for keyword-only arguments that have
+    # no default, so the two lists are the same length for any signature the
+    # parser can produce; `strict=True` makes a parser change visible here
+    # rather than silently mislabelling a default.
+    for arg, default_node in zip(args_obj.kwonlyargs, args_obj.kw_defaults, strict=True):
         if default_node is None:
             continue
         val = _constant_value(default_node)
@@ -2022,6 +2026,7 @@ def _dolthub_pull():
         try:
             subprocess.run(
                 ["dolt", "pull"],
+                check=False,
                 cwd=str(repo_path),
                 capture_output=True,
                 text=True,
@@ -3286,11 +3291,11 @@ def _start_dukascopy_task(
                     base_completed = completed_items + failed_items
 
                     def report_progress(pct: float, message: str) -> None:
-                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
+                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0  # noqa: B023 - progress callback only runs inside this iteration's download
                         _update_task_progress(
                             task_id,
                             percent=overall,
-                            current=f"{item_label}: {message}",
+                            current=f"{item_label}: {message}",  # noqa: B023 - progress callback only runs inside this iteration's download
                             total=total,
                         )
 
@@ -3710,11 +3715,11 @@ def _start_jforex_task(
                     base_completed = completed_items + failed_items
 
                     def report_progress(pct: float, message: str) -> None:
-                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0
+                        overall = ((base_completed + (max(0.0, min(pct, 100.0)) / 100.0)) / total) * 100.0  # noqa: B023 - progress callback only runs inside this iteration's download
                         _update_task_progress(
                             task_id,
                             percent=overall,
-                            current=f"{item_label}: {message}",
+                            current=f"{item_label}: {message}",  # noqa: B023 - progress callback only runs inside this iteration's download
                             total=total,
                         )
 
