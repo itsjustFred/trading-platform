@@ -260,12 +260,15 @@ Tick gesendet (nie 0).
 
 `live_runner/broker_reconciliation.py` vergleicht periodisch die lokale
 Ledger-Wahrheit (`live_executions`-Fills je Deployment) mit dem Broker-Stand je
-Account: Netto-Position je Symbol, erwartete Working Orders und protective
-Stops. Nicht lesbarer Broker-Stand gilt als Mismatch (fail closed), pausiert
-aber erst nach `broker_reconciliation_consecutive_mismatches` aufeinander
-folgenden Fehl-Pässen (Default 2); ein sauberer Pass setzt den Zähler zurück.
-Der Report liegt read-only unter `GET /api/live/reconciliation`. Details und
-offene Maintainer-Entscheidungen: `docs/live-deploy-runbook.md`.
+Account: Netto-Position je Symbol, erwartete Working Orders und - sofern der
+Adapter sie listen kann - protective Stops. Nicht lesbarer Broker-Stand gilt
+als Mismatch (fail closed), stoppt aber erst nach
+`broker_reconciliation_consecutive_mismatches` aufeinander folgenden
+Fehl-Pässen (Default 2) die **Entries** des Deployments (Status bleibt
+ACTIVE, Exits und Trailing laufen weiter); ein sauberer Pass setzt den Zähler
+zurück und hebt den Halt auf. Der Report liegt read-only unter
+`GET /api/live/reconciliation`. Details und offene Maintainer-Entscheidungen:
+`docs/live-deploy-runbook.md`.
 
 ## Implizite Divergenz
 

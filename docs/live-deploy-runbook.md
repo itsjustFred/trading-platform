@@ -186,11 +186,33 @@ snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
 - protective stops with open broker positions when the adapter can list them.
 
 Unreadable broker state is a mismatch (fail closed), but it must not flap: a
-deployment is paused only after `broker_reconciliation_consecutive_mismatches`
-consecutive bad passes (default `2`), and a clean pass resets the streak. The
-pause is the ordinary `PAUSED` status transition, so the existing dispatch
-claim, submission drain and STOPPED enforcement keep their semantics; exits
-remain governed by the same rules as an operator pause.
+deployment's entries are halted only after
+`broker_reconciliation_consecutive_mismatches` consecutive bad passes
+(default `2`), and a clean pass resets the streak *and* releases the halt.
+
+The halt is **entry-only**. It is a persisted flag on the deployment (the
+`broker_reconciliation_entries_halted` settings key), checked by the dispatch
+path immediately before an entry order is submitted - the deployment stays
+`ACTIVE`, so exits, in-flight orders, trailing stops and STOPPED enforcement
+keep their normal semantics. A `PAUSED` status was rejected for this on
+purpose: it would also freeze exits and trailing, exactly when a broker/ledger
+divergence makes them most needed. The halt and its release are written to the
+live control audit trail as `broker_reconciliation_entries_halt` /
+`broker_reconciliation_entries_resume` (actor `broker_reconciliation`).
+
+To release a halt early, set the deployment `PAUSED` and back to `ACTIVE` (the
+resume transition clears the flag); a still-mismatched account is re-halted on
+the next pass, so this cannot hide a live divergence. To make the halt
+permanent, leave the flag - or `PAUSED`/`STOPPED` the deployment.
+
+Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
+count as orders the ledger still expects to be working: both live order paths
+expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
+unfilled row is a cancelled/expired/rejected historical order, not a working
+one. Accounts holding positions or orders placed *outside* the platform
+(manual trades, another tool) will always mismatch - the ledger cannot vouch
+for them; flatten or adopt them at the broker before relying on a clean
+report.
 
 Settings live in deployment `settings` (see `live_deployments.example.yaml`).
 Broker state is account-level, so the strictest values across an account's
@@ -203,22 +225,27 @@ deployments win:
 - `broker_reconciliation_enabled` (default `true`; the account reconciles unless
   every deployment on it opts out)
 
+All four are validated at deployment creation: an unusable value is refused
+instead of being silently defaulted. At runtime an unrecognised boolean still
+fails closed to *enabled* (a typo like `"flase"` cannot disable
+reconciliation).
+
 The latest pass is written to
 `$DATA_DIR/live/broker_reconciliation_report.json` and served read-only at
 `GET /api/live/reconciliation`. Every mismatch logs the structured diff; the
-pause threshold logs at ERROR with `alert=broker_reconciliation_mismatch`.
+halt threshold logs at ERROR with `alert=broker_reconciliation_mismatch`.
 
 ### Open decision
 
 Interval, tolerance and the consecutive-mismatch count are maintainer decisions.
 The shipped defaults are deliberately conservative (5-minute interval, adapter
 precision or the strict 1e-9 quantity tolerance, two consecutive mismatches)
-because a false pause is recoverable while a missed broker/ledger divergence is
-not. Whether account-level mismatches should pause *all* ACTIVE deployments on
-the account (current conservative choice) or only the deployments whose ledger
-rows implicate the symbol is also open; the account-wide pause is kept because
-broker positions and working orders are netted per account and cannot be
-attributed to one deployment safely.
+because a false halt is recoverable while a missed broker/ledger divergence is
+not. Whether account-level mismatches should halt entries on *all* ACTIVE
+deployments on the account (current conservative choice) or only the
+deployments whose ledger rows implicate the symbol is also open; the
+account-wide halt is kept because broker positions and working orders are
+netted per account and cannot be attributed to one deployment safely.
 
 ## Strategy Promotion Gate (#165)
 
