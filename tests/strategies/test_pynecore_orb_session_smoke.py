@@ -22,7 +22,14 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from tests.strategies.pyne_cli import pyne_bin, run_pyne
+try:  # pytest collects this as part of the `tests` package
+    from tests.strategies.pyne_cli import pyne_bin, run_pyne
+except ModuleNotFoundError:  # direct execution: python <this file>
+    # Same reason as in `test_pynecore_orb_interval_guard.py`: the launcher at
+    # the bottom runs this file directly, and only the script's own directory
+    # lands on `sys.path`, so the absolute `tests.` import cannot resolve.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tests.strategies.pyne_cli import pyne_bin, run_pyne
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STRATEGY_PATH = PROJECT_ROOT / "strategies" / "pynecore_orb" / "pynecore_orb.py"

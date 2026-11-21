@@ -13,7 +13,16 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from tests.strategies.pyne_cli import pyne_bin, run_pyne
+try:  # pytest collects this as part of the `tests` package
+    from tests.strategies.pyne_cli import pyne_bin, run_pyne
+except ModuleNotFoundError:  # direct execution: python <this file>
+    # The launcher at the bottom runs this file directly, and a script's own
+    # directory - not the repository root - is what lands on `sys.path`, so the
+    # absolute `tests.` import cannot resolve. Put the root back before
+    # importing, rather than dropping the launcher or making the import
+    # relative (it is collected as a package module under pytest).
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tests.strategies.pyne_cli import pyne_bin, run_pyne
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STRATEGY_PATH = PROJECT_ROOT / "strategies" / "pynecore_orb" / "pynecore_orb.py"
