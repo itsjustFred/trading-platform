@@ -357,6 +357,45 @@ def _install_fake_vectorbt(monkeypatch, tmp_path, run_fn, *, sampler=None) -> li
     return studies
 
 
+def _run_two_window_study(
+    monkeypatch,
+    tmp_path,
+    run_fn,
+    *,
+    risk_adjust_objective: bool = True,
+    fixed_three_way: bool = False,
+):
+    """Run a 2-trial grid over ``window`` in {2, 3} through ``run_fn``.
+
+    Returns ``(payload, trials_by_window)``. With ``fixed_three_way`` the
+    split is pinned to ``_fixed_three_way_split`` so tests can target the
+    validation segment by date.
+    """
+    if fixed_three_way:
+        monkeypatch.setattr(
+            optimizer_module,
+            "_split_backtest_period",
+            lambda *args, **kwargs: _fixed_three_way_split(),
+        )
+    studies = _install_fake_vectorbt(
+        monkeypatch,
+        tmp_path,
+        run_fn,
+        sampler=optuna.samplers.GridSampler({"window": [2, 3]}),
+    )
+    config = OptimizationConfig(
+        base_backtest_id="bt_x",
+        target_metric="total_pnl",
+        n_trials=2,
+        parameter_ranges={"window": {"type": "int", "min": 2, "max": 3, "step": 1}},
+        risk_adjust_objective=risk_adjust_objective,
+    )
+    payload = run_optimization(config, progress_callback=None)
+    (study,) = studies
+    trials = {trial.params.get("window"): trial for trial in study.trials}
+    return payload, trials
+
+
 def test_runtime_config_accepts_zero_risk_sizing(tmp_path: Path):
     result = _base_result(tmp_path)
     result.meta.risk_per_trade_pct = 0.0
@@ -627,24 +666,11 @@ class TestRiskAdjustedObjectiveWiring:
                 _two_point_curve(99_000.0),
             )
 
-        studies = _install_fake_vectorbt(
-            monkeypatch,
-            tmp_path,
-            fake_run_vectorbt,
-            sampler=optuna.samplers.GridSampler({"window": [2, 3]}),
+        payload, trials = _run_two_window_study(
+            monkeypatch, tmp_path, fake_run_vectorbt
         )
-
-        config = OptimizationConfig(
-            base_backtest_id="bt_x",
-            target_metric="total_pnl",
-            n_trials=2,
-            parameter_ranges={"window": {"type": "int", "min": 2, "max": 3, "step": 1}},
-        )
-        payload = run_optimization(config, progress_callback=None)
-
-        (study,) = studies
-        corrupt = next(t for t in study.trials if t.params.get("window") == 2)
-        loser = next(t for t in study.trials if t.params.get("window") == 3)
+        corrupt = trials[2]
+        loser = trials[3]
 
         # Objective path: the corrupt run takes the penalty, not a 0.0 score
         # that would outrank the measured -30 total_pnl loser.
@@ -673,11 +699,6 @@ class TestRiskAdjustedObjectiveWiring:
         and lose to the measured validation loser. Counter-case:
         ``risk_adjust_objective=False`` leaves the same run selectable.
         """
-        monkeypatch.setattr(
-            optimizer_module,
-            "_split_backtest_period",
-            lambda *args, **kwargs: _fixed_three_way_split(),
-        )
 
         def fake_run_vectorbt(config, strategy_path):
             # _fixed_three_way_split windows: train 2024-01..05, validation
@@ -706,24 +727,11 @@ class TestRiskAdjustedObjectiveWiring:
                 _two_point_curve(99_000.0),
             )
 
-        studies = _install_fake_vectorbt(
-            monkeypatch,
-            tmp_path,
-            fake_run_vectorbt,
-            sampler=optuna.samplers.GridSampler({"window": [2, 3]}),
+        payload, trials = _run_two_window_study(
+            monkeypatch, tmp_path, fake_run_vectorbt, fixed_three_way=True
         )
-
-        config = OptimizationConfig(
-            base_backtest_id="bt_x",
-            target_metric="total_pnl",
-            n_trials=2,
-            parameter_ranges={"window": {"type": "int", "min": 2, "max": 3, "step": 1}},
-        )
-        payload = run_optimization(config, progress_callback=None)
-
-        (study,) = studies
-        corrupt = next(t for t in study.trials if t.params.get("window") == 2)
-        loser = next(t for t in study.trials if t.params.get("window") == 3)
+        corrupt = trials[2]
+        loser = trials[3]
 
         # The train side stays clean: the corrupt-on-validation trial was
         # NOT penalized - its train stats are fully measured.
@@ -740,12 +748,18 @@ class TestRiskAdjustedObjectiveWiring:
 
         # Counter-case: with the risk-adjusted objective off, the same
         # validation run is selectable and wins on raw total_pnl.
-        payload_off = run_optimization(
-            config.model_copy(update={"risk_adjust_objective": False}),
-            progress_callback=None,
+        payload_off, trials_off = _run_two_window_study(
+            monkeypatch,
+            tmp_path,
+            fake_run_vectorbt,
+            risk_adjust_objective=False,
+            fixed_three_way=True,
         )
         off_selection = payload_off["three_way"]["selection"]
-        assert off_selection["winner_trial_number"] == corrupt.number
+        off_winner = next(
+            t for t in trials_off.values() if t.number == off_selection["winner_trial_number"]
+        )
+        assert off_winner.params["window"] == 2
 
 
 # ─── embargo is applied to the windows that actually run ────────────────────
