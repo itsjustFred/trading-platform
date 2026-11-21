@@ -1148,6 +1148,7 @@ class TestRiskAdjustedObjective:
                 "undefined_metrics": ["max_drawdown_pct"],
             },
             {"total_trades": 30, "max_drawdown_pct": float("nan")},
+            {"total_trades": 30, "max_drawdown_pct": float("inf")},
         ):
             value, terms = _risk_adjusted_metric_value(
                 100.0,
@@ -1175,9 +1176,10 @@ class TestRiskAdjustedObjective:
         from runner.optimizer import _risk_adjusted_metric_value
 
         # #320: "unmeasurable" is broader than corrupt artifacts - a stats
-        # dict with no max_drawdown_pct key at all (e.g. a run whose equity
-        # curve has fewer than two points, which runner/stats.py declares
-        # undefined) takes the same worst-case haircut.
+        # dict with no max_drawdown_pct key at all takes the same worst-case
+        # haircut. (runner/stats.py itself never omits the key: a run whose
+        # equity curve has fewer than two points publishes the 0.0 placeholder
+        # and names the metric in `undefined_metrics` - covered above.)
         value, terms = _risk_adjusted_metric_value(
             100.0,
             {"total_trades": 30},

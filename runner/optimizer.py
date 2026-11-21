@@ -106,6 +106,27 @@ RAW_MAXIMIZE_METRICS = frozenset(
 )
 
 
+def _resolved_max_drawdown(stats: Mapping[str, Any]) -> float | None:
+    """``max_drawdown_pct`` resolved to a finite fraction, or None.
+
+    ``None`` covers every unmeasurable case the drawdown consumers share:
+    an absent key, an explicit ``None``, a name in ``undefined_metrics``
+    (#250), a value that does not parse as a float, and a non-finite one
+    (#320). Percent-scale values (> 1.0) still resolve - the scale guard in
+    ``_risk_adjusted_metric_value`` fails loud on them instead of letting
+    the penalty path absorb them.
+    """
+    resolved = stats if isinstance(stats, dict) else dict(stats)
+    raw = resolve_defined_stat(resolved, "max_drawdown_pct", None)
+    if raw is None:
+        return None
+    try:
+        value = abs(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _risk_adjusted_metric_value(
     value: float,
     stats: dict[str, Any],
@@ -148,13 +169,7 @@ def _risk_adjusted_metric_value(
         trade_count = int(stats.get("total_trades", 0) or 0)
     except (TypeError, ValueError):
         trade_count = 0
-    max_dd_raw = resolve_defined_stat(stats, "max_drawdown_pct", None)
-    try:
-        max_dd = None if max_dd_raw is None else abs(float(max_dd_raw))
-    except (TypeError, ValueError):
-        max_dd = None
-    if max_dd is not None and not math.isfinite(max_dd):
-        max_dd = None
+    max_dd = _resolved_max_drawdown(stats)
     # Pre-mortem T3: stats publish drawdown as a FRACTION (e.g. 0.05, not
     # 5.0). Percent-scale input would silently zero every trial via the
     # min(max_dd, 1.0) clamp — fail loud instead.
@@ -185,14 +200,7 @@ def _drawdown_unmeasurable(stats: Mapping[str, Any]) -> bool:
     measurable here so the scale guard in ``_risk_adjusted_metric_value``
     still fails loud instead of being absorbed into the penalty path.
     """
-    resolved = stats if isinstance(stats, dict) else dict(stats)
-    raw = resolve_defined_stat(resolved, "max_drawdown_pct", None)
-    if raw is None:
-        return True
-    try:
-        return not math.isfinite(float(raw))
-    except (TypeError, ValueError):
-        return True
+    return _resolved_max_drawdown(stats) is None
 
 
 #: Marker value recorded on no-trade trials. Purely informational (the trial

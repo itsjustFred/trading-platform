@@ -273,6 +273,90 @@ def _base_result(tmp_path: Path):
     return BacktestResult(meta=meta, trades=[])
 
 
+def _pnl_trade(trade_id: int, pnl: float):
+    """One closed LONG trade whose realized pnl is ``pnl``."""
+    from shared.models import Trade, TradeExit
+
+    return Trade(
+        id=trade_id,
+        symbol="GOLD1",
+        direction="LONG",
+        entry_time="2024-02-01T00:00:00+00:00",
+        entry_price=100.0,
+        quantity=1.0,
+        exits=[
+            TradeExit(
+                time="2024-02-02T00:00:00+00:00",
+                price=100.0 + pnl,
+                quantity=1.0,
+                pnl=pnl,
+            )
+        ],
+        pnl=pnl,
+    )
+
+
+def _two_point_curve(end_equity: float):
+    """A readable two-point equity curve, so drawdown stays measurable."""
+    from shared.models import EquityPoint
+
+    return [
+        EquityPoint(time="2024-02-01T00:00:00+00:00", equity=100_000.0),
+        EquityPoint(time="2024-02-02T00:00:00+00:00", equity=end_equity),
+    ]
+
+
+def _vectorbt_result(config, trades, equity_curve):
+    """A vectorbt ``BacktestResult`` for one trial/period run."""
+    from shared.models import BacktestMeta, BacktestResult
+
+    meta = BacktestMeta(
+        id="trial",
+        created_at="2024-01-01T00:00:00+00:00",
+        engine="vectorbt",
+        strategies=["s"],
+        backtest_start=config.start_date,
+        backtest_end=config.end_date,
+        initial_capital=config.initial_capital,
+    )
+    return BacktestResult(meta=meta, trades=trades, equity_curve=equity_curve)
+
+
+def _install_fake_vectorbt(monkeypatch, tmp_path, run_fn, *, sampler=None) -> list:
+    """Route ``run_optimization`` through ``run_fn``; returns created studies.
+
+    Patches the engine, the base-backtest loader, the strategy reference and
+    the coverage/data guards, and spies on ``optuna.create_study`` so tests
+    can inspect the finished trials. ``sampler`` (e.g. a GridSampler over the
+    trial parameters) is injected into the study when given.
+    """
+    studies: list = []
+    real_create_study = optimizer_module.optuna.create_study
+
+    def spy_create_study(**kwargs):
+        if sampler is not None:
+            kwargs["sampler"] = sampler
+        study = real_create_study(**kwargs)
+        studies.append(study)
+        return study
+
+    monkeypatch.setattr(optimizer_module.optuna, "create_study", spy_create_study)
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", run_fn)
+    monkeypatch.setattr(
+        optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path)
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_resolve_strategy_reference",
+        lambda r: ("s", Path("mock_strategy.py"), "s"),
+    )
+    monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
+    monkeypatch.setattr(
+        optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True
+    )
+    return studies
+
+
 def test_runtime_config_accepts_zero_risk_sizing(tmp_path: Path):
     result = _base_result(tmp_path)
     result.meta.risk_per_trade_pct = 0.0
@@ -489,77 +573,17 @@ class TestRiskAdjustedObjectiveWiring:
     """C3: the objective return carries the haircut, not the raw metric."""
 
     def test_sparse_trial_returns_adjusted_value(self, monkeypatch, tmp_path):
-        from shared.models import (
-            BacktestMeta,
-            BacktestResult,
-            EquityPoint,
-            Trade,
-            TradeExit,
-        )
-
-        def _trade(i: int) -> Trade:
-            return Trade(
-                id=i,
-                symbol="GOLD1",
-                direction="LONG",
-                entry_time="2024-02-01T00:00:00+00:00",
-                entry_price=100.0,
-                quantity=1.0,
-                exits=[
-                    TradeExit(
-                        time="2024-02-02T00:00:00+00:00",
-                        price=200.0,
-                        quantity=1.0,
-                        pnl=100.0,
-                    )
-                ],
-                pnl=100.0,
-            )
-
         def fake_run_vectorbt(config, strategy_path):
-            meta = BacktestMeta(
-                id="trial",
-                created_at="2024-01-01T00:00:00+00:00",
-                engine="vectorbt",
-                strategies=["s"],
-                backtest_start=config.start_date,
-                backtest_end=config.end_date,
-                initial_capital=config.initial_capital,
-            )
-            return BacktestResult(
-                meta=meta,
-                trades=[_trade(1), _trade(2), _trade(3)],
+            return _vectorbt_result(
+                config,
+                [_pnl_trade(i, 100.0) for i in (1, 2, 3)],
                 # A flat curve keeps max_drawdown_pct measurable (0.0) so the
                 # sparsity haircut is the only factor under test (#286: an
                 # absent curve leaves drawdown undefined and scores 0).
-                equity_curve=[
-                    EquityPoint(time="2024-02-01T00:00:00+00:00", equity=100_000.0),
-                    EquityPoint(time="2024-02-02T00:00:00+00:00", equity=100_000.0),
-                ],
+                _two_point_curve(100_000.0),
             )
 
-        studies: list = []
-        real_create_study = optimizer_module.optuna.create_study
-
-        def spy_create_study(**kwargs):
-            study = real_create_study(**kwargs)
-            studies.append(study)
-            return study
-
-        monkeypatch.setattr(optimizer_module.optuna, "create_study", spy_create_study)
-        monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_vectorbt)
-        monkeypatch.setattr(
-            optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path)
-        )
-        monkeypatch.setattr(
-            optimizer_module,
-            "_resolve_strategy_reference",
-            lambda r: ("s", Path("mock_strategy.py"), "s"),
-        )
-        monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
-        monkeypatch.setattr(
-            optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True
-        )
+        studies = _install_fake_vectorbt(monkeypatch, tmp_path, fake_run_vectorbt)
 
         config = OptimizationConfig(
             base_backtest_id="bt_x",
@@ -585,85 +609,29 @@ class TestRiskAdjustedObjectiveWiring:
         ranking and the validation selection. It must take the same penalty
         path as an undefined objective (#132).
         """
-        from shared.models import (
-            BacktestMeta,
-            BacktestResult,
-            EquityPoint,
-            Trade,
-            TradeExit,
-        )
-
-        def _trade(i: int, pnl: float) -> Trade:
-            return Trade(
-                id=i,
-                symbol="GOLD1",
-                direction="LONG",
-                entry_time="2024-02-01T00:00:00+00:00",
-                entry_price=100.0,
-                quantity=1.0,
-                exits=[
-                    TradeExit(
-                        time="2024-02-02T00:00:00+00:00",
-                        price=100.0 + pnl,
-                        quantity=1.0,
-                        pnl=pnl,
-                    )
-                ],
-                pnl=pnl,
-            )
 
         def fake_run_vectorbt(config, strategy_path):
-            meta = BacktestMeta(
-                id="trial",
-                created_at="2024-01-01T00:00:00+00:00",
-                engine="vectorbt",
-                strategies=["s"],
-                backtest_start=config.start_date,
-                backtest_end=config.end_date,
-                initial_capital=config.initial_capital,
-            )
             if config.parameters.get("window") == 2:
                 # Corrupt artifact: trades exist and total_pnl is positive,
                 # but there is no equity curve, so max_drawdown_pct is
                 # undefined while the target metric stays measurable.
-                return BacktestResult(
-                    meta=meta,
-                    trades=[_trade(1, 100.0), _trade(2, 100.0), _trade(3, 100.0)],
-                    equity_curve=[],
+                return _vectorbt_result(
+                    config,
+                    [_pnl_trade(i, 100.0) for i in (1, 2, 3)],
+                    [],
                 )
             # Measured loser: negative pnl on a readable two-point curve.
-            return BacktestResult(
-                meta=meta,
-                trades=[_trade(1, -10.0), _trade(2, -10.0), _trade(3, -10.0)],
-                equity_curve=[
-                    EquityPoint(time="2024-02-01T00:00:00+00:00", equity=100_000.0),
-                    EquityPoint(time="2024-02-02T00:00:00+00:00", equity=99_000.0),
-                ],
+            return _vectorbt_result(
+                config,
+                [_pnl_trade(i, -10.0) for i in (1, 2, 3)],
+                _two_point_curve(99_000.0),
             )
 
-        studies: list = []
-        real_create_study = optimizer_module.optuna.create_study
-
-        def spy_create_study(**kwargs):
-            study = real_create_study(
-                sampler=optuna.samplers.GridSampler({"window": [2, 3]}), **kwargs
-            )
-            studies.append(study)
-            return study
-
-        monkeypatch.setattr(optimizer_module.optuna, "create_study", spy_create_study)
-        monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_vectorbt)
-        monkeypatch.setattr(
-            optimizer_module, "_load_base_backtest", lambda _id: _base_result(tmp_path)
-        )
-        monkeypatch.setattr(
-            optimizer_module,
-            "_resolve_strategy_reference",
-            lambda r: ("s", Path("mock_strategy.py"), "s"),
-        )
-        monkeypatch.setattr(optimizer_module, "ensure_backtest_data", lambda **kwargs: None)
-        monkeypatch.setattr(
-            optimizer_module, "has_sufficient_segment_coverage", lambda **kwargs: True
+        studies = _install_fake_vectorbt(
+            monkeypatch,
+            tmp_path,
+            fake_run_vectorbt,
+            sampler=optuna.samplers.GridSampler({"window": [2, 3]}),
         )
 
         config = OptimizationConfig(
@@ -692,6 +660,92 @@ class TestRiskAdjustedObjectiveWiring:
         }
         assert corrupt.number in unselectable
         assert "penalty" in unselectable[corrupt.number]
+
+    def test_unmeasurable_validation_drawdown_is_unselectable(
+        self, monkeypatch, tmp_path
+    ):
+        """#320: pin the validation-side guard on its own.
+
+        Both trials measure drawdown on train; only ``window == 2`` loses
+        its equity curve on validation, so ``max_drawdown_pct`` is undefined
+        out of sample while ``total_pnl`` stays measurable. The trial must
+        be unselectable with ``"validation: max_drawdown_pct undefined"``
+        and lose to the measured validation loser. Counter-case:
+        ``risk_adjust_objective=False`` leaves the same run selectable.
+        """
+        monkeypatch.setattr(
+            optimizer_module,
+            "_split_backtest_period",
+            lambda *args, **kwargs: _fixed_three_way_split(),
+        )
+
+        def fake_run_vectorbt(config, strategy_path):
+            # _fixed_three_way_split windows: train 2024-01..05, validation
+            # 2024-06..09, test 2024-10..12.
+            on_validation = str(config.start_date).startswith("2024-06")
+            if config.parameters.get("window") == 2:
+                if on_validation:
+                    # Measured on train, corrupt on validation: trades and
+                    # a positive total_pnl, but no equity curve, so
+                    # max_drawdown_pct is undefined while the target metric
+                    # stays measurable.
+                    return _vectorbt_result(
+                        config,
+                        [_pnl_trade(i, 100.0) for i in (1, 2, 3)],
+                        [],
+                    )
+                return _vectorbt_result(
+                    config,
+                    [_pnl_trade(i, 100.0) for i in (1, 2, 3)],
+                    _two_point_curve(100_000.0),
+                )
+            # window == 3: the measured loser on every segment.
+            return _vectorbt_result(
+                config,
+                [_pnl_trade(i, -10.0) for i in (1, 2, 3)],
+                _two_point_curve(99_000.0),
+            )
+
+        studies = _install_fake_vectorbt(
+            monkeypatch,
+            tmp_path,
+            fake_run_vectorbt,
+            sampler=optuna.samplers.GridSampler({"window": [2, 3]}),
+        )
+
+        config = OptimizationConfig(
+            base_backtest_id="bt_x",
+            target_metric="total_pnl",
+            n_trials=2,
+            parameter_ranges={"window": {"type": "int", "min": 2, "max": 3, "step": 1}},
+        )
+        payload = run_optimization(config, progress_callback=None)
+
+        (study,) = studies
+        corrupt = next(t for t in study.trials if t.params.get("window") == 2)
+        loser = next(t for t in study.trials if t.params.get("window") == 3)
+
+        # The train side stays clean: the corrupt-on-validation trial was
+        # NOT penalized - its train stats are fully measured.
+        assert not corrupt.user_attrs.get("penalty_applied")
+
+        selection = payload["three_way"]["selection"]
+        assert selection["winner_trial_number"] == loser.number
+        unselectable = {
+            row["trial_number"]: row["reason"] for row in selection["unselectable_trials"]
+        }
+        assert (
+            unselectable[corrupt.number] == "validation: max_drawdown_pct undefined"
+        )
+
+        # Counter-case: with the risk-adjusted objective off, the same
+        # validation run is selectable and wins on raw total_pnl.
+        payload_off = run_optimization(
+            config.model_copy(update={"risk_adjust_objective": False}),
+            progress_callback=None,
+        )
+        off_selection = payload_off["three_way"]["selection"]
+        assert off_selection["winner_trial_number"] == corrupt.number
 
 
 # ─── embargo is applied to the windows that actually run ────────────────────
