@@ -2264,7 +2264,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         when a stop still works at the broker or the position is already flat.
         Re-submitting next to a working stop would leave two stops on one
         position, and the second becomes an orphan the moment the first fills -
-        an orphaned sell-stop opens a short.
+        an orphaned sell-stop opens a short. The same rule covers a working book
+        nobody could re-read: it cannot show that no stop works, so the restore is
+        refused rather than guessed, and the position is unprotected until the
+        next enforcement retry.
 
         The stop is sized and sided from the position as the broker reports it
         *now*, not from the snapshot the flatten started from: the leg that was
@@ -2295,15 +2298,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return False
         try:
             working = await self._list_working_book(client, symbols={symbol})
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "Could not re-read orders before restoring a stop; restoring anyway",
+        except Exception as exc:
+            # Not restoring is the bounded failure. The re-read is what proves no stop
+            # still works, and a book nobody could read proves nothing - the held-leg
+            # lookup inside it is paged, so it is also the part that can fail. Restoring
+            # anyway would place a second stop beside whatever the broker kept: two
+            # stops reduce a position twice, and the extra one is an orphan the moment
+            # the first fills. The position is then unprotected until the next
+            # enforcement retry, which is the same state every other refusal below
+            # reports - and the sweep takes no unbounded risk.
+            logger.critical(
+                "Not restoring a stop: the working book could not be re-read, so it "
+                "cannot be shown that no stop still works",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
             )
-            working = None
-        if working is not None and self._has_working_stop(
-            working, symbol, live.stop_side
-        ):
+            return False
+        if self._has_working_stop(working, symbol, live.stop_side):
             logger.warning(
                 "Not restoring a stop: one still works at the broker",
                 extra={"data": {"symbol": symbol}},

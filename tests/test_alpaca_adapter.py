@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -606,6 +607,29 @@ def test_a_reducing_side_stop_is_not_duplicated() -> None:
     assert client.submitted == []
 
 
+def test_an_unreadable_working_book_does_not_restore_a_stop() -> None:
+    """A stop is not re-placed next to one the broker may still be holding.
+
+    The re-read before a restore is what proves no stop still works, and the
+    paged held-leg lookup that makes it complete is also what can fail. "Restoring
+    anyway" then places a second stop beside whatever the broker kept: two stops
+    reduce the position twice, and the extra one is an orphan the moment the
+    first fills - an orphaned sell-stop opens a short. A position left
+    unprotected until the next enforcement retry is the bounded outcome; a
+    duplicate stop is not bounded at all.
+    """
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
+    adapter = _adapter(client)
+
+    async def _list_working_book(client: Any, *, symbols: set[str] | None) -> list[Any]:
+        raise RuntimeError("429: rate limit reached")
+
+    adapter._list_working_book = _list_working_book  # type: ignore[method-assign]
+
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 190.0)) is False
+    assert client.submitted == []
+
+
 def test_refused_close_without_a_restorable_stop_is_reported_as_naked() -> None:
     client = _FakeTradingClient(
         orders=[
@@ -1133,8 +1157,8 @@ def test_a_refused_cancel_is_settled_by_id_without_a_fresh_book() -> None:
     on a mature account a sweep with two refusals would issue two 20-page nested
     listings, and a rate limit there fails the sweep closed. The refusal is settled
     by id instead - where this leg still reads as ``held``, so the refusal stands -
-    and the flatten's failure report, the untouched close and the stop restore are
-    all still there.
+    and the flatten's failure report, the untouched close and the restore it refuses
+    are all still there.
     """
     client = _BracketPositionClient(
         positions=[_FakePosition("AAPL", 10.0)], oco_siblings=False
@@ -1163,16 +1187,18 @@ def test_a_refused_cancel_is_settled_by_id_without_a_fresh_book() -> None:
     outcome = asyncio.run(_adapter(client).close_all_positions())
 
     assert outcome.complete is False
-    assert outcome.failed == ("AAPL:cancel:sl-leg:cancel rejected",)
+    # The restore was refused on a book nobody could read, and the reason says so: a
+    # stop placed beside an order nobody could list reduces the position twice, and
+    # the extra one is an orphan the moment the first fills.
+    assert outcome.failed == ("AAPL:cancel:sl-leg:cancel rejected;NO-STOP-RESTORED",)
     assert client.close_calls == []
     # Two ``status=all`` listings: the flatten's own book and the restore's re-read.
     # The refusal cost none of its own - a test that only checked the outcome would
     # also pass if the excusal verified nothing at all.
     assert reads["all"] == 2
-    # The restore went ahead on a book it could not read: the position is live, and a
-    # stop placed beside an order nobody could list beats a naked position.
+    # Nothing was submitted: no second stop next to one the broker may still hold.
     restored = [order for order in client.orders if order.order_type == "stop"]
-    assert [(order.stop_price, order.qty) for order in restored] == [(95.0, 10.0)]
+    assert [(order.stop_price, order.qty) for order in restored] == []
 
 
 def test_a_refused_cancel_is_not_excused_by_a_broker_that_cannot_find_the_order() -> None:
