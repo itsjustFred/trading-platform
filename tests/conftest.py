@@ -400,6 +400,65 @@ def _accounts_env_readers() -> list[str]:
     return offenders
 
 
+# Violations an xdist worker recorded and handed to the controller through ``workeroutput``.
+# A worker's own ``session.exitstatus`` is ignored by xdist, so without this handoff a swallowed
+# violation on a worker would fail nothing.
+_WORKER_VIOLATIONS: list[str] = []
+
+
+def _hermeticity_failure_messages(session: pytest.Session) -> list[str]:
+    """Every sandbox escape this process recorded, as session-failure messages."""
+    failures: list[str] = []
+
+    # The directory check runs in the controller only - an xdist worker would snapshot a tree its
+    # siblings are still writing. The other guards run in every process, because a worker is a
+    # separate process in which the tests really ran.
+    if not hasattr(session.config, "workerinput"):
+        changes = _watched_repo_dirs_changed()
+        if changes:
+            shown = "\n  ".join(changes[:25])
+            more = f"\n  ... and {len(changes) - 25} more" if len(changes) > 25 else ""
+            failures.append(
+                "\n\nERROR: the repo directories the suite must leave alone changed during the test"
+                f" session:\n  {shown}{more}"
+                "\nTests must write under tmp_path / the session DATA_DIR / LOG_DIR only. This"
+                " check cannot tell which process made the change: if a running viewer or daemon"
+                " in this checkout wrote it, stop that process or run the suite from a separate"
+                " checkout."
+            )
+
+    secret_opens = repo_secret_opens()
+    if secret_opens:
+        shown = "\n  ".join(dict.fromkeys(secret_opens))
+        failures.append(
+            "\n\nERROR: the test session tried to open the checkout's real credential"
+            f" file(s):\n  {shown}"
+            "\nconftest points every DEFAULT_ACCOUNTS_ENV at the session sandbox and redirects"
+            " the .env load. Something named the file directly: a test that needs credentials must"
+            " write its own under tmp_path. Each attempt also raised SuiteHermeticityViolation,"
+            " which broad exception handlers can swallow."
+        )
+
+    readers = _accounts_env_readers()
+    if readers:
+        shown = "\n  ".join(dict.fromkeys(readers))
+        failures.append(
+            f"\n\nERROR: these modules still resolve the real {REPO_ACCOUNTS_ENV}:\n  {shown}"
+            "\nAdd them to ACCOUNTS_ENV_MODULES in tests/conftest.py, or stop building the path."
+        )
+
+    network = network_violations()
+    if network:
+        shown = "\n  ".join(dict.fromkeys(network))
+        failures.append(
+            f"\n\nERROR: the test session attempted to reach the network:\n  {shown}"
+            "\nTests must run against a fixture, a stub transport or localhost. The offending call"
+            " also raised SuiteHermeticityViolation, which broad exception handlers can swallow."
+        )
+
+    return failures
+
+
 def pytest_sessionfinish(session: pytest.Session) -> None:
     """Fail the run loudly when the suite escaped its sandbox.
 
@@ -407,63 +466,43 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
 
     * a watched repo directory (``data/``, then ``logs/``) changed;
     * the checkout's real ``.accounts.env`` or ``.env`` was opened;
-    * a module still resolves an ``*ACCOUNTS_ENV*`` attribute to the real ``.accounts.env``.
+    * a module still resolves an ``*ACCOUNTS_ENV*`` attribute to the real ``.accounts.env``;
+    * a non-localhost socket operation was attempted (see ``_audit_hook``).
 
     Limits, by design: the window is ``pytest_configure`` to here, so writes after the session
     (atexit handlers, threads still running after the last test) are not seen. The directory check
     cannot attribute a change to the suite: any process writing ``data/`` during the run (e.g. a
     live viewer or daemon in the same checkout) fails it too. The remedy is to stop that process or
-    run the suite elsewhere.
+    run the suite elsewhere. Python subprocesses a test starts inherit the environment but not the
+    audit hook, the ``load_dotenv`` redirect or the patched module constants, so a child that
+    imports ``shared.constants`` loads the checkout's real ``.env`` again; tests that spawn
+    children must pass them a sandboxed environment explicitly.
 
-    The directory check runs in the controller only - an xdist worker would snapshot a tree its
-    siblings are still writing. The other three run in every process, because a worker is a
-    separate process in which the tests really ran.
+    Under xdist the picture splits: the directory check runs in the controller only (a worker
+    would snapshot a tree its siblings are still writing), while the other guards run in every
+    process because a worker is where the tests really ran. A worker's ``exitstatus`` is ignored
+    by the controller, so the worker hands its findings to the controller through
+    ``config.workeroutput`` and :func:`pytest_testnodedown` collects them there.
     """
-    if not hasattr(session.config, "workerinput"):
-        changes = _watched_repo_dirs_changed()
-        if changes:
-            shown = "\n  ".join(changes[:25])
-            more = f"\n  ... and {len(changes) - 25} more" if len(changes) > 25 else ""
-            _fail_session(
-                session,
-                "\n\nERROR: the repo directories the suite must leave alone changed during the test"
-                f" session:\n  {shown}{more}"
-            "\nTests must write under tmp_path / the session DATA_DIR / LOG_DIR only. This check"
-            " cannot tell which process made the change: if a running viewer or daemon in this"
-            " checkout wrote it, stop that process or run the suite from a separate checkout.",
-        )
+    failures = _hermeticity_failure_messages(session)
+    if hasattr(session.config, "workerinput"):
+        workeroutput = getattr(session.config, "workeroutput", None)
+        if isinstance(workeroutput, dict):
+            workeroutput["tp_violations"] = failures
+        for message in failures:
+            print(message, file=sys.stderr)
+        return
+    for message in dict.fromkeys((*failures, *_WORKER_VIOLATIONS)):
+        _fail_session(session, message)
 
-    secret_opens = repo_secret_opens()
-    if secret_opens:
-        shown = "\n  ".join(dict.fromkeys(secret_opens))
-        _fail_session(
-            session,
-            "\n\nERROR: the test session tried to open the checkout's real credential"
-            f" file(s):\n  {shown}"
-            "\nconftest points every DEFAULT_ACCOUNTS_ENV at the session sandbox and redirects"
-            " the .env load. Something named the file directly: a test that needs credentials must"
-            " write its own under tmp_path. Each attempt also raised SuiteHermeticityViolation,"
-            " which broad exception handlers can swallow.",
-        )
 
-    readers = _accounts_env_readers()
-    if readers:
-        shown = "\n  ".join(dict.fromkeys(readers))
-        _fail_session(
-            session,
-            f"\n\nERROR: these modules still resolve the real {REPO_ACCOUNTS_ENV}:\n  {shown}"
-            "\nAdd them to ACCOUNTS_ENV_MODULES in tests/conftest.py, or stop building the path.",
-        )
-
-    network = network_violations()
-    if network:
-        shown = "\n  ".join(dict.fromkeys(network))
-        _fail_session(
-            session,
-            f"\n\nERROR: the test session attempted to reach the network:\n  {shown}"
-            "\nTests must run against a fixture, a stub transport or localhost. The offending call"
-            " also raised SuiteHermeticityViolation, which broad exception handlers can swallow.",
-        )
+def pytest_testnodedown(node: object, error: object) -> None:
+    """Collect the hermeticity violations an xdist worker could not fail the session with."""
+    workeroutput = getattr(node, "workeroutput", None)
+    if isinstance(workeroutput, dict):
+        reported = workeroutput.get("tp_violations")
+        if isinstance(reported, list):
+            _WORKER_VIOLATIONS.extend(str(item) for item in reported)
 
 
 def _requested_browser_name(item: pytest.Item) -> str:

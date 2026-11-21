@@ -139,15 +139,19 @@ def test_sessionfinish_fails_the_run_when_a_watched_repo_dir_changed(
     assert "cannot tell which" in err
 
 
-def test_the_directory_guard_is_not_run_by_an_xdist_worker(tmp_path: Path) -> None:
+def test_the_directory_guard_is_not_run_by_an_xdist_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A worker would snapshot a tree its siblings are still writing into.
 
-    The other three guards do run in workers: a worker is a separate process in which the tests
-    really ran, so a violation recorded there must still fail the run.
+    The other guards do run in workers: a worker is a separate process in which the tests
+    really ran, so a violation recorded there must still fail the run - through ``workeroutput``,
+    because xdist ignores a worker's ``session.exitstatus``.
     """
 
     class _WorkerConfig:
         workerinput = {"id": "gw0"}
+        workeroutput: dict[str, object] = {}
 
     class _WorkerSession:
         config = _WorkerConfig()
@@ -158,12 +162,35 @@ def test_the_directory_guard_is_not_run_by_an_xdist_worker(tmp_path: Path) -> No
     (watched / "written-during-the-session.txt").write_text("x", encoding="utf-8")
     original = suite_conftest._REPO_TREES_BEFORE
     suite_conftest._REPO_TREES_BEFORE = {str(watched): {}}
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", ["connect 'api.alpaca.markets'"])
     try:
         session = _WorkerSession()
         suite_conftest.pytest_sessionfinish(session)
     finally:
         suite_conftest._REPO_TREES_BEFORE = original
+    # The directory change is not the worker's business...
     assert session.exitstatus == pytest.ExitCode.OK
+    # ...but the network violation is reported to the controller, not dropped.
+    reported = session.config.workeroutput["tp_violations"]
+    assert any("attempted to reach the network" in message for message in reported)
+
+
+def test_an_xdist_workers_violations_reach_the_controller_sessionfinish(
+    monkeypatch, capsys
+) -> None:
+    """``pytest_testnodedown`` is the only path a worker's findings have to the controller."""
+    monkeypatch.setattr(suite_conftest, "_WORKER_VIOLATIONS", [])
+    node = types.SimpleNamespace(
+        workeroutput={
+            "tp_violations": ["\n\nERROR: the test session attempted to reach the network"]
+        }
+    )
+    suite_conftest.pytest_testnodedown(node, None)
+
+    session = _Session()
+    suite_conftest.pytest_sessionfinish(session)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert "attempted to reach the network" in capsys.readouterr().err
 
 
 def test_snapshot_diff_reports_created_modified_and_deleted(tmp_path: Path) -> None:
@@ -902,6 +929,34 @@ def test_real_pytest_process_exits_nonzero_when_a_test_reads_a_repo_secret_file(
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
     assert "tried to open the checkout's real credential file" in result.stderr
     assert secret in result.stderr
+
+
+@pytest.mark.parametrize("secret", [".accounts.env", ".env"])
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_nonzero_when_a_test_swallows_the_secret_guard(
+    tmp_path: Path, secret: str, extra_args: tuple[str, ...]
+) -> None:
+    """The audit hook raises inside ``open``, but a broad ``except`` in the code under test
+    swallows it - which is why the session-end backstop exists. It must still fail the run in
+    one process, and across xdist workers, where only ``workeroutput`` carries the worker's
+    findings to the controller (a worker's own ``exitstatus`` is ignored)."""
+    leak = (
+        "from pathlib import Path\n"
+        "def test_swallows_the_guard():\n"
+        "    try:\n"
+        f"        (Path(__file__).resolve().parents[1] / {secret!r}).read_text(encoding='utf-8')\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
+    result = _run_throwaway_suite(
+        tmp_path,
+        leak,
+        extra_args,
+        seed_files={secret: "ALPACA_API_KEY=fake\n"},
+    )
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
+    assert "tried to open the checkout's real credential file" in result.stderr
 
 
 @pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
