@@ -466,6 +466,13 @@ def _run_reporter(job_name, step_name, tmp_path, pages, env_override=None):
     stub.chmod(0o755)
     pagedir = tmp_path / "pages"
     pagedir.mkdir(exist_ok=True)
+    # Every case runs only its own pages. A two-page case leaves `page-2.json` behind, and the
+    # stub's `--paginate` branch then serves it to the one-page cases that follow in the same
+    # test: the near-miss run id, which is meant to be the newest status of that case, was
+    # decided by a stale page nobody wrote for it - so the case passed for the wrong reason and a
+    # prefix-match regression would not have failed it.
+    for stale in sorted(pagedir.glob("page-*.json")):
+        stale.unlink()
     for index, page in enumerate(pages, start=1):
         (pagedir / f"page-{index}.json").write_text(page, encoding="utf-8")
     log = tmp_path / "calls.log"
@@ -497,6 +504,7 @@ T1 = "2026-11-20T10:00:00Z"
 T2 = "2026-11-20T11:00:00Z"
 
 
+@needs_bash
 def test_the_pending_mark_is_converted_only_when_this_run_wrote_it(tmp_path) -> None:
     """The four stop-path reporters exist to keep the stage from stranding `pending`, and each one
     is the workflow's own shell run against a stub `gh` - a string assertion on `--arg ctx` pinned
@@ -535,6 +543,36 @@ def test_the_pending_mark_is_converted_only_when_this_run_wrote_it(tmp_path) -> 
             assert token in description.group(1), f"{label}: the error status does not name {token}"
 
 
+@needs_bash
+def test_a_reporter_case_is_not_decided_by_a_previous_cases_pages(tmp_path) -> None:
+    """The stub serves the status list from `page-N.json` files, and the four reporters are run
+    several times per test against the same `tmp_path`. A two-page case leaves `page-2.json`
+    behind, and the stub's paginating branch then serves it to every one-page case that follows:
+    those cases decide "another run's mark is the newest" against a page nobody wrote for them,
+    so the run they are testing leaves its own pending mark stranded. Pinned here by running a
+    two-page case and then a one-page case that must be decided on its own page alone - this run's
+    own pending mark, which the stale page would otherwise have covered."""
+    job_name, step_name = REPORTERS[0]
+    _run_reporter(
+        job_name,
+        step_name,
+        tmp_path,
+        [
+            _status_page([(CONTEXT, "pending", OWN, T1)]),
+            _status_page([(CONTEXT, "pending", OTHER, T2)]),
+        ],
+    )
+    result, calls = _run_reporter(
+        job_name, step_name, tmp_path, [_status_page([(CONTEXT, "pending", OWN, T1)])]
+    )
+    assert result.returncode == 0, f"{job_name}/{step_name}: reporter failed: {result.stderr}"
+    assert "state=error" in calls, (
+        "a one-page case was decided by a previous case's pages: this run's own pending mark was"
+        " left stranded"
+    )
+
+
+@needs_bash
 def test_no_reporter_touches_a_mark_another_run_wrote(tmp_path) -> None:
     """The other half of the ownership check, on the same executed bodies: a newest mark that is
     another run's - by run id, or because it is already terminal - is not converted, and the
@@ -1678,6 +1716,7 @@ def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
         )
 
 
+@needs_bash
 def test_a_truncated_report_is_diagnosable_from_the_run_log(tmp_path) -> None:
     """The posted report is the tail of the agent's stream, anchored on the last `**Summary:**`
     line anywhere in that stream - the extraction all three agent workflows share, and one that a
@@ -1817,9 +1856,11 @@ def test_the_duplicated_comment_guards_stay_in_sync_across_the_copies() -> None:
     applied agent-id first so "pr-review" cannot be eaten by the shorter "review". A guard that
     only one copy needs is not here: the pre-mortem's stricter verdict prelude (it tolerates the
     sign-off note the skill requires) and its head-moved comment guard are pinned separately. The
-    two-level skill selection is not one of those exclusions - it is compared by
-    `test_the_skill_selection_stays_identical_across_the_copies`, which is where a copy that is
-    not strict has to fail.
+    two-level skill selection is not one of those exclusions either: it is strict in this
+    workflow and pinned by `test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels`
+    and `test_the_base_commit_guard_must_not_be_a_comment_line`, and the two siblings' copy of it
+    is pinned by the PR that owns their hunks (`test_agent_sibling_hardening.py`), which is where
+    a sibling copy that is not strict has to fail. This PR touches neither sibling file.
     """
     substitutions = {
         REVIEW: (("pr-review", "<agent>"), ("review", "<stage>")),
@@ -1908,7 +1949,7 @@ def _premortem_verdict(output: str, tmp_path) -> str:
     return result.stdout
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+@needs_bash
 @pytest.mark.parametrize(
     ("output", "expected"),
     [
