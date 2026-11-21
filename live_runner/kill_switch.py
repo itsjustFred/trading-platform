@@ -53,6 +53,13 @@ logger = get_logger("live-runner")
 #: deployment-sync loop runs every 10 s, so this is roughly every third tick.
 KILL_SWITCH_SWEEP_INTERVAL_SECONDS = 30.0
 
+#: A broker-side ``pending_cancel`` order normally settles within seconds. A
+#: halted account stays unmet while one is listed (it could still fill); after
+#: this many consecutive sweep passes the WARNING becomes an ERROR so a stuck
+#: cancel reaches an operator - the same rule STOPPED enforcement applies to
+#: ``_PENDING_CANCEL_PASSES`` in the daemon, which imports this constant.
+PENDING_CANCEL_ESCALATION_PASSES = 6
+
 
 class KillSwitchMode(Enum):
     """What a halt forbids, least restrictive first.
@@ -180,6 +187,11 @@ class KillSwitchState:
     error: str | None = None
     #: ``(account_id, mode)`` of the last completed sweep, by monotonic clock.
     swept_at: dict[tuple[str, KillSwitchMode], float] = field(default_factory=dict)
+    #: Consecutive sweeps that ended with ids still ``pending_cancel``, by
+    #: account - the kill switch's ``_PENDING_CANCEL_PASSES``. Lives here for
+    #: the same reason the sweep ledger does: it must survive a refresh but not
+    #: a lifted halt.
+    pending_cancel_passes: dict[str, int] = field(default_factory=dict)
 
     def refresh(self) -> KillSwitchState:
         """Re-read the database in place, keeping the sweep ledger. Returns self."""
@@ -191,9 +203,16 @@ class KillSwitchState:
         # entry is dropped, so a re-halt sweeps at once instead of waiting out
         # the interval of a halt that has already been lifted. The same sweep of
         # a *re-armed* mode is also keyed on the mode, so an escalation never
-        # waits either.
+        # waits either. The pending-cancel count is per episode for the same
+        # reason: a lifted and re-armed halt starts its escalation over.
         for key in [key for key in self.swept_at if self.mode_for_account(key[0]) is None]:
             del self.swept_at[key]
+        for account_id in [
+            account
+            for account in self.pending_cancel_passes
+            if self.mode_for_account(account) is None
+        ]:
+            del self.pending_cancel_passes[account_id]
         return self
 
     def mode_for_account(self, account_id: str) -> KillSwitchMode | None:
@@ -395,7 +414,9 @@ class KillSwitchEnforcementReport:
         )
 
 
-async def _cancel_working_orders(account_id: str, adapter: BaseLiveAdapter) -> _SweepStep:
+async def _cancel_working_orders(
+    account_id: str, adapter: BaseLiveAdapter, state: KillSwitchState
+) -> _SweepStep:
     """Cancel every working order, reusing the STOPPED enforcement's call."""
     if not adapter.supports_cancel_orders:
         logger.error(
@@ -422,26 +443,50 @@ async def _cancel_working_orders(account_id: str, adapter: BaseLiveAdapter) -> _
             extra={"data": {"account_id": account_id}},
         )
         return _SweepStep.INCOMPLETE
-    if not cancelled.complete or cancelled.pending_cancel:
+    if cancelled.pending_cancel:
         # ``complete`` ignores ``pending_cancel``, and a pending cancel is the one
         # outcome that can still open a position: the order may fill in a
-        # cancel/fill race, so the sweep is not clean until the ids are gone. The
-        # STOPPED machinery holds its stamp for the same reason (#274's rule), and
-        # the flatten below still runs - closing the positions is the money-safety
-        # action, and the next pass re-checks what is left.
-        logger.error(
+        # cancel/fill race, so the sweep is not clean until the ids are gone. It
+        # usually settles within seconds, so - exactly like the STOPPED
+        # machinery's ``_PENDING_CANCEL_PASSES`` - the first passes warn and only
+        # a stuck cancel escalates to ERROR. The flatten below still runs -
+        # closing the positions is the money-safety action, and the next pass
+        # re-checks what is left.
+        passes = state.pending_cancel_passes.get(account_id, 0) + 1
+        state.pending_cancel_passes[account_id] = passes
+        log = (
+            logger.error
+            if passes >= PENDING_CANCEL_ESCALATION_PASSES
+            else logger.warning
+        )
+        log(
             "Order cancel is not settled for a halted account; retrying next "
-            "tick: %s pending_cancel=%s",
+            "tick (pass %d): %s pending_cancel=%s",
+            passes,
             cancelled.describe(),
             sorted(cancelled.pending_cancel),
             extra={
                 "data": {
                     "account_id": account_id,
                     "pending_cancel": sorted(cancelled.pending_cancel),
+                    "passes": passes,
                 }
             },
         )
         return _SweepStep.INCOMPLETE
+    if not cancelled.complete:
+        # A cancel that failed outright is not a pending cancel: it logs ERROR
+        # every pass, and the escalation count is left alone - the next pending
+        # cancel resumes it rather than restarting, exactly like the STOPPED
+        # machinery, which only clears its count on a clean pass.
+        logger.error(
+            "Order cancel was incomplete for a halted account; retrying next "
+            "tick: %s",
+            cancelled.describe(),
+            extra={"data": {"account_id": account_id}},
+        )
+        return _SweepStep.INCOMPLETE
+    state.pending_cancel_passes.pop(account_id, None)
     return _SweepStep.COMPLETE
 
 
@@ -521,6 +566,7 @@ async def _sweep_halted_account(
     account_id: str,
     adapter: BaseLiveAdapter,
     mode: KillSwitchMode,
+    state: KillSwitchState,
 ) -> bool:
     """Run the sweeps ``mode`` calls for. ``True`` when the account is swept clean.
 
@@ -536,7 +582,7 @@ async def _sweep_halted_account(
     flatten_step = _SweepStep.COMPLETE
     orphan_step = _SweepStep.COMPLETE
     if mode.cancels_orders:
-        cancel_step = await _cancel_working_orders(account_id, adapter)
+        cancel_step = await _cancel_working_orders(account_id, adapter, state)
     if mode.flattens:
         # Leaving positions open is worse than leaving an order resting, so a
         # cancel that fell short does not stop the flatten (#274's rule).
@@ -640,7 +686,7 @@ async def enforce_live_kill_switch(
             continue
         if not resolved.sweep_is_due(account_id, mode):
             continue
-        if await _sweep_halted_account(account_id, adapter, mode):
+        if await _sweep_halted_account(account_id, adapter, mode, resolved):
             resolved.record_sweep(account_id, mode)
             swept.append(account_id)
         else:

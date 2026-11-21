@@ -627,6 +627,108 @@ def test_a_pending_cancel_is_not_a_completed_sweep(isolated_db_sandbox, account)
     assert "close_all_positions" in adapter.calls
 
 
+def test_a_pending_cancel_warns_first_and_escalates_like_stopped(
+    isolated_db_sandbox, account, caplog
+) -> None:
+    """A routine broker cancel must not log ERROR on every tick.
+
+    ``pending_cancel`` normally settles within seconds, so the sweep borrows
+    the STOPPED machinery's rule: WARNING while the passes are young, ERROR
+    only once ``PENDING_CANCEL_ESCALATION_PASSES`` consecutive sweeps still see
+    the ids outstanding.
+    """
+    from live_runner.kill_switch import PENDING_CANCEL_ESCALATION_PASSES
+
+    set_live_kill_switch(account, "orders", actor="operator")
+
+    class _PendingCancel(_SweepAdapter):
+        async def cancel_open_orders(self) -> ControlOutcome:
+            self.calls.append("cancel_open_orders")
+            return ControlOutcome(completed=1, pending_cancel=("order-9",))
+
+    adapter = _PendingCancel()
+    state = read_kill_switch_state()
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(PENDING_CANCEL_ESCALATION_PASSES - 1):
+            asyncio.run(
+                enforce_live_kill_switch({account: adapter}, [account], state=state)
+            )
+
+    assert "pending_cancel" in caplog.text
+    # The per-tick "halt not fully enforced" summary is ERROR by design for any
+    # unmet sweep; what must not fire early is the pending-cancel escalation.
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and "pending_cancel" in record.getMessage()
+    ]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(
+            enforce_live_kill_switch({account: adapter}, [account], state=state)
+        )
+
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and "pending_cancel" in record.getMessage()
+    ]
+    assert errors, "a stuck pending_cancel never escalated to ERROR"
+
+
+def test_a_clean_sweep_resets_the_pending_cancel_escalation(
+    isolated_db_sandbox, account, caplog, monkeypatch
+) -> None:
+    """The pass count belongs to one unsettled episode, not to the account."""
+    from live_runner.kill_switch import PENDING_CANCEL_ESCALATION_PASSES
+
+    # A completed sweep is throttled for KILL_SWITCH_SWEEP_INTERVAL_SECONDS;
+    # this test needs the very next tick to sweep again.
+    monkeypatch.setattr(kill_switch, "KILL_SWITCH_SWEEP_INTERVAL_SECONDS", 0.0)
+    set_live_kill_switch(account, "orders", actor="operator")
+    state = read_kill_switch_state()
+
+    class _FlakyCancel(_SweepAdapter):
+        pending = True
+
+        async def cancel_open_orders(self) -> ControlOutcome:
+            self.calls.append("cancel_open_orders")
+            if self.pending:
+                return ControlOutcome(completed=1, pending_cancel=("order-9",))
+            return ControlOutcome(completed=1)
+
+    adapter = _FlakyCancel()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(PENDING_CANCEL_ESCALATION_PASSES):
+            asyncio.run(
+                enforce_live_kill_switch({account: adapter}, [account], state=state)
+            )
+
+    adapter.pending = False
+    report = asyncio.run(
+        enforce_live_kill_switch({account: adapter}, [account], state=state)
+    )
+    assert report.swept == (account,)
+
+    # A later pending_cancel starts the count over: the first pass warns again
+    # instead of resuming at the escalated ERROR.
+    adapter.pending = True
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(
+            enforce_live_kill_switch({account: adapter}, [account], state=state)
+        )
+
+    assert "pending_cancel" in caplog.text
+    assert not [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and "pending_cancel" in record.getMessage()
+    ]
+
+
 def test_a_completed_sweep_is_not_repeated_before_the_interval(
     isolated_db_sandbox, account
 ) -> None:

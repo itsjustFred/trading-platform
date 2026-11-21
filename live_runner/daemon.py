@@ -59,6 +59,7 @@ from live_runner.exit_signals import (
     usable_qty_tolerance,
 )
 from live_runner.kill_switch import (
+    PENDING_CANCEL_ESCALATION_PASSES,
     KillSwitchMode,
     KillSwitchState,
     LiveHaltError,
@@ -149,10 +150,10 @@ DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
 # A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
-# deployment stays unstamped while one is listed (it could still fill); after this many
-# consecutive enforcement passes (~1 minute at the poll interval) the WARNING becomes an
-# ERROR so a stuck cancel reaches an operator.
-PENDING_CANCEL_ESCALATION_PASSES = 6
+# deployment stays unstamped while one is listed (it could still fill); after
+# PENDING_CANCEL_ESCALATION_PASSES consecutive enforcement passes (~1 minute at the
+# poll interval) the WARNING becomes an ERROR so a stuck cancel reaches an operator.
+# The kill switch's sweep applies the same rule to its own per-account counter.
 _PENDING_CANCEL_PASSES: dict[str, int] = {}
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
