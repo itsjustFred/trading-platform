@@ -324,6 +324,24 @@ def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float
 
 
 @dataclass(frozen=True)
+class BrokerOrderView:
+    """One working broker order, normalized for reconciliation (#303).
+
+    ``protection`` marks position-protection orders (bracket legs, attached
+    stop/target orders) so the reconciler does not mistake them for untracked
+    entry or exit orders.
+    """
+
+    order_id: str
+    client_order_id: str = ""
+    symbol: str = ""
+    side: str = ""
+    qty: float | None = None
+    order_type: str = ""
+    protection: bool = False
+
+
+@dataclass(frozen=True)
 class ProtectiveStop:
     """One working broker-side stop order that protects an open position.
 
@@ -425,6 +443,15 @@ class BaseLiveAdapter(ABC):
         from, including after a daemon restart.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot list protective stops")
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Every working order on the account, normalized for reconciliation.
+
+        Unlike :meth:`working_order_ids`, this view keeps the client order id and
+        marks position-protection orders so the reconciler can tell an untracked
+        entry/exit from a bracket leg or attached stop/target (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list reconciliation orders")
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         """Round a computed stop to a price the broker accepts.

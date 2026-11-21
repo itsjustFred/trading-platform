@@ -3237,6 +3237,87 @@ def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> di
     return ledgers
 
 
+def list_live_account_filled_symbols(account_id: str) -> list[str]:
+    """Symbols with at least one persisted fill on one account.
+
+    Reconciliation compares every symbol the ledger can hold a position in, not
+    only symbols that still have an unfilled order (#303).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for the filled-symbol ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(func.distinct(func.upper(LiveSignalModel.symbol)))
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        ).all()
+    return sorted({str(symbol).strip().upper() for symbol in rows if str(symbol or "").strip()})
+
+
+def list_live_account_order_expectations(account_id: str) -> list[dict[str, Any]]:
+    """Persisted signals on one account with their broker id and fill total.
+
+    Reconciliation uses these rows to know which broker orders the ledger still
+    expects to be working and which client order ids name a signal (#303). The
+    requested quantity is read from signal metadata by the caller; this function
+    only returns the persisted facts.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for order expectations")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .outerjoin(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .group_by(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+            )
+        ).all()
+    return [
+        {
+            "signal_id": str(signal_id),
+            "deployment_id": str(deployment_id),
+            "symbol": str(symbol or "").strip().upper(),
+            "action": str(action or "").strip().lower(),
+            "broker_order_id": str(broker_order_id or "").strip(),
+            "metadata": dict(metadata_json or {}),
+            "timestamp": timestamp,
+            "filled_qty": float(filled_qty or 0.0),
+        }
+        for (
+            signal_id,
+            deployment_id,
+            symbol,
+            action,
+            broker_order_id,
+            metadata_json,
+            timestamp,
+            filled_qty,
+        ) in rows
+    ]
+
+
 #: A filled quantity this close to the requested one counts as fully filled.
 _EXIT_FILL_TOLERANCE = 1e-9
 

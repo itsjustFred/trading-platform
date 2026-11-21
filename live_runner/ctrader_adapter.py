@@ -19,6 +19,7 @@ from uuid import UUID
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
@@ -3226,6 +3227,84 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if client_order_id:
                 ids.add(client_order_id)
         return ids
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        reconcile_res = await self._reconcile_state()
+        position_symbols: dict[int, str] = {}
+        for position in getattr(reconcile_res, "position", []) or []:
+            try:
+                if int(getattr(position, "positionStatus", 0) or 0) != (
+                    self._ProtoOAPositionStatus.POSITION_STATUS_OPEN
+                ):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            position_id = self._positive_int(getattr(position, "positionId", 0))
+            if position_id is None:
+                continue
+            trade_data = getattr(position, "tradeData", None)
+            symbol_id = int(getattr(trade_data, "symbolId", 0) or 0) if trade_data else 0
+            if symbol_id > 0:
+                try:
+                    position_symbols[position_id] = self._symbol_name_for_id(symbol_id)
+                except Exception:
+                    position_symbols[position_id] = ""
+
+        views: list[BrokerOrderView] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            key = str(order_id) if order_id is not None else client_order_id
+            if not key:
+                continue
+
+            symbol_id = int(getattr(order, "symbolId", 0) or 0)
+            symbol = ""
+            if symbol_id > 0:
+                symbol = self._symbol_name_for_id(symbol_id)
+            if not symbol:
+                position_id = self._positive_int(getattr(order, "positionId", 0))
+                if position_id is not None:
+                    symbol = position_symbols.get(position_id, "")
+
+            qty: float | None = None
+            if symbol:
+                try:
+                    volume = _to_float(getattr(order, "volume", 0), default=0.0)
+                    scale = self._scale_for(symbol)
+                    if volume > 0:
+                        qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
+                except Exception:
+                    qty = None
+
+            trade_side = int(getattr(order, "tradeSide", 0) or 0)
+            if trade_side == int(self._ProtoOATradeSide.BUY):
+                side = "buy"
+            elif trade_side == int(self._ProtoOATradeSide.SELL):
+                side = "sell"
+            else:
+                side = ""
+
+            protection = order_type == int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
+            views.append(
+                BrokerOrderView(
+                    order_id=key,
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    order_type=str(order_type),
+                    protection=protection,
+                )
+            )
+        return views
 
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.

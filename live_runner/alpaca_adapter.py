@@ -26,6 +26,7 @@ from live_runner.alpaca_fees import (
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
@@ -222,6 +223,16 @@ def _order_type(order: Any) -> str:
         raw = _order_attr(order, "type", "")
     text = str(getattr(raw, "value", raw) or "").strip().lower()
     return text.rsplit(".", 1)[-1]
+
+
+def _order_remaining_qty(order: Any) -> float | None:
+    """Remaining working quantity for a broker order, when both fields are readable."""
+    qty = _to_float(_order_attr(order, "qty", None), default=math.nan)
+    filled = _to_float(_order_attr(order, "filled_qty", None), default=0.0)
+    if not math.isfinite(qty):
+        return None
+    remaining = qty - (filled if math.isfinite(filled) else 0.0)
+    return remaining if math.isfinite(remaining) and remaining > 0 else qty
 
 
 def _stop_candidates(order: Any) -> Iterator[Any]:
@@ -1903,6 +1914,37 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     if order_id is not None:
                         ids.add(order_id)
         return ids
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        client = await self._require_trading_client()
+        orders = await self._list_open_orders(client, nested=True)
+        protection_sides = await self._protection_sides_by_symbol()
+        protected_ids = self._protection_order_ids(orders, protection_sides)
+        views: list[BrokerOrderView] = []
+        seen: set[str] = set()
+        for order in orders:
+            for item in (order, *_order_legs(order)):
+                order_id = _control_order_id(_order_attr(item, "id"))
+                client_order_id = _control_order_id(_order_attr(item, "client_order_id"))
+                if order_id is None and client_order_id is None:
+                    continue
+                key = order_id or client_order_id or ""
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                views.append(
+                    BrokerOrderView(
+                        order_id=key,
+                        client_order_id=str(client_order_id or ""),
+                        symbol=_order_symbol(item),
+                        side=_order_side(item),
+                        qty=_order_remaining_qty(item),
+                        order_type=_order_type(item),
+                        protection=key in protected_ids,
+                    )
+                )
+        return views
 
     def exit_qty_step(self, symbol: str) -> float:
         """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
