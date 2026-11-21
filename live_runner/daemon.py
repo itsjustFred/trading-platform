@@ -2251,6 +2251,26 @@ def _dispatchable_discord_deployments_for_account(
     ]
 
 
+def _primary_discord_deployment(deployments: list[LiveDeploymentConfig]) -> LiveDeploymentConfig:
+    """The deployment whose configuration drives the account's Discord listener.
+
+    One listener serves every deployment of the account, so one deployment's service
+    name, token, auth scheme, timeframe and ``service_id`` are the listener's. They
+    therefore come from an ACTIVE deployment whenever the account has one: a freshly
+    created deployment is PAUSED, and this list is ordered newest first, so taking the
+    head unconditionally would let a brand-new paused bot's token and timeframe decide
+    how an older ACTIVE bot's channel is polled - a listener that can miss that
+    channel's signals, or 401 against a bot that was never in it. An account whose
+    deployments are all paused keeps one too (#126): it still needs a listener to hear
+    exits, and its own deployment is the only credential scope it has.
+    """
+    for wanted in ("ACTIVE", "PAUSED"):
+        for deployment in deployments:
+            if _normalize_deployment_status(deployment.status) == wanted:
+                return deployment
+    return next(iter(deployments))
+
+
 def _deployment_can_dispatch(
     deployment: LiveDeploymentConfig, *, is_exit: bool = False
 ) -> bool:
@@ -3312,7 +3332,8 @@ async def _run_discord_signal_listener_for_account(
         return
 
     # Resolve a real account token (account/user tokens, not a generic bot token).
-    primary_deployment = next(iter(dispatchable_deployments))
+    # Not simply the head of the list: see `_primary_discord_deployment`.
+    primary_deployment = _primary_discord_deployment(dispatchable_deployments)
     # The trusted-author allowlist is the ingestion source gate (Decision
     # Record): authors trusted by ANY deployment on the polled channels are
     # merged into one allowlist. Without an explicit allowlist the listener
