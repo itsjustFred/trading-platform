@@ -2773,6 +2773,35 @@ async def _prepare_claim_and_submit_signal(
         )
         return
 
+    # Kill switch (#300), read again at the last moment before the broker sees
+    # anything. The gate in `prepare_order_with_risk` ran before the broker
+    # reads, so an operator who halted the account while this entry was being
+    # sized must not have the order land anyway - that window is exactly when the
+    # halt is being used. Nothing has been claimed at this point, so a refusal
+    # costs no submission lease.
+    try:
+        await refuse_entry_while_halted(
+            account_id,
+            deployment_id=str(deployment.id),
+            symbol=live_signal.symbol,
+        )
+    except LiveHaltError as exc:
+        logger.warning(
+            "Entry refused by the kill switch at the submission gate; nothing was "
+            "sent to the broker and the submission lease was never claimed",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "halt_mode": exc.mode.value if exc.mode is not None else None,
+                    "halt_state_unreadable": exc.state_unreadable,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
+
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
     # deployment. The claim turns "still ACTIVE" into a single atomic database
@@ -4400,6 +4429,7 @@ _HALT_MODES_NEEDING_AN_ADAPTER = frozenset(
 def _accounts_needing_halt_enforcement(
     halt_state: KillSwitchState,
     deployments: list[LiveDeploymentConfig],
+    registered_account_ids: Iterable[str] = (),
 ) -> set[str]:
     """Accounts whose halt needs a connected adapter to be enforced.
 
@@ -4410,17 +4440,24 @@ def _accounts_needing_halt_enforcement(
     every tick while its positions stayed open, which is the STOPPED machinery's
     own lesson.
 
+    Registered accounts are candidates as well as deployed ones, so a halt on (or
+    a global halt over) an account with no deployment row is still enforced
+    rather than silently skipped: the account is registered, the operator halted
+    it, and their broker-side position is the thing being halted.
+
     Retention is never permission: the accounts returned here are added to the
     retained set so an adapter exists for the sweep, and only the runnable set
     gets listener tasks, so this cannot make an account tradeable. An unreadable
     halt state answers ``entries`` - which needs no adapter - so a broken read
     connects nothing extra and still refuses every entry.
     """
+    candidates = {deployment.account_id for deployment in deployments} | {
+        str(account_id) for account_id in registered_account_ids
+    }
     return {
-        deployment.account_id
-        for deployment in deployments
-        if halt_state.mode_for_account(deployment.account_id)
-        in _HALT_MODES_NEEDING_AN_ADAPTER
+        account_id
+        for account_id in candidates
+        if halt_state.mode_for_account(account_id) in _HALT_MODES_NEEDING_AN_ADAPTER
     }
 
 
@@ -5215,7 +5252,7 @@ async def sync_deployments_loop(
             # the same reason (#300). Retention only: the runnable set below is
             # what may trade.
             halt_enforcement_account_ids = _accounts_needing_halt_enforcement(
-                halt_state, deployments
+                halt_state, deployments, (account.id for account in accounts)
             ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
             retained_account_ids = (
                 runnable_account_ids | enforcement_account_ids | halt_enforcement_account_ids
@@ -5257,7 +5294,7 @@ async def sync_deployments_loop(
             # STOPPED sweep above just used, plus every connected adapter.
             kill_switch_report = await enforce_live_kill_switch(
                 active_adapters,
-                retained_account_ids | set(active_adapters),
+                halt_enforcement_account_ids | retained_account_ids | set(active_adapters),
                 state=halt_state,
             )
             if kill_switch_report.modes:

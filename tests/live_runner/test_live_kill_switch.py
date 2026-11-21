@@ -698,6 +698,113 @@ def test_an_unreadable_halt_state_retains_nothing(
     assert retained == set()
 
 
+def test_a_re_halt_after_a_clear_sweeps_at_once(isolated_db_sandbox, account) -> None:
+    """A lifted halt leaves no sweep behind to inherit.
+
+    Otherwise a clear followed by a re-halt of the same mode would wait out the
+    interval of the halt that was just lifted - and the account is not known to
+    be flat at that point, because it was allowed to trade in between. The clear
+    has to be observed by a refresh for it to be seen as an episode, which is why
+    this goes through one; a clear and a re-halt inside a single tick are
+    indistinguishable at this level and wait out the interval, never longer.
+    """
+    set_live_kill_switch(account, "flatten", actor="operator")
+    adapter = _SweepAdapter()
+    state = read_kill_switch_state()
+    asyncio.run(enforce_live_kill_switch({account: adapter}, [account], state=state))
+
+    clear_live_kill_switch(account, actor="operator")
+    state.refresh()
+    set_live_kill_switch(account, "flatten", actor="operator")
+    state.refresh()
+
+    report = asyncio.run(enforce_live_kill_switch({account: adapter}, [account], state=state))
+
+    assert report.swept == (account,)
+    assert adapter.calls.count("close_all_positions") == 2
+
+
+def test_a_halt_on_a_registered_account_with_no_deployment_is_enforced(
+    isolated_db_sandbox,
+) -> None:
+    """A registered account is the operator's account, with or without a row here.
+
+    The halt is an instruction about the account, not about a deployment: an
+    account the operator registered but has not deployed anything on can still
+    hold a broker-side position, and a global halt has to reach it rather than
+    only the accounts that happen to have a deployment row.
+    """
+    import live_runner.daemon as daemon
+    from shared.database import ensure_live_account
+
+    ensure_live_account("acc-idle", "alpaca", is_demo=True)
+    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "flatten", actor="operator")
+
+    retained = daemon._accounts_needing_halt_enforcement(
+        read_kill_switch_state(), [], ["acc-idle"]
+    )
+
+    assert retained == {"acc-idle"}
+
+
+def test_a_halt_set_while_the_entry_is_being_prepared_stops_the_submit(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    """The gate runs again at the last moment before the broker sees anything.
+
+    `prepare_order_with_risk` reads broker state, so an operator who halts while
+    this entry is being sized must not have it land anyway - that is the window
+    the halt is being used in. Nothing has been claimed yet, so the refusal costs
+    no submission lease and the deployment is not locked out.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.kill_switch import KillSwitchMode, LiveHaltError
+    from risk import TradeSignal
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    claims: list[str] = []
+    real_refuse = daemon.refuse_entry_while_halted
+    reads = {"count": 0}
+
+    async def _refuse(*args: Any, **kwargs: Any) -> None:
+        reads["count"] += 1
+        if reads["count"] > 1:
+            raise LiveHaltError(
+                "halted", account_id=account, mode=KillSwitchMode.FLATTEN
+            )
+        return await real_refuse(*args, **kwargs)
+
+    monkeypatch.setattr(daemon, "refuse_entry_while_halted", _refuse)
+    monkeypatch.setattr(
+        daemon,
+        "claim_live_deployment_submission",
+        lambda *a, **k: claims.append("claimed") or "token",
+        raising=False,
+    )
+
+    asyncio.run(
+        daemon._prepare_claim_and_submit_signal(
+            account,
+            adapter,
+            deployment,
+            TradeSignal(
+                action="buy",
+                symbol="AAPL",
+                entry_price=100.0,
+                stop_loss=95.0,
+                take_profit=110.0,
+                timeframe="1h",
+            ),
+            _entry_signal(deployment),
+            is_exit=False,
+        )
+    )
+
+    assert adapter.submitted == []
+    assert claims == []
+
+
 def test_a_halt_written_while_the_daemon_is_running_is_enforced(
     isolated_db_sandbox, account
 ) -> None:

@@ -14154,9 +14154,22 @@ async def resume_live_kill_switch(
         request=request,
         why="re-enables trading on this scope, so it must be confirmed.",
     )
-    lifted = await asyncio.to_thread(
-        clear_live_kill_switch, scope, actor=_live_control_actor(request)
-    )
+    try:
+        lifted = await asyncio.to_thread(
+            clear_live_kill_switch, scope, actor=_live_control_actor(request)
+        )
+    except ValueError as exc:
+        # An empty or mis-cased scope is a client error, not a server one, and
+        # the refusal is the event worth recording.
+        await _audit_live_control(
+            action="kill_switch.resume",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     await _audit_live_control(
         action="kill_switch.resume",
         target_type="live_kill_switch",

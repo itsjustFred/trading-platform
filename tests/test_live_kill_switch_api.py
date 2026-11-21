@@ -164,3 +164,23 @@ def test_resuming_a_scope_that_is_not_halted_is_idempotent(client) -> None:
 
     assert response.status_code == 200
     assert response.json()["lifted"] is False
+
+
+def test_resuming_a_malformed_scope_is_a_refusal_not_a_crash(client) -> None:
+    """A scope the write path refuses must not become a 500.
+
+    ``clear_live_kill_switch`` raises for an empty or mis-cased global scope; that
+    is a client error with its own audited refusal, exactly like a halt on a
+    scope that names no account.
+    """
+    response = client.post(
+        RESUME_PATH, json={"scope": "", "confirmed_scope": ""}
+    )
+
+    assert response.status_code == 400
+    refusals = [
+        entry
+        for entry in list_live_control_audit()
+        if entry["action"] == "kill_switch.resume" and entry["succeeded"] is False
+    ]
+    assert refusals, "a refused resume was not recorded as an attempt"

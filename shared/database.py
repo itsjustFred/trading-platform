@@ -819,10 +819,12 @@ class LiveControlAuditModel(SQLModel, table=True):
     )
 
 
-#: Reserved ``scope`` of the halt that covers every account. Deliberately not a
-#: value an account id can take: an account literally named ``global`` would
-#: otherwise be indistinguishable from the platform-wide halt, and the write
-#: path refuses it outright (see :func:`set_live_kill_switch`).
+#: Reserved ``scope`` of the halt that covers every account. Refused as an account
+#: id on both sides: the account row cannot be created with it (see
+#: :func:`_assert_not_reserved_kill_switch_scope`), and a halt scope spelled that
+#: way is the platform-wide halt rather than one account's. An account literally
+#: named ``global`` would otherwise be indistinguishable from the halt that covers
+#: everything, and halting it would halt the world.
 KILL_SWITCH_GLOBAL_SCOPE = "global"
 
 #: The halt modes, least restrictive first.
@@ -3791,6 +3793,7 @@ def _create_live_account_record(
     is_demo: bool | None = None,
 ) -> LiveAccountConfig:
     """Insert a brand-new live account row."""
+    _assert_not_reserved_kill_switch_scope(account_id)
     account = LiveAccountModel(
         id=account_id,
         broker=broker,
@@ -3919,6 +3922,19 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
     init_db()
     with get_session() as session:
         for account in accounts:
+            try:
+                _assert_not_reserved_kill_switch_scope(account.id)
+            except ValueError as exc:
+                # Discovery data, not an operator request: refusing the whole
+                # batch would stop every other account from being persisted, and
+                # one unusable row is not worth that.
+                logger.error(
+                    "Refusing to store a live account whose id collides with the "
+                    "reserved kill switch scope: %r",
+                    account.id,
+                    extra={"data": {"account_id": str(account.id), "error": str(exc)}},
+                )
+                continue
             current = session.get(LiveAccountModel, account.id)
             if current is None:
                 session.add(LiveAccountModel.from_live_account(account))
@@ -4345,6 +4361,23 @@ def _normalize_kill_switch_scope(scope: object) -> str:
     return normalized
 
 
+def _assert_not_reserved_kill_switch_scope(account_id: object) -> None:
+    """Refuse an account id that would collide with the reserved halt scope.
+
+    The kill switch's global scope and an account scope are one column, so an
+    account literally named ``global`` could not be halted as an account: writing
+    a halt for it would halt every account instead of that one. Refused at
+    creation rather than at halt time, so the ambiguity never exists to be
+    resolved under pressure.
+    """
+    normalized = str(account_id or "").strip()
+    if normalized.upper() == KILL_SWITCH_GLOBAL_SCOPE.upper():
+        raise ValueError(
+            f"'{account_id}' is the reserved kill switch scope and cannot be a "
+            f"live account id; halting that account would halt every account"
+        )
+
+
 def _kill_switch_scope_is_unknown_account(scope: str) -> bool:
     """Whether ``live_accounts`` *proves* this scope names no account.
 
@@ -4381,10 +4414,19 @@ def set_live_kill_switch(
     while reporting a halt, or be read as the strictest mode.
 
     Re-setting an already halted scope escalates in place: the mode is replaced
-    but ``halted_at`` is not, because the account has been halted continuously
-    since the first write and that instant is what an incident review asks for.
+    but ``halted_at``, ``halted_by`` and ``reason`` are not, because the account
+    has been halted continuously since the first write and that instant - and
+    whoever set it - is what an incident review asks for. The escalation itself is
+    attributed in ``live_control_audit``, which records the actor of every write.
     Escalating never needs a restart to take effect either - the daemon keys its
     re-sweep on the mode, so a change re-sweeps immediately.
+
+    A *weaker* mode on a standing halt is refused. The halt is an operator
+    emergency control, and a step-down from ``flatten`` to ``entries`` would stop
+    the sweeps while the row still reads as halted - silently weakening the one
+    control that must not weaken by accident (a stale tab, a mistyped mode, a
+    half-finished script). Lifting is ``clear_live_kill_switch``, which states
+    what it did and attributes it; weakening is not a quiet edit.
 
     Re-arming a *cleared* scope is a new episode, not an escalation: one row per
     scope has nowhere else to keep the earlier episode's instant, and reporting
@@ -4417,6 +4459,18 @@ def set_live_kill_switch(
     with get_session() as session:
         record = session.get(LiveKillSwitchModel, normalized_scope)
         now = _utcnow_naive()
+        if (
+            record is not None
+            and record.cleared_at is None
+            and str(record.mode) in KILL_SWITCH_MODES
+            and KILL_SWITCH_MODES.index(normalized_mode)
+            < KILL_SWITCH_MODES.index(str(record.mode))
+        ):
+            raise ValueError(
+                f"Refusing to weaken a standing kill switch halt on "
+                f"'{normalized_scope}' from '{record.mode}' to '{normalized_mode}'; "
+                "lift the halt instead (clear_live_kill_switch)"
+            )
         if record is None:
             record = LiveKillSwitchModel(
                 scope=normalized_scope,
@@ -4428,13 +4482,15 @@ def set_live_kill_switch(
             session.add(record)
         else:
             record.mode = normalized_mode
-            record.halted_by = actor_name
-            record.reason = str(reason or "")
-            # A new episode (the row was cleared) or a row that never carried an
-            # instant gets one now; an escalation of a standing halt keeps the
-            # original, because the account has been halted since then.
             if record.cleared_at is not None or record.halted_at is None:
+                # A new episode (the row was cleared) or a row that never carried
+                # an instant gets one now, and it is attributed to whoever armed
+                # it. An escalation of a standing halt keeps the original actor,
+                # reason and instant, because the account has been halted since
+                # then and by them.
                 record.halted_at = now
+                record.halted_by = actor_name
+                record.reason = str(reason or "")
             # A row that was cleared is un-cleared by this write: the halt is
             # live again, and a stale cleared_at would read it back as lifted.
             record.cleared_at = None

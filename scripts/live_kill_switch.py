@@ -97,10 +97,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "(see the accounts command)"
         ),
     )
+    # Not an argparse `choices`: a mode the parser rejects exits before the
+    # audited refusal path in `main`, so an attempted halt with a mistyped mode
+    # would be missing from the control audit trail. Validated in `_halt` instead.
     halt.add_argument(
         "--mode",
         required=True,
-        choices=[mode.value for mode in KillSwitchMode],
+        metavar="{" + ",".join(mode.value for mode in KillSwitchMode) + "}",
         help=(
             "'entries' refuses new entries; 'orders' also cancels working orders; "
             "'flatten' also closes every open position"
@@ -131,6 +134,11 @@ def _print_json(payload: object) -> None:
 
 
 def _halt(args: argparse.Namespace) -> int:
+    if KillSwitchMode.parse(args.mode) is None:
+        raise ValueError(
+            f"Unknown kill switch mode {args.mode!r}; expected one of "
+            f"{', '.join(mode.value for mode in KillSwitchMode)}"
+        )
     state = set_live_kill_switch(
         args.scope,
         args.mode,

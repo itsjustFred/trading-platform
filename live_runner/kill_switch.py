@@ -187,6 +187,13 @@ class KillSwitchState:
         self.halts = snapshot.halts
         self.readable = snapshot.readable
         self.error = snapshot.error
+        # A scope the halt no longer covers has no sweep worth remembering: the
+        # entry is dropped, so a re-halt sweeps at once instead of waiting out
+        # the interval of a halt that has already been lifted. The same sweep of
+        # a *re-armed* mode is also keyed on the mode, so an escalation never
+        # waits either.
+        for key in [key for key in self.swept_at if self.mode_for_account(key[0]) is None]:
+            del self.swept_at[key]
         return self
 
     def mode_for_account(self, account_id: str) -> KillSwitchMode | None:
@@ -218,7 +225,14 @@ class KillSwitchState:
         )
 
     def sweep_is_due(self, account_id: str, mode: KillSwitchMode) -> bool:
-        """Whether ``account_id`` may be swept in ``mode`` again."""
+        """Whether ``account_id`` may be swept in ``mode`` again.
+
+        The interval bounds how long a broker-side order placed by hand can
+        survive: refusing entries stops the daemon opening risk, not a human at
+        the broker. A clear and a re-halt of the same mode inside one tick are
+        indistinguishable here, and that re-halt waits out the remainder - the
+        same bound the interval already sets, never longer than it.
+        """
         last = self.swept_at.get((str(account_id), mode))
         if last is None:
             return True

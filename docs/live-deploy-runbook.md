@@ -477,7 +477,10 @@ scope that names no live account is refused - a typo'd halt would look armed whi
 nothing. `accounts` lists the scopes that exist.
 
 A scope is cleared by stamping `cleared_at` rather than deleting the row, so "who halted this
-account, when, and who lifted it" stays answerable after the incident.
+account, when, and who lifted it" stays answerable after the incident. A standing halt may only
+be made stricter: re-writing a halted scope with a weaker mode is refused, because a step-down
+from `flatten` to `entries` would stop the sweeps behind a row that still reads as halted. Lift
+the halt instead - that is an attributed action, and the sweep ledger then starts clean.
 
 ### CLI
 
@@ -513,8 +516,10 @@ Every attempt, refused ones included, is attributed in `live_control_audit`
 ### What a halt does not do
 
 - It does not disconnect the adapter. A halted account that still needs a sweep keeps its
-  adapter connected for the sweep - the same retention STOPPED enforcement uses - but only the
-  runnable set gets listener tasks, so retention never grants trading permission.
+  adapter connected for the sweep - the same retention STOPPED enforcement uses. Only the
+  *deployment execution* listeners are gated on the runnable set, so retention never grants
+  trading permission; a Discord connection for an ACTIVE deployment can still be listening, and
+  what stops its orders is the entry gate, not a missing listener.
 - It does not stop the live trailing-stop loop (#167). A `flatten` sweep cancels what the flatten
   orphaned; an `entries` halt leaves every working order exactly where it is.
 - It does not replace STOPPED. A STOPPED deployment is a deployment-level stop enforced once per

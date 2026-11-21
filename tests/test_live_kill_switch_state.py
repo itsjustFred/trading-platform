@@ -16,6 +16,7 @@ from shared.database import (
     KILL_SWITCH_GLOBAL_SCOPE,
     LiveAccountModel,
     clear_live_kill_switch,
+    ensure_live_account,
     get_live_kill_switch_state,
     get_session,
     read_live_kill_switch_scopes,
@@ -187,13 +188,65 @@ def test_an_unrecognised_mode_is_refused_on_the_way_in(
 
 def test_a_mode_is_normalised_before_it_is_stored(isolated_db_sandbox) -> None:
     """Padding and case are an operator typing, not a different mode."""
-    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "  FLATTEN  ", actor="operator")
+    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "  entries  ", actor="operator")
+
+    assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "entries"}
+
+    # Escalating, because weakening a standing halt is refused: a re-write may
+    # only add restriction (see the test below).
+    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "FLATTEN\t", actor="operator")
 
     assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "flatten"}
 
-    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "entries\t", actor="operator")
 
-    assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "entries"}
+def test_a_standing_halt_cannot_be_weakened_by_a_re_write(
+    isolated_db_sandbox,
+) -> None:
+    """A step-down must not quietly stop the sweeps behind a halt that still reads armed.
+
+    The row would still report a halt while the mode in force is the one that
+    touches nothing, which is the one direction a kill switch can lose money in.
+    Lifting is a separate, attributed action; weakening is not a quiet edit.
+    """
+    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "flatten", actor="operator")
+
+    with pytest.raises(ValueError, match="weaken"):
+        set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "entries", actor="operator")
+
+    assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "flatten"}
+
+
+def test_an_escalation_is_not_attributed_to_whoever_escalated(
+    isolated_db_sandbox,
+) -> None:
+    """The original halt's actor survives an escalation.
+
+    Otherwise the record attributes the whole halt - a continuous one - to the
+    last person who touched it, and "who halted this account" gets the wrong
+    answer exactly when it matters. The escalation is attributed in
+    ``live_control_audit``, which records the actor of every write.
+    """
+    set_live_kill_switch(
+        KILL_SWITCH_GLOBAL_SCOPE, "entries", actor="operator-a", reason="incident 42"
+    )
+
+    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "flatten", actor="operator-b")
+    state = get_live_kill_switch_state(KILL_SWITCH_GLOBAL_SCOPE)
+
+    assert state is not None
+    assert state.mode == "flatten"
+    assert state.halted_by == "operator-a"
+    assert state.reason == "incident 42"
+
+
+def test_the_reserved_global_scope_cannot_be_created_as_an_account(
+    isolated_db_sandbox,
+) -> None:
+    """The two scopes share one column, so the collision must never exist."""
+    with pytest.raises(ValueError, match="reserved kill switch scope"):
+        ensure_live_account(KILL_SWITCH_GLOBAL_SCOPE, "alpaca")
+
+    assert read_live_kill_switch_scopes() == {}
 
 
 def test_a_halt_for_an_unknown_account_is_refused(isolated_db_sandbox) -> None:

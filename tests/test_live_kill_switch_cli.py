@@ -44,13 +44,20 @@ def account(isolated_db_sandbox) -> str:
 
 
 def _child_env(data_dir: Path) -> dict[str, str]:
-    """An environment that cannot reach the live platform's data directory."""
+    """An environment that cannot reach the live platform's database.
+
+    ``DATABASE_URL`` is dropped *and* pointed at the sandbox: the engine builder
+    prefers it over ``DATA_DIR``, so inheriting it would have a CLI subprocess
+    write real halts into a real live database and then assert on the sandbox.
+    """
     env = dict(os.environ)
-    for dropped in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES"):
+    for dropped in ("BASE_URL", "PERMA_ALLOW_LIVE_VIEWER_WRITES", "DATABASE_URL"):
         env.pop(dropped, None)
+    data_dir.mkdir(parents=True, exist_ok=True)
     env["DATA_DIR"] = str(data_dir)
     env["TRADING_DATA_DIR"] = str(data_dir)
     env["LOG_DIR"] = str(data_dir / "logs")
+    env["DATABASE_URL"] = f"sqlite:///{(data_dir / 'backtests.db').as_posix()}"
     return env
 
 
@@ -190,12 +197,25 @@ def test_a_typo_d_account_scope_is_refused_and_writes_nothing(account) -> None:
     assert read_live_kill_switch_scopes() == {}
 
 
-def test_a_mode_this_build_cannot_interpret_is_refused_by_the_parser(account) -> None:
-    with pytest.raises(SystemExit) as excinfo:
-        live_kill_switch.main(["halt", "--scope", "global", "--mode", "stop"])
+def test_a_mode_this_build_cannot_interpret_is_refused_and_audited(account) -> None:
+    """A mistyped mode is refused *and* recorded as an attempt.
 
-    assert excinfo.value.code == 2
+    Validated in the command rather than by argparse `choices`, because the
+    parser's own exit happens before the audited refusal path - so an attempted
+    halt with a bad mode would be missing from the control audit trail, which is
+    exactly the event somebody has to find later.
+    """
+    exit_code = live_kill_switch.main(["halt", "--scope", "global", "--mode", "stop"])
+
+    assert exit_code == 1
     assert read_live_kill_switch_scopes() == {}
+    refusals = [
+        entry
+        for entry in list_live_control_audit()
+        if entry["action"] == "kill_switch.halt" and entry["succeeded"] is False
+    ]
+    assert refusals[-1]["target_id"] == "global"
+    assert "stop" in refusals[-1]["detail"]["error"]
 
 
 def test_a_halt_is_recorded_in_the_control_audit_trail(account) -> None:
