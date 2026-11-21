@@ -66,6 +66,7 @@ from live_runner.promotion import (
 from live_runner.service_discovery import discover_discord_bots_from_env
 from live_runner.signal_archive import (
     SignalDecisionRecorder,
+    get_signal_archive,
     market_features_from_frame,
     record_signal_decision,
 )
@@ -839,9 +840,12 @@ def _apply_signal_processor(
     timeframe = _deployment_signal_timeframe(deployment)
     market_data = _build_processor_market_data(signal, timeframe=timeframe)
     if decision is not None:
-        # Issue #308: the OHLCV frame is already in hand for the processor —
-        # record the cheap signal-time features it supports. Best effort: a
-        # feature failure must never change the trading decision.
+        # Issue #308: when the signal carries an OHLCV frame
+        # (``signal.metadata["market_data"]``), record the cheap signal-time
+        # features it supports. Production Discord signals do not carry one
+        # today — market features are computed offline from historical OHLCV
+        # by ``message_created_at`` instead. Best effort: a feature failure
+        # must never change the trading decision.
         try:
             decision.set_features(market_features_from_frame(market_data))
         except Exception:
@@ -2654,61 +2658,70 @@ async def _submit_normalized_discord_signal(
         account_id=account_id,
         deployment=deployment,
     )
-    prepared = await _prepare_discord_signal_for_submission(
-        account_id,
-        deployment,
-        trade_signal,
-        signal_timeframe=signal_timeframe,
-        wait_enabled=wait_enabled,
-        adapter=adapter,
-        decision=decision,
-    )
-    if prepared is None:
-        return
-    normalized_signal = prepared
-
     try:
-        live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
-    except ValueError as exc:
-        # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
-        # deployment without dropping the listener loop or sibling deployments.
-        logger.exception(
-            "Invalid deployment boolean config; skipping deployment",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "deployment_id": str(deployment.id),
-                    "symbol": trade_signal.symbol,
-                }
-            },
+        prepared = await _prepare_discord_signal_for_submission(
+            account_id,
+            deployment,
+            trade_signal,
+            signal_timeframe=signal_timeframe,
+            wait_enabled=wait_enabled,
+            adapter=adapter,
+            decision=decision,
         )
-        decision.refused("invalid_signal_config", detail=str(exc))
-        return
+        if prepared is None:
+            return
+        normalized_signal = prepared
 
-    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
-    if is_exit:
-        # Exits of every deployment on this account and symbol go one after the
-        # other, from sizing to the persisted order (see ``_exit_lock``).
-        async with _exit_lock(account_id, live_signal.symbol):
-            await _prepare_claim_and_submit_signal(
-                account_id,
-                adapter,
-                deployment,
-                normalized_signal,
-                live_signal,
-                is_exit=True,
-                decision=decision,
+        try:
+            live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+        except ValueError as exc:
+            # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
+            # deployment without dropping the listener loop or sibling deployments.
+            logger.exception(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                    }
+                },
             )
-        return
-    await _prepare_claim_and_submit_signal(
-        account_id,
-        adapter,
-        deployment,
-        normalized_signal,
-        live_signal,
-        is_exit=False,
-        decision=decision,
-    )
+            decision.refused("invalid_signal_config", detail=str(exc))
+            return
+
+        is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+        if is_exit:
+            # Exits of every deployment on this account and symbol go one after the
+            # other, from sizing to the persisted order (see ``_exit_lock``).
+            async with _exit_lock(account_id, live_signal.symbol):
+                await _prepare_claim_and_submit_signal(
+                    account_id,
+                    adapter,
+                    deployment,
+                    normalized_signal,
+                    live_signal,
+                    is_exit=True,
+                    decision=decision,
+                )
+            return
+        await _prepare_claim_and_submit_signal(
+            account_id,
+            adapter,
+            deployment,
+            normalized_signal,
+            live_signal,
+            is_exit=False,
+            decision=decision,
+        )
+    except Exception as exc:
+        # Issue #308: an unexpected failure must still leave a decision
+        # record — "one per (signal, deployment)" is only true if the escape
+        # path records too. The exception is re-raised unchanged.
+        decision.unknown(
+            "unhandled_error", detail=f"{type(exc).__name__}: {exc}"
+        )
+        raise
 
 
 async def _prepare_claim_and_submit_signal(
@@ -2793,10 +2806,7 @@ async def _prepare_claim_and_submit_signal(
                 },
             )
             if decision is not None:
-                decision.refused(
-                    "exit_pre_submission_error" if is_exit else "pre_submission_error",
-                    detail=str(exc),
-                )
+                decision.refused("exit_pre_submission_error", detail=str(exc))
             return
         logger.warning(
             "Discord signal refused before submission; nothing was sent to the broker",
@@ -5430,6 +5440,11 @@ async def run_daemon(
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
                 await source.disconnect(failed=False)
+        # #308: flush the raw-signal archive last — records still queued by
+        # the just-cancelled listeners must reach disk before exit. Off the
+        # event loop: close() joins the writer thread.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(get_signal_archive().close, timeout=5.0)
         with contextlib.suppress(Exception):
             await scheduler.stop()
         logger.info(
