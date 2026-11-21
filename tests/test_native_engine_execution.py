@@ -868,3 +868,29 @@ def test_native_engine_single_take_profit_level_closes_the_whole_position():
     assert take_profit_exits[0].price == pytest.approx(112.0)
     assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
     assert trade.exits[-1].reason == "tp", "the position is flat after the take-profit"
+
+
+def test_native_engine_take_profit_alias_ignores_a_malformed_alias_value():
+    """A non-numeric value is not a level, so it cannot shadow the canonical one.
+
+    Converting each spelling during the scan made ``float("bad")`` raise on the
+    low-priority alias before the canonical spelling was ever reached, so which
+    level a conflicting row resolved to still depended on the column order.
+    """
+    engine = _engine()
+    canonical_first = pd.Series({"take_profit": 110.0, "tp_price": "not-a-number"})
+    alias_first = pd.Series({"tp_price": "not-a-number", "take_profit": 110.0})
+
+    for row in (canonical_first, alias_first):
+        _, take_profit_levels = engine._extract_levels(row)
+
+        assert [level["price"] for level in take_profit_levels] == [110.0]
+
+
+def test_native_engine_take_profit_alias_falls_back_from_a_malformed_canonical():
+    engine = _engine()
+    row = pd.Series({"take_profit": "not-a-number", "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["price"] for level in take_profit_levels] == [115.0]
