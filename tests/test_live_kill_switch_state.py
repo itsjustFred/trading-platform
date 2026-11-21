@@ -14,11 +14,25 @@ import pytest
 
 from shared.database import (
     KILL_SWITCH_GLOBAL_SCOPE,
+    LiveAccountModel,
     clear_live_kill_switch,
     get_live_kill_switch_state,
+    get_session,
     read_live_kill_switch_scopes,
     set_live_kill_switch,
 )
+
+
+@pytest.fixture
+def account(isolated_db_sandbox) -> str:
+    """One known live account: an account-scoped halt must name a real one."""
+    database, _engine, _data_dir = isolated_db_sandbox
+    database.init_db()
+    with get_session() as session:
+        session.add(LiveAccountModel(id="acc-1", broker="fixture", name="acc-1"))
+        session.commit()
+    return "acc-1"
+
 
 
 def test_a_halt_is_persisted_for_a_fresh_reader(isolated_db_sandbox) -> None:
@@ -43,21 +57,25 @@ def test_a_halt_survives_a_restart(isolated_db_sandbox) -> None:
     assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "orders"}
 
 
-def test_clearing_a_halt_takes_it_out_of_the_active_set(isolated_db_sandbox) -> None:
-    set_live_kill_switch("acc-1", "orders", actor="operator")
+def test_clearing_a_halt_takes_it_out_of_the_active_set(
+    isolated_db_sandbox, account: str
+) -> None:
+    set_live_kill_switch(account, "orders", actor="operator")
 
-    assert clear_live_kill_switch("acc-1", actor="operator") is True
+    assert clear_live_kill_switch(account, actor="operator") is True
     assert read_live_kill_switch_scopes() == {}
     # Clearing twice is a no-op, not a second clear that rewrites history.
-    assert clear_live_kill_switch("acc-1", actor="operator") is False
+    assert clear_live_kill_switch(account, actor="operator") is False
 
 
-def test_clearing_leaves_the_history_of_the_halt_readable(isolated_db_sandbox) -> None:
+def test_clearing_leaves_the_history_of_the_halt_readable(
+    isolated_db_sandbox, account: str
+) -> None:
     """Who halted trading, when, and who lifted it stays answerable."""
-    set_live_kill_switch("acc-1", "flatten", actor="operator-a", reason="incident 42")
-    clear_live_kill_switch("acc-1", actor="operator-b")
+    set_live_kill_switch(account, "flatten", actor="operator-a", reason="incident 42")
+    clear_live_kill_switch(account, actor="operator-b")
 
-    state = get_live_kill_switch_state("acc-1")
+    state = get_live_kill_switch_state(account)
     assert state is not None
     assert state.active is False
     assert state.mode == "flatten"
@@ -67,16 +85,18 @@ def test_clearing_leaves_the_history_of_the_halt_readable(isolated_db_sandbox) -
     assert state.cleared_at is not None
 
 
-def test_global_and_account_scopes_are_independent(isolated_db_sandbox) -> None:
+def test_global_and_account_scopes_are_independent(
+    isolated_db_sandbox, account: str
+) -> None:
     set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "entries", actor="operator")
-    set_live_kill_switch("acc-1", "flatten", actor="operator")
+    set_live_kill_switch(account, "flatten", actor="operator")
 
     assert read_live_kill_switch_scopes() == {
         KILL_SWITCH_GLOBAL_SCOPE: "entries",
-        "acc-1": "flatten",
+        account: "flatten",
     }
 
-    clear_live_kill_switch("acc-1", actor="operator")
+    clear_live_kill_switch(account, actor="operator")
 
     assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "entries"}
 
@@ -102,12 +122,14 @@ def test_escalating_the_mode_keeps_the_original_halt_instant(
     assert second.halted_at == first.halted_at
 
 
-def test_re_arming_a_cleared_scope_records_a_new_halt(isolated_db_sandbox) -> None:
-    set_live_kill_switch("acc-1", "entries", actor="operator")
-    clear_live_kill_switch("acc-1", actor="operator")
+def test_re_arming_a_cleared_scope_records_a_new_halt(
+    isolated_db_sandbox, account: str
+) -> None:
+    set_live_kill_switch(account, "entries", actor="operator")
+    clear_live_kill_switch(account, actor="operator")
 
-    set_live_kill_switch("acc-1", "orders", actor="operator")
-    state = get_live_kill_switch_state("acc-1")
+    set_live_kill_switch(account, "orders", actor="operator")
+    state = get_live_kill_switch_state(account)
 
     assert state is not None
     assert state.active is True
@@ -122,7 +144,7 @@ def test_an_unknown_scope_reads_as_no_halt(isolated_db_sandbox) -> None:
     assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "entries"}
 
 
-@pytest.mark.parametrize("mode", ["", "  ", "halt", "STOP", "flat", "entries ", None])
+@pytest.mark.parametrize("mode", ["", "  ", "halt", "STOP", "flat", None])
 def test_an_unrecognised_mode_is_refused_on_the_way_in(
     isolated_db_sandbox, mode: object
 ) -> None:
@@ -139,9 +161,14 @@ def test_an_unrecognised_mode_is_refused_on_the_way_in(
 
 
 def test_a_mode_is_normalised_before_it_is_stored(isolated_db_sandbox) -> None:
+    """Padding and case are an operator typing, not a different mode."""
     set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "  FLATTEN  ", actor="operator")
 
     assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "flatten"}
+
+    set_live_kill_switch(KILL_SWITCH_GLOBAL_SCOPE, "entries\t", actor="operator")
+
+    assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "entries"}
 
 
 def test_a_halt_for_an_unknown_account_is_refused(isolated_db_sandbox) -> None:
@@ -163,7 +190,7 @@ def test_the_reserved_global_scope_cannot_be_used_as_an_account_scope(
 
 
 def test_a_halt_for_an_unknown_account_is_allowed_when_accounts_are_unreadable(
-    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch, account: str
 ) -> None:
     """Never block an operator's halt on a read failure.
 
@@ -178,6 +205,7 @@ def test_a_halt_for_an_unknown_account_is_allowed_when_accounts_are_unreadable(
 
     monkeypatch.setattr("shared.database.list_live_accounts", _unreadable)
 
+    # 'acc-unverified' names no account either, but nothing can prove that now.
     set_live_kill_switch("acc-unverified", "flatten", actor="operator")
 
     assert read_live_kill_switch_scopes() == {"acc-unverified": "flatten"}

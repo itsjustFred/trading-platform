@@ -819,6 +819,85 @@ class LiveControlAuditModel(SQLModel, table=True):
     )
 
 
+#: Reserved ``scope`` of the halt that covers every account. Deliberately not a
+#: value an account id can take: an account literally named ``global`` would
+#: otherwise be indistinguishable from the platform-wide halt, and the write
+#: path refuses it outright (see :func:`set_live_kill_switch`).
+KILL_SWITCH_GLOBAL_SCOPE = "global"
+
+#: The halt modes, least restrictive first.
+#:
+#: ``entries``  refuse new entries. Working orders and open positions are left
+#:              alone, so an operator can stop adding risk without liquidating.
+#: ``orders``   also cancel every working order.
+#: ``flatten``  also close every open position and sweep the protections the
+#:              flatten orphaned.
+#:
+#: The order is load-bearing: it is the strictness ranking
+#: ``live_runner.kill_switch.strictest_kill_switch_mode`` uses to combine a
+#: global halt with a per-account one. Defined here, not there, because this is
+#: the layer that stores a mode and has to refuse one it cannot interpret.
+KILL_SWITCH_MODES: tuple[str, ...] = ("entries", "orders", "flatten")
+
+
+@dataclass(frozen=True)
+class LiveKillSwitchState:
+    """One halt scope as stored, with the history of its latest episode."""
+
+    scope: str
+    mode: str
+    halted_at: datetime | None = None
+    halted_by: str = "unknown"
+    reason: str = ""
+    cleared_at: datetime | None = None
+    cleared_by: str | None = None
+
+    @property
+    def active(self) -> bool:
+        """Whether this scope is halted right now.
+
+        A cleared row is kept rather than deleted, so "who halted this account,
+        when, and who lifted it" stays answerable after the fact.
+        """
+        return self.cleared_at is None
+
+
+class LiveKillSwitchModel(SQLModel, table=True):
+    """Durable operator halt (kill switch), one row per scope.
+
+    ``scope`` is either :data:`KILL_SWITCH_GLOBAL_SCOPE` or a live account id.
+    The daemon reads it before every entry and on every tick, so it has to
+    survive a restart: an in-process flag would leave a halted account trading
+    again the moment the daemon was redeployed, which is exactly the window an
+    operator uses the halt for.
+
+    Clearing writes ``cleared_at`` instead of deleting the row, so the audit
+    question "was this account halted during the incident, and by whom" is
+    still answerable. Only rows with ``cleared_at IS NULL`` are read as active.
+    """
+
+    __tablename__ = "live_kill_switch"
+
+    scope: str = Field(primary_key=True)
+    mode: str = Field(default="")
+    halted_at: datetime | None = Field(default=None)
+    halted_by: str = Field(default="unknown")
+    reason: str = Field(default="")
+    cleared_at: datetime | None = Field(default=None)
+    cleared_by: str | None = Field(default=None)
+
+    def to_state(self) -> LiveKillSwitchState:
+        return LiveKillSwitchState(
+            scope=self.scope,
+            mode=self.mode,
+            halted_at=self.halted_at,
+            halted_by=self.halted_by,
+            reason=self.reason,
+            cleared_at=self.cleared_at,
+            cleared_by=self.cleared_by,
+        )
+
+
 class ServiceModel(SQLModel, table=True):
     __tablename__ = "services"
     __table_args__ = (UniqueConstraint("name", "type", name="uq_services_name_type"),)
@@ -4243,6 +4322,173 @@ def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:
         session.add(record)
         session.commit()
     return True
+
+
+def _normalize_kill_switch_scope(scope: object) -> str:
+    """Normalize and validate one halt scope, or refuse it.
+
+    The reserved global scope is only accepted in its exact spelling: a padded
+    or differently-cased ``Global`` would be read back as an *account* scope, so
+    the halt would silently cover one account named "Global" instead of every
+    account.
+    """
+    normalized = str(scope or "").strip()
+    if not normalized:
+        raise ValueError("kill switch scope must not be empty")
+    if normalized.upper() == KILL_SWITCH_GLOBAL_SCOPE.upper():
+        if normalized != KILL_SWITCH_GLOBAL_SCOPE:
+            raise ValueError(
+                f"'{normalized}' looks like the reserved global halt scope; "
+                f"write it exactly as '{KILL_SWITCH_GLOBAL_SCOPE}'"
+            )
+        return KILL_SWITCH_GLOBAL_SCOPE
+    return normalized
+
+
+def _kill_switch_scope_is_unknown_account(scope: str) -> bool:
+    """Whether ``live_accounts`` *proves* this scope names no account.
+
+    ``True`` only for a lookup that answered. A lookup that failed cannot prove
+    the scope is a typo, and refusing the halt on that basis would make a broken
+    read the reason trading kept running - the opposite of what a kill switch is
+    for.
+    """
+    try:
+        known = {str(account.id) for account in list_live_accounts()}
+    except Exception as exc:
+        logger.warning(
+            "Could not verify the kill switch account scope %s; writing the halt anyway",
+            scope,
+            extra={"data": {"scope": scope, "error": repr(exc)}},
+        )
+        return False
+    return scope not in known
+
+
+def set_live_kill_switch(
+    scope: object,
+    mode: object,
+    *,
+    actor: str = "unknown",
+    reason: str = "",
+) -> LiveKillSwitchState:
+    """Halt ``scope`` in ``mode``, and return the stored state.
+
+    ``mode`` must be one of the modes ``live_runner.kill_switch`` defines. It is
+    normalized (case, padding) here so every reader sees the same spelling, and
+    an unrecognized mode is refused rather than stored for a later reader to
+    interpret - a misspelling that reached the table would either halt nothing
+    while reporting a halt, or be read as the strictest mode.
+
+    Re-setting an already halted scope escalates in place: the mode is replaced
+    but ``halted_at`` is not, because the account has been halted continuously
+    since the first write and that instant is what an incident review asks for.
+    Escalating never needs a restart to take effect either - the daemon keys its
+    re-sweep on the mode, so a change re-sweeps immediately.
+
+    An account scope that matches no live account is refused: a typo'd id writes
+    a halt that covers nothing while the operator reads it as armed. The check
+    is skipped only when the accounts cannot be read at all (see
+    :func:`_kill_switch_scope_is_unknown_account`).
+    """
+    normalized_scope = _normalize_kill_switch_scope(scope)
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in KILL_SWITCH_MODES:
+        raise ValueError(
+            f"Unknown kill switch mode {mode!r}; expected one of "
+            f"{', '.join(sorted(KILL_SWITCH_MODES))}"
+        )
+    if (
+        normalized_scope != KILL_SWITCH_GLOBAL_SCOPE
+        and _kill_switch_scope_is_unknown_account(normalized_scope)
+    ):
+        raise ValueError(
+            f"Refusing to write a kill switch halt for unknown live account "
+            f"'{normalized_scope}'; a typo'd scope would halt nothing while "
+            f"reporting a halt"
+        )
+    actor_name = str(actor or "unknown").strip() or "unknown"
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveKillSwitchModel, normalized_scope)
+        now = _utcnow_naive()
+        if record is None:
+            record = LiveKillSwitchModel(
+                scope=normalized_scope,
+                mode=normalized_mode,
+                halted_at=now,
+                halted_by=actor_name,
+                reason=str(reason or ""),
+            )
+            session.add(record)
+        else:
+            record.mode = normalized_mode
+            record.halted_by = actor_name
+            record.reason = str(reason or "")
+            if record.halted_at is None:
+                record.halted_at = now
+            # A row that was cleared is un-cleared by this write: the halt is
+            # live again, and a stale cleared_at would read it back as lifted.
+            record.cleared_at = None
+            record.cleared_by = None
+        session.commit()
+        session.refresh(record)
+        return record.to_state()
+
+
+def clear_live_kill_switch(
+    scope: object,
+    *,
+    actor: str = "unknown",
+) -> bool:
+    """Lift the halt on ``scope``. ``False`` when it was not halted.
+
+    The row is kept and stamped rather than deleted, so the history above stays
+    readable. Clearing a scope that is already clear is reported as a no-op
+    instead of rewriting a second clear over the first one's attribution.
+    """
+    normalized_scope = _normalize_kill_switch_scope(scope)
+    actor_name = str(actor or "unknown").strip() or "unknown"
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveKillSwitchModel, normalized_scope)
+        if record is None or record.cleared_at is not None:
+            return False
+        record.cleared_at = _utcnow_naive()
+        record.cleared_by = actor_name
+        session.add(record)
+        session.commit()
+    return True
+
+
+def get_live_kill_switch_state(scope: object) -> LiveKillSwitchState | None:
+    """One scope's stored state, cleared or active, or ``None`` if never halted."""
+    normalized_scope = _normalize_kill_switch_scope(scope)
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveKillSwitchModel, normalized_scope)
+        return None if record is None else record.to_state()
+
+
+def read_live_kill_switch_scopes() -> dict[str, str]:
+    """``{scope: mode}`` for every scope halted right now.
+
+    One query, and it is the only read the daemon's hot paths make: the entry
+    gate runs it before every entry and the tick enforcement once per tick. A
+    scope cleared (or never halted) is simply absent.
+
+    Raises on a database failure rather than returning ``{}``: an empty result
+    is indistinguishable from "nothing is halted", which is the one answer that
+    must never be produced by an unreadable database.
+    """
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveKillSwitchModel.scope, LiveKillSwitchModel.mode).where(
+                LiveKillSwitchModel.cleared_at.is_(None)
+            )
+        ).all()
+    return {str(scope): str(mode) for scope, mode in rows}
 
 
 def list_stopped_enforced_deployment_ids() -> set[str]:
