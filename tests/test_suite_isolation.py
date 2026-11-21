@@ -494,6 +494,23 @@ def test_the_secret_file_matcher_only_names_the_real_files(tmp_path: Path) -> No
     assert suite_conftest._repo_secret_path(None) is None
 
 
+def test_the_secret_file_matcher_is_case_insensitive_on_case_insensitive_file_systems(
+    monkeypatch,
+) -> None:
+    """On NTFS and default APFS ``.ENV`` *is* ``.env``: the same file under another spelling.
+
+    The early name check must not wave a differently-cased name through, or the guard misses the
+    open on exactly the platforms where the casing cannot protect the file. The platform flag is
+    patched rather than skipped on because the comparison logic is what is under test, and it must
+    hold wherever the flag says the file system folds case.
+    """
+    monkeypatch.setattr(suite_conftest, "_CASE_INSENSITIVE_FS", True)
+    differently_cased = REPO_ENV_FILE.with_name(".ENV")
+    assert suite_conftest._repo_secret_path(differently_cased) is not None
+    monkeypatch.setattr(suite_conftest, "_CASE_INSENSITIVE_FS", False)
+    assert suite_conftest._repo_secret_path(differently_cased) is None
+
+
 def test_sessionfinish_fails_the_run_when_a_repo_secret_file_was_opened(
     monkeypatch, capsys
 ) -> None:
@@ -1027,3 +1044,20 @@ def test_real_pytest_process_exits_zero_when_nothing_leaves_the_sandbox(
 
     assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
     assert "ERROR" not in result.stderr
+
+
+def test_real_pytest_process_runs_the_suite_without_xdist(tmp_path: Path) -> None:
+    """``pytest_testnodedown`` is an xdist hookspec, so the conftest must mark it optional.
+
+    Without the marker a plain run - ``-p no:xdist`` while debugging, or an environment whose
+    ``dev`` extra was never installed - dies in plugin validation with INTERNALERROR before a
+    single test runs.
+    """
+    clean = (
+        "def test_ok():\n"
+        "    assert True\n"
+    )
+    result = _run_throwaway_suite(tmp_path, clean, ("-p", "no:xdist"))
+
+    assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
+    assert "INTERNALERROR" not in result.stderr

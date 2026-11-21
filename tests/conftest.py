@@ -25,6 +25,12 @@ REPO_ENV_FILE = (PROJECT_ROOT / ".env").resolve()
 WATCHED_REPO_DIRS = (REPO_DATA_DIR, REPO_LOG_DIR)
 _REPO_SECRET_FILES = frozenset({REPO_ACCOUNTS_ENV, REPO_ENV_FILE})
 _SECRET_FILE_NAMES = frozenset({REPO_ACCOUNTS_ENV.name, REPO_ENV_FILE.name})
+_SECRET_FILE_NAMES_FOLDED = frozenset(name.casefold() for name in _SECRET_FILE_NAMES)
+_REPO_SECRET_FILES_FOLDED = frozenset(str(path).casefold() for path in _REPO_SECRET_FILES)
+# NTFS and a default APFS volume resolve a differently-cased name to the same file, so the
+# comparisons in ``_repo_secret_path`` fold case there; on a case-sensitive file system ``.ENV``
+# is a different file and the exact match is both correct and cheaper.
+_CASE_INSENSITIVE_FS = os.name == "nt" or sys.platform == "darwin"
 
 # The suite must never write into the repo's ``data/``: in the main checkout that is the live
 # platform's database, catalog and market data. Every process (the xdist controller and each
@@ -122,6 +128,13 @@ def network_violations() -> tuple[str, ...]:
     return tuple(_NETWORK_VIOLATIONS)
 
 
+def _is_secret_file_name(name: str) -> bool:
+    """Whether ``name`` spells a secret file's name, folding case where the FS does."""
+    if _CASE_INSENSITIVE_FS:
+        return name.casefold() in _SECRET_FILE_NAMES_FOLDED
+    return name in _SECRET_FILE_NAMES
+
+
 def _repo_secret_path(raw_path: object) -> Path | None:
     """The checkout's real secret file ``raw_path`` names, or ``None``.
 
@@ -143,15 +156,18 @@ def _repo_secret_path(raw_path: object) -> Path | None:
         candidate = Path(os.fspath(raw_path))
     except (TypeError, ValueError):
         return None
-    if candidate.name not in _SECRET_FILE_NAMES and not os.path.islink(candidate):
+    if not _is_secret_file_name(candidate.name) and not os.path.islink(candidate):
         return None
     try:
         resolved = candidate.resolve()
     except OSError:
         return None
     # Both spellings of the name: a symlink keeps its own, its target keeps the real one.
-    if candidate.name not in _SECRET_FILE_NAMES and resolved.name not in _SECRET_FILE_NAMES:
+    if not _is_secret_file_name(candidate.name) and not _is_secret_file_name(resolved.name):
         return None
+    if _CASE_INSENSITIVE_FS:
+        # ``Path`` equality stays case-sensitive on posix even where the file system is not.
+        return resolved if str(resolved).casefold() in _REPO_SECRET_FILES_FOLDED else None
     return resolved if resolved in _REPO_SECRET_FILES else None
 
 
@@ -502,8 +518,14 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
         _fail_session(session, message)
 
 
+@pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node: object, error: object) -> None:
-    """Collect the hermeticity violations an xdist worker could not fail the session with."""
+    """Collect the hermeticity violations an xdist worker could not fail the session with.
+
+    ``optionalhook`` because ``pytest_testnodedown`` is an xdist hookspec: without the plugin
+    (``-p no:xdist``, or a ``dev`` extra that was never installed) pluggy would otherwise reject
+    the unknown hook and the whole run would die in plugin validation.
+    """
     workeroutput = getattr(node, "workeroutput", None)
     if isinstance(workeroutput, dict):
         reported = workeroutput.get("tp_violations")
