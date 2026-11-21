@@ -841,7 +841,7 @@ def _apply_signal_processor(
         "timeframe": signal.timeframe,
         "metadata": dict(signal.metadata or {}),
     }
-    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
     # #150 fail closed at signal time: a processed signal that asks for a
     # trailing mode the live path cannot execute through THIS adapter is
     # rejected here — the signal is not traded, instead of running with the
