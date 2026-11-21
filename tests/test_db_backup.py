@@ -13,6 +13,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -20,12 +21,12 @@ import pytest
 from scripts import db_backup
 
 
-@pytest.fixture()
+@pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / "backtests.db"
 
 
-@pytest.fixture()
+@pytest.fixture
 def backup_dir(tmp_path: Path) -> Path:
     return tmp_path / "backups"
 
@@ -293,6 +294,189 @@ def test_restore_rejects_self_restore(
 
     with pytest.raises(db_backup.BackupVerificationError, match="onto itself"):
         db_backup.restore_db(db_path, db_path, backup_dir=backup_dir)
+
+
+def _hold_db_open(db_path: Path, ready: Path) -> subprocess.Popen:
+    """A second process holding ``db_path`` open, the way the viewer does.
+
+    The connection must be a *different* process: POSIX locks are per-process, so an idle
+    ``sqlite3.connect`` in this test process cannot reproduce the cross-process busy the
+    journal-mode probe exists to catch. ``ready`` is touched once the connection is live.
+    """
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sqlite3, sys, time\n"
+            "c = sqlite3.connect(sys.argv[1])\n"
+            "c.execute('SELECT name FROM sqlite_master').fetchall()\n"
+            "open(sys.argv[2], 'w').write('ready')\n"
+            "time.sleep(60)\n",
+            str(db_path),
+            str(ready),
+        ]
+    )
+
+
+def _wait_for_ready(ready: Path, process: subprocess.Popen) -> None:
+    deadline = 100
+    while not ready.exists() and deadline:
+        if process.poll() is not None:
+            pytest.fail(f"db holder exited early with {process.returncode}")
+        time.sleep(0.1)
+        deadline -= 1
+    assert ready.exists(), "db holder never signalled ready"
+
+
+def test_restore_refuses_while_another_process_has_the_database_open(
+    db_path: Path, backup_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The viewer (or any process) holding the DB open must stop the restore.
+
+    ``os.replace`` would strand that connection on the unlinked inode - writes it commits
+    afterwards land in a file nobody reads - so the journal-mode probe treats "the file is
+    open" as "a daemon may be running" and refuses before anything is staged.
+    """
+    _no_daemon(monkeypatch)
+    _make_db(db_path, [1.0], ["m1"])
+    snapshot = db_backup.backup_db(db_path, backup_dir).path
+    ready = tmp_path / "holder.ready"
+    holder = _hold_db_open(db_path, ready)
+    try:
+        _wait_for_ready(ready, holder)
+        with pytest.raises(db_backup.DaemonRunningError, match="has the database open"):
+            db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+    # Nothing was staged or swapped: the live database is untouched and a retry succeeds.
+    assert _read_state(db_path) == ([1.0], ["m1"])
+    assert db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+    assert _read_state(db_path) == ([1.0], ["m1"])
+
+
+def test_restore_force_overrides_an_open_database_connection(
+    db_path: Path, backup_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+) -> None:
+    """``--force`` is the documented override for the open-database refusal."""
+    _no_daemon(monkeypatch)
+    _make_db(db_path, [1.0], ["m1"])
+    snapshot = db_backup.backup_db(db_path, backup_dir).path
+    ready = tmp_path / "holder.ready"
+    holder = _hold_db_open(db_path, ready)
+    try:
+        _wait_for_ready(ready, holder)
+        db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir, force=True)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+    assert "WARNING: --force used" in capsys.readouterr().err
+    assert _read_state(db_path) == ([1.0], ["m1"])
+
+
+def test_restore_holds_the_single_instance_lock_through_the_swap(
+    db_path: Path, backup_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock must stay held from before staging until after ``os.replace``.
+
+    A probe-then-release leaves a window in which a daemon can start mid-restore; holding the
+    lock is what makes its own acquire fail instead. The spy probes the lock file at the exact
+    moment of the swap: busy means this restore still holds it.
+    """
+    _no_daemon(monkeypatch)
+    _make_db(db_path, [1.0], ["m1"])
+    snapshot = db_backup.backup_db(db_path, backup_dir).path
+    lock_path = db_backup.daemon_lock_path(db_path)
+    real_replace = os.replace
+    seen: list[bool] = []
+
+    def spy_replace(src: object, dst: object) -> object:
+        seen.append(db_backup._probe_flock(lock_path))
+        return real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db_backup.os, "replace", spy_replace)
+    db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+
+    assert seen == [True]
+
+
+def test_restore_refuses_a_daemon_process_even_with_a_free_authoritative_lock(
+    db_path: Path, backup_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #313 transition window: an old-build daemon holds no lock but is still a daemon.
+
+    Once ``shared.single_instance`` exists a free lock plus a found ``live_runner.daemon``
+    process must still refuse - the process could be an old build that never takes the lock,
+    or one trading a different ``DATABASE_URL``. ``--force`` stays the override.
+    """
+    _make_db(db_path, [1.0], ["m1"])
+    snapshot = db_backup.backup_db(db_path, backup_dir).path
+    monkeypatch.setattr(
+        db_backup,
+        "check_daemon",
+        lambda _db: db_backup.DaemonCheck(
+            lock_held=False,
+            lock_authoritative=True,
+            processes=("python -m live_runner.daemon",),
+            notes=(),
+        ),
+    )
+
+    with pytest.raises(db_backup.DaemonRunningError, match="live daemon process"):
+        db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+
+    assert _read_state(db_path) == ([1.0], ["m1"])
+
+
+def test_restore_removes_leftover_sidecars_before_the_swap(
+    db_path: Path, backup_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crashed session can leave ``-wal``/``-shm``/``-journal`` files behind.
+
+    Frames in them belong to the pre-restore database; replayed over the restored file they
+    would resurrect rows the backup does not have. Real sidecar bytes are copied back after
+    the writer closes (which normally deletes them) to simulate the leftovers.
+    """
+    _no_daemon(monkeypatch)
+    _make_db(db_path, [1.0], ["m1"])
+    snapshot = db_backup.backup_db(db_path, backup_dir).path
+
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("INSERT INTO fills (qty) VALUES (2.0)")
+    connection.commit()
+    leftovers: dict[str, bytes] = {}
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.exists():
+            leftovers[suffix] = sidecar.read_bytes()
+    connection.close()
+    for suffix, data in leftovers.items():
+        db_path.with_name(db_path.name + suffix).write_bytes(data)
+    db_path.with_name(db_path.name + "-journal").write_bytes(b"")
+
+    db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+
+    assert _read_state(db_path) == ([1.0], ["m1"])
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not db_path.with_name(db_path.name + suffix).exists()
+
+
+def test_backup_files_are_stored_in_rollback_journal_mode(
+    db_path: Path, backup_dir: Path
+) -> None:
+    """A backup must be one self-contained file: WAL mode would need -wal/-shm sidecars."""
+    _make_db(db_path, [1.0], ["m1"])
+    info = db_backup.backup_db(db_path, backup_dir)
+
+    connection = db_backup._connect_read(info.path)
+    try:
+        mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        connection.close()
+    assert str(mode).lower() == "delete"
 
 
 # --- daemon detection ---------------------------------------------------------
