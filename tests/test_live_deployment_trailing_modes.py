@@ -38,8 +38,8 @@ def _bot_defaulting_to(monkeypatch, **overrides: object) -> None:
     daemon would build. Patching the factory entry is the same seam the
     health-check tests use.
     """
-    from signal_bots.registry import SIGNAL_PROCESSORS
     from signal_bots.ramjet.processor import RamJetSignalProcessor
+    from signal_bots.registry import SIGNAL_PROCESSORS
 
     def factory(config: dict) -> RamJetSignalProcessor:
         return RamJetSignalProcessor({**config, **overrides})
@@ -250,7 +250,11 @@ def test_stored_row_with_a_flip_bot_default_still_loads_and_logs_an_error(
         "logger",
         SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
     )
-    monkeypatch.setattr(daemon, "list_live_accounts", lambda: [LiveAccountConfig(id="acct-1", broker="alpaca")])
+    monkeypatch.setattr(
+        daemon,
+        "list_live_accounts",
+        lambda: [LiveAccountConfig(id="acct-1", broker="alpaca")],
+    )
     monkeypatch.setattr(daemon, "list_live_deployments", lambda: [deployment])
 
     _accounts, loaded = asyncio.run(daemon._load_db_accounts_and_deployments())
@@ -271,7 +275,11 @@ def test_stored_row_with_a_working_bot_default_loads_quietly(monkeypatch) -> Non
         "logger",
         SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
     )
-    monkeypatch.setattr(daemon, "list_live_accounts", lambda: [LiveAccountConfig(id="acct-1", broker="alpaca")])
+    monkeypatch.setattr(
+        daemon,
+        "list_live_accounts",
+        lambda: [LiveAccountConfig(id="acct-1", broker="alpaca")],
+    )
     monkeypatch.setattr(daemon, "list_live_deployments", lambda: [deployment])
 
     asyncio.run(daemon._load_db_accounts_and_deployments())
