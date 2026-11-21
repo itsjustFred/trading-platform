@@ -120,6 +120,10 @@ class TestArgumentParsing:
 class TestSingleInstanceGuard:
     """The guard sits in ``run_daemon``: before the first database touch and every connect."""
 
+    # A broken guard lets the daemon run on (the loops never end), so the refusal is pinned with a
+    # short per-test timeout: a regression must fail in 30s as a timeout, not in the suite-wide 180s
+    # as a hang. The passing path raises in about a second.
+    @pytest.mark.timeout(30)
     def test_a_second_daemon_is_refused_while_the_first_holds_the_lock(
         self, monkeypatch: Any, tmp_data_dir: Path
     ) -> None:
@@ -138,6 +142,7 @@ class TestSingleInstanceGuard:
         assert reached == [], "the refusal must precede the first database read"
         assert str(tmp_data_dir / "backtests.db.lock") in str(excinfo.value)
 
+    @pytest.mark.timeout(30)
     def test_the_lock_is_released_when_the_daemon_exits(
         self, monkeypatch: Any, tmp_data_dir: Path
     ) -> None:
@@ -180,6 +185,21 @@ class TestLockPath:
         from live_runner import daemon
 
         monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@localhost/trading")
+
+        assert daemon.daemon_lock_path() == tmp_data_dir / "backtests.db.lock"
+
+    def test_the_lock_falls_back_to_the_data_dir_for_an_in_memory_url(
+        self, monkeypatch: Any, tmp_data_dir: Path
+    ) -> None:
+        """An in-memory database has no file to sit beside.
+
+        Treating ``:memory:`` as a path would create ``:memory:.lock`` in the process's working
+        directory - the repo root for the daemon - which is both the wrong directory and a file
+        the caller never asked for.
+        """
+        from live_runner import daemon
+
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
 
         assert daemon.daemon_lock_path() == tmp_data_dir / "backtests.db.lock"
 
@@ -247,9 +267,10 @@ class TestRealEntryPoint:
             holder.kill()
             holder.wait(timeout=10)
 
-        assert result.returncode == daemon_cli.EXIT_ALREADY_RUNNING, (
-            f"stdout={result.stdout}\nstderr={result.stderr}"
-        )
+        # The literal 3, not ``daemon_cli.EXIT_ALREADY_RUNNING``: the exit code is the contract
+        # an operator and a systemd ``Restart=always`` unit key on, and importing the constant
+        # would let an edit to it move this assertion with it - the test would pass either way.
+        assert result.returncode == 3, f"stdout={result.stdout}\nstderr={result.stderr}"
         assert "already running" in result.stderr.lower(), result.stderr
         assert str(lock_path) in result.stderr, "the refusal must name the lock it found held"
         assert not (data_dir / "backtests.db").exists(), (
