@@ -127,13 +127,14 @@ def _parent_order(*, legs: list[SimpleNamespace] | None = None) -> SimpleNamespa
     )
 
 
-def _alpaca_adapter(orders_by_client_id: dict[str, Any]) -> AlpacaLiveAdapter:
+def _alpaca_adapter(
+    orders_by_client_id: dict[str, Any] | None = None, *, client: Any | None = None
+) -> AlpacaLiveAdapter:
     adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True, account_id=ACCOUNT)
     adapter._connected = True
-    client = SimpleNamespace(
+    adapter._trading_client = client or SimpleNamespace(
         get_order_by_client_id=lambda client_order_id: orders_by_client_id[client_order_id]
     )
-    adapter._trading_client = client
     return adapter
 
 
@@ -143,6 +144,8 @@ def _leg_fill_update(
     qty: float = 10.0,
     execution_id: str = "exec-leg-1",
     client_order_id: str | None = None,
+    side: str = "sell",
+    price: float = 95.0,
 ) -> SimpleNamespace:
     """A trade update for a bracket leg's fill.
 
@@ -153,20 +156,20 @@ def _leg_fill_update(
     return SimpleNamespace(
         event="fill",
         qty=qty,
-        price=95.0,
-        fill_price=95.0,
+        price=price,
+        fill_price=price,
         timestamp=T1,
         execution_id=execution_id,
         order=SimpleNamespace(
             id=leg_id,
             client_order_id=client_order_id if client_order_id is not None else f"leg-{leg_id}",
             symbol="AAPL",
-            side="sell",
+            side=side,
             order_type="stop",
             qty=qty,
             status="filled",
             filled_qty=qty,
-            filled_avg_price=95.0,
+            filled_avg_price=price,
             filled_at=T1,
             updated_at=T1,
             commission=None,
@@ -201,6 +204,18 @@ def _close_fill_kwargs(
 
 def _ledger(database, deployment_id: str, symbol: str = "AAPL") -> float:
     return database.get_live_deployment_net_filled_qty(deployment_id, symbol)
+
+
+def _entry_signal() -> LiveSignal:
+    """A bracket entry signal of the kind every Alpaca entry carries."""
+    return LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=200.0,
+        timestamp=T0,
+        metadata={"stop_loss": 195.0, "take_profit": 210.0},
+    )
 
 
 def _executions(database) -> list[tuple[str, str | None, float]]:
@@ -427,7 +442,42 @@ def test_a_leg_fill_on_the_stream_reduces_the_deployment_ledger(database, monkey
     close_rows = [
         row for row in _executions(database) if row[0] == database.broker_close_signal_id(parent)
     ]
-    assert [(row[1], row[2]) for row in close_rows] == [("alpaca:exec:exec-leg-1", 10.0)]
+    # Keyed on the leg's own broker order id and its cumulative quantity: the reconciliation
+    # pass derives the same key for the same fill, so a redelivery is a skip there too.
+    assert [(row[1], row[2]) for row in close_rows] == [
+        (f"alpaca:order:{STOP_LEG_ID}:leg:cum:10.00000000", 10.0)
+    ]
+
+
+def test_a_submitted_bracket_teaches_the_adapter_its_legs(database, monkeypatch) -> None:
+    """The submit response carries the bracket's legs, so a leg's fill is attributed from then on.
+
+    Without this the mapping exists only after the first reconciliation pass, and a leg that fills
+    before then is dropped as unattributable.
+    """
+    from live_runner import alpaca_adapter as alpaca_module
+
+    canonical_signal_id = str(uuid4())
+    monkeypatch.setattr(
+        alpaca_module, "save_live_signal", lambda _signal: (canonical_signal_id, True)
+    )
+    monkeypatch.setattr(
+        alpaca_module, "set_live_signal_broker_order_id", lambda *_a, **_k: True
+    )
+    adapter = _alpaca_adapter(
+        client=SimpleNamespace(
+            submit_order=lambda order_data: _parent_order(legs=[_leg(), _leg(
+                order_id="99999999-8888-4777-8666-555555555555", order_type="limit"
+            )])
+        )
+    )
+
+    assert asyncio.run(adapter.submit_order(_entry_signal(), qty=1.0)) == PARENT_ORDER_ID
+
+    assert adapter._bracket_leg_order_id_to_signal_id == {
+        STOP_LEG_ID: canonical_signal_id,
+        "99999999-8888-4777-8666-555555555555": canonical_signal_id,
+    }
 
 
 def test_a_leg_inheriting_the_parents_client_order_id_is_not_a_second_entry_fill(
@@ -491,8 +541,8 @@ def test_a_partial_leg_fill_is_backfilled_up_to_the_leg_cumulative(database) -> 
     """The stream stored the first slice only; reconciliation adds exactly the rest."""
     parent = _persist_entry(database)
     adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
-    asyncio.run(adapter.reconcile_executions())
-    # The stream saw only the first 4 of the leg's 10.
+    # Learned at submit (and at every reconcile), so a fill of the leg can reach the stream first.
+    adapter._register_bracket_legs(parent, _parent_order(legs=[_leg()]))
     asyncio.run(adapter._on_trade_update(_leg_fill_update(qty=4.0, execution_id="exec-partial")))
     assert _ledger(database, DEP_ENTRY) == pytest.approx(6.0)
 
@@ -512,16 +562,20 @@ def test_a_leg_on_the_extending_side_is_not_booked_as_a_close(database, caplog) 
     asyncio.run(adapter.reconcile_executions())
 
     with caplog.at_level(logging.WARNING):
-        asyncio.run(adapter._on_trade_update(_leg_fill_update()))
+        asyncio.run(adapter._on_trade_update(_leg_fill_update(side="buy")))
         asyncio.run(adapter.reconcile_executions())
 
     assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
+    assert [
+        record for record in caplog.records if "reduces it" in record.getMessage()
+    ]
 
 
 def test_a_leg_of_an_order_that_is_not_ours_is_dropped(database, caplog) -> None:
     """SAFE: a fill for an order this deployment never submitted still changes nothing."""
     parent = _persist_entry(database)
-    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+    # The parent's stop leg is still working: nothing of this signal has closed yet.
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg(filled_qty=0.0, status="held")])})
     asyncio.run(adapter.reconcile_executions())
     # Another account's order fills: its client order id is not a signal and its order id was
     # never registered as a leg of one of ours.
@@ -532,6 +586,8 @@ def test_a_leg_of_an_order_that_is_not_ours_is_dropped(database, caplog) -> None
 
     assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
     assert any("not a UUID" in record.getMessage() for record in caplog.records)
+    close_signal_id = database.broker_close_signal_id(parent)
+    assert [row for row in _executions(database) if row[0] == close_signal_id] == []
 
 
 def test_a_still_open_leg_is_not_backfilled(database) -> None:
