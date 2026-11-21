@@ -70,7 +70,36 @@ def test_a_halt_is_set_from_the_dashboard_and_read_back(client) -> None:
     # cannot describe two different observations of an escalation.
     assert detail[0]["mode"] == "orders"
     assert detail[0]["history_available"] is True
-    assert detail[0]["halted_by"]
+    assert detail[0]["halted_by"] == "jane"
+
+
+def test_a_failed_history_read_is_marked_not_fatal(client, monkeypatch) -> None:
+    """The halt's state is the answer; a broken history read must not 500 it.
+
+    ``history_available: false`` is distinguishable from a scope with no
+    recorded history, so the caller sees "could not read" rather than "never
+    happened".
+    """
+    _halt(client, scope=ACCOUNT, mode="entries")
+
+    def _unreadable(scope: str) -> None:
+        raise OSError("database is unavailable")
+
+    monkeypatch.setattr(
+        viewer_main_module, "get_live_kill_switch_state", _unreadable
+    )
+
+    response = client.get("/api/live/kill-switch")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["halts"] == [{"scope": ACCOUNT, "mode": "entries"}]
+    detail = payload["halt_details"]
+    assert len(detail) == 1
+    assert detail[0]["scope"] == ACCOUNT
+    assert detail[0]["mode"] == "entries"
+    assert detail[0]["history_available"] is False
+    assert detail[0]["halted_by"] == "unknown"
 
 
 def test_a_money_moving_mode_is_refused_without_a_confirmation(client) -> None:
@@ -163,6 +192,96 @@ def test_a_confirmed_resume_lifts_the_halt(client) -> None:
     ]
     assert resumes[-1]["succeeded"] is True
     assert resumes[-1]["actor"] == "jane"
+
+
+def test_resuming_an_account_halt_under_a_global_halt_still_reads_halted(
+    client,
+) -> None:
+    """``halted`` answers "still covered", not "own row lifted".
+
+    A global halt covers every account, so resuming the account's own halt
+    must not report ``halted: false`` - that would tell the operator trading
+    may resume on an account the platform halt still covers.
+    """
+    _halt(client, scope="global", mode="flatten", confirmed_scope="global")
+    _halt(client, scope=ACCOUNT, mode="entries")
+
+    response = client.post(
+        RESUME_PATH,
+        json={"scope": ACCOUNT, "confirmed_scope": ACCOUNT},
+        headers={"X-Operator": "jane"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["lifted"] is True
+    assert payload["halted"] is True
+    assert read_live_kill_switch_scopes() == {"global": "flatten"}
+
+
+def test_resuming_the_global_halt_reports_halted_by_remaining_scopes(
+    client,
+) -> None:
+    """The same answer for the global scope itself."""
+    _halt(client, scope="global", mode="flatten", confirmed_scope="global")
+    _halt(client, scope=ACCOUNT, mode="entries")
+
+    response = client.post(
+        RESUME_PATH,
+        json={"scope": "global", "confirmed_scope": "global"},
+        headers={"X-Operator": "jane"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["lifted"] is True
+    # The account's own halt still stands, but it does not cover the 'global'
+    # scope - the scope that was resumed is no longer halted.
+    assert payload["halted"] is False
+    assert read_live_kill_switch_scopes() == {ACCOUNT: "entries"}
+
+
+def test_a_failed_halt_write_is_audited_not_silent(client, monkeypatch) -> None:
+    """A database error is a 500, but the attempt still lands in the audit."""
+
+    def _broken(*args: object, **kwargs: object) -> None:
+        raise OSError("database is unavailable")
+
+    monkeypatch.setattr(viewer_main_module, "set_live_kill_switch", _broken)
+
+    with TestClient(viewer_main_module.app, raise_server_exceptions=False) as raw:
+        response = _halt(raw, scope=ACCOUNT, mode="entries")
+
+    assert response.status_code == 500
+    refusals = [
+        entry
+        for entry in list_live_control_audit()
+        if entry["action"] == "kill_switch.halt" and entry["succeeded"] is False
+    ]
+    assert refusals, "a failed halt write was not recorded as an attempt"
+    assert "database is unavailable" in refusals[-1]["detail"]["reason"]
+
+
+def test_a_failed_resume_write_is_audited_not_silent(client, monkeypatch) -> None:
+    def _broken(*args: object, **kwargs: object) -> None:
+        raise OSError("database is unavailable")
+
+    monkeypatch.setattr(viewer_main_module, "clear_live_kill_switch", _broken)
+
+    with TestClient(viewer_main_module.app, raise_server_exceptions=False) as raw:
+        response = raw.post(
+            RESUME_PATH,
+            json={"scope": ACCOUNT, "confirmed_scope": ACCOUNT},
+            headers={"X-Operator": "jane"},
+        )
+
+    assert response.status_code == 500
+    refusals = [
+        entry
+        for entry in list_live_control_audit()
+        if entry["action"] == "kill_switch.resume" and entry["succeeded"] is False
+    ]
+    assert refusals, "a failed resume write was not recorded as an attempt"
 
 
 def test_resuming_a_scope_that_is_not_halted_is_idempotent(client) -> None:

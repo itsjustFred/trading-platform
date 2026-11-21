@@ -14031,12 +14031,20 @@ async def _kill_switch_details(state: Any) -> list[dict[str, Any]]:
     return details
 
 
-async def _live_kill_switch_state_payload() -> dict[str, Any]:
-    """The halt state as the daemon enforces it, plus each scope's history."""
-    state = await asyncio.to_thread(read_kill_switch_state)
+async def _live_kill_switch_state_payload(state: Any = None) -> dict[str, Any]:
+    """The halt state as the daemon enforces it, plus each scope's history.
+
+    An already-read ``state`` is reused so a caller can answer from the same
+    observation it just acted on rather than racing a second read.
+    """
+    resolved = (
+        state
+        if state is not None
+        else await asyncio.to_thread(read_kill_switch_state)
+    )
     return {
-        **kill_switch_payload(state),
-        "halt_details": await _kill_switch_details(state),
+        **kill_switch_payload(resolved),
+        "halt_details": await _kill_switch_details(resolved),
     }
 
 
@@ -14118,6 +14126,19 @@ async def halt_live_kill_switch(
             detail={"reason": str(exc), "mode": mode},
         )
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    except Exception as exc:
+        # A database failure is not a client error, but the attempt still
+        # belongs in the audit trail: an operator asking "did anyone try to
+        # halt this" must not get silence because the write 500'd.
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": f"{type(exc).__name__}: {exc}", "mode": mode},
+        )
+        raise
     await _audit_live_control(
         action="kill_switch.halt",
         target_type="live_kill_switch",
@@ -14193,6 +14214,18 @@ async def resume_live_kill_switch(
             detail={"reason": str(exc)},
         )
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    except Exception as exc:
+        # Same rule as the halt route: a failed write is still an attempt, and
+        # the audit trail is where an operator looks for it.
+        await _audit_live_control(
+            action="kill_switch.resume",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": f"{type(exc).__name__}: {exc}"},
+        )
+        raise
     await _audit_live_control(
         action="kill_switch.resume",
         target_type="live_kill_switch",
@@ -14216,11 +14249,17 @@ async def resume_live_kill_switch(
                 }
             },
         )
+    # ``halted`` answers "is this scope still covered by a halt", not "was this
+    # scope's own row lifted": a global halt still covers the account after its
+    # own halt is resumed, and reporting ``halted: false`` there would tell the
+    # operator trading may resume when it may not. Read once, after the clear,
+    # so the answer and the embedded state describe the same observation.
+    state = await asyncio.to_thread(read_kill_switch_state)
     return {
-        "halted": False,
+        "halted": state.mode_for_account(scope) is not None,
         "lifted": lifted,
         "scope": scope,
-        "state": await _live_kill_switch_state_payload(),
+        "state": await _live_kill_switch_state_payload(state),
     }
 
 

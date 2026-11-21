@@ -530,6 +530,11 @@ Every attempt, refused ones included, is attributed in `live_control_audit`
   `pending_cancel` - such an order can still fill in a cancel/fill race) is reported as `unmet`
   or `without_adapter` in an ERROR every tick, and its entries are still refused. A halt that
   could not be enforced says so rather than looking clean.
+- It does not cover manual order paths that bypass the daemon's entry gate.
+  `live_runner/test_signal_trigger.py --live` calls `adapter.submit_order` directly for
+  slippage-pipeline testing, so the kill switch does not see it - do not run it against a
+  halted account. (`scripts/live_smoke.py` is different: it submits through
+  `submit_order_with_risk`, so it is refused like any other entry.)
 
 ### Verifying
 
