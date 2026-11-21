@@ -61,6 +61,7 @@ from shared.models import (
     VerificationEvidenceStatus,
     execution_price_is_usable,
     resolve_defined_stat,
+    validate_commission_cost,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -703,7 +704,12 @@ class LiveExecutionModel(SQLModel, table=True):
             signal_id=str(execution.signal_id),
             actual_price=execution.actual_price,
             filled_qty=execution.filled_qty,
-            commission=execution.commission,
+            # The write guard again at the persistence boundary (#285): `LiveExecution`
+            # already validates, but `model_construct` or a future caller could bypass
+            # it, and a wrong-sign commission silently flips `gross - commission` PnL.
+            # SQLModel table models do not run pydantic validators, so the check is
+            # explicit here - the funnel every save path (plain and cumulative) uses.
+            commission=validate_commission_cost(execution.commission),
             timestamp=execution.timestamp,
             broker_order_id=execution.broker_order_id,
             dedupe_key=(str(execution.dedupe_key).strip() or None)

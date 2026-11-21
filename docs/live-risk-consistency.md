@@ -212,23 +212,30 @@ Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (di
 
 ## Commission-Vorzeichen (#184 Finding 14)
 
-`live_executions.commission` ist bei **allen** Brokern ein **positiver Kostenwert**
-(Gebühr = positiv, Rebate = negativ, bekannt-null = `0.0`; ein Rebate kann nur der
-cTrader-Pfad speichern, `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative Werte ab). Net-PnL ist überall
+`live_executions.commission` ist bei **allen** Brokern ein **nicht-negativer Kostenwert**
+(Gebühr = positiv, bekannt-null = `0.0`; #285). Net-PnL ist überall
 `gross - commission` (Viewer, `net_pnl`, Alpaca-CFEE-Backfill aus #143).
 Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
 als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
-`base_adapter.commission_cost` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
+`base_adapter.commission_from_signed_cash_flow` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
 backfillt CFEE als positive Kosten.
+Seit #285 ist der Wert schreibseitig abgesichert: `LiveExecution.commission` und
+`LiveExecutionModel.commission` validieren über `shared.models.validate_commission_cost`
+und werfen `ValueError`/`ValidationError` bei negativem oder nicht-endlichem Wert -
+`commission_from_signed_cash_flow` ist die einzige Sanktionierung der Vorzeichen-Umrechnung,
+aber auch ihr Ergebnis (z. B. ein cTrader-Rebate, das negativ wird) darf nicht gespeichert
+werden. `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative Werte ebenfalls ab.
 Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) trugen das rohe negative
 Vorzeichen; `init_db` wandelt sie einmalig per Migration
 (`_migrate_ctrader_commission_to_cost`, `abs` des gespeicherten Werts) in einen positiven
 Kostenwert um. Nur Konten mit Broker `ctrader` sind betroffen, NULL (unbekannt) und `0.0`
 bleiben. Die Migration ist in `schema_data_migrations` vermerkt und läuft genau einmal:
-ein erneutes `abs` würde einen vom korrigierten Adapter gespeicherten Rebate (negativ)
-in eine Gebühr verwandeln. Ein vor der Änderung gespeicherter cTrader-Rebate (roh positiv)
+seit #285 kann ohnehin kein negativer Wert mehr geschrieben werden, aber ein erneutes
+`abs` würde einen bereits konvertierten Wert unnötig anfassen. Ein vor der Änderung
+gespeicherter cTrader-Rebate (roh positiv)
 ist von einer neuen Gebühr nicht unterscheidbar und bleibt positiv.
-`commission_cost` lehnt nicht-endliche Werte mit `ValueError` ab (kein stilles `0.0`).
+`commission_from_signed_cash_flow` lehnt nicht-endliche Werte mit `ValueError` ab
+(kein stilles `0.0`).
 Deploy-Hinweis: Daemon vor dem ersten Start des neuen Builds stoppen (siehe
 `docs/live-deploy-runbook.md`); ein alter Build, der nach dem Migrationsvermerk noch eine
 rohe negative Gebühr schreibt, wird nicht mehr umgewandelt.

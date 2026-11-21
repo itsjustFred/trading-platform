@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from shared.atomic_io import write_text_atomically
 from shared.trailing import validate_live_deployment_trailing_override
@@ -351,6 +358,26 @@ def execution_price_is_usable(price: Any, verdict: Any) -> bool:
     return math.isfinite(number) and number > 0.0
 
 
+def validate_commission_cost(value: float | None) -> float | None:
+    """The ``live_executions.commission`` write guard (#285): a charge is a positive cost.
+
+    ``None`` is "fee not known yet" (#124) and ``0.0`` a known zero; both pass through. A
+    negative or non-finite value is refused because net PnL is ``gross - commission``
+    everywhere, so a wrong sign silently flips it. Broker-signed cash flows are converted
+    with ``live_runner.base_adapter.commission_from_signed_cash_flow`` before they get
+    here - that helper decides the sign, this guard decides what may be stored. A broker
+    rebate therefore cannot be stored: the conversion yields a negative cost and this
+    guard refuses it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError(f"commission must be finite, got {value!r}")
+    if value < 0:
+        raise ValueError(f"commission must be a non-negative cost, got {value!r}")
+    return value
+
+
 class LiveExecution(BaseModel):
     """Execution fill received from broker for a previously emitted signal."""
 
@@ -365,6 +392,10 @@ class LiveExecution(BaseModel):
     # at fill time the fee is unknown and a later backfill fills it in. The field is required on
     # purpose - an adapter must decide which of the two it has, rather than inherit a default
     # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
+    #
+    # Non-negative by construction (#285): a charge is stored as a positive cost and a wrong
+    # sign would silently flip ``gross - commission`` net PnL, so the field validator refuses
+    # a negative or non-finite value instead of storing it.
     commission: float | None
     timestamp: datetime
     broker_order_id: str
@@ -397,6 +428,11 @@ class LiveExecution(BaseModel):
     # one is `absent`. Nullable because rows written before this column existed carry no verdict -
     # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
+
+    @field_validator("commission")
+    @classmethod
+    def _commission_is_a_non_negative_cost(cls, value: float | None) -> float | None:
+        return validate_commission_cost(value)
 
 
 class LiveBalanceRecord(BaseModel):

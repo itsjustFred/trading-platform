@@ -23,7 +23,7 @@ from live_runner.base_adapter import (
     LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
-    commission_cost,
+    commission_from_signed_cash_flow,
     is_unbounded_tp,
     money_digits_from_trader,
     money_scale,
@@ -535,7 +535,7 @@ def _deal_commission(deal: Any | None) -> float:
 
     cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
     positive cost, the ``live_executions.commission`` convention shared with Alpaca (see
-    ``base_adapter.commission_cost``).
+    ``base_adapter.commission_from_signed_cash_flow``).
 
     ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
     ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
@@ -549,7 +549,7 @@ def _deal_commission(deal: Any | None) -> float:
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
     if not raw or not math.isfinite(raw):
         return 0.0
-    return commission_cost(raw / money_scale(money_digits_from_trader(deal)))
+    return commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
