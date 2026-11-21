@@ -92,7 +92,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # configuration at a different point in the import order and could disagree
 # with the DATA_DIR this module already resolved.
 DATA_DIR = RESOLVED_DATA_DIR
-DB_PATH = DATA_DIR / "backtests.db"
+DB_FILENAME = "backtests.db"
+DB_PATH = DATA_DIR / DB_FILENAME
 # Optional engine override. New code should call get_engine(); importing
 # ENGINE no longer forces engine creation at import time. Tests that need a
 # bespoke engine set this attribute directly (it is part of the module
@@ -105,7 +106,7 @@ def _sqlite_url(path: Path) -> str:
 
 
 def _default_database_url() -> str:
-    return _sqlite_url(DATA_DIR / "backtests.db")
+    return _sqlite_url(DATA_DIR / DB_FILENAME)
 
 
 def _is_sqlite_url(url: str) -> bool:
@@ -148,7 +149,7 @@ def live_db_path() -> Path:
         raw_file = sqlite_url_file(url)
         if raw_file and raw_file != ":memory:":
             return Path(raw_file)
-    return DATA_DIR / "backtests.db"
+    return DATA_DIR / DB_FILENAME
 
 
 def _create_database_engine() -> Any:

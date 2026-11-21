@@ -429,8 +429,9 @@ class TestRealEntryPoint:
         try:
             await_held(holder)
             _run_daemon_process([], data_dir)
+            contender = SingleInstanceLock(lock_path)
             with pytest.raises(SingleInstanceError):
-                SingleInstanceLock(lock_path).acquire()
+                contender.acquire()
         finally:
             holder.kill()
             holder.wait(timeout=10)

@@ -58,10 +58,14 @@ class TestAcquireAndRelease:
 
     def test_the_context_manager_releases_on_an_exception(self, tmp_path: Path) -> None:
         lock_path = tmp_path / "backtests.db.lock"
+        lock = SingleInstanceLock(lock_path)
+
+        def _body() -> None:
+            with lock:
+                raise ValueError("daemon body failed")
 
         with pytest.raises(ValueError):
-            with SingleInstanceLock(lock_path):
-                raise ValueError("daemon body failed")
+            _body()
 
         SingleInstanceLock(lock_path).acquire().release()
 
@@ -70,8 +74,9 @@ class TestAcquireAndRelease:
         lock = SingleInstanceLock(tmp_path / "backtests.db.lock")
         lock.acquire()
         try:
+            contender = SingleInstanceLock(lock.lock_path)
             with pytest.raises(SingleInstanceError) as excinfo:
-                SingleInstanceLock(lock.lock_path).acquire()
+                contender.acquire()
         finally:
             lock.release()
         assert str(lock.lock_path) in str(excinfo.value)
@@ -93,8 +98,9 @@ class TestCrossProcessExclusion:
         try:
             await_held(holder)
 
+            contender = SingleInstanceLock(lock_path)
             with pytest.raises(SingleInstanceError) as excinfo:
-                SingleInstanceLock(lock_path).acquire()
+                contender.acquire()
             assert str(lock_path) in str(excinfo.value)
         finally:
             holder.kill()
@@ -131,8 +137,9 @@ class TestCrossProcessExclusion:
         held = SingleInstanceLock(alias_path)
         held.acquire()
         try:
+            contender = SingleInstanceLock(real_path)
             with pytest.raises(SingleInstanceError):
-                SingleInstanceLock(real_path).acquire()
+                contender.acquire()
         finally:
             held.release()
 
