@@ -389,7 +389,7 @@ Implementierung: `live_runner/signal_archive.py`.
 Jeder Record trägt `schema_version` (aktuell `1`). Die Offline-Pipeline muss
 Zeilen, die nicht parsen (z. B. eine durch einen Absturz abgeschnittene
 Zeile), überspringen und auf `discord_message_id` deduplizieren — ein
-Daemon-Neustart kann zuletzt gepollte Nachrichten erneut archivieren.
+Daemon-Neustart kann zuletzt emittierte Nachrichten erneut archivieren.
 
 **Record-Typen.**
 
