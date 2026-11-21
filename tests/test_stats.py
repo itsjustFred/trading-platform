@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from runner.stats import (
+    _daily_returns,
     _daily_returns_from_equity_curve,
     _daily_returns_series_from_equity_curve,
     _max_consecutive,
@@ -540,6 +541,29 @@ class TestMaxDrawdown:
 
     def test_single_point(self):
         assert _max_drawdown_pct_manual([100]) == 0.0
+
+
+class TestDailyReturnsHelper:
+    """Pin the raw period-return fallback used when no daily series exists."""
+
+    def test_period_over_period_returns(self):
+        assert _daily_returns([100.0, 110.0, 99.0]) == pytest.approx([0.1, -0.1])
+
+    def test_non_positive_previous_equity_is_flat_not_dropped(self):
+        assert _daily_returns([0.0, 10.0, 5.0]) == pytest.approx([0.0, -0.5])
+
+    def test_short_series_has_no_returns(self):
+        assert _daily_returns([]) == []
+        assert _daily_returns([100.0]) == []
+
+    def test_equity_curve_falls_back_when_no_daily_series_exists(self):
+        curve = [
+            EquityPoint(time="2024-01-01T00:00:00Z", equity=0.0),
+            EquityPoint(time="2024-01-02T00:00:00Z", equity=10.0),
+        ]
+
+        assert _daily_returns_series_from_equity_curve(curve) is None
+        assert _daily_returns_from_equity_curve(curve) == [0.0]
 
 
 class TestComputeStatsForResult:
