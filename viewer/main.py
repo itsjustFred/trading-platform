@@ -184,7 +184,10 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
         return []
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
-from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
+from live_runner.broker_order_conflicts import (
+    CONFLICT_SCAN_LIMIT,
+    resolve_broker_order_conflicts,
+)
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
 from shared.models import (
@@ -5241,7 +5244,7 @@ def _broker_order_conflict_health(
     has it passes it rather than scanning twice for one response.
     """
     if grouped is None:
-        grouped = deployments_with_broker_order_conflicts()
+        grouped = deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT)
     conflicts = [conflict for rows in grouped.values() for conflict in rows]
     return {
         "status": "error" if conflicts else "ok",
@@ -13288,7 +13291,10 @@ async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
     deployments, conflicts_by_deployment = await asyncio.gather(
         asyncio.to_thread(list_live_deployments),
-        asyncio.to_thread(deployments_with_broker_order_conflicts),
+        # The shared scan limit, not the database default: a deployment halted by a
+        # conflict older than the 200-row default would report no conflict and no halt
+        # reason, which is the one fact this payload exists to carry.
+        asyncio.to_thread(deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT),
     )
     return [
         _serialize_live_deployment_payload(
@@ -13316,7 +13322,7 @@ async def get_live_dashboard() -> dict[str, Any]:
         deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
     ]
     conflicts_by_deployment = await asyncio.to_thread(
-        deployments_with_broker_order_conflicts
+        deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT
     )
 
     # Fetch stats and trades for all accounts concurrently instead of
@@ -13795,7 +13801,14 @@ async def _reverify_account_against_broker(account_id: str) -> bool:
 
 @app.put(
     "/api/live/deployments/{deployment_id}/status",
-    responses={409: {"description": "Activation is refused by the promotion gate (#165)"}},
+    responses={
+        409: {
+            "description": (
+                "Activation is refused by the promotion gate (#165) or by an "
+                "unresolved broker order id conflict (#126)"
+            )
+        }
+    },
 )
 async def update_live_deployment_status_endpoint(
     deployment_id: str,
@@ -13821,6 +13834,49 @@ async def update_live_deployment_status_endpoint(
         deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
         if deployment is None:
             raise HTTPException(status_code=404, detail="Live deployment not found")
+
+        # Fail closed (#126): a deployment that still carries a broker order id conflict is
+        # halted, and this endpoint is the documented way back - so it must not be the way
+        # *out*. Writing ACTIVE here re-opens ENTRY_DISPATCH_STATUSES and the submission
+        # claim immediately, while `enforce_broker_order_conflict_halts` only re-pauses it
+        # on the next service-sync tick: an entry accepted inside that window is a live
+        # order on a deployment whose broker exposure the ledger cannot explain. One extra
+        # read per operator action, on a path that is about to spend broker round-trips.
+        recorded_conflicts = await asyncio.to_thread(
+            deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT
+        )
+        conflicting_ids = sorted(
+            {
+                str(conflicting_id)
+                for conflict in recorded_conflicts.get(deployment_id, [])
+                for conflicting_id in conflict["conflicting_broker_order_ids"]
+            }
+        )
+        if conflicting_ids:
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "unresolved broker order id conflict",
+                    "account_id": str(deployment.account_id or ""),
+                    "conflicting_broker_order_ids": conflicting_ids,
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment is halted for an unresolved broker order id "
+                    f"conflict (conflicting ids: {', '.join(conflicting_ids)}). An "
+                    "untracked broker order may exist, so it cannot be activated. "
+                    "Reconcile the conflicting id with the broker, then clear it with "
+                    f"POST /api/live/deployments/{deployment_id}/broker-order-conflicts/resolve"
+                    " before resuming."
+                ),
+            )
 
         # Check what can actually trade before spending a broker round-trip on
         # it. An internal-source deployment has no live evaluator, so no account

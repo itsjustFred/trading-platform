@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from live_runner.broker_order_conflicts import CONFLICT_SCAN_LIMIT
 from shared.models import (
     LiveAccount,
     LiveAccountConfig,
@@ -507,13 +508,20 @@ def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatc
             status="ACTIVE",
         ), conflicted_but_active],
     )
-    monkeypatch.setattr(
-        viewer_main_module,
-        "deployments_with_broker_order_conflicts",
-        lambda: {
+    scan_limits: list[int] = []
+
+    def _conflicts(*args, **kwargs):
+        # Record what the endpoint asked for: the fleet-wide read has to carry the
+        # shared scan limit, or a conflict older than the database's 200-row default
+        # would make this payload answer "no conflict" for a halted deployment.
+        scan_limits.append(args[0] if args else kwargs.get("limit"))
+        return {
             str(deployment.id): [conflict],
             str(conflicted_but_active.id): [conflict],
-        },
+        }
+
+    monkeypatch.setattr(
+        viewer_main_module, "deployments_with_broker_order_conflicts", _conflicts
     )
 
     client = TestClient(viewer_main_module.app)
@@ -530,6 +538,121 @@ def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatc
     # one is a conflict the halt is about to land on, and saying otherwise would hide it.
     assert payload[2]["broker_order_conflicts"] == [conflict]
     assert payload[2]["halted_for_broker_order_conflict"] is False
+    assert scan_limits and scan_limits[0] == CONFLICT_SCAN_LIMIT, (
+        f"the deployments endpoint read the conflict ledger at {scan_limits[0]!r}, "
+        "not the shared scan limit, so an older conflict is invisible to operators"
+    )
+
+
+def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
+    monkeypatch, isolated_db_sandbox
+) -> None:
+    """#311 blocker 2a: the resume path must not be the way out of a conflict halt.
+
+    The halt is re-asserted on the service-sync tick, but that tick is up to 60 s away
+    and an ACTIVE write opens entries and the submission claim *now*: an entry inside
+    that window is a live order on a deployment whose broker exposure the ledger cannot
+    explain. The operator endpoint refuses while the conflict is recorded, names the
+    conflicting ids and points at the resolve endpoint - the way out of the halt.
+    """
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-conflict", "alpaca", is_demo=True)
+    deployment_id = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(deployment_id),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-conflict",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            # A fresh deployment is created PAUSED, so this is the state a conflict
+            # halt is imposed on.
+            status="PAUSED",
+            signal_source_type="discord",
+        )
+    )
+
+    # A duplicate delivery carrying a different broker order id: the conflict is
+    # recorded on the signal and the deployment is halted by the same transaction.
+    from shared.database import save_live_signal
+    from shared.models import LiveSignal
+
+    _signal = LiveSignal(
+        deployment_id=deployment_id,
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 11, 21, tzinfo=timezone.utc),
+        metadata={"discord_message_id": "ord-1", "broker_order_id": "BRK-AAA"},
+    )
+    save_live_signal(_signal)
+    save_live_signal(_signal.model_copy(update={"metadata": {
+        "discord_message_id": "ord-1",
+        "broker_order_id": "BRK-BBB",
+    }}))
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+
+    broker_round_trips: list[str] = []
+
+    async def _must_not_reverify(account_id: str) -> bool:
+        broker_round_trips.append(account_id)
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _must_not_reverify
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        # Confirmed, so the 409 is the conflict refusal and not the precondition.
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "BRK-BBB" in detail
+    assert "broker-order-conflicts/resolve" in detail
+    # The row is untouched - no fail-open window at all.
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+    # Refused before any broker round-trip: no account verification can lift a halt.
+    assert broker_round_trips == []
+
+    # The refusal is audited like every other refused live control.
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == deployment_id and not entry.get("succeeded")
+    ]
+    assert entries, "the refused activation must be audited"
+    assert "conflict" in (entries[0].get("detail") or {}).get("reason", "")
+
+    # Resolve the conflict and the same call is no longer refused for it: the conflict
+    # gate is the only thing that changed, so this keeps it from reading as "the
+    # deployment can never be armed".
+    from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
+
+    resolve_broker_order_conflicts(deployment_id)
+    resumed = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert database_module.get_live_deployment(deployment_id).status == "ACTIVE"
 
 
 def test_an_unread_conflict_ledger_is_not_reported_as_confirmed_empty(monkeypatch) -> None:
@@ -563,10 +686,11 @@ def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):
         status="PAUSED",
     )
     _dashboard_fixture(monkeypatch, viewer_main_module, deployment)
-    monkeypatch.setattr(
-        viewer_main_module,
-        "deployments_with_broker_order_conflicts",
-        lambda: {
+    scan_limits: list[int] = []
+
+    def _conflicts(*args, **kwargs):
+        scan_limits.append(args[0] if args else kwargs.get("limit"))
+        return {
             str(deployment.id): [
                 {
                     "signal_id": "11111111-1111-1111-1111-111111111111",
@@ -576,7 +700,10 @@ def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):
                     "conflicting_broker_order_ids": ["BRK-BBB"],
                 }
             ]
-        },
+        }
+
+    monkeypatch.setattr(
+        viewer_main_module, "deployments_with_broker_order_conflicts", _conflicts
     )
 
     client = TestClient(viewer_main_module.app)
@@ -590,6 +717,13 @@ def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):
     # The halted deployment is not in `active_strategies` (it is not ACTIVE), which is
     # exactly why the conflict is reported on its own.
     assert payload["active_strategies"] == []
+    # Read once for the whole response, at the shared scan limit: a conflict older
+    # than the database's 200-row default would make the dashboard report a clean
+    # fleet while a deployment is halted.
+    assert scan_limits and scan_limits[0] == CONFLICT_SCAN_LIMIT, (
+        f"the dashboard read the conflict ledger at {scan_limits[0]!r}, not the "
+        "shared scan limit"
+    )
 
 
 def test_resolving_broker_order_conflicts_requires_confirmation_and_a_reason(
