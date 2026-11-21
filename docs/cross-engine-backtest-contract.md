@@ -51,9 +51,10 @@ parent Cleanup 16 record.
   resolvers use (#237): when a row carries both, `take_profit` wins and
   `tp_price` is the fallback when it is absent, null or unusable. Native
   resolves it inside `TradeEngine._extract_levels`; vectorbt resolves it in
-  `_find_indicator_series`, where the alias spellings are scanned
-  canonical-first so the winner never depends on the order the strategy
-  published them in. One alias pair must never become two levels: both would
+  `_find_indicator_series` (which alias series to read) and
+  `_resolve_take_profit_price` (the entry-bar value), canonical spelling first,
+  so the winner never depends on the order the strategy published them in.
+  One alias pair must never become two levels: both would
   be named `tp`, so the row's single intended level filled as two take-profit
   legs that shared the `tp_pct` fraction, and the phantom candidate also took
   a share of the default `1/n` split (an explicit `tpN_pct` fraction is keyed
