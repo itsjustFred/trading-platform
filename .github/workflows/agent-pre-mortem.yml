@@ -86,11 +86,15 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # PR's name - and the *current* head is refused too: its bucket is named after
 # the commit, so it would run beside the push analysing that same diff instead of
 # superseding it. Re-running the current head is `-f pr_number=<N>` alone:
+#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N>
+# and re-analysing an older commit of this PR - the case a dispatch exists for -
+# is the same command with that commit's SHA, which is what keeps it in a bucket
+# of its own beside the current head's run:
 #   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 # A dispatch can only name a ref that carries this workflow file. This PR is the
 # one that adds it, so until it merges into the default branch the manual rerun is
 # not reachable and a push is the only re-run - every push re-analyses the new
-# head, which is the normal path anyway. After the merge the command above works
+# head, which is the normal path anyway. After the merge the commands above work
 # from any branch.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):

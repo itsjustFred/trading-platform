@@ -887,6 +887,43 @@ def _dispatch_group(group_template: str, sha: str) -> str:
     )
 
 
+def test_the_documented_current_head_rerun_is_the_form_the_refusal_names() -> None:
+    """The header documents how to re-run the current head, and the resolve step refuses naming
+    it: an operator who copies the documented command straight after reading that refusal hits
+    the refusal itself. The sentence and the command that follows it are pinned against each
+    other, and against the remedy the refusal prints.
+
+    The command that used to follow "Re-running the current head is `-f pr_number=<N>` alone:"
+    was the older-commit form, `-f pr_number=<N> -f head_sha=<head-sha>` - the very form the
+    workflow refuses for the current head - so the documented remedy for a current-head re-run
+    could not be used. The bare form now follows the sentence, and the SHA form is labelled as
+    the older-commit one so it is not read as the current head's."""
+    text = (WORKFLOWS / PREMORTEM).read_text(encoding="utf-8")
+    sentence = re.search(
+        r"^#.*Re-running the current head is `-f pr_number=<N>` alone:$", text, re.M
+    )
+    assert sentence, "the header no longer documents the bare current-head rerun"
+    documented = re.findall(r"^#\s+(gh workflow run \S.*)$", text[sentence.end() :], re.M)
+    assert documented, "no rerun command follows that sentence"
+    assert "head_sha" not in documented[0], (
+        "the documented current-head rerun names a head_sha, which the workflow refuses:\n"
+        + documented[0]
+    )
+    # The older-commit form is still documented, and says which commit it is for: dropping it
+    # would leave the one case a dispatch exists for undocumented.
+    with_sha = [command for command in documented if "head_sha" in command]
+    assert with_sha, "the older-commit rerun form is no longer documented"
+    leading = text[sentence.end() : text.index(with_sha[-1])]
+    assert "older commit" in leading, (
+        "the head_sha form is not labelled as the older-commit one, so it reads as the current"
+        " head's:\n" + leading
+    )
+    # And the refusal names the same remedy the header documents.
+    resolve = _load(PREMORTEM)["jobs"]["resolve"]
+    body = _run(_find_step(resolve, r"^Resolve PR$"))
+    assert "omit head_sha" in body, "the refusal no longer names the bare form"
+
+
 def test_a_text_edit_cannot_cancel_the_running_analysis() -> None:
     """The concurrency bucket decides which run cancels which, and this is a behaviour, not a
     string: a `pull_request` `edited` run whose event carries no changed base (a title, body or
