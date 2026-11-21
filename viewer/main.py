@@ -13988,21 +13988,44 @@ async def _require_kill_switch_confirmation(
 
 
 async def _kill_switch_details(state: Any) -> list[dict[str, Any]]:
-    """Every halted scope with the history its row carries, for the payload."""
+    """Every halted scope with the history its row carries, for the payload.
+
+    The mode is the one the state read already captured, so the payload's two
+    views cannot describe two different observations of a halt someone escalated
+    in between. A history read that fails is marked as such rather than allowed to
+    fail the whole response: the state above it is the answer the caller asked
+    for, and "history unavailable" is distinguishable from "no history".
+    """
     details: list[dict[str, Any]] = []
     for scope in state.halted_scopes():
-        record = await asyncio.to_thread(get_live_kill_switch_state, scope)
+        mode = state.halts[scope].value
+        try:
+            record = await asyncio.to_thread(get_live_kill_switch_state, scope)
+        except Exception as exc:
+            logger.warning(
+                "Could not read the halt history for scope %s",
+                scope,
+                extra={"data": {"scope": scope, "error": repr(exc)}},
+            )
+            details.append(
+                {
+                    "scope": scope,
+                    "mode": mode,
+                    "halted_at": None,
+                    "halted_by": "unknown",
+                    "reason": "",
+                    "history_available": False,
+                }
+            )
+            continue
         details.append(
             {
                 "scope": scope,
-                "mode": (
-                    record.mode
-                    if record is not None
-                    else state.halts[scope].value
-                ),
+                "mode": mode,
                 "halted_at": record.halted_at if record is not None else None,
                 "halted_by": record.halted_by if record is not None else "unknown",
                 "reason": record.reason if record is not None else "",
+                "history_available": True,
             }
         )
     return details

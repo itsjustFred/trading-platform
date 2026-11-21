@@ -526,9 +526,10 @@ Every attempt, refused ones included, is attributed in `live_control_audit`
   transition; the kill switch is an account- or platform-level halt that stays in force until it
   is lifted.
 - It is not a guarantee about the broker. An account whose halt cannot be enforced (no adapter
-  can be connected, or the broker refuses a cancel) is reported as `unmet` or `without_adapter`
-  in an ERROR every tick, and its entries are still refused. A halt that could not be enforced
-  says so rather than looking clean.
+  can be connected, the broker refuses a cancel, or a cancel is still settling in
+  `pending_cancel` - such an order can still fill in a cancel/fill race) is reported as `unmet`
+  or `without_adapter` in an ERROR every tick, and its entries are still refused. A halt that
+  could not be enforced says so rather than looking clean.
 
 ### Verifying
 

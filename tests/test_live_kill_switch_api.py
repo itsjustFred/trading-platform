@@ -63,6 +63,14 @@ def test_a_halt_is_set_from_the_dashboard_and_read_back(client) -> None:
     # The returned state is what the daemon enforces, not an echo of the write.
     assert payload["state"]["halts"] == [{"scope": ACCOUNT, "mode": "orders"}]
     assert payload["state"]["halted_accounts"] == [ACCOUNT]
+    detail = payload["state"]["halt_details"]
+    assert len(detail) == 1
+    assert detail[0]["scope"] == ACCOUNT
+    # The detail's mode is the one the state captured, so the payload's two views
+    # cannot describe two different observations of an escalation.
+    assert detail[0]["mode"] == "orders"
+    assert detail[0]["history_available"] is True
+    assert detail[0]["halted_by"]
 
 
 def test_a_money_moving_mode_is_refused_without_a_confirmation(client) -> None:

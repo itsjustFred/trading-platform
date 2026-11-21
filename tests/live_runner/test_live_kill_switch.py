@@ -600,6 +600,33 @@ def test_an_incomplete_flatten_is_reported_and_retried(
     assert "AAPL" in caplog.text
 
 
+def test_a_pending_cancel_is_not_a_completed_sweep(isolated_db_sandbox, account) -> None:
+    """A cancel the broker accepted but has not settled can still fill.
+
+    ``ControlOutcome.complete`` ignores ``pending_cancel``, so reading it as a
+    clean sweep would let an order fill after the account was reported flat. The
+    STOPPED machinery holds its stamp for exactly the same reason.
+    """
+    set_live_kill_switch(account, "flatten", actor="operator")
+
+    class _PendingCancel(_SweepAdapter):
+        async def cancel_open_orders(self) -> ControlOutcome:
+            self.calls.append("cancel_open_orders")
+            return ControlOutcome(completed=1, pending_cancel=("order-9",))
+
+    adapter = _PendingCancel()
+    report = asyncio.run(
+        enforce_live_kill_switch(
+            {account: adapter}, [account], state=read_kill_switch_state()
+        )
+    )
+
+    assert report.unmet == (account,)
+    assert report.swept == ()
+    # The flatten still runs: closing the positions is the money-safety action.
+    assert "close_all_positions" in adapter.calls
+
+
 def test_a_completed_sweep_is_not_repeated_before_the_interval(
     isolated_db_sandbox, account
 ) -> None:

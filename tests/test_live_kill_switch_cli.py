@@ -218,6 +218,22 @@ def test_a_mode_this_build_cannot_interpret_is_refused_and_audited(account) -> N
     assert "stop" in refusals[-1]["detail"]["error"]
 
 
+def test_a_json_result_is_the_only_thing_on_stdout(account, capsys) -> None:
+    """A caller parsing `--json` must not have to unwrap a log line.
+
+    The CLI's own warning about the halt goes to stderr (the console handlers are
+    rerouted in `main`), so stdout stays a single JSON document.
+    """
+    exit_code = live_kill_switch.main(
+        ["halt", "--scope", ACCOUNT, "--mode", "entries", "--json"]
+    )
+    out, err = capsys.readouterr()
+
+    assert exit_code == 0
+    assert json.loads(out)["mode"] == "entries"
+    assert "Kill switch halt written by the CLI" in err
+
+
 def test_a_halt_is_recorded_in_the_control_audit_trail(account) -> None:
     """Who halted trading, and why, stays answerable afterwards."""
     exit_code = live_kill_switch.main(

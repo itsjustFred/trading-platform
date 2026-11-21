@@ -422,12 +422,24 @@ async def _cancel_working_orders(account_id: str, adapter: BaseLiveAdapter) -> _
             extra={"data": {"account_id": account_id}},
         )
         return _SweepStep.INCOMPLETE
-    if not cancelled.complete:
+    if not cancelled.complete or cancelled.pending_cancel:
+        # ``complete`` ignores ``pending_cancel``, and a pending cancel is the one
+        # outcome that can still open a position: the order may fill in a
+        # cancel/fill race, so the sweep is not clean until the ids are gone. The
+        # STOPPED machinery holds its stamp for the same reason (#274's rule), and
+        # the flatten below still runs - closing the positions is the money-safety
+        # action, and the next pass re-checks what is left.
         logger.error(
-            "Order cancel was incomplete for a halted account; retrying next "
-            "tick: %s",
+            "Order cancel is not settled for a halted account; retrying next "
+            "tick: %s pending_cancel=%s",
             cancelled.describe(),
-            extra={"data": {"account_id": account_id}},
+            sorted(cancelled.pending_cancel),
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "pending_cancel": sorted(cancelled.pending_cancel),
+                }
+            },
         )
         return _SweepStep.INCOMPLETE
     return _SweepStep.COMPLETE

@@ -57,7 +57,7 @@ from shared.database import (
     record_live_control_audit,
     set_live_kill_switch,
 )
-from shared.logging import get_logger
+from shared.logging import get_logger, route_console_logs_to_stderr
 
 logger = get_logger("live-runner")
 
@@ -284,6 +284,8 @@ _COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI. Returns the process exit code; never raises for a refusal."""
+    # stdout is the result document for --json callers; the log lines go to stderr.
+    route_console_logs_to_stderr()
     args = _build_parser().parse_args(argv)
     command = _COMMANDS[args.command]
     try:
