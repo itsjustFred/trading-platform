@@ -248,11 +248,39 @@ def _invalidate_ohlcv_cache(cache_key: tuple[str, str]) -> None:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _load_result(backtest_id: str) -> BacktestResult | None:
-    path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
+_SAFE_RESULT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _contained_backtest_result_path(backtest_id: object) -> Path | None:
+    """The ``{id}.trades.json`` path for a client-supplied backtest id, or None.
+
+    Same contract as the viewer's asset-path containment (#222/#155): the id
+    must be a single safe path segment, and the resolved candidate must be a
+    direct child of the resolved ``BACKTESTS_DIR`` with no symlink in the way,
+    so an id can never resolve a read outside the backtests tree (#230).
+    """
+    normalized = str(backtest_id or "").strip()
+    if (
+        not normalized
+        or normalized in {".", ".."}
+        or _SAFE_RESULT_ID_RE.fullmatch(normalized) is None
+    ):
         return None
-    return BacktestResult.load(str(path))
+    base = BACKTESTS_DIR.resolve()
+    raw_candidate = BACKTESTS_DIR / f"{normalized}.trades.json"
+    if raw_candidate.is_symlink():
+        return None
+    candidate = raw_candidate.resolve()
+    if candidate.parent != base:
+        return None
+    return candidate
+
+
+def _load_result(backtest_id: str) -> BacktestResult | None:
+    path = _contained_backtest_result_path(backtest_id)
+    if path is None or not path.exists():
+        return None
+    return BacktestResult.load(path, root=BACKTESTS_DIR)
 
 
 def _optimization_path(optimization_id: str) -> Path:

@@ -1908,12 +1908,14 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
     if result is not None:
         return result
 
-    path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
+    # Containment, not a bare join: the id is a route parameter, and an
+    # unresolved `..`/absolute form must never read outside BACKTESTS_DIR (#230).
+    path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if path is None or not path.exists():
         return None
 
     try:
-        fallback_result = BacktestResult.load(str(path))
+        fallback_result = BacktestResult.load(path, root=BACKTESTS_DIR)
         save_result_to_sqlite(fallback_result)
         return fallback_result
     except Exception as exc:
@@ -9769,7 +9771,11 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
 
     result.meta.notes = updated_name
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
+    # The write side of the same id→path join the loader contains (#230): a
+    # stored row loaded by id must never be written outside BACKTESTS_DIR.
+    output_path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if output_path is None:
+        raise HTTPException(status_code=400, detail="Invalid backtest id")
     try:
         result.save(output_path)
         save_result_to_sqlite(result)

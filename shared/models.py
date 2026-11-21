@@ -1063,9 +1063,20 @@ class BacktestResult:
         return p
 
     @classmethod
-    def load(cls, path: str | Path) -> BacktestResult:
-        """Load from JSON file."""
+    def load(cls, path: str | Path, *, root: str | Path | None = None) -> BacktestResult:
+        """Load from JSON file.
+
+        ``root`` optionally confines the read: the resolved path must stay
+        inside the resolved root, so a caller that builds ``path`` from an
+        identifier cannot be walked out of its data directory (#230). Without
+        ``root`` the path is taken as given, which is what the CLI callers
+        need.
+        """
         p = Path(path)
+        if root is not None:
+            resolved = p.resolve()
+            if not resolved.is_relative_to(Path(root).resolve()):
+                raise ValueError(f"Backtest result path escapes root {root}: {path}")
         if not p.is_file():
             raise FileNotFoundError(f"Backtest result file not found: {path}")
         return cls.from_json(p.read_text(encoding="utf-8"))

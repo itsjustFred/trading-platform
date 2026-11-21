@@ -906,3 +906,136 @@ def test_failed_maintenance_rollback_retains_journal_and_requires_manual_cleanup
         db_delete=lambda _asset_id: True,
     )
     assert journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# Seam 8: backtest result paths loaded by id (#230)
+# ---------------------------------------------------------------------------
+
+
+def _trades_result(backtest_id: str):
+    from shared.models import BacktestMeta, BacktestResult
+
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=backtest_id,
+            created_at="2026-01-01T00:00:00Z",
+            engine="native",
+            strategies=["Demo"],
+        ),
+        trades=[],
+        stats={},
+    )
+
+
+def test_contained_backtest_result_path_refuses_escape(monkeypatch, tmp_path):
+    from viewer import core
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(core, "BACKTESTS_DIR", backtests_dir)
+
+    expected = (backtests_dir / "abc-123_X.Y").resolve()
+    assert (
+        core._contained_backtest_result_path("abc-123_X.Y")
+        == expected.with_name("abc-123_X.Y.trades.json")
+    )
+
+    for raw in (
+        "../escape",
+        "..",
+        ".",
+        "",
+        "   ",
+        "a/b",
+        "a\\b",
+        "/abs/path",
+        "C:\\temp\\x",
+        "a:b",
+        "..%2Fescape",
+        "id name",
+        None,
+    ):
+        assert core._contained_backtest_result_path(raw) is None, f"{raw!r} must be refused"
+
+    # A symlink planted inside the tree must not be followed out of it.
+    outside = tmp_path / "outside.trades.json"
+    _trades_result("outside").save(outside)
+    link = backtests_dir / "link.trades.json"
+    link.symlink_to(outside)
+    assert core._contained_backtest_result_path("link") is None
+
+
+def test_backtest_result_load_root_confines_reads(tmp_path):
+    from shared.models import BacktestResult
+
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    inside = backtests_dir / "ok.trades.json"
+    outside = tmp_path / "outside.trades.json"
+    _trades_result("ok").save(inside)
+    _trades_result("outside").save(outside)
+
+    assert BacktestResult.load(inside, root=backtests_dir).meta.id == "ok"
+    with pytest.raises(ValueError):
+        BacktestResult.load(outside, root=backtests_dir)
+    # A `..` segment that resolves outside the root is refused after resolving.
+    with pytest.raises(ValueError):
+        BacktestResult.load(backtests_dir / ".." / "outside.trades.json", root=backtests_dir)
+    # Without root the CLI contract is unchanged: any path loads as given.
+    assert BacktestResult.load(outside).meta.id == "outside"
+
+
+def test_backtest_stats_endpoint_never_reads_outside_backtests_dir(
+    security_client, tmp_path
+):
+    """An id that escapes BACKTESTS_DIR is a 404, not a file read (#230)."""
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+
+    # A perfectly valid artifact parked OUTSIDE the backtests tree: if the
+    # loader still joined the raw id it would be served.
+    secret = tmp_path / "escape.trades.json"
+    _trades_result("escape").save(secret)
+
+    for bad_id in ("../escape", "..%2Fescape", "a/b", "/etc/passwd"):
+        response = security_client.get(f"/api/backtest/{bad_id}/stats")
+        assert response.status_code in {400, 404, 422}, (bad_id, response.status_code)
+        assert response.status_code != 200
+    assert secret.exists()
+
+    # The contained id still serves normally.
+    _trades_result("real-run").save(backtests_dir / "real-run.trades.json")
+    response = security_client.get("/api/backtest/real-run/stats")
+    assert response.status_code == 200, response.text
+
+
+def test_backtest_rename_refuses_an_id_that_escapes_backtests_dir(
+    security_client, tmp_path, monkeypatch
+):
+    """The write side of the same join must not rename-save outside the tree."""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    import viewer.main as viewer_app_module
+
+    result = _trades_result("row-loaded")
+    monkeypatch.setattr(viewer_app_module, "_load_result", lambda _id: result)
+
+    response = security_client.patch(
+        "/api/backtests/..%2Fescape",
+        json={"name": "new title"},
+    )
+    assert response.status_code in {400, 404, 422}, response.status_code
+
+    # Routing cannot deliver a raw separator, but the guard must refuse the
+    # id itself: a stored row loaded by id is never written outside the tree.
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_backtest(
+                "../escape", viewer_app_module.NameUpdateRequest(name="x")
+            )
+        )
+    assert exc_info.value.status_code == 400
+    assert not (tmp_path / "escape.trades.json").exists()
