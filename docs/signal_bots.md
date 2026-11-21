@@ -252,8 +252,32 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   nicht im Ledger landen. **Restrisiko:** Auf einem genetteten Account senkt eine
   Broker-seitige Schließung für ein anderes Deployment die Broker-Position; die
   Deckelung schließt dann einen Teil von dessen Anteil mit. Der Alert nennt das,
-  das Ledger muss danach abgeglichen werden. Fills von Bracket-Legs gegen das
-  Parent-Signal zu buchen ist die eigentliche Lösung und ein eigenes Issue.
+  das Ledger muss danach abgeglichen werden.
+- **Broker-seitige Schließungen im Ledger (#144):** Ein Alpaca-Bracket-Leg
+  (Stop- oder Target-Leg) schließt die Position des Parent-Signals, ohne dass
+  diese Plattform je eine Order dafür abgeschickt hat. Seit #144 wird so ein Fill
+  **gegen das Ledger des Parent-Deployments gebucht**:
+  `record_live_broker_side_close_fill` legt ein Signal derselben Deployment mit
+  der *reduzierenden* Seite an (Sell für ein Buy-Entry; `source=broker_close`,
+  deterministische Id aus der Parent-Signal-Id, Metadaten `broker_side_close`,
+  `broker_close_reason`, `parent_signal_id`) und bucht den Fill im selben
+  gesperrten Insert-Pfad wie jeden anderen Fill, mit dem Broker-eigenen
+  Dedupe-Key (Leg-Order-Id + kumulierte Leg-Menge). Das Ledger des Deployments
+  sinkt damit um genau das, was der Broker geschlossen hat, und
+  `get_account_net_filled_qty_by_deployment` stimmt wieder mit der
+  Broker-Position überein - kein `exit_ledger_mismatch`-Alert mehr und der Exit
+  sized gegen den eigenen Anteil statt gegen die Deckelung.
+  Die Zuordnung Leg-Order-Id → Parent-Signal wird beim Submit und in jedem
+  Reconciliation-Pass aus den verschachtelten Legs der Parent-Order gelernt (der
+  Pass läuft beim Connect, bevor der Trading-Stream Events verarbeitet); ein
+  Fill, dessen Order-Id keine bekannte Leg ist, bleibt unverändert auf dem
+  bisherigen Pfad. Eine Leg auf der *aufbauenden* Seite, ein unbekanntes
+  Parent-Signal, ein Fill ohne Zeitstempel oder ohne nutzbare Menge wird
+  abgelehnt (geloggt, nichts geschrieben) - nie erfunden.
+  **Noch offen (#144):** cTrader-SL/TP-Schließungen (Deal → Position →
+  Origin-Signal), Flatten (`close_all_positions` / `close_position`) und
+  manuelle Schließungen werden noch nicht gebucht; für sie gilt weiterhin
+  Deckelung + Alert, und das Ledger muss manuell abgeglichen werden.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.

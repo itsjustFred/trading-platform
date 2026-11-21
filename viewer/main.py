@@ -91,6 +91,7 @@ from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
 from shared.database import (
+    BROKER_CLOSE_SIGNAL_SOURCE,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
@@ -12723,6 +12724,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
 
     trades: list[dict[str, Any]] = []
     for row in rows:
+        # #144: a broker-side close is a ledger row for a fill the broker made, not a
+        # trade of ours: it has no theoretical price, so any P&L or slippage computed
+        # from it would be fabricated (a stop at 95 would read as a -950 loss on 10
+        # shares). The realized-PnL stats path prices it from actual prices instead.
+        if str(row.get("source") or "") == BROKER_CLOSE_SIGNAL_SOURCE:
+            continue
         signal_metadata = row.get("signal_metadata")
         metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
