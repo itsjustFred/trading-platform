@@ -128,30 +128,48 @@ def _intrabar_frame() -> pd.DataFrame:
     )
 
 
-def _unusable_take_profit_strategy_text() -> str:
-    """A canonical take-profit no bar can reach, plus the usable alias price."""
-    rungs = 24
+def _alias_strategy_text(*, canonical_price: str, alias_price: str, alias_first: bool) -> str:
+    """One take-profit level published under both spellings, conflicting prices.
+
+    ``alias_first`` publishes the alias spelling (``tp_price``) ahead of the
+    canonical one, so the indicators dict's insertion order favours the loser.
+    An order-dependent resolution exits at / records the alias price instead.
+    """
+    levels = "'tp_price': alias, 'take_profit': canonical"
+    if alias_first:
+        levels = "'take_profit': canonical, 'tp_price': alias"
     return (
         "import pandas as pd\n"
-        "STRATEGY_META = {'name': 'vbt_tp_unusable', 'version': '1.0'}\n"
+        "STRATEGY_META = {'name': 'vbt_tp_alias', 'version': '1.0'}\n"
         "def generate_signals(df, params):\n"
         "    n = len(df)\n"
         "    entries = pd.Series([i == 0 for i in range(n)], index=df.index)\n"
         "    exits = pd.Series([i == n - 1 for i in range(n)], index=df.index)\n"
         "    direction = pd.Series(['LONG'] + [None] * (n - 1), index=df.index, dtype=object)\n"
-        "    take_profit = pd.Series([float('inf'), None, None], index=df.index, dtype=object)\n"
-        "    tp_price = pd.Series([110.0, None, None], index=df.index, dtype=object)\n"
-        "    return entries, exits, {'direction': direction, 'take_profit': take_profit, 'tp_price': tp_price}\n"
+        f"    alias = pd.Series([{alias_price}, None, None], index=df.index, dtype=object)\n"
+        f"    canonical = pd.Series([{canonical_price}, None, None], index=df.index)\n"
+        f"    return entries, exits, {{'direction': direction, {levels}}}\n"
     )
+
+
+def _alias_env(tmp_path: Path, name: str, **kwargs):
+    _write_shared_ohlcv(tmp_path, "VBA", _frame())
+    _write_shared_ohlcv(tmp_path, "VBA", _intrabar_frame(), timeframe="5m")
+    path = tmp_path / f"{name}.py"
+    path.write_text(_alias_strategy_text(**kwargs))
+    return tmp_path, str(path)
 
 
 @pytest.fixture
 def unusable_tp_env(tmp_path: Path):
-    _write_shared_ohlcv(tmp_path, "VBA", _frame())
-    _write_shared_ohlcv(tmp_path, "VBA", _intrabar_frame(), timeframe="5m")
-    path = tmp_path / "vbt_tp_unusable.py"
-    path.write_text(_unusable_take_profit_strategy_text())
-    return tmp_path, str(path)
+    """A canonical take-profit no bar can reach, plus the usable alias price."""
+    return _alias_env(
+        tmp_path,
+        "vbt_tp_unusable",
+        canonical_price="float('inf')",
+        alias_price="110.0",
+        alias_first=True,
+    )
 
 
 class TestUnusableTakeProfitPrice:
@@ -169,30 +187,6 @@ class TestUnusableTakeProfitPrice:
         assert trade.exits, "the usable take-profit level must fill"
         assert trade.exits[0].price == pytest.approx(110.0)
         assert trade.meta["tp_price"] == pytest.approx(110.0)
-
-
-def _alias_strategy_text(*, alias_first: bool) -> str:
-    """One take-profit level published under both spellings, conflicting prices.
-
-    ``alias_first`` publishes the alias spelling (105) ahead of the canonical
-    one (110) so the indicators dict's insertion order favours the loser. An
-    order-dependent resolution exits at 105 / records 105 in ``trade.meta``.
-    """
-    levels = "'tp_price': tp_price, 'take_profit': take_profit"
-    if alias_first:
-        levels = "'take_profit': take_profit, 'tp_price': tp_price"
-    return (
-        "import pandas as pd\n"
-        "STRATEGY_META = {'name': 'vbt_tp_alias', 'version': '1.0'}\n"
-        "def generate_signals(df, params):\n"
-        "    n = len(df)\n"
-        "    entries = pd.Series([i == 0 for i in range(n)], index=df.index)\n"
-        "    exits = pd.Series([i == n - 1 for i in range(n)], index=df.index)\n"
-        "    direction = pd.Series(['LONG'] + [None] * (n - 1), index=df.index, dtype=object)\n"
-        "    tp_price = pd.Series([105.0, None, None], index=df.index, dtype=object)\n"
-        "    take_profit = pd.Series([110.0, None, None], index=df.index, dtype=object)\n"
-        f"    return entries, exits, {{'direction': direction, {levels}}}\n"
-    )
 
 
 def _config(tmp_path: Path, strategy_path: str) -> BacktestConfig:
@@ -218,11 +212,13 @@ def _config(tmp_path: Path, strategy_path: str) -> BacktestConfig:
 def alias_env(tmp_path: Path, request):
     """Both publication orders: the resolution must not depend on either."""
     alias_first = bool(getattr(request, "param", True))
-    _write_shared_ohlcv(tmp_path, "VBA", _frame())
-    _write_shared_ohlcv(tmp_path, "VBA", _intrabar_frame(), timeframe="5m")
-    path = tmp_path / "vbt_tp_alias.py"
-    path.write_text(_alias_strategy_text(alias_first=alias_first))
-    return tmp_path, str(path)
+    return _alias_env(
+        tmp_path,
+        "vbt_tp_alias",
+        canonical_price="110.0",
+        alias_price="105.0",
+        alias_first=alias_first,
+    )
 
 
 @pytest.mark.parametrize("alias_env", [True, False], indirect=True)

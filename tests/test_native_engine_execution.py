@@ -1,3 +1,5 @@
+from typing import Any
+
 import pandas as pd
 import pytest
 
@@ -607,6 +609,50 @@ def test_native_engine_take_profit_alias_does_not_consume_a_fraction_share():
     ] * 3
 
 
+def _level_frame(bars: int = 5) -> pd.DataFrame:
+    """``bars`` bars whose entry fills next-open and whose bar 2 rallies
+    through every take-profit level these tests use (and no further).
+    """
+    rungs = range(bars)
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [f"2024-01-01 00:{minute:02d}" for minute in rungs], utc=True
+            ),
+            "open": [100.0, 101.0] + [105.0] * (bars - 2),
+            "high": [100.5, 101.5, 112.5] + [105.5] * (bars - 3),
+            "low": [99.5, 100.5, 104.5] + [104.5] * (bars - 3),
+            "close": [100.0, 101.0] + [105.0] * (bars - 2),
+        }
+    )
+
+
+def _run_with_levels(engine: TradeEngine, levels: dict[str, Any], bars: int = 5):
+    """Run ``engine`` over ``_level_frame(bars)`` with ``levels`` on bar 0.
+
+    Each entry is one signal column published on the entry bar only, so the
+    exit legs report which level the engine actually armed.
+    """
+    rungs = range(bars)
+
+    def strategy(df, params):
+        index = df.index
+        entries = pd.Series([i == 0 for i in rungs], index=index)
+        exits = pd.Series([i == bars - 1 for i in rungs], index=index)
+        indicators = {
+            "direction": pd.Series(
+                ["LONG"] + [None] * (bars - 1), index=index, dtype=object
+            )
+        }
+        for name, value in levels.items():
+            series = pd.Series([None] * bars, index=index, dtype=object)
+            series.iloc[0] = value
+            indicators[name] = series
+        return entries, exits, indicators, []
+
+    return engine.run(_level_frame(bars), strategy)
+
+
 def test_native_engine_take_profit_alias_fills_one_take_profit_level():
     """End to end (#237): the aliased pair is one take-profit level.
 
@@ -616,39 +662,14 @@ def test_native_engine_take_profit_alias_fills_one_take_profit_level():
     position at 105 and the rest at 112 — two take-profit legs for one
     intended level. The collapsed level fills once, at the canonical price.
     """
-    engine = _engine()
-    frame = pd.DataFrame(
+    result = _run_with_levels(
+        _engine(),
         {
-            "timestamp": pd.to_datetime(
-                [
-                    "2024-01-01 00:00",
-                    "2024-01-01 00:01",
-                    "2024-01-01 00:02",
-                    "2024-01-01 00:03",
-                    "2024-01-01 00:04",
-                ],
-                utc=True,
-            ),
-            "open": [100.0, 101.0, 105.0, 105.0, 105.0],
-            "high": [100.5, 101.5, 112.5, 105.5, 105.5],
-            "low": [99.5, 100.5, 104.5, 104.5, 104.5],
-            "close": [100.0, 101.0, 105.0, 105.0, 105.0],
-        }
-    )
-
-    def strategy(df, params):
-        index = df.index
-        entries = pd.Series([True, False, False, False, False], index=index)
-        exits = pd.Series([False, False, False, False, True], index=index)
-        indicators = {
-            "direction": pd.Series(["LONG", None, None, None, None], index=index, dtype=object),
             # Both spellings of the SAME level, with conflicting prices.
-            "take_profit": pd.Series([105.0, None, None, None, None], index=index, dtype=object),
-            "tp_price": pd.Series([112.0, None, None, None, None], index=index, dtype=object),
-        }
-        return entries, exits, indicators, []
-
-    result = engine.run(frame, strategy)
+            "take_profit": 105.0,
+            "tp_price": 112.0,
+        },
+    )
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -718,40 +739,15 @@ def test_native_engine_non_positive_take_profit_does_not_close_the_position_at_z
     whole position at price 0 on the first monitored bar. The alias price is
     the usable one, and that is the level the exit must fill at.
     """
-    engine = _engine()
-    frame = pd.DataFrame(
+    result = _run_with_levels(
+        _engine(),
         {
-            "timestamp": pd.to_datetime(
-                [
-                    "2024-01-01 00:00",
-                    "2024-01-01 00:01",
-                    "2024-01-01 00:02",
-                    "2024-01-01 00:03",
-                    "2024-01-01 00:04",
-                ],
-                utc=True,
-            ),
-            "open": [100.0, 101.0, 105.0, 105.0, 105.0],
-            "high": [100.5, 101.5, 112.5, 105.5, 105.5],
-            "low": [99.5, 100.5, 104.5, 104.5, 104.5],
-            "close": [100.0, 101.0, 105.0, 105.0, 105.0],
-        }
-    )
-
-    def strategy(df, params):
-        index = df.index
-        entries = pd.Series([True, False, False, False, False], index=index)
-        exits = pd.Series([False, False, False, False, True], index=index)
-        indicators = {
-            "direction": pd.Series(["LONG", None, None, None, None], index=index, dtype=object),
-            "stop_loss": pd.Series([95.0, None, None, None, None], index=index, dtype=object),
+            "stop_loss": 95.0,
             # The unusable canonical price plus the usable alias price.
-            "take_profit": pd.Series([0.0, None, None, None, None], index=index, dtype=object),
-            "tp_price": pd.Series([112.0, None, None, None, None], index=index, dtype=object),
-        }
-        return entries, exits, indicators, []
-
-    result = engine.run(frame, strategy)
+            "take_profit": 0.0,
+            "tp_price": 112.0,
+        },
+    )
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -771,39 +767,14 @@ def test_native_engine_fixed_risk_amount_never_arms_a_take_profit_at_zero():
     position at price 0 on the first monitored bar. The alias price is the
     usable one, so that is the level the exit fills at.
     """
-    engine = _engine({"fixed_risk_amount": 500.0})
-    frame = pd.DataFrame(
+    result = _run_with_levels(
+        _engine({"fixed_risk_amount": 500.0}),
         {
-            "timestamp": pd.to_datetime(
-                [
-                    "2024-01-01 00:00",
-                    "2024-01-01 00:01",
-                    "2024-01-01 00:02",
-                    "2024-01-01 00:03",
-                    "2024-01-01 00:04",
-                ],
-                utc=True,
-            ),
-            "open": [100.0, 101.0, 105.0, 105.0, 105.0],
-            "high": [100.5, 101.5, 112.5, 105.5, 105.5],
-            "low": [99.5, 100.5, 104.5, 104.5, 104.5],
-            "close": [100.0, 101.0, 105.0, 105.0, 105.0],
-        }
+            "stop_loss": 95.0,
+            "take_profit": 0.0,
+            "tp_price": 112.0,
+        },
     )
-
-    def strategy(df, params):
-        index = df.index
-        entries = pd.Series([True, False, False, False, False], index=index)
-        exits = pd.Series([False, False, False, False, True], index=index)
-        indicators = {
-            "direction": pd.Series(["LONG", None, None, None, None], index=index, dtype=object),
-            "stop_loss": pd.Series([95.0, None, None, None, None], index=index, dtype=object),
-            "take_profit": pd.Series([0.0, None, None, None, None], index=index, dtype=object),
-            "tp_price": pd.Series([112.0, None, None, None, None], index=index, dtype=object),
-        }
-        return entries, exits, indicators, []
-
-    result = engine.run(frame, strategy)
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -827,38 +798,15 @@ def test_native_engine_single_take_profit_level_closes_the_whole_position():
     exit) is a plain behaviour change to the exit convention, so it is left to
     a maintainer decision rather than smuggled into the alias fix.
     """
-    engine = _engine()
-    frame = pd.DataFrame(
+    result = _run_with_levels(
+        _engine(),
         {
-            "timestamp": pd.to_datetime(
-                [
-                    "2024-01-01 00:00",
-                    "2024-01-01 00:01",
-                    "2024-01-01 00:02",
-                    "2024-01-01 00:03",
-                ],
-                utc=True,
-            ),
-            "open": [100.0, 101.0, 105.0, 105.0],
-            "high": [100.5, 101.5, 112.5, 105.5],
-            "low": [99.5, 100.5, 104.5, 104.5],
-            "close": [100.0, 101.0, 105.0, 105.0],
-        }
+            "stop_loss": 95.0,
+            "take_profit": 112.0,
+            "tp_pct": 0.5,
+        },
+        bars=4,
     )
-
-    def strategy(df, params):
-        index = df.index
-        entries = pd.Series([True, False, False, False], index=index)
-        exits = pd.Series([False, False, False, True], index=index)
-        indicators = {
-            "direction": pd.Series(["LONG", None, None, None], index=index, dtype=object),
-            "stop_loss": pd.Series([95.0, None, None, None], index=index, dtype=object),
-            "take_profit": pd.Series([112.0, None, None, None], index=index, dtype=object),
-            "tp_pct": pd.Series([0.5, None, None, None], index=index, dtype=object),
-        }
-        return entries, exits, indicators, []
-
-    result = engine.run(frame, strategy)
 
     assert len(result.trades) == 1
     trade = result.trades[0]
