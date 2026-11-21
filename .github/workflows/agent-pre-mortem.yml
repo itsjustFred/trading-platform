@@ -127,7 +127,15 @@ concurrency:
   # only the current head's analysis survives - which is the one the PR actually
   # needs - while a dispatch of an older commit keeps its own bucket and still runs
   # beside the push's run, which is the case the whole keying exists for.
-  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ inputs.head_sha || 'current-head' }}
+  #
+  # An `edited` event that changes no base - a title, body or label edit - is a bucket
+  # of its own, named after this run. Its resolve job is skipped (the guard below),
+  # so joining the bucket of the analysis it would cancel leaves that analysis
+  # cancelled with no replacement: the verdict is never posted and the stage stays
+  # `pending` until the next push. Handing the run its own bucket cannot cancel the
+  # running analysis, and a retarget - which *does* re-analyse - still joins
+  # `current-head` and supersedes it, because that is exactly what it invalidates.
+  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ inputs.head_sha || (github.event.action == 'edited' && !github.event.changes.base && format('edited-{0}', github.run_id)) || 'current-head' }}
   cancel-in-progress: true
 
 env:
@@ -187,6 +195,21 @@ jobs:
               echo "::error::PR #${INPUT_PR} is not open."
               exit 1
             fi
+            # A dispatch is the only path that reaches what a push never opens: a fork PR, which
+            # is never pre-mortemed (its head commit is not one this repository can write a status
+            # for, and its comment belongs to no branch here), or one still a draft. Refusing
+            # either is what keeps a run from going green while grading nothing: the skip for them
+            # is implicit on the other paths - `same_repo` skips the agent and post jobs, and a
+            # draft never fires at all - so an explicit request that is silently skipped reads as
+            # "no findings" to the operator who asked for it.
+            if [ "$(jq -r .head.repo.full_name pr.json)" != "$GITHUB_REPOSITORY" ]; then
+              echo "::error::PR #${INPUT_PR} is a fork PR; fork PRs are not pre-mortemed. Push a branch to this repository to have it analysed."
+              exit 1
+            fi
+            if [ "$(jq -r .draft pr.json)" = "true" ]; then
+              echo "::error::PR #${INPUT_PR} is still a draft; it is pre-mortemed when it is ready for review."
+              exit 1
+            fi
             # A dispatch may name an older commit (a rerun after an infra
             # failure, or one the head moved past). It is analysed on purpose:
             # its status lands on that commit, and the comment guard below
@@ -210,6 +233,16 @@ jobs:
               # documented rerun is exactly that case: an older commit sits on
               # the first page of a commit list that pages at 30.
               head_now=$(jq -r .head.sha pr.json)
+              # The bucket a dispatch lands in carries the commit it names, so naming the
+              # current head does not share the `current-head` bucket of the push analysing that
+              # same diff right now: the rerun would run beside it instead of superseding it, a
+              # second 30-minute session on an unchanged diff, and every repetition of the
+              # remedy a capped run prints spends the free model's quota for nothing. Omitting
+              # head_sha is what re-runs the current head in the bucket that supersedes.
+              if [ "$head_now" = "$INPUT_SHA" ]; then
+                echo "::error::head_sha ${INPUT_SHA} is the current head of PR #${INPUT_PR}; omit head_sha to re-run it in the bucket that supersedes the push's run, or name an older commit of this PR to analyse it beside them."
+                exit 1
+              fi
               if [ "$head_now" != "$INPUT_SHA" ]; then
                 if ! commits=$(gh api --paginate \
                   "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}/commits" --jq '.[].sha'); then
@@ -271,6 +304,12 @@ jobs:
           # publishes no outputs, so the event's base is what a resolve failure still has;
           # a dispatch names none and the description falls back to the head alone.
           BASE_SHA: ${{ steps.pr.outputs.base || github.event.pull_request.base.sha }}
+          # Fork PRs are never pre-mortemed: the pending mark is written for a same-repo PR
+          # only, and a fork's head commit is not one this repository can read a status for -
+          # the read below would 404 on it. A failed resolve publishes no outputs, so the
+          # event's own head repository is the fallback, and a dispatch that refused a fork
+          # names nothing at all.
+          SAME_REPO: ${{ steps.pr.outputs.same_repo || github.event.pull_request.head.repo.full_name == github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -278,6 +317,10 @@ jobs:
           # status, so with no SHA the run log is the signal.
           if [ -z "$HEAD_SHA" ]; then
             echo "::warning::No head SHA was resolved from the event or the dispatch input; a pending stage status can only be cleared by a later run."
+            exit 0
+          fi
+          if [ "$SAME_REPO" != "true" ]; then
+            echo "::notice::A fork PR was not pre-mortemed; nothing was marked pending."
             exit 0
           fi
           # The conversion is a read-then-write, because the commit status API has no
@@ -708,7 +751,13 @@ jobs:
       # publishes no outputs, so a cancelled resolve leaves it empty and the description
       # names the head alone.
       BASE_SHA: ${{ needs.resolve.outputs.base || github.event.pull_request.base.sha }}
-      SAME_REPO: ${{ needs.resolve.outputs.same_repo }}
+      # A cancelled run publishes no outputs, so `needs.resolve.outputs.same_repo` is empty
+      # exactly when the resolve job was the one cancelled - and an empty value is not "false":
+      # reading it as such sent a fork run's head SHA to the commit-status API of a commit
+      # this repository cannot read, and the reporter failed on the 404. The event's own head
+      # repository is what keeps a cancelled same-repo run's mark clearable and a fork's run
+      # clean.
+      SAME_REPO: ${{ needs.resolve.outputs.same_repo || github.event.pull_request.head.repo.full_name == github.repository }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Report cancelled pre-mortem run
@@ -717,10 +766,11 @@ jobs:
           # Fork PRs are never pre-mortemed: the resolve job guards its pending mark and the
           # agent job on the same `same_repo` output, and a fork's head commit is not one this
           # repository can write a status for - the read below would 404 on it. A cancelled run
-          # publishes no outputs, so an empty value is left to the ownership check below, which
-          # stops the reporter on anything this run did not write.
-          if [ "$SAME_REPO" = "false" ]; then
-            echo "::notice::A fork PR was not pre-mortemed; nothing was marked pending."
+          # publishes no outputs, so the value is derived from the event above; anything short
+          # of a confirmed same-repo PR leaves the reporter alone rather than 404ing on a
+          # commit this repository cannot read.
+          if [ "$SAME_REPO" != "true" ]; then
+            echo "::notice::A fork PR was not pre-mortemed, or its repository could not be read; nothing was marked pending."
             exit 0
           fi
           if [ -z "$HEAD_SHA" ]; then

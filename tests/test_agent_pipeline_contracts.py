@@ -585,6 +585,245 @@ def test_a_base_retarget_reruns_the_pre_mortem_and_a_text_edit_does_not() -> Non
     )
 
 
+# The expression syntax the concurrency group needs, and nothing else: if the group carries
+# something this evaluator does not know, the test below fails on the token rather than guessing.
+_EXPR_TOKEN = re.compile(
+    r"""
+    \s*(?:   (?P<or>\|\|)
+      |     (?P<and>&&)
+      |     (?P<not>!)(?!=)
+      |     (?P<eq>==)
+      |     (?P<lparen>\()
+      |     (?P<rparen>\))
+      |     (?P<comma>,)
+      |     (?P<string>'(?:[^']*)'|"[^"]*")
+      |     (?P<number>-?\d+)
+      |     (?P<path>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)
+      |     (?P<unknown>\S)
+    )""",
+    re.VERBOSE,
+)
+
+
+def _truthy(value) -> bool:
+    """GitHub's truthiness, which a Python `bool` gets wrong: '' and 0 and null are false, a
+    non-empty string (even 'false') is true."""
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(value)
+
+
+class _Expr:
+    """A recursive-descent evaluator for the `${{ }}` expressions this file asserts on.
+
+    The concurrency bucket is a workflow behaviour - which run cancels which - and a test that
+    reads the YAML cannot tell a group that isolates a text edit from the one that used to let it
+    cancel the running analysis, which is exactly what happened: a title edit joined the
+    `current-head` bucket, cancelled the analysis of the head, and was then skipped itself, so no
+    verdict was posted and the stage stayed `pending`. The expression is therefore evaluated
+    against the payloads GitHub actually delivers, with GitHub's own operator rules (an `||`
+    returns the first truthy operand, an `&&` the first falsy one, and the last if none)."""
+
+    def __init__(self, text: str, context: dict) -> None:
+        text = text.strip()
+        self.tokens: list[tuple[str, str]] = []
+        position = 0
+        while position < len(text):
+            match = _EXPR_TOKEN.match(text, position)
+            assert match, f"{text!r}: the evaluator cannot read {text[position:]!r}"
+            position = match.end()
+            kind = match.lastgroup
+            assert kind != "unknown", f"{text!r}: unknown token {match.group()!r}"
+            self.tokens.append((str(kind), match.group(kind)))
+        self.index = 0
+        self.context = context
+
+    def _peek(self) -> tuple[str, str] | None:
+        return self.tokens[self.index] if self.index < len(self.tokens) else None
+
+    def _eat(self, kind: str) -> str:
+        token = self._peek()
+        assert token and token[0] == kind, f"expected {kind}, got {token}"
+        self.index += 1
+        return token[1]
+
+    def evaluate(self):
+        value = self._or()
+        assert self._peek() is None, f"unread tokens: {self.tokens[self.index :]}"
+        return value
+
+    def _or(self):
+        value = self._and()
+        while self._peek() and self._peek()[0] == "or":
+            self._eat("or")
+            right = self._and()
+            value = value if _truthy(value) else right
+        return value
+
+    def _and(self):
+        value = self._unary()
+        while self._peek() and self._peek()[0] == "and":
+            self._eat("and")
+            right = self._unary()
+            value = value if not _truthy(value) else right
+        return value
+
+    def _unary(self):
+        if self._peek() and self._peek()[0] == "not":
+            self._eat("not")
+            return not _truthy(self._unary())
+        return self._comparison()
+
+    def _comparison(self):
+        left = self._atom()
+        if self._peek() and self._peek()[0] == "eq":
+            self._eat("eq")
+            return left == self._atom()
+        return left
+
+    def _atom(self):
+        token = self._peek()
+        assert token, "the expression ends early"
+        kind, text = token
+        if kind == "lparen":
+            self._eat("lparen")
+            value = self._or()
+            self._eat("rparen")
+            return value
+        if kind == "string":
+            self._eat("string")
+            return text[1:-1]
+        if kind == "number":
+            self._eat("number")
+            return int(text)
+        if kind == "path":
+            self._eat("path")
+            if self._peek() and self._peek()[0] == "lparen":  # format('...', a.b)
+                self._eat("lparen")
+                arguments = []
+                while self._peek() and self._peek()[0] != "rparen":
+                    arguments.append(self._or())
+                    if self._peek() and self._peek()[0] == "comma":
+                        self._eat("comma")
+                self._eat("rparen")
+                assert text == "format", f"unknown function {text}()"
+                assert arguments, "format() takes a template"
+                return str(arguments[0]).format(*arguments[1:])
+            value = self.context
+            for part in text.split("."):
+                # A path the payload does not carry is null, exactly as GitHub resolves it:
+                # `github.event.changes.base` is null for every action but a retarget, and that
+                # null is what makes `!github.event.changes.base` the text-edit case.
+                if value is None:
+                    return None
+                assert isinstance(value, dict), f"{text}: {part} is read from a non-object"
+                value = value.get(part)
+            return value
+        raise AssertionError(f"unexpected token {token}")
+
+
+def _workflow_expressions(text: str, context: dict) -> str:
+    """Render every `${{ ... }}` in a workflow string the way GitHub does for one run."""
+
+    def replace(match: re.Match) -> str:
+        value = _Expr(match.group(1), context).evaluate()
+        return "" if value is None else str(value)
+
+    return re.sub(r"\$\{\{(.*?)\}\}", replace, text)
+
+
+def _run_context(event: dict, inputs: dict | None = None, run_id: int = 44828760524) -> dict:
+    """The `github` and `inputs` contexts one run's expressions are evaluated against.
+
+    `github.event.inputs` is where a `workflow_dispatch` keeps its inputs and where a
+    `pull_request` run finds nothing; the workflow-level `inputs` context is the same map. So one
+    empty map serves both, exactly as GitHub hands it to both expression contexts.
+    """
+    inputs = inputs or {}
+    return {
+        "github": {"event": {"inputs": inputs, **event}, "run_id": run_id},
+        "inputs": inputs,
+    }
+
+
+def _dispatch_group(group_template: str, sha: str) -> str:
+    """Render the concurrency group of a manual dispatch that names `sha`."""
+    return _workflow_expressions(
+        group_template,
+        _run_context({}, {"pr_number": 185, "head_sha": sha}),
+    )
+
+
+def test_a_text_edit_cannot_cancel_the_running_analysis() -> None:
+    """The concurrency bucket decides which run cancels which, and this is a behaviour, not a
+    string: a `pull_request` `edited` run whose event carries no changed base (a title, body or
+    label edit) reaches the resolve job, finds it has nothing to do - the guard skips it - and
+    therefore posts no verdict. In the bucket it used to share, `cancel-in-progress: true` made
+    it cancel the analysis of the head it just invalidated on paper: no verdict, no comment, the
+    stage left `pending` on the one commit the PR is built on. So the bucket for such a run is
+    its own, named after this run, and the only runs that still share a bucket are the ones that
+    analyse the same diff (a push, a retarget that re-analyses, a rerun of the same commit)."""
+    data = _load(PREMORTEM)
+    concurrency = data["concurrency"]
+    group_template = str(concurrency["group"])
+    assert concurrency.get("cancel-in-progress") is True, "a superseded run is no longer cancelled"
+    base = "a" * 40
+    head = "b" * 40
+    events = {
+        # A push, and the rerun the workflow documents for it: the same analysed diff, so the
+        # same bucket and one supersedes the other instead of running twice side by side.
+        "a push": {"action": "synchronize", "pull_request": {"number": 185, "head": {"sha": head}}},
+        "a retarget": {
+            "action": "edited",
+            "pull_request": {"number": 185, "head": {"sha": head}},
+            "changes": {"base": {"ref": "x", "sha": base}},
+        },
+        # The run that must not cancel anything: its resolve job is skipped, so it analyses nothing.
+        "a title edit": {
+            "action": "edited",
+            "pull_request": {"number": 185, "head": {"sha": head}},
+            "changes": {"title": {"from": "old", "to": "new"}},
+        },
+    }
+    buckets = {
+        label: _workflow_expressions(group_template, _run_context(event))
+        for label, event in events.items()
+    }
+    assert buckets["a push"] == "agent-pre-mortem-185-current-head", buckets
+    # A retarget re-analyses the same pair, so it belongs in the bucket it supersedes.
+    assert buckets["a retarget"] == buckets["a push"], buckets
+    assert buckets["a title edit"] == "agent-pre-mortem-185-edited-44828760524", buckets
+    # And the buckets are per run, so two edits on one PR neither cancel each other nor the
+    # analysis that is already running.
+    reruns = {
+        _workflow_expressions(group_template, _run_context(events["a title edit"], run_id=run_id))
+        for run_id in (1, 2)
+    }
+    assert len(reruns) == 2, reruns
+    assert buckets["a title edit"] not in reruns & {buckets["a push"]}
+
+
+def test_the_current_head_rerun_supersedes_the_push_run() -> None:
+    """The documented rerun of the current head (`-f head_sha=<head>`) is the one a capped run
+    tells the operator to make, and a bucket of its own would run a second 30-minute session on
+    the diff the push is analysing right now: every repetition of the remedy spends the free
+    model's quota for nothing, and the cap is what stops the stage from producing a verdict for
+    any PR at all. Naming the current head is therefore refused by the resolve step, so the only
+    dispatch that runs is one of a commit this workflow does not already analyse - and an older
+    commit keeps the bucket the keying exists for, beside the current head's run."""
+    data = _load(PREMORTEM)
+    group_template = str(data["concurrency"]["group"])
+    body = _run(_find_step(data["jobs"]["resolve"], r"^Resolve PR$"))
+    assert 'if [ "$head_now" = "$INPUT_SHA" ]' in body, (
+        "a dispatch of the current head runs a second analysis of the same diff"
+    )
+    head = "b" * 40
+    assert _dispatch_group(group_template, head) == f"agent-pre-mortem-185-{head}"
+    assert _dispatch_group(group_template, "c" * 40) == "agent-pre-mortem-185-" + "c" * 40
+
+
 def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None:
     """`head_sha` is the one input a caller types by hand, and it decides which diff is
     analysed and which commit carries the verdict. A well-formed SHA that belongs to another PR
@@ -619,6 +858,31 @@ def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None
     assert resolve.get("permissions", {}).get("contents") == "read", (
         "the resolve job cannot read the PR's commit list, so the check cannot be made"
     )
+
+
+def test_a_dispatch_refuses_a_fork_a_draft_and_the_current_head() -> None:
+    """A dispatch is the only path that reaches what a push never opens, and all three of its
+    refusals are the difference between a run that says why it did nothing and a green run that
+    graded nothing:
+
+    - a fork PR: `same_repo` skips the agent and post jobs, so without a word the operator reads
+      "no findings" from a request the workflow refused;
+    - a draft: the `pull_request` triggers never fire for one, so a dispatch is the only way in,
+      and pre-morteming a draft spends quota on a diff nobody has approved for review;
+    - the current head as `head_sha`: the bucket carries the commit a dispatch names, so this
+      runs a second 30-minute session *beside* the push analysing that same diff, and every
+      repetition of the remedy a capped run prints spends the free model's quota for nothing -
+      the cap being what then stops the stage producing a verdict for any PR at all."""
+    data = _load(PREMORTEM)
+    body = _run(_find_step(data["jobs"]["resolve"], r"^Resolve PR$"))
+    assert ".draft" in body and "still a draft" in body, "a dispatch pre-mortems a draft PR"
+    assert ".head.repo.full_name" in body and "fork PR" in body, (
+        "a dispatch of a fork PR is a green run with no comment, no status and no refusal"
+    )
+    assert 'if [ "$head_now" = "$INPUT_SHA" ]' in body, (
+        "a dispatch of the current head runs a second analysis of the diff the push is analysing"
+    )
+    assert "omit head_sha" in body, "the refusal does not say what re-runs the current head"
 
 
 def test_the_pre_mortem_skips_drafts_and_forks() -> None:
@@ -1026,15 +1290,38 @@ def test_the_cancelled_reporter_skips_a_fork_pr() -> None:
     """Fork PRs are skipped by the resolve job's `same_repo` guard and by the agent job, and a
     fork's head commit is not one this repository can write a status for: the reporter's read
     would 404 on it, so the job fails - fails closed, but with a spurious red job per cancelled
-    fork run. The cancellation reporter therefore checks the same output first and stops."""
+    fork run. The cancellation reporter therefore checks the same value first and stops.
+
+    A cancelled job publishes no outputs, so `needs.resolve.outputs.same_repo` is empty exactly
+    when the resolve job was the one cancelled - and an empty value is not "false": taking it as
+    one sent a fork run's head SHA to the API and failed the reporter on the 404. So the value
+    is confirmed as *same-repo* (from the event's own head repository when the output is gone)
+    and the reporter stops on anything short of that."""
     job = _load(PREMORTEM)["jobs"]["report-cancelled"]
     step = _find_step(job, r"^Report cancelled pre-mortem run$")
     same_repo = str(_step_env(job, step).get("SAME_REPO", "")).strip()
-    assert same_repo == "${{ needs.resolve.outputs.same_repo }}", (
-        f"the cancellation reporter cannot tell a fork PR from one it pre-mortemed: {same_repo}"
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in same_repo, (
+        f"a cancelled resolve leaves the reporter unable to tell a fork PR: {same_repo}"
     )
     body = _run(step)
-    assert '[ "$SAME_REPO" = "false" ]' in body, "the cancellation reporter runs for a fork PR"
+    assert '[ "$SAME_REPO" != "true" ]' in body, (
+        "the cancellation reporter runs for a fork PR, or for a repository it cannot read"
+    )
+
+
+def test_the_resolve_reporter_skips_a_fork_pr() -> None:
+    """The resolve failure reporter runs on the same fork 404, and for the same reason: a
+    dispatch that refused a fork PR is a failed resolve, and its reporter reads the fork's head
+    commit to find the pending mark that was never written there."""
+    job = _load(PREMORTEM)["jobs"]["resolve"]
+    step = _find_step(job, r"^Report resolve failure$")
+    same_repo = str(_step_env(job, step).get("SAME_REPO", "")).strip()
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in same_repo, (
+        f"the resolve reporter cannot tell a fork PR: {same_repo}"
+    )
+    assert '[ "$SAME_REPO" != "true" ]' in _run(step), (
+        "the resolve reporter reads a fork commit's status and fails on the 404"
+    )
 
 
 def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
