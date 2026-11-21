@@ -1,10 +1,11 @@
 """Append-only archive of raw Discord signals (issue #308).
 
-Every Discord message a ``DiscordSignalSource`` polls from a signal channel
+Every Discord message a ``DiscordSignalSource`` emits for signal processing
 is recorded once (``discord_signal_received``) — parsed or refused, and
 including messages from authors outside the trusted allowlist, which are
-kept for impostor auditing and marked ``author_trusted: false``. Every
-per-deployment trading decision on a parsed signal is recorded once
+kept for impostor auditing and marked ``author_trusted: false``. The
+startup cursor-priming page is only marked seen and is not archived.
+Every per-deployment trading decision on a parsed signal is recorded once
 (``discord_signal_decision``). The store exists so the signal bots can be
 backtested and meta-labelled later: without it the raw signals only exist in
 the log stream, and only from the day recording starts.
@@ -221,23 +222,27 @@ class SignalArchive:
             by_day.setdefault(_record_file_for(record).name, []).append(line)
         for name, lines in by_day.items():
             path = archive_dir() / name
-            # One payload, one os.write per file per batch on an O_APPEND fd:
-            # a batch reaches the OS as a single syscall, so a full disk can
-            # only truncate at a line boundary and two daemons cannot
-            # interleave inside a line.
+            # One payload, one os.write per file per batch on an O_APPEND fd.
+            # A short write is a write error, not a retry: a full disk or
+            # signal can still leave a partial last line, which readers skip.
             payload = "".join(f"{line}\n" for line in lines).encode("utf-8")
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fd = os.open(
-                    path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644
+                    path,
+                    os.O_WRONLY
+                    | os.O_APPEND
+                    | os.O_CREAT
+                    | getattr(os, "O_BINARY", 0),
+                    0o644,
                 )
                 try:
-                    view = memoryview(payload)
-                    while view:
-                        written = os.write(fd, view)
-                        if written <= 0:
-                            raise OSError("short write on signal archive file")
-                        view = view[written:]
+                    written = os.write(fd, payload)
+                    if written != len(payload):
+                        raise OSError(
+                            "short write on signal archive file: "
+                            f"{written}/{len(payload)} bytes"
+                        )
                     os.fsync(fd)
                 finally:
                     os.close(fd)
@@ -336,7 +341,7 @@ def received_record(
     refusal: tuple[str, str | None] | None,
     author_trusted: bool | None = None,
 ) -> dict[str, Any]:
-    """One ``discord_signal_received`` record for a polled Discord message.
+    """One ``discord_signal_received`` record for an emitted Discord message.
 
     ``parsed`` is the ``TradeSignal`` the parser produced (``None`` when it
     refused); ``refusal`` is the ``(reason, detail)`` the parser reported.

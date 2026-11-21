@@ -2003,7 +2003,7 @@ class DiscordSignalSource(BaseSignalSource):
             on_author_accepted=self._record_author_accepted,
             outcome_sink=_outcome_sink,
         )
-        # Issue #308: archive every polled message, parsed or refused —
+        # Issue #308: archive every emitted message, parsed or refused —
         # including authors outside the trusted allowlist, kept for impostor
         # auditing and marked ``author_trusted: false``. record() is a
         # non-blocking put_nowait; the try only guards record *construction*,

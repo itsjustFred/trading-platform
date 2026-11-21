@@ -364,15 +364,17 @@ Account-(User-)Token unverändert. Eine falsche Kombination antwortet mit
 
 ### Raw-Signal-Archiv (#308)
 
-Jede von `DiscordSignalSource` gepollte Nachricht aus einem
-Signal-Bot-Channel wird append-only archiviert — ob sie nun in einen
-`TradeSignal` geparst wird oder vom Parser abgelehnt wurde. Auch Nachrichten
-von Autoren außerhalb der Trusted-Author-Allowlist werden archiviert (für
-die Impostor-Auditierbarkeit) und tragen `author_trusted: false`; Inhalte
-werden nicht redigiert. Ohne dieses Archiv existieren die Rohsignale nur im
-Log-Stream und nur ab dem Tag der Aufzeichnung — Backtests und
-Meta-Labeling der Bots (nitro, ramjet, rocketfuel) brauchen die
-historische Rohdatenmenge.
+Jede Nachricht, die `DiscordSignalSource` zur Signalverarbeitung emittiert,
+wird append-only archiviert — ob sie nun in einen `TradeSignal` geparst
+wird oder vom Parser abgelehnt wurde. Auch Nachrichten von Autoren außerhalb
+der Trusted-Author-Allowlist werden archiviert (für die
+Impostor-Auditierbarkeit) und tragen `author_trusted: false`; Inhalte werden
+nicht redigiert. Die Startup-Cursor-Priming-Seite wird nur als gesehen
+gemarkiert und nicht archiviert — auch Nachrichten, die während eines
+Daemon-Stops eintrafen, können also fehlen. Ohne dieses Archiv existieren
+die Rohsignale nur im Log-Stream und nur ab dem Tag der Aufzeichnung —
+Backtests und Meta-Labeling der Bots (nitro, ramjet, rocketfuel) brauchen
+die historische Rohdatenmenge.
 
 **Speicherort und Format.** JSON Lines unter
 `DATA_DIR / "signal_log" / "discord_signals-<YYYY-MM-DD>.jsonl"` (eine Datei
@@ -391,7 +393,8 @@ Daemon-Neustart kann zuletzt gepollte Nachrichten erneut archivieren.
 
 **Record-Typen.**
 
-- `discord_signal_received` — einmal pro polled Nachricht: Roh-Content,
+- `discord_signal_received` — einmal pro zur Signalverarbeitung emittierter
+  Nachricht: Roh-Content,
   Autor (ID, Username, Bot-Flag, `author_trusted`), Channel, Message-ID,
   `message_created_at`, Archivierzeit (`logged_at`), Bot-Name, Account,
   Service, `parse_status` (`parsed`/`rejected`),

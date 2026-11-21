@@ -103,7 +103,7 @@ def test_record_after_close_is_ignored(archive: SignalArchive) -> None:
     archive.close(timeout=2.0)
     before = archive.written
     archive.record({"type": "x", "late": True})
-    archive.flush(timeout=1.0)
+    assert archive._queue.empty()
     assert archive.written == before
 
 
@@ -432,6 +432,74 @@ def test_writer_exits_when_closed_and_queue_drained(tmp_path, monkeypatch) -> No
     finally:
         gate.set()
         arch.close(timeout=2.0)
+
+
+def test_short_write_is_an_error_not_retried(archive: SignalArchive, monkeypatch) -> None:
+    calls: list[int] = []
+
+    def _short_write(fd: int, data: bytes) -> int:
+        calls.append(len(data))
+        return len(data) // 2
+
+    monkeypatch.setattr(sa.os, "write", _short_write)
+    archive.record({"type": "x", "logged_at": "2026-11-21T00:00:00+00:00"})
+    assert archive.flush(timeout=5.0)
+    assert len(calls) == 1
+    assert archive.write_errors == 1
+    assert archive.written == 0
+
+
+def test_run_daemon_shutdown_flushes_signal_archive(
+    archive_env: SignalArchive, monkeypatch, tmp_path
+) -> None:
+    close_calls: list[float] = []
+    real_close = archive_env.close
+
+    def _close(timeout: float = 5.0) -> None:
+        close_calls.append(timeout)
+        real_close(timeout=timeout)
+
+    monkeypatch.setattr(archive_env, "close", _close)
+
+    class _Scheduler:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    async def _sync_loop(*_args, **_kwargs) -> None:
+        sa.get_signal_archive().record(
+            {
+                "type": "shutdown_flush_probe",
+                "logged_at": "2026-11-21T00:00:00+00:00",
+            }
+        )
+
+    async def _noop_loop(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(
+        daemon, "_discover_and_register_discord_services", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
+    monkeypatch.setattr(daemon, "ServiceScheduler", _Scheduler)
+    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda: object())
+    monkeypatch.setattr(daemon, "sync_deployments_loop", _sync_loop)
+    monkeypatch.setattr(daemon, "sync_services_loop", _noop_loop)
+    monkeypatch.setattr(daemon, "_poll_balances", _noop_loop)
+    monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_loop)
+    monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_loop)
+
+    asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
+
+    assert close_calls == [5.0]
+    records = [
+        record
+        for record in _all_records()
+        if record.get("type") == "shutdown_flush_probe"
+    ]
+    assert len(records) == 1
 
 
 # -- discord_source integration -------------------------------------------------
