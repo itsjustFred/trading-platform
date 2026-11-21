@@ -46,9 +46,7 @@ from live_runner.shutdown import (
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     EXIT_CLEANUP_TIMEOUT,
     EXIT_OK,
-    EXIT_PATH_TIMEOUT_SECONDS,
     FORCED_EXIT_CODE,
-    WORST_CASE_SHUTDOWN_SECONDS,
     ShutdownCoordinator,
     SubmissionRefusedError,
     close_the_loop_bounded,
@@ -1737,18 +1735,10 @@ def test_close_the_loop_gives_up_on_a_task_that_ignores_every_cancel(
     assert elapsed < 5.0, f"the exit path must not wait past its budget: {elapsed}"
 
 
-def test_the_exit_path_budget_is_part_of_the_budget_the_unit_file_grants() -> None:
-    """The tail after ``run_daemon`` is bounded, and it is inside the unit window.
-
-    ``TimeoutStopSec`` = worst case + exit path, so the sum is the whole window
-    systemd gives the daemon; if the exit path ever grows past what is left, the
-    daemon is SIGKILLed after it has already done all the work.
-    """
-    assert 0 < EXIT_PATH_TIMEOUT_SECONDS
-    assert (
-        WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_TIMEOUT_SECONDS
-        <= 180.0
-    ), "the exit path must fit inside the unit's TimeoutStopSec"
+# The exit path's own deadline, and that the generated unit's stop timeout still
+# covers the whole shutdown window with it included, are pinned against the
+# artifacts in ``tests/test_shutdown_budget_contract.py`` (that file's job), so
+# the number is not asserted twice here.
 
 
 def test_the_exit_codes_are_the_values_the_service_manager_sees() -> None:
