@@ -267,6 +267,10 @@ jobs:
           # The resolved head (the commit "Mark running" marked) first; the
           # event's head when the payload path failed; the dispatch input last.
           HEAD_SHA: ${{ steps.pr.outputs.head || github.event.pull_request.head.sha || inputs.head_sha }}
+          # The base of the analysed pair, for the error description below. A failed job
+          # publishes no outputs, so the event's base is what a resolve failure still has;
+          # a dispatch names none and the description falls back to the head alone.
+          BASE_SHA: ${{ steps.pr.outputs.base || github.event.pull_request.base.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -281,6 +285,12 @@ jobs:
           # *newest* status of the context (the API's own ordering is not documented, so
           # it is sorted by creation time here instead of taking `[0]` on faith) and the
           # run that wrote it - so only this run's own `pending` mark becomes an `error`.
+          # Both reads go through the `jq` binary with `--arg`: `gh api` has no `--arg` of
+          # its own, and an invocation the binary refuses is a reporter that never runs.
+          # The status list is paginated, because the API returns one page and the mark
+          # this run has to convert is not guaranteed to be on it; the target URL is
+          # compared for equality, because `runs/123` is a prefix of `runs/1234` and one
+          # run must not claim another's mark.
           # Another run of the same commit (a rerun of it in the same concurrency bucket,
           # or a dispatch running beside the push's run) keeps whatever it wrote, and a
           # status this run never wrote is never converted. What the API cannot close is
@@ -288,15 +298,22 @@ jobs:
           # it can still be overwritten by this one, so this is best effort: no status API
           # offers a conditional write, and the invariant this file claims is the one the
           # ownership check buys, not an atomic conversion.
-          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
-            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
           state=${status%%|*}
           owner=${status#*|}
+          # The base the analysed pair was computed against, when this run knows it: a resolve
+          # failure publishes none of this job's own outputs, so the event's base is the
+          # fallback the head above already uses, and a dispatch names none at all. An empty
+          # " on base " in the description would name nothing, so the pair is conditional.
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
           if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Resolve step failed for ${HEAD_SHA:0:8}; see the run log" > /dev/null
+              -f description="Resolve step failed for ${HEAD_SHA:0:8}${pair}; see the run log" \
+              -f target_url="$RUN_URL" > /dev/null
           else
             # Either nothing this run wrote is there any more (another run replaced it,
             # or the mark never happened), or the newest status is another run's. Say so
@@ -556,18 +573,25 @@ jobs:
           # what it allows is pinned down instead: the *newest* status of the context
           # (the API's own ordering is not documented, hence the sort by creation time
           # rather than `[0]`) and the run that wrote it, so only this run's own
-          # `pending` mark is converted. The read-then-write window between them
+          # `pending` mark is converted. Both reads are `gh api --paginate ... | jq -sr
+          # --arg ...`: `gh api` itself has no `--arg`, and a status list is one page per
+          # 30 entries, so the mark to convert is not guaranteed to be on the page the
+          # API returns first. The target URL is compared for equality, since
+          # `.../runs/123` is a prefix of `.../runs/1234`. The read-then-write window between them
           # cannot be closed by this API, so this is best effort, not an atomic
           # conversion.
-          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
-            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
           state=${status%%|*}
           owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
           if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Pre-mortem run failed for ${HEAD_SHA:0:8}; see the run log" -f target_url="$RUN_URL" > /dev/null
+              -f description="Pre-mortem run failed for ${HEAD_SHA:0:8}${pair}; see the run log" \
+              -f target_url="$RUN_URL" > /dev/null
           else
             # A terminal status (a verdict of its own, or an earlier error) stands;
             # say so instead of leaving the run silent about what it did not do.
@@ -643,15 +667,18 @@ jobs:
           set -euo pipefail
           # The same identity-bearing, best-effort conversion the other reporters make:
           # the newest status of the context, and only when this run wrote it.
-          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
-            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
           state=${status%%|*}
           owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
           if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Post step failed for ${HEAD_SHA:0:8}; see the run log" > /dev/null
+              -f description="Post step failed for ${HEAD_SHA:0:8}${pair}; see the run log" \
+              -f target_url="$RUN_URL" > /dev/null
           else
             echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; this failure did not replace it."
           fi
@@ -677,6 +704,10 @@ jobs:
       # warning in a log nobody opens. The event's head (or the dispatch input) is what
       # keeps the mark clearable.
       HEAD_SHA: ${{ needs.resolve.outputs.head || github.event.pull_request.head.sha || inputs.head_sha }}
+      # The base of the analysed pair, for the error description below; a cancelled job
+      # publishes no outputs, so a cancelled resolve leaves it empty and the description
+      # names the head alone.
+      BASE_SHA: ${{ needs.resolve.outputs.base || github.event.pull_request.base.sha }}
       SAME_REPO: ${{ needs.resolve.outputs.same_repo }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -701,15 +732,18 @@ jobs:
           # The pending mark that is converted is this run's own - the newest status of
           # the context, and the one this run wrote - and the read-then-write window the
           # API cannot close is stated as best effort rather than denied.
-          status=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
-            --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
-            --jq '([.statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last) as $s | ($s.state // "unset") + "|" + (($s.target_url // "") | startswith($url) | tostring)')
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
           state=${status%%|*}
           owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
           if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
             gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
               -f state=error -f context="$PREMORTEM_CONTEXT" \
-              -f description="Pre-mortem run cancelled for ${HEAD_SHA:0:8}; re-dispatch to run it" -f target_url="$RUN_URL" > /dev/null
+              -f description="Pre-mortem run cancelled for ${HEAD_SHA:0:8}${pair}; re-dispatch to run it" \
+              -f target_url="$RUN_URL" > /dev/null
           else
             echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; the cancellation did not replace it."
           fi

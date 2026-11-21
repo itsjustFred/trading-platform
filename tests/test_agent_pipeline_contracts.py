@@ -31,8 +31,12 @@ What is pinned here:
   cancelled run, a failed run, a failed post step, including the reporter of a failed agent run
   itself - converts a `pending` status this run wrote itself and never touches another run's:
   the commit status API has no conditional write, so the conversion reads the *newest* status of
-  the context (sorted by creation time, since the API's own ordering is undocumented) and the run
-  that wrote it, and what is left - the window between that read and the write - is stated as
+  the context (sorted by creation time, since the API's own ordering is undocumented) of every
+  page of the status list, and the run that wrote it compared by exact target URL - and the
+  reporters' own `run:` bodies are executed here against a stub `gh`, because `gh api` has no
+  `--arg` of its own and a string assertion cannot tell a flag the binary accepts from one it
+  does not: that broken flag was pinned by this suite for three rounds. What is left - the
+  window between that read and the write - is stated as
   best effort in the reporters' comments; a head that moved keeps its own status but no longer
   owns the comment;
 - every result the pre-mortem writes names the diff it was computed against: the analysed base
@@ -98,6 +102,8 @@ bash-level verdict extraction.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
@@ -256,6 +262,204 @@ def _step_env(job: dict, step: dict) -> dict:
     env = dict(job.get("env") or {})
     env.update(step.get("env") or {})
     return env
+
+
+# ---- the pre-mortem's pending->error reporters, executed against a stub `gh` ----
+
+# The values the workflow fills in from expressions. The reporters are run here (below), and the
+# harness below refuses to run one whose env it does not know - a reporter that reads a variable
+# the harness never sets is a reporter whose behaviour is not being tested.
+REPORTER_ENV = {
+    "GH_TOKEN": "stub-token",
+    "GITHUB_REPOSITORY": "itsjustFred/trading-platform",
+    "PR_NUMBER": "185",
+    "BASE_SHA": "1" * 40,
+    "HEAD_SHA": "0" * 40,
+    "SAME_REPO": "true",
+    "PREMORTEM_CONTEXT": CONTEXT,
+    "RUN_URL": "https://github.com/itsjustFred/trading-platform/actions/runs/123",
+}
+
+# Every stop-path reporter of the pre-mortem: (job name, step name). The four that turn a
+# `pending` status into an `error`.
+REPORTERS = (
+    ("resolve", "Report resolve failure"),
+    ("post", "Report failed pre-mortem run"),
+    ("post", "Report post failure"),
+    ("report-cancelled", "Report cancelled pre-mortem run"),
+)
+
+_STUB_GH = """#!/usr/bin/env bash
+# A stand-in for the `gh` this repo's workflows call, because a reporter that cannot run is not
+# a reporter: `gh api` has no `--arg`, and a test that only reads the YAML cannot tell a flag the
+# binary accepts from one it does not (the four reporters were written with `gh api --arg` and
+# the contract test asserted the string was there). So the stub refuses what the real gh refuses,
+# serves every page of the commit-status list when it is asked to paginate and only the first
+# page when it is not - which is what makes the API's paging visible here - and records every
+# write the reporter makes.
+set -u
+printf '%s\\n' "$@" >> "$STUB_LOG"
+for arg in "$@"; do
+  case "$arg" in
+    --arg|--arg=*) echo "unknown flag: --arg" >&2; exit 1 ;;
+  esac
+done
+case "$*" in
+  *"/commits/"*"/status"*)
+    if [[ "$*" == *"--paginate"* ]]; then
+      n=1
+      while [ -f "$STUB_PAGES/page-$n.json" ]; do
+        cat "$STUB_PAGES/page-$n.json"
+        n=$((n + 1))
+      done
+    elif [ -f "$STUB_PAGES/page-1.json" ]; then
+      cat "$STUB_PAGES/page-1.json"
+    else
+      printf '{"state":"unset","statuses":[]}\\n'
+    fi
+    ;;
+  *) : ;;
+esac
+exit 0
+"""
+
+
+def _step_variables(step: dict) -> set[str]:
+    """The shell variables a step reads from its environment - every `$NAME` the body uses.
+
+    The workflow-level and job-level `env:` blocks are GitHub's, so a step's *own* `env:` is not
+    the whole picture: `GITHUB_REPOSITORY` and `PREMORTEM_CONTEXT` are declared once for the whole
+    workflow and every reporter inherits them. What matters is what the body actually reads, and
+    the assignment of a value (`state=`, `owner=`) is not a read - those are the step's own.
+    """
+    body = _run(step)
+    assigned = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=", body, flags=re.M))
+    return set(re.findall(r"\$\{?([A-Z_][A-Z0-9_]*)", body)) - assigned
+
+
+def _status_page(states: list[tuple[str, str, str, str]]) -> str:
+    """One page of the commit status response: (context, state, target_url, created_at)."""
+    return json.dumps(
+        {
+            "state": "success",
+            "sha": REPORTER_ENV["HEAD_SHA"],
+            "statuses": [
+                {"context": ctx, "state": state, "target_url": url, "created_at": at}
+                for ctx, state, url, at in states
+            ],
+        }
+    )
+
+
+def _run_reporter(job_name, step_name, tmp_path, pages, env_override=None):
+    """Execute one reporter step's own `run:` body against the stub `gh`.
+
+    The body is lifted out of the YAML and run with the environment the step declares, so what is
+    tested is the workflow's own shell - every flag, pipe and jq expression it contains.
+    """
+    job = _load(PREMORTEM)["jobs"][job_name]
+    step = _find_step(job, re.compile(f"^{step_name}$"))
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "gh"
+    stub.write_text(_STUB_GH, encoding="utf-8")
+    stub.chmod(0o755)
+    pagedir = tmp_path / "pages"
+    pagedir.mkdir(exist_ok=True)
+    for index, page in enumerate(pages, start=1):
+        (pagedir / f"page-{index}.json").write_text(page, encoding="utf-8")
+    log = tmp_path / "calls.log"
+    log.unlink(missing_ok=True)
+    env = {
+        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
+        "STUB_LOG": str(log),
+        "STUB_PAGES": str(pagedir),
+    }
+    for key in _step_variables(step):
+        assert key in REPORTER_ENV, f"{job_name}/{step_name}: the harness sets no {key}"
+        env[key] = REPORTER_ENV[key]
+    env.update(env_override or {})
+    script = tmp_path / "step.sh"
+    script.write_text(_run(step), encoding="utf-8")
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    calls = log.read_text(encoding="utf-8") if log.exists() else ""
+    return result, calls
+
+
+OWN = REPORTER_ENV["RUN_URL"]
+OTHER = "https://github.com/itsjustFred/trading-platform/actions/runs/999"
+T1 = "2026-11-20T10:00:00Z"
+T2 = "2026-11-20T11:00:00Z"
+
+
+def test_the_pending_mark_is_converted_only_when_this_run_wrote_it(tmp_path) -> None:
+    """The four stop-path reporters exist to keep the stage from stranding `pending`, and each one
+    is the workflow's own shell run against a stub `gh` - a string assertion on `--arg ctx` pinned
+    the broken `gh api --arg` for three rounds, because nothing here ever executed a reporter.
+    Three behaviours are pinned, each with the failure it prevents:
+
+    - the read reaches the `jq` binary (`gh api` has no `--arg`), so the reporter runs at all;
+    - the mark is the *newest* of the context across **every page** of the status list - the API's
+      ordering is undocumented, so a reporter that reads the first page converts whichever run's
+      mark happens to be on it;
+    - the run that wrote it is this one, by exact `target_url` - a prefix match lets run
+      `.../runs/123` claim the mark of run `.../runs/1234` and turn a live analysis into an error;
+    - a `success` or a status of another run is left alone, and every error names the base...head
+      pair and links to the run that wrote it.
+    """
+    for job_name, step_name in REPORTERS:
+        label = f"{job_name}/{step_name}"
+        # This run's pending mark is the newest status of the context, and it is on the second
+        # page: only a paginating read finds it, and only this run's mark is converted.
+        result, calls = _run_reporter(
+            job_name,
+            step_name,
+            tmp_path,
+            [
+                _status_page([(CONTEXT, "pending", OTHER, T1)]),
+                _status_page([(CONTEXT, "pending", OWN, T2)]),
+            ],
+        )
+        assert result.returncode == 0, f"{label}: reporter failed: {result.stderr}"
+        assert "state=error" in calls, f"{label}: this run's own pending mark was not converted"
+        assert f"context={CONTEXT}" in calls, f"{label}: the error carries no context"
+        assert f"target_url={OWN}" in calls, f"{label}: the error links no run"
+        description = re.search(r"description=(.*)", calls)
+        assert description, f"{label}: the error carries no description"
+        for token in (REPORTER_ENV["HEAD_SHA"][:8], REPORTER_ENV["BASE_SHA"][:8]):
+            assert token in description.group(1), f"{label}: the error status does not name {token}"
+
+
+def test_no_reporter_touches_a_mark_another_run_wrote(tmp_path) -> None:
+    """The other half of the ownership check, on the same executed bodies: a newest mark that is
+    another run's - by run id, or because it is already terminal - is not converted, and the
+    reporter says what it left alone instead of failing silently. The near-miss run id
+    (`.../runs/1234` when this run is `.../runs/123`) is the prefix match: converting it marks a
+    live analysis `error` while it still runs."""
+    near_miss = OWN + "4"
+    cases = {
+        "another run's pending mark is the newest": [
+            _status_page([(CONTEXT, "pending", OWN, T1)]),
+            _status_page([(CONTEXT, "pending", OTHER, T2)]),
+        ],
+        "the newest mark's run id only starts with this run's": [
+            _status_page([(CONTEXT, "pending", near_miss, T2)])
+        ],
+        "the newest mark is already terminal": [_status_page([(CONTEXT, "success", OWN, T2)])],
+        "no status of this context exists": [_status_page([("other/context", "pending", OWN, T1)])],
+    }
+    for job_name, step_name in REPORTERS:
+        label = f"{job_name}/{step_name}"
+        for why, pages in cases.items():
+            result, calls = _run_reporter(job_name, step_name, tmp_path, pages)
+            assert result.returncode == 0, f"{label} ({why}): reporter failed: {result.stderr}"
+            assert "state=error" not in calls, f"{label} ({why}): converted {why}"
+            assert "::notice::" in result.stdout, f"{label} ({why}): silent about it"
 
 
 def _verdict_arms(body: str) -> dict[str, str]:
@@ -458,12 +662,12 @@ def test_the_agent_workflows_share_one_free_model_configuration() -> None:
     edit per line."""
     for name, prefix in FREE_MODEL_VARS.items():
         env = _load(name)["env"]
-        assert env["MODEL"] == (
-            f"${{{{ vars.{prefix}_MODEL || '{DEFAULT_MODEL}' }}}}"
-        ), f"{name}: {env['MODEL']!r}"
-        assert env["VARIANT"] == (
-            f"${{{{ vars.{prefix}_VARIANT || '{DEFAULT_VARIANT}' }}}}"
-        ), f"{name}: {env['VARIANT']!r}"
+        assert env["MODEL"] == (f"${{{{ vars.{prefix}_MODEL || '{DEFAULT_MODEL}' }}}}"), (
+            f"{name}: {env['MODEL']!r}"
+        )
+        assert env["VARIANT"] == (f"${{{{ vars.{prefix}_VARIANT || '{DEFAULT_VARIANT}' }}}}"), (
+            f"{name}: {env['VARIANT']!r}"
+        )
         _job_name, job = _agent_job(_load(name))
         bodies = _job_bodies([job])
         assert "$MODEL" in bodies and "$VARIANT" in bodies, (
@@ -659,6 +863,15 @@ def test_every_error_status_names_the_analysed_commit() -> None:
         assert "${HEAD_SHA:0:8}" in description.group(1), (
             f"{pattern}: the error status does not name the commit it was written for"
         )
+        # The base goes with it: a status is current for a base...head pair, and a failed or
+        # cancelled run names only the head when nothing ever told it the base - a resolve
+        # failure publishes none of this job's own outputs, and a dispatch names no base at all.
+        assert "${BASE_SHA:0:8}" in description.group(1) or "${pair}" in description.group(1), (
+            f"{pattern}: the error status does not name the base it was written for"
+        )
+        assert '-f target_url="$RUN_URL"' in body, (
+            f"{pattern}: the error status links no run, so no reader can tell it from another's"
+        )
 
 
 def test_the_pending_conversion_is_identity_bearing() -> None:
@@ -684,12 +897,25 @@ def test_the_pending_conversion_is_identity_bearing() -> None:
         assert "sort_by(.created_at)" in body, (
             f"{pattern}: reads the first status the API happens to return, not the newest"
         )
-        assert "--arg ctx" in body and "--arg url" in body, (
-            f"{pattern}: reads the statuses without the context or without this run's URL"
+        # The read is `gh api --paginate ... | jq -sr --arg ctx ... --arg url ...`, and the shape
+        # is pinned because it is what was wrong: `gh api` has no `--arg` of its own, so the four
+        # reporters aborted on their first command and left the stage `pending` for three rounds
+        # while a string assertion insisted the broken flag was there. The status list is
+        # paginated (one page per 30 entries, and the mark to convert is not guaranteed to be on
+        # the first) and the run identity is compared for equality: `.../runs/123` is a prefix of
+        # `.../runs/1234`. What the shell does with this is executed, not read:
+        # `test_the_pending_mark_is_converted_only_when_this_run_wrote_it` runs all four bodies.
+        assert (
+            'gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status"' in body
+        ), f"{pattern}: the status read is not paginated"
+        assert '| jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL"' in body, (
+            f"{pattern}: the read does not go through the jq binary, which alone takes --arg"
         )
-        assert "target_url" in body and "startswith($url)" in body, (
-            f"{pattern}: converts a pending mark this run did not write"
+        assert "[.[].statuses[]" in body, f"{pattern}: the pages are read as one status list"
+        assert '((($s.target_url // "") == $url)' in body, (
+            f"{pattern}: the run identity is a prefix match, so runs/123 claims runs/1234"
         )
+        assert "startswith" not in body, f"{pattern}: the run identity is still a prefix match"
         assert '"$owner" = "true"' in body, (
             f"{pattern}: the ownership of the pending mark is not checked"
         )
