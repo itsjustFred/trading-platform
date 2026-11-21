@@ -288,6 +288,19 @@ the verdict could stand on a file nobody had looked at since the promotion.
   current CLI (one command, the same evidence): the new record replaces the old
   one for the same parameter set, and records of other parameter sets are kept.
   A promotion recorded this way is what the ledger holds from then on.
+- Re-recording needs the evidence files themselves, so an evidence file that was
+  cleaned up (an old `DATA_DIR/optimizations` run, a scratch paper report) has no
+  recovery shortcut: re-run what produced it -- the optimization for the
+  out-of-sample part, the paper run for the paper report, the parity harness for
+  the parity report -- and record the promotion again with the new files. The
+  command exits non-zero naming the missing file, and writes nothing, so a
+  half-re-recorded promotion is not possible.
+- Before deploying this change, look for `*.promoted.json` ledgers (they sit next
+  to the promoted file) and re-record every one of them: each pre-#260 ledger
+  drops its deployment to `experimental` on the first check after the upgrade and
+  the daemon then refuses its entry orders until it is re-recorded. Check the
+  evidence files still exist first; the runbook of an upgrade that must not stop
+  trading is to re-record and only then restart the daemon.
 
 ### Recording a promotion (CLI only)
 
@@ -295,7 +308,7 @@ the verdict could stand on a file nobody had looked at since the promotion.
 uv run python -m runner.cli promote \
     --strategy example_sma \
     --promoted-by "Jane Doe" \
-    --optimization-result optimizations/opt-123.json \
+    --optimization-result data/optimizations/opt-123.json \
     --paper-account-id 10105152 --paper-broker ctrader \
     --paper-start 2026-08-01 --paper-end 2026-10-15 --paper-trades 42 \
     --paper-report docs/reports/paper_example_sma.csv \
@@ -303,6 +316,17 @@ uv run python -m runner.cli promote \
     --parity-deviation total_return=0.012 --parity-deviation sharpe_ratio=0.008 \
     --parity-report docs/reports/parity_example_sma.json
 ```
+
+The paths are the ones this repository uses: `data/optimizations` is
+`DATA_DIR/optimizations` with `DATA_DIR` unset (the default) -- pass the path the
+optimizer actually wrote wherever `DATA_DIR` points.
+
+An evidence file no other checkout can see makes a promotion that is not
+portable: the ledger has to be committed and its evidence files have to exist
+where the ledger is in force. This repository ignores every `*.csv`, so the
+`--paper-report` above is git-ignored and a promotion recorded with it would be
+refused on the next clone. Such a report belongs outside the repository (recorded
+absolutely, in force on that machine only) or as a copy that git tracks.
 
 For a signal bot use `--signal-processor ramjet` and pass the deployment's
 `signal_processor_config` as `--params '{...}'` (`--params` is refused for a
