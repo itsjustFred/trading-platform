@@ -476,18 +476,28 @@ not warned at.
   deduplicated across redeliveries, in the same transaction as the halt.
 - The **affected deployment** is set to `PAUSED`. The other deployments on the
   account keep trading, and their positions are untouched. A `STOPPED`
-  deployment is never downgraded (its cancel-and-flatten sweep already ran).
+  deployment is never downgraded: its own cancel-and-flatten enforcement handles
+  it, so check `stopped_enforced_at` on the deployment payload (and the broker)
+  before treating it as closed. A `STOPPED` row without that stamp still has
+  exposure at the broker - `exposure_may_be_open` reports exactly that.
 - `ERROR` log with `alert=live_broker_order_id_conflict` (Sentry turns it into
   an event), naming the signal, the deployment, the tracked and the conflicting
   id, and whether this call wrote the halt.
-- Every service sync tick re-applies the halt: a restart, a status write or a
-  row written by an older build cannot leave a conflicted deployment trading
-  again. Re-asserting a halt logs at `INFO`; a new one logs the `ERROR` alert.
+- Every service sync tick re-applies the halt, before anything else in that tick
+  and in its own error handling: a restart, a status write or a row written by an
+  older build cannot leave a conflicted deployment trading again. Every halt write
+  logs the `ERROR` alert, at detection and at a tick re-halt alike; the tick adds
+  an `INFO` summary naming the deployments it re-halted. An already-halted
+  deployment logs nothing (re-writing it would move `updated_at` every pass), and
+  a halt that cannot be written is its own `ERROR` alert.
 
 **`PAUSED` still allows exits** (maintainer decision, #126). A pause blocks new
-entries and still dispatches exit-only signals, matching `base_adapter.py:226`
-("stop opening new positions"): `ACTIVE` or `PAUSED` for a close, `ACTIVE` alone
-for an entry, checked at the fan-out, the pre-submit re-check and the atomic
+entries and still dispatches exit-only signals, matching the `PAUSED` row of the
+"Operator safety controls" comment in `live_runner/base_adapter.py`
+("stop opening new positions; orders and positions are left untouched"): `ACTIVE` or
+`PAUSED` for a close, `ACTIVE` alone for an entry, decided per deployment from the
+raw signal - a parsed exit intent, or a plain `SELL`/`SHORT` on a deployment that
+cannot short - and checked at the fan-out, the pre-submit re-check and the atomic
 submission claim. `STOPPED` is excluded - its exposure is closed by the stop
 sweeps. This applies to every pause, manual ones included. Consequence: a
 deployment halted for a conflict can still close the position the ledger *does*
@@ -512,6 +522,15 @@ what may be *opened* is still decided per signal, so no entry can come out of it
 - Health read: `live_runner.broker_order_conflicts.check_broker_order_conflicts()`
   → `{"status": "ok" | "error", "deployment_ids": [...], "conflicts": [...]}`.
 
+**Cost, and what grows it.** Every one of those reads scans `live_signals` for the JSON
+key, because there is no index on it: once per 60 s service-sync tick in the daemon, and
+once per dashboard or deployments request. That is fine at today's signal counts and it is
+the reason the resolution path is an endpoint rather than something a page polls in a
+loop. If the fleet ever grows enough for it to matter, the fix is structural - a partial
+index on the conflicts key, or a dedicated per-deployment flag column - and not a cap on
+the read: the reads that decide a halt and a resolution above are deliberately uncapped,
+so a trimming that hides an older conflict cannot happen there.
+
 **How to resolve one**
 
 1. Look the conflicting id up at the broker (open orders and positions). This is
@@ -528,13 +547,19 @@ what may be *opened* is still decided per signal, so no entry can come out of it
    for it in the ledger if it belongs to this platform.
 4. Record the resolution: `POST
    /api/live/deployments/{id}/broker-order-conflicts/resolve` with
-   `{"confirmed_deployment_id": id, "reason": "<what you found>"}`. The reason is
+   `{"confirmed_deployment_id": "<deployment id>", "reason": "<what you found>"}`.
+   The reason is
    required and audited; the call clears every recorded conflict for the
    deployment (a partial clear would still leave it halted) and reports the
    in-flight submission drain with it.
-5. Resume: `PUT /api/live/deployments/{id}/status` → `ACTIVE`, which does its own
-   broker re-verification. The halt re-asserts at the next tick until step 4 has
-   recorded the resolution, so a resume that does not stick means the conflict is
-   still recorded - and a duplicate still being redelivered can re-record it even
+5. Resume: `PUT /api/live/deployments/{id}/status` with
+   `{"status": "ACTIVE", "confirmation": {"confirmed_deployment_id": "<deployment id>"}}`
+   (an unconfirmed write is a `428`, and a confirmation naming another deployment a
+   `409`), which does its own broker re-verification. The write is **refused with
+   `409` while a conflict is still recorded**: the way out of the halt is step 4,
+   not a status write. So a resume that does not stick means step 4 cleared nothing
+   - and a duplicate still being redelivered can re-record the conflict even
+   after step 4, because the conflict ledger's own read-modify-write wins that race
+   on purpose. - and a duplicate still being redelivered can re-record it even
    after step 4, because the conflict ledger's own read-modify-write wins that race
    on purpose.
