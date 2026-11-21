@@ -44,9 +44,9 @@ ISOLATED_ACCOUNTS_ENV = _SESSION_ROOT / ".accounts.env"
 # load it at import time, before any test can intervene, so the load is redirected here rather
 # than prevented: the call still happens, the content is the empty session file.
 ISOLATED_DOTENV_FILE = _SESSION_ROOT / ".env"
-# The accounts-env override the production resolver reads at call time (see
-# ``live_runner/credential_env.py``). Imported here rather than from that module because this file
-# must not import production code before the redirects below are installed.
+# A stale TP_ACCOUNTS_ENV names a real credential file. Production no longer reads it, but it is
+# scrubbed anyway: a variable that points at the checkout's secrets has no business being set for
+# a test, and keeping it out means a reintroduced reader cannot be fed by the shell.
 ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
 # Exported broker, Discord, Sentry and database configuration is as much a leak as the files
 # above: ``load_accounts_env_values`` overlays ``os.environ`` under the accounts file, so a real
@@ -86,9 +86,9 @@ os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
 # Removed rather than redirected: an exported TP_ACCOUNTS_ENV names a real credential file, and
-# the resolver prefers it over the module default it is also given. Removing it leaves exactly one
-# redirect in play - the roster of module constants below - so a test that patches a module default
-# still changes what the code reads.
+# nothing in the suite may read one. Removing it leaves exactly one redirect in play - the roster
+# of module constants below - so a test that patches a module default still changes what the code
+# reads.
 os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 
 

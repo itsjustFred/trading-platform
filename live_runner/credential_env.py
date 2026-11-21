@@ -26,9 +26,6 @@ logger = get_logger("live-runner")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
-# The override an operator (or the test suite) can export to name a different accounts env file
-# without editing code.
-ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
 
 
 def resolve_accounts_env_path(named: Path | str | None = None, *, default: Path | str) -> Path:
@@ -39,15 +36,15 @@ def resolve_accounts_env_path(named: Path | str | None = None, *, default: Path 
     to that signature, and the call reads the original file anyway. That is how the test suite came
     to read the checkout's real credential file from a signature nobody touched.
 
-    Three levels, most specific first: a path the caller named is used verbatim (it is the caller's
-    own configuration, and the override must not silently replace it), then ``TP_ACCOUNTS_ENV``
-    (an operator instruction, which has to reach the entry points that name no path), then
-    ``default``.
+    A path the caller named is used verbatim (it is the caller's own configuration); with none,
+    ``default`` - which every caller passes as its module constant, looked up at call time - wins.
+    There is deliberately no environment override: an env var honoured by only some readers gave
+    two components different views of the accounts file, and the readers that missed it (the
+    viewer, deployment-save validation, the smoke scripts) kept trading against the project file.
     """
     if named is not None:
         return Path(named)
-    override = os.environ.get(ACCOUNTS_ENV_ENV_VAR, "").strip()
-    return Path(override).expanduser() if override else Path(default)
+    return Path(default)
 
 TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})

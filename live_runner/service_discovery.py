@@ -21,8 +21,8 @@ def discover_discord_bots_from_env(
     """Discover the Discord bots configured in the accounts env.
 
     ``accounts_env`` is optional so the daemon can hand over the file it was started with: without
-    it the bots are discovered from the module default, which an operator who redirected the
-    accounts env (TP_ACCOUNTS_ENV, or an explicit path) has already said is not the file to use.
+    it the bots are discovered from the module default, which an operator who named another file
+    has already said is not the file to use.
     """
     # File-first precedence: .accounts.env wins over the process environment.
     env_values = load_accounts_env_values(

@@ -777,7 +777,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help=(
             "Path to .accounts.env-style credential file "
-            "(default: TP_ACCOUNTS_ENV or the project file)."
+            "(default: the project file)."
         ),
     )
     parser.add_argument(
@@ -807,7 +807,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # green document as a run that never looked at the DB.
         args.check_db = True
     # Resolve once here so the preflight, the crash redaction and the result document all name the
-    # same file: TP_ACCOUNTS_ENV applies only when --accounts-env was not given.
+    # same file: --accounts-env applies only when given, else the module default.
     accounts_env = resolve_accounts_env_path(args.accounts_env, default=DEFAULT_ACCOUNTS_ENV)
 
     # stdout carries exactly one JSON result document; log lines go to stderr.

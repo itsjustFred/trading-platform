@@ -240,7 +240,7 @@ def test_the_resolver_defaults_are_not_frozen_at_the_repo_path() -> None:
 
 def test_the_suite_drops_an_inherited_accounts_env_override() -> None:
     """Removed, not ``setdefault``: an exported TP_ACCOUNTS_ENV names a real credential file, and
-    the resolver prefers it over the module default it is also given."""
+    nothing in the suite may read one."""
     assert suite_conftest.ACCOUNTS_ENV_ENV_VAR not in os.environ
     # The one redirect that stays in play is the roster of module constants, so a test that patches
     # a module default still changes what the code reads.
@@ -291,50 +291,30 @@ def test_no_external_credential_env_var_is_set() -> None:
     assert leaked == []
 
 
-def test_the_accounts_env_override_env_var_wins_over_the_default(tmp_path: Path) -> None:
-    """The documented operator escape hatch, and the reason the resolver exists."""
-    from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
+def test_the_module_default_is_used_when_nothing_is_named(tmp_path: Path) -> None:
+    """With no named path the resolver returns the caller's default - and nothing else.
+
+    There is deliberately no environment override: an env var honoured by only some readers gave
+    two components different views of the accounts file. A reintroduced ``TP_ACCOUNTS_ENV`` read
+    here would fail this test.
+    """
+    from live_runner.credential_env import resolve_accounts_env_path
 
     module_default = tmp_path / ".accounts.env"
-    original = os.environ.get(ACCOUNTS_ENV_ENV_VAR)
-    os.environ[ACCOUNTS_ENV_ENV_VAR] = "/somewhere/else/.accounts.env"
-    try:
-        assert resolve_accounts_env_path(default=module_default) == Path(
-            "/somewhere/else/.accounts.env"
-        )
-    finally:
-        if original is None:
-            os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
-        else:
-            os.environ[ACCOUNTS_ENV_ENV_VAR] = original
-
-
-def test_the_module_default_is_used_when_nothing_is_named_or_overridden(tmp_path: Path) -> None:
-    from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
-
-    module_default = tmp_path / ".accounts.env"
-    os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
+    assert resolve_accounts_env_path(default=module_default) == module_default
+    os.environ["TP_ACCOUNTS_ENV"] = "/somewhere/else/.accounts.env"
     try:
         assert resolve_accounts_env_path(default=module_default) == module_default
     finally:
-        os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
+        os.environ.pop("TP_ACCOUNTS_ENV", None)
 
 
 def test_a_caller_named_accounts_env_is_used_verbatim(tmp_path: Path) -> None:
-    """A named path is the caller's own configuration: the override must not replace it.
-
-    The suite drops the override, so a resolver that let it win over a named path would make every
-    accounts-env test read the module default instead of the file it wrote.
-    """
-    from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
+    """A named path is the caller's own configuration: the default must not replace it."""
+    from live_runner.credential_env import resolve_accounts_env_path
 
     named = tmp_path / "named.accounts.env"
     assert resolve_accounts_env_path(named, default=named) == named
-    os.environ[ACCOUNTS_ENV_ENV_VAR] = str(tmp_path / "override.accounts.env")
-    try:
-        assert resolve_accounts_env_path(named, default=named) == named
-    finally:
-        os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 
 
 def test_the_sandbox_accounts_env_carries_no_credentials() -> None:

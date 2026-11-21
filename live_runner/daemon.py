@@ -305,7 +305,7 @@ def _accounts_env_file(accounts_env: Path | str | None) -> Path:
 
     The three loops below used to freeze ``accounts_env: Path = DEFAULT_ACCOUNTS_ENV`` in their
     signatures, which bound the path at import time and ignored every later redirect of the module
-    constant. Resolving here keeps the default honest, and lets TP_ACCOUNTS_ENV redirect it.
+    constant. Resolving here keeps the default honest.
     """
     return resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
 

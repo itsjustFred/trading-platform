@@ -4,9 +4,9 @@ Status: credential-gated as of 2026-07-13.
 
 ## Preconditions
 
-- `.accounts.env` exists and remains gitignored. `TP_ACCOUNTS_ENV` overrides that path for the
-  entry points that default to it (preflight's `--accounts-env`, the daemon, account discovery); it
-  wins over both the file and the module default.
+- `.accounts.env` exists and remains gitignored. Entry points that need a different file take it
+  as an explicit argument (preflight's `--accounts-env`, the daemon's `accounts_env` parameter);
+  there is no environment override, so every reader resolves the same path.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
