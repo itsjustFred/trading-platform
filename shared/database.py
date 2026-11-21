@@ -3379,7 +3379,12 @@ def record_live_broker_side_close_fill(
                 )
                 session.add(close_signal)
                 try:
-                    session.commit()
+                    # ``flush`` and not ``commit``: the whole function runs inside one
+                    # ``BEGIN IMMEDIATE``, and committing here would end it - the execution
+                    # insert below would then run without the write lock this function holds
+                    # (the PR body's "one transaction" claim depends on this). A flush is
+                    # enough to make the close signal's primary key real for the insert below.
+                    session.flush()
                 except IntegrityError:
                     # A concurrent close of the same parent: the row is there, which is all this
                     # path needs (no broker order is ever dispatched for it).
@@ -3848,6 +3853,15 @@ def _newest_filled_entry_signal(
         .where(LiveSignalModel.deployment_id.in_(deployment_ids))
         .where(func.upper(LiveSignalModel.symbol) == symbol)
         .where(has_fill)
+        # #144: a broker-side close is a bookkeeping row for the parent entry, not an entry.
+        # It carries the newest fill on the symbol, so without this a trailing stop would read
+        # it as the entry and see a sell against a long, dropping the trail for the symbol.
+        .where(
+            or_(
+                LiveSignalModel.source.is_(None),
+                LiveSignalModel.source != BROKER_CLOSE_SIGNAL_SOURCE,
+            )
+        )
         .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
     )
     offset = 0
@@ -3994,6 +4008,14 @@ def list_live_signal_ids_for_reconciliation(
                 LiveSignalModel.deployment_id == LiveDeploymentModel.id,
             )
             .where(LiveDeploymentModel.account_id == normalized_account_id)
+            # #144: a broker-close signal is a ledger row, not a live order: it has no broker
+            # order of ours, so reconciling it is a wasted fetch of a nonexistent order.
+            .where(
+                or_(
+                    LiveSignalModel.source.is_(None),
+                    LiveSignalModel.source != BROKER_CLOSE_SIGNAL_SOURCE,
+                )
+            )
         )
         if before is not None:
             cursor_timestamp, cursor_id = before
