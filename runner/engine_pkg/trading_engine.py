@@ -85,11 +85,15 @@ class TradeEngine:
         # ``self.equity`` stays the *reporting* equity (it feeds the equity
         # curve) and must never reach a sizing decision: an open position's
         # paper profit is not spendable, and an unrealized drawdown is not a
-        # realized loss. This is the same basis the reference engines size on
-        # — MT5 (the EA's ``CalculateLotSize`` risks a fixed cash amount, and
-        # the repo's MT5 sizing fallback uses capital + closed-trade PnL) and
-        # the vectorbt runner (``equity = initial_capital``, credited with net
-        # PnL at each close).
+        # realized loss. The basis is decided by D2; the references are
+        # consistent with it but cannot distinguish the two, because none of
+        # them ever sizes while a position is open — MT5 risks a fixed cash
+        # amount and reads no account value at all (the repo's MT5 sizing
+        # fallback starts at the capital and is credited only when a trade
+        # closes), and the vectorbt runner holds one position at a time
+        # (``in_trade``) with no partial exit, so it credits ``equity`` with
+        # ``pnl - fees`` only at the close and never sizes against an open
+        # mark. Realized cash equals mark-to-market there.
         self._sizing_equity = float(config.initial_capital)
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None

@@ -10,9 +10,10 @@ Every fraction below is taken of **realized cash**: `initial_capital` plus the
 net PnL of *closed* trades. The mark-to-market equity that feeds the equity
 curve is never a sizing input — an open position's paper profit is not
 spendable, and an unrealized drawdown is not a realized loss (decision record
-D2 in `docs/cleanup-16d1-money-path-semantics.md`; this is also the basis MT5
-and the vectorbt runner size on). `signal replay` is the documented exception:
-it marks open positions to market for sizing (decision record D9).
+D2 in `docs/cleanup-16d1-money-path-semantics.md`, which also records why MT5
+and the vectorbt runner are *consistent* with this basis without being able to
+decide it). `signal replay` is the documented exception: it marks open
+positions to market for sizing (decision record D9).
 
 ## The three knobs — one documented meaning each
 

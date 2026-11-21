@@ -45,36 +45,71 @@ so the recorded figure is the fill-time basis for an order that is re-sized at
 fill and the creation-time basis for the fallback-sized MARKET order that
 keeps its creation quantity under the D4 exception.
 
-`_sizing_equity` is recomputed by `_refresh_sizing_equity()` at every partial
-close and when a trade is finalized, net of the round-trip fees a
-partly-closed position still owes (`_close_partial` books exit legs gross; the
-exact fee replaces the estimate at finalization).
+`_sizing_equity` is recomputed by `_refresh_sizing_equity()` when a position is
+opened, at every partial close and when a trade is finalized. What it holds
+back is exactly the cost the fee model has already **incurred** for every
+still-open position, and nothing it has not (`_close_partial` books exit legs
+gross; the whole round-trip fee only leaves the ledger at finalization):
 
-**Basis parity (#262):** neither reference sizes on mark-to-market equity, so
-the native engine now matches them rather than diverging:
+- the **entry leg on the position's original quantity**, plus the per-trade
+  surcharge — owed from the moment the position was opened, which is why a
+  position that has not exited yet holds it back too; and
+- the **exit leg of every leg that has already closed**, priced at that leg's
+  own fill price.
+
+The exit leg of the still-open remainder is a *future* cost and is deliberately
+not held back: sizing may not be reduced by a fee the position has not
+incurred. Because `fee_for_trade == entry_fee + exit_fee`, the held-back
+figure and the fee charged at finalization meet there exactly.
+
+**Basis parity (#262):** D2 decides the basis. Neither reference marks open
+positions to market for sizing, so they are *consistent* with it — but they
+cannot distinguish the two bases, because none of them ever sizes while a
+position is open:
 
 - **MT5 (basis-independent fixed cash):** the EA's `CalculateLotSize`
   (`strategy-comparisons/intraday_volatility_breakout/IntradayVolatilityBreakout.mq5:381-395`)
   sizes from the `Fixed_Risk_Amount` input
   (`IntradayVolatilityBreakout.mq5:46`) — a fixed cash amount — and never reads
   the account value at all (no `AccountInfoDouble`, `ACCOUNT_BALANCE` or
-  `ACCOUNT_EQUITY` anywhere in the EA), so an open position's paper PnL cannot
-  reach its lots either way. The repo's MT5 sizing code matches that: lots come
-  from `fixed_risk_amount` (`scripts/regenerate_mt5_parity_artifacts.py`
+  `ACCOUNT_EQUITY` anywhere in the EA), so its lots are the same on either
+  basis. The repo's MT5 sizing code matches that: lots come from
+  `fixed_risk_amount` (`scripts/regenerate_mt5_parity_artifacts.py`
   `_mt5_raw_lots`, line 344), with a 2% default stop distance when the report
   carries no stop (line 437) — the fixed-risk branch is taken whenever that
   distance is positive (line 443). Its only equity-denominated branch is the
   degenerate non-positive-distance fallback `equity / entry_price` (line 446),
   and that `equity` starts at the starting capital (line 367) and is credited
-  with a *closed* trade's PnL at its exit (line 486) — realized cash.
-- **vectorbt (realized cash):** `runner/engines/vectorbt_adapter.py` seeds
-  `equity = config.initial_capital` (line 403) and credits `pnl - fees` at each
-  close (line 651), so `_size_trade`'s sizing basis is realized cash; its
-  `trade.meta["risk_math"]["equity_at_entry"]` records that same figure.
+  with a *closed* trade's PnL at its exit (line 486) — realized cash. The
+  script pairs one entry with one exit (`entry_indices` / `exit_cursor`), so
+  it never sizes while a position is open either.
+- **vectorbt (credited only at the close):** `runner/engines/vectorbt_adapter.py`
+  seeds `equity = config.initial_capital` (line 403) and credits `pnl - fees`
+  at each close (line 651), so `_size_trade`'s sizing basis is realized cash;
+  its `trade.meta["risk_math"]["equity_at_entry"]` records that same figure
+  (line 570). The runner holds one position at a time (`in_trade`, line 401)
+  and has no partial exit, so it never sizes while a position is open.
 
-Neither reference marks open positions to market for sizing, so moving the
-native engine to mark-to-market sizing would have broken parity with both
-(and MT5 could not even express it).
+**Therefore the references are consistent with realized cash but cannot decide
+between realized cash and mark-to-market** — in both, the two figures are equal
+at every moment a sizing decision is taken (no open position, hence no open
+mark), and MT5 could not even express a mark-to-market basis because it reads
+no account value. What decided D2 is the requirement itself: an open position's
+paper profit is not spendable and an unrealized drawdown is not a realized
+loss, which only the realized basis states directly.
+
+**Partial-exit timing vs. the multi-symbol replay (documented divergence):**
+`_close_partial` credits a partial leg to `_realized_pnl` (and hence to
+`_sizing_equity`) the moment it closes, while `replay_shared_equity`
+(`runner/engines/_shared.py`) credits a trade's PnL to its shared ledger only
+at that trade's **last** exit (`_release_through`, before the next entry).
+So a symbol's own run already books the first leg's cash into a later entry's
+basis, while the replay does not credit it until the whole trade is out: the
+per-unit coefficient `quantity / equity_at_entry` therefore stays exact only
+for the run that produced it, and a cross-symbol replay reproduces *quantities*
+rather than matching cash step for step. Accepted, not papered over — the
+alternative (credit nothing until the last exit) would let partial proceeds
+compound into entries that the ledger had not received.
 
 **Scope note:** F21 also flags the hidden per-call sizing protocol
 (`fixed_risk_amount`, `tick_value`, `lot_step`, `min_lot`, `max_lot`,
