@@ -23,7 +23,12 @@ from pathlib import Path
 from runner.agent_process import build_backtest_child_env
 from runner.approval_gate import require_generated_strategy_approval
 from runner.converters.lean_converter import convert_lean_result
-from runner.engines.base import BacktestConfig, EngineAdapter, ProgressCallback
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    ProgressCallback,
+    warn_if_engine_frozen,
+)
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 
@@ -59,6 +64,7 @@ class LeanAdapter(EngineAdapter):
         strategy_path must point to a LEAN algorithm source file. Existing
         result JSON is imported through :meth:`import_result`.
         """
+        warn_if_engine_frozen("lean", stacklevel=2)
         sp = Path(strategy_path)
         if sp.suffix.lower() == ".json":
             raise ValueError(

@@ -202,6 +202,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             **gate._parse_params(args.params),
         }
         cells = _parse_param_grid(args.param_grid, strategy_path, args.max_cells)
+        if not cells:
+            raise SystemExit("--param-grid produced no cells")
 
         adapters = {"native": NativeAdapter(), "vectorbt": VectorbtAdapter()}
         rows: list[dict[str, Any]] = []

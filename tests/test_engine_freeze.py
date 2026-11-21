@@ -13,7 +13,11 @@ import pytest
 
 from runner.backtest_grid import get_engine as grid_get_engine
 from runner.cli import get_engine
-from runner.engines.base import FROZEN_ENGINES, warn_if_engine_frozen
+from runner.engines.base import (
+    FROZEN_ENGINES,
+    BacktestConfig,
+    warn_if_engine_frozen,
+)
 
 
 def _warnings_for(func, *args, **kwargs):
@@ -48,3 +52,37 @@ class TestEngineSelectionWarnings:
     def test_helper_is_a_noop_for_unfrozen_names(self):
         for name in ("native", "", "bogus"):
             assert _warnings_for(warn_if_engine_frozen, name) == []
+
+    def test_lean_run_path_warns_but_import_result_does_not(self, tmp_path):
+        """``LeanAdapter.run`` is frozen; ``import_result`` stays supported."""
+        from runner.engines.lean_adapter import LeanAdapter
+
+        adapter = LeanAdapter(lean_project_dir=tmp_path)
+        config = BacktestConfig(
+            strategy_name="x",
+            symbols=["SYM"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+        )
+        # A .json strategy_path fails fast after the warning — no subprocess.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="import_result"):
+                adapter.run(config, str(tmp_path / "result.json"))
+        frozen = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert len(frozen) == 1
+        assert "frozen" in str(frozen[0].message)
+
+        # import_result never warns: LEAN import stays a supported oracle.
+        missing = tmp_path / "missing.json"
+        missing.write_text("{}")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                adapter.import_result(missing, config=config)
+            except Exception:
+                pass
+        assert not [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
