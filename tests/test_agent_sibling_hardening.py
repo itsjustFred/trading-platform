@@ -379,3 +379,340 @@ def test_the_selection_stops_on_what_it_cannot_read(name, probe_repo, tmp_path) 
     )
     assert result.returncode != 0, f"{name} (empty skill path): the selection did not stop"
     assert not source, f"{name} (empty skill path): recorded a skill source on a failure"
+
+
+needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+
+
+# --- quota handling (decision of 2026-11-21, issue #296) -----------------------
+#
+# An exhausted free-model cap, a rate limit or a region refusal is infrastructure,
+# not a review or mutation-testing result: it must not turn the run red. The
+# `quota-probe` job pings the same model before the agent job installs anything
+# and only a positive quota signature skips the agent - a grey check - while the
+# post job comments "not run: quota" and warns. A probe that fails for any other
+# reason fails open, so a genuine failure still fails, and the agent step's own
+# classifier takes the same path for a cap that only appears mid-run.
+
+
+def _workflow_if(job: dict) -> str:
+    """A job's `if:` with the `${{ }}` wrapper removed."""
+    expr = str(job.get("if", ""))
+    return expr.removeprefix("${{").removesuffix("}}").strip()
+
+
+def _eval_if(expr: str, needs: dict) -> bool:
+    """Evaluate the job-gate expressions these workflows use, against a `needs`
+    map of {job: {"result": ..., "outputs": {...}}}. Only the operators they
+    carry are supported: `!cancelled()`, `&&`, `||`, `==`, `!=`, parentheses and
+    `needs.<job>.result` / `needs.<job>.outputs.<name>` lookups."""
+    py = expr.replace("!cancelled()", "True")
+
+    # Rewrite needs.<job>.result / needs.<job>.outputs.<name> into subscript lookups.
+    def _result(m: re.Match) -> str:
+        return f"_needs.get({m.group(1)!r}, {{}}).get('result', '')"
+
+    def _output(m: re.Match) -> str:
+        return f"_needs.get({m.group(1)!r}, {{}}).get('outputs', {{}}).get({m.group(2)!r}, '')"
+
+    py = re.sub(r"needs\.([\w-]+)\.result\b", _result, py)
+    py = re.sub(r"needs\.([\w-]+)\.outputs\.([\w-]+)\b", _output, py)
+    py = py.replace("&&", " and ").replace("||", " or ")
+    return bool(eval(py, {"__builtins__": {}}, {"_needs": needs, "True": True}))  # noqa: S307
+
+
+def _needs_map(**jobs: dict) -> dict:
+    return {name: job for name, job in jobs.items()}
+
+
+def test_the_quota_probe_gates_the_agent_job() -> None:
+    """The decision's grey check is a job shape, not a status write: the probe
+    runs after resolve, before the agent job installs anything, and a positive
+    `available=false` skips the agent. Executed as expressions, because the
+    fail-open case is the whole point - a probe that failed, was skipped or
+    never ran must leave the agent running so a genuine failure still fails."""
+    agent_names = {"agent-code-review.yml": "review", "agent-mutation-testing.yml": "mutate"}
+    for name in SIBLINGS:
+        data = _load(name)
+        jobs = data["jobs"]
+        agent = agent_names[name]
+        probe = jobs["quota-probe"]
+
+        assert probe.get("needs") == "resolve" or probe.get("needs") == ["resolve"], (
+            f"{name}: the probe does not wait for the PR to be resolved"
+        )
+        assert "same_repo" in _workflow_if(probe), (
+            f"{name}: the probe pings the model for a fork PR"
+        )
+        assert probe.get("permissions") == {}, (
+            f"{name}: the probe holds a token scope it does not need"
+        )
+        assert not any(
+            str(s.get("uses", "")).startswith("actions/checkout") for s in probe.get("steps", [])
+        ), f"{name}: the probe checks out the PR it is only meant to price"
+        assert "steps.probe.outputs.available" in str(probe.get("outputs", {})), (
+            f"{name}: the probe reports no `available` output"
+        )
+
+        agent_job = jobs[agent]
+        needs = agent_job.get("needs")
+        assert isinstance(needs, list) and {"resolve", "quota-probe"} <= set(needs), (
+            f"{name}: the agent job does not need the probe"
+        )
+        agent_if = _workflow_if(agent_job)
+        assert "available != 'false'" in agent_if, (
+            f"{name}: the agent job is not gated on the probe's quota answer"
+        )
+        assert "!cancelled()" in agent_if, (
+            f"{name}: the gate implies success() and would skip the agent on a dead probe"
+        )
+
+        resolved = {"result": "success", "outputs": {"same_repo": "true", "number": "1"}}
+        probe_ok = {"result": "success", "outputs": {"available": "true"}}
+        probe_quota = {"result": "success", "outputs": {"available": "false"}}
+        scenarios = {
+            "quota available": (_needs_map(resolve=resolved, **{"quota-probe": probe_ok}), True),
+            "quota exhausted": (
+                _needs_map(resolve=resolved, **{"quota-probe": probe_quota}),
+                False,
+            ),
+            "probe job itself failed": (
+                _needs_map(
+                    resolve=resolved, **{"quota-probe": {"result": "failure", "outputs": {}}}
+                ),
+                True,
+            ),
+            "probe skipped with the resolve": (
+                _needs_map(
+                    resolve={"result": "skipped", "outputs": {}},
+                    **{"quota-probe": {"result": "skipped", "outputs": {}}},
+                ),
+                False,
+            ),
+            "fork PR": (
+                _needs_map(
+                    resolve={"result": "success", "outputs": {"same_repo": "false"}},
+                    **{"quota-probe": {"result": "skipped", "outputs": {}}},
+                ),
+                False,
+            ),
+        }
+        for why, (needs_map, expected) in scenarios.items():
+            assert _eval_if(agent_if, needs_map) is expected, f"{name}: {why} decided wrong"
+
+        post = jobs["post"]
+        post_needs = post.get("needs")
+        assert isinstance(post_needs, list) and "quota-probe" in post_needs, (
+            f"{name}: the post job does not see the probe's answer"
+        )
+        post_if = _workflow_if(post)
+        assert "quota-probe.outputs.available == 'false'" in post_if, (
+            f"{name}: the post job does not run for a quota skip"
+        )
+        quota_comment = _find_step(post, r"^Write quota comment$")
+        body = _run(quota_comment)
+        assert "Not run: quota" in body, f"{name}: the quota comment does not say why"
+        titles = {
+            "agent-code-review.yml": "# Code Review Action",
+            "agent-mutation-testing.yml": "# Mutation Testing Action",
+        }
+        assert titles[name] in body, f"{name}: the quota comment has no title"
+        # The probe path has no agent artifact, so the download and the post must
+        # both be gated: a skipped download would otherwise fail the post job.
+        download = next(
+            s
+            for s in post["steps"]
+            if str(s.get("uses", "")).startswith("actions/download-artifact")
+        )
+        assert "result == 'success'" in str(download.get("if", "")), (
+            f"{name}: the post job downloads an artifact the skipped agent never wrote"
+        )
+        post_step = _find_step(post, r"^Post or update")
+        assert "available == 'false'" in str(post_step.get("if", "")), (
+            f"{name}: the quota comment is written but never posted"
+        )
+
+
+_STUB_OPENCODE = """#!/usr/bin/env bash
+# A stand-in for the `opencode` the quota probe and the agent step call.
+# $STUB_OPENCODE_MODE selects the reply: ok, verdict (a parseable report),
+# quota (a cap signature on stderr, exit 1), other (a non-quota failure,
+# exit 1).
+set -u
+case "${STUB_OPENCODE_MODE:-ok}" in
+  ok) printf 'OK\\n'; exit 0 ;;
+  verdict) printf '**Summary:** probe verdict\\n**Verdict: PASS**\\n'; exit 0 ;;
+  quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
+  other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
+esac
+"""
+
+
+def _stub_bin(tmp_path) -> Path:
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "opencode"
+    stub.write_text(_STUB_OPENCODE, encoding="utf-8")
+    stub.chmod(0o755)
+    return bindir
+
+
+@needs_bash
+def test_the_quota_probe_step_reports_only_a_positive_quota_signature(tmp_path) -> None:
+    """The probe's whole contract is its output: `available=false` only when the
+    model's own reply carries a quota signature. Executed against a stub
+    `opencode` in both siblings, because the classification is a grep over
+    stderr and a string assertion cannot tell a pattern that matches from one
+    that does not. A success and a non-quota failure both fail open - the agent
+    job runs and the genuine failure surfaces there."""
+    for name in SIBLINGS:
+        stage = _stage(name)
+        job = _load(name)["jobs"]["quota-probe"]
+        step = _find_step(job, r"^Probe model quota$")
+        for mode, expected in (("ok", "true"), ("quota", "false"), ("other", "true")):
+            case = tmp_path / f"{stage}-{mode}"
+            case.mkdir(parents=True, exist_ok=True)
+            runner_temp = case / "runner-temp"
+            runner_temp.mkdir(exist_ok=True)
+            output = case / "github-output"
+            output.write_text("", encoding="utf-8")
+            env = {
+                **os.environ,
+                "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+                "STUB_OPENCODE_MODE": mode,
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_OUTPUT": str(output),
+                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            }
+            script = case / "probe.sh"
+            script.write_text(_run(step), encoding="utf-8")
+            result = subprocess.run(
+                [shutil.which("bash") or "bash", str(script)],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (
+                f"{name} ({mode}): the probe step failed:\n{result.stderr}"
+            )
+            written = output.read_text(encoding="utf-8")
+            assert f"available={expected}" in written, (
+                f"{name} ({mode}): the probe reported {written!r}, expected {expected}"
+            )
+
+
+_AGENT_STEP = {
+    "agent-code-review.yml": ("review", "Run review agent"),
+    "agent-mutation-testing.yml": ("mutate", "Run mutation agent"),
+}
+
+
+def _git(repo: Path, *args: str) -> str:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "probe",
+        "GIT_AUTHOR_EMAIL": "probe@example.invalid",
+        "GIT_COMMITTER_NAME": "probe",
+        "GIT_COMMITTER_EMAIL": "probe@example.invalid",
+    }
+    done = subprocess.run(
+        ["git", *args], cwd=repo, env=env, check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+@needs_bash
+def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
+    """The probe clears the agent job to run, but the cap can still appear
+    mid-run - the decision covers that too. Executed against a stub `opencode`
+    in both siblings: a quota signature must write the "not run: quota" comment
+    and exit 0 so the job does not go red, a parseable report must still post,
+    and a misconfigured model must still exit 1."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "--initial-branch=main", ".")
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    for name in SIBLINGS:
+        agent_name, step_name = _AGENT_STEP[name]
+        stage = _stage(name)
+        agent = _load(name)["jobs"][agent_name]
+        step = _find_step(agent, rf"^{re.escape(step_name)}$")
+        body = _run(step)
+        for mode in ("quota", "other", "verdict"):
+            case = tmp_path / f"{stage}-{mode}"
+            case.mkdir(parents=True, exist_ok=True)
+            runner_temp = case / "runner-temp"
+            (runner_temp / stage).mkdir(parents=True, exist_ok=True)
+            (runner_temp / stage / "meta.json").write_text("{}", encoding="utf-8")
+            (runner_temp / stage / "scope.txt").write_text("f.txt\n", encoding="utf-8")
+            env = {
+                **os.environ,
+                "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+                "STUB_OPENCODE_MODE": mode,
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_STEP_SUMMARY": str(case / "step-summary"),
+                "PR_NUMBER": "296",
+                "BASE_SHA": "1" * 40,
+                "HEAD_SHA": head,
+                "SKILL_SOURCE": "base branch",
+                "SKILL_PATH": f".agents/skills/{stage}/SKILL.md",
+                "MODEL": "opencode/inkling-2-small-free",
+                "VARIANT": "max",
+                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+                "SCOPE_EMPTY": "false",
+            }
+            script = case / "step.sh"
+            script.write_text(body, encoding="utf-8")
+            result = subprocess.run(
+                [shutil.which("bash") or "bash", str(script)],
+                cwd=repo,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            comment = runner_temp / stage / "comment.md"
+            if mode == "quota":
+                assert result.returncode == 0, (
+                    f"{name}: the quota path failed the step:\n{result.stderr}"
+                )
+                assert comment.is_file(), f"{name}: no comment was written"
+                text = comment.read_text(encoding="utf-8")
+                assert "Not run: quota" in text, f"{name}: no 'not run: quota' comment"
+                assert "::warning::" in result.stdout and "::error::" not in result.stdout, (
+                    f"{name}: the quota path does not warn without erroring"
+                )
+                # The mutation copy's Finish comment step titles the body later;
+                # execute it here so the posted shape is what is asserted.
+                if name == MUTATION:
+                    finish = _find_step(agent, r"^Finish comment$")
+                    finish_script = case / "finish.sh"
+                    finish_script.write_text(_run(finish), encoding="utf-8")
+                    finished = subprocess.run(
+                        [shutil.which("bash") or "bash", str(finish_script)],
+                        cwd=repo,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    assert finished.returncode == 0, (
+                        f"{name}: Finish comment failed on the quota path:\n{finished.stderr}"
+                    )
+                    text = comment.read_text(encoding="utf-8")
+                assert "# " in text.splitlines()[0], f"{name}: the quota comment has no title"
+
+            elif mode == "verdict":
+                assert result.returncode == 0, (
+                    f"{name}: a parseable report failed the step:\n{result.stderr}"
+                )
+                assert comment.is_file() and "Verdict: PASS" in comment.read_text(
+                    encoding="utf-8"
+                ), f"{name}: the verdict path wrote no comment"
+            else:
+                assert result.returncode == 1, f"{name}: a non-quota failure did not fail the step"
+                assert not comment.is_file() or "Not run: quota" not in (
+                    comment.read_text(encoding="utf-8") if comment.is_file() else ""
+                ), f"{name}: a genuine failure took the quota path"
