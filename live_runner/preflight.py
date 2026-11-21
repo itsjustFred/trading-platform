@@ -619,9 +619,7 @@ def run_live_preflight(
     db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
-    accounts_env = resolve_accounts_env_path(
-        accounts_env_path if accounts_env_path is not None else DEFAULT_ACCOUNTS_ENV
-    )
+    accounts_env = resolve_accounts_env_path(accounts_env_path, default=DEFAULT_ACCOUNTS_ENV)
     # ${VAR} references in the YAML resolve exactly like credentials: the accounts
     # env file first, the process environment only for keys the file does not
     # define. An explicit ``env`` mapping is used as-is (hermetic callers). The

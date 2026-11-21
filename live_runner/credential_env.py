@@ -31,19 +31,23 @@ DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
 
 
-def resolve_accounts_env_path(default: Path | str | None = None) -> Path:
-    """The accounts-env file to use when a caller names none.
+def resolve_accounts_env_path(named: Path | str | None = None, *, default: Path | str) -> Path:
+    """The accounts-env file to use for a caller whose default is ``default``.
 
-    Resolved at call time, NOT frozen as a default *argument*. ``def f(path=
-    DEFAULT_ACCOUNTS_ENV)`` binds the value when the module is imported: every later redirect of
-    ``DEFAULT_ACCOUNTS_ENV`` is invisible to that signature, and the call reads the original file
-    anyway. That is how the test suite came to read the checkout's real credential file from a
-    signature nobody touched. ``None`` means "the module default you already know".
+    Resolved at call time, NOT frozen as a default *argument*. ``def f(path=DEFAULT_ACCOUNTS_ENV)``
+    binds the value when the module is imported: every later redirect of the constant is invisible
+    to that signature, and the call reads the original file anyway. That is how the test suite came
+    to read the checkout's real credential file from a signature nobody touched.
+
+    Three levels, most specific first: a path the caller named is used verbatim (it is the caller's
+    own configuration, and the override must not silently replace it), then ``TP_ACCOUNTS_ENV``
+    (an operator instruction, which has to reach the entry points that name no path), then
+    ``default``.
     """
+    if named is not None:
+        return Path(named)
     override = os.environ.get(ACCOUNTS_ENV_ENV_VAR, "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path(default if default is not None else DEFAULT_ACCOUNTS_ENV)
+    return Path(override).expanduser() if override else Path(default)
 
 TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})

@@ -13,6 +13,7 @@ over HTTP while it is being imported.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import os
 import socket
@@ -41,6 +42,17 @@ from tests.conftest import (
 
 def _is_under(path: Path, root: Path) -> bool:
     return path.resolve() == root or root in path.resolve().parents
+
+
+def _called_name(node: ast.AST) -> str:
+    """The bare name of a call target, e.g. ``_discover_and_register_discord_services``."""
+    if isinstance(node, ast.Call):
+        target = node.func
+    else:  # pragma: no cover - only calls are passed today
+        target = node
+    if isinstance(target, ast.Attribute):
+        return target.attr
+    return getattr(target, "id", "")
 
 
 class _Config:  # no ``workerinput`` attribute: behaves like the controller
@@ -225,15 +237,26 @@ def test_the_resolver_defaults_are_not_frozen_at_the_repo_path() -> None:
         assert default is None, f"{module.__name__}.{function_name} froze a default: {default!r}"
 
 
-def test_the_accounts_env_override_env_var_wins() -> None:
+def test_the_suite_drops_an_inherited_accounts_env_override() -> None:
+    """Removed, not ``setdefault``: an exported TP_ACCOUNTS_ENV names a real credential file, and
+    the resolver prefers it over the module default it is also given."""
+    assert suite_conftest.ACCOUNTS_ENV_ENV_VAR not in os.environ
+    # The one redirect that stays in play is the roster of module constants, so a test that patches
+    # a module default still changes what the code reads.
+    assert os.environ["DATA_DIR"] == str(TEST_DATA_DIR)
+
+
+def test_the_accounts_env_override_env_var_wins_over_the_default(tmp_path: Path) -> None:
     """The documented operator escape hatch, and the reason the resolver exists."""
     from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
 
-    monkeypatched = {ACCOUNTS_ENV_ENV_VAR: "/somewhere/else/.accounts.env"}
+    module_default = tmp_path / ".accounts.env"
     original = os.environ.get(ACCOUNTS_ENV_ENV_VAR)
-    os.environ.update(monkeypatched)
+    os.environ[ACCOUNTS_ENV_ENV_VAR] = "/somewhere/else/.accounts.env"
     try:
-        assert resolve_accounts_env_path(None) == Path("/somewhere/else/.accounts.env")
+        assert resolve_accounts_env_path(default=module_default) == Path(
+            "/somewhere/else/.accounts.env"
+        )
     finally:
         if original is None:
             os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
@@ -241,12 +264,32 @@ def test_the_accounts_env_override_env_var_wins() -> None:
             os.environ[ACCOUNTS_ENV_ENV_VAR] = original
 
 
+def test_the_module_default_is_used_when_nothing_is_named_or_overridden(tmp_path: Path) -> None:
+    from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
+
+    module_default = tmp_path / ".accounts.env"
+    os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
+    try:
+        assert resolve_accounts_env_path(default=module_default) == module_default
+    finally:
+        os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
+
+
 def test_a_caller_named_accounts_env_is_used_verbatim(tmp_path: Path) -> None:
-    from live_runner.credential_env import resolve_accounts_env_path
+    """A named path is the caller's own configuration: the override must not replace it.
+
+    The suite drops the override, so a resolver that let it win over a named path would make every
+    accounts-env test read the module default instead of the file it wrote.
+    """
+    from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
 
     named = tmp_path / "named.accounts.env"
-    assert resolve_accounts_env_path(named) == named
-    assert resolve_accounts_env_path(str(named)) == named
+    assert resolve_accounts_env_path(named, default=named) == named
+    os.environ[ACCOUNTS_ENV_ENV_VAR] = str(tmp_path / "override.accounts.env")
+    try:
+        assert resolve_accounts_env_path(named, default=named) == named
+    finally:
+        os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 
 
 def test_the_sandbox_accounts_env_carries_no_credentials() -> None:
@@ -399,15 +442,22 @@ def test_a_loopback_name_lookup_is_allowed() -> None:
 
 
 def test_a_loopback_connect_is_allowed_through_to_the_os(monkeypatch) -> None:
-    """The guard stops the *network*, not localhost: the OS refusal still has to arrive."""
+    """The guard stops the *network*, not localhost: a real localhost connect still succeeds."""
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
-    probe = socket.socket()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
     try:
-        with pytest.raises(OSError) as refused:
-            probe.connect(("127.0.0.1", 1))
+        probe = socket.socket()
+        try:
+            probe.connect(("127.0.0.1", port))
+            accepted, _ = listener.accept()
+            accepted.close()
+        finally:
+            probe.close()
     finally:
-        probe.close()
-    assert not isinstance(refused.value, suite_conftest.SuiteHermeticityViolation)
+        listener.close()
     assert suite_conftest.network_violations() == ()
 
 
@@ -439,6 +489,98 @@ def test_a_unix_socket_connect_is_not_a_network_violation(monkeypatch) -> None:
     finally:
         probe.close()
     assert suite_conftest.network_violations() == ()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: socket.gethostbyname("api.alpaca.markets"),
+        # An IP literal, so the datagram path is the one under test and not a name lookup.
+        lambda: socket.socket().sendto(b"x", ("35.221.23.121", 443)),
+    ],
+    ids=["gethostbyname", "sendto"],
+)
+def test_a_datagram_or_bare_lookup_is_refused_too(monkeypatch, call) -> None:
+    """UDP and a DNS-only lookup reach the network without a ``connect``."""
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation):
+        call()
+    assert len(suite_conftest.network_violations()) == 1
+
+
+def test_every_daemon_discovery_call_names_the_resolved_accounts_env() -> None:
+    """The file the daemon resolved must reach every discovery call.
+
+    ``run_daemon`` and the credential-reload loop each dispatch discovery on a worker thread. A
+    dispatch that omits the file falls back to the module default, which an operator who redirected
+    the accounts env has already said is not the file to use. Read from the AST because
+    ``run_daemon`` is an unbounded loop: its first statement cannot be driven and then stopped.
+    """
+    tree = ast.parse((_PROJECT_ROOT / "live_runner" / "daemon.py").read_text(encoding="utf-8"))
+    dispatches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _called_name(node) == "to_thread"
+    ]
+    discovery = [
+        call
+        for call in dispatches
+        if any(
+            ast.unparse(argument) == "_discover_and_register_discord_services"
+            for argument in call.args
+        )
+    ]
+    assert discovery, "live_runner/daemon.py never dispatches Discord service discovery"
+    for call in discovery:
+        arguments = [ast.unparse(argument) for argument in call.args]
+        position = arguments.index("_discover_and_register_discord_services")
+        following = arguments[position + 1 :]
+        assert following, f"{ast.unparse(call)} names no accounts env"
+        assert following[0] == "accounts_env", ast.unparse(call)
+
+
+def test_the_daemon_discovers_bots_from_the_file_it_was_given(tmp_path, monkeypatch) -> None:
+    """Discovery must not read the module default when the daemon resolved another file.
+
+    Otherwise an operator who redirected the accounts env (or named one on the command line) still
+    gets bots from the checkout's default, which is the file they said not to use.
+    """
+    import live_runner.daemon as daemon
+    import live_runner.service_discovery as service_discovery
+
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text(
+        "DISCORD_BOT_RAMJET_TOKEN=token\nDISCORD_BOT_RAMJET_CHANNEL_ID=1431465140905185452\n",
+        encoding="utf-8",
+    )
+    # The daemon hands the file it resolved to discovery, rather than letting discovery pick its
+    # own. Patched in the daemon's namespace, where the name is imported, so this asserts the call
+    # and not the reader.
+    monkeypatch.setattr(daemon, "list_services", lambda *args, **kwargs: [])
+    monkeypatch.setattr(daemon, "create_service", lambda service: service)
+    seen: list[Path | None] = []
+
+    def _discover(accounts_env=None):
+        seen.append(Path(accounts_env) if accounts_env is not None else None)
+        return []
+
+    monkeypatch.setattr(daemon, "discover_discord_bots_from_env", _discover)
+    daemon._discover_and_register_discord_services(accounts_env)
+    assert seen == [accounts_env]
+
+    # ... and the reader itself uses the file it is handed, not the module default. The real
+    # function is called, so a discovery that ignored its argument reads the (empty) sandbox path.
+    monkeypatch.undo()
+    discovered = service_discovery.discover_discord_bots_from_env(accounts_env)
+    assert discovered == [
+        {
+            "name": "RAMJET",
+            "token_env_key": "DISCORD_BOT_RAMJET_TOKEN",
+            "channel_id": "1431465140905185452",
+        }
+    ]
+    # The same call through the module default finds nothing: that path is the session sandbox.
+    assert service_discovery.discover_discord_bots_from_env() == []
 
 
 def test_sessionfinish_fails_the_run_when_the_network_was_reached(monkeypatch, capsys) -> None:

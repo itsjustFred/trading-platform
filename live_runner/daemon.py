@@ -307,9 +307,7 @@ def _accounts_env_file(accounts_env: Path | str | None) -> Path:
     signatures, which bound the path at import time and ignored every later redirect of the module
     constant. Resolving here keeps the default honest, and lets TP_ACCOUNTS_ENV redirect it.
     """
-    return resolve_accounts_env_path(
-        accounts_env if accounts_env is not None else DEFAULT_ACCOUNTS_ENV
-    )
+    return resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
 
 
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
@@ -320,8 +318,12 @@ def _accounts_env_mtime(accounts_env: Path) -> int | None:
     return accounts_env_mtime(accounts_env)
 
 
-def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:
-    discovered = discover_discord_bots_from_env()
+def _discover_and_register_discord_services(
+    accounts_env: Path | str | None = None, *, log_summary: bool = True
+) -> list[Service]:
+    # The same file the rest of the daemon resolved: discovery that read the module default instead
+    # would discover bots from a file the operator redirected away from.
+    discovered = discover_discord_bots_from_env(accounts_env)
     discovered_names = [str(item.get("name") or "").strip().upper() for item in discovered]
     if log_summary:
         if discovered_names:
@@ -3924,7 +3926,9 @@ async def sync_services_loop(
             if current_mtime != accounts_env_mtime:
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
-                await asyncio.to_thread(_discover_and_register_discord_services, log_summary=False)
+                await asyncio.to_thread(
+                    _discover_and_register_discord_services, accounts_env, log_summary=False
+                )
                 if _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
                     logger.info(
                         "Credentials changed; clearing blocked Discord bot services",
@@ -5207,7 +5211,7 @@ async def run_daemon(
     active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
     scheduler = ServiceScheduler()
 
-    await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
+    await asyncio.to_thread(_discover_and_register_discord_services, accounts_env, log_summary=True)
     await asyncio.to_thread(_recover_failed_services)
     await scheduler.start()
 

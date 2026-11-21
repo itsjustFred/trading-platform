@@ -955,10 +955,9 @@ async def discover_configured_accounts(
 ) -> list[LiveAccount]:
     # File-first precedence: .accounts.env wins over the process environment.
     # Discovery also must not mutate os.environ (no load_dotenv side effects).
-    env_path = resolve_accounts_env_path(
-        accounts_env if accounts_env is not None else DEFAULT_ACCOUNTS_ENV
+    env = load_accounts_env_values(
+        resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
     )
-    env = load_accounts_env_values(env_path)
 
     discovered_accounts: dict[tuple[str, str], LiveAccount] = {}
 

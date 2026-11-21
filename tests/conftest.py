@@ -44,6 +44,10 @@ ISOLATED_ACCOUNTS_ENV = _SESSION_ROOT / ".accounts.env"
 # load it at import time, before any test can intervene, so the load is redirected here rather
 # than prevented: the call still happens, the content is the empty session file.
 ISOLATED_DOTENV_FILE = _SESSION_ROOT / ".env"
+# The accounts-env override the production resolver reads at call time (see
+# ``live_runner/credential_env.py``). Imported here rather than from that module because this file
+# must not import production code before the redirects below are installed.
+ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
 for _session_dir in (TEST_DATA_DIR, TEST_LOG_DIR):
     _session_dir.mkdir(parents=True, exist_ok=True)
 ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
@@ -51,6 +55,11 @@ ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
 os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
+# Removed rather than redirected: an exported TP_ACCOUNTS_ENV names a real credential file, and
+# the resolver prefers it over the module default it is also given. Removing it leaves exactly one
+# redirect in play - the roster of module constants below - so a test that patches a module default
+# still changes what the code reads.
+os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
 
 
 class SuiteHermeticityViolation(RuntimeError):
@@ -154,11 +163,34 @@ def _audit_hook(event: str, args: tuple) -> None:
         host = address[0] if isinstance(address, (tuple, list)) and address else address
         _refuse_remote_host(host, "connect")
         return
-    if event == "socket.getaddrinfo":
+    if event in ("socket.getaddrinfo", "socket.gethostbyname"):
         _refuse_remote_host(args[0] if args else None, "name lookup")
+        return
+    if event in ("socket.sendto",):
+        address = args[1] if len(args) > 1 else None
+        if isinstance(address, (str, bytes)):
+            return  # AF_UNIX path
+        host = address[0] if isinstance(address, (tuple, list)) and address else address
+        _refuse_remote_host(host, "send")
 
 
 sys.addaudithook(_audit_hook)
+
+
+# ``shared.constants`` and ``viewer.main`` load the checkout's real ``.env`` at import time, so
+# the load is redirected to the empty session file. This has to be installed *before* the roster
+# below is imported: importing it pulls in ``shared.constants``, which would otherwise load the
+# real file before the redirect exists.
+_real_load_dotenv = dotenv.load_dotenv
+
+
+def _redirected_load_dotenv(path=None, *args, **kwargs):
+    if _repo_secret_path(path) == REPO_ENV_FILE:
+        path = ISOLATED_DOTENV_FILE
+    return _real_load_dotenv(path, *args, **kwargs)
+
+
+dotenv.load_dotenv = _redirected_load_dotenv
 
 
 # ``DEFAULT_ACCOUNTS_ENV`` is the path of the checkout's real credential file, and it is a module
@@ -198,20 +230,6 @@ def _isolate_accounts_env() -> None:
 
 
 _isolate_accounts_env()
-
-
-# ``shared.constants`` and ``viewer.main`` load the checkout's real ``.env`` at import time, so
-# the load is redirected to the empty session file. Everything else keeps the real function.
-_real_load_dotenv = dotenv.load_dotenv
-
-
-def _redirected_load_dotenv(path=None, *args, **kwargs):
-    if _repo_secret_path(path) == REPO_ENV_FILE:
-        path = ISOLATED_DOTENV_FILE
-    return _real_load_dotenv(path, *args, **kwargs)
-
-
-dotenv.load_dotenv = _redirected_load_dotenv
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:

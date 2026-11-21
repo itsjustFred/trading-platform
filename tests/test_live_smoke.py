@@ -174,7 +174,9 @@ def test_discord_replay_smoke_routes_to_fake_order(tmp_path: Path) -> None:
     directory read nothing at all.
     """
     accounts_env = tmp_path / ".accounts.env"
-    accounts_env.write_text("ALPACA_API_KEY=smoke-key\nALPACA_SECRET_KEY=smoke-secret\n", encoding="utf-8")
+    accounts_env.write_text(
+        "ALPACA_API_KEY=smoke-key\nALPACA_SECRET_KEY=smoke-secret\n", encoding="utf-8"
+    )
     report = asyncio.run(
         run_smoke(
             mode="discord-replay",
