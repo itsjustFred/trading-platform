@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import re
-import sys
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Iterable, Mapping
@@ -70,8 +69,10 @@ from live_runner.shutdown import (
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     EXIT_CLEANUP_TIMEOUT,
+    EXIT_CRASH,
     EXIT_OK,
     EXIT_PATH_TIMEOUT_SECONDS,
+    SENTRY_FLUSH_TIMEOUT_SECONDS,
     ShutdownCoordinator,
     SubmissionRefusedError,
     close_the_loop_bounded,
@@ -136,7 +137,7 @@ from shared.models import (
     ServiceStatus,
     ServiceType,
 )
-from shared.sentry import capture_exception, initialize_sentry
+from shared.sentry import capture_exception, flush_sentry, initialize_sentry
 from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
     validate_live_deployment_trailing_override,
@@ -5627,8 +5628,9 @@ async def _shutdown_cleanup(
     #    request. It runs off the loop under the same deadline, so a release that
     #    does not come back is reported as a failed phase instead of hanging the
     #    daemon in front of its exit code. The abandonment is recorded as well:
-    #    the pool's workers are non-daemon threads, so ``main`` has to leave
-    #    through ``os._exit`` to still report that exit code.
+    #    the pool's workers are non-daemon threads, which is one of the reasons
+    #    ``main`` leaves the process immediately instead of letting the
+    #    interpreter finish.
     if not await _bounded(
         release_twisted_reactor_threads_bounded(cleanup_timeout),
         timeout=cleanup_timeout,
@@ -5828,6 +5830,38 @@ async def run_daemon(
     return EXIT_OK if cleanup_ok else EXIT_CLEANUP_TIMEOUT
 
 
+def _leave_the_process(exit_code: int) -> None:
+    """Flush what has to reach the outside world, then leave with ``exit_code``.
+
+    The daemon leaves the process this way on every path - a clean shutdown, a
+    timed-out phase and a crash alike - rather than letting the interpreter finish
+    on its own, because the teardown that would run next joins every thread the
+    daemon left alive and that join has no deadline:
+
+    * ``concurrent.futures.thread._python_exit`` joins every live executor worker,
+      and a worker running a broker request - an Alpaca REST call, a balance
+      poll - is cancelled at the await but never at the call, so a task that
+      *honoured* its cancel still leaves one running. A clean shutdown reports
+      ``EXIT_OK`` in milliseconds and then waits out the broker's own timeout.
+    * ``threading`` joins every non-daemon thread, which is what Twisted's reactor
+      pool workers are when the release above was abandoned.
+
+    Either wait is past the unit's ``TimeoutStopSec``, so systemd would report the
+    SIGKILL it sent itself instead of the exit code - the code an operator needs
+    when a broker outcome was left unknown. Flushing first is what ``os._exit``
+    skips: the log handlers, and the Sentry queue (bounded, and counted in the
+    exit window the runbook publishes).
+
+    The cost is real and is the reason this is a maintainer decision: no
+    interpreter teardown ever runs for the live daemon, so no ``atexit`` hook, no
+    ``__del__``, no second pass of generator finalisation. Everything the daemon
+    needs on the way out is already closed by the bounded shutdown above.
+    """
+    logging.shutdown()
+    flush_sentry(SENTRY_FLUSH_TIMEOUT_SECONDS)
+    os._exit(exit_code)
+
+
 def main() -> None:
     """Run the daemon and report its exit code, never past the shutdown budget.
 
@@ -5840,11 +5874,19 @@ def main() -> None:
     ``to_thread`` worker, which no cancel can stop). The exit code that says a
     broker outcome was left unknown would then arrive only after the unit file's
     ``TimeoutStopSec``, so systemd reports the SIGKILL it sent itself instead -
-    hence ``close_the_loop_bounded`` in place of that close, and the forced
-    ``os._exit`` below whenever the tail was not clean.
+    hence ``close_the_loop_bounded`` in place of that close.
 
-    A crashed daemon still re-raises: the traceback is what an operator acts on,
-    and it gets the same bounded tail before it.
+    The tail is then left immediately, through ``_leave_the_process``, on every
+    path: bounding the close is not enough, because the close only reports what
+    is unfinished *on the loop*. A task that awaited a ``to_thread`` call reports
+    nothing unfinished when it is cancelled and leaves the worker thread running,
+    and a reactor release that timed out leaves Twisted's non-daemon pool workers
+    behind; the interpreter would join both at its own pace.
+
+    A crashed daemon logs its traceback here and exits ``EXIT_CRASH`` instead of
+    re-raising: the interpreter's traceback dump is part of the teardown this
+    skips, and an operator acts on that traceback, so it is written explicitly -
+    before the handlers are closed - rather than lost with the rest.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -5858,7 +5900,7 @@ def main() -> None:
         )
     except BaseException as exc:
         # A crashed run leaves exactly the leftovers above, so the tail it gets
-        # is the bounded one; the exception itself is raised again afterwards.
+        # is the bounded one; the exception itself is reported below.
         crashed = exc
         with contextlib.suppress(BaseException):
             exit_path_clean = loop.run_until_complete(
@@ -5869,21 +5911,35 @@ def main() -> None:
         # run on a loop the daemon is about to close.
         asyncio.set_event_loop(None)
         loop.close()
-    # Flush and close log handlers before exiting; the exit code tells systemd
-    # whether the shutdown was clean.
-    logging.shutdown()
     if crashed is not None:
-        raise crashed
-    if _SHUTDOWN.reactor_release_abandoned or not exit_path_clean:
-        # Two reasons the interpreter cannot be trusted to finish: the reactor
-        # release timed out, so the Twisted pool's workers - which are not daemon
-        # threads - may still be alive, and the exit path abandoned a task that
-        # ignored its cancel, so the default executor's join would wait for
-        # whatever that task left running. Leave through os._exit instead: the
-        # code still reaches the service manager, where a hang would be SIGKILLed
-        # and the operator would never learn a broker outcome was left unknown.
-        os._exit(exit_code)
-    sys.exit(exit_code)
+        # Before the flush, because ``logging.shutdown`` closes the handlers and
+        # ``os._exit`` runs no ``sys.excepthook``: without this line a crashed
+        # daemon would exit ``1`` in silence.
+        logger.error(
+            "The live daemon crashed; exiting immediately without interpreter "
+            "teardown",
+            exc_info=crashed,
+            extra={"data": {"exit_code": EXIT_CRASH}},
+        )
+        _leave_the_process(EXIT_CRASH)
+    # Whatever the verdict, ``_leave_the_process`` runs next: a bounded close does
+    # not make the interpreter's teardown safe to wait for. What was left behind
+    # gets one line each, because this is the end of the log an operator reads -
+    # and the reactor release that timed out is one of those leftovers, recorded
+    # by the phase that gave up on it.
+    if _SHUTDOWN.reactor_release_abandoned:
+        logger.error(
+            "Leaving immediately: the reactor release was abandoned, so Twisted's "
+            "pool workers may still be alive",
+            extra={"data": {"exit_code": exit_code}},
+        )
+    if not exit_path_clean:
+        logger.error(
+            "Leaving immediately: the exit path could not account for everything "
+            "left on the loop",
+            extra={"data": {"exit_code": exit_code}},
+        )
+    _leave_the_process(exit_code)
 
 
 if __name__ == "__main__":

@@ -45,8 +45,10 @@ from live_runner.shutdown import (
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     EXIT_CLEANUP_TIMEOUT,
+    EXIT_CRASH,
     EXIT_OK,
     FORCED_EXIT_CODE,
+    SENTRY_FLUSH_TIMEOUT_SECONDS,
     ShutdownCoordinator,
     SubmissionRefusedError,
     close_the_loop_bounded,
@@ -1371,34 +1373,215 @@ def test_the_exit_path_survives_a_task_that_ignores_every_cancel(
     assert process.returncode == EXIT_CLEANUP_TIMEOUT, text[-2000:]
 
 
+# A stand-in for the deployment-sync loop that produces the one leftover the
+# wedged-loop test above cannot see: a broker request already handed to a
+# ``to_thread`` worker, from a task that honours its cancellation. Nothing here
+# is stubborn, so every deadline the shutdown runs reports success and the exit
+# path reports a clean tail - and the worker the request is running on is still
+# alive, with 300 s of broker call left.
+_COOPERATIVE_WORKER_PROGRAM = """
+import asyncio
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.environ["TP_REPO_ROOT"])
+
+import live_runner.daemon as daemon
+
+# Longer than any budget this test could grant it, so a single second spent
+# waiting for it is a wait the budget did not allow.
+_WORKER_SECONDS = 300.0
+_marker = Path(os.environ["TP_WORKER_MARKER"])
+_real_run_daemon = daemon.run_daemon
+
+
+def _broker_request():
+    # An Alpaca REST call, or a balance poll, that was already in flight. It
+    # cannot be recalled once the worker has it: ``asyncio.to_thread`` cancels
+    # the await, never the call, and the request is not on the shutdown's
+    # in-flight ledger, so the drain neither waits for it nor cancels it.
+    time.sleep(_WORKER_SECONDS)
+    _marker.write_text("the worker finished", encoding="utf-8")
+
+
+async def _cooperative_loop(*_args, **_kwargs):
+    # One in-flight broker request, awaited cooperatively. Cancelling this task
+    # cancels the await - the CancelledError is raised at once and the task ends
+    # cancelled - so both the phase that cancels it and the exit path that
+    # follows report a clean shutdown. The worker keeps running either way.
+    request = asyncio.ensure_future(asyncio.to_thread(_broker_request))
+    await asyncio.sleep(0)
+    print("REQUESTED", flush=True)
+    try:
+        await request
+    except asyncio.CancelledError:
+        # The await is recalled; the worker it was waiting on is not.
+        raise
+
+
+daemon.sync_deployments_loop = _cooperative_loop
+
+
+async def _fast_daemon(**kwargs):
+    # The real 150 s worst case, scaled down: what is under test is the exit path
+    # after the last phase, and that is the part that has to hold the budget.
+    kwargs.setdefault("drain_timeout_seconds", 0.2)
+    kwargs.setdefault("cleanup_timeout_seconds", 0.2)
+    return await _real_run_daemon(**kwargs)
+
+
+daemon.run_daemon = _fast_daemon
+daemon.main()
+"""
+
+
+def test_a_clean_shutdown_does_not_wait_for_the_worker_a_broker_call_left_behind(
+    tmp_path: Path,
+) -> None:
+    """End to end through ``main``: a cooperative task still leaves a worker.
+
+    The exit tail was bounded for a task that *ignores* its cancel; the plain
+    case was not. A task awaiting ``asyncio.to_thread`` always honours its
+    cancellation, so the cancel phase and ``close_the_loop_bounded`` both report
+    a clean tail - and the worker thread the broker request is running on keeps
+    running, because no cancel can reach it. ``main`` then leaves through
+    ``sys.exit``, and the interpreter's own teardown joins that worker with no
+    deadline (``concurrent.futures.thread._python_exit``): a shutdown that
+    reported ``EXIT_OK`` in milliseconds does not produce its exit code for as
+    long as the broker call takes, which is past the unit's ``TimeoutStopSec``,
+    so systemd reports the SIGKILL it sent itself instead of the verdict.
+
+    The exit code here is ``0`` - the drain and every phase really did finish -,
+    and it has to arrive while the worker is still running: the marker it writes
+    only exists if the process lived long enough for the 300 s call to return.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    marker = tmp_path / "worker-finished"
+    env = dict(os.environ)
+    env.update(
+        DATA_DIR=str(data_dir),
+        LOG_DIR=str(tmp_path / "logs"),
+        PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+        TP_REPO_ROOT=str(Path(__file__).resolve().parents[1]),
+        TP_WORKER_MARKER=str(marker),
+    )
+    process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", _COOPERATIVE_WORKER_PROGRAM],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    lines: queue.Queue[str] = queue.Queue()
+    reader = threading.Thread(
+        target=lambda: [lines.put(line) for line in process.stdout],  # type: ignore[union-attr]
+        daemon=True,
+    )
+    reader.start()
+    output: list[str] = []
+    started = time.monotonic()
+    try:
+        deadline = started + 60
+        requested = False
+        while time.monotonic() < deadline and not requested:
+            try:
+                line = lines.get(timeout=1)
+            except queue.Empty:
+                assert process.poll() is None, (
+                    "the daemon exited early: " + "".join(output)[-2000:]
+                )
+                continue
+            output.append(line)
+            requested = "REQUESTED" in line
+        assert requested, "the stand-in loop never started: " + "".join(output)[-2000:]
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=60)
+    finally:
+        if process.poll() is None:  # pragma: no cover - only on a failed test
+            process.kill()
+            process.wait(timeout=30)
+        reader.join(timeout=10)
+    elapsed = time.monotonic() - started
+    output.extend(lines.queue)
+    text = "".join(output)
+    # The whole bounded shutdown, scaled: the drain plus six phases at 0.2 s, the
+    # 2 s exit path and the bounded flush that now precede it, with ample slack
+    # for process start-up on a loaded machine. The worker alone would take
+    # 300 s, so only a tail that does not join it can beat this.
+    assert elapsed < 20.0, (
+        f"the exit code did not arrive within the budget after {elapsed:.2f}s"
+    )
+    assert not marker.exists(), (
+        "the process waited for the worker: the marker says the broker call "
+        "returned before the exit code was reported"
+    )
+    assert process.returncode == EXIT_OK, text[-2000:]
+
+
 # ─── exit codes ─────────────────────────────────────────────────────────────────
+
+
+class _ProcessLeft(Exception):
+    """Stand-in for ``os._exit``, which never returns to its caller."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _record_exit(order: list[str]) -> Any:
+    """Record the exit code and stop, exactly as ``os._exit`` would."""
+
+    def _exit(code: int) -> None:
+        order.append(f"exit:{code}")
+        raise _ProcessLeft(code)
+
+    return _exit
+
+
+def _record_flush(order: list[str]) -> Any:
+    """Record a bounded flush in the order it was called in."""
+
+    def _flush(timeout: float) -> bool:
+        order.append(f"sentry:{timeout}")
+        return True
+
+    return _flush
 
 
 @pytest.mark.parametrize("code", [EXIT_OK, EXIT_CLEANUP_TIMEOUT])
 def test_main_exits_with_the_code_the_daemon_returned(
     monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
-    """The shutdown verdict has to survive the last mile to the service manager."""
-    flushed: list[int] = []
+    """The shutdown verdict has to survive the last mile to the service manager.
+
+    It arrives through ``os._exit`` on a clean tail too: the interpreter's own
+    teardown joins the threads the daemon left alive - an executor worker a
+    cooperative cancel did not stop, Twisted's pool workers - and that join has
+    no deadline, so a verdict that reached ``sys.exit`` could still be replaced
+    by the SIGKILL the unit sends at ``TimeoutStopSec``. The flush that happens
+    first is what that exit skips, so it is pinned here in order: logs, then the
+    bounded Sentry flush, then the exit.
+    """
+    order: list[str] = []
 
     async def _fake_run_daemon(**_kwargs: Any) -> int:
         return code
 
-    def _exit(forced: int) -> None:
-        # A clean tail leaves the interpreter to finish normally, so the exit code
-        # goes through ``sys.exit``. Stated rather than assumed: the other test in
-        # this section pins the opposite, and silence here would let both pass.
-        pytest.fail(f"a clean exit path must not leave through os._exit ({forced})")
-
     monkeypatch.setattr(daemon, "run_daemon", _fake_run_daemon)
-    monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
-    monkeypatch.setattr(daemon.os, "_exit", _exit)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: order.append("logs"))
+    monkeypatch.setattr(daemon, "flush_sentry", _record_flush(order))
+    monkeypatch.setattr(daemon.os, "_exit", _record_exit(order))
 
-    with pytest.raises(SystemExit) as excinfo:
+    with pytest.raises(_ProcessLeft) as excinfo:
         daemon.main()
 
     assert excinfo.value.code == code
-    assert flushed == [1], "log handlers must be flushed before the exit code lands"
+    assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", f"exit:{code}"]
 
 
 def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
@@ -1406,67 +1589,71 @@ def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
 ) -> None:
     """A timed-out reactor release must not cost the operator the exit code.
 
-    Twisted's pool workers are non-daemon threads, so the exit path's executor
-    join would block in interpreter shutdown waiting for the very thread the
-    release gave up on. The service manager would then SIGKILL the daemon at
-    ``TimeoutStopSec`` and the ``1`` that says "a broker outcome needs
-    reconciliation" would be lost.
+    Twisted's pool workers are non-daemon threads, so the interpreter would join
+    them at shutdown with no deadline. The service manager would then SIGKILL the
+    daemon at ``TimeoutStopSec`` and the ``1`` that says "a broker outcome needs
+    reconciliation" would be lost. The recorded abandonment is what this pins
+    next to the exit code the manager sees.
     """
-    flushed: list[int] = []
-    exited: list[int] = []
-
-    class _Exit(Exception):
-        def __init__(self, code: int) -> None:
-            self.code = code
+    order: list[str] = []
+    abandoned: list[bool] = []
 
     async def _fake_run_daemon(**_kwargs: Any) -> int:
         daemon._SHUTDOWN.note_abandoned_reactor_release()
+        abandoned.append(daemon._SHUTDOWN.reactor_release_abandoned)
         return EXIT_CLEANUP_TIMEOUT
 
-    def _exit(code: int) -> None:
-        # os._exit never returns; a stand-in that did would let main fall through
-        # to sys.exit and hide the very difference under test.
-        exited.append(code)
-        raise _Exit(code)
-
     monkeypatch.setattr(daemon, "run_daemon", _fake_run_daemon)
-    monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
-    monkeypatch.setattr(daemon.os, "_exit", _exit)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: order.append("logs"))
+    monkeypatch.setattr(daemon, "flush_sentry", _record_flush(order))
+    monkeypatch.setattr(daemon.os, "_exit", _record_exit(order))
 
-    with pytest.raises(_Exit) as excinfo:
+    with pytest.raises(_ProcessLeft) as excinfo:
         daemon.main()
 
     assert excinfo.value.code == EXIT_CLEANUP_TIMEOUT
-    assert flushed == [1], "log handlers must be flushed before the process is killed"
-    assert exited == [EXIT_CLEANUP_TIMEOUT], "the exit code must still reach the manager"
+    assert abandoned == [True], "the timed-out release has to be recorded"
+    assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", "exit:1"]
 
 
-def test_main_reraises_a_crashed_daemon_after_its_bounded_tail(
-    monkeypatch: pytest.MonkeyPatch,
+def test_main_logs_the_traceback_and_exits_after_a_crash(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A crash keeps its traceback, and its exit path is bounded like a signal's.
 
     ``main`` used to hand the loop to ``asyncio.run`` on every path, crash
     included, so a crashed daemon left whatever was still on the loop for the
-    interpreter to wait on with no deadline. It now takes the same bounded tail
-    and re-raises: the traceback is what an operator acts on.
+    interpreter to wait on with no deadline. It now takes the same bounded tail,
+    and because it then leaves through ``os._exit`` - which runs no
+    ``sys.excepthook`` - it writes the traceback itself, before the handlers are
+    closed, and exits with the interpreter's own crash code.
     """
-    flushed: list[int] = []
+    order: list[str] = []
 
     async def _crashed(**_kwargs: Any) -> int:
         raise RuntimeError("the daemon crashed")
 
-    def _exit(forced: int) -> None:
-        pytest.fail(f"a crash must not be turned into os._exit({forced})")
-
     monkeypatch.setattr(daemon, "run_daemon", _crashed)
-    monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
-    monkeypatch.setattr(daemon.os, "_exit", _exit)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: order.append("logs"))
+    monkeypatch.setattr(daemon, "flush_sentry", _record_flush(order))
+    monkeypatch.setattr(daemon.os, "_exit", _record_exit(order))
 
-    with pytest.raises(RuntimeError, match="the daemon crashed"):
-        daemon.main()
+    with caplog.at_level("ERROR"):
+        with pytest.raises(_ProcessLeft) as excinfo:
+            daemon.main()
 
-    assert flushed == [1], "the log must be flushed before the traceback either"
+    crashed = [
+        record for record in caplog.records if record.exc_info and record.exc_info[0]
+    ]
+    assert crashed, "a crashed daemon must write its traceback before it exits"
+    assert crashed[0].exc_info is not None
+    assert crashed[0].exc_info[0] is RuntimeError
+    assert "the daemon crashed" in caplog.text
+    # Same exit tail as a signal: logs, then the Sentry flush, then the exit -
+    # with the traceback written before all three, because ``logging.shutdown``
+    # closes the handlers and ``os._exit`` writes nothing at all.
+    assert excinfo.value.code == EXIT_CRASH
+    assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", f"exit:{EXIT_CRASH}"]
 
 
 def test_shutdown_timeouts_are_bounded_by_default() -> None:
@@ -1787,3 +1974,8 @@ def test_the_exit_codes_are_the_values_the_service_manager_sees() -> None:
     assert EXIT_CLEANUP_TIMEOUT == 1
     assert EXIT_CLEANUP_TIMEOUT != EXIT_OK
     assert FORCED_EXIT_CODE == 130
+    # A crash keeps the code the interpreter itself used for the unhandled
+    # exception this path replaces, so nothing watching the service manager
+    # sees a crash start reporting anything else.
+    assert EXIT_CRASH == 1
+    assert EXIT_CRASH != EXIT_OK

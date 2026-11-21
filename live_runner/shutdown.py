@@ -30,7 +30,10 @@ pins the three together so they cannot drift apart.
 after ``run_daemon`` returned and reported its verdict (see
 :func:`close_the_loop_bounded` and ``live_runner.daemon.main``), because that is
 where the interpreter would otherwise wait, with no bound, for whatever the
-bounded phases already gave up on.
+bounded phases already gave up on. Bounding the loop close is half of it: the
+other half is that ``main`` then leaves the process immediately, because the
+interpreter's own teardown would join every thread the bounded close could not
+reach.
 
 Shutdown NEVER cancels, closes or modifies open orders or positions at the
 broker. Positions belong to the strategy's own exit logic and the operator;
@@ -64,6 +67,11 @@ DEFAULT_CLEANUP_TIMEOUT_SECONDS = 20.0
 EXIT_OK = 0
 EXIT_CLEANUP_TIMEOUT = 1
 FORCED_EXIT_CODE = 130
+# A daemon that crashed also leaves non-zero. It is the number the interpreter
+# itself would have used for the unhandled exception this path replaces (see
+# ``live_runner.daemon.main``), so nothing watching the service manager sees a
+# change in what a crash reports.
+EXIT_CRASH = 1
 
 # How many bounded cleanup phases run after the drain, in order: the daemon loop
 # cancel, the listener/Discord cancel, the Discord close, the scheduler stop, the
@@ -95,6 +103,20 @@ WORST_CASE_SHUTDOWN_SECONDS = (
 # on it: it stays small, and the worst case plus this figure is still inside the
 # ``TimeoutStopSec`` the generated unit sets.
 EXIT_PATH_TIMEOUT_SECONDS = 2.0
+
+# The bounded flush of the Sentry queue that precedes the exit: ``main`` leaves
+# through ``os._exit``, which runs no ``atexit`` hook, so without an explicit
+# flush the ERROR events this shutdown emitted (a drain timeout, an exit path
+# that gave up) would never leave the process. It is a network wait, so it is
+# bounded, and it is counted in the exit window below rather than left to add an
+# unbounded tail of its own to the budget.
+SENTRY_FLUSH_TIMEOUT_SECONDS = 2.0
+
+# The whole window a shutdown may still spend after ``run_daemon`` has reported:
+# the bounded loop close above, then the flush. ``main`` cannot let the
+# interpreter do this part for it - see ``live_runner.daemon.main`` - so the
+# budget has to cover it explicitly.
+EXIT_PATH_WINDOW_SECONDS = EXIT_PATH_TIMEOUT_SECONDS + SENTRY_FLUSH_TIMEOUT_SECONDS
 
 
 def release_twisted_reactor_threads(log: logging.Logger | None = None) -> None:
@@ -151,8 +173,8 @@ async def release_twisted_reactor_threads_bounded(timeout: float) -> None:
     The abandoned release thread itself is a daemon thread, but the reactor pool
     workers it was joining are not: a timed-out release can still block the
     interpreter at exit. That is why the caller also records the abandonment
-    (``ShutdownCoordinator.note_abandoned_reactor_release``) and ``main`` leaves
-    through ``os._exit`` so the exit code still reaches the service manager.
+    (``ShutdownCoordinator.note_abandoned_reactor_release``) - and why ``main``
+    leaves through ``os._exit`` on every path, abandoned release or not.
     """
     loop = asyncio.get_running_loop()
     finished: asyncio.Future[None] = loop.create_future()
@@ -201,9 +223,11 @@ async def close_the_loop_bounded(timeout: float) -> bool:
     it has already done all of its work, and the operator never learns the exit
     code that says a broker outcome was left unknown.
 
-    Returns ``True`` only when nothing was left unfinished, so ``main`` knows
-    whether it can let the interpreter finish normally or has to leave through
-    ``os._exit`` to still report the code.
+    Returns ``True`` only when nothing was left unfinished. That is *not* proof
+    that the process may now let the interpreter finish: a task that awaited a
+    ``to_thread`` call honours its cancel, reports nothing unfinished here, and
+    leaves the worker thread running all the same. ``main`` therefore reports
+    this verdict in its log and leaves through ``os._exit`` either way.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -294,8 +318,10 @@ class ShutdownCoordinator:
         """Whether the last run gave up on the reactor release.
 
         A release that timed out was joining the reactor pool's workers, which
-        are non-daemon threads: the interpreter can block on them at exit, so
-        ``main`` has to leave through ``os._exit`` to still report the code.
+        are non-daemon threads, so the interpreter could still block on them at
+        exit. The timed-out phase is what reports the failure (and the exit
+        code); this is the recorded reason behind it, kept so the state of an
+        abandoned release is observable rather than inferred from the verdict.
         """
         return self._reactor_release_abandoned
 
@@ -382,6 +408,16 @@ class ShutdownCoordinator:
 
     def end_submission(self) -> None:
         """Unregister in-flight broker work once the broker has answered it."""
+        # ``max(0, …)``: a mutation the drain abandoned - its task ignored the
+        # cancel, so nothing awaits it any more - can still reach this line from
+        # the run that is over, after ``bind`` reset the ledger for the next one.
+        # That subtraction must not make the ledger negative: a count below zero
+        # never comes back to zero, so the next run's drain would wait for work
+        # nobody is running and report ``1`` for a shutdown with nothing to
+        # reconcile. Saturating is enough because the daemon runs once per
+        # process and leaves it immediately after a shutdown
+        # (``live_runner.daemon.main``), so a stranded subtraction has no later
+        # run to be charged to.
         self._inflight = max(0, self._inflight - 1)
         if self._inflight == 0 and self._idle is not None:
             self._idle.set()

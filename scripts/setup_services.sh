@@ -46,11 +46,12 @@ EOF
 # Worst-case graceful shutdown: 30 s drain + 20 s per bounded cleanup phase
 # (live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS, 6 phases), so 150 s, plus
 # the bounded exit path that runs after the daemon has reported its verdict
-# (live_runner.shutdown.EXIT_PATH_TIMEOUT_SECONDS, 2 s): 152 s in all.
+# (live_runner.shutdown.EXIT_PATH_TIMEOUT_SECONDS, 2 s, then the bounded Sentry
+# flush in live_runner.shutdown.SENTRY_FLUSH_TIMEOUT_SECONDS, 2 s): 154 s in all.
 # systemd's default TimeoutStopSec is 90 s, which SIGKILLs the daemon before it
 # can finish the drain and report its exit code - the operator's only signal
 # that a broker outcome was left unknown (docs/live-deploy-runbook.md,
-# "Stopping the daemon"). 180 s covers the whole 152 s window;
+# "Stopping the daemon"). 180 s covers the whole 154 s window;
 # tests/test_shutdown_budget_contract.py pins that against the constants.
 
 cat <<EOF > /etc/systemd/system/trading-daemon.service

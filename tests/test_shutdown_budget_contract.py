@@ -30,6 +30,8 @@ from live_runner.shutdown import (
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     EXIT_PATH_TIMEOUT_SECONDS,
+    EXIT_PATH_WINDOW_SECONDS,
+    SENTRY_FLUSH_TIMEOUT_SECONDS,
     WORST_CASE_SHUTDOWN_SECONDS,
     ShutdownCoordinator,
 )
@@ -148,6 +150,13 @@ def test_the_runbook_states_the_budget_the_code_actually_has() -> None:
     assert float(exit_path.group(1)) == EXIT_PATH_TIMEOUT_SECONDS, (
         "the documented exit path must be the computed one"
     )
+    sentry_flush = re.search(
+        r"at most (\d+(?:\.\d+)?) s \(`SENTRY_FLUSH_TIMEOUT_SECONDS`\)", section
+    )
+    assert sentry_flush is not None, "the runbook must state the flush the exit path pays"
+    assert float(sentry_flush.group(1)) == SENTRY_FLUSH_TIMEOUT_SECONDS, (
+        "the documented flush must be the computed one"
+    )
 
 
 def test_the_exit_path_is_bounded_and_short() -> None:
@@ -160,6 +169,20 @@ def test_the_exit_path_is_bounded_and_short() -> None:
     is what the operator's window is computed from.
     """
     assert 0 < EXIT_PATH_TIMEOUT_SECONDS < DEFAULT_CLEANUP_TIMEOUT_SECONDS
+
+
+def test_the_exit_window_covers_the_flush_the_exit_pays() -> None:
+    """``main`` flushes Sentry before it leaves, so the window has to include it.
+
+    The process leaves through ``os._exit``, which runs no ``atexit`` hook, so
+    the SDK's queue is flushed explicitly and that flush is a network wait. It
+    adds its own deadline to the exit path rather than being unbounded, and the
+    two together are what the unit's stop timeout has to stay above.
+    """
+    assert 0 < SENTRY_FLUSH_TIMEOUT_SECONDS < DEFAULT_CLEANUP_TIMEOUT_SECONDS
+    assert EXIT_PATH_WINDOW_SECONDS == (
+        EXIT_PATH_TIMEOUT_SECONDS + SENTRY_FLUSH_TIMEOUT_SECONDS
+    )
 
 
 def test_the_generated_daemon_unit_outlives_the_worst_case_shutdown() -> None:
@@ -179,12 +202,13 @@ def test_the_generated_daemon_unit_outlives_the_worst_case_shutdown() -> None:
     assert seconds > WORST_CASE_SHUTDOWN_SECONDS, (
         f"TimeoutStopSec={seconds:g} is inside the {WORST_CASE_SHUTDOWN_SECONDS:g} s worst case"
     )
-    # The window is the whole shutdown, the bounded exit path included: a daemon
-    # that is SIGKILLed in its tail is killed after it has already done all of
-    # its work, which loses the exit code just the same.
-    assert seconds >= WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_TIMEOUT_SECONDS, (
+    # The window is the whole shutdown, the bounded exit path included - the loop
+    # close and the flush that follows it both: a daemon that is SIGKILLed in its
+    # tail is killed after it has already done all of its work, which loses the
+    # exit code just the same.
+    assert seconds >= WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_WINDOW_SECONDS, (
         f"TimeoutStopSec={seconds:g} is inside the "
-        f"{WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_TIMEOUT_SECONDS:g} s shutdown window"
+        f"{WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_WINDOW_SECONDS:g} s shutdown window"
     )
     # The reviewed value: the worst case plus 30 s for the exit path itself.
     assert seconds == 180.0
