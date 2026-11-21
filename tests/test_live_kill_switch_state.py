@@ -216,6 +216,58 @@ def test_a_standing_halt_cannot_be_weakened_by_a_re_write(
     assert read_live_kill_switch_scopes() == {KILL_SWITCH_GLOBAL_SCOPE: "flatten"}
 
 
+def test_two_racing_halt_writes_cannot_downgrade_each_other(
+    isolated_db_sandbox, account: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLI ``flatten`` racing a viewer ``orders`` must not lose to it.
+
+    Both writes are legal escalations of a standing ``entries`` halt, so both
+    pass the weaken check if they read the same snapshot - and then the last
+    commit wins, silently stepping the halt down. The write is serialized
+    (BEGIN IMMEDIATE), so the second writer reads the first one's committed
+    mode and is refused as a weakening.
+    """
+    import threading
+    import time
+
+    import shared.database as database
+
+    set_live_kill_switch(account, "entries", actor="operator")
+
+    real_utcnow = database._utcnow_naive
+
+    def _slow_utcnow() -> object:
+        # Both threads read the row, then pause before writing, so without the
+        # write lock they would both pass the check on the same 'entries'
+        # snapshot. The stagger makes the 'orders' write commit last.
+        time.sleep(0.4)
+        return real_utcnow()
+
+    monkeypatch.setattr(database, "_utcnow_naive", _slow_utcnow)
+
+    outcomes: dict[str, object] = {}
+
+    def _write(mode: str, key: str, delay: float) -> None:
+        time.sleep(delay)
+        try:
+            set_live_kill_switch(account, mode, actor=f"operator-{key}")
+            outcomes[key] = "written"
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+            outcomes[key] = exc
+
+    flatten_thread = threading.Thread(target=_write, args=("flatten", "flatten", 0.0))
+    orders_thread = threading.Thread(target=_write, args=("orders", "orders", 0.15))
+    flatten_thread.start()
+    orders_thread.start()
+    flatten_thread.join(timeout=30)
+    orders_thread.join(timeout=30)
+
+    assert not flatten_thread.is_alive() and not orders_thread.is_alive()
+    assert outcomes["flatten"] == "written"
+    assert isinstance(outcomes["orders"], ValueError)
+    assert read_live_kill_switch_scopes() == {account: "flatten"}
+
+
 def test_an_escalation_is_not_attributed_to_whoever_escalated(
     isolated_db_sandbox,
 ) -> None:

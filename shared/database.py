@@ -4457,46 +4457,57 @@ def set_live_kill_switch(
     actor_name = str(actor or "unknown").strip() or "unknown"
     init_db()
     with get_session() as session:
-        record = session.get(LiveKillSwitchModel, normalized_scope)
-        now = _utcnow_naive()
-        if (
-            record is not None
-            and record.cleared_at is None
-            and str(record.mode) in KILL_SWITCH_MODES
-            and KILL_SWITCH_MODES.index(normalized_mode)
-            < KILL_SWITCH_MODES.index(str(record.mode))
-        ):
-            raise ValueError(
-                f"Refusing to weaken a standing kill switch halt on "
-                f"'{normalized_scope}' from '{record.mode}' to '{normalized_mode}'; "
-                "lift the halt instead (clear_live_kill_switch)"
-            )
-        if record is None:
-            record = LiveKillSwitchModel(
-                scope=normalized_scope,
-                mode=normalized_mode,
-                halted_at=now,
-                halted_by=actor_name,
-                reason=str(reason or ""),
-            )
-            session.add(record)
-        else:
-            record.mode = normalized_mode
-            if record.cleared_at is not None or record.halted_at is None:
-                # A new episode (the row was cleared) or a row that never carried
-                # an instant gets one now, and it is attributed to whoever armed
-                # it. An escalation of a standing halt keeps the original actor,
-                # reason and instant, because the account has been halted since
-                # then and by them.
-                record.halted_at = now
-                record.halted_by = actor_name
-                record.reason = str(reason or "")
-            # A row that was cleared is un-cleared by this write: the halt is
-            # live again, and a stale cleared_at would read it back as lifted.
-            record.cleared_at = None
-            record.cleared_by = None
-        session.commit()
-        session.refresh(record)
+        # Take the write lock before the weaken check, not after it: the check
+        # and the write must be one atomic fact, or two concurrent halts (a CLI
+        # 'flatten' and a viewer 'orders', say) both pass on the same snapshot
+        # and the last commit silently steps the halt down. BEGIN IMMEDIATE
+        # serialises the check against every other writer, the same way the
+        # submission-claim and re-point paths do.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveKillSwitchModel, normalized_scope)
+            now = _utcnow_naive()
+            if (
+                record is not None
+                and record.cleared_at is None
+                and str(record.mode) in KILL_SWITCH_MODES
+                and KILL_SWITCH_MODES.index(normalized_mode)
+                < KILL_SWITCH_MODES.index(str(record.mode))
+            ):
+                raise ValueError(
+                    f"Refusing to weaken a standing kill switch halt on "
+                    f"'{normalized_scope}' from '{record.mode}' to '{normalized_mode}'; "
+                    "lift the halt instead (clear_live_kill_switch)"
+                )
+            if record is None:
+                record = LiveKillSwitchModel(
+                    scope=normalized_scope,
+                    mode=normalized_mode,
+                    halted_at=now,
+                    halted_by=actor_name,
+                    reason=str(reason or ""),
+                )
+                session.add(record)
+            else:
+                record.mode = normalized_mode
+                if record.cleared_at is not None or record.halted_at is None:
+                    # A new episode (the row was cleared) or a row that never carried
+                    # an instant gets one now, and it is attributed to whoever armed
+                    # it. An escalation of a standing halt keeps the original actor,
+                    # reason and instant, because the account has been halted since
+                    # then and by them.
+                    record.halted_at = now
+                    record.halted_by = actor_name
+                    record.reason = str(reason or "")
+                # A row that was cleared is un-cleared by this write: the halt is
+                # live again, and a stale cleared_at would read it back as lifted.
+                record.cleared_at = None
+                record.cleared_by = None
+            session.commit()
+            session.refresh(record)
+        except Exception:
+            session.rollback()
+            raise
         return record.to_state()
 
 
@@ -4515,13 +4526,20 @@ def clear_live_kill_switch(
     actor_name = str(actor or "unknown").strip() or "unknown"
     init_db()
     with get_session() as session:
-        record = session.get(LiveKillSwitchModel, normalized_scope)
-        if record is None or record.cleared_at is not None:
-            return False
-        record.cleared_at = _utcnow_naive()
-        record.cleared_by = actor_name
-        session.add(record)
-        session.commit()
+        # Same write lock as set_live_kill_switch: a resume racing a halt must
+        # serialise, not interleave a stale read into a lost update.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveKillSwitchModel, normalized_scope)
+            if record is None or record.cleared_at is not None:
+                return False
+            record.cleared_at = _utcnow_naive()
+            record.cleared_by = actor_name
+            session.add(record)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
     return True
 
 
