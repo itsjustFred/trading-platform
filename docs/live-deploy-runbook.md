@@ -111,6 +111,16 @@ results stop predicting live behaviour:
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
   flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
   flatten never misses a stop that was replaced under it.
+- Wrong side of the market: an amendment is never sent at or beyond the latest close — a long's
+  stop has to sit below it and a short's above it. A catch-up (after a restart, or after the
+  stop-quantity pause below) replays every close it skipped, so a peak the market has since
+  fallen through would trail the stop onto the wrong side: the broker refuses it (and the retry
+  loop would end in give-up) or it fills at the market on the spot. The amendment goes to the
+  last trailed level that stays clear of the last close, and the closes it stops at stay
+  unprocessed and are replayed on the next pass, so no close is applied to a stop that would
+  cross and no trailed peak is lost — it is applied as soon as the market is back above it. A
+  stop the broker already holds on the wrong side of the market is left exactly as it is. This
+  never loosens a stop: the broker's own stop stays in force until a better one is confirmed.
 - Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
   logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
@@ -127,13 +137,16 @@ results stop predicting live behaviour:
   Failures no retry can fix (an unservable timeframe, an adapter without market data) are never
   probed and last until the entry signal or the position changes (a daemon restart also starts
   counting again). The broker-side stop stays at its last level while given up.
-  This includes a trailed stop the market has already fallen through since the bar closed: the
-  broker refuses it, the old stop keeps protecting the position, and the replay backtest would
-  have exited on that bar instead.
+  A trailed stop the market has already fallen through since the bar closed is not amended at
+  all (see "Wrong side of the market" above): no replace is sent, the bars stay unprocessed and
+  the old stop keeps protecting the position, while the replay backtest would have exited on
+  that bar instead.
 - Restart: nothing needs to be restored. The current stop is read from the broker on every pass
   and the trailing config from the persisted entry signal (`live_signals.metadata`,
   `trailing_sl_config`). After a restart the trail continues from the broker's stop, catches up on
-  up to 50 closed bars, and cannot move a stop backwards.
+  up to 50 closed bars, and cannot move a stop backwards. The catch-up is bounded by the "wrong
+  side of the market" rule above: a peak the market has fallen through is not applied until the
+  market is back above it.
 - Cleanup: in-memory progress is dropped as soon as the position is gone at the broker (stop or
   take profit hit, exit signal, manual close) or its deployment is no longer ACTIVE. A partial
   exit keeps the trail on the remaining quantity — see the stop-quantity rule below for the one

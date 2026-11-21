@@ -22,6 +22,15 @@ Design, in the order the guarantees depend on each other:
   declare ``supports_stop_amendment`` (atomic amend/replace) are trailed. A
   refused or failed amendment is logged, reported to Sentry and retried with
   backoff; the previous broker-side stop is untouched meanwhile.
+* **A stop is never sent at or beyond the latest close.** A long's stop sits
+  below the last close and a short's above it; at or beyond it the order is not
+  a stop but an immediate fill (or a broker refusal). A catch-up replays every
+  close it skipped, so a peak the market has since fallen through would trail
+  the stop exactly there: the amendment goes to the last trailed level that
+  stays clear of the last close, and the closes it stops at stay unprocessed
+  (replayed on the next pass) instead of being applied to a stop that would
+  cross. A stop the broker already holds on the wrong side of the market is
+  left alone.
 * **Trigger.** Work happens once per closed bar: an account is visited when a
   bar boundary of its fastest ACTIVE deployment timeframe has passed (or a
   retry is due). Between boundaries the loop only compares timestamps — no
@@ -657,7 +666,7 @@ class LiveTrailingStopManager:
             self._resume(trail.outage, context)
             return awaiting_bar
 
-        target = self._trail_target(
+        levels = self._trail_levels(
             adapter=adapter,
             action=action,
             symbol=symbol,
@@ -667,6 +676,27 @@ class LiveTrailingStopManager:
             current=current,
             bars=bars,
         )
+        # The catch-up after a pause replays every close it skipped, so the
+        # trail can reach a level the market has already traded through: a peak
+        # earlier in the pause and a fall since leaves the trailed stop above the
+        # last close for a long (below for a short). Such a stop is not a stop -
+        # the broker refuses it (and the retry loop would end in give-up) or it
+        # fills at the market on the spot - so an amendment is never sent at or
+        # beyond the last close. ``_amendable_level`` picks the last level that
+        # stays clear of it; the bars after it are left unprocessed rather than
+        # applied to a stop that would cross.
+        target, applied = self._amendable_level(
+            levels, last_close=bars[-1][1], reducing_side=reducing_side
+        )
+        if target is None:
+            context["last_close"] = bars[-1][1]
+            logger.warning(
+                "Live trailing stop would sit at or beyond the latest close; "
+                "no amendment is sent and the bars stay unprocessed",
+                extra={"data": {**context, "unprocessed_bars": len(bars)}},
+            )
+            self._resume(trail.outage, context)
+            return awaiting_bar
         improves = (
             target > current.stop_price if reducing_side == "sell" else target < current.stop_price
         )
@@ -680,14 +710,17 @@ class LiveTrailingStopManager:
                         **context,
                         "new_stop": amended.stop_price,
                         "new_stop_order_id": amended.order_id,
-                        "bar_time": bars[-1][0].isoformat(),
+                        "bar_time": bars[applied - 1][0].isoformat(),
+                        "bars_applied": applied,
+                        "bars_left_unprocessed": len(bars) - applied,
                     }
                 },
             )
         # Only reached when the broker confirmed the amendment (or none was
         # needed): a failed amendment leaves these bars unprocessed, so the
-        # retry recomputes the same target.
-        trail.last_bar_time = bars[-1][0]
+        # retry recomputes the same target. The same holds for the bars the
+        # last clear level stops at: they are replayed, not dropped.
+        trail.last_bar_time = bars[applied - 1][0]
         self._resume(trail.outage, context)
         return awaiting_bar
 
@@ -730,7 +763,7 @@ class LiveTrailingStopManager:
         )
         return (newest_seen is None or newest_seen < expected_open) and within_grace
 
-    def _trail_target(
+    def _trail_levels(
         self,
         *,
         adapter: BaseLiveAdapter,
@@ -741,13 +774,14 @@ class LiveTrailingStopManager:
         position: Mapping[str, Any],
         current: ProtectiveStop,
         bars: list[tuple[datetime, float]],
-    ) -> float:
+    ) -> list[tuple[datetime, float]]:
         """The broker-tick-rounded stop after one engine call per new bar close.
 
-        Same arithmetic as the replay adapter, starting from the stop the broker holds.
-        The percent arithmetic does not read the entry price; the model only requires a
-        positive one, so a broker row without it falls back to the first bar close rather
-        than blocking the trail.
+        Same arithmetic as the replay adapter, starting from the stop the broker holds, in
+        bar order: entry ``i`` is the stop the engine holds once the first ``i`` closes
+        have been applied. The percent arithmetic does not read the entry price; the model
+        only requires a positive one, so a broker row without it falls back to the first
+        bar close rather than blocking the trail.
         """
         try:
             entry_price = float(position.get("entry_price") or 0.0)
@@ -764,11 +798,41 @@ class LiveTrailingStopManager:
             timeframe=timeframe,
             metadata={TRAILING_SL_CONFIG_METADATA_KEY: dict(trailing_cfg)},
         )
-        for _bar_time, close in bars:
+        levels: list[tuple[datetime, float]] = []
+        for bar_time, close in bars:
             self._risk_engine.apply_trailing_stop(signal, market_price=close)
-        if signal.stop_loss is None:
-            raise _TrailingFailure("trailing produced no stop")
-        return adapter.round_stop_price(current, float(signal.stop_loss))
+            if signal.stop_loss is None:
+                raise _TrailingFailure("trailing produced no stop")
+            levels.append(
+                (bar_time, adapter.round_stop_price(current, float(signal.stop_loss)))
+            )
+        return levels
+
+    @staticmethod
+    def _amendable_level(
+        levels: list[tuple[datetime, float]], *, last_close: float, reducing_side: str
+    ) -> tuple[float | None, int]:
+        """The last trailed level that stays clear of the last close, and how many bars it covers.
+
+        A long's stop has to sit *below* the last close and a short's *above* it: at or
+        beyond it the order is not a stop, it is an immediate fill (or a broker refusal).
+        The engine only ever moves a stop in the favourable direction, so once a level
+        reaches the wrong side of the last close every later level has too — the answer is
+        the prefix of levels that stay clear, and the bars after that prefix are left
+        unprocessed (they are replayed on the next pass, never applied to a stop that
+        would cross). ``None`` means even the first level is already on the wrong side,
+        which is what a stop the market has fallen through since the bar closed looks
+        like: nothing is amended and the broker's stop stays in force.
+        """
+        applied = 0
+        target: float | None = None
+        for _bar_time, level in levels:
+            clear = level < last_close if reducing_side == "sell" else level > last_close
+            if not clear:
+                break
+            target = level
+            applied += 1
+        return target, applied
 
     @staticmethod
     def _single_stop(

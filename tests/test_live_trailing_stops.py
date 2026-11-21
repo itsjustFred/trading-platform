@@ -243,6 +243,17 @@ def _infos(monkeypatch) -> list[str]:
     return logged
 
 
+def _warnings(monkeypatch) -> list[dict]:
+    """Every WARNING the trailing loop logs, as its structured data."""
+    logged: list[dict] = []
+    monkeypatch.setattr(
+        trailing_stops.logger,
+        "warning",
+        lambda message, *a, **kw: logged.append(kw["extra"]["data"]),
+    )
+    return logged
+
+
 # ── the trail itself ─────────────────────────────────────────────────────────
 
 
@@ -497,7 +508,209 @@ def test_restart_catches_up_on_closes_missed_while_down(live: _Live) -> None:
 
     live.feed(LiveTrailingStopManager(), [101.0])
 
+    # The missed new high would trail the stop to 104 * 0.99 = 102.96, which is
+    # above the last close of 101: a stop on the wrong side of the market is an
+    # immediate fill, not a stop. The amendment goes to the last level still
+    # below it (100 * 0.99 = 99.00) and the closes it stops at stay unprocessed
+    # for the next pass, so no close is applied to a stop that would cross.
+    assert live.client.stop_prices() == [99.0]
+
+
+def test_a_restart_catch_up_still_applies_a_peak_the_market_has_not_fallen_through(
+    live: _Live,
+) -> None:
+    live.feed(LiveTrailingStopManager(), [100.0])
+    # Daemon down while two bars close, the second of them a new high.
+    live.closes += [102.0, 104.0]
+
+    live.feed(LiveTrailingStopManager(), [103.0])
+
+    # 104 * 0.99 = 102.96, still below the last close: the catch-up applies it.
     assert live.client.stop_prices() == [102.96]
+
+
+# ── a stop must never be sent at or beyond the latest close ───────────────────
+
+
+def test_a_catch_up_never_amends_a_long_stop_above_the_last_close(live: _Live) -> None:
+    """A stop above the market is an immediate fill, not a stop.
+
+    The catch-up replays every close it skipped, so a peak the market has since
+    fallen through would trail the stop onto the wrong side of the last close:
+    the broker refuses it (and the retry loop would end in give-up) or it fills
+    at the market on the spot. The amendment goes to the last level that is
+    still below the last close instead, and nothing is loosened: the broker's
+    own stop stays in force until a better one is confirmed.
+    """
+    live.feed(LiveTrailingStopManager(), [100.0])
+    # Daemon down while the price peaks at 110 and falls back to 104.
+    live.closes += [110.0, 104.0]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [104.0])
+
+    # 110 * 0.99 = 108.90 is above 104; 100 * 0.99 = 99.00 is not.
+    assert live.client.replace_calls == [("stop-1", 99.0)]
+    assert live.client.stop_prices() == [99.0]
+
+    # Still below the peak's trailed level: the skipped closes stay unprocessed
+    # and nothing is amended, because a stop of 105 * 0.99 = 103.95 would be a
+    # level the peak has already overtaken.
+    live.feed(manager, [105.0])
+    assert live.client.replace_calls == [("stop-1", 99.0)]
+    assert live.client.stop_prices() == [99.0]
+
+    # The peak is not lost, only deferred: back at it, the same pass applies it
+    # together with the closes since and the stop moves to 108.90.
+    live.feed(manager, [110.0])
+
+    assert live.client.replace_calls[-1] == ("stop-1+", 108.9)
+    assert live.client.stop_prices() == [108.9]
+
+
+def test_a_catch_up_never_amends_a_short_stop_below_the_last_close(isolated_db) -> None:
+    database, _engine, _data_dir = isolated_db
+    live = _Live(database, side="sell")
+    live.feed(LiveTrailingStopManager(), [100.0])
+    # Daemon down while the price bottoms at 90 and recovers to 96.
+    live.closes += [90.0, 96.0]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [96.0])
+
+    # 90 * 1.01 = 90.90 is below 96; 100 * 1.01 = 101.00 is not.
+    assert live.client.replace_calls == [("stop-1", 101.0)]
+    assert live.client.stop_prices() == [101.0]
+
+    live.feed(manager, [90.0])
+
+    assert live.client.replace_calls[-1] == ("stop-1+", 90.9)
+    assert live.client.stop_prices() == [90.9]
+
+
+def test_the_catch_up_after_the_pause_never_crosses_the_last_close(
+    live: _Live, surfaced
+) -> None:
+    """The pause's catch-up is the case the review found: the peak is skipped,
+    the market falls back, and the resumed trail would put the stop above it."""
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [100.0, 110.0])
+    assert live.client.replace_calls == []
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
+
+    # Resized by hand while the market is back at 104.
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.feed(manager, [104.0])
+
+    assert live.client.replace_calls == [("stop-1+", 99.0)]
+    assert live.client.stop_prices() == [99.0]
+
+    # Back at the peak: it is applied now, together with the closes since.
+    live.feed(manager, [110.0])
+
+    assert live.client.replace_calls[-1] == ("stop-1++", 108.9)
+    assert live.client.stop_prices() == [108.9]
+
+
+def test_a_stop_the_market_has_already_fallen_through_is_not_amended(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    """A broker stop already above the market cannot be trailed at all.
+
+    Amending to a level at or beyond the last close would be refused by the
+    broker, so the pass skips the amendment, leaves the bars unprocessed and
+    logs a line. It is not a failure: the old stop keeps protecting the
+    position and no retry loop runs.
+    """
+    warnings = _warnings(monkeypatch)
+    live.client.orders = [
+        _FakeOrder("stop-1", "AAPL", "sell", order_type="stop", qty=10, stop_price=104.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    manager = LiveTrailingStopManager()
+    live.closes = [100.0, 101.0]
+
+    live.tick(manager, T0 + 2 * MINUTE + timedelta(seconds=2))
+
+    assert len(warnings) == 1
+    assert warnings[0]["symbol"] == "AAPL"
+    assert warnings[0]["current_stop"] == 104.0
+    assert warnings[0]["last_close"] == 101.0
+    assert warnings[0]["unprocessed_bars"] == 2
+    assert live.client.replace_calls == []
+    assert live.client.stop_prices() == [104.0]
+    assert surfaced == []
+    trail = manager._trails[(ACCOUNT, "AAPL")]
+    assert trail.outage.failures == 0
+    assert trail.outage.given_up is False
+    assert trail.last_bar_time is None
+
+
+def test_a_stop_exactly_at_the_last_close_is_not_sent(live: _Live) -> None:
+    """At the last close is as bad as beyond it: the order fills immediately.
+
+    The rule is strict (a long's stop below the last close, a short's above),
+    and the broker's own stop sitting exactly on the market is the case that
+    pins it: no trailed level can be on the right side of it, so the pass
+    amends nothing rather than replace one immediate fill with another.
+    """
+    live.client.orders = [
+        _FakeOrder("stop-1", "AAPL", "sell", order_type="stop", qty=10, stop_price=101.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    manager = LiveTrailingStopManager()
+    live.closes = [101.0]
+
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2))
+
+    assert live.client.replace_calls == []
+    assert live.client.stop_prices() == [101.0]
+
+
+def test_a_short_stop_exactly_at_the_last_close_is_not_sent(isolated_db) -> None:
+    database, _engine, _data_dir = isolated_db
+    live = _Live(database, side="sell")
+    live.client.orders = [
+        _FakeOrder("stop-1", "AAPL", "buy", order_type="stop", qty=10, stop_price=99.0),
+        _FakeOrder("tp-1", "AAPL", "buy", qty=10),
+    ]
+    manager = LiveTrailingStopManager()
+    live.closes = [99.0]
+
+    live.tick(manager, T0 + MINUTE + timedelta(seconds=2))
+
+    assert live.client.replace_calls == []
+    assert live.client.stop_prices() == [99.0]
+
+
+def test_a_short_stop_the_market_has_recovered_above_is_not_amended(
+    isolated_db, monkeypatch
+) -> None:
+    """The rounded price is what reaches the broker, so that is what is checked.
+
+    A short's stop rounds up, away from the market: the level the engine holds
+    after a 95.05 close is 96.0005 and the price that would be sent for it is
+    96.01. With the market back at 96.01 that level is not a stop - it sits
+    exactly on the market and fills on the spot - so the amendment is skipped
+    and the stops stay unprocessed.
+    """
+    database, _engine, _data_dir = isolated_db
+    live = _Live(database, side="sell")
+    live.closes = [95.05, 96.01]
+    warnings = _warnings(monkeypatch)
+
+    live.tick(LiveTrailingStopManager(), T0 + 2 * MINUTE + timedelta(seconds=2))
+
+    assert len(warnings) == 1
+    assert warnings[0]["last_close"] == 96.01
+    assert warnings[0]["unprocessed_bars"] == 2
+    assert live.client.replace_calls == []
+    assert live.client.stop_prices() == [102.0]
 
 
 # ── cleanup and attribution ──────────────────────────────────────────────────
