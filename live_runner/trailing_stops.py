@@ -56,7 +56,7 @@ from risk import RiskEngine, TradeSignal
 from shared.database import find_latest_filled_live_entry_signals
 from shared.logging import get_logger
 from shared.models import LiveDeploymentConfig
-from shared.sentry import capture_exception
+from shared.sentry import capture_exception, capture_message
 from shared.trailing import (
     TRAILING_MODE_NONE,
     TRAILING_SL_CONFIG_METADATA_KEY,
@@ -179,7 +179,7 @@ class _Trail:
     last_bar_time: datetime | None = None
     outage: _Outage = field(default_factory=_Outage)
     #: Whether the last pass found the broker's stop covering more than the
-    #: position holds (#258). Losing it costs one repeated warning at most.
+    #: position holds (#258). Losing it costs one repeated report at most.
     stop_qty_oversized: bool = False
 
     @property
@@ -784,8 +784,8 @@ class LiveTrailingStopManager:
             )
         return symbol_stops[0]
 
-    @staticmethod
     def _stop_covers_more_than_held(
+        self,
         trail: _Trail,
         stop: ProtectiveStop,
         position: Mapping[str, Any],
@@ -803,9 +803,13 @@ class LiveTrailingStopManager:
         sell the position it protects. A stop the broker reports no quantity for is
         trailed — nothing is known to be wrong with it.
 
-        The result is compared with the previous pass, so the warning is raised on
+        The result is compared with the previous pass, so the report is raised on
         every transition into the mismatch (a second partial exit after a resize is
-        reported again) rather than once per position.
+        reported again) rather than once per position. Only an operator can end the
+        pause, and a WARNING nobody reads would leave a live position untrailed
+        indefinitely, so the transition is an ERROR with a Sentry event; a repeat
+        while the mismatch lasts is silent, because the state has not changed and
+        one event per transition is the alert.
         """
         held = abs(_position_qty(position))
         oversized = stop.qty is not None and stop.qty > held + _STOP_QTY_TOLERANCE
@@ -813,10 +817,10 @@ class LiveTrailingStopManager:
             return oversized
         trail.stop_qty_oversized = oversized
         if oversized:
-            logger.warning(
+            self._surface_message(
                 "Protective stop quantity exceeds the open position; the stop is left "
                 "untrailed until it is resized to the quantity held",
-                extra={"data": {**context, "stop_qty": stop.qty, "position_qty": held}},
+                {**context, "stop_qty": stop.qty, "position_qty": held},
             )
         return oversized
 
@@ -878,6 +882,17 @@ class LiveTrailingStopManager:
         with contextlib.suppress(Exception):
             capture_exception(
                 exc,
+                service_name="live-runner",
+                context={"component": "live_trailing_stops", **context},
+            )
+
+    @staticmethod
+    def _surface_message(message: str, context: Mapping[str, Any]) -> None:
+        """Report a state an operator has to act on: ERROR plus one Sentry event."""
+        logger.error(message, extra={"data": dict(context)})
+        with contextlib.suppress(Exception):
+            capture_message(
+                message,
                 service_name="live-runner",
                 context={"component": "live_trailing_stops", **context},
             )

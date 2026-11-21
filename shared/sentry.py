@@ -169,6 +169,29 @@ def capture_exception(
     return str(event_id) if event_id is not None else None
 
 
+def capture_message(
+    message: str,
+    *,
+    service_name: str | None = None,
+    context: Mapping[str, Any] | None = None,
+    level: str = "error",
+) -> str | None:
+    """Capture a message (no exception) with optional structured context.
+
+    For a state an operator has to act on that is not a raised error — the
+    same hygiene as :func:`capture_exception`: a scoped event, the service
+    tagged, the context attached and redacted by ``before_send``.
+    """
+
+    with sentry_sdk.push_scope() as scope:
+        if service_name:
+            scope.set_tag("service", service_name)
+        if context:
+            scope.set_context("error_context", dict(context))
+        event_id = sentry_sdk.capture_message(message, level=level)
+    return str(event_id) if event_id is not None else None
+
+
 def _before_send(event: dict[str, Any], hint: dict[str, Any]) -> dict[str, Any] | None:
     del hint
     return _redact_value(event)

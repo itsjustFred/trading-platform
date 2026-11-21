@@ -142,12 +142,18 @@ results stop predicting live behaviour:
   bracket stop leg can still be sized to the original entry, and what Alpaca does when such a stop
   triggers (cap, oversell, reject) has **not** been verified on paper (#258). A stop whose
   quantity the broker reports as larger than the position holds is therefore left **untrailed**:
-  the loop logs a WARNING (`Protective stop quantity exceeds the open position; the stop is left
+  the loop reports it (`Protective stop quantity exceeds the open position; the stop is left
   untrailed until it is resized to the quantity held`, with account, symbol, signal, stop order
-  id, stop quantity and position quantity) on every transition into the mismatch — so a second
-  partial exit after a resize is reported again — and amends nothing. It is not a failure: no
-  retry, no Sentry, no give-up, and no bar is consumed, so the moment the stop is resized to the
-  quantity held (by hand today) the trail resumes and applies every close it skipped (up to 50).
+  id, stop quantity and position quantity) as an ERROR with one Sentry event
+  (`component=live_trailing_stops`) on every transition into the mismatch — so a second partial
+  exit after a resize is reported again — and amends nothing. A repeat while the mismatch lasts
+  is silent: the state has not changed and one event per transition is the alert. Only a manual
+  resize ends the pause, which is why the transition is an ERROR rather than a WARNING: nobody
+  reads a warning that says a live position is no longer trailed. It is not a failure: no retry,
+  no give-up, and no bar is consumed, so the moment the stop is resized to the quantity held (by
+  hand today) the trail resumes and applies every close it skipped (up to 50). The pause also
+  ends any failure run that was recorded before it, and clears a give-up: the pass that finds the
+  oversized stop did reach the broker, so it counts as a success like any other pass.
   A stop the broker reports no quantity for is trailed as usual. Resizing the stop on the trail
   itself (a replace carrying `qty=`) is the follow-up, gated on the paper probe of #258.
 

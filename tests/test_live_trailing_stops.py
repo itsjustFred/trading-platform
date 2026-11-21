@@ -45,6 +45,17 @@ from tests.test_alpaca_adapter import (
 T0 = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
 MINUTE = timedelta(minutes=1)
 ACCOUNT = "acc-alpaca"
+#: The report the loop raises on every transition into the stop-quantity
+#: mismatch (#258): an ERROR with a Sentry event, because only an operator can
+#: end that pause.
+_OVERSIZED_STOP_REPORT = (
+    "Protective stop quantity exceeds the open position; the stop is left "
+    "untrailed until it is resized to the quantity held"
+)
+_RETRY_REPORT = (
+    "Live trailing stop could not be updated; the previous broker-side stop stays in "
+    "force and the update is retried"
+)
 
 
 class _ReplacingClient(_FakeTradingClient):
@@ -201,31 +212,24 @@ def live(isolated_db) -> _Live:
 
 @pytest.fixture
 def surfaced(monkeypatch) -> list[tuple[str, dict]]:
-    """Every failure the trailing loop surfaces: (log message, Sentry context)."""
+    """Everything the trailing loop surfaces: (log message, Sentry context)."""
     events: list[tuple[str, dict]] = []
     logged: list[str] = []
 
     def _capture(exc, *, service_name=None, context=None):
         events.append((logged[-1] if logged else "", {**(context or {}), "error": repr(exc)}))
 
+    def _capture_message(message, *, service_name=None, context=None, level="error"):
+        events.append((logged[-1] if logged else "", {**(context or {}), "message": message}))
+
     def _error(message, *args, **kwargs):
         logged.append(str(message))
 
     monkeypatch.setattr(trailing_stops, "capture_exception", _capture)
+    monkeypatch.setattr(trailing_stops, "capture_message", _capture_message)
     monkeypatch.setattr(trailing_stops.logger, "error", _error)
     monkeypatch.setattr(trailing_stops.logger, "critical", _error)
     return events
-
-
-def _warnings(monkeypatch) -> list[dict]:
-    """Every WARNING the trailing loop logs, as its structured data."""
-    logged: list[dict] = []
-    monkeypatch.setattr(
-        trailing_stops.logger,
-        "warning",
-        lambda message, *a, **kw: logged.append(kw["extra"]["data"]),
-    )
-    return logged
 
 
 def _infos(monkeypatch) -> list[str]:
@@ -516,9 +520,8 @@ def test_position_close_cleans_up_trailing_state(live: _Live, surfaced) -> None:
 
 
 def test_a_partial_exit_pauses_the_trail_until_the_stop_matches_the_position(
-    live: _Live, surfaced, monkeypatch
+    live: _Live, surfaced
 ) -> None:
-    warnings = _warnings(monkeypatch)
     manager = LiveTrailingStopManager()
     live.feed(manager, [103.0])
     assert live.client.stop_prices() == [101.97]
@@ -534,12 +537,11 @@ def test_a_partial_exit_pauses_the_trail_until_the_stop_matches_the_position(
     )
     live.feed(manager, [106.0])
 
-    assert len(warnings) == 1
-    assert warnings[0]["stop_qty"] == 10.0
-    assert warnings[0]["position_qty"] == 5.0
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
+    assert surfaced[0][1]["stop_qty"] == 10.0
+    assert surfaced[0][1]["position_qty"] == 5.0
     assert live.client.stop_prices() == [101.97]
     assert manager.tracked_positions() == {(ACCOUNT, "AAPL")}
-    assert surfaced == []
 
     # The stop is resized to what is held: the trail picks the close it skipped
     # up (106 * 0.99 = 104.94) and the next one after it.
@@ -549,7 +551,7 @@ def test_a_partial_exit_pauses_the_trail_until_the_stop_matches_the_position(
     ]
     live.feed(manager, [107.0])
 
-    assert len(warnings) == 1
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
     assert live.client.stop_prices() == [105.93]
 
 
@@ -1180,10 +1182,7 @@ def test_a_short_data_outage_does_not_stop_a_1m_trail(live: _Live, surfaced) -> 
 def test_a_long_outage_gives_up_once_then_resumes_when_data_recovers(
     live: _Live, surfaced, monkeypatch
 ) -> None:
-    infos: list[str] = []
-    monkeypatch.setattr(
-        trailing_stops.logger, "info", lambda message, *a, **k: infos.append(str(message))
-    )
+    infos = _infos(monkeypatch)
     outage = _Outage(live)
     manager = LiveTrailingStopManager()
     outage.run(manager, minutes=1)
@@ -1327,54 +1326,51 @@ def test_a_missing_bar_is_retried_only_while_it_can_still_be_feed_delay(live: _L
 
 
 def test_a_stop_larger_than_the_position_is_left_untrailed(
-    live: _Live, surfaced, monkeypatch
+    live: _Live, surfaced
 ) -> None:
-    warnings = _warnings(monkeypatch)
     live.client.positions = [_FakePosition("AAPL", 6)]
     manager = LiveTrailingStopManager()
 
-    live.feed(manager, [100.0, 103.0])
+    live.feed(manager, [100.0, 103.0, 104.0])
 
     # Reported once, and nothing is amended: the stop's quantity is not resized,
     # so the trail touches nothing it has not verified it can move safely.
-    assert len(warnings) == 1
-    assert warnings[0]["symbol"] == "AAPL"
-    assert warnings[0]["stop_order_id"] == "stop-1"
-    assert warnings[0]["stop_qty"] == 10.0
-    assert warnings[0]["position_qty"] == 6.0
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
+    sentry = surfaced[0][1]
+    assert sentry["component"] == "live_trailing_stops"
+    assert sentry["symbol"] == "AAPL"
+    assert sentry["stop_order_id"] == "stop-1"
+    assert sentry["stop_qty"] == 10.0
+    assert sentry["position_qty"] == 6.0
     assert live.client.replace_calls == []
     assert live.client.stop_prices() == [98.0]
     # Not even market data is read: there is no stop level to compute.
     assert live.market_data_calls == 0
-    assert surfaced == []
 
 
 def test_an_oversized_stop_on_a_short_position_is_left_untrailed(
-    isolated_db, surfaced, monkeypatch
+    isolated_db, surfaced
 ) -> None:
     database, _engine, _data_dir = isolated_db
     live = _Live(database, side="sell")
     live.client.positions = [_FakePosition("AAPL", -6)]
-    warnings = _warnings(monkeypatch)
 
     live.feed(LiveTrailingStopManager(), [100.0, 96.0])
 
-    assert len(warnings) == 1
-    assert warnings[0]["stop_qty"] == 10.0
-    assert warnings[0]["position_qty"] == 6.0
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
+    assert surfaced[0][1]["stop_qty"] == 10.0
+    assert surfaced[0][1]["position_qty"] == 6.0
     assert live.client.replace_calls == []
     assert live.client.stop_prices() == [102.0]
-    assert surfaced == []
 
 
-def test_a_stop_quantity_within_qty_tolerance_is_still_trailed(live: _Live, monkeypatch) -> None:
-    warnings = _warnings(monkeypatch)
+def test_a_stop_quantity_within_qty_tolerance_is_still_trailed(live: _Live, surfaced) -> None:
     live.client.positions = [_FakePosition("AAPL", 10.0000000001)]
 
     live.feed(LiveTrailingStopManager(), [103.0])
 
     # Broker float dust on the position qty is not an oversized stop.
-    assert warnings == []
+    assert surfaced == []
     assert live.client.stop_prices() == [101.97]
 
 
@@ -1392,9 +1388,8 @@ def test_a_stop_quantity_within_qty_tolerance_is_still_trailed(live: _Live, monk
     ],
 )
 def test_the_qty_tolerance_boundary_is_what_decides(
-    live: _Live, monkeypatch, stop_qty: float, trailed: bool
+    live: _Live, surfaced, stop_qty: float, trailed: bool
 ) -> None:
-    warnings = _warnings(monkeypatch)
     live.client.positions = [_FakePosition("AAPL", 10)]
     live.client.orders = [
         _FakeOrder("stop-1", "AAPL", "sell", order_type="stop", qty=stop_qty, stop_price=98.0),
@@ -1403,12 +1398,12 @@ def test_the_qty_tolerance_boundary_is_what_decides(
 
     live.feed(LiveTrailingStopManager(), [103.0])
 
-    assert (len(warnings) == 1) is not trailed
+    assert (len(surfaced) == 1) is not trailed
     assert live.client.stop_prices() == ([98.0] if not trailed else [101.97])
 
 
 def test_a_stop_whose_quantity_the_broker_does_not_report_is_still_trailed(
-    isolated_db, monkeypatch
+    isolated_db, surfaced
 ) -> None:
     database, _engine, _data_dir = isolated_db
     live = _Live(database)
@@ -1416,24 +1411,23 @@ def test_a_stop_whose_quantity_the_broker_does_not_report_is_still_trailed(
         _FakeOrder("stop-1", "AAPL", "sell", order_type="stop", qty=0.0, stop_price=98.0),
         _FakeOrder("tp-1", "AAPL", "sell", qty=10),
     ]
-    warnings = _warnings(monkeypatch)
 
     live.feed(LiveTrailingStopManager(), [103.0])
 
-    assert warnings == []
+    assert surfaced == []
     assert live.client.stop_prices() == [101.97]
 
 
 def test_an_oversized_stop_is_not_a_failure_and_does_not_block_the_next_pass(
-    live: _Live, surfaced, monkeypatch
+    live: _Live, surfaced
 ) -> None:
-    _warnings(monkeypatch)
     live.client.positions = [_FakePosition("AAPL", 6)]
     manager = LiveTrailingStopManager()
 
     live.tick(manager, T0 + MINUTE + timedelta(seconds=2))
 
-    assert surfaced == []
+    # The one report is the mismatch itself, not a failure of the pass.
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
     trail = manager._trails[(ACCOUNT, "AAPL")]
     assert trail.outage.failures == 0
     assert trail.outage.given_up is False
@@ -1451,7 +1445,6 @@ def test_a_failure_run_does_not_outlive_the_pause_it_was_recorded_before(
     refusal would give the position up on the spot, with a CRITICAL alert,
     long after the failure that started the run.
     """
-    _warnings(monkeypatch)
     live.client.replace_error = RuntimeError("422 the amendment was refused")
     manager = LiveTrailingStopManager()
 
@@ -1460,6 +1453,7 @@ def test_a_failure_run_does_not_outlive_the_pause_it_was_recorded_before(
     trail = manager._trails[(ACCOUNT, "AAPL")]
     first_failure_at = trail.outage.first_failure_at
     assert trail.outage.failures == 1
+    assert [message for message, _ in surfaced] == [_RETRY_REPORT]
 
     # The stop is left at the entry quantity, so the trail is paused for longer
     # than the give-up window measured from that first failure.
@@ -1484,9 +1478,10 @@ def test_a_failure_run_does_not_outlive_the_pause_it_was_recorded_before(
     assert trail.outage.first_failure_at != first_failure_at
     assert trail.outage.given_up is False
     assert [message for message, _ in surfaced] == [
-        "Live trailing stop could not be updated; the previous broker-side stop stays in "
-        "force and the update is retried"
-    ] * 2
+        _RETRY_REPORT,
+        _OVERSIZED_STOP_REPORT,
+        _RETRY_REPORT,
+    ]
 
 
 def test_the_pause_resumes_a_trail_that_was_already_given_up_on(
@@ -1511,7 +1506,8 @@ def test_the_pause_resumes_a_trail_that_was_already_given_up_on(
     live.tick(manager, T0 + timedelta(minutes=82, seconds=2))
     trail = manager._trails[(ACCOUNT, "AAPL")]
     assert trail.outage.given_up is True
-    assert any("given up" in message for message, _ in surfaced)
+    assert surfaced[0][0] == _RETRY_REPORT
+    assert surfaced[1][0].startswith("Live trailing stop given up on for this position")
 
     # The partial exit leaves the stop oversized; the next pass (the probe that
     # is now due) ends the outage instead of failing through it.
@@ -1521,6 +1517,10 @@ def test_the_pause_resumes_a_trail_that_was_already_given_up_on(
     assert trail.outage.failures == 0
     assert trail.outage.next_probe_at is None
     assert list(infos) == ["Live trailing stop resumed after a given-up failure recovered"]
+    # The mismatch report that this pass raised is the last thing surfaced, and
+    # it is not a failure: nothing was retried and nothing was given up on.
+    assert len(surfaced) == 3
+    assert surfaced[2][0] == _OVERSIZED_STOP_REPORT
 
     # Resized by hand: the trail resumes without any further probe delay.
     live.client.replace_error = None
@@ -1536,14 +1536,14 @@ def test_the_pause_resumes_a_trail_that_was_already_given_up_on(
 
 
 def test_the_trail_resumes_and_catches_up_once_the_stop_matches_the_position(
-    live: _Live, monkeypatch
+    live: _Live, surfaced
 ) -> None:
-    _warnings(monkeypatch)
     live.client.positions = [_FakePosition("AAPL", 6)]
     manager = LiveTrailingStopManager()
 
-    live.feed(manager, [100.0, 103.0])
+    live.feed(manager, [100.0, 110.0])
     assert live.client.replace_calls == []
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
 
     # The stop is resized down to what is held: the closes the skip left
     # unprocessed are all applied, so the pause never loses a trailed peak.
@@ -1551,21 +1551,22 @@ def test_the_trail_resumes_and_catches_up_once_the_stop_matches_the_position(
         _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=98.0),
         _FakeOrder("tp-1", "AAPL", "sell", qty=10),
     ]
-    live.feed(manager, [104.0])
+    live.feed(manager, [109.9])
 
-    # One amendment per pass, to the target of the newest of the skipped closes
-    # (100 -> 99, 103 -> 101.97, 104 -> 102.96).
-    assert live.client.replace_calls == [("stop-1+", 102.96)]
-    assert live.client.stop_prices() == [102.96]
+    # One amendment per pass. The target is the *skipped* peak (110 * 0.99 =
+    # 108.90), not the newest close (109.9 * 0.99 = 108.80, one tick lower), so
+    # the assertion distinguishes replaying every skipped close from reading
+    # only the last one.
+    assert live.client.replace_calls == [("stop-1+", 108.9)]
+    assert live.client.stop_prices() == [108.9]
 
 
-def test_a_second_oversized_stop_is_reported_again(live: _Live, monkeypatch) -> None:
-    warnings = _warnings(monkeypatch)
+def test_a_second_oversized_stop_is_reported_again(live: _Live, surfaced) -> None:
     live.client.positions = [_FakePosition("AAPL", 6)]
     manager = LiveTrailingStopManager()
 
     live.feed(manager, [100.0])
-    assert len(warnings) == 1
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
 
     # Resized once, then halved again by a second partial exit: the second
     # mismatch is reported too, not swallowed by the first one's latch.
@@ -1574,23 +1575,57 @@ def test_a_second_oversized_stop_is_reported_again(live: _Live, monkeypatch) -> 
         _FakeOrder("tp-1", "AAPL", "sell", qty=10),
     ]
     live.feed(manager, [103.0])
-    assert len(warnings) == 1
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
     assert live.client.stop_prices() == [101.97]
 
     live.client.positions = [_FakePosition("AAPL", 3)]
     live.feed(manager, [104.0])
-    assert len(warnings) == 2
-    assert warnings[1]["stop_qty"] == 6.0
-    assert warnings[1]["position_qty"] == 3.0
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT] * 2
+    assert surfaced[1][1]["stop_qty"] == 6.0
+    assert surfaced[1][1]["position_qty"] == 3.0
     assert live.client.stop_prices() == [101.97]
 
 
-def test_a_stop_matching_the_position_does_not_warn(live: _Live, monkeypatch) -> None:
-    warnings = _warnings(monkeypatch)
-
+def test_a_stop_matching_the_position_is_not_reported(live: _Live, surfaced) -> None:
     live.feed(LiveTrailingStopManager(), [100.0])
 
-    assert warnings == []
+    assert surfaced == []
+
+
+def test_the_pause_is_an_error_with_a_sentry_event_once_per_transition(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    """Only a manual resize ends the pause, so it must not be a WARNING.
+
+    The skip leaves a live position untrailed for as long as the operator takes
+    to notice, which is exactly the case a WARNING is lost in: the transition
+    into the mismatch is an ERROR with one Sentry event, a repeat while the
+    mismatch lasts is silent, and the transition back (the resize) is silent too.
+    """
+    infos = _infos(monkeypatch)
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    manager = LiveTrailingStopManager()
+
+    live.feed(manager, [100.0, 103.0, 104.0])
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
+    assert surfaced[0][1]["message"] == _OVERSIZED_STOP_REPORT
+    assert surfaced[0][1]["component"] == "live_trailing_stops"
+    assert surfaced[0][1]["account_id"] == ACCOUNT
+    assert surfaced[0][1]["signal_id"] == str(live.entry.id)
+    assert list(infos) == []
+
+    # Resized: the pause ends, the trail resumes on the closes it skipped, and
+    # the transition back raises nothing of its own.
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.feed(manager, [111.0])
+
+    assert [message for message, _ in surfaced] == [_OVERSIZED_STOP_REPORT]
+    assert live.client.replace_calls == [("stop-1+", 109.89)]
+    assert live.client.stop_prices() == [109.89]
+    assert "Trailed live stop" in list(infos)
 
 
 def test_alpaca_reports_the_stop_quantity_and_keeps_it_through_an_amend() -> None:
