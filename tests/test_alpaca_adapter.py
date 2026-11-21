@@ -752,6 +752,37 @@ def test_the_live_position_reads_the_broker_row() -> None:
     assert asyncio.run(adapter._live_position("MSFT")).flat is True
 
 
+def test_a_positions_read_that_fails_is_reported_not_swallowed(caplog) -> None:
+    """A listing that cannot be read is an operator signal, not a silent answer.
+
+    The old fail-closed on it returned "not flat" without a word, so a persistent
+    listing failure re-submitted a stop on every refused close with nothing to say
+    why - and a second stop next to a working one is an orphan the moment the
+    first fills. The answer stays fail-closed; the silence does not.
+    """
+    import logging
+
+    client = _FakeTradingClient(orders=[], positions=[])
+    adapter = _adapter(client)
+
+    def _unreachable():
+        raise RuntimeError("positions unreachable")
+
+    client.get_all_positions = _unreachable  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="trading.live-runner"):
+        live = asyncio.run(adapter._live_position("AAPL"))
+
+    assert (live.flat, live.stop_qty) == (False, None)
+    warnings = [
+        record for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any(
+        "Could not re-read positions" in record.message for record in warnings
+    )
+    assert any("positions unreachable" in str(getattr(record, "data", {})) for record in warnings)
+
+
 def test_a_flat_position_is_not_given_a_stop() -> None:
     """A restored stop on a flat position is the orphan the sweeps remove.
 
