@@ -7,12 +7,26 @@ import inspect
 import math
 import os
 import re
+import sys
 import uuid
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+if __name__ == "__main__":
+    # `python -m live_runner.daemon` runs THIS module, imports first: everything below (pandas, the
+    # broker SDKs, shared.database, the logger factory, Sentry) loads before any statement in this
+    # file. Answering the CLI here, before those imports, is what makes `--help` side-effect free:
+    # an agent - or an operator typo in a script - exits with usage instead of opening the live
+    # database, running the migrations and starting a second daemon (#310).
+    #
+    # Nested inside this guard, above the heavy imports: this path loads only
+    # `live_runner.daemon_cli`, which imports the standard library alone.
+    from live_runner.daemon_cli import main as _daemon_cli_main
+
+    raise SystemExit(_daemon_cli_main(sys.argv[1:]))
 
 import pandas as pd
 
@@ -106,6 +120,7 @@ from shared.database import (
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
+    live_db_path,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
     renew_live_deployment_submission,
@@ -124,6 +139,7 @@ from shared.models import (
     ServiceType,
 )
 from shared.sentry import capture_exception, initialize_sentry
+from shared.single_instance import SingleInstanceError, SingleInstanceLock
 from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
     validate_live_deployment_trailing_override,
@@ -138,6 +154,19 @@ _ACCOUNT_NOT_AUTHORIZED_LOG = "Account %s not authorized for token, skipping"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
+
+
+def daemon_lock_path() -> Path:
+    """The single-instance lock file: a sibling of the SQLite file this daemon trades (#310).
+
+    Resolved through ``live_db_path`` so the lock sits next to the file the engine really opens
+    (``DATABASE_URL`` when it names a SQLite file, ``DATA_DIR/backtests.db`` otherwise) - a lock
+    beside some other file would exclude nobody.
+    """
+    db_path = live_db_path()
+    return db_path.with_name(f"{db_path.name}.lock")
+
+
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
 # A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
@@ -5176,10 +5205,11 @@ async def sync_deployments_loop(
         await asyncio.sleep(interval_seconds)
 
 
-async def run_daemon(
+async def _run_daemon_locked(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
 ) -> None:
+    """The daemon's body; it runs only while this process holds the single-instance lock (#310)."""
     logger.info(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},
@@ -5298,9 +5328,40 @@ async def run_daemon(
         )
 
 
-def main() -> None:
-    asyncio.run(run_daemon())
+async def run_daemon(
+    *,
+    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+) -> None:
+    """Run the live daemon under the single-instance lock (#310).
+
+    The lock is acquired here, before the first database touch and every broker connect (both
+    happen inside ``_run_daemon_locked``), so a second daemon is refused with a
+    ``SingleInstanceError`` instead of running the schema and data migrations underneath a running
+    build - the 2026-11-21 incident, where a ``--help`` invocation started a second daemon that
+    migrated the live database under the old one. The operating system owns the lock and releases
+    it when this process exits, including on SIGKILL, so a killed daemon never blocks a restart.
+    """
+    lock = SingleInstanceLock(daemon_lock_path())
+    try:
+        lock.acquire()
+    except SingleInstanceError:
+        logger.error(
+            "Refusing to start: another live daemon holds the single-instance lock %s",
+            lock.lock_path,
+        )
+        raise
+    try:
+        await _run_daemon_locked(accounts_env=accounts_env)
+    finally:
+        lock.release()
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: Sequence[str] | None = None) -> int:
+    """Start the daemon and return the process exit code.
+
+    Kept for embedders; ``python -m live_runner.daemon`` goes through ``live_runner.daemon_cli``,
+    which parses the arguments before this module's heavy imports (#310).
+    """
+    from live_runner.daemon_cli import main as _cli_main
+
+    return _cli_main(argv)

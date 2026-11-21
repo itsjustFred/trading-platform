@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import unquote
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -109,6 +110,37 @@ def _default_database_url() -> str:
 
 def _is_sqlite_url(url: str) -> bool:
     return url.strip().lower().startswith("sqlite")
+
+
+def sqlite_url_file(url: str) -> str:
+    """The file part of a SQLite URL: query string and fragment stripped, percent-decoding undone.
+
+    ``DATABASE_URL`` is handed straight to SQLAlchemy, which reads everything after the first
+    ``?`` as driver options rather than as part of the filename, so
+    ``sqlite:////abs/backtests.db?timeout=30`` opens ``/abs/backtests.db``. Splitting the raw URL
+    kept ``?timeout=30`` in the path, and a ``Path`` carrying it is not a file: a working database
+    was reported as "Database file not found".
+
+    Empty when the URL names no file (``sqlite://``); the caller decides what that means.
+    """
+    without_params = url.partition("?")[0].partition("#")[0]
+    return unquote(without_params.split("///", 1)[1]) if "///" in without_params else ""
+
+
+def live_db_path() -> Path:
+    """The live database file this process trades.
+
+    The SQLite file ``DATABASE_URL`` names when it names one, so a caller acting on the file itself
+    (the daemon's single-instance lock, which sits next to it) sees the file the engine really
+    opens. A URL that names no file - in-memory, a bare ``sqlite://``, or another dialect - has no
+    file to point at, so the ``DATA_DIR/backtests.db`` default is used.
+    """
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url and _is_sqlite_url(url):
+        raw_file = sqlite_url_file(url)
+        if raw_file and raw_file != ":memory:":
+            return Path(raw_file)
+    return DATA_DIR / "backtests.db"
 
 
 def _create_database_engine() -> Any:
