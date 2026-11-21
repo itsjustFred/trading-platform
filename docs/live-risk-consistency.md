@@ -207,8 +207,30 @@ Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 `max_entry_quote_age_seconds`, `entry_quote_source`, `entry_deviation_sl_fraction` (mit Vorzeichen),
 `entry_deviation_direction` (`toward_stop_loss` / `away_from_stop_loss` / `none`),
 `max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` bei
-akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
-Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
+akzeptierten Signalen).
+Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt.
+
+Seit #134 ist das Quote-Snapshot zusätzlich als eigene Spalten auf
+`live_signals` projiziert (`entry_quote_bid/ask/side/price/time/source`,
+`entry_quote_time_source`), zusammen mit der Timing-Kette `producer_at`
+(Produktionszeitpunkt, z. B. Discord `created_at`), `message_received_at`
+(lokaler Empfang im Daemon) sowie `order_submitted_at`/`broker_ack_at`, die
+die Broker-Adapter um den Submit-Aufruf setzen und über
+`set_live_signal_broker_order_id` persistieren. Abgelehnte Signale landen in
+einer eigenen Tabelle `live_signal_rejections` (gleiche Quote-/Timing-Spalten,
+plus `stage`, `reason`, `gate_rejection_rule` und `dedupe_key`), nie in
+`live_signals` - eine Signal-Zeile behauptet, dass eine Order existieren
+kann, was Dedupe, Reconciliation und Recovery voraussetzen. Die Persistenz
+der Rejections ist best-effort: ein Fehler wird geloggt und ändert die
+Ablehnung nicht. Pro Fill werden `live_executions.order_type` und
+`requested_qty` gespeichert, soweit die Broker-Payload sie liefert.
+`list_live_signal_executions_for_deployments` zerlegt den Legacy-Slippage
+(`actual - theoretical`) in `signal_delay_bps` (Quote beim Submit vs.
+Signalpreis), `execution_slippage_bps` (Fill vs. dasselbe Quote) und
+`spread_bps`; alle drei sind adverse-positiv und einzeln `NULL`, wenn ihre
+Eingaben fehlen. Ein Fill ohne nutzbares Quote-Snapshot setzt
+`quote_snapshot_missing=true` - fehlende Daten werden markiert, nie als 0
+gedeutet.
 
 ## Commission-Vorzeichen (#184 Finding 14)
 

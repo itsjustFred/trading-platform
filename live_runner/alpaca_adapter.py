@@ -224,6 +224,16 @@ def _order_type(order: Any) -> str:
     return text.rsplit(".", 1)[-1]
 
 
+def _requested_order_qty(order: Any) -> float | None:
+    """The order's requested quantity as the broker stated it (#134).
+
+    ``qty`` on an Alpaca order is the total ordered quantity in the same
+    share/coin units the fill's ``filled_qty`` uses. ``None`` when the payload
+    does not state a usable one - never an invented quantity.
+    """
+    return _positive_finite(_order_attr(order, "qty", None))
+
+
 def _stop_candidates(order: Any) -> Iterator[Any]:
     """Orders that may be a position's working stop: the order, and a filled parent's held legs.
 
@@ -936,6 +946,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             dedupe_key=(
                 f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
             ),
+            order_type=_order_type(order) or None,
+            requested_qty=_requested_order_qty(order),
         )
         persisted_qty = await asyncio.to_thread(
             save_live_execution_up_to_cumulative,
@@ -1388,12 +1400,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self,
         canonical_signal_id: str,
         broker_order_id: str,
+        *,
+        submitted_at: datetime | None = None,
+        acknowledged_at: datetime | None = None,
     ) -> None:
         normalized_order_id = _normalize_broker_order_id(broker_order_id)
         if normalized_order_id is None:
             raise RuntimeError("Alpaca order response has no valid broker order id.")
         persisted = await asyncio.to_thread(
-            set_live_signal_broker_order_id, canonical_signal_id, normalized_order_id
+            set_live_signal_broker_order_id,
+            canonical_signal_id,
+            normalized_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
         )
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
@@ -1550,14 +1569,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 market_request_cls=market_request_cls,
                 client_order_id=canonical_signal_id,
             )
+        # #134: bracket the broker call with the order-timing stamps. The
+        # values are captured here, in memory, and persisted with the order id
+        # once the broker answers - never written speculatively before the
+        # request, so a lost response cannot fabricate a submission record.
+        submitted_at = datetime.now(timezone.utc)
         order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
+        acknowledged_at = datetime.now(timezone.utc)
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
         if broker_order_id is None:
             raise RuntimeError(
                 "Alpaca order response carried no valid positive broker order id "
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
-        await self._persist_submitted_order_id(canonical_signal_id, broker_order_id)
+        await self._persist_submitted_order_id(
+            canonical_signal_id,
+            broker_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
+        )
         logger.info(
             "Submitted Alpaca live order",
             extra={
@@ -2743,6 +2773,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 timestamp=fill_ts,
                 broker_order_id=broker_order_id,
                 dedupe_key=dedupe_key,
+                order_type=_order_type(order) or None,
+                requested_qty=_requested_order_qty(order),
             )
             persisted_qty = await self._persist_execution_fill(
                 execution, broker_cumulative_filled_qty

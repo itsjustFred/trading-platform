@@ -567,7 +567,7 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
     )
 
     first = LiveSignal(
@@ -646,7 +646,7 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
     )
 
     assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == _alpaca_order_id(
@@ -760,7 +760,9 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     )
     persistence_calls: list[tuple[str, str]] = []
 
-    def _fail_persistence(signal_id: str, broker_order_id: str) -> bool:
+    def _fail_persistence(
+        signal_id: str, broker_order_id: str, **_kwargs: object
+    ) -> bool:
         assert signal_id == canonical_signal_id, (
             "Alpaca broker order id was persisted against the noncanonical signal row"
         )
@@ -2824,7 +2826,7 @@ def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(m
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
     )
     saved: list[LiveExecution] = []
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
@@ -2996,7 +2998,7 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
     )
 
     class _OrderListReq:
@@ -3130,7 +3132,7 @@ def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch):
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
     )
 
     class _NewOrderReq:
@@ -3192,7 +3194,7 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
     monkeypatch.setattr(
-        module, "set_live_signal_broker_order_id", lambda _sid, _order_id: False
+        module, "set_live_signal_broker_order_id", lambda _sid, _order_id, **_kw: False
     )
 
     class _NewOrderReq:
@@ -4023,7 +4025,7 @@ def test_ctrader_submit_exit_only_uses_broker_position_request(monkeypatch) -> N
             saved_signals.append(saved_signal) or (signal_id, True)
         ),
     )
-    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda _sid, _oid: True)
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda _sid, _oid, **_kw: True)
     adapter._submit_new_order_request = _submit
 
     assert asyncio.run(adapter.submit_order(signal, qty=3.0)) == "901"
@@ -4065,7 +4067,7 @@ def test_ctrader_persisted_close_recovers_by_position_before_broker_requery(
         "get_live_signal_metadata",
         lambda _sid: {"risk_sizing_mode": "exit_only", "position_id": 77},
     )
-    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda _sid, _oid: True)
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda _sid, _oid, **_kw: True)
     monkeypatch.setattr(
         module,
         "save_live_signal",
@@ -4793,7 +4795,7 @@ def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(
-        module, "set_live_signal_broker_order_id", lambda _sid, _oid: True
+        module, "set_live_signal_broker_order_id", lambda _sid, _oid, **_kw: True
     )
     volumes: list[int] = []
 
@@ -5158,7 +5160,7 @@ def _alpaca_bracket_adapter(monkeypatch):
         return str(signal.id), True
 
     monkeypatch.setattr(module, "save_live_signal", _save)
-    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda sid, oid: True)
+    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda sid, oid, **_kw: True)
     return adapter, submitted, saved
 
 

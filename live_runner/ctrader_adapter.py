@@ -492,6 +492,13 @@ def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCAL
     return _to_float(volume, default=0.0) / float(volume_per_qty)
 
 
+def _enum_name_or_none(name_fn: Any, value: int) -> str | None:
+    try:
+        return str(name_fn(value))
+    except Exception:
+        return None
+
+
 def _light_symbol_assets(symbol: Any) -> tuple[int, int] | None:
     """(baseAssetId, quoteAssetId) of a ``ProtoOALightSymbol``, or ``None``.
 
@@ -1444,6 +1451,41 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             "refusing to scale its volume with a guessed symbol."
         )
 
+    def _order_type_name(self, order: Any) -> str | None:
+        """The order's type name as the broker stated it (#134), or ``None``.
+
+        ``orderType`` is the protobuf enum's int value; the adapter's
+        ``ProtoOAOrderType`` wrapper names it. ``None`` when the payload or
+        the enum wrapper does not state one - never a fabricated type.
+        """
+        if order is None:
+            return None
+        raw = getattr(order, "orderType", None)
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        name_fn = getattr(self._ProtoOAOrderType, "Name", None)
+        if not callable(name_fn):
+            return None
+        return _enum_name_or_none(name_fn, value)
+
+    def _requested_order_qty(self, order: Any, symbol: str) -> float | None:
+        """The order's requested volume converted to qty units (#134).
+
+        ``order.volume`` is in broker volume units; it is converted with the
+        same symbol scale the fill uses. ``None`` when the order is absent or
+        states no positive volume - never an invented quantity.
+        """
+        if order is None:
+            return None
+        volume = _to_float(getattr(order, "volume", 0), default=0.0)
+        if volume <= 0.0:
+            return None
+        return _broker_volume_to_qty(volume, self._scale_for(symbol).volume_per_qty)
+
     async def _load_symbols_into_cache(self) -> None:
         symbols_req = self._ProtoOASymbolsListReq()
         symbols_req.ctidTraderAccountId = self.ctid_trader_account_id
@@ -2192,6 +2234,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
+            order_type=self._order_type_name(order),
+            requested_qty=self._requested_order_qty(order, deal_symbol),
             # The deal id is positive here - this path returns early when `deal_id <= 0` - so the
             # stored value is the broker's real id, not a sentinel.
             broker_fill_id=_deal_id_or_none(deal),
@@ -2433,7 +2477,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             else:
                 request = self._build_new_order_request(signal, symbol_id=symbol_id)
+        # #134: bracket the broker call with the order-timing stamps, persisted
+        # with the order id once the broker answers.
+        submitted_at = datetime.now(timezone.utc)
         response = await self._submit_new_order_request(request)
+        acknowledged_at = datetime.now(timezone.utc)
 
         order_id = self._extract_order_id_from_payload(response)
         if order_id is None:
@@ -2447,7 +2495,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         broker_order_id = str(order_id)
         persisted = await asyncio.to_thread(
-            set_live_signal_broker_order_id, canonical_signal_id, broker_order_id
+            set_live_signal_broker_order_id,
+            canonical_signal_id,
+            broker_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
         )
         if not persisted:
             raise RuntimeError("Failed to persist cTrader broker order id.")
@@ -3547,6 +3599,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `_deal_id_or_none` keeps the protobuf `0` sentinel out of the column, so "the broker
             # told us nothing" stays distinguishable from "the broker said zero".
             broker_fill_id=_deal_id_or_none(deal),
+            order_type=self._order_type_name(order),
+            requested_qty=self._requested_order_qty(order, fill_symbol),
         )
         if cumulative_qty > 0:
             # P1's amendment semantics, not a second insert: the same key with a *larger*
