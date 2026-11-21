@@ -1,5 +1,13 @@
 # Cross-Engine Backtest Contract
 
+> **Freeze notice (#318, 2026-11-21).** Per
+> `docs/adr/0001-native-single-strategy-engine.md`, `native` is the single
+> strategy engine going forward. `vectorbt`, `pynecore` and the LEAN *run*
+> path are frozen (bug fixes only, no new features) and scheduled for
+> removal; LEAN becomes import-only. This contract will shrink to native +
+> signal replay once they are gone. Selecting a frozen engine emits a
+> `DeprecationWarning`.
+
 Status: contract for the backtest engine adapters (`runner/engines/`), shared
 primitives in `runner/engines/contract.py`, conformance tests in
 `tests/test_engine_contract.py`.

@@ -7,7 +7,10 @@ This is the current "state of the union" for the trading-platform repository.
 - **Backend API:** FastAPI (`viewer/main.py`)
 - **Frontend:** React + TypeScript + Vite (`frontend/`)
 - **Primary backtest engine:** native event-based engine (`runner/engines/native_adapter.py`)
-- **Additional engines:** vectorbt, PyneCore and LEAN adapters
+- **Additional engines:** vectorbt, PyneCore and LEAN adapters — all frozen
+  (bug fixes only) per `docs/adr/0001-native-single-strategy-engine.md` (#318);
+  native is the single strategy engine going forward, LEAN becomes
+  import-only, and pynecore is scheduled for deletion
 - **Performance/statistics:** `runner/stats.py`, QuantStats-derived metrics, custom p-value / PSR handling
 - **Persistence:** SQLite (`$DATA_DIR/backtests.db`) + JSON compatibility (`$DATA_DIR/backtests/*.trades.json`)
 
