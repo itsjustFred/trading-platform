@@ -1537,8 +1537,9 @@ class DiscordSignalSource(BaseSignalSource):
         # authors the allowlist does not trust - by definition untrusted channel members -
         # so letting three of them flip the service status would hand any member of the
         # channel the ability to take the bot out of service (the daemon stops
-        # every discord service that is not RUNNING). The refusal itself is already correct; this alert is the signal for
-        # the operator, who checks the logged `rejected_author_ids` against the allowlist.
+        # every discord service that is not RUNNING). The refusal itself is already
+        # correct; this alert is the signal for the operator, who checks the logged
+        # `rejected_author_ids` against the allowlist.
 
     def author_rejection_summary(self) -> dict[str, Any]:
         """How many messages were dropped for authorship, and by whom.
