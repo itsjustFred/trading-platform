@@ -656,3 +656,156 @@ def test_native_engine_take_profit_alias_fills_one_take_profit_level():
     )
     assert take_profit_exits[0].price == pytest.approx(105.0)
     assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
+
+
+# ─── #237 follow-up: a level price that cannot fire arms no level ─────────────
+
+
+def test_native_engine_take_profit_alias_falls_back_when_the_canonical_is_not_usable():
+    """A non-positive canonical price is not a level (live parity, #237).
+
+    ``risk.live.resolve_live_levels`` raises ``take_profit must be > 0``
+    (``risk/live.py``), so a row whose canonical spelling is ``0`` must never
+    win over a usable alias: a LONG take-profit of 0 is reached by every bar
+    (``bar_high >= 0``), and arming it closed the whole position at price 0.
+    """
+    engine = _engine()
+    row = pd.Series({"take_profit": 0.0, "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(115.0)
+
+
+def test_native_engine_take_profit_alias_ignores_a_non_finite_canonical_price():
+    engine = _engine()
+    row = pd.Series({"take_profit": float("inf"), "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["price"] for level in take_profit_levels] == [115.0]
+
+
+def test_native_engine_does_not_arm_a_non_positive_take_profit_level():
+    """With no usable alias the row arms no take-profit level at all."""
+    engine = _engine()
+    row = pd.Series({"take_profit": 0.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert take_profit_levels == []
+
+
+def test_native_engine_does_not_arm_a_non_positive_numbered_take_profit_level():
+    """The same rule for numbered levels: ``tp1: 0`` is not a level."""
+    engine = _engine()
+    row = pd.Series({"tp1": 0.0, "tp2": 120.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp2"]
+    assert [level["price"] for level in take_profit_levels] == [120.0]
+    assert take_profit_levels[0]["fraction"] == pytest.approx(1.0)
+
+
+def test_native_engine_non_positive_take_profit_does_not_close_the_position_at_zero():
+    """End to end (#237): a ``take_profit`` of 0 must not book a fantasy exit.
+
+    A LONG take-profit of 0 is reached by every bar, so arming it closed the
+    whole position at price 0 on the first monitored bar. The alias price is
+    the usable one, and that is the level the exit must fill at.
+    """
+    engine = _engine()
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01 00:00",
+                    "2024-01-01 00:01",
+                    "2024-01-01 00:02",
+                    "2024-01-01 00:03",
+                    "2024-01-01 00:04",
+                ],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 105.0, 105.0, 105.0],
+            "high": [100.5, 101.5, 112.5, 105.5, 105.5],
+            "low": [99.5, 100.5, 104.5, 104.5, 104.5],
+            "close": [100.0, 101.0, 105.0, 105.0, 105.0],
+        }
+    )
+
+    def strategy(df, params):
+        index = df.index
+        entries = pd.Series([True, False, False, False, False], index=index)
+        exits = pd.Series([False, False, False, False, True], index=index)
+        indicators = {
+            "direction": pd.Series(["LONG", None, None, None, None], index=index, dtype=object),
+            "stop_loss": pd.Series([95.0, None, None, None, None], index=index, dtype=object),
+            # The unusable canonical price plus the usable alias price.
+            "take_profit": pd.Series([0.0, None, None, None, None], index=index, dtype=object),
+            "tp_price": pd.Series([112.0, None, None, None, None], index=index, dtype=object),
+        }
+        return entries, exits, indicators, []
+
+    result = engine.run(frame, strategy)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1
+    assert take_profit_exits[0].price == pytest.approx(112.0)
+    assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
+    assert all(leg.price > 0 for leg in trade.exits), "no leg may fill at price 0"
+
+
+def test_native_engine_fixed_risk_amount_never_arms_a_take_profit_at_zero():
+    """End to end (#237): the fixed-amount sizing path books no price-0 exit.
+
+    ``fixed_risk_amount`` sizing returns before the ``TradeSignal`` that
+    validates the level, so the unusable price reached ``_create_order`` and
+    armed a take-profit at 0 — which every bar reaches, closing the whole
+    position at price 0 on the first monitored bar. The alias price is the
+    usable one, so that is the level the exit fills at.
+    """
+    engine = _engine({"fixed_risk_amount": 500.0})
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01 00:00",
+                    "2024-01-01 00:01",
+                    "2024-01-01 00:02",
+                    "2024-01-01 00:03",
+                    "2024-01-01 00:04",
+                ],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 105.0, 105.0, 105.0],
+            "high": [100.5, 101.5, 112.5, 105.5, 105.5],
+            "low": [99.5, 100.5, 104.5, 104.5, 104.5],
+            "close": [100.0, 101.0, 105.0, 105.0, 105.0],
+        }
+    )
+
+    def strategy(df, params):
+        index = df.index
+        entries = pd.Series([True, False, False, False, False], index=index)
+        exits = pd.Series([False, False, False, False, True], index=index)
+        indicators = {
+            "direction": pd.Series(["LONG", None, None, None, None], index=index, dtype=object),
+            "stop_loss": pd.Series([95.0, None, None, None, None], index=index, dtype=object),
+            "take_profit": pd.Series([0.0, None, None, None, None], index=index, dtype=object),
+            "tp_price": pd.Series([112.0, None, None, None, None], index=index, dtype=object),
+        }
+        return entries, exits, indicators, []
+
+    result = engine.run(frame, strategy)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1
+    assert take_profit_exits[0].price == pytest.approx(112.0)
+    assert all(leg.price > 0 for leg in trade.exits), "no leg may fill at price 0"

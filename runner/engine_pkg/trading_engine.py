@@ -57,6 +57,29 @@ def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     return (1, int(name[2:]), name)
 
 
+def _armable_take_profit(value: Any) -> float | None:
+    """A take-profit price the engine may arm, else ``None``.
+
+    ``risk.live.resolve_live_levels`` refuses a present-but-unusable level
+    (non-numeric, non-finite or ``<= 0``) instead of trading it, so the backtest
+    must never arm one either: a LONG take-profit of ``0`` is reached by every
+    bar (``bar_high >= 0``) and would close the whole position at price ``0``,
+    while a non-finite level can never be reached at all. Returning ``None``
+    leaves the level unarmed — for the alias pair it lets the fallback
+    spelling (#237) supply the price — which is the conservative reading of a
+    row no committed strategy emits.
+    """
+    if pd.isna(value):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
 class TradeEngine:
     def __init__(
         self,
@@ -192,22 +215,26 @@ class TradeEngine:
         # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
         # comparison/extraction helpers) — and the winner must not depend on
         # the signal frame's column order. Appending one candidate per column
-        # made two levels that share the "tp_pct" fraction, so a 50% exit
-        # fraction closed the whole position at the take-profit level.
+        # made two levels named "tp" for one intended level, so the single
+        # take-profit the row describes filled as two legs that shared the
+        # "tp_pct" fraction.
         # (rank, price): 0 = canonical take_profit, 1 = tp_price alias.
         plain_tp: tuple[int, float] | None = None
         for key in row.index:
             lower = str(key).lower()
             if lower in {"take_profit", "tp_price"}:
-                alias_value = row.get(key)
-                if pd.isna(alias_value):
+                alias_value = _armable_take_profit(row.get(key))
+                if alias_value is None:
                     continue
                 rank = 0 if lower == "take_profit" else 1
                 if plain_tp is None or rank < plain_tp[0]:
-                    plain_tp = (rank, float(alias_value))
+                    plain_tp = (rank, alias_value)
                 continue
-            if lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
-                tp_candidates.append((lower, float(row.get(key))))
+            if lower.startswith("tp") and lower[2:].isdecimal():
+                numbered_value = _armable_take_profit(row.get(key))
+                if numbered_value is None:
+                    continue
+                tp_candidates.append((lower, numbered_value))
         if plain_tp is not None:
             tp_candidates.append(("tp", plain_tp[1]))
 
