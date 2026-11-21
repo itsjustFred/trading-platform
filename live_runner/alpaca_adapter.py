@@ -2469,7 +2469,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         `held` stop leg rests on, but an OTO entry - which the adapter submits for an
         unbounded take profit - has a stop leg and no take-profit sibling, so the symbols
         the open listing names are not enough. The lookup's 20-page budget bounds the
-        history it reads.
+        history it reads, and it is the one caller that passes ``symbols=None``: these
+        helpers have no default scope, so no caller can reach one by omission.
         """
         client = await self._require_trading_client()
         open_orders = await self._list_open_orders(client)
@@ -2479,7 +2480,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if not _is_flat(_position_qty(position))
         }
         orders = self._merge_held_legs(
-            open_orders, await self._list_resting_legs(client)
+            open_orders, await self._list_resting_legs(client, symbols=None)
         )
         completed = 0
         unidentified: list[str] = []
@@ -2497,7 +2498,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # The broker's OCO may already have removed this leg with the
                 # sibling just cancelled; a refusal for an order that is no
                 # longer resting is not a failure the daemon must retry forever.
-                if await self._cancel_already_gone(client, order_id):
+                if await self._cancel_already_gone(client, order_id, symbols=None):
                     continue
                 failed.append(f"{order_id}:{exc}")
                 continue
@@ -2561,17 +2562,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         positions being acted on); ``None`` looks account-wide, which only the orphan sweep
         may ask for: its whole job is symbols that no longer have a position, and an OTO
         entry's stop leg has no take-profit sibling that ``status=open`` would name. The
-        20-page budget bounds even the account-wide history.
+        20-page budget bounds even the account-wide history, and there is no default
+        scope, so no caller reaches an account-wide scan by omission.
 
         The listing is newest-first and capped at 500 rows, so one call is only the
         newest 500 orders of the account's whole history - a mature account fills that
         page with terminal orders. A full page therefore pages back over the history
         until a page comes back not full (the end of the history) rather than failing:
         an account that trades a bracket per day reaches 500 orders within a few months,
-        and a flatten that then failed would leave the position open. Only a history
-        longer than the page budget fails, because the pages past it hold orders this
-        lookup cannot vouch for. A failure to list is not swallowed either way: a
-        missing stop would be reported as "no stop" for a position that does have one.
+        and a flatten that then failed would leave the position open. The 20-page
+        budget is the end of that, and a 20th full page fails with it: a history of
+        exactly 10,000 orders cannot be told apart from a longer one, and either way
+        the pages past it hold orders this lookup cannot vouch for. A failure to list
+        is not swallowed either way: a missing stop would be reported as "no stop" for
+        a position that does have one.
         """
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
@@ -2609,9 +2613,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     "cannot be asked for; refusing to treat the list as complete"
                 )
         raise RuntimeError(
-            f"Alpaca's order history is longer than "
-            f"{_ALPACA_HELD_LEG_PAGE_LIMIT * _ALPACA_HELD_LEG_LOOKUP_LIMIT} orders; "
-            "refusing to treat the list as complete"
+            f"Alpaca's order history reached "
+            f"{_ALPACA_HELD_LEG_PAGE_LIMIT * _ALPACA_HELD_LEG_LOOKUP_LIMIT} orders "
+            "without an empty page; refusing to treat the list as complete"
         )
 
     @staticmethod
@@ -2625,7 +2629,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
 
     async def _list_resting_legs(
-        self, client: Any, *, symbols: set[str] | None = None
+        self, client: Any, *, symbols: set[str] | None
     ) -> list[Any]:
         """The bracket legs themselves, the ones no ``status=open`` listing shows (#245).
 
@@ -2643,7 +2647,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
 
     async def _list_working_book(
-        self, client: Any, *, symbols: set[str] | None = None
+        self, client: Any, *, symbols: set[str] | None
     ) -> list[Any]:
         """Every order still resting at the broker, or a hard failure - never a partial book.
 
@@ -2682,7 +2686,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return orders
 
     async def _cancel_already_gone(
-        self, client: Any, order_id: str, *, symbols: set[str] | None = None
+        self, client: Any, order_id: str, *, symbols: set[str] | None
     ) -> bool:
         """Whether a refused cancel was for an order that is no longer resting.
 

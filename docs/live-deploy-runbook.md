@@ -179,8 +179,8 @@ clean-up.
 - The `status=all` listing is newest-500-rows at a time, and a mature account fills that page
   with terminal orders, so a full page pages back through the history (bounded at 20 pages)
   instead of failing: an account trading one bracket a day reaches 500 orders within two
-  years, and a flatten that failed on its own order book would leave the position open. Only a
-  history longer than the budget fails. The page cursor goes past the oldest row it saw by a
+  years, and a flatten that failed on its own order book would leave the position open. A 20th
+  full page fails too: exactly 10,000 orders cannot be told apart from a longer history. The page cursor goes past the oldest row it saw by a
   microsecond, so no order at the boundary is skipped. (`status=open` still refuses a full
   page: 500 *working* orders means orders the sweep cannot see.)
 - The orphan sweep's leg lookup is account-wide, bounded by the same 20-page budget: a bracket's

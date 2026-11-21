@@ -294,10 +294,9 @@ def _status_all_requests(client: _FakeTradingClient) -> list[object]:
     ]
 
 
-#: Statuses no further cancel or fill can come from.
-_TERMINAL_STATUSES = frozenset(
-    {"canceled", "expired", "rejected", "done", "filled", "partially_filled"}
-)
+#: Statuses no further cancel can be sent for. A ``filled`` order has nothing left to
+#: cancel; a ``partially_filled`` one still has, which is why it is not in this set.
+_TERMINAL_STATUSES = frozenset({"canceled", "expired", "rejected", "done", "filled"})
 
 
 def _working(order: object) -> bool:
