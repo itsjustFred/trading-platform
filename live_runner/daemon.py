@@ -96,6 +96,7 @@ from shared.database import (
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
     create_service,
+    flag_live_ledger_reconciliation,
     get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
@@ -1567,7 +1568,24 @@ def _alert_ledger_mismatch(
     The residual risk is stated in the alert: on a netted account, a broker-side
     close made for another deployment lowers the broker position, and the cap
     then closes part of that deployment's share.
+
+    A mismatch means a close the ledgers never saw happened - a flatten or a
+    manual close no adapter could attribute (#144 decision). The ERROR alert is
+    the surface; the durable ``ledger_reconciliation_required`` audit flag is
+    what an operator and the periodic broker reconciliation (#330) act on.
     """
+    flag_live_ledger_reconciliation(
+        account_id=deployment.account_id,
+        symbol=symbol,
+        cause="exit_ledger_mismatch",
+        detail={
+            "deployment_id": str(deployment.id),
+            "own_ledger_qty": float(own_qty),
+            "exit_qty_before_step": float(exit_qty),
+            "reason": str(exc),
+            **exc.log_data(),
+        },
+    )
     logger.error(
         "ALERT: deployment ledgers do not match the broker position; submitting "
         "the exit capped at the broker position. If another deployment's "

@@ -3173,6 +3173,11 @@ _BROKER_CLOSE_NAMESPACE = uuid5(NAMESPACE_URL, "trading-platform/live/broker-sid
 BROKER_CLOSE_REASON_ALPACA_STOP_LEG = "alpaca_bracket_stop"
 BROKER_CLOSE_REASON_ALPACA_TARGET_LEG = "alpaca_bracket_target"
 BROKER_CLOSE_REASON_ALPACA_LEG = "alpaca_bracket_leg"
+#: A cTrader position close the platform did not submit (SL/TP, flatten, manual).
+#: cTrader does not say WHICH of those fired, so one reason covers them all; the
+#: deal -> position -> opening-order -> clientOrderId chain is what makes the
+#: attribution exact rather than guessed.
+BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE = "ctrader_position_close"
 
 
 def broker_close_signal_id(parent_signal_id: str) -> str:
@@ -3184,6 +3189,52 @@ def broker_close_signal_id(parent_signal_id: str) -> str:
     an audit field in the signal's metadata.
     """
     return str(uuid5(_BROKER_CLOSE_NAMESPACE, str(parent_signal_id or "")))
+
+
+def get_live_signal_account_id(signal_id: str) -> str | None:
+    """The account id of the deployment a live signal belongs to, or ``None``.
+
+    A broker-side close resolved through a position's opening order must prove
+    the signal it names lives on THIS account before its ledger may be reduced:
+    a ``clientOrderId`` is only a UUID, and a UUID persisted under another
+    account's deployment would otherwise receive the close (#144).
+    """
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        account_id = session.exec(
+            select(LiveDeploymentModel.account_id)
+            .join(
+                LiveSignalModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveSignalModel.id == normalized_signal_id)
+        ).first()
+    return str(account_id) if account_id is not None else None
+
+
+def live_execution_dedupe_key_exists(dedupe_key: str) -> bool:
+    """Whether an execution row already carries this dedupe key (#144).
+
+    ``record_live_broker_side_close_fill`` returns ``0.0`` both for a duplicate
+    and for a refusal, and the caller must tell them apart: a duplicate is a
+    handled fill, a refusal is a ledger gap that has to be flagged. The key is
+    the broker-native identity both the stream and the reconcile pass derive,
+    so its presence is the honest answer.
+    """
+    normalized_key = str(dedupe_key or "").strip()
+    if not normalized_key:
+        return False
+    init_db()
+    with get_session() as session:
+        row = session.exec(
+            select(LiveExecutionModel.id)
+            .where(LiveExecutionModel.dedupe_key == normalized_key)
+            .limit(1)
+        ).first()
+    return row is not None
 
 
 def get_live_signal_filled_qty_for_broker_order(signal_id: str, broker_order_id: str) -> float:
@@ -3509,6 +3560,45 @@ def record_live_broker_side_close_fill(
             session.rollback()
             raise
     return quantity
+
+
+#: ``live_control_audit.action`` written when a close the ledgers never saw could
+#: not be attributed to one deployment (#144 maintainer decision). The audit row
+#: is the durable flag; periodic broker reconciliation (#330) acts on the
+#: ledger-vs-broker mismatch it computes itself, and this record is what tells an
+#: operator the gap was already detected rather than discovered at the next exit.
+LEDGER_RECONCILIATION_AUDIT_ACTION = "ledger_reconciliation_required"
+
+
+def flag_live_ledger_reconciliation(
+    *,
+    account_id: str,
+    symbol: str,
+    cause: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Flag that an account+symbol ledger no longer explains the broker position.
+
+    Written when a broker-side close cannot be attributed to exactly one
+    deployment's parent signal - a flatten, a manual close, or a position whose
+    opening orders name several signals (a netted book). The fill is NOT
+    guessed into a ledger: the flag plus the caller's ERROR alert is the surface
+    (#144 decision), and the next exit's ``LedgerMismatchError`` or the periodic
+    broker reconciliation is what acts on it. Never raises - an audit write that
+    could abort fill handling would be a worse failure than the missing flag.
+    """
+    return record_live_control_audit(
+        action=LEDGER_RECONCILIATION_AUDIT_ACTION,
+        target_type="account_symbol",
+        target_id=f"{str(account_id or '').strip()}:{str(symbol or '').strip().upper()}",
+        actor="live-runner",
+        detail={
+            "account_id": str(account_id or ""),
+            "symbol": str(symbol or "").strip().upper(),
+            "cause": str(cause or ""),
+            **dict(detail or {}),
+        },
+    )
 
 
 def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:

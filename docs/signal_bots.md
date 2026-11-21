@@ -274,10 +274,27 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   bisherigen Pfad. Eine Leg auf der *aufbauenden* Seite, ein unbekanntes
   Parent-Signal, ein Fill ohne Zeitstempel oder ohne nutzbare Menge wird
   abgelehnt (geloggt, nichts geschrieben) - nie erfunden.
-  **Noch offen (#144):** cTrader-SL/TP-Schließungen (Deal → Position →
-  Origin-Signal), Flatten (`close_all_positions` / `close_position`) und
-  manuelle Schließungen werden noch nicht gebucht; für sie gilt weiterhin
-  Deckelung + Alert, und das Ledger muss manuell abgeglichen werden.
+  **cTrader (#144):** Eine broker-seitige Positionsschließung (SL/TP, Flatten,
+  manuell - cTrader unterscheidet die nicht) wird über die Kette **Deal →
+  `positionId` → `OrderListByPositionId` → `clientOrderId`/Order-Id des
+  eröffnenden Orders → Signal** derselben Parent-Deployment zugeordnet und über
+  denselben `record_live_broker_side_close_fill`-Pfad gebucht
+  (`broker_close_reason=ctrader_position_close`, Dedupe-Key
+  `ctrader:position-close:{dealId}`, gedeckelt am kumulierten Volumen des
+  schließenden Orders). Die Zuordnung zählt nur, wenn **genau ein** Signal der
+  Position zugeordnet ist: null (manuelle Position, nie eingereichte Orders)
+  oder mehrere (genettetes Buch mehrerer Deployments) werden **nicht geraten**,
+  sondern das Account+Symbol wird als `ledger_reconciliation_required` im
+  Control-Audit geflaggt und ein `ERROR`-Alert (`alert=
+  ledger_reconciliation_required`) ausgelöst - die periodische
+  Broker-Reconciliation (#330) bzw. der nächste Exit-Mismatch-Alert handelt
+  danach. Derselbe Flag wird bei `exit_ledger_mismatch` geschrieben. Der
+  Reconciliation-Pass (`reconcile_executions`) holt zusätzlich die
+  Account-Deal-Liste der letzten 7 Tage nach, um vom Stream verpasste
+  Schließungen nachzubuchen; Deals eigener Orders werden übersprungen. Ein
+  Manuell-/Flatten-Close einer Position, die genau ein Signal eröffnete, ist
+  damit **exakt** zugeordnet (kein Raten); was die Kette nicht eindeutig
+  auflösen kann, bleibt geflaggt.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
