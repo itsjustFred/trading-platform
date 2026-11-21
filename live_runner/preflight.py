@@ -18,7 +18,11 @@ from pydantic import ValidationError
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
-from live_runner.credential_env import overlay_process_env, read_accounts_env_file
+from live_runner.credential_env import (
+    overlay_process_env,
+    read_accounts_env_file,
+    resolve_accounts_env_path,
+)
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from runner.promotion_gate import StrategyNotPromotedError
@@ -608,14 +612,16 @@ def _config_error_message(exc: Exception, *, redact: Mapping[str, str]) -> str:
 def run_live_preflight(
     config_path: str | Path,
     *,
-    accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env_path: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     check_connectivity: bool = False,
     check_db: bool = False,
     db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
-    accounts_env = Path(accounts_env_path)
+    accounts_env = resolve_accounts_env_path(
+        accounts_env_path if accounts_env_path is not None else DEFAULT_ACCOUNTS_ENV
+    )
     # ${VAR} references in the YAML resolve exactly like credentials: the accounts
     # env file first, the process environment only for keys the file does not
     # define. An explicit ``env`` mapping is used as-is (hermetic callers). The

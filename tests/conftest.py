@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import importlib
+import ipaddress
 import os
 import shutil
 import sys
@@ -8,22 +10,208 @@ import tempfile
 from functools import lru_cache
 from pathlib import Path
 
+import dotenv
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_DATA_DIR = (PROJECT_ROOT / "data").resolve()
+REPO_LOG_DIR = (PROJECT_ROOT / "logs").resolve()
+REPO_ACCOUNTS_ENV = (PROJECT_ROOT / ".accounts.env").resolve()
+REPO_ENV_FILE = (PROJECT_ROOT / ".env").resolve()
+
+# What the suite must observe read-only. ``logs/`` belongs beside ``data/`` because a run that
+# writes the live-runner log puts fabricated order events into the log read during a live
+# incident, which is the same failure mode as writing the live database: a green run that lied.
+WATCHED_REPO_DIRS = (REPO_DATA_DIR, REPO_LOG_DIR)
+_REPO_SECRET_FILES = frozenset({REPO_ACCOUNTS_ENV, REPO_ENV_FILE})
+_SECRET_FILE_NAMES = frozenset({REPO_ACCOUNTS_ENV.name, REPO_ENV_FILE.name})
 
 # The suite must never write into the repo's ``data/``: in the main checkout that is the live
 # platform's database, catalog and market data. Every process (the xdist controller and each
-# worker imports this file) gets its own throwaway DATA_DIR, forced rather than ``setdefault`` so
-# an exported DATA_DIR pointing at production cannot leak in either. It is set before any
-# ``shared`` import, because ``shared.constants`` resolves DATA_DIR at import time.
-_SESSION_DATA_DIR = Path(tempfile.mkdtemp(prefix="tp-pytest-data-")).resolve()
-atexit.register(shutil.rmtree, _SESSION_DATA_DIR, ignore_errors=True)
-TEST_DATA_DIR = _SESSION_DATA_DIR
+# worker imports this file) gets its own throwaway sandbox, forced rather than ``setdefault`` so
+# an exported DATA_DIR pointing at production cannot leak in either. Both directories are set
+# before any ``shared`` import, because ``shared.constants`` resolves DATA_DIR and LOG_DIR from
+# the environment at import time and the platform writes through both.
+_SESSION_ROOT = Path(tempfile.mkdtemp(prefix="tp-pytest-session-")).resolve()
+atexit.register(shutil.rmtree, _SESSION_ROOT, ignore_errors=True)
+TEST_DATA_DIR = _SESSION_ROOT / "data"
+TEST_LOG_DIR = _SESSION_ROOT / "logs"
+# Where a caller that names no accounts-env file resolves to. It deliberately does not exist: a
+# test that needs credentials writes its own under ``tmp_path``, and a file that existed here
+# would be the same leak one directory further away from the checkout.
+ISOLATED_ACCOUNTS_ENV = _SESSION_ROOT / ".accounts.env"
+# The substitute for the checkout's real ``.env``. ``shared.constants`` and ``viewer.main`` both
+# load it at import time, before any test can intervene, so the load is redirected here rather
+# than prevented: the call still happens, the content is the empty session file.
+ISOLATED_DOTENV_FILE = _SESSION_ROOT / ".env"
+for _session_dir in (TEST_DATA_DIR, TEST_LOG_DIR):
+    _session_dir.mkdir(parents=True, exist_ok=True)
+ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
 
 os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
+os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
+
+
+class SuiteHermeticityViolation(RuntimeError):
+    """A test reached outside its sandbox.
+
+    Raised inside an audit hook, so it surfaces as an ordinary exception in the offending
+    frame. A ``RuntimeError`` subclass rather than an ``OSError`` on purpose: the failure must
+    not be mistakable for the network error the call would have produced, and broad
+    ``except Exception`` handlers in the code under test swallow it - which is why every
+    violation is also recorded and fails the session at
+    :func:`pytest_sessionfinish`.
+    """
+
+
+_REPO_SECRET_OPENS: list[str] = []
+_NETWORK_VIOLATIONS: list[str] = []
+
+
+def repo_secret_opens() -> tuple[str, ...]:
+    """Every open of the checkout's real ``.accounts.env`` / ``.env`` seen this session."""
+    return tuple(_REPO_SECRET_OPENS)
+
+
+def network_violations() -> tuple[str, ...]:
+    """Every non-localhost socket operation refused this session."""
+    return tuple(_NETWORK_VIOLATIONS)
+
+
+def _repo_secret_path(raw_path: object) -> Path | None:
+    """The checkout's real secret file ``raw_path`` names, or ``None``.
+
+    The name is checked before the path is resolved: ``open`` is the hottest audit event in the
+    process and most calls are imports of ``.pyc`` files.
+    """
+    if isinstance(raw_path, int) or raw_path is None:
+        return None
+    try:
+        if isinstance(raw_path, bytes):
+            raw_path = os.fsdecode(raw_path)
+        candidate = Path(os.fspath(raw_path))
+    except (TypeError, ValueError):
+        return None
+    if candidate.name not in _SECRET_FILE_NAMES:
+        return None
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    return resolved if resolved in _REPO_SECRET_FILES else None
+
+
+def _is_local_host(host: object) -> bool:
+    """Whether ``host`` names this machine.
+
+    ``None`` is the wildcard lookup (a bind, or "any" address), never a remote name.
+    """
+    if host is None:
+        return True
+    if not isinstance(host, str):
+        return False
+    candidate = host.strip("[]").strip().lower()
+    if candidate in ("", "localhost", "0.0.0.0", "::"):
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        # A name that is not an IP literal stays unproven, and an unproven host is not local.
+        return False
+
+
+def _refuse_remote_host(host: object, action: str) -> None:
+    if _is_local_host(host):
+        return
+    _NETWORK_VIOLATIONS.append(f"{action} {host!r}")
+    raise SuiteHermeticityViolation(
+        f"the suite refused a {action} to {host!r}: tests must not reach the network. "
+        "Point them at a fixture, a stub transport or localhost."
+    )
+
+
+def _audit_hook(event: str, args: tuple) -> None:
+    """Record the two leaks that are invisible in a green run, and stop the network one.
+
+    Installed at import time of this file, which is before collection: that is what makes it cover
+    the import-time readers too (a module that discovers over HTTP while being imported is
+    collected, not run).
+    """
+    if event == "open":
+        secret = _repo_secret_path(args[0] if args else None)
+        if secret is not None:
+            _REPO_SECRET_OPENS.append(str(secret))
+            raise SuiteHermeticityViolation(
+                f"the suite refused to open the checkout's real {secret.name}: tests must not read"
+                " or write it. A test that needs credentials writes its own under tmp_path."
+            )
+        return
+    if event == "socket.connect":
+        address = args[1] if len(args) > 1 else None
+        if isinstance(address, (str, bytes)):
+            return  # AF_UNIX path: no network
+        host = address[0] if isinstance(address, (tuple, list)) and address else address
+        _refuse_remote_host(host, "connect")
+        return
+    if event == "socket.getaddrinfo":
+        _refuse_remote_host(args[0] if args else None, "name lookup")
+
+
+sys.addaudithook(_audit_hook)
+
+
+# ``DEFAULT_ACCOUNTS_ENV`` is the path of the checkout's real credential file, and it is a module
+# constant in six modules plus a name imported from them in two more. A copy in a test
+# (``from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV``) binds the value the module
+# held at import time, so every copy is pointed at the session sandbox here, before collection:
+# patching one module's attribute leaves the others reading the real file.
+_ACCOUNTS_ENV_DEFINERS: tuple[tuple[str, str], ...] = (
+    ("live_runner.credential_env", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.service_discovery", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.account_discovery", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.ctrader_adapter", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.daemon", "DEFAULT_ACCOUNTS_ENV"),
+    ("scripts.live_smoke", "DEFAULT_ACCOUNTS_ENV"),
+    ("scripts.verify_ctrader_order", "ACCOUNTS_ENV"),
+    ("live_runner.test_signal_trigger", "DEFAULT_ACCOUNTS_ENV"),
+)
+# These import the name from a module above, and the value they bind lands in function default
+# arguments, which are frozen at import time. They are therefore imported *after* the definers
+# have been patched: that is the only moment the frozen copy can be given the sandbox path.
+_ACCOUNTS_ENV_IMPORTERS: tuple[tuple[str, str], ...] = (
+    ("live_runner.preflight", "DEFAULT_ACCOUNTS_ENV"),
+    ("scripts.discover_discord_authors", "DEFAULT_ACCOUNTS_ENV"),
+)
+ACCOUNTS_ENV_MODULES = _ACCOUNTS_ENV_DEFINERS + _ACCOUNTS_ENV_IMPORTERS
+
+
+def _isolate_accounts_env() -> None:
+    for module_name, attribute in ACCOUNTS_ENV_MODULES:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, attribute):
+            raise AssertionError(
+                f"{module_name} no longer defines {attribute}; the accounts-env roster in "
+                "tests/conftest.py is stale and the real .accounts.env would be read again"
+            )
+        setattr(module, attribute, ISOLATED_ACCOUNTS_ENV)
+
+
+_isolate_accounts_env()
+
+
+# ``shared.constants`` and ``viewer.main`` load the checkout's real ``.env`` at import time, so
+# the load is redirected to the empty session file. Everything else keeps the real function.
+_real_load_dotenv = dotenv.load_dotenv
+
+
+def _redirected_load_dotenv(path=None, *args, **kwargs):
+    if _repo_secret_path(path) == REPO_ENV_FILE:
+        path = ISOLATED_DOTENV_FILE
+    return _real_load_dotenv(path, *args, **kwargs)
+
+
+dotenv.load_dotenv = _redirected_load_dotenv
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
@@ -52,42 +240,140 @@ def diff_snapshots(
     return changes
 
 
-_REPO_DATA_BEFORE: dict[str, tuple[int, int]] | None = None
+_REPO_TREES_BEFORE: dict[str, dict[str, tuple[int, int]]] = {}
 
 
 def pytest_configure(config: pytest.Config) -> None:
     # Controller only: xdist workers would each snapshot a tree the others are racing against.
     if hasattr(config, "workerinput"):
         return
-    global _REPO_DATA_BEFORE
-    _REPO_DATA_BEFORE = snapshot_tree(REPO_DATA_DIR)
+    global _REPO_TREES_BEFORE
+    _REPO_TREES_BEFORE = {str(root): snapshot_tree(root) for root in WATCHED_REPO_DIRS}
+
+
+def _fail_session(session: pytest.Session, message: str) -> None:
+    print(message, file=sys.stderr)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def _watched_repo_dirs_changed() -> list[str]:
+    assert _REPO_TREES_BEFORE, "pytest_configure never snapshotted the watched directories"
+    changes: list[str] = []
+    for root, before in _REPO_TREES_BEFORE.items():
+        for change in diff_snapshots(before, snapshot_tree(Path(root))):
+            changes.append(f"{root}: {change}")
+    return changes
+
+
+def _is_suite_module(module: object) -> bool:
+    """Whether ``module`` lives under this repo's ``tests/`` tree.
+
+    The suite's own modules legitimately hold the real path - they compare against it - so the
+    sweep skips them. It is a guard for *production* readers: the audit hook is what stops a test
+    from using the path.
+    """
+    source = getattr(module, "__file__", None)
+    if not source:
+        return False
+    try:
+        return Path(source).resolve().is_relative_to((PROJECT_ROOT / "tests").resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _accounts_env_readers() -> list[str]:
+    """Every imported module whose ``*ACCOUNTS_ENV*`` attribute is still the real file.
+
+    Swept at session end, when ``sys.modules`` holds everything the run imported: a *new* module
+    that resolves its own copy of the path is a leak the roster cannot know about, and it would
+    otherwise stay invisible until the file's owner noticed a fake account in discovery.
+    """
+    offenders: list[str] = []
+    for module_name, module in list(sys.modules.items()):
+        if module is None or _is_suite_module(module):
+            continue
+        try:
+            attributes = list(vars(module).items())
+        except Exception:  # pragma: no cover - a module without a usable __dict__
+            continue
+        for name, value in attributes:
+            if "ACCOUNTS_ENV" not in name or isinstance(value, (bool, int, float)):
+                continue
+            try:
+                candidate = Path(os.fspath(value))
+            except (TypeError, ValueError):
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved == REPO_ACCOUNTS_ENV:
+                offenders.append(f"{module_name}.{name}")
+    return offenders
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
-    """Fail the run loudly if the repo's real ``data/`` directory changed during the session.
+    """Fail the run loudly when the suite escaped its sandbox.
+
+    Three independent guards, because each one fails silently on its own:
+
+    * a watched repo directory (``data/``, then ``logs/``) changed;
+    * the checkout's real ``.accounts.env`` or ``.env`` was opened;
+    * a module still resolves an ``*ACCOUNTS_ENV*`` attribute to the real ``.accounts.env``.
 
     Limits, by design: the window is ``pytest_configure`` to here, so writes after the session
-    (atexit handlers, threads still running after the last test) are not seen. The check cannot
-    attribute a change to the suite: any process writing ``data/`` during the run (e.g. a live
-    viewer or daemon in the same checkout) fails it too. The remedy is to stop that process or run
-    the suite elsewhere.
+    (atexit handlers, threads still running after the last test) are not seen. The directory check
+    cannot attribute a change to the suite: any process writing ``data/`` during the run (e.g. a
+    live viewer or daemon in the same checkout) fails it too. The remedy is to stop that process or
+    run the suite elsewhere.
+
+    The directory check runs in the controller only - an xdist worker would snapshot a tree its
+    siblings are still writing. The other three run in every process, because a worker is a
+    separate process in which the tests really ran.
     """
-    if hasattr(session.config, "workerinput") or _REPO_DATA_BEFORE is None:
-        return
-    changes = diff_snapshots(_REPO_DATA_BEFORE, snapshot_tree(REPO_DATA_DIR))
-    if not changes:
-        return
-    shown = "\n  ".join(changes[:25])
-    more = f"\n  ... and {len(changes) - 25} more" if len(changes) > 25 else ""
-    print(
-        f"\n\nERROR: the repo data directory {REPO_DATA_DIR} changed during the test session:"
-        f"\n  {shown}{more}"
-        "\nTests must write under tmp_path / the session DATA_DIR only. This check cannot tell"
-        " which process made the change: if a running viewer or daemon in this checkout wrote it,"
-        " stop that process or run the suite from a separate checkout.",
-        file=sys.stderr,
-    )
-    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    if not hasattr(session.config, "workerinput"):
+        changes = _watched_repo_dirs_changed()
+        if changes:
+            shown = "\n  ".join(changes[:25])
+            more = f"\n  ... and {len(changes) - 25} more" if len(changes) > 25 else ""
+            _fail_session(
+                session,
+                "\n\nERROR: the repo directories the suite must leave alone changed during the test"
+                f" session:\n  {shown}{more}"
+            "\nTests must write under tmp_path / the session DATA_DIR / LOG_DIR only. This check"
+            " cannot tell which process made the change: if a running viewer or daemon in this"
+            " checkout wrote it, stop that process or run the suite from a separate checkout.",
+        )
+
+    secret_opens = repo_secret_opens()
+    if secret_opens:
+        shown = "\n  ".join(dict.fromkeys(secret_opens))
+        _fail_session(
+            session,
+            f"\n\nERROR: the test session opened the checkout's real credential file(s):\n  {shown}"
+            "\nconftest points every DEFAULT_ACCOUNTS_ENV at the session sandbox and redirects the"
+            " .env load. Something opened the file directly: a test that needs credentials must"
+            " write its own under tmp_path.",
+        )
+
+    readers = _accounts_env_readers()
+    if readers:
+        shown = "\n  ".join(dict.fromkeys(readers))
+        _fail_session(
+            session,
+            f"\n\nERROR: these modules still resolve the real {REPO_ACCOUNTS_ENV}:\n  {shown}"
+            "\nAdd them to ACCOUNTS_ENV_MODULES in tests/conftest.py, or stop building the path.",
+        )
+
+    network = network_violations()
+    if network:
+        shown = "\n  ".join(dict.fromkeys(network))
+        _fail_session(
+            session,
+            f"\n\nERROR: the test session attempted to reach the network:\n  {shown}"
+            "\nTests must run against a fixture, a stub transport or localhost. The offending call"
+            " also raised SuiteHermeticityViolation, which broad exception handlers can swallow.",
+        )
 
 
 def _requested_browser_name(item: pytest.Item) -> str:

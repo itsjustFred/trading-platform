@@ -24,6 +24,27 @@ from shared.logging import get_logger
 
 logger = get_logger("live-runner")
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
+# The override an operator (or the test suite) can export to name a different accounts env file
+# without editing code.
+ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
+
+
+def resolve_accounts_env_path(default: Path | str | None = None) -> Path:
+    """The accounts-env file to use when a caller names none.
+
+    Resolved at call time, NOT frozen as a default *argument*. ``def f(path=
+    DEFAULT_ACCOUNTS_ENV)`` binds the value when the module is imported: every later redirect of
+    ``DEFAULT_ACCOUNTS_ENV`` is invisible to that signature, and the call reads the original file
+    anyway. That is how the test suite came to read the checkout's real credential file from a
+    signature nobody touched. ``None`` means "the module default you already know".
+    """
+    override = os.environ.get(ACCOUNTS_ENV_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path(default if default is not None else DEFAULT_ACCOUNTS_ENV)
+
 TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
 

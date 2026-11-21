@@ -36,6 +36,7 @@ from live_runner.credential_env import (
     discord_bot_env_canonical_name,
     discord_bot_env_key,
     load_accounts_env_values,
+    resolve_accounts_env_path,
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
@@ -297,6 +298,18 @@ def _raw_bool_text(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _accounts_env_file(accounts_env: Path | str | None) -> Path:
+    """Resolve a named-or-default accounts env file at call time.
+
+    The three loops below used to freeze ``accounts_env: Path = DEFAULT_ACCOUNTS_ENV`` in their
+    signatures, which bound the path at import time and ignored every later redirect of the module
+    constant. Resolving here keeps the default honest, and lets TP_ACCOUNTS_ENV redirect it.
+    """
+    return resolve_accounts_env_path(
+        accounts_env if accounts_env is not None else DEFAULT_ACCOUNTS_ENV
+    )
 
 
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
@@ -3899,9 +3912,10 @@ async def sync_services_loop(
     active_discord_bot_tasks: dict[str, asyncio.Task[None]],
     scheduler: ServiceScheduler,
     *,
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
     interval_seconds: int = SERVICE_SYNC_INTERVAL_SECONDS,
 ) -> None:
+    accounts_env = _accounts_env_file(accounts_env)
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
@@ -5048,10 +5062,11 @@ async def sync_deployments_loop(
     active_tasks: dict[str, asyncio.Task[None]],
     active_discord_tasks: dict[str, asyncio.Task[None]],
     *,
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
     deployment_snapshot: list[LiveDeploymentConfig] | None = None,
 ) -> None:
+    accounts_env = _accounts_env_file(accounts_env)
     known_deployment_statuses: dict[str, str] = {}
     # Seeded from the database, not empty. Every restart used to re-run cancel
     # and flatten for deployments that were already stopped, because this set
@@ -5178,8 +5193,9 @@ async def sync_deployments_loop(
 
 async def run_daemon(
     *,
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
 ) -> None:
+    accounts_env = _accounts_env_file(accounts_env)
     logger.info(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},
