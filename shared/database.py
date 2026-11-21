@@ -2490,6 +2490,53 @@ def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
     )
 
 
+#: What :func:`_pause_live_deployment_for_conflict` reports about the halt.
+#: "PAUSED": this call wrote the pause. "already-halted": the deployment was already
+#: PAUSED or STOPPED, so no new halt was needed (a redelivered conflict).
+CONFLICT_HALT_PAUSED = "PAUSED"
+CONFLICT_HALT_ALREADY_HALTED = "already-halted"
+
+
+def _pause_live_deployment_for_conflict(session: Session, deployment_id: object) -> str:
+    """Halt the deployment named by a conflicted signal, in the caller's transaction.
+
+    The pause is *narrow* on purpose: only this deployment stops. Other deployments on
+    the same broker account keep trading, and their positions are untouched.
+
+    Writes through the caller's ``session`` rather than :func:`update_live_deployment_status`
+    so the halt and the conflict record that justifies it commit together; a second
+    session would take its own write lock inside the open transaction and deadlock.
+
+    Refuses (:data:`CONFLICT_HALT_ALREADY_HALTED`) when the row is already PAUSED - a
+    redelivered conflict re-halts nothing - and when it is STOPPED, which is a stronger
+    operator intent with its own cancel-and-flatten enforcement that this must never
+    downgrade. A deleted deployment is left deleted: the conflict record on the signal is
+    the evidence that survives.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    row = session.get(LiveDeploymentModel, normalized)
+    if row is None:
+        logger.warning(
+            "Broker order id conflict on a signal whose deployment no longer exists "
+            "(deployment_id=%s); the conflict stays recorded on the signal",
+            normalized,
+        )
+        return CONFLICT_HALT_ALREADY_HALTED
+    current_status = str(row.status or "").strip().upper()
+    if current_status in {"PAUSED", "STOPPED"}:
+        return CONFLICT_HALT_ALREADY_HALTED
+    row.status = "PAUSED"
+    # Same write the STOPPED -> PAUSED transition in `update_live_deployment_status`
+    # makes: leaving the enforcement stamp behind would let the row report a proven stop
+    # for a deployment that is only paused.
+    row.stopped_enforced_at = None
+    row.updated_at = _utcnow_naive()
+    session.add(row)
+    return CONFLICT_HALT_PAUSED
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2542,14 +2589,38 @@ def _reconcile_existing_live_signal(
         metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
         existing.metadata_json = metadata
         session.add(existing)
+    # Fail closed (#126): the halt and the conflict record share one transaction. A warning
+    # alone leaves the deployment trading while a broker order it does not track may hold
+    # a position, so the affected deployment is paused here and cannot place further
+    # entries. Committing the pause separately would leave a crash between the two commits
+    # with a persisted conflict on a still-ACTIVE deployment.
+    paused_now = _pause_live_deployment_for_conflict(session, existing.deployment_id)
     # Ends the write transaction opened above; a no-op commit when nothing changed.
     session.commit()
     logger.error(
-        "Conflicting broker_order_id for duplicate live signal: an untracked broker "
-        "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
+        "ALERT: conflicting broker_order_id for duplicate live signal: an untracked "
+        "broker order may exist and the deployment was halted. Resolve the conflict "
+        "with the broker before reactivating the deployment "
+        "(signal_id=%s, deployment_id=%s, tracked=%s, conflicting=%s, paused=%s)",
         existing.id,
+        existing.deployment_id,
         existing_broker_id,
         new_broker_id,
+        paused_now,
+        extra={
+            "data": {
+                "alert": "live_broker_order_id_conflict",
+                "signal_id": str(existing.id),
+                "deployment_id": str(existing.deployment_id),
+                "tracked_broker_order_id": existing_broker_id,
+                "conflicting_broker_order_id": new_broker_id,
+                "conflicting_broker_order_ids": list(conflicts),
+                # What this call did to the halt: "PAUSED" when it wrote the pause, and
+                # "already-halted" when the deployment was already PAUSED/STOPPED, so a
+                # redelivery is not reported as a fresh halt.
+                "deployment_halt": paused_now,
+            }
+        },
     )
 
 
@@ -3548,6 +3619,20 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
             }
         )
     return conflicts
+
+
+def deployments_with_broker_order_conflicts(limit: int = 200) -> dict[str, list[dict[str, Any]]]:
+    """Unresolved broker order id conflicts, grouped by deployment id.
+
+    The read behind the halt: the daemon re-pauses every deployment that still carries
+    an unresolved conflict (:func:`live_runner.daemon.enforce_broker_order_conflicts`) and
+    the viewer reports them to operators. One query for the whole fleet, so neither side
+    scans signals per deployment.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for conflict in list_live_signal_broker_order_conflicts(limit=limit):
+        grouped.setdefault(str(conflict["deployment_id"]), []).append(conflict)
+    return grouped
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
