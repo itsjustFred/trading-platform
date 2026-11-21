@@ -145,6 +145,16 @@ env:
   SKILL_PATH: .agents/skills/actions-pre-mortem/SKILL.md
   PREMORTEM_CONTEXT: agent/pre-mortem
 
+# The default token scopes, narrowed once for the whole workflow. A job with its own
+# `permissions:` block replaces this one (it does not add to it), so this is only the default for
+# a job that declares none - and without it every job runs on the repository's default scopes,
+# which are whatever Actions is set to grant and not what this workflow needs. No job here needs
+# more than reading the repository: the agent job reads the checkout, resolve reads the PR and
+# writes one status, post writes one comment and one status, the cancellation reporter writes one
+# status, and each of those three declares exactly the scope it uses.
+permissions:
+  contents: read
+
 jobs:
   # Resolves the PR and writes its metadata (title and body via jq, never via
   # ${{ }} interpolation into a shell script). On pull_request the event payload

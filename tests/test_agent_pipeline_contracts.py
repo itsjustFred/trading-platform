@@ -532,11 +532,42 @@ def test_no_agent_workflow_starts_another_workflow() -> None:
         bodies = _all_run_bodies(data)
         for call in ("gh workflow run", "createWorkflowDispatch", "/dispatches"):
             assert call not in bodies, f"{name}: starts another workflow with {call!r}"
+        # The workflow-level block first: a job-level `permissions:` replaces it, so iterating
+        # the jobs and never reading the workflow's own block left a scope nothing here looks
+        # at - and a workflow with no block runs on the repository's default token scopes, which
+        # are whatever Actions is configured to grant, not what this workflow needs.
+        workflow_permissions = data.get("permissions") or {}
+        assert workflow_permissions.get("actions") != "write", (
+            f"{name}: holds workflow-level actions: write, which only bought a dispatch"
+        )
         for job_name, job in data["jobs"].items():
             permissions = job.get("permissions") or {}
             assert permissions.get("actions") != "write", (
                 f"{name}/{job_name}: holds actions: write, which only bought a dispatch"
             )
+
+
+def test_the_pre_mortem_narrows_the_default_token_scopes() -> None:
+    """A workflow with no workflow-level `permissions` block runs on the repository's default
+    token scopes - whatever Actions is configured to grant, which is write-everything for as long
+    as it is - so a job added later without its own block would inherit them. The pre-mortem's
+    jobs are the four it has: the agent job reads, the resolve job reads the PR and writes a
+    status, the post job writes a comment and a status, the cancellation reporter writes a status.
+    None of them needs more than reading the repository, so the workflow says that once, and the
+    jobs that write declare it themselves - a per-job block *replaces* the workflow's, so the
+    narrow default cannot widen anything."""
+    data = _load(PREMORTEM)
+    permissions = data.get("permissions")
+    assert isinstance(permissions, dict), "no workflow-level permissions block"
+    assert set(permissions) <= {"contents", "pull-requests", "statuses"}, (
+        f"the workflow-level token scopes are broader than the jobs it runs: {sorted(permissions)}"
+    )
+    assert not [scope for scope, value in permissions.items() if value == "write"], (
+        f"the workflow-level default writes: {permissions}"
+    )
+    assert permissions.get("contents") == "read", (
+        f"the agent job's checkout needs contents: read by default: {permissions}"
+    )
 
 
 def test_the_pre_mortem_adds_ready_for_review_and_a_manual_rerun() -> None:
