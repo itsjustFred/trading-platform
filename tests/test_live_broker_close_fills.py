@@ -192,7 +192,7 @@ def _close_fill_kwargs(
         actual_price=95.0,
         actual_price_observed="observed",
         commission=0.0,
-        timestamp=timestamp if timestamp is not None else T1,
+        timestamp=timestamp,
         broker_order_id=broker_order_id,
         dedupe_key=dedupe_key,
         close_side=close_side,
@@ -389,7 +389,10 @@ def test_a_close_dedupe_key_owned_by_another_signal_is_never_stolen(database, ca
 
     assert persisted == pytest.approx(0.0)
     assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
-    assert _ledger(database, DEP_OTHER) == pytest.approx(10.0)
+    # The other deployment's own fills are untouched: its entry 10 plus the row that owns the key.
+    assert _ledger(database, DEP_OTHER) == pytest.approx(11.0)
+    close_signal_id = database.broker_close_signal_id(parent)
+    assert [row for row in _executions(database) if row[0] == close_signal_id] == []
     assert any(
         "Dedupe key collision across signals" in record.getMessage() for record in caplog.records
     )

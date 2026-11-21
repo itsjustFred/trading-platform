@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import (
     JSON,
@@ -3140,6 +3140,249 @@ def get_live_signal_filled_qty(signal_id: str) -> float:
             )
         ).one()
     return float(filled_qty or 0.0)
+
+
+# ─── broker-side closes (#144) ────────────────────────────────────────────────────────────────────
+
+#: Metadata key marking a signal this platform created to carry a broker-side close (#144): a
+#: bracket's stop/target leg fill, or a broker-side SL/TP close. It belongs to the same
+#: deployment as the signal whose position it closed, so the deployment's ledger nets it, but it
+#: is neither an entry nor an exit order of ours - nothing dispatches it to a broker.
+BROKER_SIDE_CLOSE_KEY = "broker_side_close"
+#: Metadata key: which kind of broker-side close the signal carries (see the callers).
+BROKER_CLOSE_REASON_KEY = "broker_close_reason"
+#: Metadata key: the signal whose position the close reduced.
+BROKER_CLOSE_PARENT_SIGNAL_KEY = "parent_signal_id"
+
+#: `source` of a broker-close signal. Deliberately neither `internal` nor `discord*`: the replay
+#: path only replays those two, and a close that already happened at the broker must never be
+#: re-submitted as a new order.
+BROKER_CLOSE_SIGNAL_SOURCE = "broker_close"
+
+#: Namespace for the deterministic ids of broker-close signals.
+_BROKER_CLOSE_NAMESPACE = uuid5(NAMESPACE_URL, "trading-platform/live/broker-side-close")
+
+#: Close reasons an adapter passes to :func:`record_live_broker_side_close_fill`.
+BROKER_CLOSE_REASON_ALPACA_STOP_LEG = "alpaca_bracket_stop"
+BROKER_CLOSE_REASON_ALPACA_TARGET_LEG = "alpaca_bracket_target"
+BROKER_CLOSE_REASON_ALPACA_LEG = "alpaca_bracket_leg"
+
+
+def broker_close_signal_id(parent_signal_id: str) -> str:
+    """The stable id of the close signal carrying one parent signal's broker-side closes (#144).
+
+    Keyed on the parent signal alone, never on the close reason: every close of one entry - a
+    stop leg, a target leg, a broker-side SL/TP deal - reduces the same quantity, so they must
+    share one close signal or the same fill would be counted once per reason. The reason stays
+    an audit field in the signal's metadata.
+    """
+    return str(uuid5(_BROKER_CLOSE_NAMESPACE, str(parent_signal_id or "")))
+
+
+def get_live_signal_filled_qty_for_broker_order(signal_id: str, broker_order_id: str) -> float:
+    """The quantity already recorded for one signal and one broker order (a leg's own id).
+
+    A reconciliation pass reads the leg's broker-side cumulative, which covers every partial fill
+    of that leg, so only the slice still missing may be persisted. Summing per (signal, broker
+    order) keeps a sibling leg's fills out of that arithmetic (#144).
+    """
+    normalized_signal_id = str(signal_id or "").strip()
+    normalized_order_id = str(broker_order_id or "").strip()
+    if not normalized_signal_id or not normalized_order_id:
+        return 0.0
+    init_db()
+    with get_session() as session:
+        filled_qty = session.exec(
+            select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                LiveExecutionModel.signal_id == normalized_signal_id
+            )
+            .where(LiveExecutionModel.broker_order_id == normalized_order_id)
+        ).one()
+    return float(filled_qty or 0.0)
+
+
+def record_live_broker_side_close_fill(
+    *,
+    parent_signal_id: str,
+    close_reason: str,
+    filled_qty: float,
+    actual_price: float,
+    actual_price_observed: str | None,
+    commission: float | None,
+    timestamp: datetime,
+    broker_order_id: str,
+    dedupe_key: str,
+    broker_fill_id: int | None = None,
+    close_side: str | None = None,
+) -> float:
+    """Record a broker-side close against the parent signal's deployment ledger (#144).
+
+    Alpaca bracket stop/target legs and cTrader position SL/TP closes are orders the platform
+    never submitted, so their fills arrive with no signal of ours to attribute them to. Left
+    unrecorded they shrink the broker position while every ledger still counts the shares, and
+    #142's guard then reports a mismatch on every later exit for that account and symbol: the
+    exit is capped at the broker position, which on a netted account can be another deployment's
+    share.
+
+    The close is carried by a signal of the parent's own deployment whose action is the
+    *reducing* side (a sell for a buy entry), so the deployment's signed net filled quantity
+    falls by exactly what the broker closed - the same ledger every exit is sized against, whose
+    signs come from the parent signal's action. The signal id is derived from the parent signal
+    alone, so a redelivered fill, a reconnect and a second partial fill of the same leg all reuse
+    one close signal; only the fills differ, and they go through the same single locked insert
+    path as every other fill (:func:`save_live_execution`) with the caller's broker-native
+    dedupe key, so a redelivery is a skip rather than a second row.
+
+    Returns the quantity newly persisted, ``0.0`` when nothing was written (a duplicate, a
+    non-positive quantity, or a refusal below). Refusals never write and are logged: they are
+    broker facts this function cannot honestly attribute, and an invented attribution is the
+    failure mode it exists to prevent.
+
+    Refuses - returning ``0.0`` - when the parent signal is unknown, its action is neither
+    ``buy`` nor ``sell``, ``close_side`` contradicts the reducing side the parent's action
+    implies (a fill that would *extend* the position must never be recorded as a close), the
+    quantity is not finite and positive, or the caller supplied no timestamp.
+    """
+    normalized_parent = str(parent_signal_id or "").strip()
+    normalized_reason = str(close_reason or "").strip()
+    if not normalized_parent or not normalized_reason:
+        logger.warning(
+            "Broker-side close fill carries no parent signal or no close reason; "
+            "refusing to attribute it",
+            extra={
+                "data": {
+                    "parent_signal_id": str(parent_signal_id or ""),
+                    "close_reason": str(close_reason or ""),
+                    "broker_order_id": str(broker_order_id or ""),
+                }
+            },
+        )
+        return 0.0
+    quantity = float(filled_qty or 0.0)
+    if not math.isfinite(quantity) or quantity <= 0.0:
+        # SQLite stores NaN as NULL, so a non-finite quantity can only fail or corrupt the sum.
+        logger.warning(
+            "Refusing to record a broker-side close fill with a non-positive or non-finite "
+            "quantity (parent_signal_id=%s, close_reason=%s, filled_qty=%r)",
+            normalized_parent,
+            normalized_reason,
+            filled_qty,
+        )
+        return 0.0
+    stamp = timestamp if isinstance(timestamp, datetime) else None
+    if stamp is None:
+        logger.warning(
+            "Refusing to record a broker-side close fill without a timestamp: the execution "
+            "ledger is ordered by it and a fabricated time could not be corrected later "
+            "(parent_signal_id=%s, close_reason=%s)",
+            normalized_parent,
+            normalized_reason,
+        )
+        return 0.0
+    if stamp.tzinfo is None or stamp.tzinfo.utcoffset(stamp) is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            parent = session.get(LiveSignalModel, normalized_parent)
+            if parent is None:
+                session.rollback()
+                logger.warning(
+                    "Broker-side close fill names no persisted parent signal; refusing to "
+                    "attribute it (parent_signal_id=%s, close_reason=%s, broker_order_id=%s)",
+                    normalized_parent,
+                    normalized_reason,
+                    str(broker_order_id or ""),
+                )
+                return 0.0
+            parent_action = str(parent.action or "").strip().lower()
+            if parent_action not in {"buy", "sell"}:
+                session.rollback()
+                logger.warning(
+                    "Refusing to record a broker-side close for a parent signal whose action "
+                    "has no position sign (parent_signal_id=%s, action=%r, close_reason=%s)",
+                    normalized_parent,
+                    parent.action,
+                    normalized_reason,
+                )
+                return 0.0
+            reducing_side = "sell" if parent_action == "buy" else "buy"
+            requested_side = str(close_side or "").strip().lower()
+            if requested_side and requested_side != reducing_side:
+                session.rollback()
+                logger.warning(
+                    "Refusing to record a broker-side close on the extending side: the parent "
+                    "signal is a %s, so only a %s reduces it (parent_signal_id=%s, "
+                    "close_reason=%s, side=%r)",
+                    parent_action,
+                    reducing_side,
+                    normalized_parent,
+                    normalized_reason,
+                    close_side,
+                )
+                return 0.0
+
+            close_signal_id = broker_close_signal_id(normalized_parent)
+            close_signal = session.get(LiveSignalModel, close_signal_id)
+            if close_signal is None:
+                close_signal = LiveSignalModel(
+                    id=close_signal_id,
+                    deployment_id=str(parent.deployment_id),
+                    # The parent's symbol, upper-cased the way the ledger and the exit sizing
+                    # compare it (`func.upper(...) == symbol.upper()`).
+                    symbol=str(parent.symbol or "").upper(),
+                    action=reducing_side,
+                    # No price of ours belongs to a close the broker made: the fill's own price
+                    # is recorded on the execution, which is what PnL reads.
+                    theoretical_price=0.0,
+                    timestamp=stamp,
+                    source=BROKER_CLOSE_SIGNAL_SOURCE,
+                    broker_order_id="",
+                    discord_message_id=None,
+                    idempotency_key=None,
+                    metadata_json={
+                        BROKER_SIDE_CLOSE_KEY: True,
+                        BROKER_CLOSE_REASON_KEY: normalized_reason,
+                        BROKER_CLOSE_PARENT_SIGNAL_KEY: normalized_parent,
+                    },
+                )
+                session.add(close_signal)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # A concurrent close of the same parent: the row is there, which is all this
+                    # path needs (no broker order is ever dispatched for it).
+                    session.rollback()
+                    close_signal = session.get(LiveSignalModel, close_signal_id)
+                    if close_signal is None:
+                        raise
+
+            execution = LiveExecution(
+                signal_id=UUID(close_signal_id),
+                actual_price=float(actual_price or 0.0),
+                actual_price_observed=actual_price_observed,
+                filled_qty=quantity,
+                commission=commission,
+                timestamp=stamp,
+                broker_order_id=str(broker_order_id or ""),
+                broker_fill_id=broker_fill_id,
+                dedupe_key=dedupe_key,
+            )
+            record = LiveExecutionModel.from_live_execution(execution)
+            if not record.dedupe_key:
+                # A caller that supplied no key still gets the auto-derived one (C1/#127)
+                # rather than a NULL that bypasses the unique index.
+                record.dedupe_key = _auto_execution_dedupe_key(execution)
+            if not _insert_live_execution_locked(session, record):
+                session.rollback()
+                return 0.0
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    return quantity
 
 
 def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
