@@ -1,0 +1,374 @@
+"""Tests for shared/alerts.py: the ops alert sink and its logging handler.
+
+The backend is always a fake here; no test touches the network or a real
+webhook. The sink's guarantees under test: never blocks, never raises,
+rate-limits, deduplicates, drops-and-counts on overflow.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Mapping
+from typing import Any
+
+import pytest
+
+from shared import alerts
+from shared.alerts import (
+    AlertLogHandler,
+    AlertSink,
+    DiscordWebhookBackend,
+    create_sink_from_env,
+    format_alert_text,
+    install_alert_sink,
+)
+
+
+class FakeBackend:
+    """Collects alerts; can be gated to simulate a slow/hung webhook."""
+
+    def __init__(self, *, gate: threading.Event | None = None) -> None:
+        self.sent: list[dict[str, Any]] = []
+        self.gate = gate
+        self._lock = threading.Lock()
+
+    def send(self, alert: Mapping[str, Any]) -> None:
+        if self.gate is not None:
+            assert self.gate.wait(timeout=10)
+        with self._lock:
+            self.sent.append(dict(alert))
+
+    def wait_for(self, count: int, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if len(self.sent) >= count:
+                return
+            time.sleep(0.01)
+        raise AssertionError(f"expected {count} alerts, got {len(self.sent)}")
+
+
+def _sink(backend: FakeBackend, **kwargs: Any) -> AlertSink:
+    kwargs.setdefault("dedup_seconds", 0.0)
+    return AlertSink(backend, **kwargs)
+
+
+def _wait_stats(sink: AlertSink, predicate, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        stats = sink.stats()
+        if predicate(stats):
+            return stats
+        time.sleep(0.01)
+    raise AssertionError(f"stats never satisfied predicate: {sink.stats()}")
+
+
+@pytest.fixture(autouse=True)
+def _clean_alert_state():
+    alerts._reset_for_tests()
+    yield
+    alerts._reset_for_tests()
+
+
+class TestSinkDelivery:
+    def test_submit_delivers_payload_to_backend(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        try:
+            sink.submit({"message": "boom", "level": "ERROR"}, dedup_key="k1")
+            backend.wait_for(1)
+            assert backend.sent[0]["message"] == "boom"
+            assert sink.stats()["sent"] == 1
+        finally:
+            sink.close()
+
+    def test_backend_failure_is_counted_not_raised(self):
+        class Exploding:
+            def send(self, alert):
+                raise RuntimeError("webhook down")
+
+        sink = _sink(Exploding())
+        try:
+            sink.submit({"message": "x"}, dedup_key="k")
+            stats = _wait_stats(sink, lambda s: s["failed"] == 1)
+            assert stats["sent"] == 0
+        finally:
+            sink.close()
+
+    def test_dedup_suppresses_same_key_within_window(self):
+        backend = FakeBackend()
+        sink = AlertSink(backend, dedup_seconds=60.0)
+        try:
+            for _ in range(5):
+                sink.submit({"message": "same"}, dedup_key="dup")
+            stats = _wait_stats(sink, lambda s: s["sent"] + s["suppressed"] == 5)
+            assert stats["sent"] == 1
+            assert stats["suppressed"] == 4
+        finally:
+            sink.close()
+
+    def test_different_keys_are_not_deduplicated(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        try:
+            sink.submit({"message": "a"}, dedup_key="k1")
+            sink.submit({"message": "b"}, dedup_key="k2")
+            backend.wait_for(2)
+        finally:
+            sink.close()
+
+    def test_rate_limit_drops_and_counts_overflow(self):
+        backend = FakeBackend()
+        sink = AlertSink(backend, max_per_minute=2, dedup_seconds=0.0)
+        try:
+            for i in range(6):
+                sink.submit({"message": f"m{i}"}, dedup_key=f"k{i}")
+            stats = _wait_stats(sink, lambda s: s["sent"] + s["dropped"] == 6)
+            assert stats["sent"] == 2
+            assert stats["dropped"] == 4
+        finally:
+            sink.close()
+
+    def test_full_queue_drops_without_blocking_or_raising(self):
+        gate = threading.Event()
+        backend = FakeBackend(gate=gate)
+        sink = AlertSink(backend, queue_size=4, dedup_seconds=0.0)
+        try:
+            # Worker takes at most one item while gated; 10 submits against a
+            # 4-slot queue must drop the excess without blocking the caller.
+            for i in range(10):
+                sink.submit({"message": f"m{i}"}, dedup_key=f"k{i}")
+            stats = sink.stats()
+            assert stats["dropped"] > 0
+            assert stats["queued"] <= 4
+        finally:
+            gate.set()
+            sink.close()
+
+    def test_dropped_count_is_folded_into_next_alert(self):
+        backend = FakeBackend()
+        sink = AlertSink(backend, max_per_minute=1, dedup_seconds=0.0, rate_window_seconds=0.2)
+        try:
+            sink.submit({"message": "first"}, dedup_key="a")
+            sink.submit({"message": "dropped1"}, dedup_key="b")
+            sink.submit({"message": "dropped2"}, dedup_key="c")
+            backend.wait_for(1)
+            stats = _wait_stats(sink, lambda s: s["sent"] + s["dropped"] == 3)
+            assert stats["sent"] == 1
+            assert stats["dropped"] == 2
+            # After the rate window slides, the next alert reports the drops.
+            time.sleep(0.3)
+            sink.submit({"message": "after window"}, dedup_key="d")
+            backend.wait_for(2)
+            assert backend.sent[1].get("dropped") == 2
+        finally:
+            sink.close()
+
+
+class TestLogHandler:
+    def _logger(self, name: str) -> logging.Logger:
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        return logger
+
+    def test_error_record_reaches_sink(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-error")
+        logger.addHandler(handler)
+        try:
+            logger.error("broker exploded", extra={"data": {"symbol": "EURUSD"}})
+            backend.wait_for(1)
+            alert = backend.sent[0]
+            assert alert["level"] == "ERROR"
+            assert alert["message"] == "broker exploded"
+            assert alert["data"]["symbol"] == "EURUSD"
+        finally:
+            sink.close()
+
+    def test_info_record_is_not_alerted(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-info")
+        logger.addHandler(handler)
+        try:
+            logger.info("routine heartbeat")
+            logger.warning("still routine")
+            time.sleep(0.2)
+            assert backend.sent == []
+        finally:
+            sink.close()
+
+    def test_alert_marker_routes_below_error(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-marker")
+        logger.addHandler(handler)
+        try:
+            logger.warning(
+                "operator note",
+                extra={"data": {"alert": "custom_marker", "k": 1}},
+            )
+            backend.wait_for(1)
+            assert backend.sent[0]["alert"] == "custom_marker"
+        finally:
+            sink.close()
+
+    def test_dedup_key_uses_template_not_formatted_message(self):
+        """Same failure with different args must dedup, not page per occurrence."""
+        backend = FakeBackend()
+        sink = AlertSink(backend, dedup_seconds=60.0)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-templ")
+        logger.addHandler(handler)
+        try:
+            for i in range(4):
+                logger.error("fill rejected for id=%s", i)
+            stats = _wait_stats(sink, lambda s: s["sent"] + s["suppressed"] == 4)
+            assert stats["sent"] == 1
+            assert stats["suppressed"] == 3
+        finally:
+            sink.close()
+
+    def test_sensitive_data_is_redacted_before_send(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-redact")
+        logger.addHandler(handler)
+        try:
+            logger.error(
+                "auth failed for token=abc123secret",
+                extra={"data": {"api_key": "sk-live-123", "symbol": "XAUUSD"}},
+            )
+            backend.wait_for(1)
+            alert = backend.sent[0]
+            assert "abc123secret" not in alert["message"]
+            assert alert["data"]["api_key"] == "[Filtered]"
+            assert alert["data"]["symbol"] == "XAUUSD"
+        finally:
+            sink.close()
+
+    def test_emit_never_raises_on_broken_record(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink)
+        record = logging.LogRecord(
+            "trading.test-alerts-broken",
+            logging.ERROR,
+            __file__,
+            1,
+            "msg %s",
+            ("arg",),
+            None,
+        )
+        record.data = {"bad": object()}  # not a Mapping value json can fail on -> still fine
+        handler.emit(record)  # must not raise
+        sink.close()
+
+
+class TestInstall:
+    def test_disabled_without_webhook_env(self):
+        assert create_sink_from_env(env={}) is None
+        assert install_alert_sink(env={}) is None
+
+    def test_enabled_with_webhook_env_uses_discord_backend(self, monkeypatch):
+        sent = []
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+        monkeypatch.setattr(
+            "requests.post",
+            lambda url, json=None, timeout=None: (
+                sent.append({"url": url, "json": json}) or FakeResponse()
+            ),
+        )
+        sink = create_sink_from_env(env={"OPS_ALERT_WEBHOOK_URL": "https://discord.example/hook"})
+        assert sink is not None
+        try:
+            sink.submit({"message": "hi", "level": "ERROR"}, dedup_key="k")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not sent:
+                time.sleep(0.01)
+            assert sent and sent[0]["url"] == "https://discord.example/hook"
+            assert "hi" in sent[0]["json"]["content"]
+        finally:
+            sink.close()
+
+    def test_install_attaches_handler_to_existing_and_new_loggers(self):
+        backend = FakeBackend()
+        # A logger that already exists when install runs is picked up by the
+        # loggerDict scan inside install_alert_sink.
+        pre = logging.getLogger("trading.test-alerts-preinstall")
+        pre.setLevel(logging.DEBUG)
+        pre.propagate = False
+        sink = install_alert_sink(sink=_sink(backend))
+        assert sink is not None
+        assert any(isinstance(h, AlertLogHandler) for h in pre.handlers)
+        try:
+            # A service logger created after install gets the handler through
+            # the get_logger hook.
+            from shared.logging import get_logger
+
+            post = get_logger("test-alerts-postinstall")
+            post.error("post-install failure")
+            backend.wait_for(1)
+            assert backend.sent[0]["message"] == "post-install failure"
+        finally:
+            alerts._reset_for_tests()
+
+    def test_install_is_idempotent(self):
+        backend = FakeBackend()
+        first = install_alert_sink(sink=_sink(backend))
+        second = install_alert_sink(sink=_sink(FakeBackend()))
+        assert first is second
+
+
+class TestFormatting:
+    def test_format_includes_level_service_location_and_data(self):
+        text = format_alert_text(
+            {
+                "level": "ERROR",
+                "service": "trading.live-runner",
+                "location": "daemon:run:10",
+                "message": "boom",
+                "data": {"symbol": "EURUSD"},
+            }
+        )
+        assert "[ERROR] trading.live-runner daemon:run:10" in text
+        assert "boom" in text
+        assert "EURUSD" in text
+
+    def test_format_truncates_to_discord_limit(self):
+        text = format_alert_text({"message": "x" * 5000})
+        assert len(text) <= alerts.MAX_MESSAGE_CHARS
+
+    def test_discord_backend_payload_shape(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+        def fake_post(url, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        monkeypatch.setattr("requests.post", fake_post)
+        backend = DiscordWebhookBackend("https://discord.example/hook")
+        backend.send({"message": "alert body", "level": "ERROR"})
+        assert captured["url"] == "https://discord.example/hook"
+        assert captured["json"] == {
+            "content": format_alert_text({"message": "alert body", "level": "ERROR"})
+        }
+        assert captured["timeout"] == alerts.DEFAULT_BACKEND_TIMEOUT_SECONDS

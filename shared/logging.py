@@ -275,6 +275,15 @@ def get_logger(service: str) -> logging.Logger:
     stream_handler._trading_console = True  # type: ignore[attr-defined]
     logger.addHandler(stream_handler)
 
+    # Ops alert sink (shared/alerts.py): installed per-process by the entry
+    # point that wants alerting (today only the live daemon). Lazy import keeps
+    # this module free of an alerts -> logging -> alerts cycle.
+    from shared.alerts import get_alert_handler
+
+    alert_handler = get_alert_handler()
+    if alert_handler is not None and alert_handler not in logger.handlers:
+        logger.addHandler(alert_handler)
+
     _loggers[service] = logger
     return logger
 

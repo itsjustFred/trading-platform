@@ -90,6 +90,7 @@ from risk.live import (
 )
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
+from shared.alerts import install_alert_sink
 from shared.constants import normalize_timeframe
 from shared.database import (
     LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
@@ -132,6 +133,11 @@ from shared.trailing import (
 from signal_bots.registry import get_signal_processor
 
 initialize_sentry("live-runner")
+# Ops alert channel (#304): ERROR records and explicit `alert=` records are
+# pushed to OPS_ALERT_WEBHOOK_URL when configured; unset disables it and the
+# daemon behaves exactly as before. Fire-and-forget: it cannot block or raise
+# into the trading paths.
+install_alert_sink()
 logger = get_logger("live-runner")
 
 _ACCOUNT_NOT_AUTHORIZED_LOG = "Account %s not authorized for token, skipping"
