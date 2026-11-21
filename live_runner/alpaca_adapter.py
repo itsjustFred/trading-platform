@@ -2407,8 +2407,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         stop needs - is read back from the broker, because the leg that fills on
         its way out is exactly the case this sweep has to survive.
         """
-        orders = await self._list_working_book(client, symbols={symbol})
-        on_symbol = [order for order in orders if _order_symbol(order) == symbol]
+        on_symbol = await self._working_book_on_symbol(client, symbol)
         stop_price = self._best_stop_price(on_symbol, symbol)
 
         cancelled_any = False
@@ -2446,7 +2445,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # held legs included: a stop leg the broker kept listing is exactly what
         # must stop this flatten from closing a position it did not dis-arm.
         try:
-            remaining_orders = await self._list_working_book(client, symbols={symbol})
+            remaining_orders = await self._working_book_on_symbol(client, symbol)
         except Exception as exc:
             return await self._abandon_flatten(
                 client,
@@ -2458,7 +2457,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         still_working = [
             _control_order_id(_order_attr(order, "id"))
             for order in remaining_orders
-            if _order_symbol(order) == symbol
         ]
         if still_working:
             return await self._abandon_flatten(
@@ -2806,6 +2804,33 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         orders = await self._list_open_orders(client)
         legs = await self._list_resting_legs(client, symbols=symbols)
         return self._merge_held_legs(orders, legs)
+
+    async def _working_book_on_symbol(self, client: Any, symbol: str) -> list[Any]:
+        """The working book filtered to *symbol*, held legs placed by their parent.
+
+        A held leg can arrive without a symbol of its own, and the parent it rests
+        under is what names the symbol, exactly as the orphan sweep resolves it:
+        filtered by the leg's own symbol such a leg reads as "another symbol",
+        survives the cancel, its stop goes on reserving the position's quantity,
+        and the close is then refused for that reservation - a flatten that cannot
+        finish. The leg lookup is scoped to *symbol* already, so a leg without a
+        symbol of its own belongs to this flatten; one whose parent names another
+        symbol is still left out.
+        """
+        open_orders = await self._list_open_orders(client)
+        legs = await self._list_resting_legs(client, symbols={symbol})
+        orders = self._merge_held_legs(open_orders, legs)
+        leg_symbols = {
+            leg_id: _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+            if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
+        }
+        on_symbol = []
+        for order in orders:
+            order_id = _control_order_id(_order_attr(order, "id"))
+            if (_order_symbol(order) or leg_symbols.get(order_id or "", "")) == symbol:
+                on_symbol.append(order)
+        return on_symbol
 
     @staticmethod
     def _merge_held_legs(

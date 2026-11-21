@@ -1062,6 +1062,29 @@ def test_a_held_leg_left_working_is_reported_as_still_working() -> None:
     assert client.submitted == []
 
 
+def test_a_symbol_less_leg_left_working_is_reported_as_still_working() -> None:
+    """The re-read places the leg the same way the cancel list did.
+
+    A pending_cancel leg that carries no symbol of its own is still on this
+    position, still reserving its quantity. A re-read that filtered it out by the
+    leg's own symbol would go on to close a position it did not disarm - and be
+    refused by the broker for the quantity the leg reserves, after the position's
+    own stop had already been cancelled.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)], cancel_settles=False
+    )
+    client.parent.legs[1].symbol = ""
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    (problem,) = outcome.failed
+    assert problem.startswith("AAPL:orders-still-working:")
+    assert "sl-leg" in problem
+    assert client.close_calls == []
+
+
 def test_a_refused_cancel_is_not_excused_for_an_order_that_filled() -> None:
     """The excusal is for an order that left *without* executing.
 
@@ -1257,6 +1280,29 @@ def test_a_refused_cancel_is_not_excused_when_the_broker_cannot_answer_by_id() -
     assert outcome.complete is False
     assert outcome.failed == ("AAPL:cancel:entry-1:cancel rejected",)
     assert client.close_calls == []
+
+
+def test_the_flatten_resolves_a_held_leg_symbol_from_its_parent() -> None:
+    """A leg that carries no symbol is still this symbol's order to cancel.
+
+    The flatten filters the working book by the order's own symbol, and a held
+    stop leg can arrive without one. Read as "another symbol" it survives the
+    cancel, its stop goes on reserving the position's quantity, and the close is
+    refused for that reservation - a flatten that cannot finish. The parent the
+    leg rests under names the symbol, exactly as the orphan sweep resolves it.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)], oco_siblings=False
+    )
+    # The broker reports the held stop leg without a symbol of its own.
+    client.parent.legs[1].symbol = ""
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert outcome.failed == ()
+    assert client.cancelled == ["tp-leg", "sl-leg"]
+    assert client.close_calls == ["AAPL"]
 
 
 def test_flatten_refuses_a_full_held_leg_page() -> None:
