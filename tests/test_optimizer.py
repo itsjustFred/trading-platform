@@ -309,12 +309,14 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    # #86: dense TRAIN and VALIDATION coverage (01-01..01-07 daily) so their
-    # gates pass and the TEST gate (01-09..01-10, empty) is the one that fails.
+    # #86: dense TRAIN and VALIDATION coverage so their gates pass and the
+    # TEST gate is the one that fails. #133: weekend-dated stamps are surplus
+    # under the venue calendar, so validation's Jan-08 boundary bar must be a
+    # real weekday stamp.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
-        [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)],
+        [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 9)],
     )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
@@ -406,7 +408,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
         [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 11)],
     )
     _write_ohlcv_bars(
-        data_dir, "MSFT", [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)]
+        data_dir, "MSFT", [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 9)]
     )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)

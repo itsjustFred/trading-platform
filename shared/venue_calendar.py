@@ -24,6 +24,7 @@ import datetime as dt
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -154,24 +155,34 @@ class VenueCalendar:
     def _expected_daily_bars(
         self, start: pd.Timestamp, end: pd.Timestamp, step_minutes: float
     ) -> int:
-        # Count grid instants (daily cadence anchored at `start`, as before)
-        # whose UTC date has any trading time.  This keeps the stamped-date
-        # convention: a daily bar is labelled by the date it summarises.
-        step = pd.Timedelta(minutes=step_minutes)
-        instant = start
-        count = 0
-        trading_dates: set[pd.Timestamp] = set()
+        # Daily+ bars are labelled by trading date, not by grid position:
+        # count the distinct dates the venue considers a trading day inside
+        # ``[start, end]``.  ``FxWeekCalendar`` overrides the date identity
+        # (NY-close session dates, Mon-Fri) because its UTC Sunday carries a
+        # partial session that is not a fifth/sixth daily bar.
+        return len(self.daily_bar_dates(start, end))
+
+    def daily_bar_dates(self, start: pd.Timestamp, end: pd.Timestamp) -> set[dt.date]:
+        """Trading dates that own a daily bar inside ``[start, end]``."""
+        start = _as_utc(start)
+        end = _as_utc(end)
+        dates: set[dt.date] = set()
         probe = start.normalize()
-        while probe <= end.normalize() + pd.Timedelta(days=1):
+        while probe <= end.normalize():
             day_start = probe.tz_localize(UTC) if probe.tzinfo is None else probe
-            if self.trading_minutes_between(day_start, day_start + pd.Timedelta(days=1)) > 0:
-                trading_dates.add(day_start.normalize())
+            if (
+                self.trading_minutes_between(
+                    day_start, day_start + pd.Timedelta(days=1)
+                )
+                > 0
+            ):
+                dates.add(day_start.date())
             probe += pd.Timedelta(days=1)
-        while instant <= end:
-            if instant.normalize() in trading_dates:
-                count += 1
-            instant += step
-        return count
+        return dates
+
+    def daily_bar_date(self, ts: pd.Timestamp) -> dt.date | None:
+        """The daily-bar identity of a bar stamped ``ts`` (``None`` = surplus)."""
+        return _as_utc(ts).date()
 
     grid_anchor: str = "utc"
 
@@ -237,6 +248,55 @@ class FxWeekCalendar(VenueCalendar):
                 intervals.append(TradingInterval(lo, hi))
             cursor += dt.timedelta(days=7)
         return intervals
+
+    def daily_bar_dates(self, start: pd.Timestamp, end: pd.Timestamp) -> set[dt.date]:
+        # FX daily bars follow the New-York-close convention: each bar covers
+        # the 24h ending at 17:00 ET and is labelled by that close's NY date,
+        # giving exactly five bars per week (Mon-Fri).  Sunday 17:00 ET opens
+        # the week; the partial Sunday UTC session is NOT a sixth bar.
+        start = _as_utc(start)
+        end = _as_utc(end)
+        dates: set[dt.date] = set()
+        first = start.tz_convert(self.zone).date() - dt.timedelta(days=2)
+        last = end.tz_convert(self.zone).date() + dt.timedelta(days=2)
+        day = first
+        while day <= last:
+            if day.weekday() < 5:  # Mon-Fri close dates only
+                boundary_local = dt.datetime.combine(day, dt.time(17, 0), tzinfo=self.zone)
+                boundary_utc = pd.Timestamp(boundary_local.astimezone(UTC))
+                segment_open = pd.Timestamp(
+                    (boundary_local - dt.timedelta(days=1)).astimezone(UTC)
+                )
+                if segment_open < end and boundary_utc > start:
+                    dates.add(day)
+            day += dt.timedelta(days=1)
+        return dates
+
+    def daily_bar_date(self, ts: pd.Timestamp) -> dt.date | None:
+        ts = _as_utc(ts)
+        local = ts.tz_convert(self.zone)
+        # The trading week runs Sunday 17:00 -> Friday 17:00 ET.  Check this
+        # week's Sunday and the previous one (``ts`` may precede this Sunday's
+        # open while still belonging to the prior week is impossible, but the
+        # extra candidate keeps boundary stamps unambiguous).
+        days_ahead = (6 - local.date().weekday()) % 7
+        sunday = local.date() + dt.timedelta(days=days_ahead)
+        for week_sunday in (sunday, sunday - dt.timedelta(days=7)):
+            open_local = dt.datetime.combine(
+                week_sunday, dt.time(17, 0), tzinfo=self.zone
+            )
+            open_utc = pd.Timestamp(open_local.astimezone(UTC))
+            close_local = open_local + dt.timedelta(days=5)
+            close_utc = pd.Timestamp(close_local.astimezone(UTC))
+            if not (open_utc <= ts <= close_utc):
+                continue
+            for k in range(1, 6):
+                boundary_local = open_local + dt.timedelta(days=k)
+                boundary_utc = pd.Timestamp(boundary_local.astimezone(UTC))
+                if ts <= boundary_utc:
+                    return boundary_local.date()
+            return close_local.date()
+        return None
 
 
 class NyseCalendar(VenueCalendar):
@@ -465,17 +525,25 @@ def _normalise_holidays(raw: Iterable[Any]) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, Mapping):
             continue
-        try:
-            day_number = int(item.get("holiday_date", item.get("date_days", 0)) or 0)
-        except (TypeError, ValueError):
+        # A holiday without a parseable date is dropped, never defaulted:
+        # ``date_days=0`` would make every 1 January a holiday when
+        # ``is_recurring`` is set.
+        raw_date = item.get("holiday_date", item.get("date_days"))
+        if raw_date is None:
             continue
         start_second = item.get("start_second")
         end_second = item.get("end_second")
+        try:
+            day_number = int(raw_date)
+            start_second = int(start_second) if start_second is not None else None
+            end_second = int(end_second) if end_second is not None else None
+        except (TypeError, ValueError):
+            continue
         holidays.append(
             {
                 "date_days": day_number,
-                "start_second": int(start_second) if start_second is not None else None,
-                "end_second": int(end_second) if end_second is not None else None,
+                "start_second": start_second,
+                "end_second": end_second,
                 "is_recurring": bool(item.get("is_recurring", False)),
             }
         )
@@ -511,47 +579,121 @@ def _holiday_bounds(
 
 FOREX_ASSET_CLASSES = frozenset({"forex", "fx", "currency"})
 CRYPTO_ASSET_CLASSES = frozenset({"crypto", "cryptocurrency"})
-METALS_ASSET_CLASSES = frozenset({"metals", "metal", "xau", "xag"})
+METALS_ASSET_CLASSES = frozenset({"metals", "metal", "xau", "xag", "xpt", "xpd"})
 INDEX_ASSET_CLASSES = frozenset({"index", "indices", "idx"})
 FUTURES_ASSET_CLASSES = frozenset({"futures", "future"})
 US_EQUITY_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf"})
 US_EQUITY_SOURCES = frozenset({"alpaca", "dolthub", "huggingface", "test", "yfinance"})
 
+#: Asset classes whose venue is a broker CFD schedule: no built-in session
+#: model exists for them, so only a cached broker calendar (cTrader) or an
+#: explicit fail-closed ``None`` can answer.
+BROKER_CFD_ASSET_CLASSES = frozenset(
+    METALS_ASSET_CLASSES
+    | INDEX_ASSET_CLASSES
+    | FUTURES_ASSET_CLASSES
+    | {"energy", "volatility", "commodity", "commodities"}
+)
+
+#: ISO-4217-style currency codes for strict FX pair shapes.  Mirrors the
+#: cTrader fallback table in ``live_runner/ctrader_adapter.py``; a six-letter
+#: symbol is FX only when BOTH halves are currency codes, so ``NVIDIA`` or
+#: ``GOLD`` can never pass.
+FX_CURRENCY_CODES = frozenset(
+    {
+        "AUD", "BRL", "CAD", "CHF", "CNH", "CNY", "CZK", "DKK", "EUR",
+        "GBP", "HKD", "HUF", "IDR", "ILS", "INR", "JPY", "KRW", "MXN",
+        "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "RUB", "SAR", "SEK",
+        "SGD", "THB", "TRY", "USD", "ZAR",
+    }
+)
+
+#: Known crypto bases for strict crypto-pair shapes: the union of the Alpaca
+#: allowlist (``live_runner/symbol_class.py``) and the cTrader fallback bases.
+#: ``split_crypto_pair`` alone accepts ANY ``XXX/USD`` shape, which would
+#: classify ``EUR/USD`` and ``XAUUSD`` as crypto.
+CRYPTO_BASES = frozenset(
+    {
+        "AAVE", "ADA", "ALGO", "APT", "ARB", "ATOM", "AVAX", "BAT", "BCH",
+        "BNB", "BTC", "CRV", "DASH", "DOGE", "DOT", "EOS", "ETC", "ETH",
+        "FIL", "GRT", "HBAR", "INJ", "LTC", "LINK", "MANA", "MATIC", "MKR",
+        "NEAR", "OP", "PEPE", "SHIB", "SNX", "SOL", "SUI", "SUSHI", "SAND",
+        "TRUMP", "TRX", "UNI", "USDT", "VET", "XLM", "XMR", "XRP", "XTZ",
+        "YFI", "ZEC",
+    }
+)
+
+_US_EQUITY_TICKER_RE = re.compile(r"^[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?$")
+
+
+def _dukascopy_symbol_config() -> Mapping[str, Any]:
+    """``SYMBOL_CONFIG`` from the Dukascopy downloader, or ``{}`` on failure.
+
+    The import is lazy and failures are logged rather than swallowed: a
+    missing config degrades symbol-shape resolution to the strict heuristics
+    below instead of silently changing the venue.
+    """
+    try:
+        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+    except Exception:
+        logger.warning(
+            "dukascopy SYMBOL_CONFIG unavailable; venue resolution uses "
+            "symbol-shape heuristics only",
+            exc_info=True,
+        )
+        return {}
+    return SYMBOL_CONFIG
+
+
+def _config_asset_class(symbol: str) -> str:
+    """Declared asset class for ``symbol`` in Dukascopy's SYMBOL_CONFIG."""
+    config = _dukascopy_symbol_config()
+    entry = config.get(symbol) or config.get(symbol.replace("/", ""))
+    if not isinstance(entry, Mapping):
+        return ""
+    return str(entry.get("asset_class") or "").strip().lower()
+
 
 def _is_crypto_symbol(symbol: str) -> bool:
     from shared.alpaca_symbols import split_crypto_pair
 
-    return split_crypto_pair(symbol) is not None
+    pair = split_crypto_pair(symbol)
+    return pair is not None and pair[0] in CRYPTO_BASES
 
 
-def _is_forex_symbol(symbol: str) -> bool:
+def _is_fx_pair(symbol: str) -> bool:
+    """Strict FX shape: ``CCYCCY`` or ``CCY/CCY`` with ISO currency codes."""
     normalized = str(symbol or "").strip().upper()
     if "/" in normalized:
-        return True
-    if len(normalized) == 6 and normalized.isalpha():
-        return True
-    try:
-        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
-
-        return normalized in {
-            key.upper()
-            for key, value in SYMBOL_CONFIG.items()
-            if str(value.get("asset_class", "")).strip().lower() == "forex"
-        }
-    except Exception:
+        parts = normalized.split("/")
+        if len(parts) == 2:
+            return all(part in FX_CURRENCY_CODES for part in parts)
         return False
+    if len(normalized) == 6 and normalized.isalpha():
+        return (
+            normalized[:3] in FX_CURRENCY_CODES
+            and normalized[3:] in FX_CURRENCY_CODES
+        )
+    return False
 
 
 def _is_us_equity_symbol(symbol: str) -> bool:
-    import re
+    return _US_EQUITY_TICKER_RE.fullmatch(str(symbol or "").strip().upper()) is not None
 
-    return re.fullmatch(r"[A-Z][A-Z.\-]{0,9}", str(symbol or "").strip().upper()) is not None
+
+#: Only broker sources with a cache writer may appear in cache paths; the
+#: component is an allowlist, not a sanitised filename, so ``../../x`` can
+#: never escape ``venue_calendars/``.
+_CALENDAR_CACHE_SOURCES = frozenset({"ctrader", "alpaca"})
 
 
 def _calendar_cache_path(data_dir: str | Path, source: str, symbol: str) -> Path:
+    src = str(source or "").strip().lower()
+    if src not in _CALENDAR_CACHE_SOURCES:
+        raise ValueError(f"unsupported venue calendar source: {source!r}")
     root = Path(data_dir) if data_dir else Path(".")
     safe_symbol = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in symbol.upper())
-    return root / "venue_calendars" / source.lower() / f"{safe_symbol}.json"
+    return root / "venue_calendars" / src / f"{safe_symbol}.json"
 
 
 def load_cached_calendar(
@@ -560,20 +702,32 @@ def load_cached_calendar(
     source: str,
     symbol: str,
 ) -> VenueCalendar | None:
-    path = _calendar_cache_path(data_dir, source, symbol)
+    """Load a cached broker calendar; any malformed payload fails closed."""
     try:
+        path = _calendar_cache_path(data_dir, source, symbol)
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        if not isinstance(payload, dict):
+            return None
+        kind = str(payload.get("kind") or "")
+        if kind == "broker_schedule":
+            calendar = BrokerScheduleCalendar(payload)
+            # A schedule with no usable intervals can never prove coverage:
+            # fail closed rather than letting an empty calendar vacuously
+            # pass every segment.
+            return calendar if calendar.intervals else None
+        if kind == "exchange_sessions":
+            calendar = ExchangeSessionCalendar(payload)
+            return calendar if calendar.sessions else None
+        if kind == "alpaca_equity":
+            return NyseCalendar(name="alpaca-equity")
+    except Exception as exc:
+        logger.warning(
+            "Ignoring unusable venue calendar cache for %s/%s: %s",
+            source,
+            symbol,
+            exc,
+        )
         return None
-    if not isinstance(payload, dict):
-        return None
-    kind = str(payload.get("kind") or "")
-    if kind == "broker_schedule":
-        return BrokerScheduleCalendar(payload)
-    if kind == "exchange_sessions":
-        return ExchangeSessionCalendar(payload)
-    if kind == "alpaca_equity":
-        return NyseCalendar(name="alpaca-equity")
     return None
 
 
@@ -631,52 +785,67 @@ def resolve_venue_calendar(
 ) -> VenueCalendar | None:
     """Resolve the authoritative session calendar for a segment.
 
-    Returns ``None`` when no broker calendar is cached and no built-in model
-    unambiguously fits; callers must treat that as fail-closed.
+    Precedence: explicit ``asset_class``/``source`` metadata and broker cache
+    entries beat symbol-shape heuristics, which are strict and only resolve
+    unambiguous shapes (known crypto bases, ISO FX pairs, US equity tickers on
+    a known equity source).  ``None`` means the venue is unknown: callers must
+    fail closed and must never treat it as 24/7.
     """
     normalized = str(symbol or "").strip().upper()
     if not normalized:
         return None
 
-    # Broker cache first: cTrader schedules are authoritative for cTrader data.
-    if source and source.lower() == "ctrader" and data_dir:
-        cached = load_cached_calendar(data_dir=data_dir, source="ctrader", symbol=normalized)
-        if cached is not None:
-            return cached
-
     asset = str(asset_class or "").strip().lower()
     src = str(source or "").strip().lower()
 
-    if asset in CRYPTO_ASSET_CLASSES or (not asset and _is_crypto_symbol(normalized)):
-        return ContinuousCalendar()
+    # 1. Broker caches are consulted before any shape heuristic.  The cTrader
+    #    schedule is authoritative for cTrader-sourced data AND for broker-CFD
+    #    asset classes (metals/indices/futures), which have no built-in model
+    #    regardless of which vendor supplied the bars.  The Alpaca /v2/calendar
+    #    cache applies to US-equity data from the Alpaca source.
+    if data_dir:
+        if src == "ctrader":
+            cached = load_cached_calendar(
+                data_dir=data_dir, source="ctrader", symbol=normalized
+            )
+            if cached is not None:
+                return cached
+        elif src == "alpaca" and (not asset or asset in US_EQUITY_ASSET_CLASSES):
+            cached = load_cached_calendar(
+                data_dir=data_dir, source="alpaca", symbol=normalized
+            )
+            if cached is not None:
+                return cached
+        if asset in BROKER_CFD_ASSET_CLASSES or (
+            not asset and _config_asset_class(normalized) in BROKER_CFD_ASSET_CLASSES
+        ):
+            cached = load_cached_calendar(
+                data_dir=data_dir, source="ctrader", symbol=normalized
+            )
+            if cached is not None:
+                return cached
 
-    if asset in FOREX_ASSET_CLASSES or (not asset and _is_forex_symbol(normalized)):
-        return FxWeekCalendar()
-
-    if asset in METALS_ASSET_CLASSES or asset in INDEX_ASSET_CLASSES or asset in FUTURES_ASSET_CLASSES:
-        # No built-in model for these venues; only a broker schedule fits.
-        if src == "ctrader" and data_dir:
-            return load_cached_calendar(data_dir=data_dir, source="ctrader", symbol=normalized)
-        return None
-
-    if asset in US_EQUITY_ASSET_CLASSES or asset == "index":
-        if src in US_EQUITY_SOURCES or (not src and _is_us_equity_symbol(normalized)):
-            if src == "alpaca" and data_dir:
-                cached = load_cached_calendar(
-                    data_dir=data_dir, source="alpaca", symbol=normalized
-                )
-                if cached is not None:
-                    return cached
-            return NyseCalendar()
-        return None
-
-    # Path-metadata fallback: callers pass asset_class/source discovered from
-    # the dataset path; without either, only unambiguous symbol shapes resolve.
-    if not asset and not src:
-        if _is_crypto_symbol(normalized):
+    # 2. Explicit asset_class metadata.
+    if asset:
+        if asset in CRYPTO_ASSET_CLASSES:
             return ContinuousCalendar()
-        if _is_forex_symbol(normalized):
+        if asset in FOREX_ASSET_CLASSES:
             return FxWeekCalendar()
-        if _is_us_equity_symbol(normalized):
-            return NyseCalendar()
+        if asset in US_EQUITY_ASSET_CLASSES:
+            if not src or src in US_EQUITY_SOURCES:
+                return NyseCalendar()
+            return None
+        # Broker-CFD and unrecognised asset classes: cache was already tried.
+        return None
+
+    # 3. No asset_class: Dukascopy SYMBOL_CONFIG metadata, then strict shapes.
+    config_asset = _config_asset_class(normalized)
+    if config_asset in FOREX_ASSET_CLASSES or _is_fx_pair(normalized):
+        return FxWeekCalendar()
+    if config_asset in CRYPTO_ASSET_CLASSES or _is_crypto_symbol(normalized):
+        return ContinuousCalendar()
+    if config_asset in BROKER_CFD_ASSET_CLASSES:
+        return None  # no built-in model; cTrader cache already consulted
+    if src in US_EQUITY_SOURCES and _is_us_equity_symbol(normalized):
+        return NyseCalendar()
     return None
