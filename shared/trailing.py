@@ -327,6 +327,8 @@ def validate_live_deployment_trailing_mode(
         return
     processor_config = deployment.signal_config.get("signal_processor_config")
     if isinstance(processor_config, Mapping) and "trailing_mode" in processor_config:
+        # The override check above already owns this deployment's mode; building
+        # its processor for it would only repeat the work.
         return
     if not isinstance(processor_config, Mapping):
         processor_config = {}
@@ -335,7 +337,17 @@ def validate_live_deployment_trailing_mode(
     # cycle (shared.trailing -> signal_bots.registry -> shared.trailing).
     from signal_bots.registry import get_signal_processor
 
-    processor = get_signal_processor(processor_name, dict(processor_config))
+    try:
+        processor = get_signal_processor(processor_name, dict(processor_config))
+    except Exception as exc:
+        # An unregistered id or a bot config that no longer loads is a client
+        # error (the API answers 400 with this detail), not a 500; at the
+        # daemon's load path it is a configuration error that must not cost the
+        # whole deployment list its sync tick.
+        raise ValueError(
+            f"{context}: its signal processor '{processor_name}' could not be "
+            f"built to check the trailing mode it would emit: {exc}"
+        ) from exc
     mode = getattr(processor, "trailing_mode", None)
     if mode is None:
         return

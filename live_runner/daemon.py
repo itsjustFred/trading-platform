@@ -4809,14 +4809,13 @@ async def _load_db_accounts_and_deployments(
                 extra={"data": {"deployment_id": str(deployment.id)}},
             )
         except Exception as exc:
-            # The processor could not be built at all (unregistered id, a bot
-            # config that no longer loads). That is a configuration error too,
-            # and it must not cost the whole deployment list its sync tick: the
-            # signal-time gates still refuse every signal this deployment makes.
+            # Anything else reading the deployment's trailing mode can raise. It
+            # must not cost the whole deployment list its sync tick: the
+            # signal-time gates still refuse every signal this deployment makes,
+            # so a stored row is surfaced here and traded nowhere.
             logger.error(
-                "Stored live deployment's signal processor could not be checked for a "
-                "trailing mode live cannot execute; its entry signals will be "
-                "refused: %s",
+                "Stored live deployment's trailing mode could not be checked; its entry "
+                "signals will be refused: %s",
                 exc,
                 extra={"data": {"deployment_id": str(deployment.id)}},
             )

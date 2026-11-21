@@ -150,6 +150,20 @@ def test_an_unregistered_processor_is_a_deployment_config_error() -> None:
         _check(_deployment({"signal_processor": "mystery"}))
 
 
+def test_an_unbuildable_processor_is_a_client_error_not_a_crash(monkeypatch) -> None:
+    """A bot config that no longer loads must refuse the deployment as a config
+    error (the API answers 400 with the detail), not surface as a 500."""
+    from signal_bots.registry import SIGNAL_PROCESSORS
+
+    def broken_factory(config: dict) -> object:
+        raise RuntimeError("bot config no longer loads")
+
+    monkeypatch.setitem(SIGNAL_PROCESSORS, "ramjet", broken_factory)
+
+    with pytest.raises(ValueError, match="could not be built"):
+        _check(_deployment({"signal_processor": "ramjet"}))
+
+
 # ── the deployment-validation stages ─────────────────────────────────────────
 
 
