@@ -111,10 +111,15 @@ def _require_number(value: Any, label: str) -> float:
 
 
 def _recorded_path(data: Mapping[str, Any], key: str) -> str:
-    """A recorded evidence path: absent reads as "", a non-string is malformed."""
+    """A recorded evidence path: absent or empty reads as "", a non-string is malformed.
+
+    An empty path is not refused here: :meth:`PromotionEvidence.missing_evidence_paths`
+    reports it, with its key and the recovery, as a record that does not name its
+    file.
+    """
     value = data.get(key, "")
     if not isinstance(value, str):
-        raise InvalidPromotionError(f"'{key}' must be a non-empty string")
+        raise InvalidPromotionError(f"'{key}' must be a string")
     return value.strip()
 
 

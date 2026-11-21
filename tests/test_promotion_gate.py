@@ -7,12 +7,9 @@ Enforcement-point tests (preflight, daemon, viewer) live in
 from __future__ import annotations
 
 import argparse
-import atexit
 import hashlib
 import json
 import os
-import shutil
-import tempfile
 import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -47,6 +44,7 @@ from runner.promotion_gate import (
     require_promoted,
 )
 from shared.models import LiveDeploymentConfig
+from tests.conftest import TEST_DATA_DIR
 
 STRATEGY_NAME = "alpha"
 DEFAULTS = {"fast": 10, "slow": 30, "mode": "trend"}
@@ -90,7 +88,10 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-_SCRATCH_EVIDENCE_ROOT: Path | None = None
+#: Evidence root for the callers that have no ``tmp_path`` of their own. It lives in the
+#: suite's throwaway ``DATA_DIR`` (``tests/conftest.py``), which is per-process and
+#: removed at exit, so a test never writes outside ``tmp_path`` or ``DATA_DIR``.
+_EVIDENCE_SCRATCH_ROOT = TEST_DATA_DIR / "promotion-evidence"
 
 
 def _evidence_scratch_dir() -> Path:
@@ -99,14 +100,10 @@ def _evidence_scratch_dir() -> Path:
     The ledger records the path and the hash of every evidence file, so evidence
     whose files do not exist cannot be recorded or re-checked. Callers that
     tamper with the files pass a directory under ``tmp_path`` instead; this
-    scratch tree serves the ones that have none, and is removed at exit like
-    the session data directory in ``conftest.py``.
+    scratch tree serves the ones that have none and goes with the session data
+    directory.
     """
-    global _SCRATCH_EVIDENCE_ROOT
-    if _SCRATCH_EVIDENCE_ROOT is None:
-        _SCRATCH_EVIDENCE_ROOT = Path(tempfile.mkdtemp(prefix="tp-promotion-evidence-"))
-        atexit.register(shutil.rmtree, _SCRATCH_EVIDENCE_ROOT, ignore_errors=True)
-    directory = _SCRATCH_EVIDENCE_ROOT / uuid.uuid4().hex
+    directory = _EVIDENCE_SCRATCH_ROOT / uuid.uuid4().hex
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
@@ -180,13 +177,19 @@ def promote_strategy_file(
     name: str = STRATEGY_NAME,
     evidence_dir: Path | None = None,
 ) -> dict[str, Any]:
+    """Promote one strategy file, its evidence in a directory of its own.
+
+    The default is per kind (``evidence/strategy``), so promoting a strategy and
+    a signal bot in the same test cannot have one overwrite the other's files.
+    """
     return promote(
         strategies_dir / name / f"{name}.py",
         kind="strategy",
         parameters=DEFAULTS,
         evidence=good_evidence(
             strategy_file=f"{name}.py",
-            evidence_dir=evidence_dir or strategies_dir.parent / EVIDENCE_SUBDIR,
+            evidence_dir=evidence_dir
+            or strategies_dir.parent / EVIDENCE_SUBDIR / "strategy",
         ),
         promoted_by="Fred (reviewer)",
         root=strategies_dir,
@@ -227,7 +230,8 @@ def promote_ramjet_bot(evidence_dir: Path | None = None) -> Any:
         parameters=target.parameters,
         evidence=good_evidence(
             strategy_file="ramjet_strategy.py",
-            evidence_dir=evidence_dir or target.root.parent / EVIDENCE_SUBDIR,
+            evidence_dir=evidence_dir
+            or target.root.parent / EVIDENCE_SUBDIR / "signal-bot",
         ),
         promoted_by="Fred (reviewer)",
         root=target.root,
@@ -1233,7 +1237,68 @@ def test_a_record_with_an_evidence_path_of_the_wrong_type_is_malformed(
     _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path=42))
     status = _status(strategies_dir)
     assert not status.is_production
+    # The classification, not only the refusal: a coerced path would fail later
+    # with a different reason.
     assert "malformed" in status.reason
+    assert "'report_path' must be a string" in status.reason
+
+
+def test_an_empty_evidence_path_is_a_record_that_does_not_name_its_file(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """``""`` and absent read the same: the record does not name its file."""
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path=""))
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "does not name the file" in status.reason
+    assert "parity.report_path" in status.reason
+
+
+def test_promoting_a_strategy_and_a_bot_keeps_both_promotions(
+    strategies_dir: Path, bots_root: Path
+) -> None:
+    """Two promotions in one test keep their own evidence files.
+
+    The helpers share a ``tmp_path``, so an evidence directory they shared would
+    have the second promotion overwrite the first's files -- and the first
+    re-check would then refuse it.
+    """
+    promote_strategy_file(strategies_dir)
+    target = promote_ramjet_bot()
+    assert _status(strategies_dir).is_production
+    assert (
+        promotion_status(
+            target.path, target.parameters, kind=target.kind, root=target.root
+        ).is_production
+    )
+
+
+def test_a_recorded_path_round_trips_through_the_repository_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger form of a path is portable: POSIX separators, root-relative.
+
+    ``pytest`` only runs on the Linux leg of CI, so this is the standing guard
+    for the path handling on every platform: a repository file is recorded
+    relative, with forward slashes (what ``PureWindowsPath.as_posix`` produces on
+    Windows), and the relative form resolves back against the repository root of
+    the checking process while an absolute one stands for itself.
+    """
+    import runner.promotion_gate as gate
+
+    monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
+    evidence = tmp_path / "evidence" / "nested.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}", encoding="utf-8")
+    recorded = recorded_evidence_path(evidence)
+    assert recorded == "evidence/nested.json"
+    assert "\\" not in recorded
+    assert gate._evidence_file(recorded) == evidence
+    outside = tmp_path.parent / "outside.json"
+    absolute = recorded_evidence_path(outside)
+    assert Path(absolute).is_absolute()
+    assert gate._evidence_file(absolute) == outside
 
 
 def test_promotion_refuses_evidence_that_does_not_name_its_file(strategies_dir: Path) -> None:
