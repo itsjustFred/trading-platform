@@ -78,8 +78,11 @@ def _short_breakout_frame() -> pd.DataFrame:
     Day 1: same OR 100/98 -> long level 100.4, short level 97.6. The 10:00 ET
     close (97.0) breaks the short level, so the LWM starts at 97.0, falls to
     96.0 and the 11:00 ET close (97.5) is above the 1% reversion level
-    96.0 * 1.01 = 96.96 -> trailing-stop exit. The 11:30 ET close (98.0) is
-    inside the old range, which must not re-enter anything.
+    96.0 * 1.01 = 96.96 -> trailing-stop exit. The 11:30 ET close (101.0)
+    breaks the OPPOSITE (long) level, which must not re-enter anything - it is
+    there so the one-trade-per-day gate is exercised on the short side too: a
+    close that stayed inside the old range would leave nothing for a cleared
+    `traded` flag to open, and that half of the pin would be vacuous.
     Day 2: a fresh OR (100.5/99.5, range 1) whose 10:00 ET close (101.0)
     breaks the new long level 100.7, proving the traded flag and the OR reset
     with the ET day.
@@ -93,7 +96,7 @@ def _short_breakout_frame() -> pd.DataFrame:
             ("2024-01-02 15:00:00+00:00", 99.0, 97.2, 96.8, 97.0),  # 10:00 ET -> SHORT
             ("2024-01-02 15:30:00+00:00", 96.5, 96.6, 95.9, 96.0),  # LWM 96.0
             ("2024-01-02 16:00:00+00:00", 96.2, 97.6, 96.0, 97.5),  # > 96.96 -> trail exit
-            ("2024-01-02 16:30:00+00:00", 97.5, 98.0, 97.4, 98.0),  # inside the range, no trade
+            ("2024-01-02 16:30:00+00:00", 97.5, 101.0, 97.4, 101.0),  # > 100.4, no 2nd trade
             ("2024-01-03 14:30:00+00:00", 100.0, 100.5, 99.5, 100.0),  # day 2, fresh OR
             ("2024-01-03 15:00:00+00:00", 100.0, 101.0, 99.8, 101.0),  # day 2 -> LONG
         ]
@@ -172,18 +175,26 @@ class TestOrbContextMirror:
         assert ctx["exit_reason"].iloc[3] == "time_exit"
 
     def test_no_entries_after_the_forced_exit(self):
-        # Forced exit first, no entries afterwards: a breakout-shaped close that
-        # arrives after 15:45 ET must not open a position either.
+        # A real long is open when the 15:45 ET bar flattens it, and the
+        # breakout-shaped close that follows (below the short level, so a fresh
+        # entry would show up as its own direction marker rather than the
+        # carried one) must not trade either.
         frame = _frame(
             [
                 ("2024-01-02 14:30:00+00:00", 100.0, 100.0, 98.0, 99.0),  # OR
-                ("2024-01-02 20:45:00+00:00", 99.0, 101.0, 99.0, 101.0),  # 15:45 ET
-                ("2024-01-02 21:00:00+00:00", 101.0, 105.0, 101.0, 105.0),  # 16:00 ET, > 100.4
+                ("2024-01-02 15:00:00+00:00", 99.0, 101.0, 99.0, 101.0),  # 10:00 ET -> LONG
+                ("2024-01-02 20:45:00+00:00", 101.0, 105.0, 101.0, 105.0),  # 15:45 ET
+                ("2024-01-02 21:00:00+00:00", 99.0, 101.0, 97.0, 97.0),  # 16:00 ET, < 97.6
             ]
         )
         ctx = _load_context_module().build_trade_context(frame, {})
-        assert pd.isna(ctx["direction"].iloc[2]), "no entry after the forced exit"
-        assert pd.isna(ctx["exit_reason"].iloc[2])
+        assert ctx["direction"].iloc[1] == "LONG"
+        assert ctx["exit_reason"].iloc[2] == "time_exit"
+        # Exactly one direction marker for the session: the carried first
+        # entry. A second one means the forced exit left the gate open.
+        assert set(ctx["direction"].iloc[1:4].dropna()) == {"LONG"}
+        # No exit reason other than the forced exit's own (carried) one.
+        assert set(ctx["exit_reason"].iloc[2:4].dropna()) == {"time_exit"}
 
     def test_flat_opening_range_trades_nothing(self):
         # A zero-width opening range has no level to break: no entry, and the
