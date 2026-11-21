@@ -154,10 +154,15 @@ def _setting_int(
         return default
     try:
         value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be an integer, got {raw!r}") from exc
+    except (TypeError, ValueError):
+        value = default
     if not minimum <= value <= maximum:
-        raise ValueError(f"{key} must be in [{minimum}, {maximum}], got {value}")
+        value = default
+    if value != raw:
+        logger.warning(
+            "Ignoring unusable broker reconciliation setting",
+            extra={"data": {"key": key, "value": raw, "using": value}},
+        )
     return value
 
 
