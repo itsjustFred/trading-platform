@@ -5227,14 +5227,21 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
 MAX_BROKER_ORDER_CONFLICT_ROWS = 20
 
 
-def _broker_order_conflict_health() -> dict[str, Any]:
+def _broker_order_conflict_health(
+    grouped: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     """Fleet-wide unresolved broker order id conflicts (#126), for the dashboard.
 
     Same read as :func:`live_runner.broker_order_conflicts.check_broker_order_conflicts`,
     kept here because the payload caps how many rows it carries: the daemon loop wants
     every one, a dashboard wants the shape of the problem.
+
+    ``grouped`` is the already-read mapping. The dashboard needs it anyway to annotate
+    its ACTIVE rows, and the read is a full scan of the signal table, so a caller that
+    has it passes it rather than scanning twice for one response.
     """
-    grouped = deployments_with_broker_order_conflicts()
+    if grouped is None:
+        grouped = deployments_with_broker_order_conflicts()
     conflicts = [conflict for rows in grouped.values() for conflict in rows]
     return {
         "status": "error" if conflicts else "ok",
@@ -13316,8 +13323,9 @@ async def get_live_dashboard() -> dict[str, Any]:
         *(_live_trades_payload(account.id) for account in accounts)
     )
     # Read once for the whole dashboard: the conflict ledger is fleet-wide state, not
-    # per-account state (#126).
-    conflict_health = await asyncio.to_thread(_broker_order_conflict_health)
+    # per-account state (#126), and this response already needs the grouping to
+    # annotate its own rows.
+    conflict_health = _broker_order_conflict_health(conflicts_by_deployment)
 
     for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
