@@ -3231,7 +3231,10 @@ def record_live_broker_side_close_fill(
     alone, so a redelivered fill, a reconnect and a second partial fill of the same leg all reuse
     one close signal; only the fills differ, and they go through the same single locked insert
     path as every other fill (:func:`save_live_execution`) with the caller's broker-native
-    dedupe key, so a redelivery is a skip rather than a second row.
+    dedupe key, so a redelivery is a skip rather than a second row. The row is written here
+    rather than through :func:`save_live_signal` because a broker close is no producer event:
+    neither that function's discord nor its idempotency dedupe describes it, and a second call
+    for the same parent would collide on the primary key rather than reuse the row.
 
     Returns the quantity newly persisted, ``0.0`` when nothing was written (a duplicate, a
     non-positive quantity, or a refusal below). Refusals never write and are logged: they are

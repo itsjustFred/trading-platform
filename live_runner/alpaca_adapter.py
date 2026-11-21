@@ -833,9 +833,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # names no signal of ours and would otherwise be dropped (`client_order_id` is not a
         # signal), leaving the broker position smaller than every ledger on the account and
         # #142's guard alerting on every later exit for that symbol.
-        # Rebuilt from the parent order's nested legs whenever one is seen: at submit, and on
+        # Learned from the parent order's nested legs whenever one is seen: at submit, and on
         # every reconciliation pass - which is the adapter's only one and runs on connect,
-        # before the trading stream consumes events, so a restart re-learns the mapping.
+        # before the trading stream consumes events, so a restart re-learns the mapping (a
+        # trailed stop is a NEW leg order id, which the next pass picks up the same way).
         self._bracket_leg_order_id_to_signal_id: dict[str, str] = {}
 
         if not self.api_key or not self.secret_key:
