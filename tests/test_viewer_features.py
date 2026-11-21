@@ -1835,20 +1835,47 @@ def test_coalesced_cleanup_state_updates_are_serialized(tmp_path, monkeypatch):
         real_write(state)
 
     monkeypatch.setattr(viewer_app_module, "_write_coalesced_cleanup_state", blocking_write)
+
+    # Spy on the state lock itself: ``second_attempted`` must fire when the
+    # second thread *attempts* the acquire — proving it was actually blocked
+    # on the lock while the first writer held it, not merely scheduled late.
+    real_lock = viewer_app_module._COALESCED_CLEANUP_STATE_LOCK
+    second_attempted = threading.Event()
+
+    class _AcquireSpyLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "second-writer":
+                second_attempted.set()
+            return real_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            real_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.release()
+            return False
+
+    monkeypatch.setattr(
+        viewer_app_module, "_COALESCED_CLEANUP_STATE_LOCK", _AcquireSpyLock()
+    )
+
     first = threading.Thread(
         target=viewer_app_module._update_coalesced_cleanup_state,
         args=("cleanup-0001",),
         kwargs={"attempts": 1, "exhausted": False},
+        name="first-writer",
     )
-    second_attempted = threading.Event()
 
     def run_second():
-        second_attempted.set()
         viewer_app_module._update_coalesced_cleanup_state(
             "cleanup-0002", attempts=1, exhausted=False
         )
 
-    second = threading.Thread(target=run_second)
+    second = threading.Thread(target=run_second, name="second-writer")
     first.start()
     assert first_write_started.wait(timeout=2)
     second.start()

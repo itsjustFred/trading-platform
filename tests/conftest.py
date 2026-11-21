@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import shutil
 import sys
@@ -225,6 +226,21 @@ def seed_live_deployments(
         session.commit()
 
 
+@contextlib.contextmanager
+def _viewer_state_lock(lock, name: str):
+    """Acquire a viewer state lock with a timeout so a leaked thread holding
+    it fails the test loudly instead of hanging the whole suite."""
+    if not lock.acquire(timeout=5):
+        raise RuntimeError(
+            f"viewer state reset timed out acquiring {name}: a thread leaked "
+            "by an earlier test still holds the lock"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
     """Clear viewer module state that must not cross test boundaries.
 
@@ -236,42 +252,56 @@ def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
     cache TTL (this is the #236 strategy-list leak).
     """
     module = viewer_main_module or sys.modules.get("viewer.main")
-    if module is None:
+    # ``viewer.core`` is the legacy module ``viewer.main`` wraps; a session
+    # that imported only ``viewer.core`` still needs its OHLCV cache reset.
+    legacy_module = (
+        getattr(module, "legacy_viewer", None)
+        if module is not None
+        else sys.modules.get("viewer.core")
+    )
+    if module is None and legacy_module is None:
         return
-    legacy_module = getattr(module, "legacy_viewer", None)
-
-    with module._STRATEGIES_CACHE_LOCK:
-        module._STRATEGIES_CACHE["payload"] = []
-        module._STRATEGIES_CACHE["expires_at"] = 0.0
-    with module._LIVE_ACCOUNTS_CACHE_LOCK:
-        module._LIVE_ACCOUNTS_CACHE["expires_at"] = 0.0
-        module._LIVE_ACCOUNTS_CACHE["payload"] = []
-        module._LIVE_ACCOUNTS_CACHE["provider_marker"] = None
-    with module._BACKTEST_META_CACHE_LOCK:
-        module._BACKTEST_META_CACHE.clear()
-        module._BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
-    with module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK:
-        module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
-    with module._PORTFOLIO_META_CACHE_LOCK:
-        module._PORTFOLIO_META_CACHE.clear()
-        module._PORTFOLIO_META_CACHE_WARMED = False
-    with module._TASK_CACHE_HYDRATION_LOCK:
-        module._TASK_CACHE_HYDRATED = False
-    with module._DATA_VIEWS_CACHE_LOCK:
-        module._invalidate_data_views_cache()
-        module._DATA_VIEWS_PREWARM_DONE = False
-    with module.DATA_TASKS_LOCK:
-        module.DATA_TASKS.clear()
-    with module._COALESCED_CLEANUP_STATE_LOCK:
-        module._COALESCED_CLEANUP_PENDING.clear()
-        module._COALESCED_CLEANUP_ORDER.clear()
-        module._COALESCED_CLEANUP_ATTEMPTS.clear()
-        module._COALESCED_CLEANUP_EXHAUSTED.clear()
-
+    if module is not None:
+        with _viewer_state_lock(module._STRATEGIES_CACHE_LOCK, "_STRATEGIES_CACHE_LOCK"):
+            module._STRATEGIES_CACHE["payload"] = []
+            module._STRATEGIES_CACHE["expires_at"] = 0.0
+        with _viewer_state_lock(module._LIVE_ACCOUNTS_CACHE_LOCK, "_LIVE_ACCOUNTS_CACHE_LOCK"):
+            module._LIVE_ACCOUNTS_CACHE["expires_at"] = 0.0
+            module._LIVE_ACCOUNTS_CACHE["payload"] = []
+            module._LIVE_ACCOUNTS_CACHE["provider_marker"] = None
+        with _viewer_state_lock(module._BACKTEST_META_CACHE_LOCK, "_BACKTEST_META_CACHE_LOCK"):
+            module._BACKTEST_META_CACHE.clear()
+            module._BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
+        with _viewer_state_lock(
+            module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK,
+            "_BACKTEST_EQUITY_PREVIEW_CACHE_LOCK",
+        ):
+            module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+        with _viewer_state_lock(module._PORTFOLIO_META_CACHE_LOCK, "_PORTFOLIO_META_CACHE_LOCK"):
+            module._PORTFOLIO_META_CACHE.clear()
+            module._PORTFOLIO_META_CACHE_WARMED = False
+        with _viewer_state_lock(module._TASK_CACHE_HYDRATION_LOCK, "_TASK_CACHE_HYDRATION_LOCK"):
+            module._TASK_CACHE_HYDRATED = False
+        with _viewer_state_lock(module._DATA_VIEWS_CACHE_LOCK, "_DATA_VIEWS_CACHE_LOCK"):
+            module._invalidate_data_views_cache()
+            module._DATA_VIEWS_PREWARM_DONE = False
+        with _viewer_state_lock(
+            module._COALESCED_CLEANUP_STATE_LOCK, "_COALESCED_CLEANUP_STATE_LOCK"
+        ):
+            module._COALESCED_CLEANUP_PENDING.clear()
+            module._COALESCED_CLEANUP_ORDER.clear()
+            module._COALESCED_CLEANUP_ATTEMPTS.clear()
+            module._COALESCED_CLEANUP_EXHAUSTED.clear()
     if legacy_module is not None:
-        with legacy_module._OHLCV_DF_CACHE_LOCK:
+        # DATA_TASKS lives in viewer.core (viewer.main re-exports it), so it
+        # is cleared here to cover sessions that never import viewer.main.
+        with _viewer_state_lock(legacy_module.DATA_TASKS_LOCK, "DATA_TASKS_LOCK"):
+            legacy_module.DATA_TASKS.clear()
+        with _viewer_state_lock(legacy_module._OHLCV_DF_CACHE_LOCK, "_OHLCV_DF_CACHE_LOCK"):
             legacy_module._OHLCV_DF_CACHE.clear()
-    module.cache_manager.invalidate_cache()
+    from data_tools import cache_manager
+
+    cache_manager.invalidate_cache()
 
 
 @pytest.fixture(autouse=True)
