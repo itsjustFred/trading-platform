@@ -122,9 +122,17 @@ def sqlite_url_file(url: str) -> str:
     was reported as "Database file not found".
 
     Empty when the URL names no file (``sqlite://``); the caller decides what that means.
+
+    ``sqlite:///file:/abs/db.db?uri=true`` is SQLAlchemy's URI form for the same database as
+    ``sqlite:////abs/db.db`` - the ``file:`` prefix is URI syntax the SQLite driver parses, not part
+    of the path. Keeping it would resolve the file to a nonexistent ``file:`` directory, so a
+    caller acting on the file (the daemon's lock) would sit beside a path nothing opens.
     """
     without_params = url.partition("?")[0].partition("#")[0]
-    return unquote(without_params.split("///", 1)[1]) if "///" in without_params else ""
+    file_part = unquote(without_params.split("///", 1)[1]) if "///" in without_params else ""
+    if file_part.startswith("file:"):
+        file_part = file_part[len("file:") :]
+    return file_part
 
 
 def live_db_path() -> Path:

@@ -8,8 +8,9 @@ migrations, and connect brokers - which is what an agent got on 2026-11-21 when 
 entry point and started a second daemon next to a running one.
 
 So the parsing - and everything that can refuse a start, including the single-instance guard the
-daemon takes - happens here, in a module that imports only the standard library, and the heavy
-``live_runner.daemon`` module is imported only once the arguments say "start".
+daemon takes - happens here, in a module whose imports are the standard library plus the
+dependency-free ``shared.single_instance``, and the heavy ``live_runner.daemon`` module is imported
+only once the arguments say "start".
 
 Exit codes: 0 (clean exit, or ``--help``), 1 (anything the daemon itself raised), 2 (argparse usage
 error), 3 (the single-instance lock is held by another daemon).

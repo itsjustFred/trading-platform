@@ -20,6 +20,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ import pytest
 
 from live_runner import daemon_cli
 from shared.single_instance import SingleInstanceError, SingleInstanceLock
+from tests.helpers.lock_holder import await_held, read_holder_line, spawn_holder
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -162,6 +164,77 @@ class TestSingleInstanceGuard:
 
         SingleInstanceLock(daemon.daemon_lock_path()).acquire().release()
 
+    @pytest.mark.timeout(60)
+    def test_the_lock_outlives_in_flight_startup_database_work(
+        self, monkeypatch: Any, tmp_data_dir: Path
+    ) -> None:
+        """A cancelled daemon drops the lock only after its own executor work has finished.
+
+        The startup discovery runs its database reads and writes on an executor thread, and
+        cancelling the daemon does not stop that thread. If the lock were released on the
+        cancellation alone, a second daemon could start while the first one's thread was still
+        writing - the overlap this lock exists to prevent - so the refused holder below is the
+        assertion, and the lock must only be acquirable once the daemon has exited for good.
+        """
+        from live_runner import daemon
+
+        started = threading.Event()
+        unblock = threading.Event()
+        ready = threading.Event()
+        daemon_loop: list[asyncio.AbstractEventLoop] = []
+        daemon_task: list[asyncio.Task[None]] = []
+
+        def _blocking_discovery(**_kwargs: Any) -> list[Any]:
+            started.set()
+            assert unblock.wait(10), "the test never unblocked the startup discovery"
+            return []
+
+        monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _blocking_discovery)
+
+        def _run_daemon() -> None:
+            loop = asyncio.new_event_loop()
+            daemon_loop.append(loop)
+            task = loop.create_task(daemon.run_daemon())
+            daemon_task.append(task)
+            ready.set()
+            try:
+                loop.run_until_complete(task)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+
+        lock_path = daemon.daemon_lock_path()
+        thread = threading.Thread(target=_run_daemon, name="daemon-under-test")
+        probe: Any = None
+        thread.start()
+        try:
+            assert ready.wait(10), "the daemon's event loop never started"
+            assert started.wait(10), "the daemon never reached the startup discovery"
+            daemon_loop[0].call_soon_threadsafe(daemon_task[0].cancel)
+            # While the discovery thread is still writing, a second process must be refused.
+            probe = spawn_holder(lock_path, hold_seconds=30.0)
+            assert read_holder_line(probe) == "refused", (
+                "the lock was released while the daemon's own executor work was still in flight"
+            )
+            unblock.set()
+        finally:
+            thread.join(timeout=30)
+            if probe is not None and probe.poll() is None:
+                probe.kill()
+                probe.wait(timeout=10)
+
+        assert not thread.is_alive(), "the daemon thread did not exit after the cancellation"
+
+        # The daemon exited for good: the lock it held is now free.
+        after = spawn_holder(lock_path, hold_seconds=15.0)
+        try:
+            await_held(after)
+        finally:
+            after.kill()
+            after.wait(timeout=10)
+
 
 class TestLockPath:
     def test_the_lock_sits_next_to_the_live_database(self, tmp_data_dir: Path) -> None:
@@ -187,6 +260,38 @@ class TestLockPath:
         monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@localhost/trading")
 
         assert daemon.daemon_lock_path() == tmp_data_dir / "backtests.db.lock"
+
+    def test_the_lock_resolves_a_symlinked_data_dir(self, monkeypatch: Any, tmp_path: Path) -> None:
+        """Two spellings of one database must select one lock, not two.
+
+        A deployment may symlink its data directory onto another disk. Without the resolve, the
+        daemon would take its lock at the alias while the SYMLINKED database itself sits in the
+        target directory.
+        """
+        from live_runner import daemon
+
+        target = tmp_path / "real-data"
+        target.mkdir()
+        alias = tmp_path / "linked-data"
+        alias.symlink_to(target, target_is_directory=True)
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(alias / 'live.db').as_posix()}")
+
+        assert daemon.daemon_lock_path() == target / "live.db.lock"
+
+    def test_the_lock_follows_the_sqlite_uri_form(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``sqlite:///file:/abs/db.db?uri=true`` is the same database as ``sqlite:////abs/db.db``.
+
+        The ``file:`` prefix is URI syntax the SQLite driver parses, not part of the path; leaving
+        it in would put the lock beside a nonexistent ``file:`` directory.
+        """
+        from live_runner import daemon
+
+        db_file = tmp_path / "live.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///file:{db_file.as_posix()}?uri=true")
+
+        assert daemon.daemon_lock_path() == db_file.with_name("live.db.lock")
 
     def test_the_lock_falls_back_to_the_data_dir_for_an_in_memory_url(
         self, monkeypatch: Any, tmp_data_dir: Path
@@ -259,9 +364,9 @@ class TestRealEntryPoint:
         """
         data_dir = tmp_path / "data"
         lock_path = data_dir / "backtests.db.lock"
-        holder = _spawn_holder(lock_path, hold_seconds=90.0)
+        holder = spawn_holder(lock_path, hold_seconds=90.0)
         try:
-            _await_held(holder)
+            await_held(holder)
             result = _run_daemon_process([], data_dir)
         finally:
             holder.kill()
@@ -281,9 +386,9 @@ class TestRealEntryPoint:
     def test_a_refused_start_leaves_the_running_daemons_lock_alone(self, tmp_path: Path) -> None:
         data_dir = tmp_path / "data"
         lock_path = data_dir / "backtests.db.lock"
-        holder = _spawn_holder(lock_path, hold_seconds=90.0)
+        holder = spawn_holder(lock_path, hold_seconds=90.0)
         try:
-            _await_held(holder)
+            await_held(holder)
             _run_daemon_process([], data_dir)
             with pytest.raises(SingleInstanceError):
                 SingleInstanceLock(lock_path).acquire()
@@ -293,28 +398,3 @@ class TestRealEntryPoint:
 
         SingleInstanceLock(lock_path).acquire().release()
 
-
-def _spawn_holder(lock_path: Path, hold_seconds: float) -> Any:
-    """Start a process that acquires ``lock_path`` and holds it for ``hold_seconds``."""
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(REPO_ROOT) if not existing else os.pathsep.join([str(REPO_ROOT), existing])
-    )
-    return subprocess.Popen(
-        [sys.executable, "-m", "tests.helpers.lock_holder", str(lock_path), str(hold_seconds)],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-def _await_held(holder: Any) -> None:
-    """Block until the holder reports the lock is granted; fail loudly if it died instead."""
-    line = holder.stdout.readline() if holder.stdout is not None else ""
-    if line.strip() != "held":
-        holder.kill()
-        stderr = holder.stderr.read() if holder.stderr is not None else ""
-        pytest.fail(f"the holder never acquired the lock (returncode={holder.poll()}): {stderr}")

@@ -445,10 +445,12 @@ to start the daemon instead (#310).
 exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lock`, or the
 `DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
 exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
-was killed (even `kill -9`) releases it on death and never blocks the next start. A systemd unit
-with `Restart=always` (see `scripts/setup_services.sh`) therefore retries a refused start every
-`RestartSec` and logs the refusal each time: that is the signal to find and stop the other daemon,
-not to delete the lock file - the file is a handle, the lock is the kernel's.
+was killed (even `kill -9`) releases it on death and never blocks the next start. On a clean stop
+the daemon first waits for its in-flight database work, so the lock is never handed on while its own
+writes are still running. A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
+therefore retries a refused start every `RestartSec` and logs the refusal each time: that is the
+signal to find and stop the other daemon, not to delete the lock file - the file is a handle, the
+lock is the kernel's.
 
 **A newer build runs data migrations.** Starting a build whose schema or one-time data migrations
 the running build does not have yet applies them on startup (see "Commission sign migration

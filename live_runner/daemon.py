@@ -164,7 +164,9 @@ def daemon_lock_path() -> Path:
     beside some other file would exclude nobody.
     """
     db_path = live_db_path()
-    return db_path.with_name(f"{db_path.name}.lock")
+    # Resolved first so a symlinked data directory and its target select the same lock file: two
+    # spellings of one database must not be two locks.
+    return db_path.resolve().with_name(f"{db_path.name}.lock")
 
 
 BALANCE_POLL_INTERVAL_SECONDS = 60
@@ -5339,7 +5341,9 @@ async def run_daemon(
     ``SingleInstanceError`` instead of running the schema and data migrations underneath a running
     build - the 2026-11-21 incident, where a ``--help`` invocation started a second daemon that
     migrated the live database under the old one. The operating system owns the lock and releases
-    it when this process exits, including on SIGKILL, so a killed daemon never blocks a restart.
+    it when this process exits, including on SIGKILL, so a killed daemon never blocks a restart. On
+    a clean exit the daemon drains its executor threads first, so it never releases the lock while
+    its own database work is still in flight either.
     """
     lock = SingleInstanceLock(daemon_lock_path())
     try:
@@ -5353,7 +5357,20 @@ async def run_daemon(
     try:
         await _run_daemon_locked(accounts_env=accounts_env)
     finally:
-        lock.release()
+        try:
+            with contextlib.suppress(Exception):
+                # Drain the default executor before the lock goes: an `asyncio.to_thread`
+                # body that is still writing (the startup discovery, a loop iteration's database
+                # work) outlives its cancelled await, and a daemon that released the lock while
+                # its own thread was still writing would hand the next daemon exactly the overlap
+                # this lock exists to prevent. The join is unbounded on purpose: a stop whose
+                # in-flight database work cannot finish must not hand the lock on, and the OS
+                # still releases the lock if the process has to be killed to end it.
+                await asyncio.get_running_loop().shutdown_default_executor()
+        finally:
+            # Released even when the drain is itself interrupted: the contract is that the lock
+            # never outlives the daemon.
+            lock.release()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

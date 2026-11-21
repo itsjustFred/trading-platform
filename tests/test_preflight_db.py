@@ -448,6 +448,19 @@ def test_resolve_db_path_drops_a_query_string_from_the_url(tmp_path: Path, monke
     assert resolve_db_path() == path
 
 
+def test_resolve_db_path_normalizes_the_sqlite_uri_form(tmp_path: Path, monkeypatch) -> None:
+    """``sqlite:///file:/abs/db.db?uri=true`` addresses the same file as ``sqlite:////abs/db.db``.
+
+    The ``file:`` prefix is URI syntax the SQLite driver parses, not a directory: a working
+    database was reported as "Database file not found" while the parser kept the prefix in the
+    path.
+    """
+    path = tmp_path / "backtests.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///file:{path.as_posix()}?uri=true")
+
+    assert resolve_db_path() == path
+
+
 def test_resolve_db_path_decodes_a_percent_encoded_url(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path.as_posix()}/my%20db.db")
 

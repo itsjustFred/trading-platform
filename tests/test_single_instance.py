@@ -20,42 +20,11 @@ the record of the lock.
 from __future__ import annotations
 
 import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 
 from shared.single_instance import SingleInstanceError, SingleInstanceLock
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-HOLDER_MODULE = "tests.helpers.lock_holder"
-
-
-def _spawn_holder(lock_path: Path, hold_seconds: float) -> subprocess.Popen[str]:
-    """Start a process that acquires ``lock_path`` and holds it for ``hold_seconds``."""
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        str(REPO_ROOT) if not existing else os.pathsep.join([str(REPO_ROOT), existing])
-    )
-    return subprocess.Popen(
-        [sys.executable, "-m", HOLDER_MODULE, str(lock_path), str(hold_seconds)],
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-def _await_held(holder: subprocess.Popen[str]) -> None:
-    """Block until the holder reports the lock is granted; fail loudly if it died instead."""
-    line = holder.stdout.readline() if holder.stdout is not None else ""
-    if line.strip() != "held":
-        holder.kill()
-        stderr = holder.stderr.read() if holder.stderr is not None else ""
-        pytest.fail(f"the holder never acquired the lock (returncode={holder.poll()}): {stderr}")
+from tests.helpers.lock_holder import await_held, spawn_holder
 
 
 class TestAcquireAndRelease:
@@ -120,9 +89,9 @@ class TestAcquireAndRelease:
 class TestCrossProcessExclusion:
     def test_a_lock_held_in_another_process_is_refused(self, tmp_path: Path) -> None:
         lock_path = tmp_path / "backtests.db.lock"
-        holder = _spawn_holder(lock_path, hold_seconds=15.0)
+        holder = spawn_holder(lock_path, hold_seconds=15.0)
         try:
-            _await_held(holder)
+            await_held(holder)
 
             with pytest.raises(SingleInstanceError) as excinfo:
                 SingleInstanceLock(lock_path).acquire()
@@ -134,14 +103,38 @@ class TestCrossProcessExclusion:
     def test_a_holder_that_exited_releases_the_lock(self, tmp_path: Path) -> None:
         """A clean exit releases too: the daemon's shutdown path must not strand the lock."""
         lock_path = tmp_path / "backtests.db.lock"
-        holder = _spawn_holder(lock_path, hold_seconds=0.5)
+        holder = spawn_holder(lock_path, hold_seconds=0.5)
         try:
-            _await_held(holder)
+            await_held(holder)
         finally:
             holder.wait(timeout=10)
 
         assert holder.returncode == 0
         SingleInstanceLock(lock_path).acquire().release()
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="creating a symlink needs elevated privileges on Windows"
+    )
+    def test_a_lock_held_through_a_symlink_is_refused_at_the_target(self, tmp_path: Path) -> None:
+        """Two spellings of one lock file are one lock.
+
+        A deployment may reach its data directory through a symlink. Both spellings address the
+        same inode, and the OS lock belongs to the inode, so a holder that acquired through the
+        alias must still refuse a process that goes through the target.
+        """
+        real_path = tmp_path / "real" / "backtests.db.lock"
+        real_path.parent.mkdir()
+        alias_dir = tmp_path / "linked"
+        alias_dir.symlink_to(real_path.parent, target_is_directory=True)
+        alias_path = alias_dir / "backtests.db.lock"
+
+        held = SingleInstanceLock(alias_path)
+        held.acquire()
+        try:
+            with pytest.raises(SingleInstanceError):
+                SingleInstanceLock(real_path).acquire()
+        finally:
+            held.release()
 
     def test_a_killed_holder_does_not_block_a_restart(self, tmp_path: Path) -> None:
         """The stale-lock case: the lock must be owned by the OS, not by a marker file.
@@ -151,9 +144,9 @@ class TestCrossProcessExclusion:
         deleted the file by hand.
         """
         lock_path = tmp_path / "backtests.db.lock"
-        holder = _spawn_holder(lock_path, hold_seconds=60.0)
+        holder = spawn_holder(lock_path, hold_seconds=60.0)
         try:
-            _await_held(holder)
+            await_held(holder)
             holder.kill()
             holder.wait(timeout=10)
         finally:
