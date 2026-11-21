@@ -1779,6 +1779,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
             return
         state = calendar.session_state(now)
+        if state == "unknown":
+            # The calendar cannot speak for ``now`` (e.g. an exchange-session
+            # cache whose fetched range does not reach it): same flat-age
+            # fallback as an unresolved venue — never assume closed.
+            if newest < now - max_age:
+                raise ValueError(
+                    f"Alpaca market data is stale for {symbol}: "
+                    f"newest bar {newest.isoformat()} exceeds {max_age}"
+                )
+            return
         if state == "closed":
             # Legitimate closures (weekends, holidays) can stack to several
             # days; beyond that the feed itself is presumed dead.

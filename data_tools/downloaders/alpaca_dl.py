@@ -23,7 +23,35 @@ from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
 
-ALPACA_CALENDAR_URL = "https://data.alpaca.markets/v2/calendar"
+# ``/v2/calendar`` lives on the TRADING API host, not ``data.alpaca.markets``
+# (the market-data host serves only the /v2/stocks|crypto endpoints). The
+# paper and live environments have separate hosts, so the correct base URL
+# is resolved per run.
+ALPACA_TRADING_BASE_URLS = {
+    True: "https://paper-api.alpaca.markets",
+    False: "https://api.alpaca.markets",
+}
+
+
+def _alpaca_trading_base_url() -> str:
+    """Base URL for the Alpaca trading API hosting ``/v2/calendar``.
+
+    Precedence: explicit ``ALPACA_TRADING_BASE_URL`` override, the standard
+    ``APCA_API_BASE_URL`` env var used by alpaca-py, then the paper/live
+    selection implied by ``ALPACA_PAPER`` (default paper, matching the live
+    adapter's default).
+    """
+    override = os.environ.get("ALPACA_TRADING_BASE_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    standard = os.environ.get("APCA_API_BASE_URL", "").strip()
+    if standard:
+        return standard.rstrip("/")
+    from live_runner.credential_env import parse_bool_env
+
+    paper = parse_bool_env("ALPACA_PAPER", os.environ.get("ALPACA_PAPER"), default=True)
+    return ALPACA_TRADING_BASE_URLS[paper]
+
 
 TIMEFRAME_MAP: dict[str, str] = {
     "m1": "1m",
@@ -76,6 +104,7 @@ def fetch_alpaca_exchange_calendar(
     start: str,
     end: str,
     session: Any | None = None,
+    base_url: str | None = None,
 ) -> list[dict[str, Any]]:
     """GET ``/v2/calendar`` exchange sessions; ``session`` is injectable.
 
@@ -85,8 +114,9 @@ def fetch_alpaca_exchange_calendar(
     import requests
 
     http = session if session is not None else requests
+    url = f"{(base_url or _alpaca_trading_base_url()).rstrip('/')}/v2/calendar"
     response = http.get(
-        ALPACA_CALENDAR_URL,
+        url,
         params={"start": start, "end": end},
         headers={
             "APCA-API-KEY-ID": api_key,
@@ -362,19 +392,26 @@ class AlpacaDownloader(Downloader):
                 if start is not None
                 else fetch_end - pd.Timedelta(days=400)
             )
+            prior = venue_calendar.load_cached_calendar_payload(
+                data_dir=output_dir, source="alpaca", symbol=symbol
+            )
             sessions = fetch_alpaca_exchange_calendar(
                 api_key=self.api_key,
                 secret_key=self.secret_key,
                 start=fetch_start.date().isoformat(),
                 end=fetch_end.date().isoformat(),
+                base_url=_alpaca_trading_base_url(),
             )
-            if not sessions:
+            if not sessions and prior is None:
                 return
             payload = venue_calendar.exchange_sessions_payload(
                 source="alpaca",
                 symbol=symbol,
                 sessions=sessions,
                 schedule_timezone="America/New_York",
+                coverage_start=fetch_start.date().isoformat(),
+                coverage_end=fetch_end.date().isoformat(),
+                prior=prior,
             )
             venue_calendar.save_cached_calendar(
                 data_dir=output_dir,

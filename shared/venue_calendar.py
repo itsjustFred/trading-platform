@@ -186,9 +186,30 @@ class VenueCalendar:
 
     grid_anchor: str = "utc"
 
+    def covers_window(self, start: pd.Timestamp, end: pd.Timestamp) -> bool:
+        """Whether this calendar is authoritative over all of ``[start, end]``.
+
+        Calendars rebuilt from a fetched payload (exchange session lists) only
+        know the range they were fetched for; outside it they must not answer
+        as if every absent date were closed. Built-in calendars cover every
+        window.
+        """
+        return True
+
+    def covers_instant(self, ts: pd.Timestamp) -> bool:
+        """Whether this calendar is authoritative at ``ts``."""
+        return self.covers_window(_as_utc(ts), _as_utc(ts))
+
     def session_state(self, now: pd.Timestamp) -> str:
-        """``open``/``closed``/``unknown`` for live staleness checks."""
+        """``open``/``closed``/``unknown`` for live staleness checks.
+
+        ``unknown`` means the calendar cannot speak for ``now`` (for example
+        a session cache whose fetched range does not reach it); callers must
+        treat it like an unresolved venue, never like ``closed``.
+        """
         now = _as_utc(now)
+        if not self.covers_instant(now):
+            return "unknown"
         return "open" if self.is_trading_instant(now) else "closed"
 
     def to_dict(self) -> dict[str, Any]:
@@ -335,6 +356,12 @@ class ExchangeSessionCalendar(VenueCalendar):
     ``America/New_York``. Early closes (``close="13:00"``) are first-class
     here, which the built-in NYSE model cannot express. Dates absent from the
     payload are closed — holidays need no separate list.
+
+    The payload also records the ``[coverage_start, coverage_end]`` date range
+    the sessions were fetched for. Outside that range the calendar is NOT
+    authoritative: dates absent from the payload may simply never have been
+    fetched, so :meth:`covers_window` reports ``False`` and callers must fall
+    back rather than treating every uncovered day as closed.
     """
 
     def __init__(self, payload: Mapping[str, Any]) -> None:
@@ -358,6 +385,30 @@ class ExchangeSessionCalendar(VenueCalendar):
             if open_t is None or close_t is None or close_t <= open_t:
                 continue
             self.sessions[day] = (open_t, close_t)
+        # Fetched coverage, as UTC instants: [coverage_start 00:00, coverage_end+1 00:00).
+        # A payload without bounds (written before coverage tracking existed)
+        # covers nothing: it cannot prove which dates were ever fetched.
+        self._covered_lo: pd.Timestamp | None = None
+        self._covered_hi: pd.Timestamp | None = None
+        raw_start = payload.get("coverage_start")
+        raw_end = payload.get("coverage_end")
+        try:
+            if raw_start is not None and raw_end is not None:
+                start_day = dt.date.fromisoformat(str(raw_start))
+                end_day = dt.date.fromisoformat(str(raw_end))
+                if end_day >= start_day:
+                    self._covered_lo = pd.Timestamp(start_day, tz=UTC)
+                    self._covered_hi = pd.Timestamp(end_day + dt.timedelta(days=1), tz=UTC)
+        except (TypeError, ValueError):
+            self._covered_lo = None
+            self._covered_hi = None
+
+    def covers_window(self, start: pd.Timestamp, end: pd.Timestamp) -> bool:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if self._covered_lo is None or self._covered_hi is None:
+            return False
+        return self._covered_lo <= start and end <= self._covered_hi
 
     def trading_intervals(
         self, start: pd.Timestamp, end: pd.Timestamp
@@ -409,21 +460,60 @@ def exchange_sessions_payload(
     sessions: Iterable[Mapping[str, Any]],
     schedule_timezone: str = "America/New_York",
     fetched_at: str | None = None,
+    coverage_start: str | None = None,
+    coverage_end: str | None = None,
+    prior: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Cache payload for an exchange-published session list (Alpaca /v2/calendar)."""
-    return {
+    """Cache payload for an exchange-published session list (Alpaca /v2/calendar).
+
+    ``coverage_start``/``coverage_end`` are the ISO dates the fetch covered;
+    the calendar is only authoritative inside them. ``prior`` is an existing
+    payload of the same kind: sessions are merged (new entries win on a date
+    collision) and the coverage range becomes the union, so an incremental
+    download never shrinks what the cache can prove.
+    """
+    merged: dict[str, dict[str, str]] = {}
+    cov_start = coverage_start
+    cov_end = coverage_end
+    stamp = fetched_at
+    if isinstance(prior, Mapping) and prior.get("kind") == "exchange_sessions":
+        for item in prior.get("sessions") or []:
+            if isinstance(item, Mapping) and item.get("date") is not None:
+                merged[str(item["date"])] = {
+                    "date": str(item["date"]),
+                    "open": str(item.get("open") or ""),
+                    "close": str(item.get("close") or ""),
+                }
+        prior_start = prior.get("coverage_start")
+        prior_end = prior.get("coverage_end")
+        if prior_start is not None and (cov_start is None or str(prior_start) < str(cov_start)):
+            cov_start = str(prior_start)
+        if prior_end is not None and (cov_end is None or str(prior_end) > str(cov_end)):
+            cov_end = str(prior_end)
+        prior_stamp = prior.get("fetched_at")
+        if prior_stamp is not None and (stamp is None or str(prior_stamp) > str(stamp)):
+            stamp = str(prior_stamp)
+    for item in sessions:
+        if isinstance(item, Mapping) and item.get("date") is not None:
+            merged[str(item["date"])] = {
+                "date": str(item["date"]),
+                "open": str(item.get("open") or ""),
+                "close": str(item.get("close") or ""),
+            }
+    payload: dict[str, Any] = {
         "kind": "exchange_sessions",
         "name": f"{source}-{symbol.upper()}-exchange",
         "source": source,
         "symbol": symbol.upper(),
         "schedule_timezone": schedule_timezone,
-        "fetched_at": fetched_at or dt.datetime.now(UTC).isoformat(),
-        "sessions": [
-            {"date": str(item["date"]), "open": str(item["open"]), "close": str(item["close"])}
-            for item in sessions
-            if isinstance(item, Mapping) and "date" in item
-        ],
+        "fetched_at": stamp or dt.datetime.now(UTC).isoformat(),
+        "sessions": [merged[key] for key in sorted(merged)],
     }
+    if cov_start is not None:
+        payload["coverage_start"] = str(cov_start)
+    if cov_end is not None:
+        payload["coverage_end"] = str(cov_end)
+    return payload
 
 
 class BrokerScheduleCalendar(VenueCalendar):
@@ -492,7 +582,8 @@ class BrokerScheduleCalendar(VenueCalendar):
                 close_utc = pd.Timestamp(close_local.astimezone(UTC))
                 # Clip against every holiday block overlapping this interval.
                 pieces = [(open_utc, close_utc)]
-                for h_open, h_close in holidays:
+                for holiday_block in holidays:
+                    h_open, h_close = holiday_block.open, holiday_block.close
                     nxt: list[tuple[pd.Timestamp, pd.Timestamp]] = []
                     for lo, hi in pieces:
                         if h_close <= lo or h_open >= hi:
@@ -511,6 +602,145 @@ class BrokerScheduleCalendar(VenueCalendar):
             cursor += dt.timedelta(days=7)
         intervals.sort(key=lambda iv: iv.open)
         return intervals
+
+    # ─── Daily-bar identity ──────────────────────────────────────────────
+    #
+    # A broker CFD trading week (e.g. cTrader FX: Sunday ~22:00 -> Friday
+    # ~22:00) is ONE continuous interval, so the base UTC-date rule would
+    # count the short Sunday-evening tail as a sixth daily bar per week.
+    # Real broker daily bars follow the FX convention instead: five bars per
+    # week, each covering the 24h ending at the broker's daily rollover —
+    # the same local time-of-day the week opens. This is the
+    # ``FxWeekCalendar`` rule generalised to an arbitrary schedule timezone
+    # and open time: a bar is labelled by the local date of its window's
+    # close, and a stamp maps to the window containing it.
+
+    def _daily_anchor(self) -> dt.time:
+        """Local time-of-day anchoring the daily-bar grid.
+
+        The daily rollover sits at the same local time the trading week
+        opens, so the anchor is the earliest interval open's time-of-day in
+        ``schedule_timezone``.
+        """
+        first_open = min(int(start) for start, _ in self.intervals)
+        seconds = first_open % 86_400
+        return dt.time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+
+    def _daily_window(self, day: dt.date) -> tuple[pd.Timestamp, pd.Timestamp]:
+        """``(open, close)`` UTC instants of the daily bar labelled ``day``."""
+        close_local = dt.datetime.combine(day, self._daily_anchor(), tzinfo=self.zone)
+        open_local = close_local - dt.timedelta(days=1)
+        return (
+            pd.Timestamp(open_local.astimezone(UTC)),
+            pd.Timestamp(close_local.astimezone(UTC)),
+        )
+
+    def daily_bar_dates(self, start: pd.Timestamp, end: pd.Timestamp) -> set[dt.date]:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        dates: set[dt.date] = set()
+        first_day = start.tz_convert(self.zone).date() - dt.timedelta(days=2)
+        last_day = end.tz_convert(self.zone).date() + dt.timedelta(days=2)
+        day = first_day
+        while day <= last_day:
+            lo, hi = self._daily_window(day)
+            # A daily bar can only exist once its window has closed inside
+            # the segment; a window still open at ``end`` is not expected.
+            if hi <= end and hi > start:
+                clipped_lo = max(lo, start)
+                clipped_hi = min(hi, end)
+                if self.trading_minutes_between(clipped_lo, clipped_hi) > 0:
+                    dates.add(day)
+            day += dt.timedelta(days=1)
+        return dates
+
+    def daily_bar_date(self, ts: pd.Timestamp) -> dt.date | None:
+        ts = _as_utc(ts)
+        local_day = ts.tz_convert(self.zone).date()
+        for day in (
+            local_day - dt.timedelta(days=2),
+            local_day - dt.timedelta(days=1),
+            local_day,
+            local_day + dt.timedelta(days=1),
+            local_day + dt.timedelta(days=2),
+        ):
+            lo, hi = self._daily_window(day)
+            if lo < ts <= hi:
+                # A stamp inside a window with no trading at all is surplus;
+                # the same window is also absent from ``daily_bar_dates``.
+                if self.trading_minutes_between(lo, hi) > 0:
+                    return day
+                return None
+        return None
+
+    def with_extra_closures(self, dates: Iterable[dt.date]) -> "BrokerScheduleCalendar":
+        """A copy of this calendar with additional full-day closures.
+
+        Used for the documented historical-holiday tolerance: the cached
+        ``ProtoOAHoliday`` list only names the CURRENT year's non-recurring
+        closures, so past dates that were really closed are indistinguishable
+        from missing data. Treating plausible closure dates (the built-in
+        US-market holiday model) as closed lets the coverage gate forgive
+        exactly those days — and nothing else.
+        """
+        epoch = dt.date(1970, 1, 1)
+        holidays = [dict(item) for item in self.holidays]
+        existing = {
+            (item.get("is_recurring"), int(item.get("date_days", -1)))
+            for item in holidays
+        }
+        for day in dates:
+            entry = {
+                "date_days": (day - epoch).days,
+                "is_recurring": False,
+                "start_second": None,
+                "end_second": None,
+            }
+            key = (False, int(entry["date_days"]))
+            if key not in existing:
+                holidays.append(entry)
+                existing.add(key)
+        return BrokerScheduleCalendar(
+            {
+                "kind": "broker_schedule",
+                "name": self.name,
+                "source": self.source,
+                "schedule_timezone": self.schedule_timezone,
+                "schedule": [
+                    {"start_second": start, "end_second": end}
+                    for start, end in self.intervals
+                ],
+                "holidays": holidays,
+            }
+        )
+
+
+def us_holiday_tolerant_calendar(
+    calendar: VenueCalendar,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> VenueCalendar:
+    """Calendar treating plausible US-market closure dates as closed.
+
+    Only ``BrokerScheduleCalendar`` gets a tolerant copy: its cached holiday
+    list names only the current year's non-recurring closures, so a segment
+    crossing a PAST broker holiday fails the strict gap/density checks even
+    though the venue really was closed. The built-in US-exchange holiday model
+    (:mod:`shared.market_calendar`) supplies the plausible closure dates —
+    metals/index/energy CFDs largely follow it, and for FX it is a documented
+    over-approximation (a real one-day hole on e.g. July 4 would be excused;
+    multi-day holes still fail). Every other calendar type is returned
+    unchanged.
+    """
+    if not isinstance(calendar, BrokerScheduleCalendar):
+        return calendar
+    first = _as_utc(start).date() - dt.timedelta(days=1)
+    last = _as_utc(end).date() + dt.timedelta(days=1)
+    plausible = market_calendar.holidays(first, last)
+    if not plausible:
+        return calendar
+    tolerant = calendar.with_extra_closures(plausible)
+    return tolerant
 
 
 def _as_utc(ts: pd.Timestamp) -> pd.Timestamp:
@@ -702,9 +932,24 @@ def load_cached_calendar(
     source: str,
     symbol: str,
 ) -> VenueCalendar | None:
-    """Load a cached broker calendar; any malformed payload fails closed."""
+    """Load a cached broker calendar; any malformed payload fails closed.
+
+    A missing cache file is the normal state for most symbols, not an error:
+    it returns ``None`` silently. Only an existing-but-unusable file warns.
+    """
     try:
         path = _calendar_cache_path(data_dir, source, symbol)
+    except Exception as exc:
+        logger.warning(
+            "Ignoring unusable venue calendar cache for %s/%s: %s",
+            source,
+            symbol,
+            exc,
+        )
+        return None
+    if not path.exists():
+        return None
+    try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return None
@@ -729,6 +974,27 @@ def load_cached_calendar(
         )
         return None
     return None
+
+
+def load_cached_calendar_payload(
+    *,
+    data_dir: str | Path,
+    source: str,
+    symbol: str,
+) -> dict[str, Any] | None:
+    """Raw cached calendar payload, or ``None`` when absent/unusable.
+
+    Unlike :func:`load_cached_calendar` this does not interpret ``kind``;
+    writers use it to merge an incremental fetch into the existing cache.
+    """
+    path = _calendar_cache_path(data_dir, source, symbol)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def save_cached_calendar(
@@ -810,7 +1076,13 @@ def resolve_venue_calendar(
             )
             if cached is not None:
                 return cached
-        elif src == "alpaca" and (not asset or asset in US_EQUITY_ASSET_CLASSES):
+        elif src == "alpaca" and (
+            asset in US_EQUITY_ASSET_CLASSES
+            or (not asset and _is_us_equity_symbol(normalized))
+        ):
+            # The exchange-session cache only ever describes US equity
+            # venues: without asset metadata a crypto/FX-shaped symbol must
+            # not pick up NYSE sessions from a stray cache entry.
             cached = load_cached_calendar(
                 data_dir=data_dir, source="alpaca", symbol=normalized
             )

@@ -482,3 +482,373 @@ def test_live_crypto_fresh_bar_passes():
     now = pd.Timestamp("2024-01-10T15:00:00Z")
     newest = pd.Timestamp("2024-01-10T10:00:00Z")
     _staleness_check("BTCUSD", "1h", True, newest, now)
+
+
+# ─── Session-cache coverage bounds (#133 fix round) ──────────────────────────
+
+
+def _session_cache_payload(
+    *,
+    coverage_start: str | None = None,
+    coverage_end: str | None = None,
+    sessions: list[dict] | None = None,
+) -> dict:
+    payload = {
+        "kind": "exchange_sessions",
+        "name": "alpaca-AAPL-exchange",
+        "source": "alpaca",
+        "schedule_timezone": "America/New_York",
+        "sessions": sessions
+        if sessions is not None
+        else [
+            {"date": "2024-07-03", "open": "09:30", "close": "16:00"},
+            {"date": "2024-07-05", "open": "09:30", "close": "16:00"},
+        ],
+    }
+    if coverage_start is not None:
+        payload["coverage_start"] = coverage_start
+    if coverage_end is not None:
+        payload["coverage_end"] = coverage_end
+    return payload
+
+
+def test_exchange_session_cache_is_only_authoritative_inside_coverage():
+    calendar = ExchangeSessionCalendar(
+        _session_cache_payload(
+            coverage_start="2024-07-01", coverage_end="2024-07-31"
+        )
+    )
+    inside = pd.Timestamp("2024-07-10T15:00:00Z")
+    before = pd.Timestamp("2024-01-10T15:00:00Z")
+    after = pd.Timestamp("2025-01-10T15:00:00Z")
+    assert calendar.covers_window(
+        pd.Timestamp("2024-07-02T00:00:00Z"), pd.Timestamp("2024-07-30T00:00:00Z")
+    )
+    assert not calendar.covers_window(
+        pd.Timestamp("2024-01-02T00:00:00Z"), pd.Timestamp("2024-01-30T00:00:00Z")
+    )
+    assert calendar.session_state(inside) in {"open", "closed"}
+    # Outside the fetched range the calendar must not claim the venue is
+    # closed — "unknown" sends callers to the flat-age fallback.
+    assert calendar.session_state(before) == "unknown"
+    assert calendar.session_state(after) == "unknown"
+
+
+def test_exchange_session_cache_without_bounds_covers_nothing():
+    """Pre-coverage-tracking payloads cannot prove which dates were fetched."""
+    calendar = ExchangeSessionCalendar(_session_cache_payload())
+    assert not calendar.covers_window(
+        pd.Timestamp("2024-07-02T00:00:00Z"), pd.Timestamp("2024-07-30T00:00:00Z")
+    )
+    assert calendar.session_state(pd.Timestamp("2024-07-10T15:00:00Z")) == "unknown"
+
+
+def test_partial_session_cache_falls_back_to_nyse_for_coverage(tmp_path: Path):
+    """A cache fetched for 2026 must not vacuously 'cover' a 2024 segment."""
+    _write_cache(
+        tmp_path,
+        "alpaca",
+        "AAPL",
+        _session_cache_payload(
+            coverage_start="2026-01-01",
+            coverage_end="2026-12-31",
+            sessions=[{"date": "2026-01-05", "open": "09:30", "close": "16:00"}],
+        ),
+    )
+    # Dense NYSE-weekday daily bars in Jan 2024.
+    stamps = [
+        ts.isoformat()
+        for ts in pd.date_range("2024-01-01", "2024-01-31", freq="B", tz="UTC")
+    ]
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "alpaca", "equity", "US", "AAPL", "1d.parquet"],
+        stamps,
+    )
+    assert _coverage(
+        symbol="AAPL", timeframe="1d",
+        start="2024-01-01", end="2024-01-31", data_dir=tmp_path,
+    )
+    # One stray bar is still not coverage: the fallback is NYSE, not 24/7.
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "alpaca", "equity", "US", "MSFT", "1d.parquet"],
+        ["2024-01-02T00:00:00+00:00"],
+    )
+    _write_cache(
+        tmp_path,
+        "alpaca",
+        "MSFT",
+        _session_cache_payload(
+            coverage_start="2026-01-01",
+            coverage_end="2026-12-31",
+            sessions=[{"date": "2026-01-05", "open": "09:30", "close": "16:00"}],
+        ),
+    )
+    assert not _coverage(
+        symbol="MSFT", timeframe="1d",
+        start="2024-01-01", end="2024-01-31", data_dir=tmp_path,
+    )
+
+
+def test_live_unknown_session_state_uses_flat_age_rule(tmp_path, monkeypatch):
+    """A session cache that does not reach 'now' must not read as closed."""
+    import live_runner.alpaca_adapter as alpaca_adapter
+
+    _write_cache(
+        tmp_path,
+        "alpaca",
+        "AAPL",
+        _session_cache_payload(
+            coverage_start="2024-01-01",
+            coverage_end="2024-01-31",
+            sessions=[{"date": "2024-01-02", "open": "09:30", "close": "16:00"}],
+        ),
+    )
+    monkeypatch.setattr(alpaca_adapter, "DATA_DIR", tmp_path)
+    now = pd.Timestamp("2024-06-10T15:00:00Z")  # far past the cache range
+    # Two days old: inside the flat 5-day intraday fallback -> not stale.
+    _staleness_check("AAPL", "1h", False, pd.Timestamp("2024-06-08T15:00:00Z"), now)
+    # Eight days old: past the flat fallback -> stale (never 'closed').
+    with pytest.raises(ValueError, match="stale"):
+        _staleness_check("AAPL", "1h", False, pd.Timestamp("2024-06-01T15:00:00Z"), now)
+
+
+def test_incremental_session_cache_merges_coverage(tmp_path: Path, monkeypatch):
+    """A second, narrower fetch must not shrink what the cache can prove."""
+    import data_tools.downloaders.alpaca_dl as alpaca_dl
+    from data_tools.downloaders.alpaca_dl import AlpacaDownloader
+
+    responses = iter(
+        [
+            [{"date": "2024-01-02", "open": "09:30", "close": "16:00"}],
+            [{"date": "2024-03-01", "open": "09:30", "close": "16:00"}],
+        ]
+    )
+    monkeypatch.setattr(
+        alpaca_dl,
+        "fetch_alpaca_exchange_calendar",
+        lambda **kwargs: next(responses),
+    )
+    downloader = AlpacaDownloader(api_key="k", secret_key="s")
+    downloader._cache_exchange_calendar(
+        tmp_path, "AAPL", pd.Timestamp("2024-01-01", tz="UTC"),
+        pd.Timestamp("2024-01-31", tz="UTC"),
+    )
+    downloader._cache_exchange_calendar(
+        tmp_path, "AAPL", pd.Timestamp("2024-03-01", tz="UTC"),
+        pd.Timestamp("2024-03-31", tz="UTC"),
+    )
+    calendar = load_cached_calendar(data_dir=tmp_path, source="alpaca", symbol="AAPL")
+    assert isinstance(calendar, ExchangeSessionCalendar)
+    assert set(calendar.sessions) == {
+        pd.Timestamp("2024-01-02").date(),
+        pd.Timestamp("2024-03-01").date(),
+    }
+    # The union of both fetched ranges stays covered.
+    assert calendar.covers_window(
+        pd.Timestamp("2024-01-15T00:00:00Z"), pd.Timestamp("2024-03-15T00:00:00Z")
+    )
+
+
+def test_alpaca_calendar_uses_the_trading_api_host(monkeypatch):
+    import data_tools.downloaders.alpaca_dl as alpaca_dl
+
+    for var in ("ALPACA_TRADING_BASE_URL", "APCA_API_BASE_URL", "ALPACA_PAPER"):
+        monkeypatch.delenv(var, raising=False)
+    assert alpaca_dl._alpaca_trading_base_url() == "https://paper-api.alpaca.markets"
+
+    monkeypatch.setenv("ALPACA_PAPER", "false")
+    assert alpaca_dl._alpaca_trading_base_url() == "https://api.alpaca.markets"
+
+    monkeypatch.setenv("APCA_API_BASE_URL", "https://custom.example.com/")
+    assert alpaca_dl._alpaca_trading_base_url() == "https://custom.example.com"
+
+    monkeypatch.setenv("ALPACA_TRADING_BASE_URL", "https://override.example.com")
+    assert alpaca_dl._alpaca_trading_base_url() == "https://override.example.com"
+
+
+def test_alpaca_session_fetch_hits_trading_host_not_data_host(monkeypatch):
+    from data_tools.downloaders.alpaca_dl import fetch_alpaca_exchange_calendar
+
+    monkeypatch.delenv("ALPACA_TRADING_BASE_URL", raising=False)
+    monkeypatch.delenv("APCA_API_BASE_URL", raising=False)
+    monkeypatch.delenv("ALPACA_PAPER", raising=False)
+    calls = {}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class _Session:
+        def get(self, url, **kwargs):
+            calls["url"] = url
+            return _Response()
+
+    fetch_alpaca_exchange_calendar(
+        api_key="k", secret_key="s",
+        start="2024-07-01", end="2024-07-31", session=_Session(),
+    )
+    assert calls["url"] == "https://paper-api.alpaca.markets/v2/calendar"
+
+
+def test_alpaca_cache_is_never_used_for_crypto_symbols(tmp_path: Path):
+    """A stray Alpaca cache must not give BTCUSD NYSE sessions."""
+    _write_cache(
+        tmp_path,
+        "alpaca",
+        "BTCUSD",
+        _session_cache_payload(),
+    )
+    calendar = resolve_venue_calendar(
+        symbol="BTCUSD", asset_class="crypto", source="alpaca", data_dir=tmp_path
+    )
+    assert isinstance(calendar, ContinuousCalendar)
+    calendar = resolve_venue_calendar(
+        symbol="BTCUSD", source="alpaca", data_dir=tmp_path
+    )
+    assert isinstance(calendar, ContinuousCalendar)
+
+
+# ─── Broker-schedule daily bars + historical holidays (#133 fix round) ───────
+
+# cTrader FX/CFD week: Sunday 22:00 -> Friday 22:00 UTC.
+_FX_SCHEDULE = {"start_second": 22 * 3600, "end_second": 5 * 86400 + 22 * 3600}
+
+
+def _broker_schedule_calendar(holidays: list[dict] | None = None) -> BrokerScheduleCalendar:
+    return BrokerScheduleCalendar(
+        {
+            "kind": "broker_schedule",
+            "name": "ctrader-XAUUSD",
+            "source": "ctrader",
+            "symbol": "XAUUSD",
+            "schedule_timezone": "UTC",
+            "schedule": [_FX_SCHEDULE],
+            "holidays": holidays or [],
+        }
+    )
+
+
+def test_broker_schedule_daily_bars_follow_the_week_rollover():
+    """Sun22->Fri22 yields FIVE daily bars/week, not a Sunday sixth."""
+    calendar = _broker_schedule_calendar()
+    # Mon 2024-01-08 .. Sun 2024-01-14.
+    dates = calendar.daily_bar_dates(
+        pd.Timestamp("2024-01-08T00:00:00Z"), pd.Timestamp("2024-01-14T23:59:59Z")
+    )
+    assert dates == {
+        pd.Timestamp(d).date()
+        for d in ("2024-01-08", "2024-01-09", "2024-01-10", "2024-01-11", "2024-01-12")
+    }
+    # Weekday stamps label their own bar.
+    for day in range(8, 13):
+        assert calendar.daily_bar_date(
+            pd.Timestamp(f"2024-01-{day:02d}T21:00:00Z")
+        ) == pd.Timestamp(f"2024-01-{day:02d}").date()
+    # A stamp inside the closed weekend tail is surplus, not a daily bar.
+    assert calendar.daily_bar_date(pd.Timestamp("2024-01-14T10:00:00Z")) is None
+    # The Sunday-evening reopen belongs to Monday's bar.
+    assert calendar.daily_bar_date(pd.Timestamp("2024-01-14T23:00:00Z")) == pd.Timestamp(
+        "2024-01-15"
+    ).date()
+
+
+def test_ctrader_metals_daily_coverage_counts_five_bars_per_week(tmp_path: Path):
+    """Real-shaped cTrader daily bars (Mon-Fri) must pass the 1d gate."""
+    _write_cache(
+        tmp_path,
+        "ctrader",
+        "XAUUSD",
+        {
+            "kind": "broker_schedule",
+            "name": "ctrader-XAUUSD",
+            "source": "ctrader",
+            "symbol": "XAUUSD",
+            "schedule_timezone": "UTC",
+            "schedule": [_FX_SCHEDULE],
+            "holidays": [],
+        },
+    )
+    stamps = [
+        f"2024-01-{day:02d}T21:00:00+00:00" for day in range(8, 13)
+    ]
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "ctrader", "metals", "XAUUSD", "1d.parquet"],
+        stamps,
+    )
+    assert _coverage(
+        symbol="XAUUSD", timeframe="1d",
+        start="2024-01-08", end="2024-01-14", data_dir=tmp_path,
+    )
+
+
+def _holiday_epoch_days(day: str) -> int:
+    import datetime as _dt
+
+    return (_dt.date.fromisoformat(day) - _dt.date(1970, 1, 1)).days
+
+
+def test_past_broker_holiday_is_tolerated_for_historical_segments(tmp_path: Path):
+    """The cached holiday list only names the CURRENT year; a 2023 Christmas
+    closure must not fail a Dec-2023 coverage segment."""
+    holiday_2026_only = [
+        {
+            "date_days": _holiday_epoch_days("2026-12-25"),
+            "is_recurring": False,
+            "start_second": None,
+            "end_second": None,
+        }
+    ]
+    for symbol in ("XAUUSD", "XAGUSD"):
+        _write_cache(
+            tmp_path,
+            "ctrader",
+            symbol,
+            {
+                "kind": "broker_schedule",
+                "name": f"ctrader-{symbol}",
+                "source": "ctrader",
+                "symbol": symbol,
+                "schedule_timezone": "UTC",
+                "schedule": [_FX_SCHEDULE],
+                "holidays": holiday_2026_only,
+            },
+        )
+    # Hourly bars Dec 18-22 and Dec 26-29 2023; closed all of Monday Dec 25
+    # (Christmas — a real venue closure the cache does not list for 2023).
+    trading_days = ["2023-12-18", "2023-12-19", "2023-12-20", "2023-12-21",
+                    "2023-12-22", "2023-12-26", "2023-12-27", "2023-12-28",
+                    "2023-12-29"]
+    stamps = [
+        ts.isoformat()
+        for day in trading_days
+        for ts in pd.date_range(f"{day}T00:00", f"{day}T23:00", freq="1h", tz="UTC")
+    ]
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "dukascopy", "metals", "XAUUSD", "1h.parquet"],
+        stamps,
+    )
+    assert _coverage(
+        symbol="XAUUSD", timeframe="1h",
+        start="2023-12-18", end="2023-12-29T23:00", data_dir=tmp_path,
+    )
+    # Control: the same window missing an EXTRA ordinary day (Dec 27 is not a
+    # US-market closure) must still fail — tolerance forgives holidays only.
+    stamps_missing_extra = [
+        ts for ts in stamps if not ts.startswith("2023-12-27")
+    ]
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "dukascopy", "metals", "XAGUSD", "1h.parquet"],
+        stamps_missing_extra,
+    )
+    assert not _coverage(
+        symbol="XAGUSD", timeframe="1h",
+        start="2023-12-18", end="2023-12-29T23:00", data_dir=tmp_path,
+    )
