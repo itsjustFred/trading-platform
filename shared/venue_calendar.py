@@ -1,0 +1,682 @@
+"""Venue-aware trading-session calendars for coverage and staleness checks.
+
+The coverage gate used to assume a US-equity weekday calendar for every
+series.  That is wrong for crypto (24/7) and FX (24/5 with a Sunday-evening
+reopen), and it is only an approximation for broker CFDs whose sessions,
+breaks and holidays come from the broker itself.
+
+This module keeps the calendar model in-repo (no new dependency) and exposes
+one resolution path for both batch coverage checks and live staleness:
+
+* broker calendars win when a cached schedule exists (Alpaca ``/v2/calendar``
+  for US equities, cTrader ``ProtoOASymbol.schedule`` for cTrader symbols);
+* otherwise a built-in model is used only when the venue is unambiguous:
+  crypto -> 24/7, FX -> 24/5 New-York-week, US equity -> NYSE regular
+  sessions;
+* anything else resolves to ``None`` and callers must fail closed.
+
+Observed bar timestamps are never used to infer session hours here; they are
+diagnostic only.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Mapping, Sequence
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+from shared import market_calendar
+
+logger = logging.getLogger(__name__)
+
+UTC = dt.timezone.utc
+SECONDS_PER_WEEK = 7 * 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class TradingInterval:
+    """One half-open ``[open, close)`` trading interval in UTC."""
+
+    open: pd.Timestamp
+    close: pd.Timestamp
+
+    def __post_init__(self) -> None:
+        if self.open.tzinfo is None or self.close.tzinfo is None:
+            raise ValueError("TradingInterval bounds must be timezone-aware")
+        if self.close <= self.open:
+            raise ValueError("TradingInterval close must be after open")
+
+
+class VenueCalendar:
+    """Session model for one symbol/venue.
+
+    ``trading_intervals`` is the authoritative primitive: expected bars,
+    trading-minute gaps and live open/closed state are all derived from it so
+    the same model answers every question.
+    """
+
+    name: str = "unknown"
+    source: str = "builtin"
+
+    def trading_intervals(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> list[TradingInterval]:
+        raise NotImplementedError
+
+    def is_trading_instant(self, ts: pd.Timestamp) -> bool:
+        ts = _as_utc(ts)
+        # trading_intervals() returns [] for an empty [start, end) range, so a
+        # point query needs a small window around the instant. Two microseconds
+        # is enough: every implementation clips intervals to [start, end) and
+        # keeps pieces with hi > lo, so an instant strictly inside a session
+        # always yields a non-empty piece containing it.
+        probe = pd.Timedelta(microseconds=1)
+        return any(
+            iv.open <= ts < iv.close
+            for iv in self.trading_intervals(ts - probe, ts + probe)
+        )
+
+    def trading_minutes_between(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> float:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end <= start:
+            return 0.0
+        total = 0.0
+        for iv in self.trading_intervals(start, end):
+            overlap_start = max(start, iv.open)
+            overlap_end = min(end, iv.close)
+            if overlap_end > overlap_start:
+                total += (overlap_end - overlap_start).total_seconds() / 60.0
+        return total
+
+    def expected_bars(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        step_minutes: float,
+    ) -> int:
+        """Expected bar *start* instants inside trading time.
+
+        Intraday grids are aligned to the interval open for session calendars
+        and to the UTC epoch for continuous calendars (FX/crypto bars are
+        clock-aligned, not session-open-aligned).  Daily+ bars count trading
+        dates, matching the stamped-date convention used by the repo's daily
+        series.
+        """
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end < start or step_minutes <= 0:
+            return 0
+        if step_minutes >= 10080.0:
+            # Weekly bars exist for every venue and are sparse enough that the
+            # old wall-clock grid is the documented convention.
+            steps = int((end - start).total_seconds() / 60.0 // step_minutes)
+            return steps + 1
+        if step_minutes >= 1440.0:
+            return self._expected_daily_bars(start, end, step_minutes)
+        return self._expected_intraday_bars(start, end, step_minutes)
+
+    def _expected_intraday_bars(
+        self, start: pd.Timestamp, end: pd.Timestamp, step_minutes: float
+    ) -> int:
+        count = 0
+        step = pd.Timedelta(minutes=step_minutes)
+        for iv in self.trading_intervals(start, end):
+            first = max(start, iv.open)
+            last = min(end, iv.close - pd.Timedelta(microseconds=1))
+            if last < first:
+                continue
+            if self.grid_anchor == "session_open":
+                offset = math.ceil(
+                    (first - iv.open).total_seconds() / (step_minutes * 60.0)
+                )
+                instant = iv.open + pd.Timedelta(minutes=offset * step_minutes)
+            else:
+                # Epoch-aligned grid (UTC clock bars).
+                epoch = pd.Timestamp(0, tz=UTC)
+                offset = math.ceil(
+                    (first - epoch).total_seconds() / (step_minutes * 60.0)
+                )
+                instant = epoch + pd.Timedelta(minutes=offset * step_minutes)
+            while instant <= last:
+                count += 1
+                instant += step
+        return count
+
+    def _expected_daily_bars(
+        self, start: pd.Timestamp, end: pd.Timestamp, step_minutes: float
+    ) -> int:
+        # Count grid instants (daily cadence anchored at `start`, as before)
+        # whose UTC date has any trading time.  This keeps the stamped-date
+        # convention: a daily bar is labelled by the date it summarises.
+        step = pd.Timedelta(minutes=step_minutes)
+        instant = start
+        count = 0
+        trading_dates: set[pd.Timestamp] = set()
+        probe = start.normalize()
+        while probe <= end.normalize() + pd.Timedelta(days=1):
+            day_start = probe.tz_localize(UTC) if probe.tzinfo is None else probe
+            if self.trading_minutes_between(day_start, day_start + pd.Timedelta(days=1)) > 0:
+                trading_dates.add(day_start.normalize())
+            probe += pd.Timedelta(days=1)
+        while instant <= end:
+            if instant.normalize() in trading_dates:
+                count += 1
+            instant += step
+        return count
+
+    grid_anchor: str = "utc"
+
+    def session_state(self, now: pd.Timestamp) -> str:
+        """``open``/``closed``/``unknown`` for live staleness checks."""
+        now = _as_utc(now)
+        return "open" if self.is_trading_instant(now) else "closed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "source": self.source}
+
+
+class ContinuousCalendar(VenueCalendar):
+    """24/7 venue (crypto)."""
+
+    def __init__(self, name: str = "crypto-24x7") -> None:
+        self.name = name
+        self.source = "builtin"
+        self.grid_anchor = "utc"
+
+    def trading_intervals(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> list[TradingInterval]:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end <= start:
+            return []
+        return [TradingInterval(start, end)]
+
+
+class FxWeekCalendar(VenueCalendar):
+    """FX 24/5: Sunday 17:00 -> Friday 17:00 America/New_York, DST-aware."""
+
+    def __init__(self) -> None:
+        self.name = "fx-24x5"
+        self.source = "builtin"
+        self.grid_anchor = "utc"
+        self.zone = ZoneInfo("America/New_York")
+
+    def trading_intervals(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> list[TradingInterval]:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end <= start:
+            return []
+        intervals: list[TradingInterval] = []
+        # Each trading week opens Sunday 17:00 ET and closes Friday 17:00 ET.
+        # Walk week-open candidates around the range; the close is 5 days later.
+        cursor = (start - pd.Timedelta(days=8)).tz_convert(self.zone).date()
+        last = (end + pd.Timedelta(days=8)).tz_convert(self.zone).date()
+        while cursor <= last:
+            # Sunday of this calendar week in New York local time.
+            days_ahead = (6 - cursor.weekday()) % 7  # weekday(): Mon=0..Sun=6
+            sunday = cursor + dt.timedelta(days=days_ahead)
+            open_local = dt.datetime.combine(sunday, dt.time(17, 0), tzinfo=self.zone)
+            close_local = open_local + dt.timedelta(days=5)
+            open_utc = pd.Timestamp(open_local.astimezone(UTC))
+            close_utc = pd.Timestamp(close_local.astimezone(UTC))
+            lo = max(start, open_utc)
+            hi = min(end, close_utc)
+            if hi > lo:
+                intervals.append(TradingInterval(lo, hi))
+            cursor += dt.timedelta(days=7)
+        return intervals
+
+
+class NyseCalendar(VenueCalendar):
+    """US equity regular sessions via shared.market_calendar."""
+
+    def __init__(self, name: str = "nyse-regular") -> None:
+        self.name = name
+        self.source = "builtin"
+        self.grid_anchor = "session_open"
+
+    def trading_intervals(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> list[TradingInterval]:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end <= start:
+            return []
+        first_day = start.tz_convert(market_calendar.US_EASTERN).date() - dt.timedelta(days=1)
+        last_day = end.tz_convert(market_calendar.US_EASTERN).date() + dt.timedelta(days=1)
+        intervals: list[TradingInterval] = []
+        for day in market_calendar.sessions_in_range(first_day, last_day):
+            open_utc = pd.Timestamp(market_calendar.session_open_utc(day))
+            close_utc = pd.Timestamp(market_calendar.session_close_utc(day))
+            lo = max(start, open_utc)
+            hi = min(end, close_utc)
+            if hi > lo:
+                intervals.append(TradingInterval(lo, hi))
+        return intervals
+
+
+class ExchangeSessionCalendar(VenueCalendar):
+    """Calendar rebuilt from an exchange's published session list.
+
+    This is the shape Alpaca ``/v2/calendar`` returns for US equities: one
+    entry per trading day with ``open``/``close`` clock times in
+    ``America/New_York``. Early closes (``close="13:00"``) are first-class
+    here, which the built-in NYSE model cannot express. Dates absent from the
+    payload are closed — holidays need no separate list.
+    """
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        self.name = str(payload.get("name") or "exchange-sessions")
+        self.source = str(payload.get("source") or "broker")
+        self.grid_anchor = "session_open"
+        try:
+            self.zone = ZoneInfo(str(payload.get("schedule_timezone") or "America/New_York"))
+        except Exception:
+            self.zone = ZoneInfo("America/New_York")
+        self.sessions: dict[dt.date, tuple[dt.time, dt.time]] = {}
+        for item in payload.get("sessions") or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                day = dt.date.fromisoformat(str(item["date"]))
+                open_t = _parse_hhmm(item.get("open"))
+                close_t = _parse_hhmm(item.get("close"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if open_t is None or close_t is None or close_t <= open_t:
+                continue
+            self.sessions[day] = (open_t, close_t)
+
+    def trading_intervals(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> list[TradingInterval]:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end <= start or not self.sessions:
+            return []
+        first_day = start.tz_convert(self.zone).date() - dt.timedelta(days=1)
+        last_day = end.tz_convert(self.zone).date() + dt.timedelta(days=1)
+        intervals: list[TradingInterval] = []
+        day = first_day
+        while day <= last_day:
+            bounds = self.sessions.get(day)
+            if bounds is not None:
+                open_local = dt.datetime.combine(day, bounds[0], tzinfo=self.zone)
+                close_local = dt.datetime.combine(day, bounds[1], tzinfo=self.zone)
+                open_utc = pd.Timestamp(open_local.astimezone(UTC))
+                close_utc = pd.Timestamp(close_local.astimezone(UTC))
+                lo = max(start, open_utc)
+                hi = min(end, close_utc)
+                if hi > lo:
+                    intervals.append(TradingInterval(lo, hi))
+            day += dt.timedelta(days=1)
+        return intervals
+
+
+def _parse_hhmm(value: Any) -> dt.time | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return dt.time(hour, minute)
+
+
+def exchange_sessions_payload(
+    *,
+    source: str,
+    symbol: str,
+    sessions: Iterable[Mapping[str, Any]],
+    schedule_timezone: str = "America/New_York",
+    fetched_at: str | None = None,
+) -> dict[str, Any]:
+    """Cache payload for an exchange-published session list (Alpaca /v2/calendar)."""
+    return {
+        "kind": "exchange_sessions",
+        "name": f"{source}-{symbol.upper()}-exchange",
+        "source": source,
+        "symbol": symbol.upper(),
+        "schedule_timezone": schedule_timezone,
+        "fetched_at": fetched_at or dt.datetime.now(UTC).isoformat(),
+        "sessions": [
+            {"date": str(item["date"]), "open": str(item["open"]), "close": str(item["close"])}
+            for item in sessions
+            if isinstance(item, Mapping) and "date" in item
+        ],
+    }
+
+
+class BrokerScheduleCalendar(VenueCalendar):
+    """Calendar rebuilt from a cached broker session schedule.
+
+    cTrader ``ProtoOAInterval`` values are seconds from Sunday 00:00 in
+    ``scheduleTimeZone``; ``ProtoOAHoliday`` dates are days since 1970-01-01.
+    The cache stores those raw fields plus ``fetched_at`` so historical windows
+    can be approximated by the current schedule (documented tolerance).
+    """
+
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        self.name = str(payload.get("name") or "broker-schedule")
+        self.source = str(payload.get("source") or "broker")
+        self.schedule_timezone = str(payload.get("schedule_timezone") or "UTC")
+        try:
+            self.zone = ZoneInfo(self.schedule_timezone)
+        except Exception:
+            self.zone = ZoneInfo("UTC")
+        self.intervals = [
+            (int(item["start_second"]), int(item["end_second"]))
+            for item in payload.get("schedule") or []
+            if isinstance(item, Mapping)
+            and "start_second" in item
+            and "end_second" in item
+        ]
+        self.holidays = _normalise_holidays(payload.get("holidays") or [])
+        self.grid_anchor = "utc"
+
+    def _week_base(self, moment: dt.datetime) -> dt.datetime:
+        local = moment.astimezone(self.zone)
+        days_since_sunday = (local.weekday() + 1) % 7
+        sunday = (local - dt.timedelta(days=days_since_sunday)).date()
+        return dt.datetime.combine(sunday, dt.time(0, 0), tzinfo=self.zone)
+
+    def _holiday_blocks(self, start: pd.Timestamp, end: pd.Timestamp) -> list[TradingInterval]:
+        blocks: list[TradingInterval] = []
+        if not self.holidays:
+            return blocks
+        cursor = start.tz_convert(self.zone).date() - dt.timedelta(days=1)
+        last = end.tz_convert(self.zone).date() + dt.timedelta(days=1)
+        while cursor <= last:
+            for holiday in self.holidays:
+                if _holiday_matches(holiday, cursor):
+                    h_open, h_close = _holiday_bounds(holiday, cursor, self.zone)
+                    blocks.append(TradingInterval(h_open, h_close))
+            cursor += dt.timedelta(days=1)
+        return blocks
+
+    def trading_intervals(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> list[TradingInterval]:
+        start = _as_utc(start)
+        end = _as_utc(end)
+        if end <= start or not self.intervals:
+            return []
+        holidays = self._holiday_blocks(start, end)
+        intervals: list[TradingInterval] = []
+        cursor = self._week_base(start.to_pydatetime())
+        last_base = self._week_base(end.to_pydatetime())
+        while cursor <= last_base:
+            for start_second, end_second in self.intervals:
+                open_local = cursor + dt.timedelta(seconds=start_second)
+                close_local = cursor + dt.timedelta(seconds=end_second)
+                open_utc = pd.Timestamp(open_local.astimezone(UTC))
+                close_utc = pd.Timestamp(close_local.astimezone(UTC))
+                # Clip against every holiday block overlapping this interval.
+                pieces = [(open_utc, close_utc)]
+                for h_open, h_close in holidays:
+                    nxt: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+                    for lo, hi in pieces:
+                        if h_close <= lo or h_open >= hi:
+                            nxt.append((lo, hi))
+                        else:
+                            if lo < h_open:
+                                nxt.append((lo, h_open))
+                            if hi > h_close:
+                                nxt.append((h_close, hi))
+                    pieces = nxt
+                for lo, hi in pieces:
+                    clipped_lo = max(start, lo)
+                    clipped_hi = min(end, hi)
+                    if clipped_hi > clipped_lo:
+                        intervals.append(TradingInterval(clipped_lo, clipped_hi))
+            cursor += dt.timedelta(days=7)
+        intervals.sort(key=lambda iv: iv.open)
+        return intervals
+
+
+def _as_utc(ts: pd.Timestamp) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return ts.tz_localize(UTC)
+    return ts.tz_convert(UTC)
+
+
+def _normalise_holidays(raw: Iterable[Any]) -> list[dict[str, Any]]:
+    holidays: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            day_number = int(item.get("holiday_date", item.get("date_days", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        start_second = item.get("start_second")
+        end_second = item.get("end_second")
+        holidays.append(
+            {
+                "date_days": day_number,
+                "start_second": int(start_second) if start_second is not None else None,
+                "end_second": int(end_second) if end_second is not None else None,
+                "is_recurring": bool(item.get("is_recurring", False)),
+            }
+        )
+    return holidays
+
+
+def _holiday_matches(holiday: Mapping[str, Any], day: dt.date) -> bool:
+    epoch = dt.date(1970, 1, 1)
+    if holiday.get("is_recurring"):
+        base = epoch + dt.timedelta(days=int(holiday["date_days"]))
+        return (day.month, day.day) == (base.month, base.day)
+    return day == epoch + dt.timedelta(days=int(holiday["date_days"]))
+
+
+def _holiday_bounds(
+    holiday: Mapping[str, Any], day: dt.date, zone: ZoneInfo
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start_second = holiday.get("start_second")
+    end_second = holiday.get("end_second")
+    day_start = dt.datetime.combine(day, dt.time(0, 0), tzinfo=zone)
+    if start_second is None and end_second is None:
+        open_utc = pd.Timestamp(day_start.astimezone(UTC))
+        return open_utc, open_utc + pd.Timedelta(days=1)
+    open_local = day_start + dt.timedelta(seconds=int(start_second or 0))
+    close_local = day_start + dt.timedelta(seconds=int(end_second or 86_400))
+    return (
+        pd.Timestamp(open_local.astimezone(UTC)),
+        pd.Timestamp(close_local.astimezone(UTC)),
+    )
+
+
+# ─── Resolution ──────────────────────────────────────────────────────────────
+
+FOREX_ASSET_CLASSES = frozenset({"forex", "fx", "currency"})
+CRYPTO_ASSET_CLASSES = frozenset({"crypto", "cryptocurrency"})
+METALS_ASSET_CLASSES = frozenset({"metals", "metal", "xau", "xag"})
+INDEX_ASSET_CLASSES = frozenset({"index", "indices", "idx"})
+FUTURES_ASSET_CLASSES = frozenset({"futures", "future"})
+US_EQUITY_ASSET_CLASSES = frozenset({"equity", "stock", "stocks", "etf"})
+US_EQUITY_SOURCES = frozenset({"alpaca", "dolthub", "huggingface", "test", "yfinance"})
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    from shared.alpaca_symbols import split_crypto_pair
+
+    return split_crypto_pair(symbol) is not None
+
+
+def _is_forex_symbol(symbol: str) -> bool:
+    normalized = str(symbol or "").strip().upper()
+    if "/" in normalized:
+        return True
+    if len(normalized) == 6 and normalized.isalpha():
+        return True
+    try:
+        from data_tools.downloaders.dukascopy_native import SYMBOL_CONFIG
+
+        return normalized in {
+            key.upper()
+            for key, value in SYMBOL_CONFIG.items()
+            if str(value.get("asset_class", "")).strip().lower() == "forex"
+        }
+    except Exception:
+        return False
+
+
+def _is_us_equity_symbol(symbol: str) -> bool:
+    import re
+
+    return re.fullmatch(r"[A-Z][A-Z.\-]{0,9}", str(symbol or "").strip().upper()) is not None
+
+
+def _calendar_cache_path(data_dir: str | Path, source: str, symbol: str) -> Path:
+    root = Path(data_dir) if data_dir else Path(".")
+    safe_symbol = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in symbol.upper())
+    return root / "venue_calendars" / source.lower() / f"{safe_symbol}.json"
+
+
+def load_cached_calendar(
+    *,
+    data_dir: str | Path,
+    source: str,
+    symbol: str,
+) -> VenueCalendar | None:
+    path = _calendar_cache_path(data_dir, source, symbol)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    kind = str(payload.get("kind") or "")
+    if kind == "broker_schedule":
+        return BrokerScheduleCalendar(payload)
+    if kind == "exchange_sessions":
+        return ExchangeSessionCalendar(payload)
+    if kind == "alpaca_equity":
+        return NyseCalendar(name="alpaca-equity")
+    return None
+
+
+def save_cached_calendar(
+    *,
+    data_dir: str | Path,
+    source: str,
+    symbol: str,
+    payload: Mapping[str, Any],
+) -> Path:
+    path = _calendar_cache_path(data_dir, source, symbol)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def ctrader_schedule_payload(
+    *,
+    symbol: str,
+    schedule: Sequence[Any],
+    schedule_timezone: str,
+    holidays: Sequence[Any],
+    fetched_at: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "kind": "broker_schedule",
+        "name": f"ctrader-{symbol.upper()}",
+        "source": "ctrader",
+        "symbol": symbol.upper(),
+        "schedule_timezone": schedule_timezone or "UTC",
+        "fetched_at": fetched_at or dt.datetime.now(UTC).isoformat(),
+        "schedule": [
+            {"start_second": int(iv.startSecond), "end_second": int(iv.endSecond)}
+            for iv in schedule
+        ],
+        "holidays": [
+            {
+                "holiday_date": int(h.holidayDate),
+                "is_recurring": bool(h.isRecurring),
+                "start_second": int(h.startSecond) if h.HasField("startSecond") else None,
+                "end_second": int(h.endSecond) if h.HasField("endSecond") else None,
+            }
+            for h in holidays
+        ],
+    }
+
+
+def resolve_venue_calendar(
+    *,
+    symbol: str,
+    timeframe: str = "",
+    data_dir: str | Path = "",
+    asset_class: str | None = None,
+    source: str | None = None,
+) -> VenueCalendar | None:
+    """Resolve the authoritative session calendar for a segment.
+
+    Returns ``None`` when no broker calendar is cached and no built-in model
+    unambiguously fits; callers must treat that as fail-closed.
+    """
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return None
+
+    # Broker cache first: cTrader schedules are authoritative for cTrader data.
+    if source and source.lower() == "ctrader" and data_dir:
+        cached = load_cached_calendar(data_dir=data_dir, source="ctrader", symbol=normalized)
+        if cached is not None:
+            return cached
+
+    asset = str(asset_class or "").strip().lower()
+    src = str(source or "").strip().lower()
+
+    if asset in CRYPTO_ASSET_CLASSES or (not asset and _is_crypto_symbol(normalized)):
+        return ContinuousCalendar()
+
+    if asset in FOREX_ASSET_CLASSES or (not asset and _is_forex_symbol(normalized)):
+        return FxWeekCalendar()
+
+    if asset in METALS_ASSET_CLASSES or asset in INDEX_ASSET_CLASSES or asset in FUTURES_ASSET_CLASSES:
+        # No built-in model for these venues; only a broker schedule fits.
+        if src == "ctrader" and data_dir:
+            return load_cached_calendar(data_dir=data_dir, source="ctrader", symbol=normalized)
+        return None
+
+    if asset in US_EQUITY_ASSET_CLASSES or asset == "index":
+        if src in US_EQUITY_SOURCES or (not src and _is_us_equity_symbol(normalized)):
+            if src == "alpaca" and data_dir:
+                cached = load_cached_calendar(
+                    data_dir=data_dir, source="alpaca", symbol=normalized
+                )
+                if cached is not None:
+                    return cached
+            return NyseCalendar()
+        return None
+
+    # Path-metadata fallback: callers pass asset_class/source discovered from
+    # the dataset path; without either, only unambiguous symbol shapes resolve.
+    if not asset and not src:
+        if _is_crypto_symbol(normalized):
+            return ContinuousCalendar()
+        if _is_forex_symbol(normalized):
+            return FxWeekCalendar()
+        if _is_us_equity_symbol(normalized):
+            return NyseCalendar()
+    return None
