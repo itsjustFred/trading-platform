@@ -61,6 +61,7 @@ from shared.models import (
     VerificationEvidenceStatus,
     execution_price_is_usable,
     resolve_defined_stat,
+    validate_commission_cost,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -703,7 +704,12 @@ class LiveExecutionModel(SQLModel, table=True):
             signal_id=str(execution.signal_id),
             actual_price=execution.actual_price,
             filled_qty=execution.filled_qty,
-            commission=execution.commission,
+            # The write guard again at the persistence boundary (#285): `LiveExecution`
+            # already validates, but `model_construct` or a future caller could bypass
+            # it, and a wrong-sign commission silently flips `gross - commission` PnL.
+            # SQLModel table models do not run pydantic validators, so the check is
+            # explicit here - the funnel every save path (plain and cumulative) uses.
+            commission=validate_commission_cost(execution.commission),
             timestamp=execution.timestamp,
             broker_order_id=execution.broker_order_id,
             dedupe_key=(str(execution.dedupe_key).strip() or None)
@@ -714,6 +720,16 @@ class LiveExecutionModel(SQLModel, table=True):
         )
 
     def to_live_execution(self) -> LiveExecution:
+        """Rehydrate the domain model — the ``commission`` guard runs again on read.
+
+        ``LiveExecution`` validates ``commission`` (#285), so a row stored before the
+        guard existed (or written around it, e.g. via ``session.add``) with a negative
+        cost raises ``ValidationError`` here instead of silently flipping
+        ``gross - commission`` net PnL. ``init_db``'s one-time
+        ``_migrate_ctrader_commission_to_cost`` ``abs``-converted legacy negatives on
+        resolved cTrader accounts — orphan rows whose broker cannot be determined are
+        skipped — so this fires on corrupt data or such orphans.
+        """
         return LiveExecution(
             id=self.id,
             signal_id=self.signal_id,
@@ -1966,8 +1982,8 @@ def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
     accounts whose broker is ``ctrader`` are touched, NULL (unknown) and zero stay as they are, and
     a row whose broker cannot be determined (orphan) is left alone.
 
-    ``abs`` is not safe to repeat blindly once the fixed adapter runs: a rebate is stored as a
-    NEGATIVE cost and a second pass would turn it into a charge. So the conversion is recorded in
+    ``abs`` is not safe to repeat blindly: any negative row still in the table is legacy or
+    corrupt data, and a second pass would flip its sign. So the conversion is recorded in
     ``schema_data_migrations`` and runs exactly once; ``init_db`` runs on every process start.
 
     Returns True when the conversion ran. No-ops when it is already recorded.

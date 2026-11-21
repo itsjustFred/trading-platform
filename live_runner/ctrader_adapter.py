@@ -23,7 +23,7 @@ from live_runner.base_adapter import (
     LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
-    commission_cost,
+    commission_from_signed_cash_flow,
     is_unbounded_tp,
     money_digits_from_trader,
     money_scale,
@@ -530,18 +530,28 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
-def _deal_commission(deal: Any | None) -> float:
-    """A deal's commission in account currency, as a positive cost.
+def _deal_commission(
+    deal: Any | None, *, rebate_logged: set[int] | None = None
+) -> float | None:
+    """A deal's commission in account currency, as a positive cost — or ``None``.
 
     cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
     positive cost, the ``live_executions.commission`` convention shared with Alpaca (see
-    ``base_adapter.commission_cost``).
+    ``base_adapter.commission_from_signed_cash_flow``).
 
     ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
     ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
     integer records a 2-digit-account commission of 3.50 as 350. A deal that carries no
     commission (an unset int64 reads as ``0``) is ``0.0`` without consulting ``moneyDigits``, so
     only a real charge can trigger the "digits missing" fallback warning.
+
+    A positive broker cash flow is a REBATE: the converted cost is negative, which the
+    ``commission`` write guard refuses. Refusing the ``LiveExecution`` would drop the whole
+    fill — the stream caller retains the event for reconciliation forever and the row never
+    reaches ``live_executions``, the lost-fill the persist path exists to prevent — so the
+    rebate is stored as ``None`` ("fee unknown"; readers already treat it as net-PnL
+    incomplete) and logged at ERROR with the deal id and the raw value. How a rebate should
+    be represented is an open maintainer decision (#285); until then the fill is kept.
     """
     if deal is None:
         return 0.0
@@ -549,7 +559,25 @@ def _deal_commission(deal: Any | None) -> float:
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
     if not raw or not math.isfinite(raw):
         return 0.0
-    return commission_cost(raw / money_scale(money_digits_from_trader(deal)))
+    cost = commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
+    if cost < 0:
+        deal_id = _deal_id_or_none(deal)
+        # ERROR once per deal id per adapter: reconciliation re-reads the same deals on
+        # every pass, and each ERROR is a Sentry event — the anomaly is logged loudly
+        # once, not once per pass.
+        if rebate_logged is None or deal_id is None or deal_id not in rebate_logged:
+            logger.error(
+                "cTrader deal %s reported a rebate: commission=%r converts to cost=%r, which "
+                "the write guard refuses; storing commission=NULL so the fill is kept and "
+                "net PnL stays flagged incomplete (#285)",
+                deal_id,
+                raw,
+                cost,
+            )
+            if rebate_logged is not None and deal_id is not None:
+                rebate_logged.add(deal_id)
+        return None
+    return cost
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -834,6 +862,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected_event = asyncio.Event()
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts: dict[int, int] = {}
+        self._rebate_logged_deal_ids: set[int] = set()
         self._unresolved_execution_events: deque[Any] = deque()
         self._reconciliation_required = False
         self._reconciliation_retry_at = 0.0
@@ -2188,7 +2217,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(
+                deal,
+                # ``getattr``: tests build partial adapters via ``__new__`` without
+                # ``__init__``; a missing set only means the ERROR is not deduped.
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
@@ -3531,7 +3565,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `actual_price` treats a non-answer as a price.
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(
+                deal,
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
