@@ -286,9 +286,11 @@ async def fetch_slice_frame(
     loop gives the whole window a fresh start instead of half a day of bars, and
     its pause doubles per attempt up to :data:`MAX_RETRY_PAUSE_SECONDS`. Every
     attempt is still bounded, and a run that cannot produce a valid slice raises
-    rather than writing a partial file. Each attempt is validated against the
-    same contract the loader enforces, so a truncated download is retried
-    instead of escaping the loop as a file that merely looks complete.
+    rather than writing a partial file. Each attempt is checked for completeness
+    inside the loop, so a truncated download is retried instead of escaping as
+    a file that merely looks complete. A frame that reaches the full row count
+    but still violates the contract is corrupt data rather than a transient
+    download, so it fails immediately instead of being retried into a skip.
     """
     from data_tools.downloaders.dukascopy_native import download_minute_candles
 
@@ -308,23 +310,30 @@ async def fetch_slice_frame(
                 log_callback=log_callback,
             )
             frame = slice_from_minute_bars(minute)
-            validate_slice_frame(frame, source="downloaded slice")
-            return frame
         except (SliceValidationError, OSError) as exc:
             last_error = exc
-            if attempt >= max(1, attempts):
-                break
-            pause = min(
-                retry_pause_seconds * 2 ** (attempt - 1), MAX_RETRY_PAUSE_SECONDS
-            )
-            logger.warning(
-                "slice fetch attempt %d/%d failed (%s); retrying in %.0fs",
-                attempt,
-                attempts,
-                exc,
-                pause,
-            )
-            await asyncio.sleep(pause)
+        else:
+            if len(frame) != EXPECTED_SLICE_ROWS:
+                last_error = SliceValidationError(
+                    f"downloaded slice: {len(frame)} rows, expected {EXPECTED_SLICE_ROWS} "
+                    f"(the window {SLICE_WINDOW_START} → {SLICE_WINDOW_END} on trading days)"
+                )
+            else:
+                validate_slice_frame(frame, source="downloaded slice")
+                return frame
+        if attempt >= max(1, attempts):
+            break
+        pause = min(
+            retry_pause_seconds * 2 ** (attempt - 1), MAX_RETRY_PAUSE_SECONDS
+        )
+        logger.warning(
+            "slice fetch attempt %d/%d failed (%s); retrying in %.0fs",
+            attempt,
+            attempts,
+            last_error,
+            pause,
+        )
+        await asyncio.sleep(pause)
     raise SliceDownloadError(f"could not generate the slice: {last_error}")
 
 

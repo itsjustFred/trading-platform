@@ -391,6 +391,35 @@ def test_the_outer_retry_is_bounded_and_raises(monkeypatch):
     assert len(calls) == 3, "exactly three attempts, no more"
 
 
+def test_a_complete_but_invalid_slice_fails_instead_of_becoming_a_download_error(
+    monkeypatch,
+):
+    """A full row count with broken quotes is corruption, not an outage.
+
+    Retrying it into ``SliceDownloadError`` would turn a real validation failure
+    into CI's warn-and-skip path, which is exactly the confusion this contract
+    exists to prevent.
+    """
+    calls: list[int] = []
+
+    async def _download(*_args, **_kwargs):
+        calls.append(1)
+        return _minute_grid_frame()
+
+    broken, fragment = violations()["zero_close"]
+    assert len(broken) == EXPECTED_SLICE_ROWS
+    monkeypatch.setattr(dukascopy_native, "download_minute_candles", _download)
+    monkeypatch.setattr(
+        "data_tools.differential_slice.slice_from_minute_bars", lambda _minute: broken
+    )
+
+    with pytest.raises(SliceValidationError, match=re.escape(fragment)) as excinfo:
+        asyncio.run(fetch_slice_frame(attempts=3, retry_pause_seconds=0))
+
+    assert not isinstance(excinfo.value, SliceDownloadError)
+    assert len(calls) == 1, "a contract violation is not a retryable download failure"
+
+
 # ───────────────────────────── nothing is committed again ─────────────────────
 
 
