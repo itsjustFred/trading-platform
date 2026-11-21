@@ -552,7 +552,12 @@ def test_an_invalid_generated_slice_exits_one_and_writes_nothing(
 
 
 def test_ci_requires_the_slice_only_when_the_fetch_succeeded():
-    """A Dukascopy outage may skip the real-data scenarios; it may not fail CI."""
+    """A Dukascopy outage may skip the real-data scenarios on PRs; on main it may not.
+
+    Pull requests warn and skip a failed download, but a push to main must fail
+    the fetch step itself so the real-data slice is always required there and a
+    permanent outage is noticed.
+    """
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert "id: fetch-slice" in workflow
@@ -561,3 +566,6 @@ def test_ci_requires_the_slice_only_when_the_fetch_succeeded():
     assert "steps.fetch-slice.outputs.download_failed" in workflow
     assert "REQUIRE_REAL_DATA_SLICE" in workflow
     assert 'REQUIRE_REAL_DATA_SLICE: "1"' not in workflow
+    # The skip is conditional on the event: only non-push runs may swallow exit 3.
+    assert 'github.event_name' in workflow
+    assert '!= "push"' in workflow

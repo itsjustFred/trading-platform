@@ -22,10 +22,12 @@ jobs:
       # The differential real-data slice is downloaded, not committed (see
       # scripts/fetch_differential_slice.py). Pointing the tests at a cached path
       # keeps the scenario from depending on the working directory of the step
-      # that reads it. REQUIRE_REAL_DATA_SLICE is set on the test step only when
-      # the fetch succeeded, so a Dukascopy outage warns and skips the real-data
-      # scenarios instead of failing the job; a present malformed slice still
-      # fails inside the tests.
+      # that reads it. On pull requests REQUIRE_REAL_DATA_SLICE is set on the
+      # test step only when the fetch succeeded, so a Dukascopy outage warns and
+      # skips the real-data scenarios instead of failing the job; on push to
+      # main the fetch step itself fails on a download error, so the slice is
+      # always required there and a permanent outage is noticed. A present
+      # malformed slice still fails inside the tests either way.
       DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +78,11 @@ jobs:
           uv run --no-sync --no-build python -m scripts.fetch_differential_slice --skip-if-valid
           status=$?
           set -e
-          if [ "$status" -eq 3 ]; then
+          # Exit 3 is a download failure with no usable cache. On pull requests
+          # (and workflow_dispatch) that warns and skips the real-data tests;
+          # on push to main the slice is required, so the step - and the job -
+          # fails instead.
+          if [ "$status" -eq 3 ] && [ "${{ github.event_name }}" != "push" ]; then
             echo "::warning::Dukascopy real-data slice download failed; the differential real-data tests will skip."
             echo "download_failed=true" >> "$GITHUB_OUTPUT"
             exit 0

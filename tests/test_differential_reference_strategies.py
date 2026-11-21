@@ -1262,10 +1262,12 @@ def test_nan_fill_bar_never_yields_non_finite_results(tmp_path, engine, builder,
 # overrides that path) with the window/schema/row-count contract in
 # data_tools/differential_slice.py. A missing slice skips these scenarios with a
 # message that names the script; REQUIRE_REAL_DATA_SLICE=1 turns that into a
-# failure instead. CI sets it only when the fetch succeeded, so a Dukascopy
-# outage warns and skips rather than failing the job, while a present malformed
-# file always fails: a skipped real-data scenario is a quietly narrower suite,
-# and that is the failure this policy exists to prevent.
+# failure instead. On pull requests CI sets it only when the fetch succeeded,
+# so a Dukascopy outage warns and skips rather than failing the job; on push to
+# main the fetch step fails on a download error, so the slice is always
+# required there. A present malformed file always fails: a skipped real-data
+# scenario is a quietly narrower suite, and that is the failure this policy
+# exists to prevent.
 
 #: Environment variable that turns a missing slice into a failure instead of a skip.
 REQUIRE_REAL_SLICE_ENV = REQUIRE_SLICE_ENV
@@ -1483,7 +1485,8 @@ def test_reference_expires_an_order_whose_fill_bar_is_unpriced():
 # The slice is a download, so its *absence* is a normal state on a fresh clone and
 # its *malformation* is not. These four pin that distinction: a missing file skips
 # (or fails under REQUIRE_REAL_DATA_SLICE, which CI sets after a successful
-# fetch), a bad file always fails. Nothing here touches the network - the frames
+# fetch on PRs and unconditionally on push to main), a bad file always fails.
+# Nothing here touches the network - the frames
 # come from tests/helpers.
 
 
