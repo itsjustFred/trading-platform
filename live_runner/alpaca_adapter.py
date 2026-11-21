@@ -833,10 +833,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # names no signal of ours and would otherwise be dropped (`client_order_id` is not a
         # signal), leaving the broker position smaller than every ledger on the account and
         # #142's guard alerting on every later exit for that symbol.
-        # Learned from the parent order's nested legs whenever one is seen: at submit, and on
+        # Learned from the parent order's nested legs whenever one is seen: at submit, on
         # every reconciliation pass - which is the adapter's only one and runs on connect,
-        # before the trading stream consumes events, so a restart re-learns the mapping (a
-        # trailed stop is a NEW leg order id, which the next pass picks up the same way).
+        # before the trading stream consumes events, so a restart re-learns the mapping -
+        # and at once in `amend_protective_stop`, because a trailed stop's replacement is
+        # a NEW leg order id that would otherwise stay unattributable until the next pass.
         self._bracket_leg_order_id_to_signal_id: dict[str, str] = {}
 
         if not self.api_key or not self.secret_key:
@@ -2778,6 +2779,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"Alpaca did not confirm the stop replacement for {stop.symbol} "
                 f"(order_id={new_order_id!r}, stop_price={confirmed_price!r}, "
                 f"requested={price!r})"
+            )
+        # #144: replacing an order gives it a NEW broker order id, so the leg-order-id ->
+        # signal map this adapter learned for the old id is stale from this moment on. The
+        # replaced order here is the bracket's stop leg whenever the pre-replacement id was
+        # learned as a leg, so its fill is re-learned against the same parent signal here
+        # rather than waiting for the next adapter connect (the only other pass).
+        previous_leg_key = _bracket_leg_key(stop.order_id)
+        new_leg_key = _bracket_leg_key(new_order_id)
+        parent_signal_id = (
+            self._bracket_leg_order_id_to_signal_id.pop(previous_leg_key, None)
+            if previous_leg_key is not None
+            else None
+        )
+        if parent_signal_id is not None and new_leg_key is not None:
+            self._bracket_leg_order_id_to_signal_id[new_leg_key] = parent_signal_id
+            logger.info(
+                "Amended Alpaca stop leg re-registered against its parent signal",
+                extra={
+                    "data": {
+                        "parent_signal_id": parent_signal_id,
+                        "previous_leg_order_id": str(stop.order_id),
+                        "leg_order_id": str(new_order_id),
+                        "symbol": stop.symbol,
+                    }
+                },
             )
         return ProtectiveStop(
             order_id=new_order_id,
