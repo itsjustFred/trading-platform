@@ -16,8 +16,10 @@ from live_runner.broker_reconciliation import (
 )
 from shared.database import (
     ENTRIES_HALT_SETTINGS_KEY,
+    claim_live_deployment_submission,
     get_live_deployment,
     list_live_control_audit,
+    release_live_deployment_submission,
     resume_live_deployment_entries_halt,
     save_live_execution,
     save_live_signal,
@@ -568,6 +570,242 @@ def test_resume_helper_refuses_a_foreign_halt_marker(isolated_db) -> None:
 
     assert resume_live_deployment_entries_halt(DEPLOYMENT_ID) is False
     assert ENTRIES_HALT_SETTINGS_KEY in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+
+def _adapter_with_order_states(states: dict[str, str]) -> FakeAdapter:
+    """A FakeAdapter whose ``get_order_state`` answers from ``states``."""
+    adapter = FakeAdapter(positions=[], orders=[])
+
+    async def get_order_state(order_id: str, *, client_order_id: str = "") -> str | None:
+        return states.get(order_id) or states.get(client_order_id)
+
+    adapter.get_order_state = get_order_state  # type: ignore[attr-defined]
+    return adapter
+
+
+def test_terminal_expected_order_is_not_a_finding(isolated_db, tmp_path) -> None:
+    """A 1-day-old expired Alpaca DAY limit must not pause a healthy account."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    recent = datetime.now(timezone.utc) - timedelta(days=1)
+    _unfilled_signal(
+        DEPLOYMENT_ID, broker_order_id="ord-expired", timestamp=recent
+    )
+
+    deployment = _deployment()
+    adapter = _adapter_with_order_states({"ord-expired": "terminal"})
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
+
+
+def test_partially_filled_ioc_with_cancelled_remainder_is_not_a_finding(
+    isolated_db, tmp_path
+) -> None:
+    """A partial fill whose remainder the broker cancelled is terminal, not missing."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=DEPLOYMENT_ID,
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc) - timedelta(hours=2),
+            metadata={"broker_order_id": "ord-ioc", "qty": 10.0},
+        )
+    )
+    _fill(signal_id, broker_order_id="ord-ioc", qty=4.0)
+
+    deployment = _deployment()
+    adapter = _adapter_with_order_states({"ord-ioc": "terminal"})
+    # The partial fill is real at the broker: position and protection agree,
+    # so the only thing that could mismatch is the missing working order.
+    adapter.positions = [{"symbol": "AAPL", "qty": 4.0}]
+    adapter.stops = [
+        ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)
+    ]
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
+
+
+def test_non_terminal_or_unknown_expected_order_still_finds(
+    isolated_db, tmp_path
+) -> None:
+    """Working, unknown and unreadable lookups all keep the finding (fail closed)."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _unfilled_signal(DEPLOYMENT_ID, broker_order_id="ord-live")
+
+    deployment = _deployment()
+    for state in ("working", None):
+        adapter = _adapter_with_order_states({"ord-live": state} if state else {})
+        manager = _manager(tmp_path, [])
+        report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+        kinds = {f.kind for f in report[ACCOUNT_ID].findings}
+        assert "missing_working_order" in kinds
+        finding = next(
+            f for f in report[ACCOUNT_ID].findings if f.kind == "missing_working_order"
+        )
+        assert finding.detail["broker_order_state"] == (state or "unknown")
+
+    raising = FakeAdapter(positions=[], orders=[])
+
+    async def _raise(order_id: str, *, client_order_id: str = ""):
+        raise RuntimeError("broker lookup failed")
+
+    raising.get_order_state = _raise  # type: ignore[attr-defined]
+
+    manager = _manager(tmp_path, [])
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: raising})
+    assert "missing_working_order" in {
+        f.kind for f in report[ACCOUNT_ID].findings
+    }
+
+
+def test_halt_is_written_and_audited_only_on_transition(
+    isolated_db, tmp_path
+) -> None:
+    """Every mismatched pass keeps the halt, but writes and audits it once."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=DEPLOYMENT_ID,
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"broker_order_id": "ord-1", "qty": 10.0},
+        )
+    )
+    _fill(signal_id, broker_order_id="ord-1", qty=10.0)
+
+    deployment = _deployment()
+    adapter = FakeAdapter(
+        positions=[{"symbol": "AAPL", "qty": 9.0}],
+        stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
+    )
+    halted: list[str] = []
+    manager = _manager(tmp_path, halted)
+
+    reports = [
+        _reconcile(manager, [deployment], {ACCOUNT_ID: adapter}) for _ in range(4)
+    ]
+
+    # The halt write ran once (first pass over the threshold); later passes
+    # still report the deployment as halted without rewriting the marker.
+    assert halted == [DEPLOYMENT_ID]
+    for report in reports[1:]:
+        assert report[ACCOUNT_ID].entries_halted_deployment_ids == (DEPLOYMENT_ID,)
+    halt_audits = [
+        row
+        for row in list_live_control_audit(target_id=DEPLOYMENT_ID)
+        if row["action"] == "broker_reconciliation_entries_halt"
+    ]
+    assert len(halt_audits) == 1
+
+
+def test_failed_resume_is_surfaced_instead_of_ok(
+    isolated_db, tmp_path, monkeypatch, caplog
+) -> None:
+    """A resume that fails must not let the report claim a clean pass."""
+    import live_runner.broker_reconciliation as recon
+
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    set_live_deployment_entries_halt(
+        DEPLOYMENT_ID,
+        {"by": "broker_reconciliation", "at": "earlier", "account_id": ACCOUNT_ID},
+    )
+
+    def _boom(deployment_id: str) -> bool:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(recon, "resume_live_deployment_entries_halt", _boom)
+
+    deployment = _deployment()
+    adapter = FakeAdapter(positions=[], orders=[])
+    manager = _manager(tmp_path, [])
+
+    with caplog.at_level("ERROR"):
+        report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    result = report[ACCOUNT_ID]
+    assert result.ok is False
+    assert result.resume_failed_deployment_ids == (DEPLOYMENT_ID,)
+    assert result.findings == ()
+    assert any(
+        getattr(record, "data", {}).get("alert") == "broker_reconciliation_resume_failed"
+        for record in caplog.records
+    )
+    # The halt itself is still in force: the failed resume changed nothing.
+    assert ENTRIES_HALT_SETTINGS_KEY in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+
+def test_submission_claim_gates_entries_on_the_halt(isolated_db) -> None:
+    """The claim re-checks the halt atomically; exits are never gated by it."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    set_live_deployment_entries_halt(
+        DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+    )
+
+    assert (
+        claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-entry", refuse_entries_halt=True
+        )
+        is False
+    )
+    # The same deployment still claims for an exit: the halt is entry-only.
+    assert (
+        claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-exit", refuse_entries_halt=False
+        )
+        is True
+    )
+    release_live_deployment_submission("tok-exit")
+
+    resume_live_deployment_entries_halt(DEPLOYMENT_ID)
+    assert (
+        claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-entry-2", refuse_entries_halt=True
+        )
+        is True
+    )
+    release_live_deployment_submission("tok-entry-2")
+
+
+def test_status_restore_without_release_keeps_the_entries_halt(
+    isolated_db,
+) -> None:
+    """A refused delete's status rollback is not an operator resume."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    set_live_deployment_entries_halt(
+        DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+    )
+
+    # Mirrors the delete endpoint: PAUSED gate, then ACTIVE restore with
+    # release_entries_halt=False because the delete was refused.
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED", release_entries_halt=False)
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE", release_entries_halt=False)
+
+    assert ENTRIES_HALT_SETTINGS_KEY in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+    # The explicit operator resume still releases it.
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    assert ENTRIES_HALT_SETTINGS_KEY not in (get_live_deployment(DEPLOYMENT_ID).settings or {})
 
 
 def test_validate_reconciliation_settings_accepts_good_values() -> None:

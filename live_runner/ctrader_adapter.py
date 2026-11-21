@@ -18,6 +18,8 @@ from uuid import UUID
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
     BrokerOrderView,
     ControlOutcome,
@@ -3308,6 +3310,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             else:
                 side = ""
 
+            if not symbol or not side:
+                logger.warning(
+                    "cTrader working order has an unreadable symbol or side; "
+                    "reconciliation can match it by id but not by symbol",
+                    extra={
+                        "data": {
+                            "account_id": self.ctid_trader_account_id,
+                            "order_id": key,
+                            "symbol_id": symbol_id,
+                            "order_type": order_type,
+                        }
+                    },
+                )
+
             protection = order_type == int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
             views.append(
                 BrokerOrderView(
@@ -3321,6 +3337,69 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             )
         return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        ``ProtoOAOrderDetailsReq`` answers for a specific order id, including
+        orders no longer working. ``None`` - a transport error, an unknown
+        order, a missing status or a status this client cannot name - always
+        fails closed: the reconciler keeps its finding.
+        """
+        order_id_int = self._coerce_broker_order_id(order_id)
+        if order_id_int is None:
+            return None
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if (
+            self._ProtoOAOrderDetailsReq is None
+            or self._ProtoOAOrderDetailsRes is None
+            or self._ProtoOAOrderStatus is None
+        ):
+            return None
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = order_id_int
+        try:
+            details_res = await self._send_request_with_refresh_retry(
+                details_req, timeout_seconds=15
+            )
+        except CTraderApiError:
+            return None
+        if not isinstance(details_res, self._ProtoOAOrderDetailsRes):
+            return None
+        order = getattr(details_res, "order", None)
+        if order is None:
+            return None
+        # ``orderStatus`` defaults to ACCEPTED on an unset order, so a broker
+        # response without a real order id must read as unknown, not working.
+        if not getattr(order, "orderId", 0):
+            return None
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            return None
+        status_enum = self._ProtoOAOrderStatus
+        if status == int(status_enum.ORDER_STATUS_ACCEPTED):
+            return ORDER_STATE_WORKING
+        terminal = {
+            int(getattr(status_enum, name))
+            for name in (
+                "ORDER_STATUS_FILLED",
+                "ORDER_STATUS_REJECTED",
+                "ORDER_STATUS_EXPIRED",
+                "ORDER_STATUS_CANCELLED",
+            )
+            if getattr(status_enum, name, None) is not None
+        }
+        if status in terminal:
+            return ORDER_STATE_TERMINAL
+        return None
 
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.

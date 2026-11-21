@@ -4282,6 +4282,23 @@ def live_deployment_entries_halted(deployment_id: str) -> bool:
     return bool((deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY))
 
 
+def live_deployment_entries_halt_marker(deployment_id: str) -> Mapping[str, Any] | None:
+    """The persisted entries-halt marker dict, or ``None`` when absent/unreadable.
+
+    Unlike :func:`live_deployment_entries_halted` this distinguishes *who* set
+    the halt, which the reconciler needs to write and audit only on the
+    transition into a halt it owns.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return None
+    if deployment is None:
+        return None
+    marker = (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    return dict(marker) if isinstance(marker, dict) else None
+
+
 def resume_live_deployment_entries_halt(deployment_id: str) -> bool:
     """Clear the halt only when the broker reconciler set it.
 
@@ -4310,7 +4327,7 @@ def resume_live_deployment_entries_halt(deployment_id: str) -> bool:
 
 
 def update_live_deployment_status(
-    deployment_id: str, status: str
+    deployment_id: str, status: str, *, release_entries_halt: bool = True
 ) -> LiveDeploymentConfig | None:
     next_status = str(status or "").upper()
     if next_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
@@ -4321,11 +4338,15 @@ def update_live_deployment_status(
         if record is None:
             return None
         record.status = next_status
-        if next_status == "ACTIVE":
+        if next_status == "ACTIVE" and release_entries_halt:
             # Resuming is the operator's explicit "trade again": it also
             # releases a broker-reconciliation entry halt. A still-mismatched
             # account is re-halted on the next pass, so this cannot hide a
             # live divergence - it only ends the halt early by decision.
+            # ``release_entries_halt=False`` is for internal status writes
+            # that merely restore a previous state (the delete endpoint's
+            # rollback): they are not an operator resume and must not clear
+            # a halt the operator never lifted.
             settings = dict(record.settings_json or {})
             if ENTRIES_HALT_SETTINGS_KEY in settings:
                 settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
@@ -4444,6 +4465,7 @@ def claim_live_deployment_submission(
     token: str,
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    refuse_entries_halt: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
@@ -4453,6 +4475,12 @@ def claim_live_deployment_submission(
     * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
       live row, so a PAUSE that committed first wins the race);
     * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    ``refuse_entries_halt`` adds a third fact for *entry* submissions only:
+    the broker-reconciliation entries halt is checked inside the same
+    statement, so a halt committed while the dispatcher was sizing the order
+    still wins the race. Exits pass ``False`` - the halt is entry-only and
+    must never freeze them.
 
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
@@ -4467,6 +4495,15 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    halt_predicate = ""
+    if refuse_entries_halt:
+        # json_extract mirrors live_deployment_entries_halted's truthiness for
+        # every JSON type: missing/null/false/0/"" read as not halted, anything
+        # else (the reconciler always stores a non-empty marker dict) blocks.
+        halt_predicate = (
+            "AND COALESCE(json_extract(settings, "
+            f"'$.{ENTRIES_HALT_SETTINGS_KEY}'), 0) IN (0, '')"
+        )
     with get_session() as session:
         session.exec(
             delete(LiveDeploymentSubmissionClaimModel).where(
@@ -4482,7 +4519,8 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE' "
+                    f"{halt_predicate}"
                 ),
                 {
                     "token": normalized_token,

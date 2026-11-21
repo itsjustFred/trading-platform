@@ -191,8 +191,9 @@ deployment's entries are halted only after
 (default `2`), and a clean pass resets the streak *and* releases the halt.
 
 The halt is **entry-only**. It is a persisted flag on the deployment (the
-`broker_reconciliation_entries_halted` settings key), checked by the dispatch
-path immediately before an entry order is submitted - the deployment stays
+`broker_reconciliation_entries_halted` settings key), re-checked atomically
+inside the submission claim immediately before an entry order is submitted -
+the deployment stays
 `ACTIVE`, so exits, in-flight orders, trailing stops and STOPPED enforcement
 keep their normal semantics. A `PAUSED` status was rejected for this on
 purpose: it would also freeze exits and trailing, exactly when a broker/ledger
@@ -209,7 +210,13 @@ Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
 count as orders the ledger still expects to be working: both live order paths
 expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
 unfilled row is a cancelled/expired/rejected historical order, not a working
-one. Accounts holding positions or orders placed *outside* the platform
+one. A younger order missing from the broker's working list is not trusted on
+the age bound alone: the reconciler asks the adapter for that order's state
+(`get_order_state`, bounded lookups per pass), and only a proven `terminal`
+state clears the finding - IOC remainders, cancelled orders and rejected
+submissions all classify terminal, while `working`, unknown, timed-out or
+unreadable states keep it. Accounts holding positions or orders placed
+*outside* the platform
 (manual trades, another tool) will always mismatch - the ledger cannot vouch
 for them; flatten or adopt them at the broker before relying on a clean
 report.

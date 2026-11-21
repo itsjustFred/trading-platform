@@ -654,6 +654,67 @@ def test_preparation_failure_never_takes_the_claim(
     assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
 
 
+def test_entries_halt_written_during_prepare_blocks_the_claim(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """A halt committed while the dispatcher was sizing must still stop the entry.
+
+    The pre-submit ``live_deployment_entries_halted`` read runs before
+    ``prepare_order_with_risk``; the claim re-checks the flag inside its own
+    transaction, so a halt landing in that window wins the race (#303).
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    adapter = _ControlAdapter()
+
+    async def _halt_during_prepare(_adapter, _deployment, live_signal):
+        database.set_live_deployment_entries_halt(
+            DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+        )
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _halt_during_prepare)
+
+    _submit(database, adapter)
+
+    assert adapter.submitted == []
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
+def test_exit_claim_is_not_gated_by_the_entries_halt(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """The halt is entry-only: an exit on a halted deployment still submits."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    database.set_live_deployment_entries_halt(
+        DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+    )
+    adapter = _ControlAdapter()
+
+    async def _prepared(_adapter, _deployment, live_signal):
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepared)
+
+    exit_signal = _trade_signal()
+    exit_signal.action = "sell"
+    exit_signal.metadata = {**dict(exit_signal.metadata), "exit_only": True}
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            ACCOUNT_ID,
+            adapter,
+            _deployment(database),
+            exit_signal,
+            signal_timeframe="1h",
+            wait_enabled=False,
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
 def test_claim_is_renewed_while_the_submit_is_in_flight(
     isolated_db_sandbox, monkeypatch
 ) -> None:

@@ -2756,15 +2756,17 @@ async def _prepare_claim_and_submit_signal(
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
-    # deployment. The claim turns "still ACTIVE" into a single atomic database
-    # fact taken immediately before submission, so a PAUSE either wins the race
-    # (the claim fails and nothing is sent) or is already in effect while this
+    # deployment, and the reconciler can halt entries. The claim turns "still
+    # ACTIVE and not entries-halted" into a single atomic database fact taken
+    # immediately before submission, so either gate either wins the race (the
+    # claim fails and nothing is sent) or is already in effect while this
     # dispatcher finishes the order it had already claimed.
     claim_token = uuid.uuid4().hex
     claimed = await asyncio.to_thread(
         claim_live_deployment_submission,
         str(deployment.id),
         claim_token,
+        refuse_entries_halt=not is_exit,
     )
     if not claimed:
         logger.info(

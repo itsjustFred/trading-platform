@@ -92,6 +92,7 @@ from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
 from shared.database import (
+    ENTRIES_HALT_SETTINGS_KEY,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
@@ -5249,6 +5250,12 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         "signal_source": deployment.signal_source,
         "signal_config": deployment.signal_config,
         "settings": deployment.settings,
+        # The broker-reconciliation entry halt lives in ``settings``; surface
+        # it as a first-class flag so a deployment that is ACTIVE-but-not-
+        # trading-entries is visible without reading the settings blob (#303).
+        "entries_halted": bool(
+            (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+        ),
     }
     safe_payload = redact_value(payload)
     return safe_payload if isinstance(safe_payload, dict) else {}
@@ -14119,7 +14126,10 @@ async def delete_live_deployment_endpoint(
     if status_gated:
         try:
             gated = await asyncio.to_thread(
-                update_live_deployment_status, deployment_id, "PAUSED"
+                update_live_deployment_status,
+                deployment_id,
+                "PAUSED",
+                release_entries_halt=False,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -14150,8 +14160,16 @@ async def delete_live_deployment_endpoint(
         restored_to: str | None = None
         if status_gated:
             try:
+                # release_entries_halt=False: this write only restores the
+                # status the refused delete borrowed. It is not an operator
+                # resume, so it must not clear a broker-reconciliation entry
+                # halt - entries would otherwise reopen on a known-mismatched
+                # account until the next pass.
                 await asyncio.to_thread(
-                    update_live_deployment_status, deployment_id, original_status
+                    update_live_deployment_status,
+                    deployment_id,
+                    original_status,
+                    release_entries_halt=False,
                 )
                 restored_to = original_status
             except Exception as restore_exc:  # pragma: no cover - defensive

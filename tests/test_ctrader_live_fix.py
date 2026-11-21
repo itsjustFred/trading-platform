@@ -1487,3 +1487,49 @@ def test_list_reconciliation_orders_fails_closed_on_an_unknown_symbol_id() -> No
 
     with pytest.raises(ValueError, match="symbol id"):
         _run(adapter.list_reconciliation_orders())
+
+
+def test_get_order_state_reads_working_and_terminal_orders(tmp_path: Path) -> None:
+    """Reconciliation lookups classify one order via ProtoOAOrderDetailsReq."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAOrderDetailsReq,
+        ProtoOAOrderDetailsRes,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
+    adapter._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
+    adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
+
+    statuses = {
+        301: ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        302: ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED,
+        303: ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+    }
+
+    async def _fake_send(request, **_kwargs):
+        assert isinstance(request, ProtoOAOrderDetailsReq)
+        res = ProtoOAOrderDetailsRes()
+        if request.orderId in statuses:
+            res.order.orderId = request.orderId
+            res.order.orderStatus = statuses[request.orderId]
+        return res
+
+    adapter._send_request_with_refresh_retry = _fake_send  # type: ignore[method-assign]
+
+    assert asyncio.run(adapter.get_order_state("301")) == "terminal"
+    assert asyncio.run(adapter.get_order_state("302")) == "working"
+    assert asyncio.run(adapter.get_order_state("303")) == "terminal"
+    # An order id the broker does not know reads as unknown, never terminal.
+    assert asyncio.run(adapter.get_order_state("999")) is None
+    assert asyncio.run(adapter.get_order_state("not-a-number")) is None

@@ -936,3 +936,66 @@ def test_reconciliation_orders_mark_bracket_legs_as_protection() -> None:
 
     assert views["leg-tp"].protection is True
     assert views["leg-sl"].protection is True
+
+
+def test_get_order_state_maps_broker_statuses() -> None:
+    """Reconciliation lookups: terminal statuses drop the finding, the rest
+    fail closed (#303)."""
+    orders = {
+        "ord-expired": SimpleNamespace(status="expired"),
+        "ord-working": SimpleNamespace(status="new"),
+        "ord-weird": SimpleNamespace(status="some_future_status"),
+    }
+
+    def get_order_by_id(order_id):
+        order = orders.get(order_id)
+        if order is None:
+            raise RuntimeError("404 not found")
+        return order
+
+    client = SimpleNamespace(get_order_by_id=get_order_by_id)
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter.get_order_state("ord-expired")) == "terminal"
+    assert asyncio.run(adapter.get_order_state("ord-working")) == "working"
+    assert asyncio.run(adapter.get_order_state("ord-weird")) is None
+    assert asyncio.run(adapter.get_order_state("ord-missing")) is None
+
+
+def test_get_order_state_falls_back_to_client_order_id() -> None:
+    def get_order_by_id(order_id):
+        raise RuntimeError("404 not found")
+
+    def get_order_by_client_id(client_order_id):
+        return SimpleNamespace(status="canceled")
+
+    client = SimpleNamespace(
+        get_order_by_id=get_order_by_id,
+        get_order_by_client_id=get_order_by_client_id,
+    )
+    adapter = _adapter(client)
+
+    assert (
+        asyncio.run(adapter.get_order_state("broker-id", client_order_id="sig-1"))
+        == "terminal"
+    )
+
+
+def test_install_http_timeout_wraps_the_session_once() -> None:
+    from live_runner.alpaca_adapter import _install_http_timeout
+
+    calls: list[dict] = []
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            calls.append({"method": method, "kwargs": kwargs})
+            return "ok"
+
+    client = SimpleNamespace(_session=_Session())
+    _install_http_timeout(client, 12.5)
+    _install_http_timeout(client, 99.0)  # second call must not double-wrap
+
+    assert client._session.request("GET", "https://example.invalid") == "ok"
+    assert calls == [
+        {"method": "GET", "kwargs": {"timeout": 12.5}}
+    ]

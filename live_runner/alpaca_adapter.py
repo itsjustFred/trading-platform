@@ -25,6 +25,8 @@ from live_runner.alpaca_fees import (
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
     BrokerOrderView,
     ControlOutcome,
@@ -82,6 +84,63 @@ _EXTENDED_HOURS_BRACKET_MESSAGE = (
     "the broker rejects bracket orders with extended_hours enabled "
     "(signal_id={signal_id}, symbol={symbol})."
 )
+
+#: Order statuses that can never work again (#303 reconciliation lookups).
+#: Everything else - and anything unrecognised - stays "unknown", which the
+#: reconciler treats as still-expected (fail closed).
+_ALPACA_TERMINAL_ORDER_STATUSES = frozenset(
+    {
+        "filled",
+        "canceled",
+        "expired",
+        "rejected",
+        "done_for_day",
+        "stopped",
+        "suspended",
+        "replaced",
+    }
+)
+_ALPACA_WORKING_ORDER_STATUSES = frozenset(
+    {
+        "new",
+        "partially_filled",
+        "pending_cancel",
+        "pending_replace",
+        "pending_new",
+        "pending_review",
+        "accepted",
+        "accepted_for_bidding",
+        "held",
+    }
+)
+
+#: Default per-request HTTP timeout for the alpaca-py REST session. alpaca-py
+#: exposes no timeout knob; without one a hung socket keeps its executor
+#: thread forever, which is how a reconciliation read used to leak workers.
+ALPACA_HTTP_TIMEOUT_SECONDS = 30.0
+
+
+def _install_http_timeout(client: Any, timeout_seconds: float) -> None:
+    """Give the alpaca-py REST session a default per-request timeout.
+
+    ``RESTClient`` has no timeout parameter and ``requests.Session`` has no
+    session-level default, so the session's ``request`` entry point is wrapped
+    once. A hung socket then fails the call instead of pinning an executor
+    thread forever.
+    """
+    session = getattr(client, "_session", None)
+    if session is None or getattr(session, "_tp_timeout_installed", False):
+        return
+    original_request = getattr(session, "request", None)
+    if not callable(original_request):
+        return
+
+    def _request_with_timeout(method: str, url: str, **kwargs: Any) -> Any:
+        kwargs.setdefault("timeout", timeout_seconds)
+        return original_request(method, url, **kwargs)
+
+    session.request = _request_with_timeout
+    session._tp_timeout_installed = True
 
 
 def _round_bracket_price_toward_entry(price: float, *, entry_price: float) -> float:
@@ -817,6 +876,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
         self._trading_client = TradingClient(self.api_key, self.secret_key, paper=self.paper)
+        _install_http_timeout(self._trading_client, ALPACA_HTTP_TIMEOUT_SECONDS)
         self._trading_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
         self._historical_data_client = StockHistoricalDataClient(
             self.api_key, self.secret_key
@@ -1945,6 +2005,52 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     )
                 )
         return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        Tries the broker order id first, then the client order id (the
+        persisted signal id). ``None`` - an error, a 404 or an unrecognised
+        status - always fails closed: the reconciler keeps its finding.
+        """
+        client = await self._require_trading_client()
+        candidates: list[str] = []
+        for value in (order_id, client_order_id):
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        states: list[str | None] = []
+        for candidate in candidates:
+            states.append(await self._alpaca_order_state(client, candidate))
+        if ORDER_STATE_WORKING in states:
+            return ORDER_STATE_WORKING
+        if ORDER_STATE_TERMINAL in states:
+            return ORDER_STATE_TERMINAL
+        return None
+
+    async def _alpaca_order_state(self, client: Any, order_id: str) -> str | None:
+        order = None
+        get_by_id = getattr(client, "get_order_by_id", None)
+        if callable(get_by_id):
+            try:
+                order = await asyncio.to_thread(get_by_id, order_id)
+            except Exception:
+                order = None
+        if order is None:
+            get_by_client = getattr(client, "get_order_by_client_id", None)
+            if callable(get_by_client):
+                try:
+                    order = await asyncio.to_thread(get_by_client, order_id)
+                except Exception:
+                    order = None
+        if order is None:
+            return None
+        status = _order_status(order)
+        if status in _ALPACA_TERMINAL_ORDER_STATUSES:
+            return ORDER_STATE_TERMINAL
+        if status in _ALPACA_WORKING_ORDER_STATUSES:
+            return ORDER_STATE_WORKING
+        return None
 
     def exit_qty_step(self, symbol: str) -> float:
         """Alpaca's smallest quantity step (9 decimals): what an exit is floored to."""
