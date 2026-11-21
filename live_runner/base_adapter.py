@@ -338,7 +338,8 @@ class ProtectiveStop:
     stop_price: float
     #: Quantity the stop order covers, when the broker reports it. Informational
     #: (excluded from equality): an amendment moves the price only, so the caller
-    #: can warn when it differs from the position, never correct it.
+    #: can only compare it with the position — and, when the stop covers more
+    #: than is held, leave it untrailed rather than correct it (#258).
     qty: float | None = field(default=None, compare=False)
 
 

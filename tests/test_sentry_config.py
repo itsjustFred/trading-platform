@@ -141,3 +141,48 @@ def test_capture_exception_uses_scoped_context(monkeypatch: pytest.MonkeyPatch) 
     assert calls["exited"] is True
     assert calls["tag:service"] == "scheduler"
     assert calls["context:error_context"] == {"task_id": "abc"}
+
+
+def test_capture_message_uses_scoped_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    class Scope:
+        def set_tag(self, key: str, value: object) -> None:
+            calls[f"tag:{key}"] = value
+
+        def set_context(self, key: str, value: object) -> None:
+            calls[f"context:{key}"] = value
+
+    class ScopeManager:
+        def __enter__(self) -> Scope:
+            calls["entered"] = True
+            return Scope()
+
+        def __exit__(self, *args: object) -> None:
+            calls["exited"] = True
+
+    seen: dict[str, object] = {}
+
+    def _capture_message(message, level="error"):
+        seen["message"] = message
+        seen["level"] = level
+        return "event-id"
+
+    monkeypatch.setattr(sentry_module.sentry_sdk, "push_scope", lambda: ScopeManager())
+    monkeypatch.setattr(sentry_module.sentry_sdk, "capture_message", _capture_message)
+
+    event_id = sentry_module.capture_message(
+        "a state an operator has to act on",
+        service_name="live-runner",
+        context={"component": "live_trailing_stops"},
+    )
+
+    assert event_id == "event-id"
+    assert seen == {
+        "message": "a state an operator has to act on",
+        "level": "error",
+    }
+    assert calls["entered"] is True
+    assert calls["exited"] is True
+    assert calls["tag:service"] == "live-runner"
+    assert calls["context:error_context"] == {"component": "live_trailing_stops"}

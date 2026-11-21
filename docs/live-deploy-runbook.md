@@ -111,6 +111,16 @@ results stop predicting live behaviour:
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
   flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
   flatten never misses a stop that was replaced under it.
+- Wrong side of the market: an amendment is never sent at or beyond the latest close — a long's
+  stop has to sit below it and a short's above it. A catch-up (after a restart, or after the
+  stop-quantity pause below) replays every close it skipped, so a peak the market has since
+  fallen through would trail the stop onto the wrong side: the broker refuses it (and the retry
+  loop would end in give-up) or it fills at the market on the spot. The amendment goes to the
+  last trailed level that stays clear of the last close, and the closes it stops at stay
+  unprocessed and are replayed on the next pass, so no close is applied to a stop that would
+  cross and no trailed peak is lost — it is applied as soon as the market is back above it. A
+  stop the broker already holds on the wrong side of the market is left exactly as it is. This
+  never loosens a stop: the broker's own stop stays in force until a better one is confirmed.
 - Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
   logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
@@ -127,20 +137,46 @@ results stop predicting live behaviour:
   Failures no retry can fix (an unservable timeframe, an adapter without market data) are never
   probed and last until the entry signal or the position changes (a daemon restart also starts
   counting again). The broker-side stop stays at its last level while given up.
-  This includes a trailed stop the market has already fallen through since the bar closed: the
-  broker refuses it, the old stop keeps protecting the position, and the replay backtest would
-  have exited on that bar instead.
+  A trailed stop the market has already fallen through since the bar closed is not amended at
+  all (see "Wrong side of the market" above): no replace is sent, the bars stay unprocessed and
+  the old stop keeps protecting the position, while the replay backtest would have exited on
+  that bar instead.
 - Restart: nothing needs to be restored. The current stop is read from the broker on every pass
   and the trailing config from the persisted entry signal (`live_signals.metadata`,
   `trailing_sl_config`). After a restart the trail continues from the broker's stop, catches up on
-  up to 50 closed bars, and cannot move a stop backwards.
+  up to 50 closed bars, and cannot move a stop backwards. The catch-up is bounded by the "wrong
+  side of the market" rule above: a peak the market has fallen through is not applied until the
+  market is back above it.
 - Cleanup: in-memory progress is dropped as soon as the position is gone at the broker (stop or
   take profit hit, exit signal, manual close) or its deployment is no longer ACTIVE. A partial
-  exit keeps the trail on the remaining quantity.
-- Stop quantity: an amendment moves the price only. After a partial exit a bracket stop leg can
-  still be sized to the original entry; the loop logs a WARNING once per position when the stop
-  covers more than the position holds, but does not resize it. What Alpaca does when such a stop
-  triggers (cap, oversell, reject) has **not** been verified on paper.
+  exit keeps the trail on the remaining quantity — see the stop-quantity rule below for the one
+  case where it pauses. A partially filled bracket parent is the same shape: while its stop leg
+  keeps the *order* quantity (which is what a partial parent fill leaves behind), the trail is
+  paused for the whole trade, not just for the filled part, and only a resize of that leg ends
+  it. Whether Alpaca sizes a partially filled bracket's stop leg to the filled quantity or to the
+  order quantity is unverified — it is part of the paper run the "Paper verification pending"
+  note below is waiting for.
+- Stop quantity: an amendment moves a stop's price, never its quantity. After a partial exit a
+  bracket stop leg can still be sized to the original entry, and what Alpaca does when such a stop
+  triggers (cap, oversell, reject) has **not** been verified on paper (#258). A stop whose
+  quantity the broker reports as larger than the position holds is therefore left **untrailed**:
+  the loop reports it (`Protective stop quantity exceeds the open position; the stop is left
+  untrailed until it is resized to the quantity held`, with account, symbol, signal, stop order
+  id, stop quantity and position quantity) as an ERROR with one Sentry event
+  (`component=live_trailing_stops`) on every transition into the mismatch — so a second partial
+  exit after a resize is reported again — and amends nothing. The pause covers the whole trade,
+  not only the over-covered part: while the stop cannot sell the position it protects, nothing
+  about it is trusted, so no close is trailed at all until the leg is resized. A repeat while the
+  mismatch lasts is silent: the state has not changed and one event per transition is the alert.
+  Only a manual resize ends the pause, which is why the transition is an ERROR rather than a
+  WARNING: nobody
+  reads a warning that says a live position is no longer trailed. It is not a failure: no retry,
+  no give-up, and no bar is consumed, so the moment the stop is resized to the quantity held (by
+  hand today) the trail resumes and applies every close it skipped (up to 50). The pause also
+  ends any failure run that was recorded before it, and clears a give-up: the pass that finds the
+  oversized stop did reach the broker, so it counts as a success like any other pass.
+  A stop the broker reports no quantity for is trailed as usual. Resizing the stop on the trail
+  itself (a replace carrying `qty=`) is the follow-up, gated on the paper probe of #258.
 
 **Limits to know when operating it**
 
@@ -172,6 +208,16 @@ clean-up.
 - Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
   `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
   cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
+- Still **not** covered (#258): a replace that carries `qty=` on that `held` stop leg, and whether
+  the replacement is still visible as a held leg / open order after a second amend. Until that
+  probe runs (a bracket entry, a partial exit, then a trail trigger, in market hours), a stop that
+  covers more than the position holds is left untrailed rather than resized — see "Stop quantity"
+  above.
+- Still **not** covered (#258): how a *partially filled* bracket parent sizes its stop leg — to the
+  quantity that filled or to the quantity that was ordered. The first pauses the trail for the whole
+  trade (the leg covers more than the position holds) and only a resize ends it; the second leaves
+  the leg matching the position and the trail continues. The probe above has to observe it, so the
+  bracket entry of that run is filled in two parts.
 
 ## Strategy Promotion Gate (#165)
 
