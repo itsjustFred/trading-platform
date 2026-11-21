@@ -489,7 +489,13 @@ class TestRiskAdjustedObjectiveWiring:
     """C3: the objective return carries the haircut, not the raw metric."""
 
     def test_sparse_trial_returns_adjusted_value(self, monkeypatch, tmp_path):
-        from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+        from shared.models import (
+            BacktestMeta,
+            BacktestResult,
+            EquityPoint,
+            Trade,
+            TradeExit,
+        )
 
         def _trade(i: int) -> Trade:
             return Trade(
@@ -523,7 +529,13 @@ class TestRiskAdjustedObjectiveWiring:
             return BacktestResult(
                 meta=meta,
                 trades=[_trade(1), _trade(2), _trade(3)],
-                equity_curve=[],
+                # A flat curve keeps max_drawdown_pct measurable (0.0) so the
+                # sparsity haircut is the only factor under test (#286: an
+                # absent curve leaves drawdown undefined and scores 0).
+                equity_curve=[
+                    EquityPoint(time="2024-02-01T00:00:00+00:00", equity=100_000.0),
+                    EquityPoint(time="2024-02-02T00:00:00+00:00", equity=100_000.0),
+                ],
             )
 
         studies: list = []
