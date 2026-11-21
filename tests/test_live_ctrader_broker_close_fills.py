@@ -23,7 +23,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 
@@ -358,7 +358,7 @@ def test_a_redelivered_close_is_a_skip_not_a_second_close(database) -> None:
 def test_a_close_resolved_by_broker_order_id_alone_books(database) -> None:
     """After a restart the in-memory maps are empty: the opening order's id is
     recovered through ``find_live_signal_id_by_broker_order_id``."""
-    signal_id = _persist_entry(database, qty=10.0)
+    _persist_entry(database, qty=10.0)
     entry = _entry_order("")  # no clientOrderId echoed
     entry.clientOrderId = ""
     adapter = _adapter(database, position_orders={POSITION_ID: [entry]})
