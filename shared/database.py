@@ -5485,7 +5485,15 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
         # An unusable price (#124, review of #143) is None, not 0.0: a 0.0 here would read as a
         # fill at zero and a slippage of -100%.
         actual = _optional_execution_price(execution)
-        slippage = actual - theoretical if actual is not None else None
+        # #144: a broker-side close has no theoretical price of ours (the broker
+        # decided the exit), so `actual - theoretical` is not a slippage - it would
+        # read as the whole fill price. Report no slippage, never a fabricated one.
+        broker_close = str(signal.source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        slippage = (
+            actual - theoretical
+            if actual is not None and not broker_close
+            else None
+        )
         if slippage is None:
             slippage_bps = None
         else:
