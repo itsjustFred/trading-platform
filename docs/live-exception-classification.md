@@ -36,19 +36,19 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/alpaca_adapter.py` | 2831 | `listen_executions` | loop survival (log and continue) | yes — stream stop cleanup |
 | `live_runner/base_adapter.py` | 48 | `order_not_submitted` | money decision (must fail closed) | yes — marks and re-raises |
 | `live_runner/base_adapter.py` | 51 | `order_not_submitted` | money decision (must fail closed) | yes — marker failure degrades to unknown |
-| `live_runner/ctrader_adapter.py` | 571 | `_twisted_deferred_timeout_class` | loop survival (log and continue) | yes — string-shape fallback |
-| `live_runner/ctrader_adapter.py` | 616 | `_reason_to_text` | loop survival (log and continue) | yes — str(reason) fallback |
-| `live_runner/ctrader_adapter.py` | 1085 | `_refresh_access_token` | money decision (must fail closed) | yes — refresh returns False |
-| `live_runner/ctrader_adapter.py` | 1176 | `_on_message` | money decision (must fail closed) | yes — execution decode flags reconciliation |
-| `live_runner/ctrader_adapter.py` | 1502 | `_load_symbol_props_into_cache` | money decision (must fail closed) | yes — propagates, no fallback scales |
-| `live_runner/ctrader_adapter.py` | 1681 | `connect` | money decision (must fail closed) | yes — retry then raise |
-| `live_runner/ctrader_adapter.py` | 1707 | `_reconcile_after_connect` | money decision (must fail closed) | yes — reconciliation flag + retry |
-| `live_runner/ctrader_adapter.py` | 1889 | `_teardown_client` | loop survival (log and continue) | yes — teardown cleanup |
-| `live_runner/ctrader_adapter.py` | 1893 | `_teardown_client` | loop survival (log and continue) | yes — teardown cleanup |
-| `live_runner/ctrader_adapter.py` | 2737 | `_unsubscribe_spot` | loop survival (log and continue) | yes — best-effort unsubscribe |
-| `live_runner/ctrader_adapter.py` | 2903 | `_asset_name_map` | loop survival (log and continue) | yes — names are log-only |
-| `live_runner/ctrader_adapter.py` | 3864 | `listen_executions` | money decision (must fail closed) | yes — requeue or raise |
-| `live_runner/ctrader_adapter.py` | 3894 | `_run_pending_reconciliation` | money decision (must fail closed) | yes — retry scheduled, flag kept |
+| `live_runner/ctrader_adapter.py` | 575 | `_twisted_deferred_timeout_class` | loop survival (log and continue) | yes — string-shape fallback |
+| `live_runner/ctrader_adapter.py` | 620 | `_reason_to_text` | loop survival (log and continue) | yes — str(reason) fallback |
+| `live_runner/ctrader_adapter.py` | 1089 | `_refresh_access_token` | money decision (must fail closed) | yes — refresh returns False |
+| `live_runner/ctrader_adapter.py` | 1180 | `_on_message` | money decision (must fail closed) | yes — execution decode flags reconciliation |
+| `live_runner/ctrader_adapter.py` | 1511 | `_load_symbol_props_into_cache` | money decision (must fail closed) | yes — propagates, no fallback scales |
+| `live_runner/ctrader_adapter.py` | 1693 | `connect` | money decision (must fail closed) | yes — retry then raise |
+| `live_runner/ctrader_adapter.py` | 1719 | `_reconcile_after_connect` | money decision (must fail closed) | yes — reconciliation flag + retry |
+| `live_runner/ctrader_adapter.py` | 1901 | `_teardown_client` | loop survival (log and continue) | yes — teardown cleanup |
+| `live_runner/ctrader_adapter.py` | 1905 | `_teardown_client` | loop survival (log and continue) | yes — teardown cleanup |
+| `live_runner/ctrader_adapter.py` | 2749 | `_unsubscribe_spot` | loop survival (log and continue) | yes — best-effort unsubscribe |
+| `live_runner/ctrader_adapter.py` | 2915 | `_asset_name_map` | loop survival (log and continue) | yes — names are log-only |
+| `live_runner/ctrader_adapter.py` | 3878 | `listen_executions` | money decision (must fail closed) | yes — requeue or raise |
+| `live_runner/ctrader_adapter.py` | 3908 | `_run_pending_reconciliation` | money decision (must fail closed) | yes — retry scheduled, flag kept |
 | `live_runner/daemon.py` | 615 | `_live_account_broker_login` | money decision (must fail closed) | yes — returns empty broker login |
 | `live_runner/daemon.py` | 708 | `_mark_discord_deployment_service_unhealthy` | loop survival (log and continue) | yes — refusal already happened |
 | `live_runner/daemon.py` | 1145 | `_check_entry_deviation` | money decision (must fail closed) | yes — raises, entry refused |
@@ -81,8 +81,8 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/daemon.py` | 5171 | `sync_deployments_loop` | loop survival (log and continue) | yes — next tick retries, no stamp |
 | `live_runner/daemon.py` | 5237 | `run_daemon` | money decision (must fail closed) | yes — logs and re-raises |
 | `live_runner/market_data_stream.py` | 146 | `_run` | loop survival (log and continue) | yes — stream reconnect backoff |
-| `live_runner/market_data_stream.py` | 197 | `set_symbols` | loop survival (log and continue) | yes — resubscribe continues |
-| `live_runner/market_data_stream.py` | 208 | `stop` | loop survival (log and continue) | yes — stop cleanup |
+| `live_runner/market_data_stream.py` | 213 | `set_symbols` | loop survival (log and continue) | yes — resubscribe continues |
+| `live_runner/market_data_stream.py` | 224 | `stop` | loop survival (log and continue) | yes — stop cleanup |
 | `live_runner/preflight.py` | 188 | `_connectivity_event_loop` | loop survival (log and continue) | yes — exit cleanup |
 | `live_runner/preflight.py` | 228 | `_run_broker_connectivity_check` | money decision (must fail closed) | yes — preflight error |
 | `live_runner/preflight.py` | 638 | `run_live_preflight` | money decision (must fail closed) | yes — ok=False |
