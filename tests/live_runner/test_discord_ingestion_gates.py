@@ -929,6 +929,107 @@ def test_account_listener_merges_trusted_authors_across_channel_group(
     assert captured.get("trusted_author_ids") == {"bot-1", "bot-2"}
 
 
+def test_the_listeners_primary_deployment_is_an_active_one(monkeypatch) -> None:
+    """#311 should-fix: one listener serves the account, so one bot's token drives it.
+
+    The dispatchable set now includes PAUSED deployments, and it is ordered newest
+    first while a freshly created deployment is PAUSED - so the head of the list could be
+    a paused bot whose token, auth scheme and timeframe decide how an older ACTIVE bot's
+    channel is polled. The ACTIVE deployment wins whenever there is one.
+    """
+    import asyncio
+
+    import live_runner.daemon as daemon
+
+    # A brand-new PAUSED deployment first, an older ACTIVE one second: the order
+    # `_dispatchable_discord_deployments_for_account` produces from created_at DESC.
+    paused_newer = _deployment_for_test(
+        "dep-3", symbols=["AAPL"], channel_id="channel-1", status="PAUSED"
+    )
+    paused_newer.signal_config["service_name"] = "NEWER-BOT"
+    paused_newer.signal_config["timeframe"] = "15m"
+    paused_newer.signal_config["trusted_author_ids"] = ["bot-1"]
+    active_older = _deployment_for_test(
+        "dep-1", symbols=["AAPL"], channel_id="channel-1", status="ACTIVE"
+    )
+    active_older.signal_config["service_name"] = "OLDER-BOT"
+    active_older.signal_config["timeframe"] = "1h"
+    active_older.signal_config["trusted_author_ids"] = ["bot-1"]
+
+    captured: dict[str, object] = {}
+
+    class _Source:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self, **_kwargs):
+            return None
+
+        async def listen_signals(self):
+            if False:
+                yield None
+
+    monkeypatch.setattr(daemon, "DiscordSignalSource", _Source)
+
+    asyncio.run(
+        daemon._run_discord_signal_listener_for_account(
+            "acc-1",
+            object(),
+            [paused_newer, active_older],
+            accounts_env_values={},
+        )
+    )
+
+    assert captured.get("timeframe") == "1h"
+
+
+def test_the_listeners_primary_deployment_falls_back_to_the_paused_one(
+    monkeypatch,
+) -> None:
+    """An account with no ACTIVE deployment still needs a listener for its exits (#126)."""
+    import asyncio
+
+    import live_runner.daemon as daemon
+
+    paused = _deployment_for_test(
+        "dep-5", symbols=["AAPL"], channel_id="channel-1", status="PAUSED"
+    )
+    paused.signal_config["timeframe"] = "15m"
+    paused.signal_config["trusted_author_ids"] = ["bot-1"]
+
+    captured: dict[str, object] = {}
+
+    class _Source:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self, **_kwargs):
+            return None
+
+        async def listen_signals(self):
+            if False:
+                yield None
+
+    monkeypatch.setattr(daemon, "DiscordSignalSource", _Source)
+
+    asyncio.run(
+        daemon._run_discord_signal_listener_for_account(
+            "acc-1",
+            object(),
+            [paused],
+            accounts_env_values={},
+        )
+    )
+
+    assert captured.get("timeframe") == "15m"
+
+
 def test_service_listener_uses_service_trusted_author_config(monkeypatch) -> None:
     """Standalone Discord bot services read trusted author IDs from the service
     config (trusted_author_ids) and pass them to the source."""

@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from live_runner.broker_order_conflicts import CONFLICT_SCAN_LIMIT
 from shared.models import (
     LiveAccount,
     LiveAccountConfig,
@@ -442,6 +443,545 @@ def test_live_dashboard_endpoint_returns_telemetry(monkeypatch):
     assert payload["capital"]["total_equity"] == 10000.0
     assert payload["active_strategies"][0]["strategy_name"] == "live_strategy"
     assert payload["active_strategies"][0]["capital_allocation"] == 1.0
+
+
+def _dashboard_fixture(monkeypatch, viewer_main_module, deployment) -> None:
+    """The stubs `get_live_dashboard` needs, so a conflict read is the only variable."""
+    account = LiveAccountConfig(id=str(deployment.account_id), broker="alpaca", name="acct")
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(viewer_main_module, "list_live_accounts", lambda: [account])
+    monkeypatch.setattr(viewer_main_module, "list_live_deployments", lambda: [deployment])
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_live_account_stats_payload",
+        lambda _account_id: {
+            "account_id": _account_id,
+            "current_equity": 10000.0,
+            "current_balance": 9900.0,
+            "total_trades": 1,
+            "total_pnl": 25.0,
+        },
+    )
+
+    async def _fake_trades(_account_id):
+        return {"account_id": _account_id, "deployment_ids": [], "trades": []}
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _fake_trades)
+
+
+def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatch):
+    """#126: the conflict is an API fact, not just a log line an operator has to find."""
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    conflict = {
+        "signal_id": "11111111-1111-1111-1111-111111111111",
+        "deployment_id": str(deployment.id),
+        "symbol": "AAPL",
+        "broker_order_id": "BRK-AAA",
+        "conflicting_broker_order_ids": ["BRK-BBB"],
+    }
+    conflicted_but_active = LiveDeploymentConfig(
+        id="77777777-7777-7777-7777-777777777777",
+        strategy_name="about_to_halt",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_live_deployments",
+        lambda: [deployment, LiveDeploymentConfig(
+            id="66666666-6666-6666-6666-666666666666",
+            strategy_name="other",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="ACTIVE",
+        ), conflicted_but_active],
+    )
+    scan_limits: list[int] = []
+
+    def _conflicts(*args, **kwargs):
+        # Record what the endpoint asked for: the fleet-wide read has to carry the
+        # shared scan limit, or a conflict older than the database's 200-row default
+        # would make this payload answer "no conflict" for a halted deployment.
+        scan_limits.append(args[0] if args else kwargs.get("limit"))
+        return {
+            str(deployment.id): [conflict],
+            str(conflicted_but_active.id): [conflict],
+        }
+
+    monkeypatch.setattr(
+        viewer_main_module, "deployments_with_broker_order_conflicts", _conflicts
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = client.get("/api/live/deployments").json()
+
+    halted = payload[0]
+    assert halted["broker_order_conflicts"] == [conflict]
+    assert halted["halted_for_broker_order_conflict"] is True
+    # A deployment with no conflict is not reported as halted for one (the ledger was
+    # read for it, and it holds nothing)...
+    assert payload[1]["broker_order_conflicts"] == []
+    assert payload[1]["halted_for_broker_order_conflict"] is False
+    # ...and a conflict alone does not imply a halt: a still-ACTIVE deployment carrying
+    # one is a conflict the halt is about to land on, and saying otherwise would hide it.
+    assert payload[2]["broker_order_conflicts"] == [conflict]
+    assert payload[2]["halted_for_broker_order_conflict"] is False
+    assert scan_limits and scan_limits[0] == CONFLICT_SCAN_LIMIT, (
+        f"the deployments endpoint read the conflict ledger at {scan_limits[0]!r}, "
+        "not the shared scan limit, so an older conflict is invisible to operators"
+    )
+
+
+def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
+    monkeypatch, isolated_db_sandbox
+) -> None:
+    """#311 blocker 2a: the resume path must not be the way out of a conflict halt.
+
+    The halt is re-asserted on the service-sync tick, but that tick is up to 60 s away
+    and an ACTIVE write opens entries and the submission claim *now*: an entry inside
+    that window is a live order on a deployment whose broker exposure the ledger cannot
+    explain. The operator endpoint refuses while the conflict is recorded, names the
+    conflicting ids and points at the resolve endpoint - the way out of the halt.
+    """
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    database_module, _engine, _data_dir = isolated_db_sandbox
+    database_module.ensure_live_account("acc-conflict", "alpaca", is_demo=True)
+    deployment_id = str(_uuid.uuid4())
+    database_module.create_live_deployment(
+        database_module.LiveDeploymentConfig(
+            id=_uuid.UUID(deployment_id),
+            strategy_name="trend_following/trend_following.py",
+            account_id="acc-conflict",
+            symbols=["EURUSD"],
+            timeframe="M15",
+            # A fresh deployment is created PAUSED, so this is the state a conflict
+            # halt is imposed on.
+            status="PAUSED",
+            signal_source_type="discord",
+        )
+    )
+
+    # A duplicate delivery carrying a different broker order id: the conflict is
+    # recorded on the signal and the deployment is halted by the same transaction.
+    from shared.database import save_live_signal
+    from shared.models import LiveSignal
+
+    _signal = LiveSignal(
+        deployment_id=deployment_id,
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime(2026, 11, 21, tzinfo=timezone.utc),
+        metadata={"discord_message_id": "ord-1", "broker_order_id": "BRK-AAA"},
+    )
+    save_live_signal(_signal)
+    save_live_signal(_signal.model_copy(update={"metadata": {
+        "discord_message_id": "ord-1",
+        "broker_order_id": "BRK-BBB",
+    }}))
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+
+    broker_round_trips: list[str] = []
+
+    async def _must_not_reverify(account_id: str) -> bool:
+        broker_round_trips.append(account_id)
+        return True
+
+    monkeypatch.setattr(
+        viewer_main_module, "_reverify_account_against_broker", _must_not_reverify
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        # Confirmed, so the 409 is the conflict refusal and not the precondition.
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "BRK-BBB" in detail
+    assert "broker-order-conflicts/resolve" in detail
+    # The row is untouched - no fail-open window at all.
+    assert database_module.get_live_deployment(deployment_id).status == "PAUSED"
+    # Refused before any broker round-trip: no account verification can lift a halt.
+    assert broker_round_trips == []
+
+    # The refusal is audited like every other refused live control.
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == deployment_id and not entry.get("succeeded")
+    ]
+    assert entries, "the refused activation must be audited"
+    assert "conflict" in (entries[0].get("detail") or {}).get("reason", "")
+
+    # Resolve the conflict and the same call is no longer refused for it: the conflict
+    # gate is the only thing that changed, so this keeps it from reading as "the
+    # deployment can never be armed".
+    from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
+
+    resolve_broker_order_conflicts(deployment_id)
+    resumed = client.put(
+        f"/api/live/deployments/{deployment_id}/status",
+        json={
+            "status": "ACTIVE",
+            "confirmation": {"confirmed_deployment_id": deployment_id},
+        },
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert database_module.get_live_deployment(deployment_id).status == "ACTIVE"
+
+
+def test_resolving_on_a_missing_deployment_is_a_404_and_is_audited(
+    isolated_db_sandbox,
+) -> None:
+    """The audited control must fail loudly, not 500, for a deployment that is gone."""
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    missing = str(_uuid.uuid4())
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        f"/api/live/deployments/{missing}/broker-order-conflicts/resolve",
+        json={
+            "confirmed_deployment_id": missing,
+            "reason": "closed at the broker",
+        },
+    )
+
+    assert response.status_code == 404, response.text
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == missing and not entry.get("succeeded")
+    ]
+    assert entries, "a refused resolve has to name who tried and what they resolved"
+    assert "not found" in (entries[0].get("detail") or {}).get("reason", "")
+
+
+def test_resolving_reports_a_submission_lease_taken_before_the_call(
+    monkeypatch,
+) -> None:
+    """A lease the endpoint's own snapshot saw is still accounted for.
+
+    The endpoint inventories the submission leases *before* it clears anything, so a lease
+    that expires and is reaped between that snapshot and the drain's first poll is still
+    part of the ledger. Without the inventory the first poll finds nothing and reports a
+    clean resolution for a submission nobody observed - the outcome the operator then
+    resumes on.
+    """
+    from datetime import timedelta
+
+    import viewer.main as viewer_main_module
+    from shared.database import LiveDeploymentSubmissionClaim
+
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda _id: LiveDeploymentConfig(
+            id=deployment_id,
+            strategy_name="live_strategy",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "resolve_broker_order_conflicts", lambda _id: []
+    )
+
+    # A lease that is already past its TTL and was never released: its order's outcome
+    # is unknown, so the drain cannot call it clean.
+    expired = LiveDeploymentSubmissionClaim(
+        token="tok-before-the-call",
+        expires_at=viewer_main_module.utcnow_naive() - timedelta(seconds=1),
+        expired=True,
+    )
+    reads: list[str] = []
+
+    def _inventory(_deployment_id):
+        reads.append("read")
+        # The first read is the endpoint's own snapshot; by the drain's first poll the
+        # lease has been reaped by a claim attempt.
+        return [expired] if len(reads) == 1 else []
+
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", _inventory
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        f"/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        json={
+            "confirmed_deployment_id": deployment_id,
+            "reason": "closed at the broker",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["submission_drain_complete"] is False
+    assert payload["submission_drain_outcome"] == "INDETERMINATE"
+    assert "Verify the broker" in payload["warning"]
+    # The inventory was asked for before anything was cleared.
+    assert len(reads) >= 2
+
+
+def test_resolving_keeps_both_warnings_when_nothing_resolved_and_a_drain_did_not(
+    monkeypatch,
+) -> None:
+    """Two different facts about one call; neither overwrites the other.
+
+    The "verify the broker" warning is the one an operator must not lose, and it used to
+    be replaced by "no recorded conflict" exactly when the drain was not clean.
+    """
+    import viewer.main as viewer_main_module
+
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda _id: LiveDeploymentConfig(
+            id=deployment_id,
+            strategy_name="live_strategy",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", lambda _id: []
+    )
+
+    async def _indeterminate_drain(_deployment_id, **_kwargs):
+        from viewer.main import LiveSubmissionDrainOutcome, LiveSubmissionDrainResult
+
+        return LiveSubmissionDrainResult(
+            outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+            in_flight=0,
+            expired_unreleased=1,
+        )
+
+    monkeypatch.setattr(
+        viewer_main_module, "_drain_live_deployment_submissions", _indeterminate_drain
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "resolve_broker_order_conflicts", lambda _id: []
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        f"/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        json={
+            "confirmed_deployment_id": deployment_id,
+            "reason": "closed at the broker",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    warning = response.json()["warning"]
+    assert "Verify the broker" in warning
+    assert "no recorded broker order id conflict" in warning
+
+
+def test_a_long_conflict_list_is_bounded_and_says_that_it_was_cut(monkeypatch) -> None:
+    """#311 nit: a bounded payload has to say it is bounded.
+
+    A deployment can carry more conflicts than one response should carry, and a silently
+    shortened list reads as "these are all of them" to an operator deciding whether to
+    resolve. The cut is reported, and the halt flag still answers from the whole list -
+    it is the presence of a conflict that halts a deployment, never the count.
+    """
+    from viewer.main import (
+        MAX_BROKER_ORDER_CONFLICT_ROWS,
+        _serialize_live_deployment_payload,
+    )
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    every_conflict = [
+        {
+            "signal_id": f"{index}" * 8,
+            "deployment_id": str(deployment.id),
+            "symbol": "AAPL",
+            "broker_order_id": "BRK-AAA",
+            "conflicting_broker_order_ids": [f"BRK-{index}"],
+        }
+        for index in range(MAX_BROKER_ORDER_CONFLICT_ROWS + 5)
+    ]
+
+    payload = _serialize_live_deployment_payload(deployment, every_conflict)
+
+    assert len(payload["broker_order_conflicts"]) == MAX_BROKER_ORDER_CONFLICT_ROWS
+    assert payload["broker_order_conflicts_truncated"] is True
+    assert payload["halted_for_broker_order_conflict"] is True
+
+    short = _serialize_live_deployment_payload(deployment, every_conflict[:1])
+    assert short["broker_order_conflicts_truncated"] is False
+    # An unread ledger is still "unknown", not "none" - and not "a truncated none".
+    unread = _serialize_live_deployment_payload(deployment)
+    assert unread["broker_order_conflicts"] is None
+    assert unread["broker_order_conflicts_truncated"] is False
+
+
+def test_an_unread_conflict_ledger_is_not_reported_as_confirmed_empty(monkeypatch) -> None:
+    """A create response never reads the ledger, so it must not answer for it."""
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+    )
+    payload = viewer_main_module._serialize_live_deployment_payload(deployment)
+
+    assert payload["broker_order_conflicts"] is None
+    assert payload["halted_for_broker_order_conflict"] is False
+
+
+def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):
+    """The dashboard lists ACTIVE rows only, so a halted conflict would be invisible."""
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    _dashboard_fixture(monkeypatch, viewer_main_module, deployment)
+    scan_limits: list[int] = []
+
+    def _conflicts(*args, **kwargs):
+        scan_limits.append(args[0] if args else kwargs.get("limit"))
+        return {
+            str(deployment.id): [
+                {
+                    "signal_id": "11111111-1111-1111-1111-111111111111",
+                    "deployment_id": str(deployment.id),
+                    "symbol": "AAPL",
+                    "broker_order_id": "BRK-AAA",
+                    "conflicting_broker_order_ids": ["BRK-BBB"],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        viewer_main_module, "deployments_with_broker_order_conflicts", _conflicts
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = client.get("/api/live/dashboard").json()
+
+    conflicts = payload["broker_order_conflicts"]
+    assert conflicts["status"] == "error"
+    assert conflicts["deployment_ids"] == [str(deployment.id)]
+    assert conflicts["conflicts"][0]["conflicting_broker_order_ids"] == ["BRK-BBB"]
+    assert conflicts["truncated"] is False
+    # The halted deployment is not in `active_strategies` (it is not ACTIVE), which is
+    # exactly why the conflict is reported on its own.
+    assert payload["active_strategies"] == []
+    # Read once for the whole response, at the shared scan limit: a conflict older
+    # than the database's 200-row default would make the dashboard report a clean
+    # fleet while a deployment is halted.
+    assert scan_limits and scan_limits[0] == CONFLICT_SCAN_LIMIT, (
+        f"the dashboard read the conflict ledger at {scan_limits[0]!r}, not the "
+        "shared scan limit"
+    )
+
+
+def test_resolving_broker_order_conflicts_requires_confirmation_and_a_reason(
+    monkeypatch,
+):
+    """#126: clearing a conflict asserts something about the broker, so it is gated."""
+    import viewer.main as viewer_main_module
+
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda _id: LiveDeploymentConfig(
+            id=deployment_id,
+            strategy_name="live_strategy",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", lambda _id: []
+    )
+    cleared: list[str] = []
+
+    def _clear(unused_id):
+        cleared.append(str(unused_id))
+        return []
+
+    monkeypatch.setattr(viewer_main_module, "resolve_broker_order_conflicts", _clear)
+    client = TestClient(viewer_main_module.app)
+    url = f"/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve"
+
+    # No body at all reaches the confirmation gate (428); a body that names no
+    # deployment is malformed rather than unconfirmed (422).
+    assert client.post(url).status_code == 428
+    assert client.post(
+        url,
+        json={"confirmed_deployment_id": deployment_id, "reason": "closed at broker"},
+    ).status_code == 200
+    # A confirmation that names another deployment is refused before anything is
+    # cleared, and so is one that does not say what was reconciled.
+    assert client.post(
+        url,
+        json={"confirmed_deployment_id": "66666666-6666-6666-6666-666666666666", "reason": "x"},
+    ).status_code == 409
+    assert client.post(
+        url,
+        json={"confirmed_deployment_id": deployment_id, "reason": "   "},
+    ).status_code == 400
+    assert cleared == [deployment_id]
 
 
 def test_ctrader_top5_endpoint_dry_run(monkeypatch):

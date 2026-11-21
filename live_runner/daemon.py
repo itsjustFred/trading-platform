@@ -31,6 +31,7 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
     validate_live_quote_prices,
 )
+from live_runner.broker_order_conflicts import enforce_broker_order_conflict_halts
 from live_runner.credential_env import (
     accounts_env_mtime,
     discord_bot_env_canonical_name,
@@ -92,6 +93,8 @@ from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.constants import normalize_timeframe
 from shared.database import (
+    LIVE_DISPATCH_ENTRY_STATUSES,
+    LIVE_DISPATCH_EXIT_STATUSES,
     LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
@@ -1615,8 +1618,9 @@ async def prepare_exit_intent_order(
     Nothing here places an order.
 
     Deliberately independent of the entry path (no risk sizing, no SL/TP guard).
-    This function checks no deployment status itself, but its callers dispatch
-    only for ACTIVE deployments, so an exit on a PAUSED one never gets here.
+    This function checks no deployment status itself: the caller's status gate decides
+    ("ACTIVE or PAUSED for a close", #126), so an exit on a PAUSED deployment does get
+    here and is sized like any other - a pause stops new positions, not closes.
     """
     metadata = dict(signal.metadata or {})
     if instruction is None:
@@ -2190,28 +2194,106 @@ def _trade_signal_to_live_signal(
     )
 
 
-def _active_discord_deployments_for_account(
+#: Statuses a deployment may open a new position from. Only ACTIVE: a pause or a stop
+#: blocks entries in every wording of the rule.
+#:
+#: Derived from the shared tuple in ``shared/database.py`` so this gate, the atomic
+#: submission claim's SQL and the conflict halt's exempt set always widen together.
+ENTRY_DISPATCH_STATUSES = frozenset(LIVE_DISPATCH_ENTRY_STATUSES)
+
+#: Statuses a deployment may close a position from. PAUSED is included on purpose (#126
+#: decision): "stop opening new positions" (the PAUSED row of the "Operator safety
+#: controls" comment in `base_adapter.py`) must not also stop a
+#: deployment closing what it already holds, or a pause forced by a broker-order-id
+#: conflict would leave the known position open until its stop - exactly the exposure
+#: the conflict could not explain. STOPPED keeps its own cancel-and-flatten enforcement
+#: and is absent: a stopped deployment is closed by the sweeps, not by signal.
+EXIT_DISPATCH_STATUSES = frozenset(LIVE_DISPATCH_EXIT_STATUSES)
+
+
+def _dispatch_statuses(*, is_exit: bool) -> frozenset[str]:
+    """The statuses one signal may be dispatched from."""
+    return EXIT_DISPATCH_STATUSES if is_exit else ENTRY_DISPATCH_STATUSES
+
+
+def _signal_is_exit(
+    action: str,
+    metadata: Mapping[str, object] | None,
+    deployment: LiveDeploymentConfig,
+) -> bool:
+    """Whether this deployment will dispatch the signal as a close (#126).
+
+    :func:`live_runner.exit_signals.is_exit_order` alone is not the whole answer: a
+    plain SELL on a deployment that cannot short is a full exit too, and that is
+    decided per deployment, in :func:`_trade_signal_to_live_signal` (which stamps
+    ``exit_only``) - *after* the dispatch gates have already run. Answering it the
+    same way here is what keeps "dispatched as an exit" and "gated as an exit" from
+    drifting apart, and therefore what lets a pause reject entries while still
+    closing a position a plain sell was about to close.
+    """
+    if is_exit_order(action, metadata):
+        return True
+    closes_only = str(action or "").strip().lower() in {"sell", "short"}
+    return closes_only and not _deployment_allows_short(deployment)
+
+
+def _dispatchable_discord_deployments_for_account(
     account_id: str,
     deployments: list[LiveDeploymentConfig],
 ) -> list[LiveDeploymentConfig]:
+    """Deployments a signal on this account can still reach for a close.
+
+    PAUSED deployments stay in the fan-out so an exit message can reach their
+    broker: they are gated per signal instead (`_deployment_can_dispatch`), which
+    is what lets a paused deployment close a position while opening none. STOPPED
+    deployments are excluded - their exposure is closed by the stop sweeps.
+    """
     return [
         deployment
         for deployment in deployments
         if deployment.account_id == account_id
-        and _normalize_deployment_status(deployment.status) == "ACTIVE"
+        and _normalize_deployment_status(deployment.status) in EXIT_DISPATCH_STATUSES
         and str(deployment.signal_source or "internal").lower() == "discord"
     ]
 
 
-def _deployment_is_currently_active(deployment: LiveDeploymentConfig) -> bool:
-    """Re-check deployment status against the DB right before submitting.
+def _primary_discord_deployment(deployments: list[LiveDeploymentConfig]) -> LiveDeploymentConfig:
+    """The deployment whose configuration drives the account's Discord listener.
+
+    One listener serves every deployment of the account, so one deployment's service
+    name, token, auth scheme, timeframe and ``service_id`` are the listener's. They
+    therefore come from an ACTIVE deployment whenever the account has one: a freshly
+    created deployment is PAUSED, and this list is ordered newest first, so taking the
+    head unconditionally would let a brand-new paused bot's token and timeframe decide
+    how an older ACTIVE bot's channel is polled - a listener that can miss that
+    channel's signals, or 401 against a bot that was never in it. An account whose
+    deployments are all paused keeps one too (#126): it still needs a listener to hear
+    exits, and its own deployment is the only credential scope it has.
+    """
+    for wanted in ("ACTIVE", "PAUSED"):
+        for deployment in deployments:
+            if _normalize_deployment_status(deployment.status) == wanted:
+                return deployment
+    return next(iter(deployments))
+
+
+def _deployment_can_dispatch(
+    deployment: LiveDeploymentConfig, *, is_exit: bool = False
+) -> bool:
+    """Re-check deployment status against the DB right before dispatching.
 
     The listener holds a snapshot taken when the sync loop last ran. If an
     operator pauses or stops one deployment on an account whose other Discord
     deployments stay active, the stale snapshot would keep the paused
     deployment trading until the next poll. The DB read here is the
     authority at the moment an order is actually dispatched.
+
+    ``is_exit`` widens the accepted statuses to :data:`EXIT_DISPATCH_STATUSES`: an exit
+    closes a position the deployment already holds, so a PAUSED deployment still
+    answers one, while a STOPPED one does not (deny-by-default keeps a status the
+    daemon does not know out of both sets).
     """
+    allowed = _dispatch_statuses(is_exit=is_exit)
     try:
         current = get_live_deployment(str(deployment.id))
     except Exception as exc:
@@ -2239,15 +2321,17 @@ def _deployment_is_currently_active(deployment: LiveDeploymentConfig) -> bool:
             },
         )
         return False
-    if _normalize_deployment_status(current.status) != "ACTIVE":
+    if _normalize_deployment_status(current.status) not in allowed:
         logger.info(
-            "Deployment is not ACTIVE; refusing to trade from stale snapshot",
+            "Deployment is not in a dispatchable status; refusing to trade from stale "
+            "snapshot",
             extra={
                 "data": {
                     "deployment_id": str(deployment.id),
                     "account_id": deployment.account_id,
                     "snapshot_status": deployment.status,
                     "current_status": current.status,
+                    "signal_kind": "exit" if is_exit else "entry",
                 }
             },
         )
@@ -2475,7 +2559,30 @@ async def _prepare_discord_signal_for_submission(
     returns ``None`` rather than raising: these signals are dispatched in a
     fan-out loop, and letting one deployment's bad config propagate would tear
     down the account's whole listener and lose the rest of the poll batch.
+
+    Whether this dispatch is a close is decided once, from the parsed message, and
+    carried into every status gate below. A pause has to block an entry and still
+    let the deployment close what it holds (#126 decision), so no gate below can ask
+    "is this deployment ACTIVE" alone.
     """
+    try:
+        is_exit = _signal_is_exit(trade_signal.action, trade_signal.metadata, deployment)
+    except ValueError:
+        # A strict boolean this deployment cannot parse (e.g. a typo'd allow_short)
+        # means nothing may be dispatched to it. Same handling as the conversion-time
+        # check: skip the deployment, and never default an unreadable config into an
+        # order.
+        logger.exception(
+            "Invalid deployment boolean config; skipping deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+        return None
     # B2 (owner decision): stale signals trade immediately on outdated
     # information — discard anything older than one deployment-timeframe
     # candle instead.
@@ -2566,9 +2673,10 @@ async def _prepare_discord_signal_for_submission(
     # pre-dispatch snapshot was taken before it. A deployment paused during the
     # wait window must not trade at the candle-close price — and neither must
     # a signal that AGED OUT during the wait (B2 price/age revalidation).
-    if not _deployment_is_currently_active(deployment):
+    if not _deployment_can_dispatch(deployment, is_exit=is_exit):
         logger.info(
-            "Skipping discord signal: deployment left ACTIVE during candle-close wait",
+            "Skipping discord signal: deployment is not in a dispatchable status "
+            "after the candle-close wait",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -2633,7 +2741,7 @@ async def _submit_normalized_discord_signal(
         )
         return
 
-    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    is_exit = _signal_is_exit(live_signal.action, live_signal.metadata, deployment)
     if is_exit:
         # Exits of every deployment on this account and symbol go one after the
         # other, from sizing to the persisted order (see ``_exit_lock``).
@@ -2737,15 +2845,18 @@ async def _prepare_claim_and_submit_signal(
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
-    # deployment. The claim turns "still ACTIVE" into a single atomic database
+    # deployment. The claim turns "still dispatchable" into a single atomic database
     # fact taken immediately before submission, so a PAUSE either wins the race
     # (the claim fails and nothing is sent) or is already in effect while this
-    # dispatcher finishes the order it had already claimed.
+    # dispatcher finishes the order it had already claimed. For an exit the claim
+    # also passes a PAUSED row, because a pause does not forbid closing what is
+    # held (#126 decision) - it still refuses any status the daemon does not know.
     claim_token = uuid.uuid4().hex
     claimed = await asyncio.to_thread(
         claim_live_deployment_submission,
         str(deployment.id),
         claim_token,
+        allow_paused=is_exit,
     )
     if not claimed:
         logger.info(
@@ -3079,8 +3190,9 @@ async def _dispatch_discord_trade_signal(
     # against broker identity, not the local account id.
     account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
-        if not _deployment_is_currently_active(deployment):
-            continue
+        # The cheap, deployment-local filters first: they need only this deployment's
+        # own configuration, so a deployment that cannot be selected for this signal at
+        # all is never asked for the settings that decide its exit classification.
         if not _deployment_matches_stockkit_route(
             deployment,
             trade_signal.metadata,
@@ -3104,13 +3216,40 @@ async def _dispatch_discord_trade_signal(
                 },
             )
             continue
+        # Classified per deployment, not once for the fan-out: a plain SELL closes on a
+        # deployment that cannot short and is a short entry on one that can (#121), so a
+        # single answer here would drop a close on one of them (#126 decision).
+        try:
+            signal_is_exit = _signal_is_exit(
+                trade_signal.action, trade_signal.metadata, deployment
+            )
+        except ValueError:
+            # A config this deployment cannot read costs *this* deployment only. Returning
+            # here would drop the signal for every other deployment on the channel -
+            # including their closes, which is the money path (#311 review: an unparseable
+            # `allow_short` on a deployment that is not even on this symbol used to stop
+            # a valid sibling's close).
+            logger.exception(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "strategy_name": deployment.strategy_name,
+                    }
+                },
+            )
+            continue
+        if not _deployment_can_dispatch(deployment, is_exit=signal_is_exit):
+            continue
 
         try:
             wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
         except ValueError:
             # A typo'd boolean must skip the deployment, not kill the listener
             # loop or other deployments on the same account. It also must not
-            # default into immediate market orders.
+            # default into immediate market orders. Same shape as the
+            # classification refusal above: `continue`, never `return`.
             logger.exception(
                 "Invalid deployment boolean config; skipping deployment",
                 extra={
@@ -3120,7 +3259,7 @@ async def _dispatch_discord_trade_signal(
                     }
                 },
             )
-            return
+            continue
 
         dispatched_to_any = True
         await _submit_normalized_discord_signal(
@@ -3176,28 +3315,31 @@ async def _run_discord_signal_listener_for_account(
     *,
     accounts_env_values: Mapping[str, str],
 ) -> None:
-    active_discord_deployments = _active_discord_deployments_for_account(account_id, deployments)
-    if not active_discord_deployments:
+    dispatchable_deployments = _dispatchable_discord_deployments_for_account(
+        account_id, deployments
+    )
+    if not dispatchable_deployments:
         logger.info(
-            "No active discord deployments for account; discord listener idle",
+            "No dispatchable discord deployments for account; discord listener idle",
             extra={"data": {"account_id": account_id}},
         )
         return
 
     channel_to_deployments = _group_discord_deployments_by_channel(
         account_id,
-        active_discord_deployments,
+        dispatchable_deployments,
         accounts_env_values=accounts_env_values,
     )
     if not channel_to_deployments:
         logger.warning(
-            "No valid discord channels configured for active discord deployments",
+            "No valid discord channels configured for dispatchable discord deployments",
             extra={"data": {"account_id": account_id}},
         )
         return
 
     # Resolve a real account token (account/user tokens, not a generic bot token).
-    primary_deployment = next(iter(active_discord_deployments))
+    # Not simply the head of the list: see `_primary_discord_deployment`.
+    primary_deployment = _primary_discord_deployment(dispatchable_deployments)
     # The trusted-author allowlist is the ingestion source gate (Decision
     # Record): authors trusted by ANY deployment on the polled channels are
     # merged into one allowlist. Without an explicit allowlist the listener
@@ -3216,7 +3358,7 @@ async def _run_discord_signal_listener_for_account(
                 "data": {
                     "account_id": account_id,
                     "deployment_ids": sorted(
-                        str(deployment.id) for deployment in active_discord_deployments
+                        str(deployment.id) for deployment in dispatchable_deployments
                     ),
                 }
             },
@@ -3905,6 +4047,44 @@ async def sync_services_loop(
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
+        # Fail closed (#126): a deployment with an unresolved broker order id conflict
+        # stays halted. This is the tick that re-pauses it if a status write, a restore
+        # or an older build left it trading, so the halt is never only the one write
+        # that happened when the conflict was recorded.
+        #
+        # First in the iteration and inside its own `try`, because the rest of the tick
+        # can fail on its own: service discovery, a bad service row or a credential
+        # reload raised before this point would skip the re-halt entirely, and a warning
+        # about a failed service sync is not something anyone reads as "a deployment
+        # with an untracked broker order went back to trading".
+        try:
+            halted = await asyncio.to_thread(enforce_broker_order_conflict_halts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The halt is the safety property. Failing to write it must be loud, and it
+            # must not stop this loop from going on to keep the services in sync.
+            logger.error(
+                "ALERT: could not enforce the broker order id conflict halts; an "
+                "untracked broker order may exist and a deployment may be trading",
+                extra={
+                    "data": {
+                        "alert": "live_broker_order_id_conflict_enforce_failed",
+                        "error": str(exc),
+                    }
+                },
+            )
+        else:
+            if halted:
+                # The alert itself is ERROR, from the enforcement: this tick only records
+                # that the halt was re-asserted.
+                logger.info(
+                    "Re-halted %d deployment(s) for unresolved broker order id "
+                    "conflicts (deployment_ids=%s)",
+                    len(halted),
+                    [row["deployment_id"] for row in halted],
+                    extra={"data": {"halted": halted}},
+                )
         try:
             current_mtime = _accounts_env_mtime(accounts_env)
             if current_mtime != accounts_env_mtime:
@@ -5007,23 +5187,37 @@ def _group_deployments_by_account(
     return deployments_by_account
 
 
-def _deployment_active_account_ids(
+def _deployment_dispatchable_account_ids(
     deployments: list[LiveDeploymentConfig],
 ) -> set[str]:
+    """Accounts whose deployments can still be dispatched to.
+
+    PAUSED is included (#126 decision): a paused deployment still closes what it
+    holds, and a close needs the account's adapter and its Discord listener - the
+    same two things an entry needs. An account whose deployments are all paused is
+    therefore still connected; nothing trades from it, because every status gate
+    below the task level refuses an entry.
+    """
     return {
         deployment.account_id
         for deployment in deployments
-        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+        if _normalize_deployment_status(deployment.status) in EXIT_DISPATCH_STATUSES
     }
 
 
-def _discord_active_account_ids(
+def _discord_dispatchable_account_ids(
     deployments: list[LiveDeploymentConfig],
 ) -> set[str]:
+    """Accounts whose listener has to stay up so an exit can reach their broker.
+
+    The ACTIVE-only version of this set stopped the whole listener when an account
+    was paused, which dropped every exit on it - the reason the #126 decision
+    widened the dispatch statuses in the first place.
+    """
     return {
         deployment.account_id
         for deployment in deployments
-        if _normalize_deployment_status(deployment.status) == "ACTIVE"
+        if _normalize_deployment_status(deployment.status) in EXIT_DISPATCH_STATUSES
         and str(deployment.signal_source or "internal").lower() == "discord"
         and _deployment_has_discord_channel(deployment)
     }
@@ -5104,26 +5298,28 @@ async def sync_deployments_loop(
             _cleanup_finished_discord_tasks(active_discord_tasks)
             _log_deployment_status_observations(deployments, known_deployment_statuses)
 
-            active_account_ids = _deployment_active_account_ids(deployments)
+            dispatchable_account_ids = _deployment_dispatchable_account_ids(deployments)
             await _disconnect_blocked_adapters(
-                active_adapters, active_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
+                active_adapters, dispatchable_account_ids & _CTRADER_AUTH_BLOCKED_ACCOUNTS
             )
             logger.debug(
                 "Evaluating deployment activation state",
                 extra={
                     "data": {
-                        "active_account_ids": sorted(active_account_ids),
+                        "active_account_ids": sorted(dispatchable_account_ids),
                         "known_adapters": sorted(active_adapters.keys()),
                     }
                 },
             )
-            runnable_account_ids = set(active_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            runnable_account_ids = set(dispatchable_account_ids) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
 
-            # A STOPPED deployment can only be flattened by an adapter, so an
-            # account whose deployments are all STOPPED still needs one. The
-            # retained set is the union of runnable and enforcement accounts;
-            # only the runnable set may trade, and the task sets below use it
-            # alone, so connecting for enforcement never grants permission.
+            # A STOPPED deployment can only be flattened by an adapter, and a PAUSED one
+            # can only close what it holds with one, so an account whose deployments are
+            # all PAUSED or STOPPED still needs one (#126). The retained set is the union
+            # of runnable and enforcement accounts; only an ACTIVE deployment accepts an
+            # entry, and that is checked per signal (`_deployment_can_dispatch`) rather
+            # than by which tasks run, so the task sets below use runnable alone and
+            # connecting for enforcement never grants permission.
             enforcement_account_ids = _account_ids_needing_stopped_enforcement(
                 deployments,
                 enforced_stopped_deployments,
@@ -5134,7 +5330,7 @@ async def sync_deployments_loop(
             # blocked account must never keep a live adapter via either path.
             await _disconnect_inactive_adapters(active_adapters, retained_account_ids)
 
-            active_discord_account_ids = _discord_active_account_ids(deployments)
+            active_discord_account_ids = _discord_dispatchable_account_ids(deployments)
 
             await _connect_active_accounts(
                 retained_account_ids,

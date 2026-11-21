@@ -442,11 +442,11 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         return None
 
     original_wait = daemon.wait_for_candle_close
-    original_active = daemon._deployment_is_currently_active
+    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
     daemon.wait_for_candle_close = _no_wait
-    daemon._deployment_is_currently_active = lambda _deployment: True
+    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda *_a, **_k: True
     try:
@@ -462,7 +462,7 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         )
     finally:
         daemon.wait_for_candle_close = original_wait
-        daemon._deployment_is_currently_active = original_active
+        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
 
@@ -1659,7 +1659,7 @@ def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(
         return None
 
     monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
     monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *_a, **_k: True)
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *_a, **_k: True)
 
