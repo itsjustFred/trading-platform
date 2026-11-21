@@ -409,6 +409,37 @@ class LiveBalanceRecord(BaseModel):
     equity: float
 
 
+class LiveLossBreakerRecord(BaseModel):
+    """Persisted loss circuit-breaker state for one scope (#301).
+
+    One row per scope: ``account:<account_id>`` covers every deployment on the
+    account, ``deployment:<deployment_id>`` covers that deployment alone. The
+    equity series is the broker account's equity for both scopes - a deployment
+    has no equity of its own, so a deployment breaker applies its own
+    thresholds to the equity of the account it trades on.
+
+    ``utc_day`` is the UTC day ``day_start_equity`` belongs to; the daily
+    breaker re-bases automatically when it changes. ``peak_equity`` is the
+    high-water mark the drawdown breaker measures from and only moves on an
+    explicit operator reset. ``*_breached`` flags latch: the daily one clears
+    on the day rollover, the drawdown one until
+    ``reset_live_loss_breaker_drawdown``.
+    """
+
+    scope: str
+    account_id: str
+    utc_day: str
+    day_start_equity: float
+    peak_equity: float
+    daily_breached: bool = False
+    drawdown_breached: bool = False
+    last_equity: float | None = None
+    last_observed_at: datetime | None = None
+    # JSON detail of the most recent breach latch (kind, equity, threshold,
+    # observed loss/drawdown fraction, UTC instant) for `status` output.
+    breach_detail: dict[str, Any] | None = None
+
+
 # ─── Portfolio models ──────────────────────────────────────────────────────────
 
 

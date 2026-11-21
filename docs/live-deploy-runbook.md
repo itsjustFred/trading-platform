@@ -437,6 +437,51 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+## Loss Circuit Breaker (#301)
+
+Every live account and every deployment carries a persisted loss breaker
+(`live_loss_breaker_state`, one row per `account:<id>` and `deployment:<id>`
+scope). Both breakers measure the broker account's equity — a deployment has
+no equity of its own, so a deployment scope applies its own thresholds to the
+equity of the account it trades on:
+
+- **Daily loss** — equity down the configured fraction (default 5 %) of the
+  start-of-day equity. The baseline is the last equity observed before the UTC
+  day boundary, so an overnight gap counts as the new day's loss. The breaker
+  re-bases and clears automatically at the UTC day boundary.
+- **Overall drawdown** — equity down the configured fraction (default 20 %)
+  from the peak equity ever observed. The latch only clears on the explicit
+  operator reset, which also re-bases the peak to the current equity.
+
+On breach the breaker blocks **new entries only** — exits are never blocked
+(PAUSED semantics). A breach latches and alerts once per episode through the
+`data.alert` log path. An unreadable breaker state or unreadable equity fails
+closed and refuses entries.
+
+Thresholds, most specific first: deployment `settings` keys
+(`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
+`loss_breaker_max_drawdown_fraction`), then per-account env
+(`LOSS_BREAKER_<ACCOUNT>_ENABLED`, `LOSS_BREAKER_<ACCOUNT>_DAILY_LOSS_FRACTION`,
+`LOSS_BREAKER_<ACCOUNT>_MAX_DRAWDOWN_FRACTION`), then the global env
+(`LOSS_BREAKER_ENABLED`, `LOSS_BREAKER_DAILY_LOSS_FRACTION`,
+`LOSS_BREAKER_MAX_DRAWDOWN_FRACTION`), then the defaults above. Env resolves
+file-first through `.accounts.env`. Malformed values are refused at deployment
+creation and at dispatch.
+
+```bash
+# Read every scope's state, latches and current ratios (read-only):
+uv run python -m scripts.live_loss_breaker status
+uv run python -m scripts.live_loss_breaker status --account alpaca-paper
+
+# The only way to clear a drawdown latch: re-bases the peak to the current
+# equity (latest balance snapshot, or --equity to state it explicitly):
+uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
+uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id> --equity 82000
+```
+
+There is deliberately no daily reset command: the daily breaker resets itself
+at the UTC boundary.
+
 ## Market-data symbol classification (Alpaca, #122)
 
 `live_runner/symbol_class.py` decides which feed a symbol belongs to, by *asset class* and never by string shape alone: a pair is recognised only when its base currency is in `CRYPTO_BASES` and its quote currency is in `CRYPTO_QUOTES` (that quote list is shared with `shared/alpaca_symbols.py`, so fee backfill and market-data routing cannot drift on it). Share-class equities (`BRK.B`, `BF-B`) are equities, exactly as in the fee backfill.

@@ -9,7 +9,7 @@ import os
 import re
 import uuid
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,11 @@ from live_runner.exit_signals import (
     resolve_exit_order,
     round_exit_qty_down,
     usable_qty_tolerance,
+)
+from live_runner.loss_breaker import (
+    LossBreakerBreachError,
+    observe_account_loss_breaker_equity,
+    refuse_entry_if_loss_breaker_tripped,
 )
 from live_runner.promotion import (
     deployment_signal_processor_name,
@@ -1911,6 +1916,18 @@ async def prepare_order_with_risk(
         adapter, deployment
     )
     resolved_balance = await _resolve_account_balance(adapter, account_balance)
+    # Loss circuit breaker (#301): per-account and per-deployment daily-loss /
+    # drawdown limits, checked at the same chokepoint every entry passes
+    # through and *after* the exit branch above, so closing a position is never
+    # blocked - PAUSED semantics, exits stay allowed. The equity is the same
+    # resolved balance sizing uses, so breaker and size cannot disagree. Runs
+    # in a thread: it is several SQLite round-trips and must not stall the loop.
+    await asyncio.to_thread(
+        refuse_entry_if_loss_breaker_tripped,
+        deployment,
+        equity=resolved_balance,
+        symbol=signal.symbol,
+    )
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
     else:
@@ -2699,6 +2716,26 @@ async def _prepare_claim_and_submit_signal(
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
                     "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
+    except LossBreakerBreachError as exc:
+        # The loss circuit breaker (#301) refused this entry. Nothing was sent,
+        # which is the breaker working; reported distinctly so an operator sees
+        # the tripped scope instead of hunting for a validation error. The
+        # breaker already logged the latch alert; this is the per-signal record.
+        logger.warning(
+            "Entry refused by the loss circuit breaker; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "breaker_scope": exc.scope,
+                    "breaker_kind": exc.kind,
+                    "breaker_state_unreadable": exc.state_unreadable,
                     "reason": str(exc),
                 }
             },
@@ -3980,6 +4017,7 @@ async def _poll_adapter_balance(
     account_id: str,
     adapter: BaseLiveAdapter,
     snapshot_time: datetime,
+    current_deployments: Callable[[], list[LiveDeploymentConfig]] | None = None,
 ) -> None:
     try:
         balance, equity = await adapter.get_balance()
@@ -3990,6 +4028,19 @@ async def _poll_adapter_balance(
             equity=float(equity),
         )
         await asyncio.to_thread(save_live_balance, record)
+        # Loss circuit breaker (#301): advance the account and deployment
+        # scopes with the equity just read, so a breach latches and alerts on
+        # the poll even when no entry signal arrives. Off the event loop - it
+        # is several SQLite round-trips per scope. A failure is logged inside
+        # the breaker and never reaches the poll.
+        deployments = current_deployments() if current_deployments is not None else ()
+        await asyncio.to_thread(
+            observe_account_loss_breaker_equity,
+            account_id,
+            float(equity),
+            now=snapshot_time,
+            deployments=deployments,
+        )
         logger.debug(
             "Saved live balance snapshot",
             extra={
@@ -4038,7 +4089,10 @@ BALANCE_POLL_TIMEOUT_SECONDS = 30.0
 
 
 async def _poll_balances(
-    adapters: dict[str, BaseLiveAdapter], *, interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS
+    adapters: dict[str, BaseLiveAdapter],
+    *,
+    interval_seconds: int = BALANCE_POLL_INTERVAL_SECONDS,
+    current_deployments: Callable[[], list[LiveDeploymentConfig]] | None = None,
 ) -> None:
     while True:
         snapshot_time = datetime.now(timezone.utc)
@@ -4058,7 +4112,13 @@ async def _poll_balances(
         async def _poll_one(account_id: str, adapter: BaseLiveAdapter) -> None:
             try:
                 await asyncio.wait_for(
-                    _poll_adapter_balance(adapters, account_id, adapter, snapshot_time),
+                    _poll_adapter_balance(
+                        adapters,
+                        account_id,
+                        adapter,
+                        snapshot_time,
+                        current_deployments=current_deployments,
+                    ),
                     timeout=BALANCE_POLL_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -5215,7 +5275,13 @@ async def run_daemon(
         ),
         name="service-sync-loop",
     )
-    balance_task = asyncio.create_task(_poll_balances(active_adapters), name="balance-poller")
+    balance_task = asyncio.create_task(
+        _poll_balances(
+            active_adapters,
+            current_deployments=lambda: list(deployment_snapshot),
+        ),
+        name="balance-poller",
+    )
     trailing_task = asyncio.create_task(
         run_trailing_stops_loop(
             LiveTrailingStopManager(),

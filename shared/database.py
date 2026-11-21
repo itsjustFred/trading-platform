@@ -51,6 +51,7 @@ from shared.models import (
     LiveBalanceRecord,
     LiveDeploymentConfig,
     LiveExecution,
+    LiveLossBreakerRecord,
     LiveSignal,
     Service,
     ServiceStatus,
@@ -754,6 +755,55 @@ class LiveBalanceModel(SQLModel, table=True):
             timestamp=self.timestamp,
             balance=self.balance,
             equity=self.equity,
+        )
+
+
+class LiveLossBreakerStateModel(SQLModel, table=True):
+    """One loss circuit-breaker row per scope (#301); see LiveLossBreakerRecord."""
+
+    __tablename__ = "live_loss_breaker_state"
+
+    scope: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    utc_day: str
+    day_start_equity: float
+    peak_equity: float
+    daily_breached: bool = Field(default=False)
+    drawdown_breached: bool = Field(default=False)
+    last_equity: float | None = Field(default=None)
+    last_observed_at: datetime | None = Field(default=None)
+    breach_detail_json: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+    @classmethod
+    def from_record(cls, record: LiveLossBreakerRecord) -> "LiveLossBreakerStateModel":
+        return cls(
+            scope=record.scope,
+            account_id=record.account_id,
+            utc_day=record.utc_day,
+            day_start_equity=record.day_start_equity,
+            peak_equity=record.peak_equity,
+            daily_breached=record.daily_breached,
+            drawdown_breached=record.drawdown_breached,
+            last_equity=record.last_equity,
+            last_observed_at=record.last_observed_at,
+            breach_detail_json=record.breach_detail,
+        )
+
+    def to_record(self) -> LiveLossBreakerRecord:
+        return LiveLossBreakerRecord(
+            scope=self.scope,
+            account_id=self.account_id,
+            utc_day=self.utc_day,
+            day_start_equity=self.day_start_equity,
+            peak_equity=self.peak_equity,
+            daily_breached=bool(self.daily_breached),
+            drawdown_breached=bool(self.drawdown_breached),
+            last_equity=self.last_equity,
+            last_observed_at=self.last_observed_at,
+            breach_detail=self.breach_detail_json,
         )
 
 
@@ -4078,6 +4128,7 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.loss_breaker import deployment_loss_breaker_limits
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -4085,6 +4136,9 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Loss breaker settings (#301) get the same treatment: a malformed
+    # threshold would otherwise refuse every entry at dispatch.
+    deployment_loss_breaker_limits(deployment)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
@@ -4793,6 +4847,203 @@ def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRec
         if record is not None:
             latest[account_id] = record
     return latest
+
+
+# ─── Loss circuit breaker (#301) ─────────────────────────────────────────────
+#
+# One row per scope in ``live_loss_breaker_state``. The observe/latch/reset
+# helpers are deliberately dumb storage: threshold evaluation lives in
+# ``live_runner.loss_breaker`` so this layer never decides whether trading is
+# allowed. ``observe`` is the only writer of the equity series and it is atomic
+# per scope (read-modify-write inside one transaction), so the balance poll and
+# an entry check observing the same scope cannot lose each other's update.
+
+
+def _loss_breaker_utc_day(observed_at: datetime) -> str:
+    """The UTC calendar day ``observed_at`` falls on, as ``YYYY-MM-DD``."""
+    if observed_at.tzinfo is None:
+        aware = observed_at.replace(tzinfo=timezone.utc)
+    else:
+        aware = observed_at
+    return aware.astimezone(timezone.utc).date().isoformat()
+
+
+def get_live_loss_breaker_state(scope: str) -> LiveLossBreakerRecord | None:
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        return None
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+    return row.to_record() if row is not None else None
+
+
+def list_live_loss_breaker_states(
+    account_id: str | None = None,
+) -> list[LiveLossBreakerRecord]:
+    init_db()
+    with get_session() as session:
+        statement = select(LiveLossBreakerStateModel).order_by(
+            LiveLossBreakerStateModel.scope.asc()
+        )
+        if account_id is not None:
+            statement = statement.where(
+                LiveLossBreakerStateModel.account_id == str(account_id)
+            )
+        rows = session.exec(statement).all()
+    return [row.to_record() for row in rows]
+
+
+def observe_live_loss_breaker(
+    scope: str,
+    account_id: str,
+    equity: float,
+    observed_at: datetime,
+    *,
+    seed_day_start_equity: float | None = None,
+    seed_peak_equity: float | None = None,
+) -> LiveLossBreakerRecord:
+    """Record one equity observation for ``scope`` and return the new state.
+
+    First observation of a UTC day re-bases ``day_start_equity`` to the last
+    equity observed before the boundary (the closest available estimate of
+    start-of-day equity - it also captures an overnight gap a fresh baseline
+    would hide) and clears the daily latch; with no earlier observation the
+    current equity is the baseline. ``peak_equity`` only ever rises here - it
+    is re-based solely by ``reset_live_loss_breaker_drawdown``. Breach flags
+    are not evaluated here; ``latch_live_loss_breaker_breach`` owns them.
+
+    ``seed_*`` apply only when the row does not exist yet: a deployment scope
+    created mid-stream inherits the account scope's baselines (both measure
+    the same account equity) instead of starting blind at the current equity.
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_scope or not normalized_account:
+        raise ValueError("observe_live_loss_breaker requires a scope and an account_id")
+    equity_value = float(equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    observed_naive = _naive_utc(observed_at)
+    utc_day = _loss_breaker_utc_day(observed_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            row = LiveLossBreakerStateModel(
+                scope=normalized_scope,
+                account_id=normalized_account,
+                utc_day=utc_day,
+                day_start_equity=(
+                    float(seed_day_start_equity)
+                    if seed_day_start_equity is not None
+                    else equity_value
+                ),
+                peak_equity=(
+                    float(seed_peak_equity)
+                    if seed_peak_equity is not None
+                    else equity_value
+                ),
+                daily_breached=False,
+                drawdown_breached=False,
+                last_equity=equity_value,
+                last_observed_at=observed_naive,
+                breach_detail_json=None,
+                updated_at=observed_naive,
+            )
+            session.add(row)
+        else:
+            if row.utc_day != utc_day:
+                # UTC day boundary: the daily breaker resets automatically.
+                # The new day's baseline is the equity last seen before the
+                # boundary, not this observation - a gap across midnight is a
+                # loss of the new day, not its starting capital.
+                row.utc_day = utc_day
+                row.day_start_equity = (
+                    float(row.last_equity)
+                    if row.last_equity is not None
+                    else equity_value
+                )
+                row.daily_breached = False
+            row.peak_equity = max(float(row.peak_equity), equity_value)
+            row.last_equity = equity_value
+            row.last_observed_at = observed_naive
+            row.updated_at = observed_naive
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.to_record()
+
+
+def latch_live_loss_breaker_breach(
+    scope: str,
+    kind: str,
+    detail: dict[str, Any],
+    latched_at: datetime,
+) -> bool:
+    """Set the ``daily``/``drawdown`` latch on ``scope``; True when it transitions.
+
+    The return value is what the caller alerts on: a scope already latched for
+    that kind reports False so a standing breach alerts once per episode, not
+    once per observation.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("latch_live_loss_breaker_breach requires a scope")
+    if kind not in {"daily", "drawdown"}:
+        raise ValueError(f"unknown loss breaker breach kind {kind!r}")
+    latched_naive = _naive_utc(latched_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            raise KeyError(f"no loss breaker state for scope {normalized_scope!r}")
+        flag = "daily_breached" if kind == "daily" else "drawdown_breached"
+        already = bool(getattr(row, flag))
+        setattr(row, flag, True)
+        row.breach_detail_json = dict(detail)
+        row.updated_at = latched_naive
+        session.add(row)
+        session.commit()
+        return not already
+
+
+def reset_live_loss_breaker_drawdown(
+    scope: str,
+    equity: float,
+    reset_at: datetime,
+) -> LiveLossBreakerRecord | None:
+    """Operator reset of the drawdown breaker: clear the latch, re-base the peak.
+
+    ``peak_equity`` is set to the current equity, not kept: the drawdown
+    breaker measures from the peak, so a reset that kept the old high-water
+    mark would re-trip on the very next observation. Returns ``None`` when the
+    scope has no state row.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("reset_live_loss_breaker_drawdown requires a scope")
+    equity_value = float(equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    reset_naive = _naive_utc(reset_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            return None
+        row.drawdown_breached = False
+        row.peak_equity = equity_value
+        row.last_equity = equity_value
+        row.last_observed_at = reset_naive
+        row.updated_at = reset_naive
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.to_record()
 
 
 def list_live_signal_executions_for_deployments(

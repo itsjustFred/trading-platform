@@ -322,3 +322,27 @@ def _restore_console_log_streams():
         for handler in logger.handlers:
             if getattr(handler, "_trading_console", False) and id(handler) not in restored:
                 handler.stream = real_stream
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loss_breaker_state():
+    """Give every test a clean ``live_loss_breaker_state``.
+
+    The loss breaker (#301) latches on purpose: a daily latch holds until the
+    UTC rollover and a drawdown latch until an operator reset, so one test's
+    tripped breaker would refuse every later entry on the same account scope
+    inside the worker's shared database. Tests that exercise the breaker set
+    up and assert its state inside a single test, so clearing before each one
+    is isolation, not a weakened assertion. Deletes through the same engine
+    ``get_session`` uses; a missing table or engine means nothing to clean.
+    """
+    try:
+        from sqlalchemy import text
+
+        import shared.database as database
+
+        with database.get_engine().begin() as conn:
+            conn.execute(text("DELETE FROM live_loss_breaker_state"))
+    except Exception:
+        pass
+    yield
