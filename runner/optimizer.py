@@ -125,6 +125,12 @@ def _risk_adjusted_metric_value(
     haircut would compress them toward zero and let losers outrank small
     winners). Non-raw metrics (sharpe/sortino/calmar/psr/cagr) and minimize
     studies pass through untouched.
+
+    ``max_drawdown_pct`` is resolved through ``resolve_defined_stat``: a run
+    whose equity is unreadable stores it as ``None`` and names it in
+    ``undefined_metrics`` (#250). An unmeasurable drawdown takes the
+    worst-case haircut (``drawdown_factor`` 0) - reading it as 0.0 would
+    hand such a run full drawdown credit (#286).
     """
     terms = {"sparsity_factor": 1.0, "drawdown_factor": 1.0}
     if direction != "maximize" or metric_key not in RAW_MAXIMIZE_METRICS:
@@ -135,16 +141,17 @@ def _risk_adjusted_metric_value(
         trade_count = int(stats.get("total_trades", 0) or 0)
     except (TypeError, ValueError):
         trade_count = 0
+    max_dd_raw = resolve_defined_stat(dict(stats), "max_drawdown_pct", None)
     try:
-        max_dd = abs(float(stats.get("max_drawdown_pct", 0.0) or 0.0))
+        max_dd = None if max_dd_raw is None else abs(float(max_dd_raw))
     except (TypeError, ValueError):
-        max_dd = 0.0
-    if not math.isfinite(max_dd):
-        max_dd = 0.0
+        max_dd = None
+    if max_dd is not None and not math.isfinite(max_dd):
+        max_dd = None
     # Pre-mortem T3: stats publish drawdown as a FRACTION (e.g. 0.05, not
     # 5.0). Percent-scale input would silently zero every trial via the
     # min(max_dd, 1.0) clamp — fail loud instead.
-    if max_dd > 1.0:
+    if max_dd is not None and max_dd > 1.0:
         raise ValueError(
             f"max_drawdown_pct {max_dd} looks percent-scaled; expected a fraction <= 1.0."
         )
@@ -152,7 +159,11 @@ def _risk_adjusted_metric_value(
         0.0,
         min(1.0, trade_count / max(int(min_trades_for_full_credit), 1)),
     )
-    drawdown_factor = max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+    drawdown_factor = (
+        0.0
+        if max_dd is None
+        else max(0.0, 1.0 - min(max_dd, 1.0) * max(drawdown_penalty_weight, 0.0))
+    )
     terms = {"sparsity_factor": sparsity, "drawdown_factor": drawdown_factor}
     return value * sparsity * drawdown_factor, terms
 
