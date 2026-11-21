@@ -56,7 +56,7 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/daemon.py` | 1364 | `_position_qty_tolerance` | money decision (must fail closed) | yes — strict default |
 | `live_runner/daemon.py` | 1478 | `_ensure_no_exit_in_flight` | money decision (must fail closed) | yes — raises ExitInFlightError |
 | `live_runner/daemon.py` | 2217 | `_deployment_is_currently_active` | money decision (must fail closed) | yes — returns False |
-| `live_runner/daemon.py` | 2445 | `_renew_submission_claim_until_cancelled` | loop survival (log and continue) | ? |
+| `live_runner/daemon.py` | 2445 | `_renew_submission_claim_until_cancelled` | loop survival (log and continue) | yes — renewal retried |
 | `live_runner/daemon.py` | 2707 | `_prepare_claim_and_submit_signal` | money decision (must fail closed) | yes — returns before claim |
 | `live_runner/daemon.py` | 2773 | `_prepare_claim_and_submit_signal` | money decision (must fail closed) | yes — holds lease on unknown outcome |
 | `live_runner/daemon.py` | 2782 | `_prepare_claim_and_submit_signal` | loop survival (log and continue) | yes — lease expiry is safe |
