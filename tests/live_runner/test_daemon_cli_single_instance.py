@@ -269,6 +269,9 @@ class TestLockPath:
 
         assert daemon.daemon_lock_path() == tmp_data_dir / "backtests.db.lock"
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="creating a symlink needs elevated privileges on Windows"
+    )
     def test_the_lock_resolves_a_symlinked_data_dir(self, monkeypatch: Any, tmp_path: Path) -> None:
         """Two spellings of one database must select one lock, not two.
 
@@ -404,6 +407,14 @@ class TestRealEntryPoint:
         # an operator and a systemd ``Restart=always`` unit key on, and importing the constant
         # would let an edit to it move this assertion with it - the test would pass either way.
         assert result.returncode == 3, f"stdout={result.stdout}\nstderr={result.stderr}"
+        # Only the lock file and the log directory (the child's LOG_DIR points inside the data dir,
+        # and the logger factory creates it while importing the heavy module): no database file, no
+        # WAL/SHM sidecars, no migration. Importing the daemon must not initialize the database
+        # either, so the refusal is the first thing that touches it.
+        written = sorted(p.name for p in data_dir.iterdir())
+        assert written == ["backtests.db.lock", "logs"], (
+            f"the refused daemon wrote into the data directory: {written}"
+        )
         assert "already running" in result.stderr.lower(), result.stderr
         assert str(lock_path) in result.stderr, "the refusal must name the lock it found held"
         assert not (data_dir / "backtests.db").exists(), (
