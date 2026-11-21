@@ -72,6 +72,7 @@ from live_runner.shutdown import (
     EXIT_CRASH,
     EXIT_OK,
     EXIT_PATH_TIMEOUT_SECONDS,
+    FORCED_EXIT_CODE,
     SENTRY_FLUSH_TIMEOUT_SECONDS,
     ShutdownCoordinator,
     SubmissionRefusedError,
@@ -5830,6 +5831,18 @@ async def run_daemon(
     return EXIT_OK if cleanup_ok else EXIT_CLEANUP_TIMEOUT
 
 
+def _crash_exit_code(exc: BaseException) -> int:
+    """The code the interpreter itself would have used for this exception.
+
+    ``main`` leaves through ``os._exit``, which runs no ``sys.excepthook``, so
+    the number has to be produced here rather than inherited: a Ctrl-C that
+    landed before the shutdown handler was installed (during start-up) is still
+    reported as 130, the same 128+SIGINT the interpreter gives an unhandled
+    ``KeyboardInterrupt``, and every other crash keeps the 1 it always had.
+    """
+    return FORCED_EXIT_CODE if isinstance(exc, KeyboardInterrupt) else EXIT_CRASH
+
+
 def _leave_the_process(exit_code: int) -> None:
     """Flush what has to reach the outside world, then leave with ``exit_code``.
 
@@ -5915,13 +5928,14 @@ def main() -> None:
         # Before the flush, because ``logging.shutdown`` closes the handlers and
         # ``os._exit`` runs no ``sys.excepthook``: without this line a crashed
         # daemon would exit ``1`` in silence.
+        crash_code = _crash_exit_code(crashed)
         logger.error(
             "The live daemon crashed; exiting immediately without interpreter "
             "teardown",
             exc_info=crashed,
-            extra={"data": {"exit_code": EXIT_CRASH}},
+            extra={"data": {"exit_code": crash_code}},
         )
-        _leave_the_process(EXIT_CRASH)
+        _leave_the_process(crash_code)
     # Whatever the verdict, ``_leave_the_process`` runs next: a bounded close does
     # not make the interpreter's teardown safe to wait for. What was left behind
     # gets one line each, because this is the end of the log an operator reads -

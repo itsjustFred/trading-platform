@@ -35,7 +35,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -1414,6 +1414,11 @@ async def _cooperative_loop(*_args, **_kwargs):
     request = asyncio.ensure_future(asyncio.to_thread(_broker_request))
     await asyncio.sleep(0)
     print("REQUESTED", flush=True)
+    if os.environ.get("TP_CRASH_AFTER_START") == "1":
+        # The same leftovers, reached through a crash instead of a signal: the
+        # crash path gets the bounded tail too, and it must not be followed by
+        # an interpreter shutdown that joins the worker.
+        raise RuntimeError("the stand-in daemon crashed")
     try:
         await request
     except asyncio.CancelledError:
@@ -1437,28 +1442,27 @@ daemon.main()
 """
 
 
-def test_a_clean_shutdown_does_not_wait_for_the_worker_a_broker_call_left_behind(
-    tmp_path: Path,
-) -> None:
-    """End to end through ``main``: a cooperative task still leaves a worker.
+class _WorkerLeftBehind(NamedTuple):
+    """What the stand-in daemon's process did: code, time, log, worker marker."""
 
-    The exit tail was bounded for a task that *ignores* its cancel; the plain
-    case was not. A task awaiting ``asyncio.to_thread`` always honours its
-    cancellation, so the cancel phase and ``close_the_loop_bounded`` both report
-    a clean tail - and the worker thread the broker request is running on keeps
-    running, because no cancel can reach it. ``main`` then leaves through
-    ``sys.exit``, and the interpreter's own teardown joins that worker with no
-    deadline (``concurrent.futures.thread._python_exit``): a shutdown that
-    reported ``EXIT_OK`` in milliseconds does not produce its exit code for as
-    long as the broker call takes, which is past the unit's ``TimeoutStopSec``,
-    so systemd reports the SIGKILL it sent itself instead of the verdict.
+    returncode: int
+    elapsed: float
+    text: str
+    worker_finished: bool
 
-    The exit code here is ``0`` - the drain and every phase really did finish -,
-    and it has to arrive while the worker is still running: the marker it writes
-    only exists if the process lived long enough for the 300 s call to return.
+
+def _run_the_cooperative_worker_program(tmp_path: Path, *, crash: bool) -> _WorkerLeftBehind:
+    """Run the stand-in daemon in a subprocess and stop it like an operator would.
+
+    The stand-in leaves exactly one leftover behind: a broker request already
+    handed to a ``to_thread`` worker, from a task that honours its cancellation.
+    Nothing here is stubborn, so every deadline the shutdown runs reports success
+    and the exit path reports a clean tail - and the worker the request is running
+    on is still alive, with 300 s of broker call left. ``crash`` reaches the same
+    leftovers through a crashed loop task instead of a signal.
     """
     data_dir = tmp_path / "data"
-    data_dir.mkdir()
+    data_dir.mkdir(exist_ok=True)
     marker = tmp_path / "worker-finished"
     env = dict(os.environ)
     env.update(
@@ -1467,6 +1471,7 @@ def test_a_clean_shutdown_does_not_wait_for_the_worker_a_broker_call_left_behind
         PYTHONPATH=str(Path(__file__).resolve().parents[1]),
         TP_REPO_ROOT=str(Path(__file__).resolve().parents[1]),
         TP_WORKER_MARKER=str(marker),
+        TP_CRASH_AFTER_START="1" if crash else "0",
     )
     process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
         [sys.executable, "-c", _COOPERATIVE_WORKER_PROGRAM],
@@ -1498,28 +1503,88 @@ def test_a_clean_shutdown_does_not_wait_for_the_worker_a_broker_call_left_behind
             output.append(line)
             requested = "REQUESTED" in line
         assert requested, "the stand-in loop never started: " + "".join(output)[-2000:]
-        process.send_signal(signal.SIGTERM)
+        if not crash:
+            # A crash needs no signal: the loop task raises on its own, and the
+            # tail under test is the one that follows it.
+            process.send_signal(signal.SIGTERM)
         process.wait(timeout=60)
     finally:
         if process.poll() is None:  # pragma: no cover - only on a failed test
             process.kill()
             process.wait(timeout=30)
         reader.join(timeout=10)
-    elapsed = time.monotonic() - started
     output.extend(lines.queue)
-    text = "".join(output)
-    # The whole bounded shutdown, scaled: the drain plus six phases at 0.2 s, the
-    # 2 s exit path and the bounded flush that now precede it, with ample slack
-    # for process start-up on a loaded machine. The worker alone would take
-    # 300 s, so only a tail that does not join it can beat this.
-    assert elapsed < 20.0, (
-        f"the exit code did not arrive within the budget after {elapsed:.2f}s"
+    return _WorkerLeftBehind(
+        returncode=process.returncode,
+        elapsed=time.monotonic() - started,
+        text="".join(output),
+        worker_finished=marker.exists(),
     )
-    assert not marker.exists(), (
+
+
+def _assert_the_budget_held(result: _WorkerLeftBehind, *, expected: int) -> None:
+    """The exit code has to arrive inside the budget, worker still running.
+
+    The whole bounded shutdown, scaled: the drain plus six phases at 0.2 s, the
+    2 s exit path and the bounded flush that now precede it, with ample slack for
+    process start-up on a loaded machine. The worker alone would take 300 s, so
+    only a tail that does not join it can beat this.
+    """
+    assert result.elapsed < 20.0, (
+        f"the exit code did not arrive within the budget after {result.elapsed:.2f}s"
+    )
+    assert result.worker_finished is False, (
         "the process waited for the worker: the marker says the broker call "
         "returned before the exit code was reported"
     )
-    assert process.returncode == EXIT_OK, text[-2000:]
+    assert result.returncode == expected, result.text[-2000:]
+
+
+def test_a_clean_shutdown_does_not_wait_for_the_worker_a_broker_call_left_behind(
+    tmp_path: Path,
+) -> None:
+    """End to end through ``main``: a cooperative task still leaves a worker.
+
+    The exit tail was bounded for a task that *ignores* its cancel; the plain
+    case was not. A task awaiting ``asyncio.to_thread`` always honours its
+    cancellation, so the cancel phase and ``close_the_loop_bounded`` both report
+    a clean tail - and the worker thread the broker request is running on keeps
+    running, because no cancel can reach it. ``main`` then left through
+    ``sys.exit``, and the interpreter's own teardown joined that worker with no
+    deadline (``concurrent.futures.thread._python_exit``): a shutdown that
+    reported ``EXIT_OK`` in milliseconds did not produce its exit code for as
+    long as the broker call takes, which is past the unit's ``TimeoutStopSec``,
+    so systemd reported the SIGKILL it sent itself instead of the verdict.
+
+    The exit code here is ``0`` - the drain and every phase really did finish -,
+    and it has to arrive while the worker is still running: the marker it writes
+    only exists if the process lived long enough for the 300 s call to return.
+    """
+    _assert_the_budget_held(
+        _run_the_cooperative_worker_program(tmp_path, crash=False), expected=EXIT_OK
+    )
+
+
+def test_a_crashed_shutdown_does_not_wait_for_the_worker_left_behind(
+    tmp_path: Path,
+) -> None:
+    """End to end through ``main``: the crash path leaves the worker behind too.
+
+    A crashed daemon re-raised, and the interpreter's teardown then joined the
+    same worker with no deadline - so the ``1`` that says "this crashed" arrived
+    only when the broker call it had already abandoned returned, or not at all
+    inside the unit's ``TimeoutStopSec``. The crash now logs its traceback and
+    leaves through ``os._exit`` like every other path, which is what has to hold
+    the budget here; the traceback is asserted, because the exit that produced
+    the code is the same one that skips the interpreter's traceback dump.
+    """
+    result = _run_the_cooperative_worker_program(tmp_path, crash=True)
+
+    _assert_the_budget_held(result, expected=EXIT_CRASH)
+    assert "Traceback" in result.text, result.text[-2000:]
+    assert "the stand-in daemon crashed" in result.text
+
+
 
 
 # ─── exit codes ─────────────────────────────────────────────────────────────────
@@ -1654,6 +1719,37 @@ def test_main_logs_the_traceback_and_exits_after_a_crash(
     # closes the handlers and ``os._exit`` writes nothing at all.
     assert excinfo.value.code == EXIT_CRASH
     assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", f"exit:{EXIT_CRASH}"]
+
+
+@pytest.mark.parametrize(
+    ("crash", "expected"),
+    [
+        (RuntimeError("the daemon crashed"), EXIT_CRASH),
+        # A Ctrl-C that landed before the shutdown handler was installed is what
+        # the interpreter reports as 130 (128+SIGINT); ``main`` produces the
+        # number itself now, so it has to produce that one.
+        (KeyboardInterrupt(), FORCED_EXIT_CODE),
+    ],
+)
+def test_a_crash_exits_with_the_code_the_interpreter_would_have_used(
+    monkeypatch: pytest.MonkeyPatch, crash: BaseException, expected: int
+) -> None:
+    """Leaving through ``os._exit`` must not change what a crash reports."""
+    order: list[str] = []
+
+    async def _crashed(**_kwargs: Any) -> int:
+        raise crash
+
+    monkeypatch.setattr(daemon, "run_daemon", _crashed)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: order.append("logs"))
+    monkeypatch.setattr(daemon, "flush_sentry", _record_flush(order))
+    monkeypatch.setattr(daemon.os, "_exit", _record_exit(order))
+
+    with pytest.raises(_ProcessLeft) as excinfo:
+        daemon.main()
+
+    assert excinfo.value.code == expected
+    assert order[-1] == f"exit:{expected}"
 
 
 def test_shutdown_timeouts_are_bounded_by_default() -> None:
