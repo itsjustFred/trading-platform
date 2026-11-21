@@ -166,11 +166,19 @@ def test_the_smoke_deployment_is_idempotent_per_account(isolated_db) -> None:
     assert len(_smoke_rows(database)) == 1, "a second deployment row was created for one label"
 
 
-def test_discord_replay_smoke_routes_to_fake_order() -> None:
+def test_discord_replay_smoke_routes_to_fake_order(tmp_path: Path) -> None:
+    """The accounts env is written here, not taken from the working directory.
+
+    ``Path(".accounts.env")`` is relative to the cwd, which for a plain ``pytest`` is the repo
+    root: the smoke run then read the checkout's real credential file, and a run in another
+    directory read nothing at all.
+    """
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text("ALPACA_API_KEY=smoke-key\nALPACA_SECRET_KEY=smoke-secret\n", encoding="utf-8")
     report = asyncio.run(
         run_smoke(
             mode="discord-replay",
-            accounts_env=Path(".accounts.env"),
+            accounts_env=accounts_env,
             alpaca_symbol="BTC/USD",
             alpaca_notional=10.0,
             ctrader_symbol="EURUSD",

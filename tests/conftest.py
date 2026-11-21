@@ -257,7 +257,10 @@ def _fail_session(session: pytest.Session, message: str) -> None:
 
 
 def _watched_repo_dirs_changed() -> list[str]:
-    assert _REPO_TREES_BEFORE, "pytest_configure never snapshotted the watched directories"
+    if not _REPO_TREES_BEFORE:
+        # Nothing to compare against: this process is an xdist worker (it does not snapshot, because
+        # its siblings are still writing the tree), or a direct call outside a run.
+        return []
     changes: list[str] = []
     for root, before in _REPO_TREES_BEFORE.items():
         for change in diff_snapshots(before, snapshot_tree(Path(root))):
