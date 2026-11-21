@@ -58,6 +58,14 @@ from live_runner.exit_signals import (
     round_exit_qty_down,
     usable_qty_tolerance,
 )
+from live_runner.kill_switch import (
+    KillSwitchMode,
+    KillSwitchState,
+    LiveHaltError,
+    enforce_live_kill_switch,
+    read_kill_switch_state,
+    refuse_entry_while_halted,
+)
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
@@ -1878,6 +1886,17 @@ async def prepare_order_with_risk(
             signal,
             instruction=None if is_exit_intent(metadata) else FULL_EXIT,
         )
+    # Kill switch (#300). The persisted halt is checked at the last chokepoint
+    # every entry order passes through, and it is checked *after* the exit branch
+    # above: closing a position must never be blocked by a halt, or the feature
+    # would trap an operator in the exposure it exists to stop adding to. It runs
+    # before any broker state is read, so a halted account costs no round-trip and
+    # an unreadable halt state refuses the entry instead of trading on a guess.
+    await refuse_entry_while_halted(
+        deployment.account_id,
+        deployment_id=str(deployment.id),
+        symbol=signal.symbol,
+    )
     # #150 fail closed at the last chokepoint before the broker: an entry
     # signal carrying a trailing config this adapter cannot execute (#167:
     # per-broker table + the adapter's stop-amendment capability) is refused —
@@ -2699,6 +2718,25 @@ async def _prepare_claim_and_submit_signal(
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
                     "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return
+    except LiveHaltError as exc:
+        # The kill switch (#300) refused this entry. Nothing was sent, which is
+        # the halt working; reported as its own reason rather than as a generic
+        # refusal, so an operator sees the halt they just set instead of hunting
+        # for a validation error.
+        logger.warning(
+            "Entry refused by the kill switch; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "halt_mode": exc.mode.value if exc.mode is not None else None,
+                    "halt_state_unreadable": exc.state_unreadable,
                     "reason": str(exc),
                 }
             },
@@ -4352,6 +4390,40 @@ def _log_deployment_status_observations(
         )
 
 
+#: Halt modes that can only be enforced through an adapter (see
+#: :func:`_accounts_needing_halt_enforcement`).
+_HALT_MODES_NEEDING_AN_ADAPTER = frozenset(
+    {KillSwitchMode.ORDERS, KillSwitchMode.FLATTEN}
+)
+
+
+def _accounts_needing_halt_enforcement(
+    halt_state: KillSwitchState,
+    deployments: list[LiveDeploymentConfig],
+) -> set[str]:
+    """Accounts whose halt needs a connected adapter to be enforced.
+
+    The mirror image of :func:`_account_ids_needing_stopped_enforcement`. A mode
+    that has to touch the broker (``orders``, ``flatten``) can only run through an
+    adapter, and an account whose deployments are all PAUSED or STOPPED is
+    otherwise never connected - so its halt would be reported as unenforceable on
+    every tick while its positions stayed open, which is the STOPPED machinery's
+    own lesson.
+
+    Retention is never permission: the accounts returned here are added to the
+    retained set so an adapter exists for the sweep, and only the runnable set
+    gets listener tasks, so this cannot make an account tradeable. An unreadable
+    halt state answers ``entries`` - which needs no adapter - so a broken read
+    connects nothing extra and still refuses every entry.
+    """
+    return {
+        deployment.account_id
+        for deployment in deployments
+        if halt_state.mode_for_account(deployment.account_id)
+        in _HALT_MODES_NEEDING_AN_ADAPTER
+    }
+
+
 def _account_ids_needing_stopped_enforcement(
     deployments: list[LiveDeploymentConfig],
     already_enforced: set[str],
@@ -5072,6 +5144,12 @@ async def sync_deployments_loop(
         )
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
+    # One halt state for the process, refreshed in place once per tick (#300). The
+    # halts are re-read every time - that is what makes a halt written while
+    # nothing was running, or across a restart, take effect - while the sweep
+    # ledger it carries (which account was already swept in which mode) has to
+    # outlive a tick, or a flat account would be re-flattened every 10 s.
+    halt_state = read_kill_switch_state()
     while True:
         try:
             # Read credential file directly without repeatedly mutating process env.
@@ -5082,6 +5160,11 @@ async def sync_deployments_loop(
                 # cTrader blocks are cleared below only for accounts whose
                 # selected credential signature actually changed.
                 _clear_discord_auth_blocked_accounts()
+            # The halt is read first, before any adapter work: it decides which
+            # accounts need one (a mode that has to touch the broker) and the
+            # entry gate asks for it on every order. Never raises - an
+            # unreadable state answers 'halted in entries mode'.
+            await asyncio.to_thread(halt_state.refresh)
             accounts, deployments = await _load_db_accounts_and_deployments()
             if deployment_snapshot is not None:
                 # Shared with the trailing-stop loop (#167) so it never has to
@@ -5128,7 +5211,15 @@ async def sync_deployments_loop(
                 deployments,
                 enforced_stopped_deployments,
             ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
-            retained_account_ids = runnable_account_ids | enforcement_account_ids
+            # A halt in a mode that has to touch the broker needs an adapter for
+            # the same reason (#300). Retention only: the runnable set below is
+            # what may trade.
+            halt_enforcement_account_ids = _accounts_needing_halt_enforcement(
+                halt_state, deployments
+            ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            retained_account_ids = (
+                runnable_account_ids | enforcement_account_ids | halt_enforcement_account_ids
+            )
 
             # B2: disconnect against retained (blocked-excluded) ids — a
             # blocked account must never keep a live adapter via either path.
@@ -5158,6 +5249,22 @@ async def sync_deployments_loop(
                 already_enforced=enforced_stopped_deployments,
                 account_lookup=account_lookup,
             )
+            # The kill switch (#300), enforced on the same tick it is read. This
+            # is the second of its two checkpoints: the entry gate refuses new
+            # entries, and this makes the modes that have to touch the broker
+            # actually touch it - a halt written while the daemon was down is
+            # enforced by the first tick after it starts. Same account set the
+            # STOPPED sweep above just used, plus every connected adapter.
+            kill_switch_report = await enforce_live_kill_switch(
+                active_adapters,
+                retained_account_ids | set(active_adapters),
+                state=halt_state,
+            )
+            if kill_switch_report.modes:
+                logger.warning(
+                    "Kill switch state enforced",
+                    extra={"data": {"report": kill_switch_report.describe()}},
+                )
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(
                 active_adapters,

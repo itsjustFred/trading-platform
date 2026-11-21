@@ -29,7 +29,7 @@ def account(isolated_db_sandbox) -> str:
     database, _engine, _data_dir = isolated_db_sandbox
     database.init_db()
     with get_session() as session:
-        session.add(LiveAccountModel(id="acc-1", broker="fixture", name="acc-1"))
+        session.add(LiveAccountModel(id="acc-1", broker="alpaca", name="acc-1"))
         session.commit()
     return "acc-1"
 
@@ -135,6 +135,31 @@ def test_re_arming_a_cleared_scope_records_a_new_halt(
     assert state.active is True
     assert state.cleared_at is None
     assert state.cleared_by is None
+
+
+def test_re_arming_a_cleared_scope_stamps_a_new_halt_instant(
+    isolated_db_sandbox, account: str
+) -> None:
+    """A re-armed halt is a new episode, not a continuation of the cleared one.
+
+    There is one row per scope, so it has nowhere else to keep the earlier
+    episode's instant: reporting that one would claim the account had been halted
+    continuously since then, which is exactly what the clear denied - and the
+    incident timeline would show a halt standing over a window in which trading
+    was allowed.
+    """
+    set_live_kill_switch(account, "entries", actor="operator")
+    first = get_live_kill_switch_state(account)
+    assert first is not None
+    clear_live_kill_switch(account, actor="operator")
+
+    set_live_kill_switch(account, "entries", actor="operator")
+    second = get_live_kill_switch_state(account)
+
+    assert second is not None
+    assert second.halted_at is not None
+    assert first.halted_at is not None
+    assert second.halted_at > first.halted_at
 
 
 def test_an_unknown_scope_reads_as_no_halt(isolated_db_sandbox) -> None:

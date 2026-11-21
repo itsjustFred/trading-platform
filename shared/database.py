@@ -4386,6 +4386,11 @@ def set_live_kill_switch(
     Escalating never needs a restart to take effect either - the daemon keys its
     re-sweep on the mode, so a change re-sweeps immediately.
 
+    Re-arming a *cleared* scope is a new episode, not an escalation: one row per
+    scope has nowhere else to keep the earlier episode's instant, and reporting
+    that one would claim the account had been halted continuously since then -
+    which is precisely what the clear denied.
+
     An account scope that matches no live account is refused: a typo'd id writes
     a halt that covers nothing while the operator reads it as armed. The check
     is skipped only when the accounts cannot be read at all (see
@@ -4425,7 +4430,10 @@ def set_live_kill_switch(
             record.mode = normalized_mode
             record.halted_by = actor_name
             record.reason = str(reason or "")
-            if record.halted_at is None:
+            # A new episode (the row was cleared) or a row that never carried an
+            # instant gets one now; an escalation of a standing halt keeps the
+            # original, because the account has been halted since then.
+            if record.cleared_at is not None or record.halted_at is None:
                 record.halted_at = now
             # A row that was cleared is un-cleared by this write: the halt is
             # live again, and a stale cleared_at would read it back as lifted.
