@@ -264,6 +264,28 @@ reuses its hashing and atomic-write helpers. A missing, unreadable or malformed
 ledger, a missing strategy file or unreadable `STRATEGY_META`, an unknown
 processor: all mean `experimental`, and the deployment is refused on real money.
 
+### The evidence files are re-hashed on every check (#260)
+
+A promotion also records the **path and SHA256 of each of the three evidence
+files**: the optimization result, the paper-trading report and the parity
+report. They are re-opened and re-hashed every time the promotion is checked,
+so a result or a report edited after the promotion -- or deleted -- makes the
+code `experimental` again, exactly like a changed strategy file. Without that,
+the verdict could stand on a file nobody had looked at since the promotion.
+
+- An evidence file inside the repository is recorded as a repository-relative
+  POSIX path, so the ledger stays portable across checkouts.
+- An evidence file outside the repository (a data directory, a machine-local
+  report) is recorded absolutely, and only verifies where that file still
+  exists: a promotion is then in force only on the machine that recorded it. That
+  is the safest reading available -- the alternative would be a path nothing can
+  resolve elsewhere, recorded as if it could.
+- Ledgers written before #260 record the file *names* only. Such a record cannot
+  be re-verified, so it is refused until the promotion is recorded again with the
+  current CLI (one command, the same evidence): the new record replaces the old
+  one for the same parameter set, and records of other parameter sets are kept.
+  A promotion recorded this way is what the ledger holds from then on.
+
 ### Recording a promotion (CLI only)
 
 ```bash
@@ -282,9 +304,14 @@ uv run python -m runner.cli promote \
 For a signal bot use `--signal-processor ramjet` and pass the deployment's
 `signal_processor_config` as `--params '{...}'` (`--params` is refused for a
 strategy). The out-of-sample evidence is read from the result file, not typed
-in. Both report files must exist; their SHA256 is recorded. Every argument is
-mandatory, and the command exits non-zero without writing anything if any
-evidence is missing or below a threshold.
+in. All three files must exist; their path and SHA256 are recorded and re-hashed
+on every check. Every argument is mandatory, and the command exits non-zero
+without writing anything if any evidence is missing, below a threshold, or
+cannot be named for the ledger.
+
+Re-record a promotion that was made before #260 (same command, same evidence)
+to bind the evidence files; see "The evidence files are re-hashed on every
+check" above.
 
 ### Enforcement points (fail closed)
 

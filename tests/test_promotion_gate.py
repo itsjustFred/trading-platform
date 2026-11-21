@@ -7,7 +7,12 @@ Enforcement-point tests (preflight, daemon, viewer) live in
 from __future__ import annotations
 
 import argparse
+import atexit
+import hashlib
 import json
+import shutil
+import tempfile
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +30,6 @@ from runner.promotion_cli import record_promotion
 from runner.promotion_gate import (
     LEDGER_VERSION,
     InvalidPromotionError,
-    OutOfSampleEvidence,
     PaperTradingEvidence,
     ParityEvidence,
     PromotionEvidence,
@@ -38,6 +42,7 @@ from runner.promotion_gate import (
     parameters_hash,
     promote,
     promotion_status,
+    recorded_evidence_path,
 )
 from shared.models import LiveDeploymentConfig
 
@@ -52,7 +57,8 @@ STRATEGY_SOURCE = (
     "def generate_signals(data, params):\n"
     "    return data\n"
 )
-_SHA = "a" * 64
+#: Where the evidence files of a promotion are written by :func:`good_evidence`.
+EVIDENCE_SUBDIR = "evidence"
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +84,31 @@ def make_signal_bots_root(root: Path) -> Path:
     return root
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_SCRATCH_EVIDENCE_ROOT: Path | None = None
+
+
+def _evidence_scratch_dir() -> Path:
+    """A unique directory for the evidence files of one promotion.
+
+    The ledger records the path and the hash of every evidence file, so evidence
+    whose files do not exist cannot be recorded or re-checked. Callers that
+    tamper with the files pass a directory under ``tmp_path`` instead; this
+    scratch tree serves the ones that have none, and is removed at exit like
+    the session data directory in ``conftest.py``.
+    """
+    global _SCRATCH_EVIDENCE_ROOT
+    if _SCRATCH_EVIDENCE_ROOT is None:
+        _SCRATCH_EVIDENCE_ROOT = Path(tempfile.mkdtemp(prefix="tp-promotion-evidence-"))
+        atexit.register(shutil.rmtree, _SCRATCH_EVIDENCE_ROOT, ignore_errors=True)
+    directory = _SCRATCH_EVIDENCE_ROOT / uuid.uuid4().hex
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def good_evidence(
     *,
     strategy_file: str = f"{STRATEGY_NAME}.py",
@@ -89,45 +120,72 @@ def good_evidence(
     paper_days: int = 70,
     paper_trades: int = 40,
     deviations: dict[str, float] | None = None,
+    evidence_dir: Path | None = None,
 ) -> PromotionEvidence:
+    """Evidence whose files exist, so the ledger can record and re-hash them (#260)."""
     moment = now or datetime.now(timezone.utc)
+    directory = evidence_dir if evidence_dir is not None else _evidence_scratch_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    bound = DEFAULTS if parameters is None else parameters
     test_end = moment - timedelta(days=100)
-    return PromotionEvidence(
-        out_of_sample=OutOfSampleEvidence(
-            optimization_id="opt-1",
-            result_file="opt-1.json",
-            result_sha256=_SHA,
-            strategy_file=strategy_file,
-            parameters_sha256=parameters_hash(DEFAULTS if parameters is None else parameters),
-            test_start=(test_end - timedelta(days=test_days)).isoformat(),
-            test_end=test_end.isoformat(),
-            test_trade_count=test_trades,
-            overfitting_passed=overfitting_passed,
+    # The payload shape the optimizer writes (#164), so the out-of-sample part
+    # is read off the file exactly as the CLI reads it, hash and path included.
+    result_path = directory / "opt-1.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "id": "opt-1",
+                "strategy": {"path": f"/work/strategies/{strategy_file}"},
+                "effective_best_parameters": bound,
+                "final_test_period": {
+                    "start": (test_end - timedelta(days=test_days)).isoformat(),
+                    "end": test_end.isoformat(),
+                },
+                "final_test_stats": {"total_trades": test_trades},
+                "three_way": {"overfitting": {"passed": overfitting_passed}},
+            }
         ),
+        encoding="utf-8",
+    )
+    paper_report = directory / "paper.csv"
+    paper_report.write_text("trade_id,pnl\n1,0.4\n", encoding="utf-8")
+    parity_report = directory / "parity.json"
+    parity_report.write_text(json.dumps({"total_return": 0.01}), encoding="utf-8")
+    return PromotionEvidence(
+        out_of_sample=out_of_sample_evidence_from_result(result_path),
         paper_trading=PaperTradingEvidence(
             account_id="paper-1",
             broker="ctrader",
             start=(moment - timedelta(days=paper_days + 1)).isoformat(),
             end=(moment - timedelta(days=1)).isoformat(),
             trade_count=paper_trades,
-            report_file="paper.csv",
-            report_sha256=_SHA,
+            report_file=paper_report.name,
+            report_path=recorded_evidence_path(paper_report),
+            report_sha256=_sha256(paper_report),
         ),
         parity=ParityEvidence(
             reference="lean",
             deviations={"total_return": 0.01} if deviations is None else deviations,
-            report_file="parity.json",
-            report_sha256=_SHA,
+            report_file=parity_report.name,
+            report_path=recorded_evidence_path(parity_report),
+            report_sha256=_sha256(parity_report),
         ),
     )
 
 
-def promote_strategy_file(strategies_dir: Path, name: str = STRATEGY_NAME) -> dict[str, Any]:
+def promote_strategy_file(
+    strategies_dir: Path,
+    name: str = STRATEGY_NAME,
+    evidence_dir: Path | None = None,
+) -> dict[str, Any]:
     return promote(
         strategies_dir / name / f"{name}.py",
         kind="strategy",
         parameters=DEFAULTS,
-        evidence=good_evidence(strategy_file=f"{name}.py"),
+        evidence=good_evidence(
+            strategy_file=f"{name}.py",
+            evidence_dir=evidence_dir or strategies_dir.parent / EVIDENCE_SUBDIR,
+        ),
         promoted_by="Fred (reviewer)",
         root=strategies_dir,
     )
@@ -158,14 +216,17 @@ def ramjet_deployment(processor_config: dict[str, Any] | None = None) -> LiveDep
     )
 
 
-def promote_ramjet_bot() -> Any:
+def promote_ramjet_bot(evidence_dir: Path | None = None) -> Any:
     """Promote the ramjet signal bot of the ``bots_root`` tree (no processor overrides)."""
     target = deployment_promotion_target(ramjet_deployment())
     promote(
         target.path,
         kind=target.kind,
         parameters=target.parameters,
-        evidence=good_evidence(strategy_file="ramjet_strategy.py"),
+        evidence=good_evidence(
+            strategy_file="ramjet_strategy.py",
+            evidence_dir=evidence_dir or target.root.parent / EVIDENCE_SUBDIR,
+        ),
         promoted_by="Fred (reviewer)",
         root=target.root,
     )
@@ -991,8 +1052,10 @@ def test_the_ledger_records_the_path_of_every_evidence_file(
     assert evidence["out_of_sample"].get("result_path") == (
         _optimizer_result(tmp_path).resolve().as_posix()
     )
-    assert evidence["paper_trading"].get("report_path") == (tmp_path / "paper.csv").resolve().as_posix()
-    assert evidence["parity"].get("report_path") == (tmp_path / "parity.json").resolve().as_posix()
+    paper_report = (tmp_path / "paper.csv").resolve().as_posix()
+    parity_report = (tmp_path / "parity.json").resolve().as_posix()
+    assert evidence["paper_trading"].get("report_path") == paper_report
+    assert evidence["parity"].get("report_path") == parity_report
     assert _status(strategies_dir).is_production
 
 
@@ -1003,13 +1066,17 @@ def test_evidence_paths_are_recorded_relative_to_the_repository(
     import runner.promotion_gate as gate
 
     monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
-    record = record_promotion(_cli_args(tmp_path))["record"]
+    args = _cli_args(tmp_path)
+    record = record_promotion(args)["record"]
     evidence = record["evidence"]
     assert evidence["out_of_sample"].get("result_path") == "opt-7.json"
     assert evidence["paper_trading"].get("report_path") == "paper.csv"
     assert evidence["parity"].get("report_path") == "parity.json"
     # The relative form resolves against the repository tree of the checking process.
     assert _status(strategies_dir).is_production
+    # ... which is what fails closed when that file is gone.
+    Path(args.optimization_result).unlink()
+    assert not _status(strategies_dir).is_production
 
 
 def test_an_altered_evidence_file_refuses_the_promotion(
@@ -1033,6 +1100,39 @@ def test_an_altered_evidence_file_refuses_the_promotion(
         path.write_bytes(originals[path])
     # Restoring the bytes restores the promotion: the check is a re-hash, not a one-way trip.
     assert _status(strategies_dir).is_production
+
+
+def test_an_altered_evidence_file_refuses_a_promotion_recorded_through_the_api(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The same re-hash on the direct ``promote`` path, without the CLI."""
+    evidence_dir = tmp_path / EVIDENCE_SUBDIR
+    promote_strategy_file(strategies_dir, evidence_dir=evidence_dir)
+    assert _status(strategies_dir).is_production
+    paper_report = evidence_dir / "paper.csv"
+    paper_report.write_text("trade_id,pnl\n1,0.9\n", encoding="utf-8")
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "paper trading" in status.reason
+
+
+def test_promotion_refuses_an_evidence_file_that_vanished_before_recording(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """Exactly what is written is checked, so the file must still be there to record it."""
+    evidence_dir = tmp_path / EVIDENCE_SUBDIR
+    evidence = good_evidence(evidence_dir=evidence_dir)
+    (evidence_dir / "opt-1.json").unlink()
+    with pytest.raises(InvalidPromotionError, match="missing or unreadable"):
+        promote(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            kind="strategy",
+            parameters=DEFAULTS,
+            evidence=evidence,
+            promoted_by="Fred",
+            root=strategies_dir,
+        )
+    assert not ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py").exists()
 
 
 def test_a_missing_evidence_file_refuses_the_promotion(
