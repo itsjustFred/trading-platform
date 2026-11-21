@@ -613,7 +613,7 @@ def _lift_optional_datetime(value: Any) -> datetime | None:
     elif isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except (ValueError, OverflowError):
+        except ValueError:
             return None
     else:
         return None
@@ -688,6 +688,7 @@ def _live_signal_quote_snapshot_fields(metadata: Mapping[str, Any]) -> dict[str,
         logger.warning(
             "Live signal quote snapshot projection failed; storing NULLs",
             extra={"data": {"error": "projection_failed"}},
+            exc_info=True,
         )
         return {name: None for name in field_names}
     return fields
@@ -5559,16 +5560,24 @@ def _live_slippage_decomposition(
     Each is ``None`` independently when its inputs are missing -
     an unusable fill price hides only ``execution_slippage_bps``, and a signal
     with no quote snapshot hides all three and sets ``quote_snapshot_missing``.
+    Exits never pass the entry quote gate, so a missing snapshot on an exit is
+    expected rather than a gap: ``quote_snapshot_missing`` is ``None`` there.
     """
     bid = _usable_quote_price(signal.entry_quote_bid)
     ask = _usable_quote_price(signal.entry_quote_ask)
     quote_price = _usable_quote_price(signal.entry_quote_price)
     has_snapshot = bid is not None and ask is not None and quote_price is not None
+    metadata = signal.metadata_json or {}
+    is_exit = bool(metadata.get("exit_only")) or str(
+        metadata.get("signal_intent") or ""
+    ) == "exit"
     result: dict[str, Any] = {
         "signal_delay_bps": None,
         "execution_slippage_bps": None,
         "spread_bps": None,
-        "quote_snapshot_missing": not has_snapshot,
+        "quote_snapshot_missing": (
+            False if has_snapshot else (None if is_exit else True)
+        ),
         "quote_bid": bid,
         "quote_ask": ask,
         "quote_price": quote_price,

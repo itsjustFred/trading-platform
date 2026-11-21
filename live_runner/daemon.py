@@ -879,6 +879,7 @@ def _apply_signal_processor(
         take_profit=processed.take_profit,
         timeframe=processed.timeframe or signal.timeframe,
         metadata=metadata,
+        received_at_local=getattr(signal, "received_at_local", None),
     )
 
 
@@ -2172,13 +2173,16 @@ def _trade_signal_to_live_signal(
     metadata["source"] = str(metadata.get("source") or "discord")
     # #134: the submit/ack stamps are written by the broker path after the
     # order returns - a payload value under these names must never survive to
-    # persistence. ``received_at_local`` is the local receipt stamp and is
-    # overwritten unconditionally: the Discord source stamps it at parse time,
-    # but any other producer could smuggle an arbitrary value through metadata,
-    # and an analytics column must never be trusted from the payload.
+    # persistence. ``received_at_local`` is the local receipt stamp: the
+    # Discord source stamps it at parse time and the daemon carries it on the
+    # signal through the candle-close wait; any other producer could smuggle
+    # an arbitrary metadata value, so payload is never trusted here.
     metadata.pop("order_submitted_at", None)
     metadata.pop("broker_ack_at", None)
-    metadata["received_at_local"] = datetime.now(timezone.utc).isoformat()
+    metadata["received_at_local"] = (
+        getattr(signal, "received_at_local", None)
+        or datetime.now(timezone.utc).isoformat()
+    )
     _mint_signal_idempotency_key(signal, deployment, metadata)
     if is_exit_intent(metadata):
         # A parsed exit is reduce-only whatever the deployment allows: on a
@@ -2529,6 +2533,13 @@ async def _prepare_discord_signal_for_submission(
         take_profit=trade_signal.take_profit,
         timeframe=signal_timeframe,
         metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
+        # Receipt is stamped at the daemon's first contact with the signal -
+        # before the candle-close wait - and carried on the signal, not in
+        # payload metadata, so a producer cannot smuggle an analytics stamp.
+        received_at_local=(
+            getattr(trade_signal, "received_at_local", None)
+            or datetime.now(timezone.utc).isoformat()
+        ),
     )
     try:
         # Fail closed on an already-stale signal BEFORE the candle-close wait:
@@ -2696,10 +2707,14 @@ async def _persist_submission_rejection(
     try:
         # Bounded: this runs on the refusal path, possibly inside the
         # per-symbol exit lock, so a contended database must not delay the
-        # operator-visible log or the fan-out to sibling deployments.
+        # operator-visible log or the fan-out to sibling deployments. The two
+        # lookups share one deadline (wait_for bounds the await, not the
+        # worker thread - a stuck DB call still finishes in the background).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
         existing = await asyncio.wait_for(
             asyncio.to_thread(get_live_signal_metadata, str(live_signal.id)),
-            timeout=5.0,
+            timeout=max(0.0, deadline - loop.time()),
         )
         if existing is not None:
             return
@@ -2711,7 +2726,7 @@ async def _persist_submission_rejection(
                 reason=str(exc),
                 extra_metadata=_entry_gate_record(exc),
             ),
-            timeout=5.0,
+            timeout=max(0.0, deadline - loop.time()),
         )
     except Exception:
         logger.warning(

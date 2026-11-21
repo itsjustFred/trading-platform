@@ -1213,6 +1213,7 @@ def _parse_trade_signal_from_message(
         take_profit=levels.take_profit,
         timeframe=str(metadata["timeframe"]),
         metadata=metadata,
+        received_at_local=metadata.get("received_at_local"),
     )
 
 
@@ -1291,6 +1292,7 @@ def _build_exit_signal(
         take_profit=None,
         timeframe=str(metadata["timeframe"]),
         metadata=metadata,
+        received_at_local=metadata.get("received_at_local"),
     )
 
 
@@ -1542,8 +1544,9 @@ class DiscordSignalSource(BaseSignalSource):
         # authors the allowlist does not trust - by definition untrusted channel members -
         # so letting three of them flip the service status would hand any member of the
         # channel the ability to take the bot out of service (the daemon stops
-        # every discord service that is not RUNNING). The refusal itself is already correct; this alert is the signal for
-        # the operator, who checks the logged `rejected_author_ids` against the allowlist.
+        # every discord service that is not RUNNING). The refusal itself is
+        # already correct; this alert is the signal for the operator, who
+        # checks the logged `rejected_author_ids` against the allowlist.
 
     def author_rejection_summary(self) -> dict[str, Any]:
         """How many messages were dropped for authorship, and by whom.

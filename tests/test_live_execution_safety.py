@@ -564,11 +564,14 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     )
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: next(save_results))
     persisted_order_ids: list[tuple[str, str]] = []
+    persisted_stamps: list[tuple[Any, Any]] = []
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
         lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
-            persisted_order_ids.append((sid, oid)) or True
+            persisted_order_ids.append((sid, oid))
+            or persisted_stamps.append((submitted_at, acknowledged_at))
+            or True
         ),
     )
 
@@ -607,6 +610,10 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     assert len(submitted_requests) == 1
     assert submitted_requests[0].client_order_id == canonical_signal_id
     assert persisted_order_ids == [(canonical_signal_id, _alpaca_order_id("order-1"))]
+    assert all(
+        isinstance(submitted, datetime) and isinstance(acknowledged, datetime)
+        for submitted, acknowledged in persisted_stamps
+    ), "submit/ack stamps must be real datetimes, not swallowed kwargs"
 
 
 def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypatch):
@@ -1200,6 +1207,11 @@ def test_ctrader_direct_persistence_strips_raw_broker_volume_keys(monkeypatch):
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(module, "save_live_signal", _capture)
     monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 5_000)
+    # The request build now runs before persistence; this test is about the
+    # persisted metadata, not the wire request.
+    monkeypatch.setattr(
+        adapter, "_build_new_order_request", lambda _signal, *, symbol_id: object()
+    )
 
     with pytest.raises(_PersistenceCaptured):
         asyncio.run(adapter.submit_order(signal, qty=3.0))
@@ -2936,6 +2948,11 @@ def test_ctrader_discord_redelivery_uses_canonical_signal_without_resubmitting(m
     monkeypatch.setattr(
         module, "save_live_signal", lambda _signal: (canonical_signal_id, False)
     )
+    # The request build runs before the dedupe save; this test is about the
+    # canonical-id recovery, not the wire request.
+    monkeypatch.setattr(
+        adapter, "_build_new_order_request", lambda _signal, *, symbol_id: object()
+    )
 
     async def _unexpected_send(*_args, **_kwargs):
         raise AssertionError("Discord redelivery submitted a second broker order")
@@ -3141,11 +3158,14 @@ def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch):
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     persisted_order_ids: list[tuple[str, str]] = []
+    persisted_stamps: list[tuple[Any, Any]] = []
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
         lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
-            persisted_order_ids.append((sid, oid)) or True
+            persisted_order_ids.append((sid, oid))
+            or persisted_stamps.append((submitted_at, acknowledged_at))
+            or True
         ),
     )
 
@@ -3181,6 +3201,61 @@ def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch):
     assert broker_order_id == "45678"
     assert persisted_order_ids == [(str(signal.id), "45678")]
     assert adapter._order_id_to_signal_id == {45678: str(signal.id)}
+    assert all(
+        isinstance(submitted, datetime) and isinstance(acknowledged, datetime)
+        for submitted, acknowledged in persisted_stamps
+    ), "submit/ack stamps must be real datetimes, not swallowed kwargs"
+
+
+def test_ctrader_request_build_refusal_persists_no_signal_row(monkeypatch):
+    """#337 cubic: a refusal while building the broker request (here: missing
+    SL/TP) must happen BEFORE ``save_live_signal`` - a persisted row would read
+    as "an order may exist" and route retries into recovery."""
+    module, adapter = _make_ctrader_adapter()
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id="dep-1",
+        symbol="EURUSD",
+        action="buy",
+        theoretical_price=1.1,
+        timestamp=datetime(2026, 7, 15, 10, 0, tzinfo=timezone.utc),
+        metadata={"qty": 1.0},  # no stop_loss / take_profit
+    )
+
+    saved: list[LiveSignal] = []
+    monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
+    monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
+    monkeypatch.setattr(
+        module,
+        "save_live_signal",
+        lambda saved_signal: saved.append(saved_signal) or (str(signal.id), True),
+    )
+    monkeypatch.setattr(adapter, "_resolve_order_volume", lambda _signal: 1.0)
+
+    class _NewOrderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+            self.symbolId = 0
+            self.orderType = 0
+            self.tradeSide = 0
+            self.volume = 0
+            self.timeInForce = 0
+            self.clientOrderId = ""
+            self.relativeStopLoss = 0
+            self.relativeTakeProfit = 0
+
+    adapter._ProtoOANewOrderReq = _NewOrderReq
+    adapter._ProtoOAOrderType = SimpleNamespace(MARKET=1)
+    adapter._ProtoOATradeSide = SimpleNamespace(BUY=1, SELL=2)
+    adapter._ProtoOATimeInForce = SimpleNamespace(IMMEDIATE_OR_CANCEL=1)
+
+    with pytest.raises(ValueError, match="without"):
+        asyncio.run(adapter.submit_order(signal, qty=1.0))
+
+    assert saved == []
 
 
 def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(monkeypatch):
@@ -3208,7 +3283,9 @@ def test_ctrader_accepted_order_fails_closed_when_local_id_persistence_fails(mon
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(module, "save_live_signal", lambda _signal: (str(signal.id), True))
     monkeypatch.setattr(
-        module, "set_live_signal_broker_order_id", lambda _sid, _order_id, **_kw: False
+        module,
+        "set_live_signal_broker_order_id",
+        lambda _sid, _order_id, *, submitted_at=None, acknowledged_at=None: False,
     )
 
     class _NewOrderReq:
@@ -4039,7 +4116,11 @@ def test_ctrader_submit_exit_only_uses_broker_position_request(monkeypatch) -> N
             saved_signals.append(saved_signal) or (signal_id, True)
         ),
     )
-    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda _sid, _oid, **_kw: True)
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda _sid, _oid, *, submitted_at=None, acknowledged_at=None: True,
+    )
     adapter._submit_new_order_request = _submit
 
     assert asyncio.run(adapter.submit_order(signal, qty=3.0)) == "901"
@@ -4081,7 +4162,11 @@ def test_ctrader_persisted_close_recovers_by_position_before_broker_requery(
         "get_live_signal_metadata",
         lambda _sid: {"risk_sizing_mode": "exit_only", "position_id": 77},
     )
-    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda _sid, _oid, **_kw: True)
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda _sid, _oid, *, submitted_at=None, acknowledged_at=None: True,
+    )
     monkeypatch.setattr(
         module,
         "save_live_signal",
@@ -4809,7 +4894,9 @@ def test_ctrader_adapter_treats_incoming_qty_as_binding(monkeypatch) -> None:
     monkeypatch.setattr(module, "get_live_signal_broker_order_id", lambda _sid: "")
     monkeypatch.setattr(module, "get_live_signal_timestamp", lambda _sid: None)
     monkeypatch.setattr(
-        module, "set_live_signal_broker_order_id", lambda _sid, _oid, **_kw: True
+        module,
+        "set_live_signal_broker_order_id",
+        lambda _sid, _oid, *, submitted_at=None, acknowledged_at=None: True,
     )
     volumes: list[int] = []
 
@@ -5174,7 +5261,11 @@ def _alpaca_bracket_adapter(monkeypatch):
         return str(signal.id), True
 
     monkeypatch.setattr(module, "save_live_signal", _save)
-    monkeypatch.setattr(module, "set_live_signal_broker_order_id", lambda sid, oid, **_kw: True)
+    monkeypatch.setattr(
+        module,
+        "set_live_signal_broker_order_id",
+        lambda sid, oid, *, submitted_at=None, acknowledged_at=None: True,
+    )
     return adapter, submitted, saved
 
 

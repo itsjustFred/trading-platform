@@ -1068,6 +1068,189 @@ def db_live_signal_quote_snapshot_fields_for_test(signal):
     return _live_signal_quote_snapshot_fields(signal.metadata)
 
 
+def _receipt_test_signal(receipt: str, *, with_source_stamp: bool):
+    from risk.models import TradeSignal
+
+    return TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "received_at": receipt,
+            "signal_timestamp": receipt,
+            "received_at_local": receipt,
+        },
+        received_at_local=receipt if with_source_stamp else None,
+    )
+
+
+def _receipt_deployment() -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        id=DEPLOYMENT,
+        strategy_name="demo",
+        account_id=ACCOUNT,
+        symbols=["EURUSD"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="discord",
+        signal_config={},
+        settings={"max_risk_per_trade": 0.01, "max_total_exposure": 0.05},
+    )
+
+
+def _prepare_with_advanced_wait(monkeypatch, trade_signal, deployment):
+    """Run the Discord prepare path with a wait that advances a fake clock."""
+    clock = {"now": datetime.now(timezone.utc)}
+    real_datetime = daemon.datetime
+
+    class _FakeDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    async def _wait_then_advance(_signal, _timeframe):
+        clock["now"] = clock["now"] + timedelta(hours=1)
+
+    monkeypatch.setattr(daemon, "datetime", _FakeDateTime)
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _wait_then_advance)
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    prepared = asyncio.run(
+        daemon._prepare_discord_signal_for_submission(
+            "acc-1",
+            deployment,
+            trade_signal,
+            signal_timeframe="1h",
+            wait_enabled=True,
+        )
+    )
+    return prepared, clock
+
+
+def test_discord_receipt_stamp_survives_candle_close_wait(db, monkeypatch) -> None:
+    """#337 blocker: ``message_received_at`` is the parse-time receipt stamp,
+    not the conversion time after ``wait_for_candle_close``."""
+    deployment = _receipt_deployment()
+    receipt = datetime.now(timezone.utc).isoformat()
+    trade_signal = _receipt_test_signal(receipt, with_source_stamp=True)
+
+    prepared, clock = _prepare_with_advanced_wait(monkeypatch, trade_signal, deployment)
+    assert prepared is not None
+    assert prepared.received_at_local == receipt
+    assert clock["now"] > datetime.fromisoformat(receipt)
+
+    live_signal = daemon._trade_signal_to_live_signal(prepared, deployment)
+    assert live_signal.metadata["received_at_local"] == receipt
+    db.save_live_signal(live_signal)
+    row = _signal_row(db, live_signal)
+    assert row.message_received_at.replace(tzinfo=timezone.utc) == datetime.fromisoformat(
+        receipt
+    )
+
+
+def test_prepare_stamps_receipt_at_first_contact_when_source_missing(
+    db, monkeypatch
+) -> None:
+    """A Discord-path signal without a source stamp is stamped when the daemon
+    first handles it - before the wait - not at conversion time."""
+    deployment = _receipt_deployment()
+    receipt = datetime.now(timezone.utc).isoformat()
+    trade_signal = _receipt_test_signal(receipt, with_source_stamp=False)
+    seen: dict[str, Any] = {}
+    clock = {"now": datetime.now(timezone.utc)}
+    real_datetime = daemon.datetime
+
+    class _FakeDateTime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    async def _wait_then_advance(_signal, _timeframe):
+        seen["stamp_during_wait"] = _signal.received_at_local
+        clock["now"] = clock["now"] + timedelta(hours=1)
+
+    monkeypatch.setattr(daemon, "datetime", _FakeDateTime)
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _wait_then_advance)
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+
+    prepared = asyncio.run(
+        daemon._prepare_discord_signal_for_submission(
+            "acc-1",
+            deployment,
+            trade_signal,
+            signal_timeframe="1h",
+            wait_enabled=True,
+        )
+    )
+    assert prepared is not None
+    assert prepared.received_at_local is not None
+    assert seen["stamp_during_wait"] == prepared.received_at_local
+
+    live_signal = daemon._trade_signal_to_live_signal(prepared, deployment)
+    assert live_signal.metadata["received_at_local"] == prepared.received_at_local
+
+
+def test_projection_exception_stores_nulls_and_warns(db, monkeypatch) -> None:
+    """#337 should-fix: the safety net must degrade to all-NULL columns, keep
+    ``save_live_signal`` succeeding, and log the exception - not just a bare
+    ``projection_failed`` marker."""
+    import logging
+
+    import shared.database as database_module
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("projection exploded")
+
+    monkeypatch.setattr(database_module, "_lift_optional_float", _boom)
+
+    records: list[logging.LogRecord] = []
+
+    class _Probe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("trading.database")
+    probe = _Probe()
+    logger.addHandler(probe)
+    try:
+        signal = _signal()
+        db.save_live_signal(signal)  # must not raise
+    finally:
+        logger.removeHandler(probe)
+
+    row = _signal_row(db, signal)
+    assert row.entry_quote_bid is None
+    assert row.entry_quote_ask is None
+    assert row.entry_quote_price is None
+    assert row.entry_quote_time is None
+    assert row.producer_at is None
+    assert row.message_received_at is None
+
+    warnings = [r for r in records if "projection failed" in r.getMessage()]
+    assert warnings, "projection failure was not logged"
+    assert any(r.exc_info and r.exc_info[0] is not None for r in warnings), (
+        "projection failure warning dropped the exception"
+    )
+
+
+def test_exit_fill_without_snapshot_is_not_flagged_missing(db) -> None:
+    """#337 nit: exits never pass the entry quote gate, so a missing snapshot
+    is expected - ``quote_snapshot_missing`` must be NULL, not True."""
+    signal = _signal(
+        metadata={"exit_only": True, "signal_intent": "exit"}, action="sell"
+    )
+    db.save_live_signal(signal)
+    db.save_live_execution(_execution(signal, price=99.8))
+
+    row = _serialized(db, signal)
+    assert row["quote_snapshot_missing"] is None
+    assert row["signal_delay_bps"] is None
+    assert row["execution_slippage_bps"] is None
+    assert row["spread_bps"] is None
+
+
 def test_refusal_log_precedes_rejection_persist(monkeypatch) -> None:
     """#337 should-fix: the operator-visible log must come before the
     rejection write, which is also bounded - a contended database can never
@@ -1123,3 +1306,37 @@ def test_refusal_log_precedes_rejection_persist(monkeypatch) -> None:
 
     assert events.index("log") < events.index("persist")
     assert events.index("persist") < events.index("persist-write")
+
+
+def test_rejection_persist_uses_one_shared_deadline(monkeypatch) -> None:
+    """#337 should-fix: the metadata check and the rejection write share one
+    deadline, so two slow lookups cannot hold the refusal path for 10s."""
+    import live_runner.daemon as daemon_mod
+    from tests.test_live_execution_safety import _deployment
+
+    deployment = _deployment()
+    live_signal = _signal(action="sell")
+    timeouts: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def _spy(awaitable, timeout):
+        timeouts.append(timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", _spy)
+    monkeypatch.setattr(
+        daemon_mod, "get_live_signal_metadata", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        daemon_mod, "save_live_signal_rejection", lambda *_a, **_k: True
+    )
+
+    asyncio.run(
+        daemon_mod._persist_submission_rejection(
+            deployment, live_signal, stage="test", exc=ValueError("nope")
+        )
+    )
+
+    assert len(timeouts) == 2
+    assert 0 < timeouts[0] <= 5.0
+    assert 0 < timeouts[1] <= timeouts[0]

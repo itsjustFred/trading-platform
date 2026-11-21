@@ -2463,12 +2463,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
                 self._resolve_order_volume(signal)
 
-            canonical_signal_id, created = await asyncio.to_thread(
-                save_live_signal, signal
-            )
-            if not created:
-                return await self._recover_duplicate_signal_order_id(canonical_signal_id)
-
+            # Build the broker request BEFORE persisting: a refusal here
+            # (unknown symbol, missing SL/TP) must not leave a live_signals
+            # row that reads as "an order may exist" and routes retries into
+            # the persisted-signal recovery path.
             symbol_id = await self._resolve_symbol_id(signal.symbol)
             if exit_only:
                 if position_id is None:
@@ -2479,6 +2477,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             else:
                 request = self._build_new_order_request(signal, symbol_id=symbol_id)
+
+            canonical_signal_id, created = await asyncio.to_thread(
+                save_live_signal, signal
+            )
+            if not created:
+                return await self._recover_duplicate_signal_order_id(canonical_signal_id)
         # #134: bracket the broker call with the order-timing stamps, persisted
         # with the order id once the broker answers.
         submitted_at = datetime.now(timezone.utc)
