@@ -155,7 +155,7 @@ results stop predicting live behaviour:
   failure on every pass and nothing is amended.
 - Real-money accounts are never amended: the loop only receives connected demo/paper adapters,
   the same hard block that applies to orders.
-**Verified on Alpaca paper (2026-11-16)**
+**Verified on Alpaca paper (2026-11-16, parts re-checked 2026-11-20)**
 
 Probe on a paper account (endpoint host checked as `paper-api.alpaca.markets`): 1 share of `F`
 as a market bracket entry (stop 3 % below, take profit 5 % above), then listings, a replace and a
@@ -166,12 +166,30 @@ clean-up.
   any open listing.** `AlpacaLiveAdapter.list_protective_stops` therefore also reads filled
   parents of symbols with an open position from a `status=all`, `nested=true` listing and takes
   their `held` stop legs (fixed in this PR; before it a real bracket position reported "no stop").
+- The same leg, on the same account and shape, is what the STOPPED sweeps have to cancel: the
+  flatten (`close_all_positions`) and the orphan-protection sweep (`cancel_orphaned_protections`)
+  now read the identical `status=all`, `nested=true` listing (scoped to the positions being
+  flattened, account-wide for the orphan sweep), the bounded page still fails closed, and a leg
+  in `pending_cancel` counts as resting (#245; before it the flatten returned
+  `orders-still-working ... NO-STOP-RESTORED` on every bracket position and an orphaned stop leg
+  could survive a stop). Cancelling one leg cancels the other at the broker, so a refused cancel
+  for an order the broker's own book no longer lists is excused - the second cancel of the pair
+  is that case, not a dropped cancel.
+- Paper check of #245 (2026-11-20, `ACC1`, endpoint host read as
+  `https://paper-api.alpaca.markets`, account `PA3FRGH7D9LI`, tiny order, nothing left behind after
+  the run). The filled-bracket shape could **not** be produced in that session: the equity market
+  was closed until the next Monday 09:30 ET, and the broker refuses both `bracket orders do not
+  support extended hours trading` (40310000) and crypto brackets (`crypto orders not allowed for
+  advanced order_class: otoco`). Verified live instead: both new requests (`status=all,
+  nested=true`, with and without `symbols`) are accepted and parsed against real alpaca-py
+  objects, a `held` leg under a *not yet filled* parent is correctly not treated as a protection
+  of a position, and the orphan sweep cancelled a resting bracket parent on a flat symbol and left
+  no working order and no position behind. The flatten and the stop restore on the recorded
+  (filled-parent) shape are pinned by `tests/test_alpaca_adapter.py`, which reproduces it. Re-run
+  the sweep check at the next regular session to confirm on the live shape.
 - `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
-- Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
-  `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
-  cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
 ## Strategy Promotion Gate (#165)
 
