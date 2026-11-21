@@ -1264,6 +1264,16 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     reread = body.index("moved=$(gh api")
     written = body.index("-F body=@body.md")
     assert reread < written, "the write does not happen under the re-read head"
+    # ... and that claim is only true if the re-read is the *last* thing the step does before the
+    # write. Both reads used to sit above the body assembly and the comment-list fetch, so the
+    # "window of the write itself" the comment swore to was the whole of that work - two API
+    # round trips wide - and a synchronize landing inside it was still written over. So the work
+    # that builds the write has to be *behind* the re-read, and a test that only compares the
+    # re-read with the write cannot see the difference.
+    for prepared in ("> body.md", "existing=$(gh api --paginate"):
+        assert body.index(prepared) < reread, (
+            f"the re-read does not gate the write: '{prepared}' runs after the head was last read"
+        )
     assert MARKER in body, "the poster carries no marker of its own"
     assert "gh api" in body, "the poster does not use the REST API"
     # A second comment carrying the marker (a duplicate from an interrupted run, or one
