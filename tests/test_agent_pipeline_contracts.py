@@ -1306,6 +1306,11 @@ def test_the_pre_mortem_marks_the_analysed_commit_pending_once() -> None:
         "the mark runs for every PR, including forks"
     )
     assert _all_run_bodies(data).count("state=pending") == 1, "more than one pending write"
+    # Its description is "Running": there is no result yet, so it names no analysed pair - which
+    # is why the header promises the pair on every *terminal* status description and not on this
+    # one. What it carries instead is the run computing it, so a reader of a pending status has
+    # somewhere to go.
+    assert '-f target_url="$RUN_URL"' in body, "the pending mark links no run"
 
 
 def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:

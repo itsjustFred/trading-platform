@@ -47,8 +47,13 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # SHA but does not overwrite the comment.
 #
 # Every result it writes names the diff it was computed against: the comment's
-# footer and every status description carry the analysed base and head, short so
-# they fit. A verdict is only current for its base...head pair, and both can move
+# footer and every terminal status description carry the analysed base and head,
+# short so they fit, and a description whose run never learned the base (a
+# cancelled resolve, or a dispatch) names the head alone rather than an empty
+# " on base ". The one status that names no diff is the `pending` mark "Mark
+# running" writes before there is a result: it links the run computing it instead,
+# which is the same thing at that point. A verdict is only current for its
+# base...head pair, and both can move
 # under it - a retarget (the trigger above), a base branch that advanced, or a
 # head that moved past the commit this run analysed - so a reader has to be able
 # to tell a stale verdict from the current one without opening the run log.
@@ -294,6 +299,8 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # The one status whose description names no analysed pair: there is no result yet, so it
+          # links the run that is computing it instead (see the header).
           gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
             -f state=pending -f context="$PREMORTEM_CONTEXT" -f description="Running" \
             -f target_url="$RUN_URL" > /dev/null
