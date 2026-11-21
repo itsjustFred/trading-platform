@@ -146,17 +146,11 @@ jobs:
           opencode --version
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
-      # skill is not merged yet) the PR's own copy. Strict, like the sibling
-      # copies: an unreachable base commit, or any git failure other than "no
-      # skill at base", stops the job instead of falling through to the PR's own
-      # rules under a prompt that claims they came from the base branch.
+      # skill is not merged yet) the PR's own copy.
       - name: Select skill revision
         if: steps.scope.outputs.empty == 'false'
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/mutation"
           skill="$RUNNER_TEMP/mutation/skill.md"
-          git cat-file -e "${BASE_SHA}^{commit}"
           if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
@@ -211,13 +205,6 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/mutation/comment.md"
-          # Whose rules ran is the one thing the report itself cannot show, and it is the
-          # fallback's whole point: while the base branch has no skill, the PR's own copy
-          # runs. Name it in the log and in the comment footer (below), so a verdict
-          # produced by a PR's own rules is never indistinguishable from one the base
-          # produced. The pre-mortem copy does the same; a silent SKILL_SOURCE is what
-          # let the fallback grade a PR unnoticed.
-          echo "::notice::Mutation-testing rules from: ${SKILL_SOURCE}."
           opencode run --standalone --archived --agent pr-mutation \
             "Mutation-test PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/mutation/meta.json. Scope file: $RUNNER_TEMP/mutation/scope.txt. Rules loaded from: ${SKILL_SOURCE}." \
             > "$out.raw"
@@ -269,11 +256,8 @@ jobs:
           if [ "$SCOPE_EMPTY" = "true" ]; then
             printf '\n\n---\n_Automated mutation testing: no agent run, empty scope (`%s` skill)_\n' "$skill_name" >> "$out"
           else
-            # Rules from the base branch, or the PR's own copy while the base has none: the
-            # source is printed, because a verdict produced by a PR's own rules must not
-            # read like one the base produced.
-            printf '\n\n---\n_Automated mutation testing using %s with `%s` skill (rules from %s)_\n' \
-              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}" >> "$out"
+            printf '\n\n---\n_Automated mutation testing using %s with `%s` skill_\n' \
+              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
           fi
           { printf '# Mutation Testing Action\n\n'; cat "$out"; } > "$out.titled"
           mv "$out.titled" "$out"

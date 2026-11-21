@@ -48,14 +48,15 @@ What is pinned here:
   already current;
 - the base-commit guard of the skill selection is asserted on its non-comment line, and a copy
   with that line commented out fails the assertion - the substring check it replaced passed with
-  the guard disabled in all three workflows at once;
-- each workflow prints whose rules ran, so a verdict produced by the PR's own skill copy (the
-  fallback while the base branch has none) is never indistinguishable from the base's;
+  the guard disabled in this workflow at once;
+- whose rules ran is printed by the pre-mortem, so a verdict produced by the PR's own skill copy
+  (the fallback while the base branch has none) is never indistinguishable from the base's - the
+  siblings are pinned by the PR that owns their hunks, which this PR no longer touches;
 - a manual rerun names a `head_sha` that is a full 40-hex SHA and one of that PR's own commits,
   so no rerun analyses a foreign diff or writes a verdict onto another PR's gate;
 - the free-model variables, the draft and fork skips and the read-only trust model follow the
   sibling workflows, whose comments swear to the same guards;
-- the duplicated guard blocks the workflows duplicate (summary-line extraction, fence strip,
+- the duplicated guard blocks the pre-mortem duplicates (summary-line extraction, fence strip,
   tree-clean check, the two-level skill selection) stay identical modulo the names each copy
   substitutes - the selection by a test of its own, which is the only way a copy that is not
   strict can fail it;
@@ -1459,23 +1460,6 @@ def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
     assert "${SKILL_SOURCE}" in body, "the footer is not filled from the skill-source variable"
 
 
-def test_the_sibling_comments_also_record_whose_rules_ran() -> None:
-    """The same gap the pre-mortem's test above pins, in its two siblings: they record
-    `SKILL_SOURCE` in their `$GITHUB_ENV`, hand it to the agent, and print nothing - a value
-    nothing reads. The fallback it records (the PR's own copy, used while the base branch has
-    no skill) is exactly the case a reader has to be able to see, so the siblings now say it in
-    the same two places: a notice in the run log, and the source in the comment footer. The
-    mutation copy's empty-scope footer is excluded by design: no agent ran, so no rules ran."""
-    for name in (REVIEW, MUTATION):
-        body = _job_bodies([_agent_job(_load(name))[1]])
-        assert re.search(r"::notice::[A-Za-z-]+ rules from: \$\{SKILL_SOURCE\}", body), (
-            f"{name}: the run log does not print whose rules ran"
-        )
-        assert "skill (rules from %s)" in body, (
-            f"{name}: the comment footer drops the rules' source"
-        )
-
-
 def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> None:
     """The rules come from the base branch, so a PR cannot weaken its own run; the PR's copy is
     used only while the base has none. A base commit that cannot be read must abort the step -
@@ -1488,11 +1472,11 @@ def test_skill_selection_refuses_an_unreachable_base_and_keeps_two_levels() -> N
     one, because deleting the standalone check on that reading would silently run the PR's own
     rules while the prompt says they came from the base branch.
 
-    The assertions are therefore scoped to the selection step of every copy, not to the agent
-    job as a whole: a base-commit check that lives in some other step (the mutation workflow's
-    scope step) leaves the selection itself able to fall through, which is how the two siblings
-    stayed non-strict while this test passed over them."""
-    for name in AGENT_WORKFLOWS:
+    The assertions are therefore scoped to the selection step of this workflow, not to the agent
+    job as a whole: a base-commit check that lives in some other step leaves the selection itself
+    able to fall through, which is how the two siblings stayed non-strict while a coarser test
+    passed over them - they are hardened, and pinned, by the PR that owns them."""
+    for name in (PREMORTEM,):
         job = _agent_job(_load(name))[1]
         body = _run(_find_step(job, r"^Select skill revision$"))
         # What the selection must contain is matched on its executable lines, not as a
@@ -1527,48 +1511,6 @@ def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
         failures = _strictness_failures(_selection_lines(job))
         assert any("unreachable base" in message for message in failures), (
             f"{name}: commenting the guard out does not fail the strictness check: {failures}"
-        )
-
-
-def test_the_skill_selection_stays_identical_across_the_copies() -> None:
-    """The two-level selection is duplicated in all three workflows, and it is the block that
-    decides whose rules ran. The pre-mortem's copy used to be the strict one and the siblings'
-    were not, and nothing compared the bodies - so the divergence that mattered most was the one
-    the "kept in sync" test never looked at. Here the three bodies are compared line by line
-    after the documented per-copy substitutions (the temp directory, the agent id, the stage and
-    the skill noun in the error line), so the next divergence fails here instead of silently
-    grading a PR under rules it may have weakened."""
-    substitutions = {
-        REVIEW: (("review skill", "<skill>"), ("pr-review", "<agent>"), ("review", "<stage>")),
-        MUTATION: (
-            ("mutation-testing skill", "<skill>"),
-            ("pr-mutation", "<agent>"),
-            ("mutation", "<stage>"),
-        ),
-        PREMORTEM: (
-            ("pre-mortem skill", "<skill>"),
-            ("pr-premortem", "<agent>"),
-            ("premortem", "<stage>"),
-        ),
-    }
-
-    def selection(name: str) -> list[str]:
-        step = _find_step(_agent_job(_load(name))[1], r"^Select skill revision$")
-        lines = []
-        for line in _run(step).splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):  # prose, not a selection line
-                continue
-            for old, new in substitutions[name]:
-                line = line.replace(old, new)
-            lines.append(line)
-        return lines
-
-    reference = selection(REVIEW)
-    assert reference, "parsed no selection lines out of the review workflow"
-    for other in (MUTATION, PREMORTEM):
-        assert selection(other) == reference, f"{other}: skill selection diverged:\n" + "\n".join(
-            selection(other)
         )
 
 
