@@ -1191,7 +1191,26 @@ def test_an_evidence_path_that_names_a_directory_is_refused(
     )
     status = _status(strategies_dir)
     assert not status.is_production
+    # Exactly that reason: opening it failed is reported with the exception's
+    # type name, and "not a regular file" is not an exception at all.
+    assert status.reason.endswith("is missing or unreadable")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
+def test_an_unreadable_evidence_file_reports_what_went_wrong(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """A file that exists but cannot be read keeps the cause the sibling keeps."""
+    record_promotion(_cli_args(tmp_path))
+    report = tmp_path / "parity.json"
+    report.chmod(0o000)
+    try:
+        status = _status(strategies_dir)
+    finally:
+        report.chmod(0o644)
+    assert not status.is_production
     assert "missing or unreadable" in status.reason
+    assert "PermissionError" in status.reason
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
