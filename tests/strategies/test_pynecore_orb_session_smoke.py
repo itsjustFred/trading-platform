@@ -23,13 +23,13 @@ import pandas as pd
 import pytest
 
 try:  # pytest collects this as part of the `tests` package
-    from tests.strategies.pyne_cli import pyne_bin, run_pyne
+    from tests.strategies.pyne_cli import TRADES_CSV, pyne_bin, run_pyne
 except ModuleNotFoundError:  # direct execution: python <this file>
     # Same reason as in `test_pynecore_orb_interval_guard.py`: the launcher at
     # the bottom runs this file directly, and only the script's own directory
     # lands on `sys.path`, so the absolute `tests.` import cannot resolve.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from tests.strategies.pyne_cli import pyne_bin, run_pyne
+    from tests.strategies.pyne_cli import TRADES_CSV, pyne_bin, run_pyne
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 STRATEGY_PATH = PROJECT_ROOT / "strategies" / "pynecore_orb" / "pynecore_orb.py"
@@ -80,7 +80,9 @@ def _bars(path: Path, days: list[list[tuple[float, float, float, float]]]) -> No
 def _run(bars: Path, workdir: Path) -> list[dict[str, str]]:
     result = run_pyne(STRATEGY_PATH, bars, workdir)
     assert result.returncode == 0, result.stderr[-2000:]
-    with (workdir / "trades.csv").open(newline="") as handle:
+    # The harness owns the path (it is what the CLI was told to write); read it
+    # through the same constant rather than spelling the name twice.
+    with (workdir / TRADES_CSV).open(newline="") as handle:
         return list(csv.DictReader(handle))
 
 
