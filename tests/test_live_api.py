@@ -444,6 +444,121 @@ def test_live_dashboard_endpoint_returns_telemetry(monkeypatch):
     assert payload["active_strategies"][0]["capital_allocation"] == 1.0
 
 
+def _dashboard_fixture(monkeypatch, viewer_main_module, deployment) -> None:
+    """The stubs `get_live_dashboard` needs, so a conflict read is the only variable."""
+    account = LiveAccountConfig(id=str(deployment.account_id), broker="alpaca", name="acct")
+    monkeypatch.setattr(viewer_main_module, "_seed_default_live_accounts", lambda: None)
+    monkeypatch.setattr(viewer_main_module, "list_live_accounts", lambda: [account])
+    monkeypatch.setattr(viewer_main_module, "list_live_deployments", lambda: [deployment])
+    monkeypatch.setattr(
+        viewer_main_module,
+        "_live_account_stats_payload",
+        lambda _account_id: {
+            "account_id": _account_id,
+            "current_equity": 10000.0,
+            "current_balance": 9900.0,
+            "total_trades": 1,
+            "total_pnl": 25.0,
+        },
+    )
+
+    async def _fake_trades(_account_id):
+        return {"account_id": _account_id, "deployment_ids": [], "trades": []}
+
+    monkeypatch.setattr(viewer_main_module, "_live_trades_payload", _fake_trades)
+
+
+def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatch):
+    """#126: the conflict is an API fact, not just a log line an operator has to find."""
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    conflict = {
+        "signal_id": "11111111-1111-1111-1111-111111111111",
+        "deployment_id": str(deployment.id),
+        "symbol": "AAPL",
+        "broker_order_id": "BRK-AAA",
+        "conflicting_broker_order_ids": ["BRK-BBB"],
+    }
+    monkeypatch.setattr(
+        viewer_main_module,
+        "list_live_deployments",
+        lambda: [deployment, LiveDeploymentConfig(
+            id="66666666-6666-6666-6666-666666666666",
+            strategy_name="other",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="ACTIVE",
+        )],
+    )
+    monkeypatch.setattr(
+        viewer_main_module,
+        "deployments_with_broker_order_conflicts",
+        lambda: {str(deployment.id): [conflict]},
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = client.get("/api/live/deployments").json()
+
+    halted = payload[0]
+    assert halted["broker_order_conflicts"] == [conflict]
+    assert halted["halted_for_broker_order_conflict"] is True
+    # A deployment with no conflict is not reported as halted for one, and a conflict
+    # alone does not imply a halt: an ACTIVE one is a conflict about to be halted.
+    assert payload[1]["broker_order_conflicts"] == []
+    assert payload[1]["halted_for_broker_order_conflict"] is False
+
+
+def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):
+    """The dashboard lists ACTIVE rows only, so a halted conflict would be invisible."""
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    _dashboard_fixture(monkeypatch, viewer_main_module, deployment)
+    monkeypatch.setattr(
+        viewer_main_module,
+        "deployments_with_broker_order_conflicts",
+        lambda: {
+            str(deployment.id): [
+                {
+                    "signal_id": "11111111-1111-1111-1111-111111111111",
+                    "deployment_id": str(deployment.id),
+                    "symbol": "AAPL",
+                    "broker_order_id": "BRK-AAA",
+                    "conflicting_broker_order_ids": ["BRK-BBB"],
+                }
+            ]
+        },
+    )
+
+    client = TestClient(viewer_main_module.app)
+    payload = client.get("/api/live/dashboard").json()
+
+    conflicts = payload["broker_order_conflicts"]
+    assert conflicts["status"] == "error"
+    assert conflicts["deployment_ids"] == [str(deployment.id)]
+    assert conflicts["conflicts"][0]["conflicting_broker_order_ids"] == ["BRK-BBB"]
+    assert conflicts["truncated"] is False
+    # The halted deployment is not in `active_strategies` (it is not ACTIVE), which is
+    # exactly why the conflict is reported on its own.
+    assert payload["active_strategies"] == []
+
+
 def test_ctrader_top5_endpoint_dry_run(monkeypatch):
     import viewer.main as viewer_main_module
 

@@ -100,6 +100,7 @@ from shared.database import (
     delete_backtest,
     delete_live_deployment,
     delete_service,
+    deployments_with_broker_order_conflicts,
     ensure_live_account,
     get_background_task_record,
     get_latest_live_balances,
@@ -5219,7 +5220,44 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
     }
 
 
-def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
+#: How many conflicting signals one deployment's payload may carry before the viewer
+#: truncates the list. The halt is binary; the ids are the evidence an operator needs
+#: to reconcile, so the cap is generous and states itself when it bites.
+MAX_BROKER_ORDER_CONFLICT_ROWS = 20
+
+
+def _broker_order_conflict_health() -> dict[str, Any]:
+    """Fleet-wide unresolved broker order id conflicts (#126), for the dashboard.
+
+    Same read as :func:`live_runner.broker_order_conflicts.check_broker_order_conflicts`,
+    kept here because the payload caps how many rows it carries: the daemon loop wants
+    every one, a dashboard wants the shape of the problem.
+    """
+    grouped = deployments_with_broker_order_conflicts()
+    conflicts = [conflict for rows in grouped.values() for conflict in rows]
+    return {
+        "status": "error" if conflicts else "ok",
+        "deployment_ids": sorted(grouped),
+        "conflicts": conflicts[:MAX_BROKER_ORDER_CONFLICT_ROWS],
+        "truncated": len(conflicts) > MAX_BROKER_ORDER_CONFLICT_ROWS,
+    }
+
+
+def _serialize_live_deployment_payload(
+    deployment: LiveDeploymentConfig,
+    broker_order_conflicts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Serialize one deployment for the API.
+
+    ``broker_order_conflicts`` are this deployment's unresolved broker order id
+    conflicts (#126), already grouped for it by the caller, or ``None`` when the
+    caller did not read them. A deployment that is not ACTIVE *and* carries a
+    conflict is reported as ``halted_for_broker_order_conflict``: that is the
+    answer to "why is this paused" for a pause the operator did not set, and it
+    is what the operator needs to see before they resume anything. Callers that
+    did not read the conflicts pass the rows as an empty list rather than
+    ``None`` when they want the key to be decisive.
+    """
     # STOPPED is a request, not a fact. The daemon marks
     # `stopped_enforced_at` only after a *complete* cancel-and-flatten sweep, so
     # a STOPPED row without that stamp still has exposure at the broker. The
@@ -5229,6 +5267,10 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
     exposure_may_be_open = (
         str(deployment.status or "").strip().upper() == "STOPPED"
         and stopped_enforced_at is None
+    )
+    conflicts = list(broker_order_conflicts or [])
+    halted_for_conflict = bool(conflicts) and (
+        str(deployment.status or "").strip().upper() != "ACTIVE"
     )
     payload = {
         "id": str(deployment.id),
@@ -5241,6 +5283,10 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
             stopped_enforced_at.isoformat() if stopped_enforced_at is not None else None
         ),
         "exposure_may_be_open": exposure_may_be_open,
+        # (#126) broker order ids recorded as conflicting for this deployment's
+        # signals: a broker order may exist that the ledger does not track.
+        "broker_order_conflicts": conflicts,
+        "halted_for_broker_order_conflict": halted_for_conflict,
         "signal_source_type": deployment.signal_source_type,
         "signal_source_id": deployment.signal_source_id,
         "symbol_filter": deployment.symbol_filter,
@@ -13227,8 +13273,16 @@ async def _resolve_live_deployment_signal_source(
 @app.get(LIVE_DEPLOYMENTS_PATH)
 async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
-    deployments = await asyncio.to_thread(list_live_deployments)
-    return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
+    deployments, conflicts_by_deployment = await asyncio.gather(
+        asyncio.to_thread(list_live_deployments),
+        asyncio.to_thread(deployments_with_broker_order_conflicts),
+    )
+    return [
+        _serialize_live_deployment_payload(
+            deployment, conflicts_by_deployment.get(str(deployment.id))
+        )
+        for deployment in deployments
+    ]
 
 
 @app.get("/api/live/dashboard")
@@ -13245,6 +13299,9 @@ async def get_live_dashboard() -> dict[str, Any]:
     active_deployments = [
         deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
     ]
+    conflicts_by_deployment = await asyncio.to_thread(
+        deployments_with_broker_order_conflicts
+    )
 
     # Fetch stats and trades for all accounts concurrently instead of
     # serially awaiting a full stats+trades scan per account.
@@ -13257,6 +13314,9 @@ async def get_live_dashboard() -> dict[str, Any]:
     trades_payloads = await asyncio.gather(
         *(_live_trades_payload(account.id) for account in accounts)
     )
+    # Read once for the whole dashboard: the conflict ledger is fleet-wide state, not
+    # per-account state (#126).
+    conflict_health = await asyncio.to_thread(_broker_order_conflict_health)
 
     for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
@@ -13289,17 +13349,25 @@ async def get_live_dashboard() -> dict[str, Any]:
         )
         active_strategies.append(
             {
-                **_serialize_live_deployment_payload(deployment),
+                **_serialize_live_deployment_payload(
+                    deployment,
+                    conflicts_by_deployment.get(str(deployment.id)),
+                ),
                 "capital_allocation": round(allocation, 6),
                 "account_equity": round(account_equity, 2),
             }
         )
 
-    recent_fills.sort(key=lambda item: str(item.get("execution_timestamp") or ""), reverse=True)
+        recent_fills.sort(key=lambda item: str(item.get("execution_timestamp") or ""), reverse=True)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "accounts": account_payloads,
         "active_strategies": active_strategies,
+        # (#126) Fleet health for the one failure a dashboard of ACTIVE rows cannot
+        # show: a deployment halted because a duplicate live signal carried a broker
+        # order id the ledger does not track is not in `active_strategies` at all, so
+        # the conflict has to be reported on its own or the halt is invisible.
+        "broker_order_conflicts": conflict_health,
         "capital": {
             "total_equity": round(total_equity, 2),
             "active_account_count": len(account_payloads),
