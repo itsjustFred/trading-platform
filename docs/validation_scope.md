@@ -42,7 +42,7 @@
 2. XLSX-Reports enthalten mindestens Orders- und Trades/Deals-Tabellen mit den benötigten Spalten.
 3. Interne `BacktestResult`-Objekte können aus dem Vergleichs-Runner oder einer Datei geladen werden.
 4. Zeitzonen werden soweit möglich normalisiert (ISO 8601 UTC); bei fehlender Zeitzoneninfo wird Broker-Serverzeit angenommen.
-5. Commission/Swap sind in MT5-Reports optional oder 0 (Demo); sie werden in `raw_metadata` abgelegt, blockieren den Import aber nicht.
+5. Commission/Swap sind in MT5-Reports optional oder 0 (Demo); die rohen MT5-Werte (mit Vorzeichen) liegen pro Trade in `Trade.meta.commission` / `Trade.meta.swap`, die normalisierten Kosten in `Trade.fees` (positiv = Kosten, negativ = Netto-Swap-Gutschrift). `raw_metadata` trägt die report-level Metadaten (Kopf-Block, `position_fills`-Evidence) und blockiert den Import nicht. Siehe Regel 5 in `docs/mt5_xlsx_schema.md`.
 
 ---
 
