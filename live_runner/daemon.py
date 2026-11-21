@@ -3164,30 +3164,9 @@ async def _dispatch_discord_trade_signal(
     # against broker identity, not the local account id.
     account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
-        # Classified per deployment, not once for the fan-out: a plain SELL closes on a
-        # deployment that cannot short and is a short entry on one that can (#121), so a
-        # single answer here would drop a close on one of them (#126 decision).
-        try:
-            signal_is_exit = _signal_is_exit(
-                trade_signal.action, trade_signal.metadata, deployment
-            )
-        except ValueError:
-            # Same refusal as the wait-boolean one above, and the same shape: a config
-            # that cannot be read must not fall through to a sibling deployment, so this
-            # drops the signal for the whole channel.
-            logger.exception(
-                "Invalid deployment boolean config; skipping deployment",
-                extra={
-                    "data": {
-                        "account_id": account_id,
-                        "deployment_id": str(deployment.id),
-                        "strategy_name": deployment.strategy_name,
-                    }
-                },
-            )
-            return
-        if not _deployment_can_dispatch(deployment, is_exit=signal_is_exit):
-            continue
+        # The cheap, deployment-local filters first: they need only this deployment's
+        # own configuration, so a deployment that cannot be selected for this signal at
+        # all is never asked for the settings that decide its exit classification.
         if not _deployment_matches_stockkit_route(
             deployment,
             trade_signal.metadata,
@@ -3211,13 +3190,40 @@ async def _dispatch_discord_trade_signal(
                 },
             )
             continue
+        # Classified per deployment, not once for the fan-out: a plain SELL closes on a
+        # deployment that cannot short and is a short entry on one that can (#121), so a
+        # single answer here would drop a close on one of them (#126 decision).
+        try:
+            signal_is_exit = _signal_is_exit(
+                trade_signal.action, trade_signal.metadata, deployment
+            )
+        except ValueError:
+            # A config this deployment cannot read costs *this* deployment only. Returning
+            # here would drop the signal for every other deployment on the channel -
+            # including their closes, which is the money path (#311 review: an unparseable
+            # `allow_short` on a deployment that is not even on this symbol used to stop
+            # a valid sibling's close).
+            logger.exception(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "strategy_name": deployment.strategy_name,
+                    }
+                },
+            )
+            continue
+        if not _deployment_can_dispatch(deployment, is_exit=signal_is_exit):
+            continue
 
         try:
             wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
         except ValueError:
             # A typo'd boolean must skip the deployment, not kill the listener
             # loop or other deployments on the same account. It also must not
-            # default into immediate market orders.
+            # default into immediate market orders. Same shape as the
+            # classification refusal above: `continue`, never `return`.
             logger.exception(
                 "Invalid deployment boolean config; skipping deployment",
                 extra={
@@ -3227,7 +3233,7 @@ async def _dispatch_discord_trade_signal(
                     }
                 },
             )
-            return
+            continue
 
         dispatched_to_any = True
         await _submit_normalized_discord_signal(
