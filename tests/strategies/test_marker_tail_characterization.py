@@ -7,12 +7,16 @@ copy-pasted across ~17 strategy files; it is being extracted into one shared
 helper (``shared.strategy_markers``) as a pure refactor.
 
 These tests pin the FULL ``generate_signals`` output — entry/exit bar
-indices, the exact ``drawings`` list and a SHA-256 over a canonical
-serialization of ``indicators_dict`` — on deterministic synthetic frames, so
-the extraction cannot silently change a single strategy's output. The
-expected values in ``tests/fixtures/strategy_marker_tail/expected_outputs.json``
-were captured from the pre-refactor implementations; they must keep matching
-byte-for-byte after the helper lands.
+indices, the exact ``drawings`` list and the canonical ``indicators_dict``
+payload — on deterministic synthetic frames, so the extraction cannot
+silently change a single strategy's output. The expected values in
+``tests/fixtures/strategy_marker_tail/expected_outputs.json`` and
+``tests/fixtures/strategy_marker_tail/indicators/`` were captured from the
+pre-refactor implementations; they must keep matching after the helper
+lands. Indicator floats are compared element-wise with an explicit
+relative tolerance (``_compare_canonical``): cross-arch SIMD/ULP drift —
+amplified by cancellation on near-zero values — made a bit-exact hash
+platform-dependent (green on aarch64, red on ubuntu x86_64 CI).
 
 No market data is required: every frame is synthetic and ``post_vix_dip_buy``
 gets its VIX series monkeypatched (it is fail-closed without one).
@@ -20,9 +24,9 @@ gets its VIX series monkeypatched (it is fail-closed without one).
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +41,7 @@ FIXTURE_PATH = (
     / "strategy_marker_tail"
     / "expected_outputs.json"
 )
+INDICATORS_FIXTURE_DIR = FIXTURE_PATH.parent / "indicators"
 
 
 def _load_strategy_module(relative: str, name: str):
@@ -300,18 +305,20 @@ def _cases() -> dict:
 
 
 def _canon_float(x):
-    """Canonical float for hashing: NaN -> None, else 10 significant digits.
+    """Canonical float for comparison: NaN -> None, else the value itself.
 
-    Indicator math (rolling/EWM kernels) legitimately differs in the last
-    ULP across CPU architectures and SIMD paths, so a bit-exact float repr
-    made this hash platform-dependent — green on aarch64, red on ubuntu
-    x86_64 CI — while pinning nothing real. Rounding to 10 significant
-    digits absorbs ULP drift and still fails on any genuine value change.
+    Indicator math (rolling/EWM kernels, MACD histograms built by
+    subtraction) legitimately differs in the last ULPs across CPU
+    architectures and SIMD paths — and cancellation can amplify that into
+    a >1e-10 *relative* difference on near-zero values, which no fixed
+    decimal precision survives. The expected payloads are therefore stored
+    at full precision and compared element-wise with an explicit relative
+    tolerance (``_compare_canonical``) instead of a bit-exact hash.
     """
     if isinstance(x, float):
         if np.isnan(x):
             return None
-        return float(f"{x:.10g}")
+        return x
     return x
 
 
@@ -334,11 +341,58 @@ def _canon(value):
     return value
 
 
-def _indicators_sha256(indicators: dict) -> str:
-    payload = json.dumps(
-        _canon(dict(indicators)), sort_keys=True, default=str
-    )
-    return hashlib.sha256(payload.encode()).hexdigest()
+def _canonical_payload(indicators: dict):
+    """JSON-native canonical form of ``indicators_dict`` (fixture storage)."""
+    return json.loads(json.dumps(_canon(dict(indicators)), sort_keys=True, default=str))
+
+
+# Cross-arch float drift is a handful of ULPs amplified by cancellation;
+# 1e-7 relative is ~9 orders of magnitude above that noise floor while
+# still failing on any change a strategy refactor could meaningfully make
+# (entries/exits/drawings remain bit-exact regardless).
+_INDICATORS_REL_TOL = 1e-7
+_INDICATORS_ABS_TOL = 1e-9
+
+
+def _compare_canonical(expected, actual, path: str = "$") -> list[str]:
+    """Deep-compare two canonical payloads; returns mismatch descriptions."""
+    mismatches: list[str] = []
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        if set(expected) != set(actual):
+            mismatches.append(
+                f"{path}: key sets differ "
+                f"(missing={sorted(set(expected) - set(actual))[:5]}, "
+                f"extra={sorted(set(actual) - set(expected))[:5]})"
+            )
+            return mismatches
+        for key in expected:
+            mismatches.extend(
+                _compare_canonical(expected[key], actual[key], f"{path}.{key}")
+            )
+        return mismatches
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            mismatches.append(f"{path}: length {len(expected)} != {len(actual)}")
+            return mismatches
+        for i, (e, a) in enumerate(zip(expected, actual)):
+            mismatches.extend(_compare_canonical(e, a, f"{path}[{i}]"))
+            if len(mismatches) >= 10:
+                return mismatches
+        return mismatches
+    if (
+        isinstance(expected, float)
+        and isinstance(actual, float)
+        and math.isfinite(expected)
+        and math.isfinite(actual)
+    ):
+        if not math.isclose(
+            expected, actual, rel_tol=_INDICATORS_REL_TOL, abs_tol=_INDICATORS_ABS_TOL
+        ):
+            mismatches.append(f"{path}: {expected!r} != {actual!r}")
+        return mismatches
+    if expected != actual:
+        mismatches.append(f"{path}: {expected!r} != {actual!r}")
+    return mismatches
 
 
 @pytest.fixture(scope="module")
@@ -346,13 +400,23 @@ def expected() -> dict:
     return json.loads(FIXTURE_PATH.read_text())
 
 
+@pytest.fixture(scope="module")
+def expected_indicators() -> dict:
+    """Per-strategy canonical ``indicators_dict`` payloads (pre-refactor)."""
+    return {
+        path.stem: json.loads(path.read_text())
+        for path in sorted(INDICATORS_FIXTURE_DIR.glob("*.json"))
+    }
+
+
 @pytest.mark.parametrize("strategy", sorted(_cases()))
-def test_strategy_output_matches_pre_refactor_golden(strategy, expected):
+def test_strategy_output_matches_pre_refactor_golden(strategy, expected, expected_indicators):
     """generate_signals output must be identical before/after the tail refactor.
 
-    Compares the exact entry/exit bar indices, the full drawings list and a
-    SHA-256 over the canonical indicators serialization against values
-    captured from the pre-refactor code.
+    Compares the exact entry/exit bar indices, the full drawings list and the
+    canonical ``indicators_dict`` payload (element-wise, float-tolerant —
+    see ``_compare_canonical``) against values captured from the
+    pre-refactor code.
     """
     frame_builder, params, needs_vix = _cases()[strategy]
     module = _load_strategy_module(
@@ -380,8 +444,11 @@ def test_strategy_output_matches_pre_refactor_golden(strategy, expected):
     assert json.dumps(drawings) == json.dumps(exp["drawings"]), (
         f"{strategy}: drawings changed"
     )
-    assert _indicators_sha256(indicators) == exp["indicators_sha256"], (
-        f"{strategy}: indicators_dict changed"
+    mismatches = _compare_canonical(
+        expected_indicators[strategy], _canonical_payload(indicators)
+    )
+    assert not mismatches, (
+        f"{strategy}: indicators_dict changed\n" + "\n".join(mismatches[:10])
     )
 
 
@@ -418,8 +485,10 @@ _MIXED_TS_EXPECTED = {
             "text": "Exit",
         },
     ],
-    "indicators_sha256": "3a07247f348b48b91a808f0b89200dd87e549f3460b99ca004b24a65d7d78714",
 }
+
+
+_MIXED_TS_INDICATORS_FIXTURE = INDICATORS_FIXTURE_DIR / "trend_following_mixed_ts.json"
 
 
 def test_mixed_format_string_timestamps_match_pre_refactor():
@@ -440,4 +509,10 @@ def test_mixed_format_string_timestamps_match_pre_refactor():
     assert [int(i) for i in entries[entries].index.tolist()] == exp["entries"]
     assert [int(i) for i in exits[exits].index.tolist()] == exp["exits"]
     assert json.dumps(drawings) == json.dumps(exp["drawings"])
-    assert _indicators_sha256(indicators) == exp["indicators_sha256"]
+    expected_indicators = json.loads(_MIXED_TS_INDICATORS_FIXTURE.read_text())
+    mismatches = _compare_canonical(
+        expected_indicators, _canonical_payload(indicators)
+    )
+    assert not mismatches, "mixed-ts indicators_dict changed\n" + "\n".join(
+        mismatches[:10]
+    )
