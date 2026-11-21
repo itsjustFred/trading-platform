@@ -748,15 +748,16 @@ def _record_problem(
         return "the promotion record is dated in the future"
     unbound = evidence.missing_evidence_paths()
     if unbound:
-        # Written before #260: the evidence files were named but not recorded,
-        # so nothing can be re-verified. Refused until it is recorded again.
+        # Written before #260: the evidence was named (result_file / report_file)
+        # but its path was not recorded, so nothing can be re-verified. Refused
+        # until the promotion is recorded again.
         return (
             "the record does not name the file(s) its evidence was read from "
             f"({', '.join(unbound)}); record the promotion again with the current CLI"
         )
     file_problems = evidence.file_problems()
     if file_problems:
-        return "the recorded evidence files changed: " + "; ".join(file_problems)
+        return "the recorded evidence files no longer match: " + "; ".join(file_problems)
     problems = evidence.problems(
         thresholds,
         kind=kind,
