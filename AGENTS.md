@@ -17,7 +17,7 @@ The suite never touches the repo's `data/`: `tests/conftest.py` forces `DATA_DIR
 
 ## Lint and type checking
 
-Ruff and mypy are configured in `pyproject.toml` (`[tool.ruff.lint]`, `[tool.mypy]`). Install the tooling with `uv sync --extra dev` (both tools are dev dependencies) and run, from the repo root:
+Ruff and mypy are configured in `pyproject.toml` (`[tool.ruff.lint]`, `[tool.mypy]`). Install the tooling with `uv sync --frozen --extra dev` (both tools are dev dependencies; `--frozen` keeps the local environment on the committed `uv.lock`, which is what CI checks out, so a run cannot quietly re-resolve a different mypy or ruff) and run, from the repo root:
 
 ```
 uv run ruff check <changed files>

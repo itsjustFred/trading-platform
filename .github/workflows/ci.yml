@@ -62,8 +62,9 @@ jobs:
         if: runner.os == 'Linux'
         # mypy is a dev dependency (`uv sync` installs it) and pinned there to
         # 2.4.1, so this is the same interpreter the developer gets from
-        # `uv sync --extra dev && uv run mypy`: no --with overlay, no second
-        # copy of the type-checker, and a version bump is one lock change.
+        # `uv sync --frozen --extra dev && uv run mypy` (AGENTS.md): no --with
+        # overlay, no second copy of the type-checker, and a version bump is one
+        # lock change.
         run: uv run --no-sync --no-build mypy
       - name: Tests
         if: runner.os == 'Linux'

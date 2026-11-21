@@ -1256,20 +1256,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     )
                 return float(stop_loss), float("nan")
             return float("nan"), float("nan")
+        # `missing` handled every None above: it either raised or returned, so
+        # both are prices here. Re-stated as a check rather than a suppression:
+        # mypy cannot correlate the `missing` scan with the loop below or with
+        # the return, and an explicit refusal keeps the invariant visible (and
+        # fails closed with a message instead of a TypeError) if the control
+        # flow above is ever reordered.
+        if stop_loss is None or take_profit is None:
+            raise ValueError(
+                "Refusing to submit Alpaca order with a missing level "
+                f"(signal_id={signal.id}, symbol={signal.symbol}); "
+                "opening an unbounded position is not allowed."
+            )
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
-            # `missing` above already raised or returned for every None, so this
-            # is unreachable today; it is stated rather than ignored so the
-            # arithmetic below type-checks without a suppression.
-            if value is None:
-                continue
             if math.isnan(value) or math.isinf(value) or value <= 0:
                 raise ValueError(
                     f"Invalid {name} price for {signal.symbol}: {value!r}; "
                     "refusing to submit."
                 )
-        # The `missing` scan drained both of None (raise, then early return), so
-        # these are prices; mypy cannot correlate that scan with this return.
-        return float(stop_loss), float(take_profit)  # type: ignore[arg-type]
+        return float(stop_loss), float(take_profit)
 
     def _normalize_bracket_entry(self, signal: LiveSignal, qty: float) -> tuple[LiveSignal, float]:
         """Bring an entry onto the grid Alpaca accepts for bracket/OTO orders.

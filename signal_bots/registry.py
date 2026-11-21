@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar
 
+import pandas as pd
 import yaml
 
 _BOT_CONFIG_FILE = "config.yaml"
@@ -34,7 +35,7 @@ class SignalProcessor(Protocol):
     """
 
     def process_signal(
-        self, raw_signal: dict[str, Any], market_data: Any
+        self, raw_signal: dict[str, Any], market_data: pd.DataFrame
     ) -> TradeSignal: ...
 
 
