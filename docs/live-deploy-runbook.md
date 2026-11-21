@@ -201,6 +201,22 @@ clean-up.
   cancel that left the leg resting is *not* reported as `pending_cancel` here, unlike the
   entry-cancel sweep: the daemon gates the STOPPED stamp on this sweep being `complete`, and
   `pending_cancel` does not make an outcome incomplete, so it would be read as a clean sweep.)
+- That verification is scoped to the symbols the sweep cancelled, and the scope is those
+  symbols however many cancels it took to clear them - both legs of one orphaned bracket, or two
+  brackets on one symbol, do not widen it, because the daemon runs this sweep every sync tick
+  and retries while it is incomplete, so two 20-page nested scans per pass is what turns a long
+  order history into a rate limit. Only an id whose symbol could not be resolved falls back to
+  account-wide, because that id names no bound.
+- The flatten places a held leg by the parent it rests under, in both its cancel list and its
+  cancel verification: a leg that arrives without a symbol of its own is still on the symbol
+  being flattened. Read as "another symbol" it survives the cancel, its stop keeps reserving the
+  position's quantity, and the close is then refused for that reservation - a flatten that cannot
+  finish. A leg whose parent names another symbol is still left out.
+- A stop is not restored onto a working book nobody could re-read. That re-read is what proves
+  no stop still works, and it is also the part that can fail now that the held-leg lookup is
+  paged; restoring anyway places a second stop beside whatever the broker kept, and two stops
+  reduce a position twice - the extra one an orphan the moment the first fills. The position is
+  then unprotected until the next enforcement retry, which the sweep reports.
 - The excusal is settled by one read of the order by id, not by re-listing the working book: a
   terminal state already proves the order is not resting, and the book is the page-limited
   nested history - up to 20 requests of 500 rows - so a sweep with several refused cancels on a
@@ -221,7 +237,8 @@ clean-up.
   take-profit leg takes the stop leg with it, and both then read back by id as `canceled`. The
   run left no working order and no position behind. The flatten and the stop restore on the
   recorded (filled-parent) shape are pinned by `tests/test_alpaca_adapter.py`, which reproduces
-  it. Re-run the sweep check at the next regular session to confirm on the live shape.
+  it. Re-run the sweep check at the next regular session to confirm on the live shape
+  (tracked in #322).
 - `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
