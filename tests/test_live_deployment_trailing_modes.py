@@ -66,11 +66,13 @@ def _deployment(
 
 
 def _check(deployment: LiveDeploymentConfig, *, broker: str = "alpaca") -> None:
+    """Run the deployment-validation gate the way the stages that know the
+    broker do: with the deployment's resolved signal timeframe."""
     validate_live_deployment_trailing_mode(
         deployment,
         context="test",
         broker=broker,
-        timeframe=deployment.timeframe,
+        timeframe=deployment.signal_timeframe,
     )
 
 
@@ -198,6 +200,36 @@ def test_every_stage_resolves_a_blank_timeframe_override_the_same_way() -> None:
         trailing_stops_module._signal_timeframe(deployment),
     )
     assert resolvers == ("5m", "5m", "5m", "5m")
+
+
+def test_a_signal_config_timeframe_override_wins_over_the_deployment_timeframe(
+    monkeypatch,
+) -> None:
+    """The resolver must read the deployment's own signal timeframe, not the
+    strategy's: a ``1d`` override on a ``5m`` deployment is unservable."""
+    _bot_defaulting_to(monkeypatch, trailing_mode="percent", trailing_percent=0.02)
+    deployment = _deployment(
+        {"signal_processor": "ramjet", "timeframe": "1d"}, timeframe="5m"
+    )
+    from live_runner.config_parser import _signal_timeframe as yaml_signal_timeframe
+
+    assert deployment.signal_timeframe == "1d"
+    assert yaml_signal_timeframe(deployment) == "1d"
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        _check(deployment, broker="alpaca")
+
+
+def test_signal_config_processor_wins_over_a_settings_processor(monkeypatch) -> None:
+    """The deployment's own ``signal_config`` names the processor that runs; a
+    stale ``settings`` copy must not decide which bot config is checked."""
+    _bot_defaulting_to(monkeypatch, **_FLIP_OVERRIDES)
+    deployment = _deployment({"signal_processor": "ramjet"})
+    # RocketFuel declares no trailing mode, so answering with it would pass.
+    deployment.settings = {"signal_processor": "rocketfuel_longsonly"}
+
+    assert deployment.signal_processor_name == "ramjet"
+    with pytest.raises(ValueError, match="supertrend_flip"):
+        _check(deployment, broker="alpaca")
 
 
 def test_an_explicit_override_is_left_to_the_override_check(monkeypatch) -> None:
