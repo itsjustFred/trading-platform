@@ -2828,8 +2828,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             result = stop()
                             if inspect.isawaitable(result):
                                 await result
-                    except Exception:  # except-kind: loop-survival
-                        pass
+                    except Exception as exc:  # except-kind: loop-survival
+                        logger.warning(
+                            "Alpaca trading stream stop failed during disconnect",
+                            extra={"data": {"error": str(exc)}},
+                        )
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 30)
             else:

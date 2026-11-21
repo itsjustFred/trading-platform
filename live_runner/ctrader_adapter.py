@@ -180,6 +180,10 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
+#: pending broker reconciliation instead of letting it sleep out the 30 s
+#: ``queue.get`` timeout. Never a real execution payload.
+_EXECUTION_RECONCILE_WAKE = object()
 
 
 def _power_of_ten_exponent(value: int) -> int:
@@ -1177,6 +1181,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if payload_type == self._execution_payload_type:
                 self._reconciliation_required = True
                 self._reconciliation_retry_at = 0.0
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
             return
 
@@ -1189,6 +1195,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._execution_queue.put_nowait(payload)
             except asyncio.QueueFull:
                 self._reconciliation_required = True
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
                 logger.warning(
                     "cTrader execution queue is full; broker reconciliation required"
                 )
@@ -1466,8 +1474,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_name_to_id = symbol_name_to_id
         self._symbol_assets = symbol_assets
         # #80: broker-API symbol properties (digits/lotSize/minVolume) are the
-        # source of truth for per-symbol scales. Best-effort: the light list
-        # above stays authoritative for ids when the detail fetch fails.
+        # source of truth for per-symbol scales. Required: a failed or
+        # unexpected detail fetch aborts authentication rather than letting
+        # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
 
@@ -1511,7 +1520,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             raise
         if not isinstance(detail_res, ProtoOASymbolByIdRes):
-            return
+            raise RuntimeError(
+                f"Unexpected symbol-props response: {type(detail_res).__name__}; "
+                "refusing to authenticate with fallback scales."
+            )
         # Archived entries first so live properties always win on collision.
         for detail in list(getattr(detail_res, "archivedSymbol", [])) + list(detail_res.symbol):
             try:
@@ -3845,6 +3857,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 await self._run_pending_reconciliation(backoff_seconds)
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
+                if event is _EXECUTION_RECONCILE_WAKE:
+                    continue
                 await self._persist_execution_event(event)
                 self._ack_execution_event(event)
                 backoff_seconds = 2

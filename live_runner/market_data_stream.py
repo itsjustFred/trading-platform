@@ -170,11 +170,27 @@ class _StreamWorker:
                         }
                     },
                 )
-                self.stream = self._create_stream()
-                with self._lock:
-                    symbols = sorted(self._symbols)
-                if symbols:
-                    self._subscribe_symbols(symbols)
+                try:
+                    self.stream = self._create_stream()
+                    with self._lock:
+                        symbols = sorted(self._symbols)
+                    if symbols:
+                        self._subscribe_symbols(symbols)
+                except Exception as setup_exc:  # except-kind: loop-survival
+                    # A failed reconnect must not kill the worker: the next
+                    # pass retries stream.run()/recreate on the backoff below.
+                    logger.warning(
+                        "Alpaca market data stream reconnect setup failed, retrying",
+                        extra={
+                            "data": {
+                                "kind": self.kind,
+                                "paper": self.paper,
+                                "error": str(setup_exc),
+                                "retry_in_seconds": backoff,
+                            }
+                        },
+                    )
+                    self.stream = None
                 import time
 
                 time.sleep(backoff)

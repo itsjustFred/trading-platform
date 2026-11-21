@@ -7,12 +7,12 @@ Every `except Exception`, bare `except`, and `except BaseException` in `live_run
 
 `tests/live_runner/test_except_classification.py` fails when a broad handler in `live_runner/` lacks a valid marker.
 
-Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, and #323 are classified here but intentionally left unchanged; the status column marks them `after PR #N`.
+Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, and #323 are classified here but intentionally left unchanged; the `Current behavior` column marks them `no — after PR #N` (#274, #277).
 
 | File | Line | Handler | Kind | Current behavior |
 |---|---:|---|---|---|
 | `live_runner/account_discovery.py` | 495 | `_message_to_debug_fields` | loop survival (log and continue) | yes — debug fallback only |
-| `live_runner/account_discovery.py` | 727 | `_request_ctrader_account_detail` | loop survival (log and continue) | yes — optional detail, host errors still propagate |
+| `live_runner/account_discovery.py` | 727 | `_request_ctrader_account_detail` | loop survival (log and continue) | yes — optional detail enrichment; on failure `ctx.balance` keeps its current value (0.0 until trader details load), host errors still propagate |
 | `live_runner/account_discovery.py` | 856 | `_build_ctrader_live_account` | loop survival (log and continue) | yes — discovery enrichment, not an order path |
 | `live_runner/account_discovery.py` | 921 | `discover_ctrader_accounts` | loop survival (log and continue) | yes — per-host continue |
 | `live_runner/account_discovery.py` | 983 | `discover_configured_accounts` | loop survival (log and continue) | yes — per-credential-block skip |
@@ -89,10 +89,10 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/preflight.py` | 737 | `_crash_redaction` | money decision (must fail closed) | yes — type-only crash message |
 | `live_runner/preflight.py` | 813 | `main` | money decision (must fail closed) | yes — failed result, exit 1 |
 | `live_runner/promotion.py` | 291 | `strategy_target` | money decision (must fail closed) | yes — PromotionTargetError |
-| `live_runner/signal_sources/discord_source.py` | 1605 | `_set_service_status` | loop survival (log and continue) | yes — status write best-effort |
-| `live_runner/signal_sources/discord_source.py` | 2052 | `_prime_cursors` | loop survival (log and continue) | yes — per-channel continue |
-| `live_runner/signal_sources/discord_source.py` | 2111 | `_poll_loop` | loop survival (log and continue) | yes — per-channel continue |
-| `live_runner/signal_sources/discord_source.py` | 2165 | `connect` | loop survival (log and continue) | yes — background loop + FAILED status |
+| `live_runner/signal_sources/discord_source.py` | 1606 | `_set_service_status` | loop survival (log and continue) | yes — status write best-effort |
+| `live_runner/signal_sources/discord_source.py` | 2053 | `_prime_cursors` | loop survival (log and continue) | yes — per-channel continue |
+| `live_runner/signal_sources/discord_source.py` | 2112 | `_poll_loop` | loop survival (log and continue) | yes — per-channel continue |
+| `live_runner/signal_sources/discord_source.py` | 2166 | `connect` | loop survival (log and continue) | yes — background loop + FAILED status |
 | `live_runner/trailing_stops.py` | 111 | `adapter_live_trailing_modes` | money decision (must fail closed) | yes — none only |
 | `live_runner/trailing_stops.py` | 129 | `adapter_live_trailing_timeframes` | money decision (must fail closed) | yes — empty set |
 | `live_runner/trailing_stops.py` | 296 | `run_once` | money decision (must fail closed) | yes — outage recorded, stops unchanged |

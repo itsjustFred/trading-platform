@@ -10,10 +10,14 @@ MARKER_RE = re.compile(r"#\s*except-kind:\s*([A-Za-z-]+)")
 def _is_broad_except(handler: ast.ExceptHandler) -> bool:
     if handler.type is None:
         return True
-    return isinstance(handler.type, ast.Name) and handler.type.id in {
-        "Exception",
-        "BaseException",
-    }
+    # `except (Exception, X)` and `except builtins.Exception` are broad too.
+    candidates = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    for node in candidates:
+        if isinstance(node, ast.Name) and node.id in {"Exception", "BaseException"}:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in {"Exception", "BaseException"}:
+            return True
+    return False
 
 
 def _broad_handlers(path: Path) -> list[ast.ExceptHandler]:
