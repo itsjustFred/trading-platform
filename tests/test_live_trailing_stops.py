@@ -228,6 +228,17 @@ def _warnings(monkeypatch) -> list[dict]:
     return logged
 
 
+def _infos(monkeypatch) -> list[str]:
+    """Every INFO message the trailing loop logs."""
+    logged: list[str] = []
+    monkeypatch.setattr(
+        trailing_stops.logger,
+        "info",
+        lambda message, *a, **kw: logged.append(str(message)),
+    )
+    return logged
+
+
 # ── the trail itself ─────────────────────────────────────────────────────────
 
 
@@ -1427,6 +1438,101 @@ def test_an_oversized_stop_is_not_a_failure_and_does_not_block_the_next_pass(
     assert trail.outage.failures == 0
     assert trail.outage.given_up is False
     assert manager._schedules[ACCOUNT].retry_at is None
+
+
+def test_a_failure_run_does_not_outlive_the_pause_it_was_recorded_before(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    """The pause must not import a stale failure run into the resumed trail.
+
+    The skip is not a failure, so it ends the failure run like any other
+    successful pass. Leaving the run alive would make the first failure after
+    the resize look like the fortieth minute of an outage: one transient
+    refusal would give the position up on the spot, with a CRITICAL alert,
+    long after the failure that started the run.
+    """
+    _warnings(monkeypatch)
+    live.client.replace_error = RuntimeError("422 the amendment was refused")
+    manager = LiveTrailingStopManager()
+
+    # One transient amendment failure before the partial exit.
+    live.feed(manager, [103.0])
+    trail = manager._trails[(ACCOUNT, "AAPL")]
+    first_failure_at = trail.outage.first_failure_at
+    assert trail.outage.failures == 1
+
+    # The stop is left at the entry quantity, so the trail is paused for longer
+    # than the give-up window measured from that first failure.
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    live.tick(manager, T0 + timedelta(minutes=30))
+    live.tick(manager, T0 + timedelta(minutes=42, seconds=2))
+    assert live.client.stop_prices() == [98.0]
+    assert trail.outage.failures == 0
+    assert trail.outage.first_failure_at is None
+
+    # The stop is resized to the quantity held and the first pass after the
+    # pause fails once: that failure starts a run of its own.
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.closes.append(104.0)
+    live.tick(manager, T0 + timedelta(minutes=43, seconds=2))
+
+    assert trail.outage.failures == 1
+    assert trail.outage.first_failure_at == T0 + timedelta(minutes=43, seconds=2)
+    assert trail.outage.first_failure_at != first_failure_at
+    assert trail.outage.given_up is False
+    assert [message for message, _ in surfaced] == [
+        "Live trailing stop could not be updated; the previous broker-side stop stays in "
+        "force and the update is retried"
+    ] * 2
+
+
+def test_the_pause_resumes_a_trail_that_was_already_given_up_on(
+    live: _Live, surfaced, monkeypatch
+) -> None:
+    """A given-up outage is cleared by the pause, not probed through it.
+
+    The skip is a pass that reached the broker and found a state an operator
+    can fix, so it counts as a success: without that, a position given up on
+    before a partial exit stays given up while the stop is oversized, and the
+    trail only comes back when the 15-minute probe finally lands after the
+    stop has already been resized by hand.
+    """
+    infos = _infos(monkeypatch)
+    live.client.replace_error = RuntimeError("422 the amendment was refused")
+    manager = LiveTrailingStopManager()
+
+    # Forty-one minutes of refusals: the outage is given up on (CRITICAL).
+    live.closes = [103.0] * 41
+    live.tick(manager, T0 + timedelta(minutes=41, seconds=2))
+    live.closes.append(104.0)
+    live.tick(manager, T0 + timedelta(minutes=82, seconds=2))
+    trail = manager._trails[(ACCOUNT, "AAPL")]
+    assert trail.outage.given_up is True
+    assert any("given up" in message for message, _ in surfaced)
+
+    # The partial exit leaves the stop oversized; the next pass (the probe that
+    # is now due) ends the outage instead of failing through it.
+    live.client.positions = [_FakePosition("AAPL", 6)]
+    live.tick(manager, T0 + timedelta(minutes=97, seconds=2))
+    assert trail.outage.given_up is False
+    assert trail.outage.failures == 0
+    assert trail.outage.next_probe_at is None
+    assert list(infos) == ["Live trailing stop resumed after a given-up failure recovered"]
+
+    # Resized by hand: the trail resumes without any further probe delay.
+    live.client.replace_error = None
+    live.client.orders = [
+        _FakeOrder("stop-1+", "AAPL", "sell", order_type="stop", qty=6, stop_price=98.0),
+        _FakeOrder("tp-1", "AAPL", "sell", qty=10),
+    ]
+    live.tick(manager, T0 + timedelta(minutes=98, seconds=2))
+
+    assert live.client.replace_calls[-1] == ("stop-1+", 102.96)
+    assert live.client.stop_prices() == [102.96]
+    assert trail.outage.given_up is False
 
 
 def test_the_trail_resumes_and_catches_up_once_the_stop_matches_the_position(

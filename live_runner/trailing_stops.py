@@ -631,6 +631,14 @@ class LiveTrailingStopManager:
             # replace, so nothing is sent to the broker. Not a failure: no
             # retry, no alert, and no bar is consumed, so the trail catches up
             # on every close it skipped once the stop matches the position.
+            # The pass itself did work — the broker's positions and stops were
+            # read — so it ends a failure run like any other successful pass.
+            # Skipping that would let a run recorded before the pause survive
+            # into the resumed trail, where the first failure after the resize
+            # is measured against a first failure from hours earlier and gives
+            # the position up on the spot (and a given-up outage would stay
+            # given up through a pause only an operator can end).
+            self._resume(trail.outage, context)
             return False
 
         get_market_data = self._market_data_source(adapter, timeframe)
