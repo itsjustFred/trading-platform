@@ -42,6 +42,15 @@ def test_platform_constants_resolve_outside_the_repo_data_dir() -> None:
         assert not _is_under(Path(path), REPO_DATA_DIR), f"{name} points into the repo data dir"
 
 
+def test_portfolio_optimizer_resolves_optimizations_dir_from_data_dir() -> None:
+    """Issue #315: portfolio_optimizer must not hardcode ``<repo>/data/optimizations``."""
+    import runner.portfolio_optimizer as portfolio_optimizer
+    import shared.constants as constants
+
+    assert portfolio_optimizer.OPTIMIZATIONS_DIR == constants.OPTIMIZATIONS_DIR
+    assert not _is_under(portfolio_optimizer.OPTIMIZATIONS_DIR, REPO_DATA_DIR)
+
+
 def test_env_data_dir_is_the_conftest_session_dir() -> None:
     """Forced, not ``setdefault``: a production DATA_DIR exported in the shell must not survive."""
     assert Path(os.environ["DATA_DIR"]).resolve() == suite_conftest.TEST_DATA_DIR
