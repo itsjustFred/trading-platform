@@ -45,14 +45,33 @@ parent Cleanup 16 record.
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
   treat both spellings as the same event class.
 - Level aliases: `take_profit` and `tp_price` are two spellings of the SAME
-  plain take-profit level (as `stop_loss`/`sl_price` are one stop). Native
-  resolves the pair once: the canonical spelling (`take_profit`, `stop_loss`)
-  wins when a row carries both, the alias order `risk.live.resolve_live_levels`,
-  the validation comparison and the vectorbt indicator lookup already use
-  (#237). One alias pair must never become two levels — both would be named
-  `tp`, share the `tp_pct` fill fraction and, through the last level's
-  remaining-quantity rule, over-allocate the position to take-profit exits.
-  Numbered levels (`tp1`, `tp2`, … with `tpN_pct` fractions) are unaffected.
+  plain take-profit level (as `stop_loss`/`sl_price` are one stop). Both engines
+  resolve the pair once, and both use the canonical-first order
+  `risk.live.resolve_live_levels`, the validation comparison and the engine
+  resolvers use (#237): when a row carries both, `take_profit` wins and
+  `tp_price` is the fallback when it is absent, null or unusable. Native
+  resolves it inside `TradeEngine._extract_levels`; vectorbt resolves it in
+  `_find_indicator_series`, where the alias spellings are scanned
+  canonical-first so the winner never depends on the order the strategy
+  published them in. One alias pair must never become two levels: both would
+  be named `tp`, so the row's single intended level filled as two take-profit
+  legs that shared the `tp_pct` fraction, and the phantom candidate also took
+  a share of the default `1/n` split (an explicit `tpN_pct` fraction is keyed
+  by level name, so only the default denominator of the numbered levels
+  changes).
+- Unusable take-profit price: a level whose price is non-numeric, non-finite
+  or `<= 0` arms no level in either engine. Live refuses the whole signal
+  instead (`resolve_live_levels` raises, see `docs/live-risk-consistency.md`),
+  so neither engine books a take-profit the market cannot price: a LONG level
+  of `0` is reached by every bar. The stop pair is validated only by live —
+  the stop feeds position sizing, so an engine-side refusal would change risk,
+  not just exits.
+- Last level rule: the LAST pending take-profit level takes the position's
+  remaining quantity, so a ladder closes the position instead of leaving a
+  dust remainder, and a single level closes the whole position (the same
+  outcome a single live bracket order produces). A `fraction` below 1 on the
+  last level therefore does not keep part of the position open; a strategy
+  that wants a remainder held past its last level needs a later signal exit.
 - Vectorbt has no bar-loop position model: protective levels are resolved on
   the entry bar and enforced through the intrabar walk (§3). Without intrabar
   data, exits happen on the scheduled signal exit and the levels are recorded

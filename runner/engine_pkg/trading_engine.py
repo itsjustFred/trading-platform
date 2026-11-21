@@ -215,9 +215,13 @@ class TradeEngine:
         # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
         # comparison/extraction helpers) — and the winner must not depend on
         # the signal frame's column order. Appending one candidate per column
-        # made two levels named "tp" for one intended level, so the single
-        # take-profit the row describes filled as two legs that shared the
-        # "tp_pct" fraction.
+        # made two levels named "tp" for the one intended level, so the row's
+        # single take-profit filled as two legs (each at the price its own
+        # spelling carried, both sharing the "tp_pct" fraction) and the
+        # phantom candidate also took a share of the default 1/n split.
+        # A lone level still closes the whole position: the last pending level
+        # takes the remaining quantity (see ``_check_stops``), which is the
+        # live bracket convention — a fraction below 1 does not leave a rest.
         # (rank, price): 0 = canonical take_profit, 1 = tp_price alias.
         plain_tp: tuple[int, float] | None = None
         for key in row.index:
@@ -1163,6 +1167,14 @@ class TradeEngine:
                     fraction = float(level.get("fraction", 0.0))
                     qty = position.quantity * fraction
                     if level is pending_tp[-1]:
+                        # The last pending level takes whatever is left, so a
+                        # ladder closes the position instead of leaving a dust
+                        # remainder (and a lone level closes the whole
+                        # position, the way a live bracket order does). A
+                        # strategy that wants to keep part of the position
+                        # open past its last level needs a later signal exit;
+                        # honouring a lone level's fraction instead is left to
+                        # a maintainer decision (see #276).
                         qty = position.remaining_qty
 
                     self._close_partial(

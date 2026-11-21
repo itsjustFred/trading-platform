@@ -530,8 +530,10 @@ def test_native_engine_ignores_non_decimal_tp_suffix_columns():
 def test_native_engine_collapses_take_profit_alias_into_a_single_level():
     """A row carrying both spellings of the plain TP must yield one level (#237).
 
-    Two "tp" levels would both read the ``tp_pct`` fraction, so a 50% exit
-    fraction closed the whole position at the take-profit level.
+    Two "tp" levels both read the ``tp_pct`` fraction, so one intended level
+    filled as two take-profit legs. The single level this resolves to keeps
+    that fraction; what the fill does with it is pinned by
+    ``test_native_engine_single_take_profit_level_closes_the_whole_position``.
     """
     engine = _engine()
     row = pd.Series(
@@ -612,7 +614,7 @@ def test_native_engine_take_profit_alias_fills_one_take_profit_level():
     with conflicting prices (``take_profit`` 105, ``tp_price`` 112). The
     duplicate made the engine arm two levels, so bar 2 closed half the
     position at 105 and the rest at 112 — two take-profit legs for one
-    intended level.
+    intended level. The collapsed level fills once, at the canonical price.
     """
     engine = _engine()
     frame = pd.DataFrame(
@@ -809,3 +811,60 @@ def test_native_engine_fixed_risk_amount_never_arms_a_take_profit_at_zero():
     assert len(take_profit_exits) == 1
     assert take_profit_exits[0].price == pytest.approx(112.0)
     assert all(leg.price > 0 for leg in trade.exits), "no leg may fill at price 0"
+
+
+def test_native_engine_single_take_profit_level_closes_the_whole_position():
+    """Characterisation (#237 follow-up): the last pending level flattens.
+
+    The reviewed PR body claimed that collapsing the alias pair stopped a
+    ``tp_pct=0.5`` take-profit from closing the whole position. It does not:
+    the fill loop gives the LAST pending level the remaining quantity, so a
+    lone level — whatever its fraction — closes the position, exactly like the
+    single bracket order a broker holds for it.
+
+    This pins what the engine does so the claim cannot drift again. Making a
+    lone level honour its fraction (and leave the remainder for a later signal
+    exit) is a plain behaviour change to the exit convention, so it is left to
+    a maintainer decision rather than smuggled into the alias fix.
+    """
+    engine = _engine()
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01 00:00",
+                    "2024-01-01 00:01",
+                    "2024-01-01 00:02",
+                    "2024-01-01 00:03",
+                ],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 105.0, 105.0],
+            "high": [100.5, 101.5, 112.5, 105.5],
+            "low": [99.5, 100.5, 104.5, 104.5],
+            "close": [100.0, 101.0, 105.0, 105.0],
+        }
+    )
+
+    def strategy(df, params):
+        index = df.index
+        entries = pd.Series([True, False, False, False], index=index)
+        exits = pd.Series([False, False, False, True], index=index)
+        indicators = {
+            "direction": pd.Series(["LONG", None, None, None], index=index, dtype=object),
+            "stop_loss": pd.Series([95.0, None, None, None], index=index, dtype=object),
+            "take_profit": pd.Series([112.0, None, None, None], index=index, dtype=object),
+            "tp_pct": pd.Series([0.5, None, None, None], index=index, dtype=object),
+        }
+        return entries, exits, indicators, []
+
+    result = engine.run(frame, strategy)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1
+    # The whole position, not the 50 % the fraction asked for.
+    assert take_profit_exits[0].price == pytest.approx(112.0)
+    assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)
+    assert trade.exits[-1].reason == "tp", "the position is flat after the take-profit"

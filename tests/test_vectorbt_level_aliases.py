@@ -128,6 +128,49 @@ def _intrabar_frame() -> pd.DataFrame:
     )
 
 
+def _unusable_take_profit_strategy_text() -> str:
+    """A canonical take-profit no bar can reach, plus the usable alias price."""
+    rungs = 24
+    return (
+        "import pandas as pd\n"
+        "STRATEGY_META = {'name': 'vbt_tp_unusable', 'version': '1.0'}\n"
+        "def generate_signals(df, params):\n"
+        "    n = len(df)\n"
+        "    entries = pd.Series([i == 0 for i in range(n)], index=df.index)\n"
+        "    exits = pd.Series([i == n - 1 for i in range(n)], index=df.index)\n"
+        "    direction = pd.Series(['LONG'] + [None] * (n - 1), index=df.index, dtype=object)\n"
+        "    take_profit = pd.Series([float('inf'), None, None], index=df.index, dtype=object)\n"
+        "    tp_price = pd.Series([110.0, None, None], index=df.index, dtype=object)\n"
+        "    return entries, exits, {'direction': direction, 'take_profit': take_profit, 'tp_price': tp_price}\n"
+    )
+
+
+@pytest.fixture
+def unusable_tp_env(tmp_path: Path):
+    _write_shared_ohlcv(tmp_path, "VBA", _frame())
+    _write_shared_ohlcv(tmp_path, "VBA", _intrabar_frame(), timeframe="5m")
+    path = tmp_path / "vbt_tp_unusable.py"
+    path.write_text(_unusable_take_profit_strategy_text())
+    return tmp_path, str(path)
+
+
+class TestUnusableTakeProfitPrice:
+    """A level price no bar can reach is not a level, in either engine."""
+
+    def test_non_finite_take_profit_falls_back_to_the_usable_alias(
+        self, unusable_tp_env
+    ) -> None:
+        tmp_path, strategy_path = unusable_tp_env
+
+        result = VectorbtAdapter().run(_config(tmp_path, strategy_path), strategy_path)
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exits, "the usable take-profit level must fill"
+        assert trade.exits[0].price == pytest.approx(110.0)
+        assert trade.meta["tp_price"] == pytest.approx(110.0)
+
+
 def _alias_strategy_text(*, alias_first: bool) -> str:
     """One take-profit level published under both spellings, conflicting prices.
 

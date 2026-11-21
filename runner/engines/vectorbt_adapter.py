@@ -390,7 +390,6 @@ def _process_symbol(
     # intrabar stop — exit detection keeps using the real stop_loss series.
     sizing_stop_series = _find_sizing_stop_series(execution_signals, execution_indicators)
     sizing_basis_series = sizing_stop_series if sizing_stop_series is not None else stop_loss_series
-    take_profit_series = _find_take_profit_series(execution_signals, execution_indicators)
     entry_stop_series = _find_entry_stop_series(execution_signals, execution_indicators)
     atr_series = _find_atr_series(execution_signals, execution_indicators)
     direction_series = _find_direction_series(execution_signals, execution_indicators)
@@ -461,7 +460,9 @@ def _process_symbol(
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
-            take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
+            take_profit_price = _resolve_take_profit_price(
+                execution_signals, execution_indicators, entry_idx
+            )
             risk_target_usd: float | None = None
             stop_distance: float | None = None
             max_position_exposure_pct: float | None = None
@@ -1467,6 +1468,49 @@ def _resolve_level_value(series: pd.Series | None, idx: int) -> float | None:
     return numeric
 
 
+def _usable_take_profit_value(series: pd.Series | None, idx: int) -> float | None:
+    """One spelling's take-profit value at ``idx``, or ``None`` when unusable.
+
+    Mirrors ``TradeEngine._armable_take_profit``: live refuses a
+    present-but-unusable level (non-numeric, non-finite or ``<= 0``) rather
+    than trading it, and a LONG take-profit of ``0`` is reached by every bar
+    (``bar_high >= 0``), so neither engine may arm one (#237).
+    """
+    if series is None:
+        return None
+    value = series.iloc[idx]
+    if pd.isna(value):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or numeric <= 0:
+        return None
+    return numeric
+
+
+def _resolve_take_profit_price(
+    signals: pd.DataFrame, indicators: IndicatorMap, idx: int
+) -> float | None:
+    """The take-profit price for one entry bar, canonical alias spelling first.
+
+    Same resolution as ``TradeEngine._extract_levels``: a spelling whose value
+    is not usable is not a level, and the fallback spelling supplies the price
+    instead (#237). A signals-frame column wins over an indicator series, as in
+    ``_find_indicator_series``.
+    """
+    for alias in _LEVEL_ALIASES["take_profit"]:
+        if alias in signals.columns:
+            series: pd.Series | None = signals[alias]
+        else:
+            series = _find_alias_indicator_series(indicators, "entry", alias)
+        price = _usable_take_profit_value(series, idx)
+        if price is not None:
+            return price
+    return None
+
+
 def _resolve_stop_distance(
     entry_idx: int,
     entry_price: float,
@@ -1711,6 +1755,14 @@ def _extract_trade_meta(
         trade_meta[meta_key] = serialized
         if meta_key == "sl_price":
             trade_meta.setdefault("sl_price", serialized)
+
+    # The reported take-profit level is the one the engine resolved, never the
+    # shadowed alias spelling and never a price that could not be armed (#237).
+    resolved_take_profit = _resolve_take_profit_price(signals, indicators, entry_idx)
+    if resolved_take_profit is not None:
+        trade_meta["tp_price"] = resolved_take_profit
+    else:
+        trade_meta.pop("tp_price", None)
 
     return trade_meta
 
