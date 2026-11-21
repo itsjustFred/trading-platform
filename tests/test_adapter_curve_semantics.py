@@ -144,7 +144,9 @@ class TestNativeCurveExitOrder:
         symbol_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "OVL"
         symbol_dir.mkdir(parents=True)
         _overlap_frame().to_parquet(symbol_dir / "1h.parquet", index=False)
-        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
+        config = BacktestConfig(
+            risk_per_trade_pct=0.01,
+            parameters={"fees": "zero", "slippage": "none"},
             strategy_name="overlap_curve",
             symbols=["OVL"],
             timeframe="1h",
