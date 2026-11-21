@@ -10,17 +10,36 @@ all explicit, all derived from code, never from a user-supplied string.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Protocol, TypeVar
 
 import yaml
 
 _BOT_CONFIG_FILE = "config.yaml"
 
+from risk.models import TradeSignal
 from signal_bots.nitro import NitroSignalProcessor
 from signal_bots.ramjet import RamJetSignalProcessor
 from signal_bots.rocketfuel import RocketFuelSignalProcessor
 
-SignalProcessorFactory = Callable[[dict[str, Any]], object]
+
+class SignalProcessor(Protocol):
+    """What a registered signal processor must expose.
+
+    The registry builds one of several heterogeneous bot classes from that
+    bot's own config file, so the static type of :func:`get_signal_processor`
+    is this protocol rather than a concrete class: callers only ever turn a raw
+    signal plus OHLCV into a :class:`~risk.models.TradeSignal`, and the protocol
+    states exactly that contract (which an ``-> object`` return cannot, leaving
+    the live path to ignore the attribute it depends on).
+    """
+
+    def process_signal(
+        self, raw_signal: dict[str, Any], market_data: Any
+    ) -> TradeSignal: ...
+
+
+SignalProcessorFactory = Callable[[dict[str, Any]], SignalProcessor]
+
 
 _ROOT = Path(__file__).resolve().parent
 CONFIG_FILENAME = "config.yaml"
@@ -42,6 +61,8 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+#: What a bot factory builds. Kept generic so each `_build_<bot>` still returns
+#: its own concrete processor class instead of widening to `object`.
 _ProcessorT = TypeVar("_ProcessorT")
 
 
@@ -207,7 +228,7 @@ def list_signal_processor_options() -> list[dict[str, str]]:
     return [dict(item) for item in SIGNAL_PROCESSOR_OPTIONS]
 
 
-def get_signal_processor(name: str, config: dict[str, Any] | None = None) -> object:
+def get_signal_processor(name: str, config: dict[str, Any] | None = None) -> SignalProcessor:
     normalized = str(name or "").strip().lower()
     factory = SIGNAL_PROCESSORS.get(normalized)
     if factory is None:

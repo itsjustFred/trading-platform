@@ -66,6 +66,10 @@ dev = [
     "pytest-timeout>=2.3.1,<3",
     "httpx>=0.27.0,<1",
     "ruff>=0.3,<1",
+    # Pinned exactly so a local run type-checks with the same mypy as the CI
+    # "Type check (mypy)" step. A range here would let a new mypy release break
+    # the gate (or start passing locally) without a deliberate bump.
+    "mypy==2.4.1",
 ]
 all = ["trading-platform[vectorbt,lean,jforex,pynecore,ctrader,dev]"]
 

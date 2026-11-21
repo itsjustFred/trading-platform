@@ -101,6 +101,37 @@ def test_the_written_artifact_carries_the_same_stamp() -> None:
 
     payload = json.loads(written.getvalue())
     assert payload["generated_at"] == module.overview["generated_at"]
-    # What the consumer file carries parses; the dropped-tzinfo mutant
-    # ("+00:00Z") and the old naive form both fail this parse.
+    # Only the two-offset form ("+00:00Z") fails this parse. `fromisoformat`
+    # has read a terminal "Z" as UTC since 3.11, so the retired naive
+    # `utcnow().isoformat() + "Z"` produced the very same string and is NOT
+    # rejected here; the clock that stamp came from is pinned by
+    # `test_the_stamp_comes_from_utc_not_the_machine_clock` below.
     datetime.fromisoformat(payload["generated_at"])
+
+
+def test_the_stamp_comes_from_utc_not_the_machine_clock() -> None:
+    """The wall clock behind ``generated_at`` is UTC, not the machine's.
+
+    The retired form (``datetime.utcnow().isoformat() + "Z"``) yields the same
+    string the aware form yields on a UTC machine, and every assertion about the
+    stamp itself therefore accepts both - which is why this pins the clock the
+    generator asks for: ``datetime.now`` must be handed UTC, never the local
+    zone and never nothing. A naive ``utcnow()`` never calls ``now`` at all, and
+    a local ``datetime.now()`` calls it with no zone, so neither passes.
+    """
+    seen: list[object] = []
+
+    class _RecordingDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            seen.append(tz)
+            return datetime(2026, 11, 20, 22, 13, 5, tzinfo=tz)
+
+    spec = importlib.util.spec_from_file_location("matrix_grid_overview_utc_clock", str(SCRIPT))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with _stubbed_paths(), patch("datetime.datetime", _RecordingDatetime):
+        spec.loader.exec_module(module)
+
+    assert seen == [timezone.utc]
+    assert module.overview["generated_at"] == "2026-11-20T22:13:05Z"

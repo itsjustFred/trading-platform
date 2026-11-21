@@ -12,7 +12,7 @@ import weakref
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -841,7 +841,7 @@ def _apply_signal_processor(
         "timeframe": signal.timeframe,
         "metadata": dict(signal.metadata or {}),
     }
-    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+    processed = processor.process_signal(raw_signal=raw_signal, market_data=market_data)
     # #150 fail closed at signal time: a processed signal that asks for a
     # trailing mode the live path cannot execute through THIS adapter is
     # rejected here — the signal is not traded, instead of running with the
@@ -1787,7 +1787,10 @@ def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> i
     open_positions_count = 0
     for position in positions:
         try:
-            position_qty = float(position.get("qty") or 0.0)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+            # Broker JSON: the qty is whatever the adapter put there (str, int,
+            # float or garbage), so `float()` is the parse and its TypeError/
+            # ValueError is the "cannot read this position" signal, not a type bug.
+            position_qty = float(position.get("qty") or 0.0)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             position_qty = 0.0
         if abs(position_qty) > 0:
@@ -2169,6 +2172,7 @@ def _trade_signal_to_live_signal(
     # action to SELL. The TradeSignal Literal gates construction today, but a
     # future loosening (e.g. adding "close") must not silently become a live
     # short — reject it here with a structured reason.
+    live_action: Literal["buy", "sell"]
     if signal.action in {"buy", "long"}:
         live_action = "buy"
     elif signal.action in {"sell", "short"}:
@@ -2183,7 +2187,7 @@ def _trade_signal_to_live_signal(
         id=uuid.uuid4(),
         deployment_id=str(deployment.id),
         symbol=signal.symbol,
-        action=live_action,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+        action=live_action,
         theoretical_price=float(signal.entry_price),
         timestamp=datetime.now(timezone.utc),
         metadata=metadata,
@@ -4777,7 +4781,7 @@ async def _enforce_stopped_deployments(
                 "data": {
                     "deployment_id": deployment_id,
                     "account_id": deployment.account_id,
-                    "cancelled": cancelled.describe(),  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
+                    "cancelled": cancelled.describe(),  # type: ignore[union-attr]  # non-None per cancel_ok
                     "flattened": flattened.describe(),
                 }
             },
