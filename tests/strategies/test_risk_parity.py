@@ -598,6 +598,44 @@ def test_trade_gate_uses_drifted_holding_weight(monkeypatch):
     assert "2024-03-01" not in by_day
 
 
+@pytest.mark.parametrize(
+    ("spy_jump_day", "expect_spy_trade"),
+    [
+        ("2024-02-01", False),  # jump ON the rebalance day: invisible to the 10:00 gate
+        ("2024-01-31", True),  # the session before: visible at 10:00, the gate must react
+    ],
+)
+def test_trade_gate_ignores_the_rebalance_day_close(monkeypatch, spy_jump_day, expect_spy_trade):
+    """#259: QC's 10:00 Rebalance reads HoldingsValue/TotalPortfolioValue through the
+    PREVIOUS close — the rebalance day's own close must not move the 2% gate.
+
+    Hand computation (11 legs at 1/11, SPY +30% from the jump day on): when the jump
+    is visible the drifted SPY weight is (1/11 * 1.3) / (1 + 0.3/11) = 0.11503, a
+    delta of 0.0909 - 0.11503 = -0.0241 against the 1/11 target (> 2% gate, SPY is
+    trimmed). When the jump lands ON the rebalance day the 10:00 decision cannot
+    see it: every leg still reads 1/11, delta 0, nothing trades — even though the
+    MOC fill at that day's close does observe the new price.
+    """
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    prices.loc[prices.index >= pd.Timestamp(spy_jump_day), "SPY"] = 130.0
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    feb_trades = [
+        trade for trade in result["trades"] if trade["exit_time"].startswith("2024-02-01")
+    ]
+    assert ("SPY" in {t["symbol"] for t in feb_trades}) is expect_spy_trade
+
+
 def test_portfolio_value_is_buy_and_hold_between_rebalances():
     """Hand computation: 50% SPY, then SPY x1.25 and x0.8 (net 1.0).
 
