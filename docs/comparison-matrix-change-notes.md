@@ -59,7 +59,13 @@ committed comparison cases, plus the remaining limitations.
   Regenerated 2026-11-21 on the same yfinance `auto_adjust=True` download
   convention as the 2026-11-13 artifact (`download_prices`,
   `lean_statistics=True`, `risk_free_rate=0.025`); the platform artifact in
-  `data/backtests/` is not committed.
+  `data/backtests/` is not committed. yfinance revised the adjusted series
+  between the two downloads, so the before/after numbers above mix the code
+  change with a data revision: re-running the PRE-change code on the
+  2026-11-21 download gives 0.9354 return / 0.3535 Sharpe / 265 trades, i.e.
+  the code change alone is 0.9354 -> 0.9500 and 0.3535 -> 0.3606 on identical
+  data. Order-leg parity vs the QC "Sleepy Tan Coyote" orders is 250/264
+  identical in (date, symbol, sign), up from 249/264 on 2026-11-13.
 - Remaining limitations:
   - Order sizing (`position_size`) and the realized-PnL factor still mark
     the portfolio through the rebalance-day close; QC's `SetHoldings` sizes
