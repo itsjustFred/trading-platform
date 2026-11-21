@@ -584,3 +584,62 @@ def test_cli_backup_list_verify_and_forced_restore(
     )
     assert restored.returncode == 0, restored.stderr
     assert _read_state(db_path) == ([1.0], ["m1"])
+
+
+def _hold_db_exclusive(db_path: Path, ready: Path) -> subprocess.Popen:
+    """A second process holding an EXCLUSIVE lock on ``db_path``.
+
+    Unlike a merely-open connection this reproduces the dangerous late opener:
+    a process that started while the restore was staging and now holds locks,
+    so commits it makes would land on the inode ``os.replace`` unlinks.
+    """
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sqlite3, sys, time\n"
+            "c = sqlite3.connect(sys.argv[1], timeout=5)\n"
+            "c.execute('BEGIN EXCLUSIVE')\n"
+            "open(sys.argv[2], 'w').write('ready')\n"
+            "time.sleep(60)\n",
+            str(db_path),
+            str(ready),
+        ]
+    )
+
+
+def test_restore_reprobes_the_open_database_before_the_swap(
+    db_path: Path, backup_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A process that opens the DB during staging/verification/snapshot must
+    still stop the restore: the open-database probe re-runs immediately before
+    ``os.replace``, when the window has shrunk to milliseconds."""
+    _no_daemon(monkeypatch)
+    _make_db(db_path, [1.0], ["m1"])
+    snapshot = db_backup.backup_db(db_path, backup_dir).path
+
+    real_backup_db = db_backup.backup_db
+    ready = tmp_path / "late-holder.ready"
+    holder_box: list[subprocess.Popen] = []
+
+    def _snapshot_then_open_late(*args: object, **kwargs: object):
+        result = real_backup_db(*args, **kwargs)
+        holder = _hold_db_exclusive(db_path, ready)
+        holder_box.append(holder)
+        _wait_for_ready(ready, holder)
+        return result
+
+    monkeypatch.setattr(db_backup, "backup_db", _snapshot_then_open_late)
+    try:
+        with pytest.raises(db_backup.DaemonRunningError, match="has the database open"):
+            db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+    finally:
+        for holder in holder_box:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+    # The live database was never swapped and no staged file was left behind.
+    assert _read_state(db_path) == ([1.0], ["m1"])
+    assert not db_path.with_name(db_path.name + ".restore-tmp").exists()
+    assert db_backup.restore_db(db_path, snapshot, backup_dir=backup_dir)
+    assert _read_state(db_path) == ([1.0], ["m1"])

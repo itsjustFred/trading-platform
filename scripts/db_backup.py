@@ -594,6 +594,15 @@ def _switch_live_db_to_rollback_journal(db_path: Path, *, force: bool) -> None:
     try:
         try:
             connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            # ``journal_mode`` is a no-op once the file already reads DELETE, so
+            # on its own it cannot see a connection that opened the database
+            # after an earlier probe passed. An EXCLUSIVE lock attempt fails on
+            # any lock another connection holds - exactly the readers/writers
+            # whose later commits ``os.replace`` would strand on the unlinked
+            # inode. An idle connection holds no lock and still passes; that
+            # residual is why the swap itself stays milliseconds after this.
+            connection.execute("BEGIN EXCLUSIVE")
+            connection.execute("ROLLBACK")
         except sqlite3.OperationalError as exc:
             busy = getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY or (
                 "locked" in str(exc).lower() or "busy" in str(exc).lower()
@@ -687,6 +696,12 @@ def restore_db(
         # WAL), and a hot ``-journal`` would roll back over the restored file the same way. The
         # safety snapshot already captured everything they committed.
         try:
+            # Re-probe immediately before the swap: staging, verification and the safety
+            # snapshot can take minutes, and a non-daemon opener (the viewer, a script) that
+            # started in that window still holds the old inode - ``os.replace`` would strand
+            # its commits on the unlinked file. The journal switch needs the database itself,
+            # so a busy result refuses here, milliseconds before the swap, instead of after.
+            _switch_live_db_to_rollback_journal(db_path, force=force)
             for suffix in ("-wal", "-shm", "-journal"):
                 db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
             for suffix in ("-wal", "-shm", "-journal"):
