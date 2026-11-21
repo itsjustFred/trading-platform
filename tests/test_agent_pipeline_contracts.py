@@ -1040,6 +1040,24 @@ def test_the_verdict_regex_accepts_exactly_the_mapped_verdicts() -> None:
     )
 
 
+def test_a_new_agent_stage_cannot_go_unregistered() -> None:
+    """`AGENT_WORKFLOWS` is three literal names, so the fourth agent workflow - a copy of one of
+    these, which is how the next one will be written - reports under this file's context, marker or
+    conventions with no test failing. The file globs nothing: every workflow in `.github/` that
+    names an agent context or marker must therefore be one of the registered three, and a new one
+    fails here until it is registered - which is the point, since registering it means deciding
+    which stage owns which marker and which status context."""
+    registered = set(AGENT_WORKFLOWS)
+    known = set(CONTEXT_OWNER.values()) | set(MARKERS.values())
+    assert known == registered, "the registered workflows and the owned names disagree"
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        if any(f"{name}" in text for name in list(CONTEXT_OWNER) + list(MARKERS)):
+            assert path.name in registered, (
+                f"{path.name}: names an agent stage's context or marker and is not registered here"
+            )
+
+
 def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
     """A context typo writes a result under a name nothing reads; a marker two workflows share
     makes one overwrite the other's comment. The pre-mortem is also the only one of the three
