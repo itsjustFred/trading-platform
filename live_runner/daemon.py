@@ -5279,8 +5279,11 @@ def _join_default_executor(timeout: float) -> None:
             "still be in flight and its outcome is unknown"
         )
     if failure:
-        # An interruption of the join itself (a signal landing mid-join) has to reach the caller,
-        # which treats it exactly like an expired budget: the workers are still writing.
+        # The only thing that lands here is an exception from ``executor.shutdown`` itself,
+        # raised on the joiner thread and relayed to this one. A signal does not: it is
+        # delivered to the main thread, which is parked in ``finished.wait`` and sees the
+        # interrupt directly - the same "workers may still be writing" outcome as an expired
+        # budget, handled by the caller's ``BaseException`` branch.
         raise failure[0]
 
 

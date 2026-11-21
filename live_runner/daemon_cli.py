@@ -73,8 +73,18 @@ def _leave_now(exit_code: int) -> NoReturn:
     loggers = [logging.getLogger(), *logging.root.manager.loggerDict.values()]
     for logger in loggers:
         for handler in getattr(logger, "handlers", []):
-            with contextlib.suppress(Exception):
+            # BaseException, not Exception: a KeyboardInterrupt landing inside ``flush()`` must
+            # not skip the ``os._exit`` this function exists to reach.
+            with contextlib.suppress(BaseException):
                 handler.flush()
+    with contextlib.suppress(BaseException):
+        # ``os._exit`` runs no ``atexit`` hook, so the Sentry client's own flush never happens:
+        # give the queued CRITICAL event its last chance to leave. Imported here because this
+        # module stays free of heavy imports until a start is certain, and the flush is a no-op
+        # when Sentry was never initialized.
+        import sentry_sdk
+
+        sentry_sdk.flush(timeout=2)
     os._exit(exit_code)
 
 
@@ -93,4 +103,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except daemon.WorkerJoinTimeout as exc:
         print(f"error: {exc}", file=sys.stderr)
         _leave_now(EXIT_WORKER_JOIN_TIMEOUT)
+    except KeyboardInterrupt:
+        # A second Ctrl-C can land while the join is still waiting on the abandoned worker
+        # threads: by the time it reaches here the daemon's own cleanup has run (or given up,
+        # with the executor detached), so leaving through ``os._exit`` is what keeps the
+        # interpreter's unbounded thread-join out of the exit path. 130 is the SIGINT code.
+        _leave_now(130)
     return 0
