@@ -207,23 +207,31 @@ class TestSingleInstanceGuard:
 
         lock_path = daemon.daemon_lock_path()
         thread = threading.Thread(target=_run_daemon, name="daemon-under-test")
-        probe: Any = None
+        probes: list[Any] = []
         thread.start()
         try:
             assert ready.wait(10), "the daemon's event loop never started"
             assert started.wait(10), "the daemon never reached the startup discovery"
             daemon_loop[0].call_soon_threadsafe(daemon_task[0].cancel)
             # While the discovery thread is still writing, a second process must be refused.
-            probe = spawn_holder(lock_path, hold_seconds=30.0)
-            assert read_holder_line(probe) == "refused", (
+            probes.append(spawn_holder(lock_path, hold_seconds=30.0))
+            assert read_holder_line(probes[-1]) == "refused", (
                 "the lock was released while the daemon's own executor work was still in flight"
+            )
+            # A second cancellation arrives while the daemon is waiting for that work. It must not
+            # abandon the wait either: the lock outlives the in-flight writes, still.
+            daemon_loop[0].call_soon_threadsafe(daemon_task[0].cancel)
+            probes.append(spawn_holder(lock_path, hold_seconds=30.0))
+            assert read_holder_line(probes[-1]) == "refused", (
+                "a second cancellation released the lock before the in-flight work finished"
             )
             unblock.set()
         finally:
             thread.join(timeout=30)
-            if probe is not None and probe.poll() is None:
-                probe.kill()
-                probe.wait(timeout=10)
+            for probe in probes:
+                if probe.poll() is None:
+                    probe.kill()
+                    probe.wait(timeout=10)
 
         assert not thread.is_alive(), "the daemon thread did not exit after the cancellation"
 
@@ -277,6 +285,26 @@ class TestLockPath:
         monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(alias / 'live.db').as_posix()}")
 
         assert daemon.daemon_lock_path() == target / "live.db.lock"
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="creating a symlink needs elevated privileges on Windows"
+    )
+    def test_the_lock_resolves_a_symlinked_database_file(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """A symlink may rename as well as redirect: the lock takes the resolved file's name.
+
+        ``alias.db`` -> ``live.db`` must not lock ``alias.db.lock``, or a daemon that reaches the
+        database through the target would take a second lock beside the real file.
+        """
+        from live_runner import daemon
+
+        real_db = tmp_path / "live.db"
+        alias_db = tmp_path / "alias.db"
+        alias_db.symlink_to(real_db)
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{alias_db.as_posix()}")
+
+        assert daemon.daemon_lock_path() == real_db.with_name("live.db.lock")
 
     def test_the_lock_follows_the_sqlite_uri_form(
         self, monkeypatch: Any, tmp_path: Path

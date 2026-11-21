@@ -163,10 +163,10 @@ def daemon_lock_path() -> Path:
     (``DATABASE_URL`` when it names a SQLite file, ``DATA_DIR/backtests.db`` otherwise) - a lock
     beside some other file would exclude nobody.
     """
-    db_path = live_db_path()
-    # Resolved first so a symlinked data directory and its target select the same lock file: two
-    # spellings of one database must not be two locks.
-    return db_path.resolve().with_name(f"{db_path.name}.lock")
+    resolved = live_db_path().resolve()
+    # Both the directory and the file name come from the resolved path: a symlink can rename as
+    # well as redirect, and two spellings of one database must not be two locks.
+    return resolved.with_name(f"{resolved.name}.lock")
 
 
 BALANCE_POLL_INTERVAL_SECONDS = 60
@@ -5343,7 +5343,9 @@ async def run_daemon(
     migrated the live database under the old one. The operating system owns the lock and releases
     it when this process exits, including on SIGKILL, so a killed daemon never blocks a restart. On
     a clean exit the daemon drains its executor threads first, so it never releases the lock while
-    its own database work is still in flight either.
+    its own database work is still in flight either. That drain shuts the loop's default executor
+    down - as :func:`asyncio.run` does at exit anyway - so an embedder must give each daemon run
+    its own event loop.
     """
     lock = SingleInstanceLock(daemon_lock_path())
     try:
@@ -5365,8 +5367,17 @@ async def run_daemon(
                 # its own thread was still writing would hand the next daemon exactly the overlap
                 # this lock exists to prevent. The join is unbounded on purpose: a stop whose
                 # in-flight database work cannot finish must not hand the lock on, and the OS
-                # still releases the lock if the process has to be killed to end it.
-                await asyncio.get_running_loop().shutdown_default_executor()
+                # still releases the lock if the process has to be killed to end it. A second
+                # cancellation must not abandon the join either, so it is awaited under a shield
+                # and the loop keeps waiting until the threads are gone.
+                drain = asyncio.ensure_future(
+                    asyncio.get_running_loop().shutdown_default_executor()
+                )
+                while not drain.done():
+                    try:
+                        await asyncio.shield(drain)
+                    except asyncio.CancelledError:
+                        continue
         finally:
             # Released even when the drain is itself interrupted: the contract is that the lock
             # never outlives the daemon.
