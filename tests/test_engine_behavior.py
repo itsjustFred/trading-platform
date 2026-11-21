@@ -188,7 +188,9 @@ class TestSizingEquityExcludesUnrealizedPnl:
     # so only the realized-cash basis can pass them.
 
     @staticmethod
-    def _run_open_position_scenario(mark: float) -> list:
+    def _run_open_position_scenario(
+        mark: float, tmp_path: Path, parameters: dict | None = None
+    ) -> list:
         """Two entries where the first is still OPEN and marked at ``mark``.
 
         Bar 0 signals entry 1 (fill = bar 1 open, 101); bar 1 closes at
@@ -219,12 +221,14 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits)
 
-        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine = TradeEngine(
+            _config(tmp_path, parameters=parameters or {}), symbol="PROBE"
+        )
         engine.run(frame, strategy)
         assert len(engine.closed_trades) >= 2, "both entries must have filled"
         return engine.closed_trades
 
-    def test_open_paper_profit_does_not_grow_next_entry(self):
+    def test_open_paper_profit_does_not_grow_next_entry(self, tmp_path: Path):
         """An OPEN position's paper profit must not compound into the next size.
 
         Entry 1 fills at 101 for 500 shares and rides to a 105 close, so
@@ -233,13 +237,13 @@ class TestSizingEquityExcludesUnrealizedPnl:
         risks 1% of 100k over the 2% fallback stop (2.1) = 476.19 shares.
         Mark-to-market sizing would risk 1% of 102k = 485.71 shares.
         """
-        trades = self._run_open_position_scenario(105.0)
+        trades = self._run_open_position_scenario(105.0, tmp_path)
         assert trades[1].quantity == pytest.approx(1000.0 / 2.1, rel=1e-9), (
             "an open position's unrealized profit is not spendable: the second "
             "entry must size from realized cash (100k), not mark-to-market (102k)"
         )
 
-    def test_open_paper_loss_does_not_shrink_next_entry(self):
+    def test_open_paper_loss_does_not_shrink_next_entry(self, tmp_path: Path):
         """An OPEN position's paper loss must not deflate the next size.
 
         Entry 1 rides down to a 99.5 close (paper −750 on 500 shares) while
@@ -247,18 +251,18 @@ class TestSizingEquityExcludesUnrealizedPnl:
         second entry risks 1% of 100k over the 1.99 fallback stop = 502.51
         shares; mark-to-market sizing would risk 1% of 99.25k = 498.74.
         """
-        trades = self._run_open_position_scenario(99.5)
+        trades = self._run_open_position_scenario(99.5, tmp_path)
         assert trades[1].quantity == pytest.approx(1000.0 / 1.99, rel=1e-9), (
             "an open position's unrealized loss is not a realized loss: the "
             "second entry must size from realized cash (100k), not 99.25k"
         )
 
-    def test_recorded_equity_at_entry_is_the_sizing_basis(self):
+    def test_recorded_equity_at_entry_is_the_sizing_basis(self, tmp_path: Path):
         """``equity_at_entry`` (the shared-replay coefficient denominator)
         must record the realized basis the order was SIZED from, not the
         mark-to-market reporting equity — otherwise the multi-symbol replay
         rescales a realized-cash quantity by a mark-to-market denominator."""
-        trades = self._run_open_position_scenario(105.0)
+        trades = self._run_open_position_scenario(105.0, tmp_path)
         for trade in trades:
             assert trade.meta["equity_at_entry"] == pytest.approx(
                 100_000.0, rel=1e-9
@@ -268,7 +272,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
                 "equity, not the basis the quantity was computed from"
             )
 
-    def test_recorded_basis_follows_the_surviving_quantity(self):
+    def test_recorded_basis_follows_the_surviving_quantity(self, tmp_path: Path):
         """``equity_at_entry`` must be the basis the surviving quantity was
         sized from, not whatever the ledger reads at fill time.
 
@@ -301,7 +305,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
-        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
         engine.run(frame, strategy)
 
         assert len(engine.closed_trades) == 2, "both entries must have filled"
@@ -321,7 +325,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "number and would corrupt the replay's per-unit coefficient"
         )
 
-    def test_resized_order_records_its_fill_time_basis(self):
+    def test_resized_order_records_its_fill_time_basis(self, tmp_path: Path):
         """The mirror rule: an order that IS re-sized at fill records the
         fill-time basis, because that is the ledger its surviving quantity was
         computed from.
@@ -352,7 +356,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss, "stop_distance": stop_distance})
 
-        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
         engine.run(frame, strategy)
 
         assert len(engine.closed_trades) == 2, "both entries must have filled"
@@ -366,7 +370,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "from (99k at fill), not the creation-time figure (100k)"
         )
 
-    def test_aggregate_exposure_denominator_is_realized_cash(self):
+    def test_aggregate_exposure_denominator_is_realized_cash(self, tmp_path: Path):
         """The aggregate-exposure fraction must use the realized denominator.
 
         Two open positions each risk 2% of 100k over a 5-point stop, so 0.04
@@ -396,7 +400,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_distance": stop_distance})
 
-        config = _config(Path("/tmp"), risk_per_trade_pct=0.02)
+        config = _config(tmp_path, risk_per_trade_pct=0.02)
         engine = TradeEngine(config, symbol="PROBE")
         engine.run(frame, strategy)
 
@@ -412,16 +416,23 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "mark-to-market figure would leave 0.013 = 280 shares"
         )
 
-    def test_partial_exit_fees_are_not_spendable_while_owed(self):
-        """A partial exit's gross PnL is realized, but its round-trip fees are
-        only charged when the trade is finalized — so the next entry may not
-        size on cash that is still owed to the fee model.
+    def test_partial_exit_fees_are_not_spendable_while_owed(self, tmp_path: Path):
+        """A partial exit's gross PnL is realized, but the fee model has only
+        been paid for the legs it has already taken — so the next entry may
+        not size on cash that is still owed to it.
 
         Entry 1 (500 shares @ 100, fee_rate 0.001) takes half off at 105: the
-        realized leg books 1,250 gross while the round-trip fee (0.001 x
-        (100 + 105) x 500 = 102.5) is only charged at finalization. Entry 2 is
-        sized on the next bar, so its basis is 100,000 + 1,250 − 102.5 =
-        101,147.5 and it risks 1% of that over the 2% fallback stop (2.1).
+        realized leg books 1,250 gross. By the time entry 2 is sized on the
+        next bar the fee model has incurred, and nothing else:
+
+        - the entry leg on the ORIGINAL 500 shares, 0.001 x 100 x 500 = 50,
+        - the exit leg of the 250 shares that closed, 0.001 x 105 x 250
+          = 26.25.
+
+        The exit leg of the 250 still-open shares is a future cost the
+        position has not incurred, so it is NOT held back. Basis = 100,000 +
+        1,250 − 76.25 = 101,173.75, and entry 2 risks 1% of that over the 2%
+        fallback stop (2.1).
         """
         frame = pd.DataFrame(
             {
@@ -453,7 +464,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         # ``fee_rate`` takes precedence over the ``fees="zero"`` default that
         # ``with_zero_fees`` merges in (resolve_fee_model's documented order),
         # so this run is priced and the owed-fee branch is exercised.
-        config = _config(Path("/tmp"), parameters={"fee_rate": 0.001})
+        config = _config(tmp_path, parameters={"fee_rate": 0.001})
         engine = TradeEngine(config, symbol="PROBE")
         engine.run(frame, strategy)
 
@@ -470,13 +481,41 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "the 50% rung closes 250 of the 500 shares"
         )
         second = engine.closed_trades[1]
-        assert second.meta["equity_at_entry"] == pytest.approx(101_147.5, rel=1e-9), (
-            "the sizing basis is realized cash less the fees still owed: "
-            "100,000 + 1,250 gross − 102.5 owed = 101,147.5"
+        assert second.meta["equity_at_entry"] == pytest.approx(101_173.75, rel=1e-9), (
+            "the sizing basis is realized cash less the fees already incurred: "
+            "100,000 + 1,250 gross − 50 entry − 26.25 exit = 101,173.75"
         )
-        assert second.quantity == pytest.approx(1011.475 / 2.1, rel=1e-9), (
-            "entry 2 sizes from 101,147.5, not from the gross 101,250 the "
-            "ledger holds before the round-trip fees are charged"
+        assert second.quantity == pytest.approx(1011.7375 / 2.1, rel=1e-9), (
+            "entry 2 sizes from 101,173.75, not from the gross 101,250 the "
+            "ledger holds before any fee is charged, and not from 101,147.5 "
+            "which would wrongly hold back the remainder's future exit fee"
+        )
+
+    def test_entry_fee_is_owed_before_the_first_exit(self, tmp_path: Path):
+        """A position with NO exit yet still owes its entry leg, so the next
+        entry may not size on cash the fee model has already been paid.
+
+        Same shape as ``test_open_paper_profit_does_not_grow_next_entry`` but
+        priced (fee_rate 0.001): entry 1 keeps its creation-time size of 500
+        shares (1% of 100k over bar 0's 2% fallback stop) and fills at 101, so
+        its entry leg is 0.001 x 101 x 500 = 50.5. The basis entry 2 is sized
+        from is therefore 100,000 − 50.5 = 99,949.5, and entry 2 risks 1% of
+        that over bar 2's 2% fallback stop (2.1) = 475.8071... shares — where
+        a run that held nothing back would still size from the full 100,000.
+        """
+        trades = self._run_open_position_scenario(
+            105.0, tmp_path, parameters={"fee_rate": 0.001}
+        )
+        entry_fee = 0.001 * 101.0 * 500.0
+        assert trades[0].quantity == pytest.approx(500.0, rel=1e-9)
+        assert trades[1].quantity == pytest.approx(
+            (0.01 * (100_000.0 - entry_fee)) / 2.1, rel=1e-9
+        ), (
+            "an open position's entry leg is already owed: the basis is "
+            f"100,000 − {entry_fee} , not the gross 100,000"
+        )
+        assert trades[1].meta["equity_at_entry"] == pytest.approx(
+            round(100_000.0 - entry_fee, 2), rel=1e-9
         )
 
 

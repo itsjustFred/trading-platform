@@ -236,31 +236,41 @@ class TradeEngine:
         """Recompute the spendable sizing cash from the realized ledger.
 
         ``_close_partial`` books exit legs gross and ``_finalize_position``
-        backs the round-trip fees out only when the last leg closes, so cash
-        from a partial exit must not be spendable while its fees are still
-        owed. The owed amount is the fee model's price of the full position at
-        the exits so far; the exact fee replaces it at finalisation.
+        backs the whole round-trip fee out only when the last leg closes, so a
+        position's realized cash is not fully spendable until it is finalized.
+        What is held back is exactly the cost the fee model has ALREADY
+        incurred for every still-open position, and nothing it has not:
+
+        - the ENTRY leg on the position's original quantity (plus the
+          per-trade surcharge, owed from the moment the position was
+          opened) — which is why a position with no exit yet holds its entry
+          fee back too, and
+        - the EXIT fee of every leg that has already closed, priced at that
+          leg's own fill price.
+
+        The exit leg of the still-open remainder is a FUTURE cost and is
+        deliberately not held back: sizing may not be reduced by a fee the
+        position has not incurred (and may never incur at that price). At
+        finalization the ledger charges ``fee_for_trade``, which is exactly
+        the entry leg plus every exit leg, so the held-back estimate and the
+        charged figure meet there.
         """
         owed = 0.0
         fee_model = None
         for position in self.positions:
-            if position.remaining_qty <= 1e-9 or not position.exits:
-                continue
-            total_qty = sum(float(item.quantity or 0.0) for item in position.exits)
-            if total_qty <= 0:
+            # A finalized position's fees are already in ``_realized_pnl``;
+            # an open one (with or without exits) still owes its entry leg.
+            if position.remaining_qty <= 1e-9:
                 continue
             if fee_model is None:
                 fee_model = resolve_fee_model(self.config.parameters)
-            avg_exit = (
-                sum(
-                    float(item.price or 0.0) * float(item.quantity or 0.0)
-                    for item in position.exits
+            owed += fee_model.entry_fee(
+                float(position.entry_price), float(position.quantity)
+            )
+            for item in position.exits:
+                owed += fee_model.exit_fee(
+                    float(item.price or 0.0), float(item.quantity or 0.0)
                 )
-                / total_qty
-            )
-            owed += fee_model.fee_for_trade(
-                float(position.entry_price), avg_exit, float(position.quantity)
-            )
         self._sizing_equity = self.config.initial_capital + self._realized_pnl - owed
 
     def _current_risk_exposure(
@@ -547,6 +557,10 @@ class TradeEngine:
                 meta=position_meta,
             )
         )
+        # F21 (D2): the position's entry leg is owed from this fill, so the
+        # spendable cash drops now — a run with no exit yet must still hold it
+        # back from the next entry.
+        self._refresh_sizing_equity()
 
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
         if not self.pending_orders:
