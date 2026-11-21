@@ -13943,6 +13943,7 @@ async def _require_kill_switch_confirmation(
     scope: str,
     confirmed_scope: str | None,
     request: Request | None,
+    why: str,
 ) -> None:
     """Refuse a money-moving kill-switch control that was not confirmed.
 
@@ -13963,10 +13964,7 @@ async def _require_kill_switch_confirmation(
         )
         raise HTTPException(
             status_code=428,
-            detail=(
-                f"'{action}' in this mode cancels orders and closes positions, so "
-                f"it must be confirmed. Send confirmed_scope='{scope}'."
-            ),
+            detail=f"'{action}' {why} Send confirmed_scope='{scope}'.",
         )
     if str(confirmed_scope).strip() != scope:
         await _audit_live_control(
@@ -14069,6 +14067,15 @@ async def halt_live_kill_switch(
             scope=scope,
             confirmed_scope=payload.confirmed_scope,
             request=request,
+            why=(
+                f"in '{mode}' mode cancels working orders"
+                + (
+                    " and closes positions"
+                    if mode == KillSwitchMode.FLATTEN.value
+                    else ""
+                )
+                + ", so it must be confirmed."
+            ),
         )
     try:
         halted = await asyncio.to_thread(
@@ -14145,6 +14152,7 @@ async def resume_live_kill_switch(
         scope=scope,
         confirmed_scope=payload.confirmed_scope,
         request=request,
+        why="re-enables trading on this scope, so it must be confirmed.",
     )
     lifted = await asyncio.to_thread(
         clear_live_kill_switch, scope, actor=_live_control_actor(request)
