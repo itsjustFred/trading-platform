@@ -54,7 +54,7 @@ logger = get_logger("live-runner")
 KILL_SWITCH_SWEEP_INTERVAL_SECONDS = 30.0
 
 
-class KillSwitchMode(str, Enum):
+class KillSwitchMode(Enum):
     """What a halt forbids, least restrictive first.
 
     The declaration order is the strictness ranking
@@ -121,14 +121,12 @@ class LiveHaltError(RuntimeError):
         message: str,
         *,
         account_id: str,
-        mode: KillSwitchMode | None = None,
-        deployment_id: str | None = None,
+        mode: KillSwitchMode,
         state_unreadable: bool = False,
     ) -> None:
         super().__init__(message)
         self.account_id = account_id
         self.mode = mode
-        self.deployment_id = deployment_id
         self.state_unreadable = state_unreadable
 
 
@@ -207,10 +205,6 @@ class KillSwitchState:
             )
         )
 
-    def mode_for_scope(self, scope: str) -> KillSwitchMode | None:
-        """The mode stored for one scope, global included, or ``None``."""
-        return self.halts.get(str(scope))
-
     def halted_scopes(self) -> tuple[str, ...]:
         """Every scope halted right now, sorted, global included."""
         return tuple(sorted(self.halts))
@@ -233,17 +227,6 @@ class KillSwitchState:
     def record_sweep(self, account_id: str, mode: KillSwitchMode) -> None:
         """Remember that ``account_id`` was just swept clean in ``mode``."""
         self.swept_at[(str(account_id), mode)] = monotonic()
-
-    def describe(self) -> str:
-        """One line for a log field or an API payload."""
-        if not self.readable:
-            return f"unreadable ({self.error})"
-        if not self.halts:
-            return "nothing halted"
-        return ", ".join(
-            f"{scope}={self.halts[scope].value}" for scope in self.halted_scopes()
-        )
-
 
 def read_kill_switch_state() -> KillSwitchState:
     """Read every active halt from the database, failing closed.
@@ -358,12 +341,11 @@ async def refuse_entry_while_halted(
         ),
         account_id=str(account_id),
         mode=mode,
-        deployment_id=(str(deployment_id) if deployment_id else None),
         state_unreadable=not resolved.readable,
     )
 
 
-class _SweepStep(str, Enum):
+class _SweepStep(Enum):
     """How one control-plane sweep of a halted account ended."""
 
     COMPLETE = "complete"
@@ -386,13 +368,6 @@ class KillSwitchEnforcementReport:
     without_adapter: tuple[str, ...] = ()
     #: ``{account_id: mode}`` for every account the halt reached this tick.
     modes: Mapping[str, KillSwitchMode] = field(default_factory=dict)
-
-    @property
-    def halted(self) -> tuple[str, ...]:
-        """Every account the halt reached, in any of the three outcomes."""
-        return tuple(
-            sorted(set(self.swept) | set(self.unmet) | set(self.without_adapter))
-        )
 
     def describe(self) -> str:
         """One line for the tick's log field."""
@@ -547,8 +522,16 @@ async def _sweep_halted_account(
         and orphan_step in (_SweepStep.COMPLETE, _SweepStep.UNSUPPORTED)
     )
     if swept:
+        # The message names what the mode actually did: an 'orders' halt leaves the
+        # positions open, and claiming a flatten that never ran is how an operator
+        # ends up believing an account is flat when it is not.
+        achievement = (
+            "orders cancelled and positions flattened"
+            if mode.flattens
+            else "working orders cancelled"
+        )
         logger.warning(
-            "Enforced a halted account: orders cancelled and positions flattened",
+            f"Enforced a halted account: {achievement}",
             extra={
                 "data": {
                     "account_id": account_id,

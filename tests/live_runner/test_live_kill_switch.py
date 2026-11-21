@@ -133,14 +133,16 @@ def test_the_stored_modes_and_the_runner_modes_are_the_same_ranking() -> None:
     assert tuple(mode.value for mode in KillSwitchMode) == KILL_SWITCH_MODES
 
 
-def _deployment(account_id: str = ACCOUNT) -> LiveDeploymentConfig:
+def _deployment(
+    account_id: str = ACCOUNT, status: str = "ACTIVE"
+) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
         id=str(uuid.uuid4()),
         strategy_name="demo",
         account_id=account_id,
         symbols=["AAPL"],
         timeframe="1h",
-        status="ACTIVE",
+        status=status,
         signal_source="discord",
         signal_source_type="discord",
         signal_config={"channel_id": "100000000000000121"},
@@ -637,6 +639,63 @@ def test_a_completed_sweep_is_repeated_once_the_interval_has_passed(
     assert first.swept == (account,)
     assert second.swept == (account,)
     assert adapter.calls.count("close_all_positions") == 2
+
+
+def test_a_halt_that_needs_the_broker_retains_an_adapter_for_its_account(
+    isolated_db_sandbox, account
+) -> None:
+    """A PAUSED account is otherwise never connected, so its halt is unenforceable.
+
+    The same lesson STOPPED enforcement learned: cancel and flatten can only run
+    through an adapter, and an account whose deployments are all PAUSED never gets
+    one. Retention is not permission - only the runnable set gets listener tasks -
+    so this cannot make an account tradeable.
+    """
+    import live_runner.daemon as daemon
+
+    paused = _deployment(status="PAUSED")
+    set_live_kill_switch(account, "flatten", actor="operator")
+
+    retained = daemon._accounts_needing_halt_enforcement(
+        read_kill_switch_state(), [paused]
+    )
+
+    assert account in retained
+
+
+def test_an_entries_halt_needs_no_adapter(isolated_db_sandbox, account) -> None:
+    """'entries' is enforced at the entry gate, so it connects nothing extra."""
+    import live_runner.daemon as daemon
+
+    paused = _deployment(status="PAUSED")
+    set_live_kill_switch(account, "entries", actor="operator")
+
+    retained = daemon._accounts_needing_halt_enforcement(
+        read_kill_switch_state(), [paused]
+    )
+
+    assert retained == set()
+
+
+def test_an_unreadable_halt_state_retains_nothing(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    """Fail closed means refusing entries, not connecting every adapter."""
+    import live_runner.daemon as daemon
+    import live_runner.kill_switch as kill_switch
+
+    paused = _deployment(status="PAUSED")
+
+    def _unreadable() -> dict[str, str]:
+        raise OSError("database is unavailable")
+
+    monkeypatch.setattr(kill_switch, "read_live_kill_switch_scopes", _unreadable)
+
+    retained = daemon._accounts_needing_halt_enforcement(
+        read_kill_switch_state(), [paused]
+    )
+
+    assert retained == set()
 
 
 def test_a_halt_written_while_the_daemon_is_running_is_enforced(

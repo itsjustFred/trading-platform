@@ -46,8 +46,8 @@ def test_a_halt_survives_a_restart(isolated_db_sandbox) -> None:
 
     The engine is disposed so every pooled connection is closed: a flag cached
     in a session, a module global or a connection-local state would survive the
-    first read and nothing else. ``scripts/live_smoke.py`` and the CLI cover the
-    same property across real processes.
+    first read and nothing else. The CLI tests cover the same property across
+    real processes, which is the shape an operator and the daemon are in.
     """
     _database, engine, _data_dir = isolated_db_sandbox
 

@@ -421,6 +421,9 @@ The cTrader smoke registers the demo account in `live_accounts` if it is not the
 database), because its parent deployment row has a foreign key to it. An account that already
 exists is left untouched.
 
+The smoke places its orders through `submit_order_with_risk`, so it is refused like any other entry
+while its account is halted (see "Kill Switch" below). That is deliberate: a smoke is still an order.
+
 ## Demo Daemon
 
 Only run after the paper smoke succeeds.
