@@ -65,6 +65,19 @@ def test_blocking_ruff_step_pins_every_bug_class_family() -> None:
     command = _command(step)
     assert "ruff check" in command, command
 
+    # An ignore option undoes the pin as surely as dropping a family from
+    # `--select`: `--select B,DTZ,... --ignore B` still "selects" every family
+    # while silently making bugbear advisory again. Both the space-separated and
+    # the `=`-joined forms are rejected, whichever argument position they take.
+    ignore_options = {
+        token
+        for token in command.split()
+        if token.split("=", 1)[0] in {"--ignore", "--extend-ignore"}
+    }
+    assert not ignore_options, (
+        f"the blocking ruff step must not carry an ignore option: {sorted(ignore_options)}"
+    )
+
     tokens = command.split()
     assert "--select" in tokens, command
     selected_tokens = tokens[tokens.index("--select") + 1].split(",")
@@ -99,5 +112,7 @@ def test_mypy_step_runs_the_dev_dependency_without_an_overlay() -> None:
 
 def test_agents_md_documents_the_dev_install() -> None:
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    assert "uv sync --extra dev" in agents
+    # `--frozen` is part of the contract: without it a local sync can re-resolve
+    # a different mypy than the one CI checks out with.
+    assert "uv sync --frozen --extra dev" in agents
     assert "uv run mypy" in agents
