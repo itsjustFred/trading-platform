@@ -557,9 +557,9 @@ so a trimming that hides an older conflict cannot happen there.
    (an unconfirmed write is a `428`, and a confirmation naming another deployment a
    `409`), which does its own broker re-verification. The write is **refused with
    `409` while a conflict is still recorded**: the way out of the halt is step 4,
-   not a status write. So a resume that does not stick means step 4 cleared nothing
-   - and a duplicate still being redelivered can re-record the conflict even
-   after step 4, because the conflict ledger's own read-modify-write wins that race
-   on purpose. - and a duplicate still being redelivered can re-record it even
-   after step 4, because the conflict ledger's own read-modify-write wins that race
-   on purpose.
+   not a status write. A resume refused with that `409` means a conflict is still
+   recorded: step 4 has not run, or a new conflict arrived since. A resume that was
+   accepted and is later re-paused means a new conflict was recorded after step 4,
+   typically a duplicate still being redelivered: the conflict ledger's own
+   read-modify-write wins that race on purpose. Investigate the new conflict and
+   repeat steps 3-5.
