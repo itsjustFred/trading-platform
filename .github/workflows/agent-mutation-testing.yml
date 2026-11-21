@@ -146,12 +146,35 @@ jobs:
           opencode --version
 
       # Rules: the base branch's skill if it has one. Otherwise (only while the
-      # skill is not merged yet) the PR's own copy.
+      # skill is not merged yet) the PR's own copy. A base commit that
+      # cannot be read aborts the step before the `if`, at the standalone
+      # `git cat-file -e`: that check is the guard, because GitHub's default
+      # shell for a `run:` block is already `bash -e {0}` and fail-fast needs no
+      # help - and inside the `if` condition that follows, a failure is a false
+      # branch, not an abort. `set -euo pipefail` adds `pipefail` and `-u` (an
+      # unset variable now fails the step instead of expanding to nothing) and
+      # states the strictness, so it is not the guard and must not be read as
+      # one.
+      #
+      # The path lookup inside the `if` is a plain assignment rather than a command
+      # in a condition, so `errexit` does apply to it: `git ls-tree` is asked for
+      # the path and the *result* decides the branch, instead of `git cat-file`
+      # being run as the condition with its failure suppressed. The distinction
+      # matters: a suppressed failure inside a condition is only a false branch, so
+      # any `git` error - a missing object, an unreadable repository, a wrong
+      # revision syntax - fell through to the PR's own copy under a prompt that
+      # said the rules came from the base branch. Now only an empty listing
+      # (the base genuinely has no skill at that path) takes that branch, and every
+      # other failure stops the job.
       - name: Select skill revision
         if: steps.scope.outputs.empty == 'false'
         run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mutation"
           skill="$RUNNER_TEMP/mutation/skill.md"
-          if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
+          git cat-file -e "${BASE_SHA}^{commit}"
+          listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")
+          if [ -n "$listing" ]; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
           elif [ -f "$SKILL_PATH" ]; then
@@ -205,6 +228,13 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/mutation/comment.md"
+          # Whose rules ran is the one thing the report itself cannot show, and it is the
+          # fallback's whole point: while the base branch has no skill, the PR's own copy
+          # runs. Name it in the log and in the comment footer (below), so a verdict
+          # produced by a PR's own rules is never indistinguishable from one the base
+          # produced. The pre-mortem copy does the same; a silent SKILL_SOURCE is what
+          # let the fallback grade a PR unnoticed.
+          echo "::notice::Mutation-testing rules from: ${SKILL_SOURCE}."
           opencode run --standalone --archived --agent pr-mutation \
             "Mutation-test PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/mutation/meta.json. Scope file: $RUNNER_TEMP/mutation/scope.txt. Rules loaded from: ${SKILL_SOURCE}." \
             > "$out.raw"
@@ -256,8 +286,11 @@ jobs:
           if [ "$SCOPE_EMPTY" = "true" ]; then
             printf '\n\n---\n_Automated mutation testing: no agent run, empty scope (`%s` skill)_\n' "$skill_name" >> "$out"
           else
-            printf '\n\n---\n_Automated mutation testing using %s with `%s` skill_\n' \
-              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+            # Rules from the base branch, or the PR's own copy while the base has none: the
+            # source is printed, because a verdict produced by a PR's own rules must not
+            # read like one the base produced.
+            printf '\n\n---\n_Automated mutation testing using %s with `%s` skill (rules from %s)_\n' \
+              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}" >> "$out"
           fi
           { printf '# Mutation Testing Action\n\n'; cat "$out"; } > "$out.titled"
           mv "$out.titled" "$out"
