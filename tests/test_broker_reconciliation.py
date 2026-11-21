@@ -19,6 +19,7 @@ from shared.database import (
     claim_live_deployment_submission,
     get_live_deployment,
     list_live_control_audit,
+    live_deployment_entries_halted,
     release_live_deployment_submission,
     resume_live_deployment_entries_halt,
     save_live_execution,
@@ -369,6 +370,34 @@ def _unfilled_signal(
     return signal_id
 
 
+def test_refused_delete_endpoint_preserves_the_entries_halt(isolated_db) -> None:
+    """The endpoint's status rollback is not an operator resume (#303)."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _unfilled_signal(DEPLOYMENT_ID, broker_order_id="ord-delete")
+    set_live_deployment_entries_halt(
+        DEPLOYMENT_ID,
+        {"by": "broker_reconciliation", "at": "now", "account_id": ACCOUNT_ID},
+    )
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main
+
+    response = TestClient(viewer_main.app).delete(
+        f"/api/live/deployments/{DEPLOYMENT_ID}"
+        f"?confirm_deployment_id={DEPLOYMENT_ID}"
+    )
+
+    assert response.status_code == 409, response.text
+    deployment = get_live_deployment(DEPLOYMENT_ID)
+    assert deployment is not None
+    assert deployment.status == "ACTIVE"
+    assert (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY, {}).get(
+        "by"
+    ) == "broker_reconciliation"
+
+
 def test_historical_unfilled_order_is_not_expected(isolated_db, tmp_path) -> None:
     """A cancelled/expired order from weeks ago must not pause a healthy account."""
     database, _engine, _data_dir = isolated_db
@@ -456,6 +485,50 @@ def test_broker_read_timeout_is_an_unreadable_pass(isolated_db, tmp_path, monkey
 
     assert report[ACCOUNT_ID].unreadable is True
     assert "timed out" in report[ACCOUNT_ID].findings[0].detail["error"]
+
+
+def test_pending_read_makes_the_next_pass_unreadable_without_restacking(
+    isolated_db, tmp_path, monkeypatch
+) -> None:
+    """A timed-out worker still owns the account until it actually finishes."""
+    import live_runner.broker_reconciliation as recon
+
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    monkeypatch.setattr(recon, "BROKER_READ_TIMEOUT_SECONDS", 0.02)
+
+    release = asyncio.Event()
+    calls = 0
+
+    class BlockingAdapter(FakeAdapter):
+        async def get_positions(self):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return []
+
+    deployment = _deployment()
+    adapter = BlockingAdapter(positions=[], orders=[])
+    manager = _manager(tmp_path, [])
+
+    async def run_passes():
+        first = await manager.reconcile_once([deployment], {ACCOUNT_ID: adapter})
+        second = await manager.reconcile_once([deployment], {ACCOUNT_ID: adapter})
+        assert calls == 1
+        assert "still in flight" in second[ACCOUNT_ID].findings[0].detail["error"]
+
+        release.set()
+        await asyncio.sleep(0.01)
+        third = await manager.reconcile_once([deployment], {ACCOUNT_ID: adapter})
+        return first, second, third
+
+    first, second, third = asyncio.run(run_passes())
+
+    assert first[ACCOUNT_ID].unreadable is True
+    assert "timed out" in first[ACCOUNT_ID].findings[0].detail["error"]
+    assert second[ACCOUNT_ID].unreadable is True
+    assert calls == 2
+    assert third[ACCOUNT_ID].ok is True
 
 
 def test_comparison_failure_fails_closed_as_unreadable(isolated_db, tmp_path, monkeypatch) -> None:
@@ -671,6 +744,47 @@ def test_non_terminal_or_unknown_expected_order_still_finds(
     }
 
 
+def test_order_state_lookups_share_one_phase_deadline(tmp_path, monkeypatch) -> None:
+    """Ten slow lookups must not serialize into a ten-minute stall (#303)."""
+    import live_runner.broker_reconciliation as recon
+
+    monkeypatch.setattr(recon, "ORDER_STATE_LOOKUP_PHASE_TIMEOUT_SECONDS", 0.07)
+    monkeypatch.setattr(recon, "BROKER_READ_TIMEOUT_SECONDS", 5.0)
+
+    calls: list[str] = []
+
+    class SlowLookupAdapter(FakeAdapter):
+        async def get_order_state(self, order_id: str, *, client_order_id: str = ""):
+            calls.append(order_id)
+            await asyncio.sleep(0.04)
+            return "terminal"
+
+    findings = [
+        recon.ReconciliationFinding(
+            kind="missing_working_order",
+            detail={"broker_order_id": f"ord-{index}"},
+        )
+        for index in range(3)
+    ]
+    summary: dict = {}
+    pending: set[asyncio.Task] = set()
+    manager = BrokerReconciliationManager(report_path=tmp_path / "report.json")
+
+    kept = asyncio.run(
+        manager._resolve_terminal_missing_orders(
+            ACCOUNT_ID,
+            SlowLookupAdapter(),
+            findings,
+            summary,
+            pending,
+        )
+    )
+
+    assert calls == ["ord-0", "ord-1"]
+    assert len(kept) == 2
+    assert kept[0].detail.get("broker_order_state") == "unknown"
+
+
 def test_halt_is_written_and_audited_only_on_transition(
     isolated_db, tmp_path
 ) -> None:
@@ -785,6 +899,28 @@ def test_submission_claim_gates_entries_on_the_halt(isolated_db) -> None:
     release_live_deployment_submission("tok-entry-2")
 
 
+def test_empty_entries_halt_marker_fails_closed_everywhere(isolated_db) -> None:
+    """An empty JSON marker must not split the reader and the claim gate."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    set_live_deployment_entries_halt(DEPLOYMENT_ID, {})
+
+    assert live_deployment_entries_halted(DEPLOYMENT_ID) is True
+    assert (
+        claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-empty-halt", refuse_entries_halt=True
+        )
+        is False
+    )
+    assert (
+        claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-empty-halt-exit", refuse_entries_halt=False
+        )
+        is True
+    )
+    release_live_deployment_submission("tok-empty-halt-exit")
+
+
 def test_status_restore_without_release_keeps_the_entries_halt(
     isolated_db,
 ) -> None:
@@ -870,3 +1006,35 @@ def test_explicit_tolerance_never_exceeds_adapter_precision() -> None:
     # An adapter that cannot report precision keeps honouring the setting.
     assert _position_qty_tolerance(NoPrecisionAdapter(), "AAPL", 0.5) == pytest.approx(0.5)
     assert _position_qty_tolerance(NoPrecisionAdapter(), "AAPL", None) == pytest.approx(1e-9)
+
+
+def test_account_tolerance_includes_an_unset_deployments_adapter_default() -> None:
+    """A loose explicit tolerance must not widen a deployment using defaults."""
+    from live_runner.broker_reconciliation import (
+        _position_qty_tolerance,
+        effective_reconciliation_config,
+    )
+    from live_runner.exit_signals import DEFAULT_QTY_TOLERANCE
+
+    explicit = _deployment(
+        settings={"broker_reconciliation_qty_tolerance": 0.5},
+        deployment_id=str(uuid4()),
+    )
+    unset = _deployment(settings={}, deployment_id=str(uuid4()))
+
+    config = effective_reconciliation_config([explicit, unset], ACCOUNT_ID)
+
+    assert config is not None
+    assert config.qty_tolerance == pytest.approx(0.5)
+    assert config.qty_tolerance_includes_adapter_default is True
+
+    class NoPrecisionAdapter(FakeAdapter):
+        def position_qty_tolerance(self, symbol: str) -> float:
+            raise RuntimeError("precision unavailable")
+
+    assert _position_qty_tolerance(
+        NoPrecisionAdapter(),
+        "AAPL",
+        config.qty_tolerance,
+        include_adapter_default=config.qty_tolerance_includes_adapter_default,
+    ) == pytest.approx(DEFAULT_QTY_TOLERANCE)

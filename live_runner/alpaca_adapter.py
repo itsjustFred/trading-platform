@@ -85,10 +85,12 @@ _EXTENDED_HOURS_BRACKET_MESSAGE = (
     "(signal_id={signal_id}, symbol={symbol})."
 )
 
-#: Order statuses that can never work again (#303 reconciliation lookups).
-#: Everything else - and anything unrecognised - stays "unknown", which the
-#: reconciler treats as still-expected (fail closed).
-_ALPACA_TERMINAL_ORDER_STATUSES = frozenset(
+#: Order statuses that account for an expected order without proving it is
+#: still working (#303 reconciliation lookups). "Terminal" here means "not a
+#: missing-order mismatch", not necessarily final at the broker: done_for_day,
+#: stopped and suspended orders are accounted for but can reappear, while an
+#: unrecognised status stays "unknown" and fails closed.
+_ALPACA_ACCOUNTED_ORDER_STATUSES = frozenset(
     {
         "filled",
         "canceled",
@@ -2046,7 +2048,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if order is None:
             return None
         status = _order_status(order)
-        if status in _ALPACA_TERMINAL_ORDER_STATUSES:
+        if status in _ALPACA_ACCOUNTED_ORDER_STATUSES:
             return ORDER_STATE_TERMINAL
         if status in _ALPACA_WORKING_ORDER_STATUSES:
             return ORDER_STATE_WORKING

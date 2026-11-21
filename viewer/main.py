@@ -103,6 +103,7 @@ from shared.database import (
     delete_live_deployment,
     delete_service,
     ensure_live_account,
+    entries_halt_marker_is_halted,
     get_background_task_record,
     get_latest_live_balances,
     get_live_account,
@@ -5233,6 +5234,10 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         str(deployment.status or "").strip().upper() == "STOPPED"
         and stopped_enforced_at is None
     )
+    entries_halt_marker = (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    entries_halt_details = (
+        entries_halt_marker if isinstance(entries_halt_marker, dict) else {}
+    )
     payload = {
         "id": str(deployment.id),
         "strategy_name": deployment.strategy_name,
@@ -5253,8 +5258,16 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
         # The broker-reconciliation entry halt lives in ``settings``; surface
         # it as a first-class flag so a deployment that is ACTIVE-but-not-
         # trading-entries is visible without reading the settings blob (#303).
-        "entries_halted": bool(
-            (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+        "entries_halted": entries_halt_marker_is_halted(entries_halt_marker),
+        "entries_halted_at": (
+            entries_halt_details.get("at")
+            if isinstance(entries_halt_details.get("at"), str)
+            else None
+        ),
+        "entries_halted_by": (
+            entries_halt_details.get("by")
+            if isinstance(entries_halt_details.get("by"), str)
+            else None
         ),
     }
     safe_payload = redact_value(payload)

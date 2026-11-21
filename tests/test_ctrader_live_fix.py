@@ -1489,6 +1489,59 @@ def test_list_reconciliation_orders_fails_closed_on_an_unknown_symbol_id() -> No
         _run(adapter.list_reconciliation_orders())
 
 
+def test_list_reconciliation_orders_fails_closed_on_missing_or_malformed_trade_data() -> None:
+    """A working order without readable tradeData is unreadable, not a blank view."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderType,
+        ProtoOATradeSide,
+    )
+
+    adapter = _control_adapter()
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._symbol_props = {}
+
+    missing = ProtoOAOrder()
+    missing.orderId = 601
+    missing.orderType = ProtoOAOrderType.LIMIT
+    missing.orderStatus = 1
+
+    zero_volume = ProtoOAOrder()
+    zero_volume.orderId = 602
+    zero_volume.orderType = ProtoOAOrderType.LIMIT
+    zero_volume.orderStatus = 1
+    zero_volume.tradeData.CopyFrom(_trade_data(volume=0))
+
+    bad_side = SimpleNamespace(
+        orderId=603,
+        orderType=int(ProtoOAOrderType.LIMIT),
+        orderStatus=1,
+        clientOrderId="bad-side",
+        positionId=0,
+        tradeData=SimpleNamespace(symbolId=1, volume=1000, tradeSide=999),
+    )
+
+    non_numeric = SimpleNamespace(
+        orderId=604,
+        orderType=int(ProtoOAOrderType.LIMIT),
+        orderStatus=1,
+        clientOrderId="bad-trade-data",
+        positionId=0,
+        tradeData=SimpleNamespace(symbolId="x", volume="x", tradeSide="x"),
+    )
+
+    for order in (missing, zero_volume, bad_side, non_numeric):
+        snapshot = SimpleNamespace(order=[order], position=[])
+
+        async def _reconcile_state(snapshot=snapshot):
+            return snapshot
+
+        adapter._reconcile_state = _reconcile_state
+        with pytest.raises(ValueError, match="tradeData"):
+            _run(adapter.list_reconciliation_orders())
+
+
 def test_get_order_state_reads_working_and_terminal_orders(tmp_path: Path) -> None:
     """Reconciliation lookups classify one order via ProtoOAOrderDetailsReq."""
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (

@@ -83,6 +83,10 @@ ORDER_EXPECTATION_MAX_AGE = timedelta(days=7)
 #: into hundreds of calls. Orders past the cap keep their finding (fail
 #: closed).
 MAX_ORDER_STATE_LOOKUPS = 10
+#: One deadline for the whole per-order state-lookup phase. Each lookup still
+#: has its own broker timeout, but ten slow-but-answering brokers must not
+#: serialize into a pass that takes minutes to fail closed.
+ORDER_STATE_LOOKUP_PHASE_TIMEOUT_SECONDS = 60.0
 
 
 def _track_read_task(
@@ -135,13 +139,18 @@ class BrokerReconciliationConfig:
     """Effective per-account reconciliation settings (#303).
 
     ``qty_tolerance`` of ``None`` means "ask the adapter for the instrument's
-    precision" (with the strict default when it cannot say). ``interval_seconds``
-    is the sleep between passes; the loop uses the smallest configured interval
-    across accounts so no account waits longer than it asked.
+    precision" (with the strict default when it cannot say).
+    ``qty_tolerance_includes_adapter_default`` records that at least one
+    enabled deployment left the tolerance unset, so the adapter/default value
+    participates even when another deployment configured a looser explicit
+    tolerance. ``interval_seconds`` is the sleep between passes; the loop uses
+    the smallest configured interval across accounts so no account waits
+    longer than it asked.
     """
 
     interval_seconds: int = DEFAULT_RECONCILIATION_INTERVAL_SECONDS
     qty_tolerance: float | None = None
+    qty_tolerance_includes_adapter_default: bool = False
     consecutive_mismatches: int = DEFAULT_CONSECUTIVE_MISMATCHES
     enabled: bool = True
 
@@ -289,6 +298,7 @@ def reconciliation_config_for_deployment(
     return BrokerReconciliationConfig(
         interval_seconds=interval,
         qty_tolerance=tolerance,
+        qty_tolerance_includes_adapter_default=tolerance is None,
         consecutive_mismatches=consecutive,
         enabled=_setting_bool(settings, "broker_reconciliation_enabled", default=True),
     )
@@ -378,6 +388,9 @@ def effective_reconciliation_config(
     return BrokerReconciliationConfig(
         interval_seconds=min(config.interval_seconds for config in enabled_configs),
         qty_tolerance=min(tolerances) if tolerances else None,
+        qty_tolerance_includes_adapter_default=any(
+            config.qty_tolerance is None for config in enabled_configs
+        ),
         consecutive_mismatches=min(config.consecutive_mismatches for config in enabled_configs),
         enabled=True,
     )
@@ -398,7 +411,11 @@ def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
 
 
 def _position_qty_tolerance(
-    adapter: BaseLiveAdapter, symbol: str, configured: float | None
+    adapter: BaseLiveAdapter,
+    symbol: str,
+    configured: float | None,
+    *,
+    include_adapter_default: bool = False,
 ) -> float:
     method = getattr(adapter, "position_qty_tolerance", None)
     precision: float | None = None
@@ -413,9 +430,13 @@ def _position_qty_tolerance(
     if configured is not None:
         configured_tolerance = usable_qty_tolerance(configured)
         # An explicit tolerance may tighten the check but must never loosen it
-        # past the precision the adapter can actually represent.
+        # past the precision the adapter can actually represent. When another
+        # deployment on the account left the tolerance unset, the strict
+        # default is the floor for the cases where the adapter cannot say.
         if precision is not None:
             return min(configured_tolerance, precision)
+        if include_adapter_default:
+            return min(configured_tolerance, usable_qty_tolerance(DEFAULT_QTY_TOLERANCE))
         return configured_tolerance
     if precision is not None:
         return precision
@@ -617,7 +638,12 @@ def compare_account_state(
     }
 
     def tolerance_for(symbol: str) -> float:
-        return _position_qty_tolerance(adapter, symbol, config.qty_tolerance)
+        return _position_qty_tolerance(
+            adapter,
+            symbol,
+            config.qty_tolerance,
+            include_adapter_default=config.qty_tolerance_includes_adapter_default,
+        )
 
     expected_orders, tracked_ids = _order_expectations(
         order_rows,
@@ -795,6 +821,8 @@ class BrokerReconciliationManager:
         order_id: str,
         client_order_id: str,
         pending: set[asyncio.Task[Any]],
+        *,
+        timeout: float = BROKER_READ_TIMEOUT_SECONDS,
     ) -> str | None:
         """One shielded broker order-state lookup; ``None`` on any failure."""
         primary = order_id or client_order_id
@@ -803,7 +831,7 @@ class BrokerReconciliationManager:
         try:
             state = await _shielded_read(
                 lookup(primary, client_order_id=client_order_id or primary),
-                BROKER_READ_TIMEOUT_SECONDS,
+                timeout,
                 pending,
             )
         except Exception:
@@ -839,13 +867,17 @@ class BrokerReconciliationManager:
         kept: list[ReconciliationFinding] = []
         terminal_ids: list[str] = []
         lookups = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ORDER_STATE_LOOKUP_PHASE_TIMEOUT_SECONDS
         for finding in findings:
             if finding.kind != "missing_working_order":
                 kept.append(finding)
                 continue
             detail = dict(finding.detail)
+            remaining = deadline - loop.time()
             if (
                 lookups >= MAX_ORDER_STATE_LOOKUPS
+                or remaining <= 0
                 or any(not task.done() for task in pending)
             ):
                 kept.append(finding)
@@ -854,7 +886,11 @@ class BrokerReconciliationManager:
             order_id = str(detail.get("broker_order_id") or "").strip()
             signal_id = str(detail.get("signal_id") or "").strip()
             state = await self._lookup_order_state(
-                lookup, order_id, signal_id, pending
+                lookup,
+                order_id,
+                signal_id,
+                pending,
+                timeout=min(remaining, BROKER_READ_TIMEOUT_SECONDS),
             )
             detail["broker_order_state"] = state or "unknown"
             if state == ORDER_STATE_TERMINAL:

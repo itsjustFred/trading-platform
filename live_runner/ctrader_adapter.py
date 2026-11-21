@@ -3233,25 +3233,31 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
         """Working orders with client ids and position-protection marks (#303)."""
         reconcile_res = await self._reconcile_state()
-        position_symbols: dict[int, str] = {}
-        for position in getattr(reconcile_res, "position", []) or []:
+        trade_side_enum = getattr(self, "_ProtoOATradeSide", None)
+        if trade_side_enum is None:
+            raise ValueError("cTrader trade-side enum is unavailable")
+        try:
+            buy_side = int(trade_side_enum.BUY)
+            sell_side = int(trade_side_enum.SELL)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("cTrader trade-side enum is unreadable") from exc
+
+        def _trade_int(value: Any, field: str, order_key: str) -> int:
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
             try:
-                if int(getattr(position, "positionStatus", 0) or 0) != (
-                    self._ProtoOAPositionStatus.POSITION_STATUS_OPEN
-                ):
-                    continue
-            except (TypeError, ValueError):
-                continue
-            position_id = self._positive_int(getattr(position, "positionId", 0))
-            if position_id is None:
-                continue
-            trade_data = getattr(position, "tradeData", None)
-            symbol_id = int(getattr(trade_data, "symbolId", 0) or 0) if trade_data else 0
-            if symbol_id > 0:
-                try:
-                    position_symbols[position_id] = self._symbol_name_for_id(symbol_id)
-                except Exception:
-                    position_symbols[position_id] = ""
+                number = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                ) from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            return number
 
         views: list[BrokerOrderView] = []
         for order in getattr(reconcile_res, "order", []) or []:
@@ -3268,60 +3274,55 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 continue
 
             # ProtoOAOrder carries symbol, volume and side under tradeData,
-            # not at the message root - reading the root yields an empty,
-            # undiagnosable view for every detached order.
+            # not at the message root. A missing or malformed tradeData makes
+            # the whole broker read unreadable: emitting a blank/zero view
+            # would let reconciliation treat an unpriced order as accounted
+            # for instead of failing closed.
             trade_data = getattr(order, "tradeData", None)
-            symbol_id = 0
-            volume_raw: Any = 0
-            trade_side_raw: Any = 0
-            if trade_data is not None:
-                try:
-                    symbol_id = int(getattr(trade_data, "symbolId", 0) or 0)
-                except (TypeError, ValueError):
-                    symbol_id = 0
-                volume_raw = getattr(trade_data, "volume", 0)
-                trade_side_raw = getattr(trade_data, "tradeSide", 0)
-            symbol = ""
-            if symbol_id > 0:
-                symbol = self._symbol_name_for_id(symbol_id)
-            if not symbol:
-                position_id = self._positive_int(getattr(order, "positionId", 0))
-                if position_id is not None:
-                    symbol = position_symbols.get(position_id, "")
+            if trade_data is None:
+                raise ValueError(f"cTrader working order {key} has no tradeData")
+            symbol_id = _trade_int(
+                getattr(trade_data, "symbolId", 0), "symbolId", key
+            )
+            if symbol_id <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has no tradeData.symbolId"
+                )
+            symbol = self._symbol_name_for_id(symbol_id)
 
-            qty: float | None = None
-            if symbol:
-                try:
-                    volume = _to_float(volume_raw, default=0.0)
-                    scale = self._scale_for(symbol)
-                    if volume > 0:
-                        qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
-                except Exception:
-                    qty = None
-
+            volume_raw = getattr(trade_data, "volume", 0)
+            if isinstance(volume_raw, bool):
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                )
             try:
-                trade_side = int(trade_side_raw or 0)
-            except (TypeError, ValueError):
-                trade_side = 0
-            if trade_side == int(self._ProtoOATradeSide.BUY):
+                volume = float(volume_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                ) from exc
+            if not math.isfinite(volume) or volume <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has non-positive tradeData.volume"
+                )
+
+            trade_side = _trade_int(
+                getattr(trade_data, "tradeSide", 0), "tradeSide", key
+            )
+            if trade_side == buy_side:
                 side = "buy"
-            elif trade_side == int(self._ProtoOATradeSide.SELL):
+            elif trade_side == sell_side:
                 side = "sell"
             else:
-                side = ""
+                raise ValueError(
+                    f"cTrader working order {key} has unknown tradeData.tradeSide"
+                )
 
-            if not symbol or not side:
-                logger.warning(
-                    "cTrader working order has an unreadable symbol or side; "
-                    "reconciliation can match it by id but not by symbol",
-                    extra={
-                        "data": {
-                            "account_id": self.ctid_trader_account_id,
-                            "order_id": key,
-                            "symbol_id": symbol_id,
-                            "order_type": order_type,
-                        }
-                    },
+            scale = self._scale_for(symbol)
+            qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
+            if not math.isfinite(qty) or qty <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData volume"
                 )
 
             protection = order_type == int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)

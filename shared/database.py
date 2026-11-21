@@ -4236,6 +4236,23 @@ ENTRIES_HALT_SETTINGS_KEY = "broker_reconciliation_entries_halted"
 ENTRIES_HALT_ACTOR = "broker_reconciliation"
 
 
+def entries_halt_marker_is_halted(value: object) -> bool:
+    """Whether a settings value counts as an entries halt.
+
+    This mirrors the atomic claim predicate in
+    :func:`claim_live_deployment_submission`: missing/null/false/0/"" are not
+    halted, while every other JSON value - including an empty object or array -
+    fails closed as halted.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value != ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) != 0.0
+    return True
+
+
 def set_live_deployment_entries_halt(
     deployment_id: str, detail: Mapping[str, Any] | None
 ) -> bool:
@@ -4279,7 +4296,9 @@ def live_deployment_entries_halted(deployment_id: str) -> bool:
         return True
     if deployment is None:
         return False
-    return bool((deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY))
+    return entries_halt_marker_is_halted(
+        (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    )
 
 
 def live_deployment_entries_halt_marker(deployment_id: str) -> Mapping[str, Any] | None:

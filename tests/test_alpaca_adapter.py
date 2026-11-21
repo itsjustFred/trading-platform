@@ -939,12 +939,16 @@ def test_reconciliation_orders_mark_bracket_legs_as_protection() -> None:
 
 
 def test_get_order_state_maps_broker_statuses() -> None:
-    """Reconciliation lookups: terminal statuses drop the finding, the rest
-    fail closed (#303)."""
+    """Reconciliation lookups: accounted-for statuses drop the finding, the
+    rest fail closed (#303)."""
     orders = {
         "ord-expired": SimpleNamespace(status="expired"),
         "ord-working": SimpleNamespace(status="new"),
         "ord-weird": SimpleNamespace(status="some_future_status"),
+        "ord-done-for-day": SimpleNamespace(status="done_for_day"),
+        "ord-stopped": SimpleNamespace(status="stopped"),
+        "ord-suspended": SimpleNamespace(status="suspended"),
+        "ord-replaced": SimpleNamespace(status="replaced"),
     }
 
     def get_order_by_id(order_id):
@@ -960,6 +964,13 @@ def test_get_order_state_maps_broker_statuses() -> None:
     assert asyncio.run(adapter.get_order_state("ord-working")) == "working"
     assert asyncio.run(adapter.get_order_state("ord-weird")) is None
     assert asyncio.run(adapter.get_order_state("ord-missing")) is None
+    for order_id in (
+        "ord-done-for-day",
+        "ord-stopped",
+        "ord-suspended",
+        "ord-replaced",
+    ):
+        assert asyncio.run(adapter.get_order_state(order_id)) == "terminal"
 
 
 def test_get_order_state_falls_back_to_client_order_id() -> None:
@@ -967,6 +978,8 @@ def test_get_order_state_falls_back_to_client_order_id() -> None:
         raise RuntimeError("404 not found")
 
     def get_order_by_client_id(client_order_id):
+        if client_order_id != "sig-1":
+            raise RuntimeError("404 not found")
         return SimpleNamespace(status="canceled")
 
     client = SimpleNamespace(
