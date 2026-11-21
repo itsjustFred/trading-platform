@@ -2610,8 +2610,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # leg is found under the filled parent of its own symbol, so those
             # symbols are enough. An id whose symbol could not be resolved has no
             # such bound, and the sweep reads account-wide rather than assume it.
+            #
+            # The bound is the symbols, not the count of cancels: one symbol can
+            # carry several cancels - both legs of an orphaned bracket, or two
+            # brackets on one symbol - and counting ids instead of the symbols they
+            # sit on would fall back to the account-wide re-read on exactly the
+            # ordinary bracket sweep. So only an unresolved symbol, which names no
+            # bound at all, widens the scope.
             verify_symbols = {symbol for symbol in cancelled_symbols.values() if symbol}
-            if len(verify_symbols) < len(cancelled):
+            if any(not symbol for symbol in cancelled_symbols.values()):
                 verify_symbols = None
             try:
                 remaining = await self._list_working_book(

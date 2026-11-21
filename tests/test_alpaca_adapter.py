@@ -1337,6 +1337,56 @@ def test_the_orphan_sweep_scopes_its_verification_to_the_symbols_it_cancelled() 
     assert _status_all_requests(client)[-1].symbols is None
 
 
+def test_the_orphan_sweep_scopes_its_verification_after_two_cancels_on_one_symbol() -> None:
+    """Two cancelled ids on one symbol are two cancels, not an account-wide re-read.
+
+    ``oco_siblings=False`` models a broker that leaves the sibling working when the
+    other leg is cancelled, so both legs of the one orphaned bracket are cancelled
+    here: two ids, one symbol. Counting the ids instead of the symbols they sit on
+    is what made the verification fall back to a second account-wide 20-page scan
+    on every daemon tick, and a rate limit fails the sweep closed - the retry then
+    pays the same price. The scope is bounded by the symbols the sweep touched, so
+    it stays scoped however many of their cancels it made.
+    """
+    client = _BracketPositionClient(positions=[], oco_siblings=False)
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is True
+    # Both legs are cancelled, both under the one symbol.
+    assert client.cancelled == ["tp-leg", "sl-leg"]
+    verification = _status_all_requests(client)[-1]
+    assert verification.symbols == ["AAPL"]
+
+
+def test_the_orphan_sweep_scopes_its_verification_over_two_brackets_on_one_symbol() -> None:
+    """Two orphaned brackets on one symbol are two symbols to verify on, not twenty pages.
+
+    The same id-vs-symbol miscount as the single bracket, from a second filled
+    parent on the symbol: the sweep cancelled four ids, and still has to verify
+    against the one symbol it cleared.
+    """
+    first = _BracketPositionClient(positions=[])
+    second = _BracketPositionClient(positions=[])
+    second.parent.id = "parent-2"
+    second.parent.legs[0].id = "tp-leg-2"
+    second.parent.legs[1].id = "sl-leg-2"
+    second.history = {order.id: order for order in second.parent.legs} | {
+        second.parent.id: second.parent
+    }
+    first.history.update(second.history)
+    first.parents.append(second.parent)
+    # The open listing shows the second bracket's take profit, as it does the first's.
+    first.orders.append(second.parent.legs[0])
+
+    outcome = asyncio.run(_adapter(first).cancel_orphaned_protections())
+
+    assert outcome.complete is True
+    assert sorted(first.cancelled) == ["sl-leg", "sl-leg-2", "tp-leg", "tp-leg-2"]
+    verification = _status_all_requests(first)[-1]
+    assert verification.symbols == ["AAPL"]
+
+
 def test_cancel_orphaned_protections_cancels_a_held_stop_leg() -> None:
     """A stop leg that outlives its position must not survive a stop.
 
