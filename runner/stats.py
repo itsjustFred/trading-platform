@@ -24,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 MIN_CALMAR_DRAWDOWN = 0.001
 SECONDS_PER_DAY = 24 * 60 * 60
+DAYS_PER_YEAR = 365.25
+#: Fallback annualisation density when the return series carries no readable
+#: clock. The measured density (``_return_periods_per_year``) is what
+#: ``compute_stats`` actually annualises with; this constant only survives as
+#: the default for direct helper calls and the unmeasurable-frequency case,
+#: where the ratios are declared undefined anyway (#229).
 DAILY_RETURN_PERIODS_PER_YEAR = 252
 DEFAULT_RISK_FREE_RATE = 0.0
 
@@ -136,6 +142,7 @@ def compute_stats(
     undefined_metrics: set[str] = set()
     return_frequency = "none"
     return_frequency_reason: str | None = None
+    periods_per_year: float | None = None
     duplicate_timestamp_count = _duplicate_timestamp_count(equity_curve or [])
 
     if equity_curve and len(equity_curve) > 1:
@@ -150,6 +157,11 @@ def compute_stats(
             backtest_end=backtest_end,
         )
         daily_return_series = _daily_returns_series_from_equity_curve(equity_curve)
+        periods_per_year = (
+            _return_periods_per_year(daily_return_series)
+            if daily_return_series is not None
+            else None
+        )
         if (
             daily_return_series is not None
             and not daily_return_series.empty
@@ -206,23 +218,39 @@ def compute_stats(
                 # else: unparseable timestamps; the ratios were already declared
                 # undefined above and p_value is period-free.
             elif len(returns_series) > 1:
+                # #229: annualise at the measured observation density, not a
+                # fixed 252 — the series only carries observed days.
+                annualization_periods = (
+                    periods_per_year
+                    if periods_per_year is not None
+                    else DAILY_RETURN_PERIODS_PER_YEAR
+                )
                 sharpe_ratio = _safe_qs(
                     qs.stats.sharpe,
                     returns_series,
                     rf=risk_free_rate,
-                    periods=DAILY_RETURN_PERIODS_PER_YEAR,
+                    periods=annualization_periods,
                 )
                 sortino_ratio = _safe_qs(
                     qs.stats.sortino,
                     returns_series,
                     rf=risk_free_rate,
-                    periods=DAILY_RETURN_PERIODS_PER_YEAR,
+                    periods=annualization_periods,
                 )
                 psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
         else:
             if return_frequency == "daily" and len(daily_returns) > 1:
-                sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
-                sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
+                annualization_periods = (
+                    periods_per_year
+                    if periods_per_year is not None
+                    else DAILY_RETURN_PERIODS_PER_YEAR
+                )
+                sharpe_ratio = _sharpe_manual(
+                    daily_returns, risk_free_rate, periods_per_year=annualization_periods
+                )
+                sortino_ratio = _sortino_manual(
+                    daily_returns, risk_free_rate, periods_per_year=annualization_periods
+                )
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
             elif return_frequency == UNKNOWN_RETURN_FREQUENCY:
                 pass  # ratios already declared undefined above; p_value is period-free
@@ -311,6 +339,12 @@ def compute_stats(
             "undefined_metrics": sorted(undefined_metrics),
             "equity_return_frequency": _describe_return_frequency(
                 return_frequency, return_frequency_reason
+            ),
+            # #229: the density Sharpe/Sortino were annualised with, measured
+            # off the observed-day return series (~252 business-day, ~365
+            # 24/7). None when the series has no measurable span.
+            "equity_return_periods_per_year": (
+                round(periods_per_year, 4) if periods_per_year is not None else None
             ),
             "duplicate_equity_timestamps": duplicate_timestamp_count,
             "ruined": ruined,
@@ -500,7 +534,13 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
         )
         series = pd.Series(equities, index=timestamps, dtype=float).sort_index(kind="stable")
         series = series.groupby(level=0).last()
-        daily_equity = series.resample("D").last().ffill()
+        # #229: keep only days the curve actually observed. Forward-filling
+        # every calendar day booked weekend/holiday zero-return observations,
+        # which diluted the mean and the dispersion by the same factor — the
+        # annualisation below then had to guess 252 vs 365 and understated
+        # business-day Sharpes by sqrt(252/365) ~= 0.831. Observed days only,
+        # annualised at the measured density, is correct for both conventions.
+        daily_equity = series.resample("D").last().dropna()
         previous = daily_equity.shift(1)
         # The curve's first observation is the OPENING equity of its first day,
         # and therefore the base of that day's return. Resampling to the last
@@ -527,6 +567,29 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
     if raw_returns is None or raw_returns.empty:
         return None
     return raw_returns
+
+
+def _return_periods_per_year(returns: pd.Series) -> float | None:
+    """Measured observation density: return observations per year (#229).
+
+    The daily return series only carries days the equity curve observed, so
+    its own count over its own span IS the annualisation factor's missing
+    input: ~250-260 for a Mon-Fri curve, ~365 for a 24/7 curve, ~52 for a
+    weekly one. The span is measured inclusive of both endpoint days
+    (``+ 1``), which keeps short dense series honest — three consecutive
+    daily returns measure 365.25, not 547.
+
+    Returns ``None`` when the density cannot be measured (fewer than two
+    returns, or a non-datetime index); callers then fall back to
+    ``DAILY_RETURN_PERIODS_PER_YEAR`` or declare the ratios undefined.
+    """
+    if not isinstance(returns.index, pd.DatetimeIndex) or len(returns) < 2:
+        return None
+    first, last = returns.index.min(), returns.index.max()
+    span_days = (last - first).total_seconds() / SECONDS_PER_DAY + 1.0
+    if span_days <= 0:
+        return None
+    return float(len(returns)) * DAYS_PER_YEAR / span_days
 
 
 def _attach_inferred_freq(returns: pd.Series) -> pd.Series:
@@ -751,6 +814,7 @@ def _empty_stats(risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, An
                 "p_value",
             ],
             "equity_return_frequency": "none",
+            "equity_return_periods_per_year": None,
             "duplicate_equity_timestamps": 0,
             "ruined": False,
             "ruin_time": None,
@@ -859,40 +923,41 @@ def _period_risk_free_rate(
 def _sharpe_manual(
     returns: list[float],
     risk_free_rate: float,
+    *,
+    periods_per_year: float,
 ) -> float:
     """Annualized Sharpe ratio, definitionally identical to quantstats.
 
     Excess returns are ``r - rf_period``; the dispersion is the sample
     standard deviation (ddof=1, i.e. ``pandas.Series.std()``); the ratio is
-    scaled by ``sqrt(252)``.
+    scaled by ``sqrt(periods_per_year)``.
 
-    There is deliberately no ``annualization_factor`` parameter. It used to
-    default to ``sqrt(252)`` and be passed ``1.0`` on the raw-period fallback
-    path (equity timestamps unresolvable), which silently published a
-    *per-observation* ratio under the name "Sharpe" — a daily 3.2 was reported
-    as 0.20 — while the docstring still claimed the function was definitionally
-    identical to the quantstats path. The knob only ever had one correct value,
-    so it is gone: ADR D5 requires ONE definition per metric on both code
-    paths, and a machine whose equity timestamps do not parse must publish the
-    same Sharpe as one whose timestamps do. The period assumption the fallback
-    cannot verify is reported through
-    ``extras.equity_return_frequency`` instead of being applied to the number.
+    ``periods_per_year`` is the measured observation density of the return
+    series (#229, ``_return_periods_per_year``): ~252 for a business-day
+    curve, ~365 for a 24/7 curve. It is a required keyword — the old fixed
+    sqrt(252) is exactly the convention that understated business-day
+    Sharpes by sqrt(252/365), and a silent default would let a caller
+    reintroduce it. ``DAILY_RETURN_PERIODS_PER_YEAR`` remains only as the
+    named fallback ``compute_stats`` uses when the density cannot be
+    measured (where the ratios are declared undefined anyway).
     """
     if len(returns) < 2:
         return 0.0
-    period_rf = _period_risk_free_rate(risk_free_rate)
+    period_rf = _period_risk_free_rate(risk_free_rate, periods=periods_per_year)
     excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
     variance = sum((value - mean_excess) ** 2 for value in excess) / (len(excess) - 1)
     std = math.sqrt(variance) if variance > 0 else 0
     if std == 0:
         return 0.0
-    return (mean_excess / std) * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+    return (mean_excess / std) * math.sqrt(periods_per_year)
 
 
 def _sortino_manual(
     returns: list[float],
     risk_free_rate: float,
+    *,
+    periods_per_year: float,
 ) -> float:
     """Annualized Sortino ratio, definitionally identical to quantstats.
 
@@ -904,19 +969,19 @@ def _sortino_manual(
     the excess returns, is a different ratio that does not match the
     quantstats path.
 
-    Like :func:`_sharpe_manual` there is no ``annualization_factor``: the
-    ratio is always scaled by ``sqrt(252)``.
+    Like :func:`_sharpe_manual` the annualisation is the measured
+    ``periods_per_year`` of the series, never a fixed 252.
     """
     if len(returns) < 2:
         return 0.0
-    period_rf = _period_risk_free_rate(risk_free_rate)
+    period_rf = _period_risk_free_rate(risk_free_rate, periods=periods_per_year)
     excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
     downside_variance = sum(min(value, 0.0) ** 2 for value in excess) / len(excess)
     downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0
     if downside_std == 0:
         return 0.0
-    return (mean_excess / downside_std) * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+    return (mean_excess / downside_std) * math.sqrt(periods_per_year)
 
 
 def _probabilistic_sharpe(

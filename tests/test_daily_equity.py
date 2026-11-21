@@ -1553,7 +1553,9 @@ class TestEngineCurveGapFill:
         # A real Sharpe ratio, not only a mean, moves by the same factor: the
         # gap-collapsed series is a *different strategy*, not a coarser view of
         # the same one.
-        assert _sharpe_manual(observed, 0.0) < _sharpe_manual(collapsed, 0.0)
+        assert _sharpe_manual(observed, 0.0, periods_per_year=252) < _sharpe_manual(
+            collapsed, 0.0, periods_per_year=252
+        )
 
     def test_gap_before_the_first_observation_is_filled(self):
         """The flat period before the engine's first point is a gap too."""

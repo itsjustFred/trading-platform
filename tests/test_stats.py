@@ -12,6 +12,7 @@ from runner.stats import (
     _max_drawdown_pct_manual,
     _period_risk_free_rate,
     _resolve_backtest_period_bounds,
+    _return_periods_per_year,
     _sharpe_manual,
     _sortino_manual,
     compute_stats,
@@ -69,7 +70,9 @@ class TestQuantStatsManualParity:
         series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
         expected = float(qs.sharpe(series, rf=0.04, periods=252))
 
-        assert _sharpe_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
+        assert _sharpe_manual(self.returns, 0.04, periods_per_year=252) == pytest.approx(
+            expected, rel=1e-12
+        )
 
     def test_manual_sortino_matches_quantstats_definition(self):
         import pandas as pd
@@ -79,7 +82,9 @@ class TestQuantStatsManualParity:
         series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
         expected = float(qs.sortino(series, rf=0.04, periods=252))
 
-        assert _sortino_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
+        assert _sortino_manual(self.returns, 0.04, periods_per_year=252) == pytest.approx(
+            expected, rel=1e-12
+        )
 
 
 class TestComputeStats:
@@ -496,8 +501,12 @@ class TestFirstTradingDayReturn:
         collapsed = [0.03, -0.01]
 
         assert observed == pytest.approx([-0.02, 0.03, -0.01])
-        assert _sharpe_manual(observed, 0.0) < _sharpe_manual(collapsed, 0.0)
-        assert _sortino_manual(observed, 0.0) < _sortino_manual(collapsed, 0.0)
+        assert _sharpe_manual(observed, 0.0, periods_per_year=252) < _sharpe_manual(
+            collapsed, 0.0, periods_per_year=252
+        )
+        assert _sortino_manual(observed, 0.0, periods_per_year=252) < _sortino_manual(
+            collapsed, 0.0, periods_per_year=252
+        )
 
     def test_compute_stats_reports_the_sharpe_of_all_three_days(self):
         stats = compute_stats([], equity_curve=self._curve(), risk_free_rate=0.0)
@@ -505,11 +514,150 @@ class TestFirstTradingDayReturn:
         series = _daily_returns_series_from_equity_curve(self._curve())
         assert series is not None
         assert stats["equity_return_frequency"] == "daily"
+        periods = _return_periods_per_year(series)
+        assert periods is not None
         assert stats["sharpe_ratio"] == pytest.approx(
-            _sharpe_manual([float(value) for value in series], 0.0), abs=1e-4
+            _sharpe_manual(
+                [float(value) for value in series], 0.0, periods_per_year=periods
+            ),
+            abs=1e-4,
         )
         assert stats["sortino_ratio"] == pytest.approx(
-            _sortino_manual([float(value) for value in series], 0.0), abs=1e-4
+            _sortino_manual(
+                [float(value) for value in series], 0.0, periods_per_year=periods
+            ),
+            abs=1e-4,
+        )
+
+
+class TestObservedDayAnnualisation:
+    """#229: Sharpe/Sortino annualise at the measured observation density.
+
+    Weekend/holiday zero-fill used to dilute every Mon-Fri curve and the
+    fixed sqrt(252) then understated the ratio by sqrt(252/365) ~= 0.831.
+    The maintainer decision (2026-11-21) is: use only observed days and
+    annualise with the measured observation density (~252 for business-day
+    curves, ~365 for 24/7 crypto).
+    """
+
+    @staticmethod
+    def _business_day_curve(seed: int = 1, days: int = 500):
+        import numpy as np
+        import pandas as pd
+
+        rng = np.random.default_rng(seed)
+        bdays = pd.bdate_range("2023-01-02", periods=days, tz="UTC")
+        returns = rng.normal(0.0008, 0.01, len(bdays))
+        equity = 100_000.0 * np.cumprod(1 + returns)
+        return [
+            EquityPoint(time=ts.isoformat(), equity=float(eq))
+            for ts, eq in zip(bdays, equity)
+        ], returns
+
+    def test_business_day_curve_recovers_the_business_day_sharpe(self):
+        curve, returns = self._business_day_curve()
+        mean = float(returns.mean())
+        std = float(returns.std(ddof=1))
+        expected = mean / std * math.sqrt(252)
+
+        stats = compute_stats([], equity_curve=curve)
+
+        # The pre-fix payload read ~0.831 * expected (sqrt(252/365) dilution).
+        assert stats["sharpe_ratio"] == pytest.approx(expected, rel=0.05)
+        assert stats["sortino_ratio"] is not None
+
+    def test_calendar_filled_curve_agrees_with_observed_day_curve(self):
+        """A point every calendar day (flat weekends) must give the same
+        Sharpe as the observed-days-only curve: the zero days dilute the
+        per-observation ratio exactly as much as the higher measured density
+        annualises it."""
+        import pandas as pd
+
+        observed, _returns = self._business_day_curve(seed=7, days=260)
+        by_day = {
+            pd.Timestamp(point.time).normalize(): point.equity for point in observed
+        }
+        start, end = min(by_day), max(by_day)
+        filled = []
+        last = None
+        for offset in range((end - start).days + 1):
+            day = start + timedelta(days=offset)
+            if day.normalize() in by_day:
+                last = by_day[day.normalize()]
+            filled.append(EquityPoint(time=day.isoformat(), equity=last))
+
+        observed_stats = compute_stats([], equity_curve=observed)
+        filled_stats = compute_stats([], equity_curve=filled)
+
+        assert observed_stats["sharpe_ratio"] == pytest.approx(
+            filled_stats["sharpe_ratio"], rel=0.02
+        )
+        assert observed_stats["sortino_ratio"] == pytest.approx(
+            filled_stats["sortino_ratio"], rel=0.02
+        )
+
+    def test_crypto_24_7_curve_annualises_near_365(self):
+        """A daily 24/7 curve measures ~365 observations/year, not 252."""
+        import numpy as np
+        import pandas as pd
+
+        rng = np.random.default_rng(3)
+        days = pd.date_range("2022-01-01", periods=400, freq="D", tz="UTC")
+        returns = rng.normal(0.0005, 0.02, len(days))
+        equity = 100_000.0 * np.cumprod(1 + returns)
+        curve = [
+            EquityPoint(time=ts.isoformat(), equity=float(eq))
+            for ts, eq in zip(days, equity)
+        ]
+
+        stats = compute_stats([], equity_curve=curve)
+        periods = stats["equity_return_periods_per_year"]
+
+        assert 340.0 < periods < 380.0
+        # Expected ratio from the series compute_stats itself builds: the
+        # first day's return has no prior close and is legitimately absent.
+        series = _daily_returns_series_from_equity_curve(curve)
+        assert series is not None
+        values = [float(value) for value in series]
+        mean = sum(values) / len(values)
+        std = (sum((value - mean) ** 2 for value in values) / (len(values) - 1)) ** 0.5
+        assert stats["sharpe_ratio"] == pytest.approx(
+            mean / std * math.sqrt(periods), abs=1e-4
+        )
+
+    def test_business_day_curve_reports_density_near_252(self):
+        curve, _returns = self._business_day_curve(seed=11, days=500)
+
+        stats = compute_stats([], equity_curve=curve)
+        periods = stats["equity_return_periods_per_year"]
+
+        assert 235.0 < periods < 270.0
+
+    def test_weekly_curve_annualises_at_the_measured_weekly_density(self):
+        """Sparse curves get their own density: ~52 weekly returns/year."""
+        import numpy as np
+        import pandas as pd
+
+        rng = np.random.default_rng(5)
+        weeks = pd.date_range("2020-01-06", periods=156, freq="W-MON", tz="UTC")
+        returns = rng.normal(0.002, 0.03, len(weeks))
+        equity = 100_000.0 * np.cumprod(1 + returns)
+        curve = [
+            EquityPoint(time=ts.isoformat(), equity=float(eq))
+            for ts, eq in zip(weeks, equity)
+        ]
+
+        stats = compute_stats([], equity_curve=curve)
+        periods = stats["equity_return_periods_per_year"]
+
+        assert 45.0 < periods < 60.0
+        series = _daily_returns_series_from_equity_curve(curve)
+        assert series is not None
+        values = [float(value) for value in series]
+        mean = sum(values) / len(values)
+        std = (sum((value - mean) ** 2 for value in values) / (len(values) - 1)) ** 0.5
+        assert stats["sharpe_ratio"] == pytest.approx(
+            mean / std * math.sqrt(periods), abs=1e-4
         )
 
 
@@ -661,8 +809,12 @@ class TestCalmarAndQsFallback:
 
         assert daily_stats["equity_return_frequency"] == "daily"
         assert unknown["equity_return_frequency"].startswith("unknown")
+        daily_series = _daily_returns_series_from_equity_curve(daily)
+        assert daily_series is not None
+        periods = _return_periods_per_year(daily_series)
+        assert periods is not None
         assert daily_stats["sharpe_ratio"] == pytest.approx(
-            _sharpe_manual(returns, 0.04), abs=1e-4
+            _sharpe_manual(returns, 0.04, periods_per_year=periods), abs=1e-4
         )
         assert "sharpe_ratio" not in daily_stats["undefined_metrics"]
         for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
@@ -704,36 +856,31 @@ class TestCalmarAndQsFallback:
         assert _describe_return_frequency("none", None) == "none"
         assert _describe_return_frequency(UNKNOWN_RETURN_FREQUENCY, "why") == "unknown:why"
 
-    def test_sharpe_manual_has_no_annualization_knob(self):
-        """The per-period variant is unreachable, not merely unused.
+    def test_sharpe_manual_requires_the_measured_density(self):
+        """#229: the annualisation density is a required input, not a default.
 
-        ``annualization_factor=1.0`` is what published a per-observation ratio
-        under the name "Sharpe". Leaving the parameter in place (unused, with a
-        default) invites the same call back, so its absence is the fix.
+        The old fixed sqrt(252) understated business-day Sharpes by
+        sqrt(252/365); ``periods_per_year`` must be supplied explicitly so a
+        caller cannot silently reintroduce a guessed period. The ratio still
+        has no ``annualization_factor`` knob — the per-period variant that
+        published a raw mean/std under the name "Sharpe" stays unreachable.
         """
         import inspect
 
         from runner.stats import _sortino_manual
 
         for helper in (_sharpe_manual, _sortino_manual):
-            assert "annualization_factor" not in inspect.signature(helper).parameters
+            parameters = inspect.signature(helper).parameters
+            assert "annualization_factor" not in parameters
+            assert parameters["periods_per_year"].kind is inspect.Parameter.KEYWORD_ONLY
+            assert parameters["periods_per_year"].default is inspect.Parameter.empty
 
-        # And the only ratio these helpers can produce is the annualized one:
-        # the per-period variant is off by exactly sqrt(252).
+        # The density scales the annualized ratio by exactly sqrt(density).
         returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002]
-        annualized = _sharpe_manual(returns, 0.0)
-        assert annualized == pytest.approx(
-            (sum(returns) / len(returns))
-            / (
-                sum(
-                    (value - sum(returns) / len(returns)) ** 2 for value in returns
-                )
-                / (len(returns) - 1)
-            )
-            ** 0.5
-            * math.sqrt(252)
-        )
-        assert annualized != pytest.approx(annualized / math.sqrt(252))
+        daily = _sharpe_manual(returns, 0.0, periods_per_year=365.25)
+        business = _sharpe_manual(returns, 0.0, periods_per_year=252.0)
+        assert daily == pytest.approx(business * math.sqrt(365.25 / 252.0))
+        assert daily != pytest.approx(daily / math.sqrt(365.25))
 
 
 class TestWithoutQuantStats:
@@ -768,13 +915,17 @@ class TestWithoutQuantStats:
         )
 
         assert stats["equity_return_frequency"] == "daily"
-        # The payload rounds `sharpe_ratio` to four decimals (stats.py:262),
+        series = _daily_returns_series_from_equity_curve(curve)
+        assert series is not None
+        periods = _return_periods_per_year(series)
+        assert periods is not None
+        # The payload rounds `sharpe_ratio` to four decimals (stats.py),
         # so the tolerance is that rounding floor, not the float equality.
         assert stats["sharpe_ratio"] == pytest.approx(
-            _sharpe_manual(returns, 0.04), abs=1e-4
+            _sharpe_manual(returns, 0.04, periods_per_year=periods), abs=1e-4
         )
         assert stats["sortino_ratio"] == pytest.approx(
-            _sortino_manual(returns, 0.04), abs=1e-4
+            _sortino_manual(returns, 0.04, periods_per_year=periods), abs=1e-4
         )
         assert "sharpe_ratio" not in stats["undefined_metrics"]
 
