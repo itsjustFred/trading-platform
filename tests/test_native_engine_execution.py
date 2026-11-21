@@ -522,3 +522,137 @@ def test_native_engine_ignores_non_decimal_tp_suffix_columns():
         pytest.approx(0.5),
         pytest.approx(0.5),
     ]
+
+
+# ─── #237: take_profit / tp_price are ONE level, never two ─────────────────────
+
+
+def test_native_engine_collapses_take_profit_alias_into_a_single_level():
+    """A row carrying both spellings of the plain TP must yield one level (#237).
+
+    Two "tp" levels would both read the ``tp_pct`` fraction, so a 50% exit
+    fraction closed the whole position at the take-profit level.
+    """
+    engine = _engine()
+    row = pd.Series(
+        {"take_profit": 110.0, "tp_price": 110.0, "sl_price": 90.0, "tp_pct": 0.5}
+    )
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(110.0)
+    assert take_profit_levels[0]["fraction"] == pytest.approx(0.5)
+
+
+def test_native_engine_take_profit_alias_prefers_the_canonical_column():
+    """Canonical ``take_profit`` wins over ``tp_price`` (#237).
+
+    The precedence is the one every other resolver in the repo uses
+    (``risk.live._LIVE_TP_KEYS``, the comparison/extraction helpers), so a
+    conflicting row resolves the same level here and in live.
+    """
+    engine = _engine()
+    row = pd.Series({"take_profit": 110.0, "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(110.0)
+
+
+def test_native_engine_take_profit_alias_resolution_ignores_column_order():
+    """The winner must not depend on the signal frame's column order (#237)."""
+    engine = _engine()
+    forward = pd.Series({"take_profit": 110.0, "tp_price": 115.0})
+    reversed_row = pd.Series({"tp_price": 115.0, "take_profit": 110.0})
+
+    _, forward_levels = engine._extract_levels(forward)
+    _, reversed_levels = engine._extract_levels(reversed_row)
+
+    assert forward_levels == reversed_levels
+    assert forward_levels[0]["price"] == pytest.approx(110.0)
+
+
+def test_native_engine_take_profit_alias_falls_back_to_tp_price_when_null():
+    """``tp_price`` is still honoured when ``take_profit`` is absent/null (#237)."""
+    engine = _engine()
+    row = pd.Series({"take_profit": float("nan"), "tp_price": 115.0})
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp"]
+    assert take_profit_levels[0]["price"] == pytest.approx(115.0)
+
+
+def test_native_engine_take_profit_alias_does_not_consume_a_fraction_share():
+    """The duplicated alias must not inflate the default-fraction denominator (#237).
+
+    With both columns present the split is over the real levels (plain TP plus
+    ``tp1``/``tp2``), not over a phantom fourth one.
+    """
+    engine = _engine()
+    row = pd.Series(
+        {"take_profit": 110.0, "tp_price": 115.0, "tp1": 105.0, "tp2": 120.0}
+    )
+
+    _, take_profit_levels = engine._extract_levels(row)
+
+    assert [level["name"] for level in take_profit_levels] == ["tp", "tp1", "tp2"]
+    assert [level["price"] for level in take_profit_levels] == [110.0, 105.0, 120.0]
+    assert [level["fraction"] for level in take_profit_levels] == [
+        pytest.approx(1.0 / 3.0)
+    ] * 3
+
+
+def test_native_engine_take_profit_alias_fills_one_take_profit_level():
+    """End to end (#237): the aliased pair is one take-profit level.
+
+    The strategy publishes its single take-profit level under both spellings,
+    with conflicting prices (``take_profit`` 105, ``tp_price`` 112). The
+    duplicate made the engine arm two levels, so bar 2 closed half the
+    position at 105 and the rest at 112 — two take-profit legs for one
+    intended level.
+    """
+    engine = _engine()
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2024-01-01 00:00",
+                    "2024-01-01 00:01",
+                    "2024-01-01 00:02",
+                    "2024-01-01 00:03",
+                    "2024-01-01 00:04",
+                ],
+                utc=True,
+            ),
+            "open": [100.0, 101.0, 105.0, 105.0, 105.0],
+            "high": [100.5, 101.5, 112.5, 105.5, 105.5],
+            "low": [99.5, 100.5, 104.5, 104.5, 104.5],
+            "close": [100.0, 101.0, 105.0, 105.0, 105.0],
+        }
+    )
+
+    def strategy(df, params):
+        index = df.index
+        entries = pd.Series([True, False, False, False, False], index=index)
+        exits = pd.Series([False, False, False, False, True], index=index)
+        indicators = {
+            "direction": pd.Series(["LONG", None, None, None, None], index=index, dtype=object),
+            # Both spellings of the SAME level, with conflicting prices.
+            "take_profit": pd.Series([105.0, None, None, None, None], index=index, dtype=object),
+            "tp_price": pd.Series([112.0, None, None, None, None], index=index, dtype=object),
+        }
+        return entries, exits, indicators, []
+
+    result = engine.run(frame, strategy)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    take_profit_exits = [leg for leg in trade.exits if leg.reason == "tp"]
+    assert len(take_profit_exits) == 1, (
+        "one aliased level must fill once, not once per spelling"
+    )
+    assert take_profit_exits[0].price == pytest.approx(105.0)
+    assert take_profit_exits[0].quantity == pytest.approx(trade.quantity)

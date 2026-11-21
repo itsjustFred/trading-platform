@@ -186,12 +186,29 @@ class TradeEngine:
 
         tp_levels: list[dict[str, Any]] = []
         tp_candidates: list[tuple[str, float]] = []
+        # "take_profit" and "tp_price" are two spellings of the SAME plain
+        # take-profit level (#237), so a row carrying both must produce a
+        # single "tp" candidate. The canonical spelling wins — the alias order
+        # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
+        # comparison/extraction helpers) — and the winner must not depend on
+        # the signal frame's column order. Appending one candidate per column
+        # made two levels that share the "tp_pct" fraction, so a 50% exit
+        # fraction closed the whole position at the take-profit level.
+        plain_tp: tuple[int, float] | None = None
         for key in row.index:
             lower = str(key).lower()
-            if lower in {"take_profit", "tp_price"} and pd.notna(row.get(key)):
-                tp_candidates.append(("tp", float(row.get(key))))
-            elif lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
+            if lower in {"take_profit", "tp_price"}:
+                alias_value = row.get(key)
+                if pd.isna(alias_value):
+                    continue
+                rank = 0 if lower == "take_profit" else 1
+                if plain_tp is None or rank < plain_tp[0]:
+                    plain_tp = (rank, float(alias_value))
+                continue
+            if lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
                 tp_candidates.append((lower, float(row.get(key))))
+        if plain_tp is not None:
+            tp_candidates.append(("tp", plain_tp[1]))
 
         # Plain "tp" (take_profit / tp_price) first, then numbered levels by
         # their numeric suffix so tp10 follows tp9, not tp1.
