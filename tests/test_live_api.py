@@ -655,6 +655,166 @@ def test_arming_a_deployment_with_an_unresolved_conflict_is_refused(
     assert database_module.get_live_deployment(deployment_id).status == "ACTIVE"
 
 
+def test_resolving_on_a_missing_deployment_is_a_404_and_is_audited(
+    isolated_db_sandbox,
+) -> None:
+    """The audited control must fail loudly, not 500, for a deployment that is gone."""
+    import uuid as _uuid
+
+    from fastapi.testclient import TestClient
+
+    import viewer.main as viewer_main_module
+
+    missing = str(_uuid.uuid4())
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        f"/api/live/deployments/{missing}/broker-order-conflicts/resolve",
+        json={
+            "confirmed_deployment_id": missing,
+            "reason": "closed at the broker",
+        },
+    )
+
+    assert response.status_code == 404, response.text
+    from shared.database import list_live_control_audit
+
+    entries = [
+        entry
+        for entry in list_live_control_audit()
+        if entry.get("target_id") == missing and not entry.get("succeeded")
+    ]
+    assert entries, "a refused resolve has to name who tried and what they resolved"
+    assert "not found" in (entries[0].get("detail") or {}).get("reason", "")
+
+
+def test_resolving_reports_a_submission_lease_taken_before_the_call(
+    monkeypatch,
+) -> None:
+    """A lease the endpoint's own snapshot saw is still accounted for.
+
+    The endpoint inventories the submission leases *before* it clears anything, so a lease
+    that expires and is reaped between that snapshot and the drain's first poll is still
+    part of the ledger. Without the inventory the first poll finds nothing and reports a
+    clean resolution for a submission nobody observed - the outcome the operator then
+    resumes on.
+    """
+    from datetime import timedelta
+
+    import viewer.main as viewer_main_module
+    from shared.database import LiveDeploymentSubmissionClaim
+
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda _id: LiveDeploymentConfig(
+            id=deployment_id,
+            strategy_name="live_strategy",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "resolve_broker_order_conflicts", lambda _id: []
+    )
+
+    # A lease that is already past its TTL and was never released: its order's outcome
+    # is unknown, so the drain cannot call it clean.
+    expired = LiveDeploymentSubmissionClaim(
+        token="tok-before-the-call",
+        expires_at=viewer_main_module.utcnow_naive() - timedelta(seconds=1),
+        expired=True,
+    )
+    reads: list[str] = []
+
+    def _inventory(_deployment_id):
+        reads.append("read")
+        # The first read is the endpoint's own snapshot; by the drain's first poll the
+        # lease has been reaped by a claim attempt.
+        return [expired] if len(reads) == 1 else []
+
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", _inventory
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        f"/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        json={
+            "confirmed_deployment_id": deployment_id,
+            "reason": "closed at the broker",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["submission_drain_complete"] is False
+    assert payload["submission_drain_outcome"] == "INDETERMINATE"
+    assert "Verify the broker" in payload["warning"]
+    # The inventory was asked for before anything was cleared.
+    assert len(reads) >= 2
+
+
+def test_resolving_keeps_both_warnings_when_nothing_resolved_and_a_drain_did_not(
+    monkeypatch,
+) -> None:
+    """Two different facts about one call; neither overwrites the other.
+
+    The "verify the broker" warning is the one an operator must not lose, and it used to
+    be replaced by "no recorded conflict" exactly when the drain was not clean.
+    """
+    import viewer.main as viewer_main_module
+
+    deployment_id = "55555555-5555-5555-5555-555555555555"
+    monkeypatch.setattr(
+        viewer_main_module,
+        "get_live_deployment",
+        lambda _id: LiveDeploymentConfig(
+            id=deployment_id,
+            strategy_name="live_strategy",
+            account_id="acct-1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+        ),
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployment_submission_claims", lambda _id: []
+    )
+
+    async def _indeterminate_drain(_deployment_id, **_kwargs):
+        from viewer.main import LiveSubmissionDrainOutcome, LiveSubmissionDrainResult
+
+        return LiveSubmissionDrainResult(
+            outcome=LiveSubmissionDrainOutcome.INDETERMINATE,
+            in_flight=0,
+            expired_unreleased=1,
+        )
+
+    monkeypatch.setattr(
+        viewer_main_module, "_drain_live_deployment_submissions", _indeterminate_drain
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "resolve_broker_order_conflicts", lambda _id: []
+    )
+
+    client = TestClient(viewer_main_module.app)
+    response = client.post(
+        f"/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        json={
+            "confirmed_deployment_id": deployment_id,
+            "reason": "closed at the broker",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    warning = response.json()["warning"]
+    assert "Verify the broker" in warning
+    assert "no recorded broker order id conflict" in warning
+
+
 def test_an_unread_conflict_ledger_is_not_reported_as_confirmed_empty(monkeypatch) -> None:
     """A create response never reads the ledger, so it must not answer for it."""
     import viewer.main as viewer_main_module

@@ -14154,15 +14154,21 @@ async def resolve_live_deployment_broker_order_conflicts_endpoint(
         "in_flight_submissions": drain.in_flight,
         "expired_unreleased_submissions": drain.expired_unreleased,
     }
+    # Both warnings are kept, in one message: the drain outcome and the resolution are
+    # different facts about the same call, and the second used to overwrite the first -
+    # dropping "verify the broker" for exactly the operator who most needs it.
+    warnings: list[str] = []
     if not drain.complete:
-        response["warning"] = (
+        warnings.append(
             "The conflicts are resolved, but submissions were still unaccounted "
             "for at the broker. Verify the broker before resuming the deployment."
         )
     if not resolved:
-        response["warning"] = (
+        warnings.append(
             "This deployment had no recorded broker order id conflict."
         )
+    if warnings:
+        response["warning"] = " ".join(warnings)
     return response
 
 
