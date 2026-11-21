@@ -49,6 +49,34 @@ parent Cleanup 16 record.
   data, exits happen on the scheduled signal exit and the levels are recorded
   in `trade.meta` (`sl_price`, `tp_price`).
 
+### Slippage (fill-price cost model, #130)
+
+Slippage is applied to the **fill price** in the adverse direction — buys
+fill higher, sells fill lower — never as a separate cost line, so `pnl`,
+`net_pnl`, the equity curve and sizing equity all carry the same cost.
+Scope per the maintainer decision: the **native** engine and **signal
+replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
+and pynecore do not model slippage and record that fact in
+`meta.data["slippage"]` when run through the CLI).
+
+- `runner.slippage.resolve_slippage_model` resolves one model per run (per
+  symbol where asset classes differ) from engine params:
+  `slippage="none"|"zero"` is the explicit parity opt-out that reproduces
+  pre-#130 gross fills; `"spread"` uses the bar's bid/ask columns
+  (MT5-tester-like) with a fixed-bps fallback; `"bps"`/`slippage_bps` is a
+  fixed-bps model; absent config picks the per-asset-class default
+  (FX/CFD-like classes → bar spread, equities → 5 bps, crypto → 10 bps,
+  all overridable via `slippage_defaults`/`slippage_default_bps`).
+- Instruments are classified from the `ohlcv/{source}/{asset_class}/…`
+  parquet path; runs that cannot be classified record `model: "none"`
+  with `reason: "unclassified_asset_class"`.
+- Every run records the resolved model per symbol in
+  `meta.data["slippage"]["models"]` (plus the data's `price_basis`), so a
+  reader never has to guess which cost model produced the numbers.
+- When a strategy already prices the spread through `spread_price_col` or
+  `ask_ohlc`, the auto model degrades to fixed bps so the quoted spread is
+  not charged twice.
+
 ## 2. End-date boundary
 
 Decision Record (Cleanup 16-A): **a date-only end boundary is inclusive of the

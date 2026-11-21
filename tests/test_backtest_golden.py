@@ -493,6 +493,11 @@ def _run_native_cli(tmp_path: Path, *, timeout: float = CLI_TIMEOUT_SECONDS) -> 
             "0.0005",
             "--fee-flat-per-trade",
             "1.0",
+            # #130: the golden pins gross-fill economics — declare the
+            # explicit parity opt-out so per-asset-class slippage defaults
+            # cannot move the fixture.
+            "--slippage",
+            "none",
             "--intrabar-resolution",
             "main_timeframe",
             "--data-dir",

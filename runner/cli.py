@@ -213,8 +213,12 @@ def cmd_run(args):
         raise ValueError("--params must decode to a JSON object")
     resolved_parameters = resolve_strategy_parameters(args.strategy, parameter_overrides)
     # #84: explicit fee declaration rides into engine params (hard error
-    # downstream when absent).
-    resolved_parameters = {**resolved_parameters, **_fee_params_from_args(args)}
+    # downstream when absent). #130: slippage model params ride the same way.
+    resolved_parameters = {
+        **resolved_parameters,
+        **_fee_params_from_args(args),
+        **_slippage_params_from_args(args),
+    }
 
     normalized_timeframe = normalize_timeframe(args.timeframe)
 
@@ -320,6 +324,20 @@ def cmd_run(args):
         "pnl": "gross",
         "net_pnl": "net_after_fees",
     }
+    # #130: every run records the slippage model used. The native and
+    # signal-replay adapters record their per-symbol models themselves;
+    # engines outside the #130 scope (vectorbt/pynecore, LEAN import-only
+    # per #318) get an explicit "not modeled" record, never silence.
+    result.meta.data.setdefault(
+        "slippage",
+        {
+            "models": {},
+            "note": (
+                f"engine '{engine.name}' does not apply a slippage model "
+                "(#130 scope: native + signal replay)"
+            ),
+        },
+    )
     result.meta.data["risk_config"] = {
         "risk_per_trade_pct": config.risk_per_trade_pct,
         "max_position_exposure_pct": config.max_position_exposure_pct,
@@ -393,7 +411,11 @@ def cmd_walkforward(args):
     """Run walk-forward validation for a strategy."""
     symbols = parse_csv_list(args.symbols)
     params = parse_params(args.params)
-    params = {**params, **_fee_params_from_args(args)}
+    params = {
+        **params,
+        **_fee_params_from_args(args),
+        **_slippage_params_from_args(args),
+    }
     result = run_walkforward(
         strategy=args.strategy,
         engine=get_engine(args.engine),
@@ -433,7 +455,11 @@ def cmd_grid(args):
         max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
-        params={**parse_params(args.params), **_fee_params_from_args(args)},
+        params={
+            **parse_params(args.params),
+            **_fee_params_from_args(args),
+            **_slippage_params_from_args(args),
+        },
         output_dir=args.output_dir,
         data_dir=args.data_dir or "",
         max_workers=args.max_workers,
@@ -462,7 +488,11 @@ def cmd_matrix(args):
         max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
-        params={**parse_params(args.params), **_fee_params_from_args(args)},
+        params={
+            **parse_params(args.params),
+            **_fee_params_from_args(args),
+            **_slippage_params_from_args(args),
+        },
         output_dir=args.output_dir,
         data_dir=args.data_dir or "",
         max_workers=args.max_workers,
@@ -559,6 +589,48 @@ def _fee_params_from_args(args) -> dict:
     return params
 
 
+def _add_slippage_flags(parser: argparse.ArgumentParser) -> None:
+    """Slippage declaration flags (#130: fill-price model, always recorded)."""
+    parser.add_argument(
+        "--slippage",
+        choices=["none", "zero", "spread", "bps", "auto"],
+        default=None,
+        help=(
+            "Slippage model applied to fill prices: 'none'/'zero' is the "
+            "explicit parity opt-out, 'spread' uses bar bid/ask data with a "
+            "bps fallback, 'bps' is a fixed-bps model (needs "
+            "--slippage-bps), 'auto' picks per asset class. Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=None,
+        help="Fixed slippage in basis points per fill side (e.g. 5 = 0.05%%)",
+    )
+    parser.add_argument(
+        "--slippage-default-bps",
+        type=float,
+        default=None,
+        help="Fallback bps for the spread model when a bar has no bid/ask data",
+    )
+
+
+def _slippage_params_from_args(args) -> dict:
+    """Merge CLI slippage flags into engine params (#130)."""
+    params: dict = {}
+    slippage = getattr(args, "slippage", None)
+    if slippage is not None:
+        params["slippage"] = str(slippage)
+    if getattr(args, "slippage_bps", None) is not None:
+        params["slippage_bps"] = float(args.slippage_bps)
+    if getattr(args, "slippage_default_bps", None) is not None:
+        params["slippage_default_bps"] = float(args.slippage_default_bps)
+    if params.get("slippage") in {"none", "zero"} and "slippage_bps" in params:
+        raise ValueError("--slippage none/zero conflicts with --slippage-bps")
+    return params
+
+
 class _SizingAliasAction(argparse.Action):
     """Store the sizing value; warn when the deprecated spelling was used.
 
@@ -613,6 +685,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(run_p, risk_default=None)
     _add_fee_flags(run_p)
+    _add_slippage_flags(run_p)
     run_p.add_argument(
         "--intrabar-resolution",
         default="open_close",
@@ -709,6 +782,7 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p.add_argument("--output-dir", default="", help="Override output directory")
     _add_sizing_flags(wf_p, risk_default=None)
     _add_fee_flags(wf_p)
+    _add_slippage_flags(wf_p)
     wf_p.add_argument("--intrabar-resolution", default="open_close")
     wf_p.add_argument("--params", default="", help="Strategy params JSON")
     wf_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
@@ -733,6 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
     grid_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(grid_p, risk_default=0.01)
     _add_fee_flags(grid_p)
+    _add_slippage_flags(grid_p)
     grid_p.add_argument("--intrabar-resolution", default="open_close")
     grid_p.add_argument("--params", default="", help='Strategy params JSON')
     grid_p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -789,6 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(matrix_p, risk_default=0.01)
     _add_fee_flags(matrix_p)
+    _add_slippage_flags(matrix_p)
     matrix_p.add_argument("--intrabar-resolution", default="open_close")
     matrix_p.add_argument("--params", default="", help='Strategy params JSON')
     matrix_p.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)
