@@ -1193,6 +1193,46 @@ def _indicator_meta_key(name: str) -> str:
     return name
 
 
+#: Protective-level aliases in canonical-first order (#237). A strategy that
+#: publishes both spellings of one level must resolve identically in every
+#: engine, so the winner can never depend on the indicators dict's insertion
+#: order. The order is the one ``risk.live._LIVE_SL_KEYS``/``_LIVE_TP_KEYS``
+#: and the native ``TradeEngine._extract_levels`` use.
+_LEVEL_ALIASES: dict[str, tuple[str, ...]] = {
+    "sizing_stop": ("sizing_stop", "sizing_sl_price", "sizing_sl"),
+    "stop_loss": ("stop_loss", "sl_price"),
+    "take_profit": ("take_profit", "tp_price"),
+}
+
+#: Alias spellings that share one ``trade.meta`` key with their canonical
+#: spelling. When a strategy publishes both, only the canonical one records
+#: itself, so the reported level never follows the dict's insertion order.
+_SHADOWED_ALIASES: dict[str, str] = {
+    "sl_price": "stop_loss",
+    "tp_price": "take_profit",
+}
+
+
+def _find_alias_indicator_series(
+    indicators: IndicatorMap, desired_when: str, alias: str
+) -> pd.Series | None:
+    """One spelling of a level alias, ``None`` when the strategy emits none."""
+    for name, (series, explicit_when) in indicators.items():
+        if _infer_indicator_when(name, explicit_when) != desired_when:
+            continue
+        if name.lower() == alias:
+            return series
+    return None
+
+
+def _alias_is_shadowed(indicators: IndicatorMap, name: str, when: str) -> bool:
+    """True when the canonical spelling of ``name``'s level is also published."""
+    canonical = _SHADOWED_ALIASES.get(name.lower())
+    if canonical is None:
+        return False
+    return _find_alias_indicator_series(indicators, when, canonical) is not None
+
+
 def _find_indicator_series(
     signals: pd.DataFrame, indicators: IndicatorMap, *, kind: str
 ) -> pd.Series | None:
@@ -1214,19 +1254,22 @@ def _find_indicator_series(
                 return signals[column]
 
     desired_when = "exit" if kind in {"exit_price", "exit_reason"} else "entry"
+    aliases = _LEVEL_ALIASES.get(kind)
+    if aliases is not None:
+        # Two passes, canonical spelling first: the alias resolution must not
+        # depend on the order the strategy emitted the spellings in.
+        for alias in aliases:
+            series = _find_alias_indicator_series(indicators, desired_when, alias)
+            if series is not None:
+                return series
+        return None
     for name, (series, explicit_when) in indicators.items():
         when = _infer_indicator_when(name, explicit_when)
         if when != desired_when:
             continue
 
         lowered = name.lower()
-        if kind == "sizing_stop" and lowered in {"sizing_stop", "sizing_sl_price", "sizing_sl"}:
-            return series
         if kind == "direction" and lowered == "direction":
-            return series
-        if kind == "stop_loss" and lowered in {"stop_loss", "sl_price"}:
-            return series
-        if kind == "take_profit" and lowered in {"take_profit", "tp_price"}:
             return series
         if kind == "exit_price" and lowered == "exit_price":
             return series
@@ -1660,6 +1703,10 @@ def _extract_trade_meta(
         meta_key = _indicator_meta_key(name)
         serialized = _serialize_meta_value(series.iloc[sample_idx])
         if serialized is None:
+            continue
+        if _alias_is_shadowed(indicators, name, when):
+            # Both spellings of one level are published: the alias must not
+            # overwrite the level the engine actually resolved (#237).
             continue
         trade_meta[meta_key] = serialized
         if meta_key == "sl_price":
