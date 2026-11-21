@@ -239,9 +239,13 @@ def exit_level_disposition(
     "unreachable" and callers fall back to the market fill. A strategy
     whose ``exit_price`` is really a *stop* (e.g. a sell stop above the
     whole bar after a gap down) should use the ``stop_loss`` legs
-    instead — stops fill at their level or the open on a gap-through,
-    which is the behaviour a ``level`` exit deliberately does not
-    reproduce.
+    instead. Protective stop/TP legs fill AT their level whenever the
+    bar trades through them — including a gap-through bar, which still
+    fills at the level today (gap → open for protective exits is the
+    still-open #208 work, not current behaviour). That per-bar
+    trigger/fill-at-level behaviour is what a ``level`` exit — which
+    only exists on its signal bar and deliberately does not reproduce
+    it — cannot express.
     ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` — an unknown
     direction would invert the classification, so it raises ``ValueError``
     like :func:`resolve_same_bar_exit`.

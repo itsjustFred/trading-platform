@@ -39,7 +39,10 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close. When a
+- Fill price: the protective **level itself**, not the bar close — and
+  that holds even when the bar gaps through the level: protective exits
+  are not re-priced to the open on a gap today (gap → open for
+  protective exits is the still-open #208 work). When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -98,8 +101,10 @@ or `level` (case-insensitive):
   warns once and flags `meta["exit_level_unreachable"]`. On the
   *marketable* side — below the low for a LONG exit, above the high for a
   SHORT exit — the resting order was marketable at the open, so under the
-  gap-through-level convention (the same rule as gap-through stops) it
-  fills at the bar's **open** and flags `meta["exit_level_gapped"]`.
+  gap-through-level convention it fills at the bar's **open** and flags
+  `meta["exit_level_gapped"]`. (This is `level`-exit semantics only:
+  protective stop/TP legs fill at their level even on a gap-through —
+  gap → open for them lands with #208.)
   Direction-specific, like every open fill: a LONG exit sells the bid at
   the raw open, while a SHORT exit buys the ask at `open + spread` when a
   spread is configured. With explicit `ask_high`/`ask_low` columns but no
@@ -109,8 +114,10 @@ or `level` (case-insensitive):
   untraded-side level is "unreachable" and falls back to the market fill.
   A strategy whose `exit_price` is really a *stop* (e.g. a sell stop
   above the whole bar after a gap down) should express it through the
-  `stop_loss` legs instead — a stop fills at its level or the open on a
-  gap-through, which is the behaviour `level` deliberately does not
+  `stop_loss` legs instead — a stop leg fills at its level whenever the
+  bar trades through it, including on a gap-through (gap → open for
+  protective exits lands with #208), which is the per-bar
+  trigger/fill-at-level behaviour `level` deliberately does not
   reproduce. This applies to every level fill, explicit `level`
   and vectorbt's legacy implicit `exit_price` alike.
 - absent or unrecognized — the **legacy fallback** applies per engine:
