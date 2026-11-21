@@ -98,6 +98,7 @@ run_one "gate harness self-check" \
 GUARDED_SCRIPTS=(
     scripts/adaptive_harvester.py
     scripts/backtest_to_validation_ref.py
+    scripts/db_backup.py
     scripts/dedupe_executions.py
     scripts/overnight_strategy_discovery.py
     scripts/recalculate_backtest_stats.py
