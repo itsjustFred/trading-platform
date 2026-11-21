@@ -14,7 +14,9 @@ only once the arguments say "start".
 
 Exit codes: 0 (clean exit, or ``--help``), 1 (anything the daemon itself raised), 2 (argparse usage
 error), 3 (the single-instance lock is held by another daemon), 4 (the daemon's worker threads are
-still running and may still be writing, so its outcome is unknown).
+still running and may still be writing, so its outcome is unknown), 130 (the conventional SIGINT
+code, when a Ctrl-C reaches the CLI - the process leaves through the same immediate exit so the
+interpreter's unbounded thread-join stays out of the path).
 """
 
 from __future__ import annotations
