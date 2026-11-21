@@ -602,7 +602,13 @@ def test_release_twisted_reactor_threads_warns_when_handler_missing(monkeypatch,
     monkeypatch.setattr(preflight.logger, "propagate", True)
     with caplog.at_level("WARNING"):
         preflight._release_twisted_reactor_threads()
-    assert any("thread pool" in r.getMessage() for r in caplog.records)
+    # The warning belongs to the preflight log: the helper lives in
+    # ``live_runner.shutdown`` now, but it must not move an operator-visible
+    # preflight warning into the daemon's shutdown log.
+    assert any(
+        r.name == "trading.live-runner" and "thread pool" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_connectivity_error_text_redacts_credential_values(tmp_path: Path, monkeypatch) -> None:

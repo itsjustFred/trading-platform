@@ -5,7 +5,6 @@ import asyncio
 import contextlib
 import json
 import re
-import sys
 import traceback
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -21,6 +20,7 @@ from live_runner.config_parser import parse_live_deployments_config
 from live_runner.credential_env import overlay_process_env, read_accounts_env_file
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from live_runner.promotion import enforce_promotion_gate, is_real_money
+from live_runner.shutdown import release_twisted_reactor_threads
 from runner.promotion_gate import StrategyNotPromotedError
 from shared.logging import get_logger, route_console_logs_to_stderr
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
@@ -138,33 +138,13 @@ def _resolve_ctrader_credentials(
 
 
 def _release_twisted_reactor_threads() -> None:
-    """Stop the Twisted reactor's thread pool so the process can exit.
+    """Release the reactor pool, warning through the preflight logger.
 
-    The cTrader adapter starts the asyncio-backed Twisted reactor with
-    ``startRunning`` and never stops it (the daemon owns it for the process
-    lifetime). Twisted resolves the broker host name through its reactor thread
-    pool, whose worker threads are not daemon threads and are only stopped by
-    the reactor's shutdown event. Without this, a preflight that connected to
-    cTrader printed its result and then hung forever in interpreter shutdown.
+    The shared helper lives in ``live_runner.shutdown`` (the daemon uses it
+    too), but its warning is a preflight warning: passing this module's logger
+    keeps it in the ``live-runner`` log where an operator looks for it.
     """
-    # ``installReactor`` stores the reactor instance under this key, so membership
-    # means "a reactor was installed"; importing it here cannot install a new one.
-    if "twisted.internet.reactor" not in sys.modules:
-        return
-    from twisted.internet import reactor
-
-    if getattr(reactor, "threadpool", None) is None:
-        return
-    stop_thread_pool = getattr(reactor, "_stopThreadPool", None)
-    if callable(stop_thread_pool):
-        # The reactor's own shutdown-trigger handler: removes its triggers and
-        # joins the workers. Shutdown never fires here, so it is called directly.
-        stop_thread_pool()
-    else:
-        logger.warning(
-            "Twisted reactor has a thread pool but no _stopThreadPool handler; "
-            "the process may hang at exit. The Twisted private API likely changed."
-        )
+    release_twisted_reactor_threads(log=logger)
 
 
 @contextlib.contextmanager
