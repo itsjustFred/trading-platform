@@ -388,7 +388,10 @@ def install_alert_sink(
     # Loggers created through shared.logging.get_logger keep LOG_LEVEL on their
     # file/console handlers, so lowering the logger itself does not change what
     # is written to disk or stdout — it only lets `data.alert` markers below
-    # LOG_LEVEL reach this handler. Foreign `trading.*` loggers keep their own
+    # LOG_LEVEL reach this handler. Side effect: `logger.debug(...)` in hot
+    # loops now builds a LogRecord and walks the handlers (no isEnabledFor
+    # guards exist in the repo); output is unchanged, only the record
+    # construction cost is added. Foreign `trading.*` loggers keep their own
     # level; ERROR records still alert through them.
     from shared.logging import managed_service_loggers
 

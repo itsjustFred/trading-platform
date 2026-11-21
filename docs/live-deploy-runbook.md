@@ -16,7 +16,8 @@ Status: credential-gated as of 2026-07-13.
 
 The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
 paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, installed
-by `run_daemon()` at daemon start (importing `live_runner.daemon` alone has no side effects).
+by `run_daemon()` at daemon start; importing `live_runner.daemon` does not install the alert sink
+(logging and Sentry setup still happen at import).
 
 Set the variables in the environment the daemon runs with — e.g. exported before start or in the
 sourced `.accounts.env` / a systemd `EnvironmentFile`.
@@ -40,7 +41,10 @@ events should page — and whether WARNING-level refusals should join them — i
 decision tracked on the issue; the handler makes that a filter change, not a call-site change.
 
 Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
-webhook drops and counts alerts; it can never block or raise into a trading path. Payloads are
+webhook drops and counts alerts; it can never block or raise into a trading path. A failed send
+(e.g. a Discord 429 or 5xx) is counted and logged on the `alerts` logger, not retried — a single
+lost alert is accepted for v1 rather than risking a retry storm against a struggling webhook.
+Payloads are
 redacted with the same rules as the JSON log formatter before they leave the process. Only the
 live daemon installs the sink today; other entry points are unaffected.
 
