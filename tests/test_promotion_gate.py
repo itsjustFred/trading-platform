@@ -608,10 +608,19 @@ def test_only_a_literal_false_skips_the_gate(strategies_dir: Path, flag: Any) ->
 
 
 def test_demo_account_passes_without_promotion(strategies_dir: Path) -> None:
-    enforce_promotion_gate(strategy_deployment(), real_money=False)
+    assert enforce_promotion_gate(strategy_deployment(), real_money=False) is None
     # Even a deployment that could not be resolved at all: paper/demo may run
     # experimental code.
-    enforce_promotion_gate(strategy_deployment("does_not_exist"), real_money=False)
+    assert (
+        enforce_promotion_gate(strategy_deployment("does_not_exist"), real_money=False)
+        is None
+    )
+    # The skip is the demo flag's doing, not a gate that never looks: the same
+    # deployments are refused the moment they count as real money.
+    with pytest.raises(StrategyNotPromotedError):
+        enforce_promotion_gate(strategy_deployment(), real_money=True)
+    with pytest.raises(StrategyNotPromotedError):
+        enforce_promotion_gate(strategy_deployment("does_not_exist"), real_money=True)
 
 
 def test_real_money_refuses_a_non_promoted_strategy(strategies_dir: Path) -> None:
@@ -623,13 +632,20 @@ def test_real_money_refuses_a_non_promoted_strategy(strategies_dir: Path) -> Non
 
 def test_real_money_accepts_a_promoted_strategy(strategies_dir: Path) -> None:
     promote_strategy_file(strategies_dir)
-    enforce_promotion_gate(strategy_deployment(), real_money=True)
+    assert enforce_promotion_gate(strategy_deployment(), real_money=True) is None
+    # The accept is a decision, not a skipped check: the ledger really does
+    # report this file production for these parameters.
+    target = deployment_promotion_target(strategy_deployment())
+    status = promotion_status(
+        target.path, target.parameters, kind=target.kind, root=target.root
+    )
+    assert status.is_production
 
 
 def test_deployment_settings_are_not_bound(strategies_dir: Path) -> None:
     promote_strategy_file(strategies_dir)
     deployment = strategy_deployment(settings={"risk_per_trade_pct": 0.5, "max_positions": 9})
-    enforce_promotion_gate(deployment, real_money=True)
+    assert enforce_promotion_gate(deployment, real_money=True) is None
 
 
 def test_per_deployment_strategy_parameters_are_refused_on_real_money(
