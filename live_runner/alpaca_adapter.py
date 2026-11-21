@@ -916,6 +916,45 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             registered += 1
         return registered
 
+    async def _fetch_parent_order_with_legs(self, signal_id: str) -> Any:
+        """Fetch the parent order for a signal, with its bracket legs nested in it.
+
+        ``get_order_by_client_id`` takes no ``nested`` argument in alpaca-py 0.44.0, and the
+        runbook records that a bracket's legs are only reported back nested in the parent
+        (``docs/live-deploy-runbook.md``): fetching by client id alone therefore returns no
+        legs, and the leg-order-id -> signal map this adapter depends on would never be
+        re-learned after a restart - the #144 defect itself, since the stream drops a leg
+        fill whose client order id names no signal. The persisted broker order id is used
+        with ``GetOrderByIdRequest(nested=True)`` first; only a signal submitted before that
+        id was persisted falls back to the client-id fetch, and an alpaca-py without the
+        nested filter degrades to the flat ``get_order_by_id``.
+        """
+        stored_order_id = await asyncio.to_thread(get_live_signal_broker_order_id, signal_id)
+        if stored_order_id:
+            try:
+                from alpaca.trading.requests import GetOrderByIdRequest
+            except ModuleNotFoundError:
+                # An alpaca-py without the nested filter request: the flat fetch below
+                # still carries the parent's own fill.
+                GetOrderByIdRequest = None  # type: ignore[assignment]
+            if GetOrderByIdRequest is not None:
+                try:
+                    return await asyncio.to_thread(
+                        self._trading_client.get_order_by_id,
+                        stored_order_id,
+                        GetOrderByIdRequest(nested=True),
+                    )
+                except TypeError:
+                    # An alpaca-py whose get_order_by_id takes no filter: ask for the
+                    # flat order instead.
+                    pass
+            return await asyncio.to_thread(
+                self._trading_client.get_order_by_id, stored_order_id
+            )
+        return await asyncio.to_thread(
+            self._trading_client.get_order_by_client_id, signal_id
+        )
+
     def _parent_signal_id_for_broker_order(self, broker_order_id: str | None) -> str | None:
         """The signal whose bracket leg this broker order id names, or ``None``."""
         if not broker_order_id:
@@ -1022,9 +1061,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         off it: both are recovered from one fetch of the parent order.
         """
         try:
-            order = await asyncio.to_thread(
-                self._trading_client.get_order_by_client_id, signal_id
-            )
+            order = await self._fetch_parent_order_with_legs(signal_id)
         except Exception:
             # Unknown to this account or not found.
             return 0
@@ -1033,9 +1070,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # reconnect) re-learns which leg orders close this signal's position - even for a parent
         # whose own fill is already recorded, which returns below without fetching anything else.
         self._register_bracket_legs(signal_id, order)
-        for leg in _order_legs(order):
-            if await self._reconcile_bracket_leg_fill(signal_id, leg):
-                recovered += 1
         broker_filled_qty = _to_float(
             getattr(order, "filled_qty", None), default=0.0
         )
@@ -1054,87 +1088,107 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             get_live_signal_filled_qty, signal_id
         )
         missing_filled_qty = broker_filled_qty - local_filled_qty
-        if missing_filled_qty <= 0:
-            return recovered
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
-        if broker_order_id is None:
-            return recovered
         # `filled_avg_price` is the broker's average over the order's WHOLE cumulative quantity.
         # Without it there is no price to record, and a fill at 0.0 is not a fill (#124): persist
         # nothing, and the next reconciliation pass retries.
-        cumulative_avg_price = _positive_finite(getattr(order, "filled_avg_price", None))
-        if cumulative_avg_price is None:
-            logger.warning(
-                "Alpaca order has filled quantity but no usable filled_avg_price; not persisting "
-                "the missed fill, the next reconciliation pass retries",
-                extra={
-                    "data": {
-                        "account_id": self.account_id,
-                        "signal_id": signal_id,
-                        "broker_order_id": broker_order_id,
-                        "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
-                        "missing_filled_qty": missing_filled_qty,
-                    }
-                },
+        cumulative_avg_price = (
+            _positive_finite(getattr(order, "filled_avg_price", None))
+            if missing_filled_qty > 0
+            else None
+        )
+        fill_ts = (
+            _broker_fill_timestamp(
+                getattr(order, "filled_at", None), getattr(order, "updated_at", None)
             )
-            return recovered
-        fill_ts = _broker_fill_timestamp(
-            getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+            if missing_filled_qty > 0
+            else None
         )
-        if fill_ts is None:
-            logger.warning(
-                "Alpaca order has filled quantity but neither a usable filled_at nor updated_at; "
-                "not persisting the missed fill with an invented time. reconciliation runs only "
-                "when the adapter connects, so the next adapter connect retries it",
-                extra={
-                    "data": {
-                        "account_id": self.account_id,
-                        "signal_id": signal_id,
-                        "broker_order_id": broker_order_id,
-                        "filled_at": str(getattr(order, "filled_at", None)),
-                        "updated_at": str(getattr(order, "updated_at", None)),
-                        "missing_filled_qty": missing_filled_qty,
-                    }
-                },
-            )
-            return recovered
-        execution = LiveExecution(
-            signal_id=UUID(signal_id),
-            # Placeholder: the save derives the remainder's own price from the cumulative average
-            # inside its transaction, because part of the order may already be recorded at a
-            # different price, and sets the verdict (`derived`, or `derived_unavailable` with the
-            # quantity still recorded at 0.0).
-            actual_price=cumulative_avg_price,
-            actual_price_observed=PRICE_DERIVED,
-            filled_qty=missing_filled_qty,
-            commission=_known_commission(order),
-            timestamp=fill_ts,
-            broker_order_id=broker_order_id,
-            dedupe_key=(
-                f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
-            ),
+        # #144: the order's own fill is booked FIRST and a leg's close only after it,
+        # because a leg closes the position that fill opened: booking a leg against a
+        # parent whose own fill could not be recovered drives the deployment's ledger
+        # below zero (the close insert refuses it outright, but the leg would then stay
+        # unbooked until the next connect - this function used to return early on exactly
+        # that, leaving an already-booked leg behind).
+        parent_fill_pending = missing_filled_qty > 0
+        parent_fill_unrecoverable = parent_fill_pending and (
+            cumulative_avg_price is None or fill_ts is None or broker_order_id is None
         )
-        persisted_qty = await asyncio.to_thread(
-            save_live_execution_up_to_cumulative,
-            execution,
-            broker_filled_qty,
-            cumulative_avg_price=cumulative_avg_price,
-        )
-        if persisted_qty <= 0.0:
-            return recovered
-        logger.info(
-            "Reconciled missed Alpaca fill",
-            extra={
-                "data": {
-                    "signal_id": signal_id,
-                    "broker_order_id": broker_order_id,
-                    "filled_qty": persisted_qty,
-                    "broker_cumulative_filled_qty": broker_filled_qty,
-                    "local_cumulative_filled_qty": local_filled_qty,
-                }
-            },
-        )
-        return recovered + 1
+        if parent_fill_pending and broker_order_id is not None:
+            if cumulative_avg_price is None:
+                logger.warning(
+                    "Alpaca order has filled quantity but no usable filled_avg_price; not "
+                    "persisting the missed fill, the next reconciliation pass retries",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
+                            "missing_filled_qty": missing_filled_qty,
+                        }
+                    },
+                )
+            elif fill_ts is None:
+                logger.warning(
+                    "Alpaca order has filled quantity but neither a usable filled_at nor "
+                    "updated_at; not persisting the missed fill with an invented time. "
+                    "reconciliation runs only when the adapter connects, so the next "
+                    "adapter connect retries it",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_at": str(getattr(order, "filled_at", None)),
+                            "updated_at": str(getattr(order, "updated_at", None)),
+                            "missing_filled_qty": missing_filled_qty,
+                        }
+                    },
+                )
+            else:
+                execution = LiveExecution(
+                    signal_id=UUID(signal_id),
+                    # Placeholder: the save derives the remainder's own price from the
+                    # cumulative average inside its transaction, because part of the order
+                    # may already be recorded at a different price, and sets the verdict
+                    # (`derived`, or `derived_unavailable` with the quantity still
+                    # recorded at 0.0).
+                    actual_price=cumulative_avg_price,
+                    actual_price_observed=PRICE_DERIVED,
+                    filled_qty=missing_filled_qty,
+                    commission=_known_commission(order),
+                    timestamp=fill_ts,
+                    broker_order_id=broker_order_id,
+                    dedupe_key=(
+                        f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
+                    ),
+                )
+                persisted_qty = await asyncio.to_thread(
+                    save_live_execution_up_to_cumulative,
+                    execution,
+                    broker_filled_qty,
+                    cumulative_avg_price=cumulative_avg_price,
+                )
+                if persisted_qty > 0.0:
+                    logger.info(
+                        "Reconciled missed Alpaca fill",
+                        extra={
+                            "data": {
+                                "signal_id": signal_id,
+                                "broker_order_id": broker_order_id,
+                                "filled_qty": persisted_qty,
+                                "broker_cumulative_filled_qty": broker_filled_qty,
+                                "local_cumulative_filled_qty": local_filled_qty,
+                            }
+                        },
+                    )
+                    recovered += 1
+        if not parent_fill_unrecoverable:
+            for leg in _order_legs(order):
+                if await self._reconcile_bracket_leg_fill(signal_id, leg):
+                    recovered += 1
+        return recovered
 
     async def reconcile_executions(self, *, max_signals: int = 200) -> int:
         """Backfill missing fill quantity for recent signals in this Alpaca account.

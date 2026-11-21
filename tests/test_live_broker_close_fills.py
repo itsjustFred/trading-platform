@@ -127,13 +127,43 @@ def _parent_order(*, legs: list[SimpleNamespace] | None = None) -> SimpleNamespa
     )
 
 
+class _FakeTradingClient:
+    """The order lookups reconciliation uses, recording how the parent was asked for.
+
+    ``orders_by_client_id`` maps a signal id (the order's ``client_order_id``) to the
+    order object; ``get_order_by_id`` resolves the same orders by their broker ``id``
+    and records the filter it was given, so a test can assert the nested-legs request.
+    """
+
+    def __init__(self, orders_by_client_id: dict[str, Any]) -> None:
+        self._orders = dict(orders_by_client_id)
+        self.get_order_by_id_calls: list[tuple[str, Any]] = []
+        self.get_order_by_client_id_calls: list[str] = []
+
+    def _by_broker_id(self, order_id: str) -> Any:
+        for order in self._orders.values():
+            if str(getattr(order, "id", "")) == str(order_id):
+                return order
+        raise KeyError(order_id)
+
+    def get_order_by_client_id(self, client_order_id: str) -> Any:
+        self.get_order_by_client_id_calls.append(client_order_id)
+        return self._orders[client_order_id]
+
+    def get_order_by_id(self, order_id: Any, filter: Any = None) -> Any:
+        self.get_order_by_id_calls.append((str(order_id), filter))
+        return self._by_broker_id(str(order_id))
+
+
 def _alpaca_adapter(
     orders_by_client_id: dict[str, Any] | None = None, *, client: Any | None = None
 ) -> AlpacaLiveAdapter:
     adapter = AlpacaLiveAdapter(api_key="k", secret_key="s", paper=True, account_id=ACCOUNT)
     adapter._connected = True
-    adapter._trading_client = client or SimpleNamespace(
-        get_order_by_client_id=lambda client_order_id: orders_by_client_id[client_order_id]
+    adapter._trading_client = (
+        client
+        if client is not None
+        else _FakeTradingClient(orders_by_client_id or {})
     )
     return adapter
 
