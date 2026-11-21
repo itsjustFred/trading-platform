@@ -16,12 +16,19 @@ are taken from the sized signal, never re-invented from payload metadata.
 It refuses — fail closed, with an ERROR alert and an audit record — when
 
 * the quantity exceeds ``pre_submit_max_qty`` (when configured),
-* the order notional exceeds ``pre_submit_max_notional_equity_fraction`` of
-  account equity,
+* the order notional exceeds an explicitly configured
+  ``pre_submit_max_notional_equity_fraction`` of account equity,
 * the resolved entry price deviates from the live broker quote by more than
   ``pre_submit_max_price_deviation_fraction``, or
 * the risk at the stop exceeds ``pre_submit_max_risk_multiple`` times the
   deployment's configured per-trade risk (``max_risk_per_trade`` of equity).
+
+The only notional ceiling the platform imposes by default is the broker's
+maximum leverage for the account and asset (#240, maintainer decision on
+#329): an order that would need more leverage than the broker allows is not
+refused — its quantity is **clamped down to the broker maximum** (floored to
+the instrument's quantity step) and the remaining caps run against the
+clamped size. An undeterminable broker maximum fails closed to 1x.
 
 Any failure to verify (no quote, a stale or missing quote time, no pip value,
 unreadable balance, missing stop, invalid cap config) refuses the order.
@@ -35,8 +42,10 @@ would be a safety bug, not a safety feature.
 
 Caps are configured per deployment in ``settings`` (a deployment binds one
 account, so this is the per-account scope) with optional per-symbol overrides
-in ``pre_submit_symbol_caps``. The defaults below are conservative backstops,
-not trading policy; the tuned values are an open maintainer decision.
+in ``pre_submit_symbol_caps``. ``pre_submit_max_notional_equity_fraction``
+unset means the notional ceiling is the broker's maximum leverage (#240);
+set explicitly it stays a hard refuse cap — an operator's deliberate tighter
+limit, never a platform default below the broker maximum.
 """
 
 from __future__ import annotations
@@ -54,7 +63,7 @@ from live_runner.base_adapter import (
     live_quote_time_rule,
     validate_live_quote_prices,
 )
-from live_runner.exit_signals import is_exit_order
+from live_runner.exit_signals import is_exit_order, round_exit_qty_down
 from risk.live import entry_gate_settings, resolve_live_levels
 from shared.logging import get_logger
 from shared.models import LiveDeploymentConfig, LiveSignal
@@ -64,13 +73,19 @@ if TYPE_CHECKING:
 
 logger = get_logger("live-runner")
 
-#: Conservative defaults (#302). These are backstops against sizing bugs, not
-#: trading policy: they sit well above what a correctly sized order can reach
-#: (the sizing notional cap defaults to 0.20 of equity) so only a broken size
-#: trips them. The tuned values are an open maintainer decision.
-DEFAULT_PRE_SUBMIT_MAX_NOTIONAL_EQUITY_FRACTION = 1.0
+#: Conservative defaults (#302), accepted by the maintainer on 2026-11-21:
+#: risk multiple 2.0 and price deviation 2%, overridable per symbol. These
+#: are backstops against sizing bugs, not trading policy; they sit well above
+#: what a correctly sized order can reach so only a broken size trips them.
 DEFAULT_PRE_SUBMIT_MAX_PRICE_DEVIATION_FRACTION = 0.02
 DEFAULT_PRE_SUBMIT_MAX_RISK_MULTIPLE = 2.0
+
+#: ``None``: no fixed equity-fraction default. The notional ceiling is the
+#: broker's maximum leverage for the account and asset (#240), failing closed
+#: to 1x when the broker maximum cannot be determined; exceeding it clamps
+#: the quantity instead of refusing. An explicit configured fraction remains
+#: a hard refuse cap.
+DEFAULT_PRE_SUBMIT_MAX_NOTIONAL_EQUITY_FRACTION: float | None = None
 
 #: No universal absolute quantity default exists (1 share, 1 lot and 0.01 lot
 #: are different instruments), so the qty cap is unset unless configured; the
@@ -104,7 +119,7 @@ class PreSubmitCapSettings:
     """Validated cap settings for one deployment (and optionally one symbol)."""
 
     max_qty: float | None
-    max_notional_equity_fraction: float
+    max_notional_equity_fraction: float | None
     max_price_deviation_fraction: float
     max_risk_multiple: float
 
@@ -237,10 +252,13 @@ def pre_submit_cap_settings(
             return default
         return value
 
+    notional_fraction = _resolve(
+        _NOTIONAL_KEY, DEFAULT_PRE_SUBMIT_MAX_NOTIONAL_EQUITY_FRACTION
+    )
     caps = PreSubmitCapSettings(
         max_qty=_resolve(_MAX_QTY_KEY, DEFAULT_PRE_SUBMIT_MAX_QTY),
-        max_notional_equity_fraction=float(
-            _resolve(_NOTIONAL_KEY, DEFAULT_PRE_SUBMIT_MAX_NOTIONAL_EQUITY_FRACTION)
+        max_notional_equity_fraction=(
+            None if notional_fraction is None else float(notional_fraction)
         ),
         max_price_deviation_fraction=float(
             _resolve(_DEVIATION_KEY, DEFAULT_PRE_SUBMIT_MAX_PRICE_DEVIATION_FRACTION)
@@ -271,25 +289,69 @@ def _is_exit_order(signal: LiveSignal) -> bool:
     return is_exit_order(signal.action, signal.metadata)
 
 
-async def _record_refusal_audit(data: Mapping[str, Any]) -> None:
-    """Append the refusal to the live audit trail; never masks the refusal."""
+async def _record_cap_audit(
+    data: Mapping[str, Any], *, action: str, succeeded: bool
+) -> None:
+    """Append a cap decision to the live audit trail; never masks it."""
     try:
         from shared.database import record_live_control_audit
 
         await asyncio.to_thread(
             record_live_control_audit,
-            action="pre_submit_cap_refusal",
+            action=action,
             target_type="live_deployment",
             target_id=str(data.get("deployment_id") or ""),
             actor="pre-submit-hard-caps",
-            succeeded=False,
+            succeeded=succeeded,
             detail=dict(data),
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.error(
-            "Could not write the pre-submit cap audit record; the refusal stands",
+            "Could not write the pre-submit cap audit record; the decision stands",
             extra={"data": {"error": repr(exc)}},
         )
+
+
+async def _record_refusal_audit(data: Mapping[str, Any]) -> None:
+    await _record_cap_audit(data, action="pre_submit_cap_refusal", succeeded=False)
+
+
+async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | None:
+    """The broker's maximum leverage, or ``None`` when it cannot be determined.
+
+    A leverage lookup failure degrades to the 1x ceiling (#240) — it never
+    refuses the order and never guesses a higher ceiling.
+    """
+    try:
+        value = await adapter.get_max_leverage(symbol)
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        leverage = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(leverage) or leverage <= 0:
+        return None
+    return leverage
+
+
+def _adapter_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
+    """The instrument's quantity step in qty units, when the adapter names one.
+
+    Both real adapters expose it as ``exit_qty_step`` — the step is a property
+    of the instrument, not of the order side. An adapter without one leaves
+    its own submit-time conversion to floor the clamped quantity.
+    """
+    method = getattr(adapter, "exit_qty_step", None)
+    if not callable(method):
+        return None
+    try:
+        step = float(method(symbol))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return step if math.isfinite(step) and step > 0 else None
 
 
 async def enforce_pre_submit_caps(
@@ -299,19 +361,22 @@ async def enforce_pre_submit_caps(
     *,
     qty: float,
     risk_config: RiskConfig,
-) -> None:
-    """Refuse an order that breaks the hard caps; return when it may submit.
+) -> float:
+    """Check the hard caps; return the quantity that may be submitted.
 
     Runs after sizing and the submission claim, immediately before the
     broker call. ``qty`` is the binding quantity the adapter will submit.
     ``risk_config`` is the deployment's :class:`RiskConfig` — the caller
     resolves it so this module never re-reads sizing policy.
 
-    Raises :class:`PreSubmitCapViolation` (a ``ValueError``) on any refusal or
-    any failure to verify. Exit orders return immediately.
+    Returns ``qty`` unchanged, or a smaller quantity clamped to the broker's
+    maximum leverage (#240: clamp, never refuse, when a correctly sized order
+    would need more leverage than the broker allows). Raises
+    :class:`PreSubmitCapViolation` (a ``ValueError``) on any refusal or any
+    failure to verify. Exit orders return ``qty`` immediately.
     """
     if _is_exit_order(signal):
-        return
+        return qty
 
     async def _fail(rule: str, reason: str, figures: Mapping[str, Any] | None = None) -> NoReturn:
         data: dict[str, Any] = {
@@ -379,18 +444,22 @@ async def enforce_pre_submit_caps(
     quote_task = asyncio.create_task(adapter.get_quote(signal.symbol))
     pip_task = asyncio.create_task(adapter.get_pip_value(signal.symbol))
     balance_task = asyncio.create_task(adapter.get_balance())
+    leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
     try:
-        quote, pip_value, (_balance, equity) = await asyncio.wait_for(
-            asyncio.gather(quote_task, pip_task, balance_task),
+        quote, pip_value, (_balance, equity), max_leverage = await asyncio.wait_for(
+            asyncio.gather(quote_task, pip_task, balance_task, leverage_task),
             timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         # gather propagates the first failure but leaves the sibling reads
         # running; cancel them so a hung broker call cannot outlive the
-        # refusal (wait_for already cancelled them on a timeout).
-        for task in (quote_task, pip_task, balance_task):
+        # refusal (wait_for already cancelled them on a timeout). The
+        # leverage read never raises — _safe_max_leverage degrades to None.
+        for task in (quote_task, pip_task, balance_task, leverage_task):
             task.cancel()
-        await asyncio.gather(quote_task, pip_task, balance_task, return_exceptions=True)
+        await asyncio.gather(
+            quote_task, pip_task, balance_task, leverage_task, return_exceptions=True
+        )
         await _fail(
             "broker_facts_unavailable",
             "could not fetch the live quote, pip value and balance needed to "
@@ -413,6 +482,9 @@ async def enforce_pre_submit_caps(
             "broker_facts_unusable", f"account equity is not finite ({equity!r})"
         )
 
+    # The broker's maximum leverage for the account and asset (#240); an
+    # undeterminable maximum fails closed to 1x — never a guessed ceiling.
+    broker_leverage = max_leverage if max_leverage is not None else 1.0
     figures: dict[str, Any] = {
         **base_figures,
         "qty": qty_value,
@@ -423,6 +495,8 @@ async def enforce_pre_submit_caps(
         "quote_price": quote_price,
         "pip_value": pip,
         "account_equity": equity_value,
+        "broker_max_leverage": max_leverage,
+        "effective_max_leverage": broker_leverage,
     }
 
     # Quote freshness, the same rule the entry-deviation gate applies (#125):
@@ -463,14 +537,76 @@ async def enforce_pre_submit_caps(
     # Notional in account currency: qty * price * pip_value (pip_value is the
     # account-currency P&L of one qty unit per 1.0 price move).
     notional = qty_value * quote_price * pip
-    max_notional = caps.max_notional_equity_fraction * equity_value
-    if notional > max_notional:
-        await _fail(
-            "notional_cap",
-            f"order notional {notional!r} exceeds the cap {max_notional!r} "
-            f"({caps.max_notional_equity_fraction!r} of equity {equity_value!r})",
-            {**figures, "notional": notional, "max_notional": max_notional},
+    if caps.max_notional_equity_fraction is not None:
+        # An explicitly configured fraction is a hard refuse cap — the
+        # operator's deliberate limit, which may sit below the broker maximum.
+        max_notional = caps.max_notional_equity_fraction * equity_value
+        if notional > max_notional:
+            await _fail(
+                "notional_cap",
+                f"order notional {notional!r} exceeds the cap {max_notional!r} "
+                f"({caps.max_notional_equity_fraction!r} of equity {equity_value!r})",
+                {**figures, "notional": notional, "max_notional": max_notional},
+            )
+
+    # The platform imposes no notional ceiling below the broker maximum
+    # (#240): an order that would need more leverage than the broker allows
+    # is clamped down to the broker maximum — floored to the instrument's
+    # quantity step — never refused. The remaining caps then run against the
+    # clamped size.
+    leverage_ceiling = broker_leverage * equity_value
+    if notional > leverage_ceiling:
+        max_qty_leverage = leverage_ceiling / (quote_price * pip)
+        step = _adapter_qty_step(adapter, signal.symbol)
+        try:
+            clamped_qty = (
+                max_qty_leverage
+                if step is None
+                else round_exit_qty_down(max_qty_leverage, step)
+            )
+        except ValueError:
+            clamped_qty = 0.0
+        if not math.isfinite(clamped_qty) or clamped_qty <= 0:
+            await _fail(
+                "broker_leverage_cap",
+                f"the broker's maximum leverage {broker_leverage!r} allows less "
+                "than one quantity step of this order; nothing compliant can "
+                "be submitted",
+                {
+                    **figures,
+                    "notional": notional,
+                    "leverage_ceiling": leverage_ceiling,
+                    "max_qty_at_broker_leverage": max_qty_leverage,
+                    "qty_step": step,
+                },
+            )
+        clamp_data: dict[str, Any] = {
+            "alert": "pre_submit_leverage_clamp",
+            "account_id": deployment.account_id,
+            "deployment_id": str(deployment.id),
+            "symbol": signal.symbol,
+            "action": signal.action,
+            "qty_before_clamp": qty_value,
+            "qty_after_clamp": clamped_qty,
+            "notional_before_clamp": notional,
+            "broker_max_leverage": max_leverage,
+            "effective_max_leverage": broker_leverage,
+            "leverage_ceiling": leverage_ceiling,
+            "qty_step": step,
+        }
+        logger.warning(
+            "Pre-submit caps clamped the order qty to the broker's maximum "
+            "leverage; the clamped size is what will be submitted",
+            extra={"data": clamp_data},
         )
+        await _record_cap_audit(
+            clamp_data, action="pre_submit_leverage_clamp", succeeded=True
+        )
+        qty_value = clamped_qty
+        notional = qty_value * quote_price * pip
+        figures["qty"] = qty_value
+        figures["qty_before_clamp"] = clamp_data["qty_before_clamp"]
+        figures["leverage_clamped"] = True
 
     # Risk at the stop vs the deployment's configured per-trade risk.
     risk_at_stop = qty_value * abs(entry_price - stop_loss) * pip
@@ -493,3 +629,4 @@ async def enforce_pre_submit_caps(
         "Pre-submit hard caps passed",
         extra={"data": {**figures, "deviation_fraction": deviation}},
     )
+    return qty_value

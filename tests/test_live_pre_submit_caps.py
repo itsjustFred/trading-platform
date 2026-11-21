@@ -89,9 +89,12 @@ class _Broker(BaseLiveAdapter):
     )
     pip_value: float = 1.0
     equity: float = 100_000.0
+    max_leverage: float | None = None
+    qty_step: float | None = None
     quote_error: Exception | None = None
     pip_error: Exception | None = None
     balance_error: Exception | None = None
+    leverage_error: Exception | None = None
     submitted: list[tuple[LiveSignal, float | None]] = field(default_factory=list)
 
     async def connect(self) -> None:
@@ -126,6 +129,15 @@ class _Broker(BaseLiveAdapter):
             raise self.balance_error
         return self.equity, self.equity
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        if self.leverage_error is not None:
+            raise self.leverage_error
+        return self.max_leverage
+
+    def exit_qty_step(self, symbol: str) -> float:
+        # Both real adapters name a step; 1e-9 is Alpaca's, effectively no floor.
+        return self.qty_step if self.qty_step is not None else 1e-9
+
     async def get_positions(self) -> list[dict[str, Any]]:
         return []
 
@@ -141,10 +153,12 @@ def _run(coro):
 # ── settings resolution ───────────────────────────────────────────────────────
 
 
-def test_cap_settings_defaults_are_the_conservative_backstops():
+def test_cap_settings_defaults_are_the_accepted_backstops():
     caps = pre_submit_cap_settings({}, symbol="AAPL")
     assert caps.max_qty is None
-    assert caps.max_notional_equity_fraction == pytest.approx(1.0)
+    # No fixed equity-fraction default: the notional ceiling is the broker's
+    # maximum leverage (#240), failing closed to 1x when unknown.
+    assert caps.max_notional_equity_fraction is None
     assert caps.max_price_deviation_fraction == pytest.approx(0.02)
     assert caps.max_risk_multiple == pytest.approx(2.0)
 
@@ -319,11 +333,13 @@ def test_stop_risk_multiple_refuses():
         )
 
 
-def test_default_caps_refuse_a_runaway_size():
-    # No settings at all: the defaults still refuse an order worth 2x equity.
+def test_default_caps_clamp_a_runaway_size_then_refuse_on_risk():
+    # No settings at all, unknown broker leverage (1x): an order worth 2x
+    # equity is clamped to the 1x ceiling (qty 2000 -> 1000), and the clamped
+    # size still breaks the 2.0x stop-risk cap, so it is refused.
     deployment = _deployment()
     broker = _Broker()
-    with pytest.raises(PreSubmitCapViolation, match="notional_cap"):
+    with pytest.raises(PreSubmitCapViolation, match="stop_risk"):
         _run(
             enforce_pre_submit_caps(
                 broker, deployment, _signal(deployment), qty=2000.0, risk_config=_risk_config()
@@ -354,6 +370,144 @@ def test_per_symbol_cap_applies_to_the_matching_symbol():
                 risk_config=_risk_config(),
             )
         )
+
+
+# ── broker-leverage ceiling: clamp, never refuse (#240) ───────────────────────
+
+
+def _loose_risk_config() -> RiskConfig:
+    return RiskConfig(max_risk_per_trade=0.5)
+
+
+def test_broker_leverage_clamps_instead_of_refusing():
+    # 247x needed: qty 247_000 * 100 * 1.0 = 24.7M notional on 100k equity.
+    # The broker allows 200x -> the qty clamps to the 200x ceiling (200_000),
+    # floored to the step, and the order may submit at the clamped size.
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    qty = _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=247_000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    assert qty == pytest.approx(200_000.0)
+
+
+def test_leverage_clamp_floors_to_the_quantity_step():
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0, qty_step=3.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    qty = _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=247_000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    # 200_000 floored to whole 3.0 steps is 199_998 — never rounded up.
+    assert qty == pytest.approx(199_998.0)
+
+
+def test_unknown_broker_leverage_fails_closed_to_1x():
+    # No broker maximum -> the ceiling is 1x equity: qty 2000 (2x) clamps to
+    # the 1x max of 1000 instead of being refused.
+    deployment = _deployment()
+    broker = _Broker()
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    qty = _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=2000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    assert qty == pytest.approx(1000.0)
+
+
+def test_leverage_lookup_failure_fails_closed_to_1x():
+    deployment = _deployment()
+    broker = _Broker(leverage_error=RuntimeError("leverage endpoint down"))
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    qty = _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=2000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    assert qty == pytest.approx(1000.0)
+
+
+def test_leverage_clamp_below_one_step_refuses():
+    # The broker maximum allows less than one quantity step: no compliant
+    # order exists, so this is a refusal, not a clamp to zero.
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0, qty_step=1e9)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    with pytest.raises(PreSubmitCapViolation, match="broker_leverage_cap"):
+        _run(
+            enforce_pre_submit_caps(
+                broker,
+                deployment,
+                signal,
+                qty=247_000.0,
+                risk_config=_loose_risk_config(),
+            )
+        )
+
+
+def test_configured_notional_fraction_still_refuses_below_broker_max():
+    # An explicit operator cap is a hard refuse cap even when the broker
+    # maximum would admit the order.
+    deployment = _deployment(pre_submit_max_notional_equity_fraction=0.1)
+    broker = _Broker(max_leverage=200.0)
+    with pytest.raises(PreSubmitCapViolation, match="notional_cap"):
+        _run(
+            enforce_pre_submit_caps(
+                broker, deployment, _signal(deployment), qty=200.0, risk_config=_risk_config()
+            )
+        )
+
+
+def test_leverage_clamp_writes_an_audit_record(caplog):
+    import logging
+
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    with caplog.at_level(logging.WARNING):
+        qty = _run(
+            enforce_pre_submit_caps(
+                broker,
+                deployment,
+                signal,
+                qty=247_000.0,
+                risk_config=_loose_risk_config(),
+            )
+        )
+    assert qty == pytest.approx(200_000.0)
+    assert "clamped the order qty" in caplog.text
+    records = [
+        row
+        for row in list_live_control_audit(limit=50)
+        if row["action"] == "pre_submit_leverage_clamp"
+        and row["target_id"] == str(deployment.id)
+    ]
+    assert records, "the clamp must leave an audit record"
+    assert records[0]["succeeded"]
+    assert records[0]["detail"]["qty_before_clamp"] == pytest.approx(247_000.0)
+    assert records[0]["detail"]["qty_after_clamp"] == pytest.approx(200_000.0)
 
 
 # ── fail closed ───────────────────────────────────────────────────────────────

@@ -428,6 +428,14 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol``.
+
+        ``None`` means the broker maximum cannot be determined; callers must
+        treat that as 1x (fail safe), never guess a higher ceiling (#240).
+        """
+        return None
+
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
     # Status semantics built on top of these:

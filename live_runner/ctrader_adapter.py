@@ -853,6 +853,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #146: (baseAssetId, quoteAssetId) per upper symbol name, from the
         # light symbol list, and the account's deposit asset. Session state.
         self._symbol_assets: dict[str, tuple[int, int]] = {}
+        # #240: ProtoOASymbol.leverageId per upper symbol name, captured with
+        # the symbol props; resolved to a leverage via GetDynamicLeverageByID.
+        self._symbol_leverage_ids: dict[str, int] = {}
         self._deposit_asset_id: int | None = None
         self._asset_names: dict[int, str] = {}
         self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
@@ -905,6 +908,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._ProtoOASubscribeSpotsReq: Any = None
         self._ProtoOAUnsubscribeSpotsReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDRes: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -929,6 +934,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAClosePositionReq,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
+                ProtoOAGetDynamicLeverageByIDReq,
+                ProtoOAGetDynamicLeverageByIDRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -986,6 +993,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
         self._ProtoOAOrderListReq = ProtoOAOrderListReq
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
+        self._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
+        self._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOAReconcileReq = ProtoOAReconcileReq
@@ -1478,9 +1487,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         if not symbol_name_to_id:
             self._symbol_props.clear()
+            self._symbol_leverage_ids.clear()
             return
         for name in symbol_name_to_id:
             self._symbol_props.pop(name, None)
+            self._symbol_leverage_ids.pop(name, None)
         try:
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOASymbolByIdReq,
@@ -1513,6 +1524,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             name = id_to_name.get(sid)
             if name is None:
                 continue
+            # #240: the symbol's dynamic-leverage id rides on the same detail
+            # payload. Archived entries come first, so a live entry's id wins.
+            leverage_id = _optional_int(getattr(detail, "leverageId", None))
+            if leverage_id is not None and leverage_id > 0:
+                self._symbol_leverage_ids[name] = leverage_id
+            else:
+                self._symbol_leverage_ids.pop(name, None)
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
             scale = _symbol_scale_from_broker_props(
                 digits=getattr(detail, "digits", None),
@@ -2274,6 +2292,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
         self._symbol_props.clear()
+        self._symbol_leverage_ids.clear()
         self._symbol_assets.clear()
         self._deposit_asset_id = None
         self._asset_names.clear()
@@ -2970,6 +2989,57 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not math.isfinite(rate) or rate <= 0:
             raise ValueError(f"cTrader conversion rate for {label} is not positive: {rate!r}")
         return rate, tuple(symbols), tuple(quotes)
+
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol`` (#240).
+
+        ``ProtoOASymbol.leverageId`` — captured with the symbol props — resolves
+        through ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
+        ascending by volume; the highest leverage sits in the first tier. The
+        answer is per account (the request carries ``ctidTraderAccountId``) and
+        per asset.
+
+        Returns ``None`` — never a guess — when the symbol has no leverage id,
+        the proto classes are unavailable, the response is unusable, or the
+        broker call fails; callers must treat ``None`` as 1x.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            self._raise_if_terminal_auth_failed()
+            if (
+                self._ProtoOAGetDynamicLeverageByIDReq is None
+                or self._ProtoOAGetDynamicLeverageByIDRes is None
+            ):
+                return None
+            leverage_id = self._symbol_leverage_ids.get(str(symbol or "").strip().upper())
+            if leverage_id is None:
+                return None
+            request = self._ProtoOAGetDynamicLeverageByIDReq()
+            request.ctidTraderAccountId = self.ctid_trader_account_id
+            request.leverageId = int(leverage_id)
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=10
+            )
+            if not isinstance(response, self._ProtoOAGetDynamicLeverageByIDRes):
+                return None
+            leverage_msg = getattr(response, "leverage", None)
+            tiers = getattr(leverage_msg, "tiers", None) if leverage_msg is not None else None
+            values = [
+                value
+                for tier in tiers or []
+                if (value := _optional_float(getattr(tier, "leverage", None))) is not None
+                and math.isfinite(value)
+                and value > 0
+            ]
+            return max(values) if values else None
+        except Exception as exc:
+            logger.warning(
+                "cTrader max leverage lookup failed; treating it as unknown (1x)",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            return None
 
     async def _fetch_trader(self) -> Any:
         """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""

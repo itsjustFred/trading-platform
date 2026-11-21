@@ -2106,7 +2106,7 @@ async def submit_order_with_risk(
     # the sizing code that produced it. Inside order_not_submitted so a
     # refusal is provably pre-request.
     with order_not_submitted():
-        await enforce_pre_submit_caps(
+        prepared_qty = await enforce_pre_submit_caps(
             adapter,
             deployment,
             prepared_signal,
@@ -2800,7 +2800,7 @@ async def _prepare_claim_and_submit_signal(
             # order_not_submitted so a refusal is provably pre-request and
             # the submission lease is released below.
             with order_not_submitted():
-                await enforce_pre_submit_caps(
+                prepared_qty = await enforce_pre_submit_caps(
                     adapter,
                     deployment,
                     prepared_signal,

@@ -220,11 +220,11 @@ Dispatch in `_prepare_claim_and_submit_signal()`); direkte Submits aus
 `scripts/live_smoke.py` und `live_runner/test_signal_trigger.py` umgehen sie
 bewusst — beides Operator-Werkzeuge für manuelle Tests, kein Daemon-Pfad; ein
 Fehler dort hat damit kein Cap-Backstop.
-**Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value und
-Balance werden hier erneut gelesen (`get_quote`/`get_pip_value`/`get_balance`),
-die Quote dabei mit demselben Frische-Gate wie der Entry-Deviation-Check
-(`max_entry_quote_age_seconds`). Menge und Preislevel stammen dagegen aus dem
-gesizeten Signal — nichts wird aus dem Payload neu erfunden.
+**Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value,
+Balance und die maximale Hebel des Brokers für Account und Asset
+(`get_max_leverage`; cTrader über `ProtoOASymbol.leverageId` +
+`GetDynamicLeverageByID`, unbekannt → 1x). Menge und Preislevel stammen
+dagegen aus dem gesizeten Signal — nichts wird aus dem Payload neu erfunden.
 
 Abgelehnt wird (fail-closed, ERROR-Alert `pre_submit_cap_refusal` plus
 Audit-Eintrag über `record_live_control_audit`), wenn
@@ -233,8 +233,18 @@ Audit-Eintrag über `record_live_control_audit`), wenn
 |-------|-----------|
 | `qty_cap` | `qty > pre_submit_max_qty` (nur wenn konfiguriert) |
 | `price_deviation` | `|entry - quote_side| / quote_side > pre_submit_max_price_deviation_fraction` (Ask für Buy, Bid für Sell, absolut in beide Richtungen) |
-| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` |
+| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` (nur wenn der Bruchteil explizit konfiguriert ist) |
 | `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
+
+Die einzige Notional-Obergrenze, die die Plattform selbst setzt, ist die
+maximale Hebel des Brokers für Account und Asset (#240, Entscheidung auf
+#329): braucht ein korrekt gesizter Order mehr Hebel als der Broker
+erlaubt, wird die Menge **auf das Broker-Maximum geklemmt** (abgerundet auf
+den Lot-Step) statt abgelehnt — verbleibende Caps laufen gegen die geklemmte
+Größe. Eine unbekannte Broker-Hebel failt closed auf 1x. Die Klemme wird
+mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert; lässt das
+Broker-Maximum nicht einmal einen Lot-Step zu, wird abgelehnt
+(`broker_leverage_cap`).
 
 Notional und Stop-Risk rechnen gegen das Account-**Equity**, während das
 Sizing gegen die **Balance** rechnet — bewusst verschiedene Basen: die Caps
@@ -262,15 +272,16 @@ fail-closed beim Submit:
 | Setting | Default | Gültig |
 |---------|---------|--------|
 | `pre_submit_max_qty` | **unbegrenzt** | `> 0`, endlich (kein universeller Default: Share, Lot und 0.01-Lot sind verschiedene Instrumente) |
-| `pre_submit_max_notional_equity_fraction` | **1.0** | `> 0` (Order-Notional als Bruchteil des Account-Equity) |
+| `pre_submit_max_notional_equity_fraction` | **Broker-Hebel** (unbekannt → 1x) | `> 0` (Order-Notional als Bruchteil des Account-Equity; nur explizit gesetzt = harter Reject-Cap) |
 | `pre_submit_max_price_deviation_fraction` | **0.02** | `> 0` |
 | `pre_submit_max_risk_multiple` | **2.0** | `> 0` (Vielfaches des konfigurierten `max_risk_per_trade`-Risikos) |
 | `pre_submit_symbol_caps` | — | Mapping `SYMBOL -> {gleiche Keys}`, überschreibt nur für dieses Symbol |
 
 Die Defaults sind konservative Backstops gegen Sizing-Bugs (Basis: #146
-~1000x, #184 100x), keine Trading-Policy — die finalen Werte sind eine offene
-Maintainer-Entscheidung. Ein Timeout von 30 s
-(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) begrenzt die drei Broker-Lesungen;
+~1000x, #184 100x), keine Trading-Policy — Risk-Multiple 2.0 und
+Price-Deviation 2% sind per Maintainer-Entscheidung (2026-11-21) akzeptiert,
+pro Symbol überschreibbar. Ein Timeout von 30 s
+(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) begrenzt die Broker-Lesungen;
 bei Timeout wird abgelehnt.
 
 ## Commission-Vorzeichen (#184 Finding 14)
