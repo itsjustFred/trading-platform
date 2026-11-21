@@ -5,10 +5,10 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 import pandas as pd
@@ -70,6 +70,27 @@ _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss"
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
 #: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
 _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
+
+#: Pages of ``_ALPACA_HELD_LEG_LOOKUP_LIMIT`` newest orders scanned back when a held-leg page
+#: comes back full. A full page means the account's history reaches further back than one
+#: page, not that the page was cut off (an account trading one bracket a day fills a page in
+#: under two years); the budget is what stops a sweep from paging forever.
+_ALPACA_HELD_LEG_PAGE_LIMIT = 20
+
+#: States in which a bracket leg still rests at the broker: ``held`` is the OCO-inactive
+#: leg of a filled parent, ``pending_cancel`` one whose cancel has not settled yet and may
+#: still fill (#198). A leg whose cancel has settled says so in the listing.
+_RESTING_LEG_STATUSES = frozenset({"held", "pending_cancel"})
+
+#: Terminal states in which an order left the book without executing. Only these let a
+#: refuse-cancel be excused: a ``filled``/``partially_filled`` order executed (a stop that
+#: fills on a position that is already flat opens a short), a ``done_for_day`` order is only
+#: out for the session and resumes with the next one, and a row nobody could read proves
+#: nothing. alpaca-py 0.44.0's ``OrderStatus`` defines no "done" - its end-of-day state is
+#: ``done_for_day`` - so there is nothing here for a shorter spelling to match. Verified on
+#: paper 2026-11-20: the leg Alpaca removes as the OCO sibling of a cancelled take profit
+#: is still readable by id, as ``canceled``.
+_GONE_WITHOUT_EXECUTING = frozenset({"canceled", "expired", "rejected"})
 
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
@@ -237,6 +258,28 @@ def _stop_candidates(order: Any) -> Iterator[Any]:
     for leg in _order_legs(order):
         if _order_status(leg) == "held":
             yield leg
+
+
+def _page_back_cursor(orders: list[Any]) -> datetime | None:
+    """The ``until`` that asks for the page before a newest-first listing's oldest row.
+
+    The cursor goes *past* that timestamp by a microsecond, never before it: ``until``
+    bounds the window at the old end, so a cursor short of the oldest row would omit the
+    orders submitted in the gap, and the filled parent that owns the resting leg can be
+    one of them. A microsecond past it instead asks for the same rows again under every
+    inclusive/exclusive reading, and a row that comes back twice is deduplicated by id -
+    unlike a row that was skipped, which cannot be recovered. None when a row carries no
+    readable timestamp, which leaves the caller unable to page back.
+    """
+    oldest: datetime | None = None
+    for order in orders:
+        stamp = _order_attr(order, "submitted_at", None)
+        if isinstance(stamp, datetime):
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if oldest is None or stamp < oldest:
+                oldest = stamp
+    return oldest + timedelta(microseconds=1) if oldest is not None else None
 
 
 def _protective_stop_of(
@@ -460,6 +503,48 @@ def _position_qty(position: Mapping[str, Any]) -> float:
             f"qty ({value!r}); refusing to treat it as flat"
         )
     return qty
+
+
+def _order_filled_qty(order: Any) -> float | None:
+    """What the broker reports an order as filled, or ``None`` when it cannot be read.
+
+    A terminal state is not proof of "left without executing" on its own: a sell stop
+    that partly fills and is then cancelled is ``canceled`` *with* a quantity. So an
+    excusal needs this number, and a number nobody could read answers "unknown" -
+    the same fail-closed answer the rest of this file gives a row it cannot read.
+    """
+    value = _to_float(_order_attr(order, "filled_qty", None), default=float("nan"))
+    return value if math.isfinite(value) else None
+
+
+class _RestingLeg(NamedTuple):
+    """A bracket leg that still rests, and the filled parent it rests under.
+
+    The parent travels with the leg because a leg can arrive without its own
+    ``symbol``: this file's other order readers fall back to the parent's
+    (``_protective_stop_of``, ``_best_stop_price`` and ``_has_working_stop`` all
+    accept an empty leg symbol), and a symbol nobody could read is not "no
+    position" - it is a position the sweep cannot place.
+    """
+
+    leg: Any
+    parent: Any
+
+
+class _LivePosition(NamedTuple):
+    """The broker's current position on a symbol.
+
+    ``flat`` is True only for a readable zero (or no row at all): a listing that
+    failed, or a quantity that cannot be read, leaves the position unknown - with
+    ``stop_qty``/``stop_side`` unset - so a caller can neither skip a position it
+    cannot see nor size an order from a quantity it could not read. The two stop
+    fields are the quantity and side of the stop that protects the position: the
+    *reducing* side's, so a long position's stop is a sell.
+    """
+
+    flat: bool
+    stop_qty: float | None = None
+    stop_side: str | None = None
 
 
 def _is_flat(qty: float) -> bool:
@@ -2075,10 +2160,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Taken from the protection about to be cancelled, so the position is
         restored to the stop the strategy chose rather than one invented from a
         stale quote. A nested stop leg is checked too, because a bracket's stop
-        is sometimes only visible there.
+        is sometimes only visible there. The book is already scoped to *symbol*
+        by the caller, and a held leg placed on it through its parent carries no
+        symbol of its own - so an empty top-level symbol is this symbol's order,
+        not another symbol's.
         """
         for order in orders:
-            if _order_symbol(order) != symbol:
+            if _order_symbol(order) not in {"", symbol}:
                 continue
             for candidate in (order, *_order_legs(order)):
                 candidate_symbol = _order_symbol(candidate)
@@ -2115,11 +2203,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         not a protection: treating it as one after the position's own sell stop was
         cancelled reports the position as protected while it is naked. Only a stop
         on the reducing side counts, and a bracket's leg counts only if that leg
-        itself is on the reducing side.
+        itself is on the reducing side. The book is already scoped to *symbol*
+        by the caller, and a held leg placed on it through its parent carries no
+        symbol of its own - so an empty top-level symbol is this symbol's order,
+        not another symbol's.
         """
         wanted = "buy" if str(side).strip().lower() == "buy" else "sell"
         for order in orders:
-            if _order_symbol(order) != symbol:
+            if _order_symbol(order) not in {"", symbol}:
                 continue
             for candidate in (order, *_order_legs(order)):
                 candidate_symbol = _order_symbol(candidate)
@@ -2132,13 +2223,41 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     return True
         return False
 
+    async def _live_position(self, symbol: str) -> _LivePosition:
+        """The broker's position on *symbol* as it stands right now.
+
+        Only a *readable, zero* quantity counts as flat, and only a readable,
+        non-zero one counts as a position to size a stop from. A listing that
+        cannot be read, or a row whose quantity cannot be read, says "unknown"
+        and is reported as such (logged, and neither flat nor sized): a restore
+        that skipped on evidence it does not have would leave a live position
+        naked, and one that guessed a quantity would sell a position that is no
+        longer there.
+        """
+        try:
+            positions = await self.get_positions()
+        except Exception as exc:
+            logger.warning(
+                "Could not re-read positions before restoring a stop; the restore "
+                "is not sized from a position nobody could read",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            return _LivePosition(flat=False)
+        for position in positions:
+            if str(position.get("symbol") or "").strip().upper() != symbol:
+                continue
+            if position.get("qty_unparseable"):
+                return _LivePosition(flat=False)
+            qty = _position_qty(position)
+            if _is_flat(qty):
+                return _LivePosition(flat=True)
+            return _LivePosition(
+                flat=False, stop_qty=abs(qty), stop_side="sell" if qty > 0 else "buy"
+            )
+        return _LivePosition(flat=True)
+
     async def _restore_stop(
-        self,
-        client: Any,
-        symbol: str,
-        qty: float,
-        side: str,
-        stop_price: float | None,
+        self, client: Any, symbol: str, stop_price: float | None
     ) -> bool:
         """Put a stop back on a position whose close was refused.
 
@@ -2148,19 +2267,59 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         logged at CRITICAL because it means live unprotected exposure.
 
         Returns whether the position is protected afterwards, which is also true
-        when a stop still works at the broker. Re-submitting in that case would
-        leave two stops on one position, and the second becomes an orphan the
-        moment the first fills - an orphaned sell-stop opens a short.
+        when a stop still works at the broker or the position is already flat.
+        Re-submitting next to a working stop would leave two stops on one
+        position, and the second becomes an orphan the moment the first fills -
+        an orphaned sell-stop opens a short. The same rule covers a working book
+        nobody could re-read: it cannot show that no stop works, so the restore is
+        refused rather than guessed, and the position is unprotected until the
+        next enforcement retry.
+
+        The stop is sized and sided from the position as the broker reports it
+        *now*, not from the snapshot the flatten started from: the leg that was
+        cancelled to unblock the close can have filled on its way out, and a stop
+        sized from the old quantity oversells what is left - into a short when it
+        triggers. A position the broker will not report is not sized either: the
+        restore refuses and says so rather than placing an order for a quantity
+        nobody read.
         """
-        try:
-            working = await self._list_open_orders(client)
-        except Exception as exc:  # pragma: no cover - defensive
+        live = await self._live_position(symbol)
+        # The position may already be flat: the stop that was cancelled to unblock the
+        # close can have been the thing that closed it (a cancel accepted and then the
+        # stop filling, or a race with the fill). Restoring a stop onto a flat position
+        # then creates the orphan this file's sweeps exist to remove - a triggered
+        # sell-stop with nothing to sell opens a short.
+        if live.flat:
             logger.warning(
-                "Could not re-read orders before restoring a stop; restoring anyway",
+                "Not restoring a stop: the broker reports the position flat",
+                extra={"data": {"symbol": symbol}},
+            )
+            return True
+        if live.stop_qty is None or live.stop_side is None:
+            logger.critical(
+                "Cannot restore a stop: the broker's live position could not be read, "
+                "so the position is unprotected until the next retry",
+                extra={"data": {"symbol": symbol}},
+            )
+            return False
+        try:
+            working = await self._working_book_on_symbol(client, symbol)
+        except Exception as exc:
+            # Not restoring is the bounded failure. The re-read is what proves no stop
+            # still works, and a book nobody could read proves nothing - the held-leg
+            # lookup inside it is paged, so it is also the part that can fail. Restoring
+            # anyway would place a second stop beside whatever the broker kept: two
+            # stops reduce a position twice, and the extra one is an orphan the moment
+            # the first fills. The position is then unprotected until the next
+            # enforcement retry, which is the same state every other refusal below
+            # reports - and the sweep takes no unbounded risk.
+            logger.critical(
+                "Not restoring a stop: the working book could not be re-read, so it "
+                "cannot be shown that no stop still works",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
             )
-            working = None
-        if working is not None and self._has_working_stop(working, symbol, side):
+            return False
+        if self._has_working_stop(working, symbol, live.stop_side):
             logger.warning(
                 "Not restoring a stop: one still works at the broker",
                 extra={"data": {"symbol": symbol}},
@@ -2170,15 +2329,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             logger.critical(
                 "Cannot restore a stop: the cancelled orders carried no stop price, "
                 "so the position is unprotected until the next retry",
-                extra={"data": {"symbol": symbol, "qty": qty}},
+                extra={"data": {"symbol": symbol, "qty": live.stop_qty}},
             )
             return False
         try:
             order_side, time_in_force, stop_request_cls = self._load_stop_order_types()
             request = stop_request_cls(
                 symbol=symbol,
-                qty=abs(qty),
-                side=order_side.SELL if side == "sell" else order_side.BUY,
+                qty=live.stop_qty,
+                side=order_side.SELL
+                if live.stop_side == "sell"
+                else order_side.BUY,
                 time_in_force=time_in_force.DAY,
                 stop_price=stop_price,
             )
@@ -2190,7 +2351,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={
                     "data": {
                         "symbol": symbol,
-                        "qty": qty,
+                        "qty": live.stop_qty,
                         "stop_price": stop_price,
                         "error": repr(exc),
                     }
@@ -2200,7 +2361,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         logger.warning(
             "Restored a stop after the broker refused to close the position",
             extra={
-                "data": {"symbol": symbol, "qty": qty, "stop_price": stop_price}
+                "data": {
+                    "symbol": symbol,
+                    "qty": live.stop_qty,
+                    "stop_price": stop_price,
+                }
             },
         )
         return True
@@ -2209,8 +2374,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self,
         client: Any,
         symbol: str,
-        qty: float,
-        side: str,
         stop_price: float | None,
         reason: str,
         *,
@@ -2223,32 +2386,34 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         failure is reported.
         """
         if removed_protection:
-            if not await self._restore_stop(client, symbol, qty, side, stop_price):
+            if not await self._restore_stop(client, symbol, stop_price):
                 return f"{reason};NO-STOP-RESTORED"
         return reason
 
-    async def _flatten_symbol(self, client: Any, symbol: str, qty: float) -> str | None:
+    async def _flatten_symbol(self, client: Any, symbol: str) -> str | None:
         """Flatten one symbol; see :meth:`_flatten_symbol_locked`."""
         async with self._order_book_lock():
-            return await self._flatten_symbol_locked(client, symbol, qty)
+            return await self._flatten_symbol_locked(client, symbol)
 
-    async def _flatten_symbol_locked(
-        self, client: Any, symbol: str, qty: float
-    ) -> str | None:
+    async def _flatten_symbol_locked(self, client: Any, symbol: str) -> str | None:
         """Cancel this symbol's working orders, then close its position.
 
         Returns ``None`` on success, or a short reason for the failure.
 
         The cancel is not optional. Alpaca reserves the quantity of every
-        reducing-side order, so `close_position` is refused with "insufficient
+        reducing-side order - a bracket's stop leg included, even though only the
+        filled parent lists it - so `close_position` is refused with "insufficient
         qty available" while the SL/TP legs are still working. That is the one
         place where "keep the protections until the flatten succeeds" cannot
         hold - the protections are exactly what blocks the flatten - so the stop
         is re-placed on every failure after a protection was removed.
+
+        Nothing here is sized from the position the flatten was handed: every
+        decision - which orders still rest, and the quantity and side a restored
+        stop needs - is read back from the broker, because the leg that fills on
+        its way out is exactly the case this sweep has to survive.
         """
-        side = "sell" if qty > 0 else "buy"
-        orders = await self._list_open_orders(client)
-        on_symbol = [order for order in orders if _order_symbol(order) == symbol]
+        on_symbol = await self._working_book_on_symbol(client, symbol)
         stop_price = self._best_stop_price(on_symbol, symbol)
 
         cancelled_any = False
@@ -2258,8 +2423,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return await self._abandon_flatten(
                     client,
                     symbol,
-                    qty,
-                    side,
                     stop_price,
                     f"unreadable-order:{_order_attr(order, 'id', None)!r}",
                     removed_protection=cancelled_any,
@@ -2267,11 +2430,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             try:
                 await self._cancel_one(client, order_id)
             except Exception as exc:
+                # The broker's OCO may already have removed this leg with the
+                # sibling just cancelled. A refused cancel of an order that is no
+                # longer resting is not a dropped cancel; treating it as one
+                # would fail - and restore a stop on - every bracket flatten.
+                if await self._cancel_already_gone(client, order_id):
+                    cancelled_any = True
+                    continue
                 return await self._abandon_flatten(
                     client,
                     symbol,
-                    qty,
-                    side,
                     stop_price,
                     f"cancel:{order_id}:{exc}",
                     removed_protection=cancelled_any,
@@ -2279,15 +2447,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             cancelled_any = True
 
         # A cancel the broker accepted but did not apply still reserves the
-        # quantity, and the close would then be refused. Confirm by re-read.
+        # quantity, and the close would then be refused. Confirm by re-read,
+        # held legs included: a stop leg the broker kept listing is exactly what
+        # must stop this flatten from closing a position it did not dis-arm.
         try:
-            remaining_orders = await self._list_open_orders(client)
+            remaining_orders = await self._working_book_on_symbol(client, symbol)
         except Exception as exc:
             return await self._abandon_flatten(
                 client,
                 symbol,
-                qty,
-                side,
                 stop_price,
                 f"verify:{exc}",
                 removed_protection=cancelled_any,
@@ -2295,14 +2463,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         still_working = [
             _control_order_id(_order_attr(order, "id"))
             for order in remaining_orders
-            if _order_symbol(order) == symbol
         ]
         if still_working:
             return await self._abandon_flatten(
                 client,
                 symbol,
-                qty,
-                side,
                 stop_price,
                 "orders-still-working:"
                 + ",".join(str(order_id) for order_id in still_working),
@@ -2315,8 +2480,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return await self._abandon_flatten(
                 client,
                 symbol,
-                qty,
-                side,
                 stop_price,
                 f"close:{exc}",
                 removed_protection=cancelled_any,
@@ -2348,7 +2511,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             qty = _position_qty(position)
             if not symbol or _is_flat(qty):
                 continue
-            problem = await self._flatten_symbol(client, symbol, qty)
+            problem = await self._flatten_symbol(client, symbol)
             if problem is not None:
                 failed.append(f"{symbol}:{problem}")
 
@@ -2379,31 +2542,114 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Called after a successful flatten, when every symbol is flat: what
         remains are the SL/TP legs detached from the positions they protected.
         An order on a symbol that still has a position is never touched, so this
-        cannot disarm a live position.
+        cannot disarm a live position - and a leg's symbol is read from the
+        parent it rests under when the leg itself carries none, because an empty
+        symbol would read as "no position" and cancel a live position's stop.
+        A bracket's held stop leg is in scope
+        (#245): it is absent from every ``status=open`` listing, so a sweep that
+        only read those would leave exactly the leg that can still trigger - and
+        a triggered sell-stop with nothing to sell opens a short.
+
+        The legs are looked up account-wide. A bracket's take profit names the symbol a
+        `held` stop leg rests on, but an OTO entry - which the adapter submits for an
+        unbounded take profit - has a stop leg and no take-profit sibling, so the symbols
+        the open listing names are not enough. The lookup's 20-page budget bounds the
+        history it reads, and it is the one caller that passes ``symbols=None``: these
+        helpers have no default scope, so no caller can reach one by omission.
+
+        The cancels are then verified by re-reading the book, as the flatten verifies
+        its own: the broker's acknowledgement is not proof the leg is gone, and Alpaca
+        keeps a cancel it accepted listed as ``pending_cancel`` until it settles - a leg
+        that can still fill. Everything this sweep cancelled that is still resting is
+        reported as a failure, so the sweep is incomplete and the daemon keeps the
+        deployment unenforced instead of stamping it stopped over a leg that can still
+        open a short.
         """
         client = await self._require_trading_client()
-        orders = await self._list_open_orders(client)
+        open_orders = await self._list_open_orders(client)
         open_symbols = {
             str(position.get("symbol") or "").strip().upper()
             for position in await self.get_positions()
             if not _is_flat(_position_qty(position))
         }
+        legs = await self._list_resting_legs(client, symbols=None)
+        # A bracket leg can arrive without its own symbol, and an empty one reads as
+        # "no position on this symbol": the sweep would then cancel the stop leg of a
+        # live position, which is the one thing this sweep promises never to do. The
+        # parent the leg rests under is what names the symbol, so the leg's symbol is
+        # resolved from it before anything is cancelled.
+        leg_symbols = {
+            leg_id: _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+            if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
+        }
+        orders = self._merge_held_legs(open_orders, legs)
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
+        cancelled: list[str] = []
+        cancelled_symbols: dict[str, str] = {}
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
                 unidentified.append(f"order:{_order_attr(order, 'id', None)!r}")
                 continue
-            if _order_symbol(order) in open_symbols:
+            symbol = _order_symbol(order) or leg_symbols.get(order_id, "")
+            if symbol in open_symbols:
                 continue
             try:
                 await self._cancel_one(client, order_id)
             except Exception as exc:
+                # The broker's OCO may already have removed this leg with the
+                # sibling just cancelled; a refusal for an order that is no
+                # longer resting is not a failure the daemon must retry forever.
+                if await self._cancel_already_gone(client, order_id):
+                    continue
                 failed.append(f"{order_id}:{exc}")
                 continue
+            cancelled.append(order_id)
+            cancelled_symbols[order_id] = symbol
             completed += 1
+        if cancelled:
+            # A held leg is only ever visible under its filled parent, so the
+            # verification has to read the whole working book, not the open
+            # listing: the one order this sweep exists to remove is the one the
+            # open listing cannot show.
+            #
+            # Scoped to the symbols this sweep actually cancelled rather than read
+            # account-wide a second time: the daemon runs this sweep every sync tick
+            # and retries while it is incomplete, so two 20-page account-wide scans
+            # per pass is what turns a long history into a rate limit, and a rate
+            # limit fails the sweep closed - the retry then pays the same price. A
+            # leg is found under the filled parent of its own symbol, so those
+            # symbols are enough. An id whose symbol could not be resolved has no
+            # such bound, and the sweep reads account-wide rather than assume it.
+            #
+            # The bound is the symbols, not the count of cancels: one symbol can
+            # carry several cancels - both legs of an orphaned bracket, or two
+            # brackets on one symbol - and counting ids instead of the symbols they
+            # sit on would fall back to the account-wide re-read on exactly the
+            # ordinary bracket sweep. So only an unresolved symbol, which names no
+            # bound at all, widens the scope.
+            verify_symbols = {symbol for symbol in cancelled_symbols.values() if symbol}
+            if any(not symbol for symbol in cancelled_symbols.values()):
+                verify_symbols = None
+            try:
+                remaining = await self._list_working_book(
+                    client, symbols=verify_symbols
+                )
+            except Exception as exc:
+                failed.append(f"verify:{exc}")
+            else:
+                still_resting = {
+                    _control_order_id(_order_attr(order, "id")) for order in remaining
+                }
+                still_resting.discard(None)
+                failed.extend(
+                    f"{order_id}:still-working"
+                    for order_id in cancelled
+                    if order_id in still_resting
+                )
         return ControlOutcome(
             completed=completed,
             unidentified=tuple(unidentified),
@@ -2452,48 +2698,219 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return list(stops.values())
 
     async def _list_filled_parents_with_held_legs(
-        self, client: Any, symbols: set[str]
+        self, client: Any, symbols: set[str] | None
     ) -> list[Any]:
-        """Filled bracket parents whose stop leg is still ``held``.
+        """Filled bracket parents that still have a bracket leg resting at the broker.
 
         Observed on Alpaca paper (2026-11-16): once a bracket entry fills, the stop leg
         stays ``held`` and is absent from every ``status=open`` listing, nested or flat.
         It is only reachable as a leg of the filled parent in a ``status=all`` listing,
-        and it can be replaced like any working stop. Only parents of symbols with an
-        open position are requested. A failure to list is not swallowed: a missing stop
-        would be reported as "no stop" for a position that does have one.
+        and it can be replaced like any working stop. ``symbols`` scopes the lookup (the
+        positions being acted on); ``None`` looks account-wide, which only the orphan sweep
+        may ask for: its whole job is symbols that no longer have a position, and an OTO
+        entry's stop leg has no take-profit sibling that ``status=open`` would name. The
+        20-page budget bounds even the account-wide history, and there is no default
+        scope, so no caller reaches an account-wide scan by omission.
+
+        The listing is newest-first and capped at 500 rows, so one call is only the
+        newest 500 orders of the account's whole history - a mature account fills that
+        page with terminal orders. A full page therefore pages back over the history
+        until a page comes back not full (the end of the history) rather than failing:
+        an account that trades a bracket per day reaches 500 orders within two years,
+        and a flatten that then failed would leave the position open. The 20-page
+        budget is the end of that, and a 20th full page fails with it: a history of
+        exactly 10,000 orders cannot be told apart from a longer one, and either way
+        the pages past it hold orders this lookup cannot vouch for. A failure to list
+        is not swallowed either way: a missing stop would be reported as "no stop" for
+        a position that does have one.
         """
         get_orders = getattr(client, "get_orders", None)
-        if not symbols or not callable(get_orders):
+        if not callable(get_orders):
+            return []
+        if symbols is not None and not symbols:
             return []
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
 
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            symbols=sorted(symbols),
-            nested=True,
-            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+        collected: dict[str, Any] = {}
+        until: datetime | None = None
+        for _ in range(_ALPACA_HELD_LEG_PAGE_LIMIT):
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                symbols=sorted(symbols) if symbols is not None else None,
+                nested=True,
+                limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+                until=until,
+            )
+            result = await asyncio.to_thread(get_orders, filter=request)
+            if not isinstance(result, (list, tuple)):
+                raise RuntimeError(
+                    f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                    "refusing to report a clean sweep"
+                )
+            for order in result:
+                row_key = _control_order_id(_order_attr(order, "id"))
+                collected[row_key or f"row-{len(collected)}"] = order
+            if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+                return self._parents_with_resting_legs(collected.values())
+            until = _page_back_cursor(result)
+            if until is None:
+                raise RuntimeError(
+                    "Alpaca's order rows carry no submitted timestamp, so the next page "
+                    "cannot be asked for; refusing to treat the list as complete"
+                )
+        raise RuntimeError(
+            f"Alpaca's order history reached "
+            f"{_ALPACA_HELD_LEG_PAGE_LIMIT * _ALPACA_HELD_LEG_LOOKUP_LIMIT} orders "
+            "without an empty page; refusing to treat the list as complete"
         )
-        result = await asyncio.to_thread(get_orders, filter=request)
-        if not isinstance(result, (list, tuple)):
-            raise RuntimeError(
-                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
-                "refusing to report a clean sweep"
-            )
-        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
-            # The listing is newest-first: a full page may have cut off the filled parent
-            # that owns the held stop leg, and "no stop" would then be a lie.
-            raise RuntimeError(
-                f"Alpaca returned {len(result)} orders, the page limit; "
-                "refusing to treat the list as complete"
-            )
+
+    @staticmethod
+    def _parents_with_resting_legs(orders: Any) -> list[Any]:
+        """Filled bracket parents that still have a bracket leg resting at the broker."""
         return [
             order
-            for order in result
+            for order in orders
             if _order_status(order) == "filled"
-            and any(_order_status(leg) == "held" for leg in _order_legs(order))
+            and any(_order_status(leg) in _RESTING_LEG_STATUSES for leg in _order_legs(order))
         ]
+
+    async def _list_resting_legs(
+        self, client: Any, *, symbols: set[str] | None
+    ) -> list[_RestingLeg]:
+        """The bracket legs themselves, the ones no ``status=open`` listing shows (#245).
+
+        A leg in ``pending_cancel`` still rests: its cancel has not settled and it can
+        still fill, so a sweep that dropped it would report a clean book while the leg
+        was still reserving quantity (#198). A leg whose cancel did settle says so in
+        the listing and is not resting. Each leg comes back with the parent it rests
+        under, so a caller can resolve a symbol the leg itself does not carry.
+        """
+        parents = await self._list_filled_parents_with_held_legs(client, symbols)
+        return [
+            _RestingLeg(leg=leg, parent=parent)
+            for parent in parents
+            for leg in _order_legs(parent)
+            if _order_status(leg) in _RESTING_LEG_STATUSES
+        ]
+
+    async def _list_working_book(
+        self, client: Any, *, symbols: set[str] | None
+    ) -> list[Any]:
+        """Every order still resting at the broker, or a hard failure - never a partial book.
+
+        ``status=open`` is not the book on a bracketed position: the stop leg stays
+        ``held`` and is absent from every open listing, so a sweep built on it alone
+        cannot see the leg - the one order that can still trigger on the position. That
+        is the probe's ``orders-still-working``/``NO-STOP-RESTORED`` result: ``held``
+        legs of filled parents are added here. The open listing itself is account-wide;
+        ``symbols`` scopes the held-leg lookup, and every caller filters the result it
+        gets back.
+        """
+        orders = await self._list_open_orders(client)
+        legs = await self._list_resting_legs(client, symbols=symbols)
+        return self._merge_held_legs(orders, legs)
+
+    async def _working_book_on_symbol(self, client: Any, symbol: str) -> list[Any]:
+        """The working book filtered to *symbol*, held legs placed by their parent.
+
+        A held leg can arrive without a symbol of its own, and the parent it rests
+        under is what names the symbol, exactly as the orphan sweep resolves it:
+        filtered by the leg's own symbol such a leg reads as "another symbol",
+        survives the cancel, its stop goes on reserving the position's quantity,
+        and the close is then refused for that reservation - a flatten that cannot
+        finish. The leg lookup is scoped to *symbol* already, so a leg without a
+        symbol of its own belongs to this flatten; one whose parent names another
+        symbol is still left out. A leg is placed by object identity as well as
+        by id: the lookup above was scoped to this symbol's parents, so a leg it
+        returns belongs here even when its id cannot be read - and dropping it
+        would let the flatten close over a protection nobody verified.
+        """
+        open_orders = await self._list_open_orders(client)
+        legs = await self._list_resting_legs(client, symbols={symbol})
+        orders = self._merge_held_legs(open_orders, legs)
+        leg_symbols = {
+            leg_id: _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+            if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
+        }
+        leg_symbols_by_object = {
+            id(resting.leg): _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+        }
+        on_symbol = []
+        for order in orders:
+            order_id = _control_order_id(_order_attr(order, "id"))
+            resolved = (
+                _order_symbol(order)
+                or leg_symbols_by_object.get(id(order))
+                or leg_symbols.get(order_id or "", "")
+            )
+            if resolved == symbol:
+                on_symbol.append(order)
+        return on_symbol
+
+    @staticmethod
+    def _merge_held_legs(
+        open_orders: list[Any], legs: Iterable[_RestingLeg]
+    ) -> list[Any]:
+        """One entry per resting order: the open listing plus the legs it cannot show.
+
+        A broker can list the same leg both ways, and an entry listed twice would hide
+        which orders actually remain. An unreadable id cannot be matched, so it is always
+        kept - the sweep still has to report it rather than silently drop it.
+        """
+        orders = list(open_orders)
+        listed = {
+            order_id
+            for order_id in (
+                _control_order_id(_order_attr(order, "id")) for order in orders
+            )
+            if order_id is not None
+        }
+        for resting in legs:
+            leg = resting.leg
+            leg_id = _control_order_id(_order_attr(leg, "id"))
+            if leg_id is None or leg_id not in listed:
+                orders.append(leg)
+                if leg_id is not None:
+                    listed.add(leg_id)
+        return orders
+
+    async def _cancel_already_gone(self, client: Any, order_id: str) -> bool:
+        """Whether a refused cancel was for an order that is no longer resting.
+
+        A bracket is an OCO pair: cancelling one leg cancels the other at the broker,
+        so the second cancel of the pair is refused for an order the broker has already
+        removed (paper probe 2026-11-20: the sibling the take profit took with it reads
+        back by id as ``canceled``). That refusal is not a dropped cancel - the read
+        below is the proof - and a sweep that reported it as one would fail, and in the
+        flatten restore a stop on, every real bracket.
+
+        "Not resting" is not itself the proof: an order also leaves the book by executing,
+        and a stop that fills on a position that is already flat opens a short. So the id
+        is read back and only an order that left *without executing* counts - in a
+        terminal state, and with nothing of its own filled. A broker that cannot find the
+        order, a row nobody could read or a quantity nobody could read proves nothing,
+        and answers "not gone" so the refusal stands.
+
+        The read is by id, not a fresh listing: a terminal state already proves the order
+        is not resting, and the book a re-list would fetch is the page-limited nested
+        history - up to 20 requests of 500 rows - which on a mature account is what turns
+        one refused bracket cancel into a rate limit, and a rate limit fails the sweep
+        closed. A sweep with several refusals must not pay that price per refusal.
+        """
+        get_order = getattr(client, "get_order_by_id", None)
+        if not callable(get_order):
+            return False
+        try:
+            order = await asyncio.to_thread(get_order, order_id)
+        except Exception:  # fail closed: a read that raises proves nothing
+            return False
+        if _order_status(order) not in _GONE_WITHOUT_EXECUTING:
+            return False
+        filled_qty = _order_filled_qty(order)
+        return filled_qty is not None and filled_qty <= 0.0
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         value = float(price)

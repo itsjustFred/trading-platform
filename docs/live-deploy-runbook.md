@@ -155,7 +155,7 @@ results stop predicting live behaviour:
   failure on every pass and nothing is amended.
 - Real-money accounts are never amended: the loop only receives connected demo/paper adapters,
   the same hard block that applies to orders.
-**Verified on Alpaca paper (2026-11-16)**
+**Verified on Alpaca paper (2026-11-16, parts re-checked 2026-11-20)**
 
 Probe on a paper account (endpoint host checked as `paper-api.alpaca.markets`): 1 share of `F`
 as a market bracket entry (stop 3 % below, take profit 5 % above), then listings, a replace and a
@@ -166,12 +166,82 @@ clean-up.
   any open listing.** `AlpacaLiveAdapter.list_protective_stops` therefore also reads filled
   parents of symbols with an open position from a `status=all`, `nested=true` listing and takes
   their `held` stop legs (fixed in this PR; before it a real bracket position reported "no stop").
+- The same leg, on the same account and shape, is what the STOPPED sweeps have to cancel: the
+  flatten (`close_all_positions`) and the orphan-protection sweep (`cancel_orphaned_protections`)
+  now read the identical `status=all`, `nested=true` listing (the flatten for the position's
+  symbol, the orphan sweep account-wide), a leg in `pending_cancel` counts as resting, and a
+  refused cancel is excused only for an order that is no longer resting *and* left without
+  executing (#245; before it the flatten returned
+  `orders-still-working ... NO-STOP-RESTORED` on every bracket position and an orphaned stop leg
+  could survive a stop). Cancelling one leg cancels the other at the broker, so the second cancel
+  of a pair is refused for an order the broker has already removed - that is the OCO, not a
+  dropped cancel.
+- The `status=all` listing is newest-500-rows at a time, and a mature account fills that page
+  with terminal orders, so a full page pages back through the history (bounded at 20 pages)
+  instead of failing: an account trading one bracket a day reaches 500 orders within two
+  years, and a flatten that failed on its own order book would leave the position open. A 20th
+  full page fails too: exactly 10,000 orders cannot be told apart from a longer history. The page cursor goes past the oldest row it saw by a
+  microsecond, so no order at the boundary is skipped. (`status=open` still refuses a full
+  page: 500 *working* orders means orders the sweep cannot see.)
+- The orphan sweep's leg lookup is account-wide, bounded by the same 20-page budget: a bracket's
+  take profit names the symbol a `held` stop leg rests on, but the OTO entry this platform
+  submits for an unbounded take profit has a stop leg and no take-profit sibling to derive the
+  symbol from.
+- A stop that filled while its leg was being cancelled ends the flatten with the position already
+  flat, and restoring a stop then would create the orphan these sweeps exist to remove, so the
+  restore re-reads the position first and skips itself on a flat one. The same read sizes and
+  sides the stop it restores: the leg that fills on its way out leaves a smaller position than
+  the flatten started from, and a stop sized from the old quantity oversells it. A position the
+  broker will not report is not sized either - the restore refuses and the sweep reports the
+  naked position, rather than placing an order for a quantity nobody read.
+- The orphan sweep re-reads the working book after its cancels, as the flatten does, and reports
+  anything it cancelled that is still resting as a failure so the sweep is incomplete: Alpaca
+  keeps a cancel it accepted listed as `pending_cancel` until it settles, and a leg that is
+  still listed can still fill. A verification it cannot make is a failure too. (An accepted
+  cancel that left the leg resting is *not* reported as `pending_cancel` here, unlike the
+  entry-cancel sweep: the daemon gates the STOPPED stamp on this sweep being `complete`, and
+  `pending_cancel` does not make an outcome incomplete, so it would be read as a clean sweep.)
+- That verification is scoped to the symbols the sweep cancelled, and the scope is those
+  symbols however many cancels it took to clear them - both legs of one orphaned bracket, or two
+  brackets on one symbol, do not widen it, because the daemon runs this sweep every sync tick
+  and retries while it is incomplete, so two 20-page nested scans per pass is what turns a long
+  order history into a rate limit. Only an id whose symbol could not be resolved falls back to
+  account-wide, because that id names no bound.
+- The flatten places a held leg by the parent it rests under, in both its cancel list and its
+  cancel verification: a leg that arrives without a symbol of its own is still on the symbol
+  being flattened. Read as "another symbol" it survives the cancel, its stop keeps reserving the
+  position's quantity, and the close is then refused for that reservation - a flatten that cannot
+  finish. A leg whose parent names another symbol is still left out.
+- A stop is not restored onto a working book nobody could re-read. That re-read is what proves
+  no stop still works, and it is also the part that can fail now that the held-leg lookup is
+  paged; restoring anyway places a second stop beside whatever the broker kept, and two stops
+  reduce a position twice - the extra one an orphan the moment the first fills. The position is
+  then unprotected until the next enforcement retry, which the sweep reports.
+- The excusal is settled by one read of the order by id, not by re-listing the working book: a
+  terminal state already proves the order is not resting, and the book is the page-limited
+  nested history - up to 20 requests of 500 rows - so a sweep with several refused cancels on a
+  mature account is what turns into a rate limit, and a rate limit fails the sweep closed. A
+  cancelled order that partly filled does not excuse its refusal (it executed), and neither
+  does one whose filled quantity cannot be read. Alpaca has no `done` order status; its
+  end-of-day state is `done_for_day`, which resumes the next session and is not an excusal.
+- Paper check of #245 (2026-11-20, `ACC1`, endpoint host read as
+  `https://paper-api.alpaca.markets`, 1 share of `F` as a resting limit bracket, nothing left
+  behind after the run). The filled-bracket shape could **not** be produced in that session: the
+  equity market was closed until the next Monday 09:30 ET, and the broker refuses both `bracket
+  orders do not support extended hours trading` (40310000) and crypto brackets (`crypto orders
+  not allowed for advanced order_class: otoco`). Verified live instead: the `status=all,
+  nested=true` request (scoped by `symbols`, and account-wide) is accepted and parsed against real
+  alpaca-py objects, a `held` leg under a *not yet filled* parent is correctly not treated as a
+  protection of a position, the orphan sweep cancelled a resting bracket parent on a flat symbol
+  and left nothing behind, and the OCO behaviour the excusal is built on: cancelling the
+  take-profit leg takes the stop leg with it, and both then read back by id as `canceled`. The
+  run left no working order and no position behind. The flatten and the stop restore on the
+  recorded (filled-parent) shape are pinned by `tests/test_alpaca_adapter.py`, which reproduces
+  it. Re-run the sweep check at the next regular session to confirm on the live shape
+  (tracked in #322).
 - `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
-- Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
-  `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
-  cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
 ## Strategy Promotion Gate (#165)
 
