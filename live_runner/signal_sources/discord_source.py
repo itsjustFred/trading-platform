@@ -14,6 +14,7 @@ from typing import Any
 
 import requests
 
+from live_runner import signal_archive
 from live_runner.credential_env import discord_bot_env_key
 from live_runner.exit_signals import ExitInstruction, exit_intent_metadata
 from live_runner.signal_sources.base_source import BaseSignalSource
@@ -1098,6 +1099,24 @@ def _build_signal_metadata(
     return metadata
 
 
+def _report_parse_outcome(
+    outcome_sink: Callable[[str, str | None], None] | None,
+    reason: str,
+    detail: str | None = None,
+) -> None:
+    """Report one parse refusal to the archive observer; never raises.
+
+    The observer only *records* a slug for the raw-signal archive (issue
+    #308); a broken observer must not change what the parser decides.
+    """
+    if outcome_sink is None:
+        return
+    try:
+        outcome_sink(reason, detail)
+    except Exception:
+        pass
+
+
 def _parse_trade_signal_from_message(
     message: Any,
     *,
@@ -1105,6 +1124,7 @@ def _parse_trade_signal_from_message(
     trusted_author_ids: Iterable[str] | None = None,
     on_author_rejection: Awaitable[None] | Callable[[str], Any] | None = None,
     on_author_accepted: Callable[[], Any] | None = None,
+    outcome_sink: Callable[[str, str | None], None] | None = None,
 ) -> TradeSignal | None:
     """Parse a Discord message into a trade signal.
 
@@ -1115,6 +1135,7 @@ def _parse_trade_signal_from_message(
     """
     content = str(getattr(message, "content", "") or "").strip()
     if not content:
+        _report_parse_outcome(outcome_sink, "empty_content")
         return None
 
     trusted = _normalize_author_ids(trusted_author_ids)
@@ -1122,6 +1143,7 @@ def _parse_trade_signal_from_message(
         author_id = _resolve_message_author_id(message)
         if not author_id or author_id not in trusted:
             _reject_untrusted_author(message, author_id, on_author_rejection)
+            _report_parse_outcome(outcome_sink, "untrusted_author", author_id or None)
             return None
 
     if on_author_accepted is not None:
@@ -1130,10 +1152,12 @@ def _parse_trade_signal_from_message(
     rejection = _non_entry_rejection(content)
     if rejection is not None:
         _log_parser_rejection(message, rejection)
+        _report_parse_outcome(outcome_sink, "non_entry_rejection", rejection)
         return None
     levels = _extract_trade_levels(content)
     if levels is None:
         _log_parser_rejection(message, "ambiguous or malformed target/stop level")
+        _report_parse_outcome(outcome_sink, "malformed_levels")
         return None
     body = levels.body
 
@@ -1141,6 +1165,7 @@ def _parse_trade_signal_from_message(
         parsed_exit = _parse_exit(body)
     except _RejectedExit as exc:
         _log_parser_rejection(message, f"unexecutable exit: {exc}", warning=True)
+        _report_parse_outcome(outcome_sink, "unexecutable_exit", str(exc))
         return None
     if parsed_exit is not None:
         return _build_exit_signal(
@@ -1149,6 +1174,7 @@ def _parse_trade_signal_from_message(
             parsed_exit,
             price=levels.entry_price,
             default_timeframe=default_timeframe,
+            outcome_sink=outcome_sink,
         )
     if _has_exit_directive(body):
         # An exit instruction this parser cannot execute is never an entry.
@@ -1159,6 +1185,7 @@ def _parse_trade_signal_from_message(
             "never read as an entry",
             warning=True,
         )
+        _report_parse_outcome(outcome_sink, "ambiguous_exit_directive")
         return None
 
     signal_type = None
@@ -1169,6 +1196,7 @@ def _parse_trade_signal_from_message(
         # reading the same message in opposite directions is exactly the
         # inconsistency the one shared predicate exists to prevent.
         if _BUY_NEGATED_RE.search(body):
+            _report_parse_outcome(outcome_sink, "negated_instruction")
             return None
         action = "buy"
         signal_type = "ram_jet_oversold_buy"
@@ -1176,11 +1204,13 @@ def _parse_trade_signal_from_message(
         signal_type = _detect_rocket_fuel_signal_type(body)
         action = _resolve_action(body, signal_type=signal_type)
     if action is None:
+        _report_parse_outcome(outcome_sink, "no_action")
         return None
 
     symbol = _extract_symbol(body)
     price = levels.entry_price
     if not symbol or price is None or price <= 0:
+        _report_parse_outcome(outcome_sink, "missing_symbol_or_price")
         return None
     if _levels_contradict_action(
         action, price, stop_loss=levels.stop_loss, take_profit=levels.take_profit
@@ -1191,6 +1221,13 @@ def _parse_trade_signal_from_message(
             f"(entry={price}, stop_loss={levels.stop_loss}, "
             f"take_profit={levels.take_profit})",
             warning=True,
+        )
+        _report_parse_outcome(
+            outcome_sink,
+            "levels_contradict_action",
+            f"{action} levels on the wrong side of the entry "
+            f"(entry={price}, stop_loss={levels.stop_loss}, "
+            f"take_profit={levels.take_profit})",
         )
         return None
 
@@ -1246,6 +1283,7 @@ def _build_exit_signal(
     *,
     price: float | None,
     default_timeframe: str,
+    outcome_sink: Callable[[str, str | None], None] | None = None,
 ) -> TradeSignal | None:
     """An exit-only signal (#121 decision 1).
 
@@ -1259,6 +1297,7 @@ def _build_exit_signal(
         _log_parser_rejection(
             message, "message mixes an exit with an entry instruction", warning=True
         )
+        _report_parse_outcome(outcome_sink, "mixed_exit_and_entry")
         return None
     if price is None:
         _log_parser_rejection(
@@ -1267,6 +1306,7 @@ def _build_exit_signal(
             "is not executed (add '@ <price>')",
             warning=True,
         )
+        _report_parse_outcome(outcome_sink, "exit_without_price")
         return None
     instruction = ExitInstruction(
         fraction=parsed_exit.fraction, position_side=parsed_exit.position_side
@@ -1356,10 +1396,15 @@ class DiscordSignalSource(BaseSignalSource):
         service_id: str | None = None,
         trusted_author_ids: Iterable[str] | str | None = None,
         auth_scheme: str | None = None,
+        account_id: str | None = None,
     ) -> None:
         normalized_name = str(bot_name or "discord").strip()
         self.bot_name = normalized_name or "discord"
         self.service_id = str(service_id or "").strip() or None
+        # The account whose listener owns this source; recorded on every
+        # archived signal so the same channel polled by two accounts stays
+        # distinguishable (issue #308).
+        self.account_id = str(account_id or "").strip() or None
         self.source_name = f"discord_{self.bot_name.lower()}"
         self.token = (token or os.environ.get("DISCORD_BOT_TOKEN", "")).strip()
         # Discord accepts two different credentials and they are NOT
@@ -1945,13 +1990,46 @@ class DiscordSignalSource(BaseSignalSource):
         if not emit:
             return
         wrapped = _DiscordMessageAdapter(message)
+        refusals: list[tuple[str, str | None]] = []
+
+        def _outcome_sink(reason: str, detail: str | None = None) -> None:
+            refusals.append((reason, detail))
+
         parsed = _parse_trade_signal_from_message(
             wrapped,
             default_timeframe=self.timeframe,
             trusted_author_ids=self.trusted_author_ids,
             on_author_rejection=self._record_author_rejection,
             on_author_accepted=self._record_author_accepted,
+            outcome_sink=_outcome_sink,
         )
+        # Issue #308: archive every emitted message, parsed or refused —
+        # including authors outside the trusted allowlist, kept for impostor
+        # auditing and marked ``author_trusted: false``. record() is a
+        # non-blocking put_nowait; the try only guards record *construction*,
+        # and failures are counted, never raised into the poll loop.
+        author_trusted = (
+            _resolve_message_author_id(wrapped) in self.trusted_author_ids
+        )
+        try:
+            signal_archive.get_signal_archive().record(
+                signal_archive.received_record(
+                    bot_name=self.bot_name,
+                    account_id=self.account_id,
+                    service_id=self.service_id,
+                    message=message,
+                    channel_id=channel_id,
+                    parsed=parsed,
+                    refusal=refusals[0] if refusals else None,
+                    author_trusted=author_trusted,
+                )
+            )
+        except Exception as exc:
+            signal_archive.get_signal_archive().enqueue_errors += 1
+            logger.warning(
+                "Discord signal archive record failed",
+                extra={"data": {"error": str(exc)}},
+            )
         if parsed is None:
             return
         parsed.metadata["source"] = self.source_name

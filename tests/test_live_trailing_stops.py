@@ -1399,7 +1399,7 @@ def test_sync_loop_publishes_the_shared_deployment_snapshot(monkeypatch) -> None
 def test_discord_dispatch_threads_the_adapter_into_the_processor_gate(monkeypatch) -> None:
     seen: list[object] = []
 
-    def _processor(signal, deployment, *, adapter=None):
+    def _processor(signal, deployment, *, adapter=None, decision=None):
         seen.append(adapter)
         return signal
 
