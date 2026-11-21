@@ -211,7 +211,10 @@ def test_nyse_daily_dates_skip_weekends_and_holidays():
     # Jul 4 is a NYSE holiday; Jul 6-7 is a weekend.
     assert dates == {
         pd.Timestamp(d).date()
-        for d in ("2024-07-01", "2024-07-02", "2024-07-03", "2024-07-05", "2024-07-08", "2024-07-09", "2024-07-10")
+        for d in (
+            "2024-07-01", "2024-07-02", "2024-07-03", "2024-07-05",
+            "2024-07-08", "2024-07-09", "2024-07-10",
+        )
     }
 
 

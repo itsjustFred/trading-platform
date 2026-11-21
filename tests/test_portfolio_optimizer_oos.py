@@ -8,7 +8,6 @@ from runner.portfolio_optimizer import (
     _align_equity_curves,
     _compute_correlation_matrix,
     _compute_oos_metrics,
-    daily_observation_count,
     _normalize_equity_matrix,
     _parse_time_to_ts,
     _period_percentage_returns,
@@ -17,6 +16,7 @@ from runner.portfolio_optimizer import (
     _split_equity_curves_by_boundaries,
     _split_equity_curves_by_time,
     _weighted_correlation_penalty,
+    daily_observation_count,
     optimize_portfolio_allocation,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
@@ -743,8 +743,14 @@ class TestMinOosDailyObservations:
         # 1-month OOS tail contains exactly one daily observation.
         times = [base + i * 86400 for i in range(39)] + [base + 100 * 86400]
         curves = {
-            "a": [StrategyEquityPoint(time=t, equity=100000.0 + i) for i, t in enumerate(times)],
-            "b": [StrategyEquityPoint(time=t, equity=100000.0 + i * 2) for i, t in enumerate(times)],
+            "a": [
+                StrategyEquityPoint(time=t, equity=100000.0 + i)
+                for i, t in enumerate(times)
+            ],
+            "b": [
+                StrategyEquityPoint(time=t, equity=100000.0 + i * 2)
+                for i, t in enumerate(times)
+            ],
         }
         result = self._run(monkeypatch, tmp_path, curves)
         assert result["oos_status"] == "insufficient_oos_bars"
