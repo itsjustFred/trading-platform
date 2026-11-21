@@ -92,14 +92,14 @@ def network_violations() -> tuple[str, ...]:
     return tuple(_NETWORK_VIOLATIONS)
 
 
-@lru_cache(maxsize=8192)
 def _repo_secret_path(raw_path: object) -> Path | None:
     """The checkout's real secret file ``raw_path`` names, or ``None``.
 
     The path is resolved before the name is compared, so a symlink to a secret file is caught by its
-    target and not by the name someone gave the link. ``open`` is the hottest audit event in the
-    process, so the answer is cached per path: the suite opens the same ``.pyc`` files thousands of
-    times, and the cache hit is what makes a full resolve on every open affordable.
+    target and not by the name someone gave the link. Nothing is cached: a cache keyed on the path
+    alone would hand back the previous answer for a path that is a symlink now, and the cwd a
+    relative path resolves against can change inside a session. ``open`` is the hottest audit event
+    in the process, and this resolution is what the guard costs per call.
     """
     if isinstance(raw_path, int) or raw_path is None:
         return None
@@ -200,23 +200,24 @@ def _redirected_load_dotenv(path=None, *args, **kwargs):
 
     The path is read from either calling convention - ``load_dotenv(p)`` and
     ``load_dotenv(dotenv_path=p)`` are the same call, and a redirect that only saw the first would
-    let the second load the real file. A call that names no path at all is resolved through the
-    library's own discovery, which walks up from the caller and would find the checkout's file.
+    let the second load the real file. A caller that supplies a stream reads from it, so the file
+    is not discovered for one. A caller that names neither is resolved through the library's own
+    discovery, which walks up from this file and would find the checkout's.
     """
     named = kwargs.pop("dotenv_path", None)
     target = path if path is not None else named
-    if target is None:
+    has_stream = bool(args) or "stream" in kwargs
+    if target is None and not has_stream:
         try:
             discovered = dotenv.find_dotenv(usecwd=False)
         except Exception:  # pragma: no cover - discovery is best effort
             discovered = ""
         target = discovered or None
+    # One expression of the path, forwarded once: a positional and a keyword copy of the same
+    # argument is how a redirect ends up applied to one of them and not the other.
     if _repo_secret_path(target) == REPO_ENV_FILE:
-        if named is not None:
-            kwargs["dotenv_path"] = ISOLATED_DOTENV_FILE
-        else:
-            path = ISOLATED_DOTENV_FILE
-    return _real_load_dotenv(path, *args, **kwargs)
+        target = ISOLATED_DOTENV_FILE
+    return _real_load_dotenv(target, *args, **kwargs)
 
 
 dotenv.load_dotenv = _redirected_load_dotenv
