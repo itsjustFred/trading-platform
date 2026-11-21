@@ -189,7 +189,25 @@ clean-up.
   symbol from.
 - A stop that filled while its leg was being cancelled ends the flatten with the position already
   flat, and restoring a stop then would create the orphan these sweeps exist to remove, so the
-  restore re-reads the position first and skips itself on a flat one.
+  restore re-reads the position first and skips itself on a flat one. The same read sizes and
+  sides the stop it restores: the leg that fills on its way out leaves a smaller position than
+  the flatten started from, and a stop sized from the old quantity oversells it. A position the
+  broker will not report is not sized either - the restore refuses and the sweep reports the
+  naked position, rather than placing an order for a quantity nobody read.
+- The orphan sweep re-reads the working book after its cancels, as the flatten does, and reports
+  anything it cancelled that is still resting as a failure so the sweep is incomplete: Alpaca
+  keeps a cancel it accepted listed as `pending_cancel` until it settles, and a leg that is
+  still listed can still fill. A verification it cannot make is a failure too. (An accepted
+  cancel that left the leg resting is *not* reported as `pending_cancel` here, unlike the
+  entry-cancel sweep: the daemon gates the STOPPED stamp on this sweep being `complete`, and
+  `pending_cancel` does not make an outcome incomplete, so it would be read as a clean sweep.)
+- The excusal is settled by one read of the order by id, not by re-listing the working book: a
+  terminal state already proves the order is not resting, and the book is the page-limited
+  nested history - up to 20 requests of 500 rows - so a sweep with several refused cancels on a
+  mature account is what turns into a rate limit, and a rate limit fails the sweep closed. A
+  cancelled order that partly filled does not excuse its refusal (it executed), and neither
+  does one whose filled quantity cannot be read. Alpaca has no `done` order status; its
+  end-of-day state is `done_for_day`, which resumes the next session and is not an excusal.
 - Paper check of #245 (2026-11-20, `ACC1`, endpoint host read as
   `https://paper-api.alpaca.markets`, 1 share of `F` as a resting limit bracket, nothing left
   behind after the run). The filled-bracket shape could **not** be produced in that session: the
