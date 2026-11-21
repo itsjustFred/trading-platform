@@ -5,7 +5,7 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, NamedTuple
@@ -86,10 +86,10 @@ _RESTING_LEG_STATUSES = frozenset({"held", "pending_cancel"})
 #: refuse-cancel be excused: a ``filled``/``partially_filled`` order executed (a stop that
 #: fills on a position that is already flat opens a short), a ``done_for_day`` order is only
 #: out for the session and resumes with the next one, and a row nobody could read proves
-#: nothing. The literal this set used to carry for "done" matches no status alpaca-py
-#: 0.44.0 defines (its end-of-day state is ``done_for_day``), so the excusal is settled on
-#: states that exist. Verified on paper 2026-11-20: the leg Alpaca removes as the
-#: OCO sibling of a cancelled take profit is still readable by id, as ``canceled``.
+#: nothing. alpaca-py 0.44.0's ``OrderStatus`` defines no "done" - its end-of-day state is
+#: ``done_for_day`` - so there is nothing here for a shorter spelling to match. Verified on
+#: paper 2026-11-20: the leg Alpaca removes as the OCO sibling of a cancelled take profit
+#: is still readable by id, as ``canceled``.
 _GONE_WITHOUT_EXECUTING = frozenset({"canceled", "expired", "rejected"})
 
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
@@ -515,6 +515,20 @@ def _order_filled_qty(order: Any) -> float | None:
     """
     value = _to_float(_order_attr(order, "filled_qty", None), default=float("nan"))
     return value if math.isfinite(value) else None
+
+
+class _RestingLeg(NamedTuple):
+    """A bracket leg that still rests, and the filled parent it rests under.
+
+    The parent travels with the leg because a leg can arrive without its own
+    ``symbol``: this file's other order readers fall back to the parent's
+    (``_protective_stop_of``, ``_best_stop_price`` and ``_has_working_stop`` all
+    accept an empty leg symbol), and a symbol nobody could read is not "no
+    position" - it is a position the sweep cannot place.
+    """
+
+    leg: Any
+    parent: Any
 
 
 class _LivePosition(NamedTuple):
@@ -2541,19 +2555,30 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             for position in await self.get_positions()
             if not _is_flat(_position_qty(position))
         }
-        orders = self._merge_held_legs(
-            open_orders, await self._list_resting_legs(client, symbols=None)
-        )
+        legs = await self._list_resting_legs(client, symbols=None)
+        # A bracket leg can arrive without its own symbol, and an empty one reads as
+        # "no position on this symbol": the sweep would then cancel the stop leg of a
+        # live position, which is the one thing this sweep promises never to do. The
+        # parent the leg rests under is what names the symbol, so the leg's symbol is
+        # resolved from it before anything is cancelled.
+        leg_symbols = {
+            leg_id: _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+            if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
+        }
+        orders = self._merge_held_legs(open_orders, legs)
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
         cancelled: list[str] = []
+        cancelled_symbols: dict[str, str] = {}
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
             if order_id is None:
                 unidentified.append(f"order:{_order_attr(order, 'id', None)!r}")
                 continue
-            if _order_symbol(order) in open_symbols:
+            symbol = _order_symbol(order) or leg_symbols.get(order_id, "")
+            if symbol in open_symbols:
                 continue
             try:
                 await self._cancel_one(client, order_id)
@@ -2566,14 +2591,29 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 failed.append(f"{order_id}:{exc}")
                 continue
             cancelled.append(order_id)
+            cancelled_symbols[order_id] = symbol
             completed += 1
         if cancelled:
             # A held leg is only ever visible under its filled parent, so the
             # verification has to read the whole working book, not the open
             # listing: the one order this sweep exists to remove is the one the
             # open listing cannot show.
+            #
+            # Scoped to the symbols this sweep actually cancelled rather than read
+            # account-wide a second time: the daemon runs this sweep every sync tick
+            # and retries while it is incomplete, so two 20-page account-wide scans
+            # per pass is what turns a long history into a rate limit, and a rate
+            # limit fails the sweep closed - the retry then pays the same price. A
+            # leg is found under the filled parent of its own symbol, so those
+            # symbols are enough. An id whose symbol could not be resolved has no
+            # such bound, and the sweep reads account-wide rather than assume it.
+            verify_symbols = {symbol for symbol in cancelled_symbols.values() if symbol}
+            if len(verify_symbols) < len(cancelled):
+                verify_symbols = None
             try:
-                remaining = await self._list_working_book(client, symbols=None)
+                remaining = await self._list_working_book(
+                    client, symbols=verify_symbols
+                )
             except Exception as exc:
                 failed.append(f"verify:{exc}")
             else:
@@ -2713,17 +2753,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
     async def _list_resting_legs(
         self, client: Any, *, symbols: set[str] | None
-    ) -> list[Any]:
+    ) -> list[_RestingLeg]:
         """The bracket legs themselves, the ones no ``status=open`` listing shows (#245).
 
         A leg in ``pending_cancel`` still rests: its cancel has not settled and it can
         still fill, so a sweep that dropped it would report a clean book while the leg
         was still reserving quantity (#198). A leg whose cancel did settle says so in
-        the listing and is not resting.
+        the listing and is not resting. Each leg comes back with the parent it rests
+        under, so a caller can resolve a symbol the leg itself does not carry.
         """
         parents = await self._list_filled_parents_with_held_legs(client, symbols)
         return [
-            leg
+            _RestingLeg(leg=leg, parent=parent)
             for parent in parents
             for leg in _order_legs(parent)
             if _order_status(leg) in _RESTING_LEG_STATUSES
@@ -2747,7 +2788,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return self._merge_held_legs(orders, legs)
 
     @staticmethod
-    def _merge_held_legs(open_orders: list[Any], legs: list[Any]) -> list[Any]:
+    def _merge_held_legs(
+        open_orders: list[Any], legs: Iterable[_RestingLeg]
+    ) -> list[Any]:
         """One entry per resting order: the open listing plus the legs it cannot show.
 
         A broker can list the same leg both ways, and an entry listed twice would hide
@@ -2762,7 +2805,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             if order_id is not None
         }
-        for leg in legs:
+        for resting in legs:
+            leg = resting.leg
             leg_id = _control_order_id(_order_attr(leg, "id"))
             if leg_id is None or leg_id not in listed:
                 orders.append(leg)

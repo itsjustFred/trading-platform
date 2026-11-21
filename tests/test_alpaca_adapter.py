@@ -133,14 +133,16 @@ class _FakeTradingClient:
         )
         # A bracket leg the broker lists only under its filled parent reserves
         # quantity too: that is what refuses a close_position on the bracket. Only
-        # while it rests - a filled or settled leg reserves nothing.
+        # while it rests - a filled or settled leg reserves nothing. A leg can arrive
+        # without its own symbol, and the parent it rests under is what places it:
+        # the reservation is on the position's symbol either way.
         for parent in self.parents:
             if str(getattr(parent, "status", "new")).lower() != "filled":
                 continue
             reserved += sum(
                 abs(leg.qty)
                 for leg in (getattr(parent, "legs", []) or [])
-                if leg.symbol == symbol
+                if (leg.symbol or parent.symbol) == symbol
                 and leg.side == side
                 and _resting(leg)
             )
@@ -300,8 +302,10 @@ def _status_all_requests(client: _FakeTradingClient) -> list[object]:
 
 
 #: Statuses no further cancel can be sent for. A ``filled`` order has nothing left to
-#: cancel; a ``partially_filled`` one still has, which is why it is not in this set.
-_TERMINAL_STATUSES = frozenset({"canceled", "expired", "rejected", "done", "filled"})
+#: cancel; a ``partially_filled`` one still has, which is why it is not in this set. These
+#: are alpaca-py 0.44.0's real states - there is no "done" (the end-of-day one is
+#: ``done_for_day``, and it resumes the next session, so it is not terminal here either).
+_TERMINAL_STATUSES = frozenset({"canceled", "expired", "rejected", "filled"})
 
 
 def _working(order: object) -> bool:
@@ -1249,6 +1253,88 @@ def test_the_orphan_sweep_reports_a_verification_it_could_not_make() -> None:
 
     assert outcome.complete is False
     assert any(item.startswith("verify:") for item in outcome.failed)
+
+
+def test_a_held_leg_with_no_readable_id_is_reported_not_dropped() -> None:
+    """A leg the adapter cannot address is reported, not silently dropped.
+
+    The merge keeps an entry with an unreadable id on purpose: dropping it would
+    hide the leg from every sweep that follows, and a leg nobody reports is a leg
+    nobody removes. The orphan sweep then names it as unidentifiable instead of
+    completing over it, and the flatten does not close a position the leg still
+    reserves.
+    """
+    client = _BracketPositionClient(positions=[])
+    client.parent.legs[1].id = ""  # the held stop leg, still nested under its parent
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is False
+    assert any("order:''" in item for item in outcome.unidentified)
+
+    client = _BracketPositionClient(positions=[_FakePosition("AAPL", 10.0)])
+    client.parent.legs[1].id = ""
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    # The flatten reports the leg it cannot address instead of closing over it, and
+    # it does not let the position go naked either: the leg still works.
+    assert outcome.complete is False
+    assert any("unreadable-order:''" in item for item in outcome.failed)
+    assert client.close_calls == []
+    assert not any("NO-STOP-RESTORED" in item for item in outcome.failed)
+
+
+def test_the_orphan_sweep_places_a_leg_by_the_parent_it_rests_under() -> None:
+    """A leg with no symbol of its own belongs to its parent's position.
+
+    The guard that keeps this sweep off a live position reads the order's symbol.
+    A leg that arrives without one would read as "no position" and be cancelled -
+    disarming the very position the sweep promises not to touch.
+    """
+    live = _BracketPositionClient(positions=[_FakePosition("AAPL", 10.0)])
+    live.parent.legs[1].symbol = ""
+    flat = _BracketPositionClient(positions=[])
+    flat.parent.legs[1].symbol = ""
+
+    assert asyncio.run(_adapter(live).cancel_orphaned_protections()).complete is True
+    # Both legs sit on the parent's symbol, so neither is touched.
+    assert live.cancelled == []
+    assert "sl-leg" not in live.cancelled
+
+    orphaned = asyncio.run(_adapter(flat).cancel_orphaned_protections())
+
+    assert orphaned.complete is True
+    assert "sl-leg" in flat.cancelled
+
+
+def test_the_orphan_sweep_scopes_its_verification_to_the_symbols_it_cancelled() -> None:
+    """The verification is not a second account-wide history scan.
+
+    The daemon runs this sweep every sync tick and retries while it is incomplete,
+    so two 20-page account-wide scans per pass is what turns a long order history
+    into a rate limit - and a rate limit fails the sweep closed. A leg is found
+    under the filled parent of its own symbol, so those symbols are enough.
+    """
+    client = _BracketPositionClient(positions=[])
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is True
+    verification = _status_all_requests(client)[-1]
+    assert verification.symbols == ["AAPL"]
+
+    client = _BracketPositionClient(positions=[])
+    client.parent.symbol = ""
+    client.parent.legs[1].symbol = ""
+    client.orders = []
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is True
+    # A symbol nobody could resolve has no bound, so the sweep verifies on the
+    # whole account rather than assume one.
+    assert _status_all_requests(client)[-1].symbols is None
 
 
 def test_cancel_orphaned_protections_cancels_a_held_stop_leg() -> None:
