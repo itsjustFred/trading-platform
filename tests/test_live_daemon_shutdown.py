@@ -1384,8 +1384,15 @@ def test_main_exits_with_the_code_the_daemon_returned(
     async def _fake_run_daemon(**_kwargs: Any) -> int:
         return code
 
+    def _exit(forced: int) -> None:
+        # A clean tail leaves the interpreter to finish normally, so the exit code
+        # goes through ``sys.exit``. Stated rather than assumed: the other test in
+        # this section pins the opposite, and silence here would let both pass.
+        pytest.fail(f"a clean exit path must not leave through os._exit ({forced})")
+
     monkeypatch.setattr(daemon, "run_daemon", _fake_run_daemon)
     monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
+    monkeypatch.setattr(daemon.os, "_exit", _exit)
 
     with pytest.raises(SystemExit) as excinfo:
         daemon.main()
@@ -1432,6 +1439,34 @@ def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
     assert excinfo.value.code == EXIT_CLEANUP_TIMEOUT
     assert flushed == [1], "log handlers must be flushed before the process is killed"
     assert exited == [EXIT_CLEANUP_TIMEOUT], "the exit code must still reach the manager"
+
+
+def test_main_reraises_a_crashed_daemon_after_its_bounded_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash keeps its traceback, and its exit path is bounded like a signal's.
+
+    ``main`` used to hand the loop to ``asyncio.run`` on every path, crash
+    included, so a crashed daemon left whatever was still on the loop for the
+    interpreter to wait on with no deadline. It now takes the same bounded tail
+    and re-raises: the traceback is what an operator acts on.
+    """
+    flushed: list[int] = []
+
+    async def _crashed(**_kwargs: Any) -> int:
+        raise RuntimeError("the daemon crashed")
+
+    def _exit(forced: int) -> None:
+        pytest.fail(f"a crash must not be turned into os._exit({forced})")
+
+    monkeypatch.setattr(daemon, "run_daemon", _crashed)
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
+    monkeypatch.setattr(daemon.os, "_exit", _exit)
+
+    with pytest.raises(RuntimeError, match="the daemon crashed"):
+        daemon.main()
+
+    assert flushed == [1], "the log must be flushed before the traceback either"
 
 
 def test_shutdown_timeouts_are_bounded_by_default() -> None:
