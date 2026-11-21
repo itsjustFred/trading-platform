@@ -979,6 +979,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             commission=_known_commission(leg),
             timestamp=fill_ts,
             broker_order_id=leg_order_id,
+            # The leg's own cumulative and average let the insert cap the booking at
+            # what the leg has actually filled and derive the missing slice's price
+            # when this backfill covers only part of it.
+            cumulative_filled_qty=leg_cumulative_qty,
+            cumulative_avg_price=_positive_finite(
+                _order_attr(leg, "filled_avg_price", None)
+            ),
             dedupe_key=_alpaca_fill_dedupe_key(
                 execution_id="",
                 broker_order_id=leg_order_id,
@@ -2890,6 +2897,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             commission=_known_commission(order),
             timestamp=fill_ts,
             broker_order_id=broker_order_id,
+            # The leg's broker cumulative caps the booking inside the insert: a
+            # delayed event whose slice a reconcile pass already covered is skipped
+            # there rather than double-counted here.
+            cumulative_filled_qty=(
+                broker_cumulative_filled_qty
+                if broker_cumulative_filled_qty > 0.0
+                else None
+            ),
+            cumulative_avg_price=_positive_finite(
+                getattr(order, "filled_avg_price", None)
+            ),
             dedupe_key=dedupe_key,
             # The leg's own side, cross-checked against the side the parent's action implies: a
             # leg that would extend the position is refused, not recorded.

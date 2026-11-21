@@ -2937,22 +2937,29 @@ def _derive_remainder_price(
     cumulative_avg_price: float,
     cumulative_qty: float,
     missing_qty: float,
+    broker_order_id: str | None = None,
 ) -> float | None:
     """The price of the quantity a signal is still missing, from the broker's cumulative average.
 
-    ``None`` (logged) when it cannot be derived honestly: a local leg has no usable price (an
-    unusable verdict, or a non-positive or non-finite price - `derived` legs are usable), or the
-    result is not finite and positive, or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION`` of
-    the average. See `save_live_execution_up_to_cumulative`.
+    ``broker_order_id`` scopes the local legs to one broker order's fills: a broker-close
+    signal carries one leg's fills next to its siblings', and only the same leg's earlier
+    slices belong in this leg's notional. ``None`` (logged) when it cannot be derived
+    honestly: a local leg has no usable price (an unusable verdict, or a non-positive or
+    non-finite price - `derived` legs are usable), or the result is not finite and positive,
+    or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION`` of the average. See
+    `save_live_execution_up_to_cumulative`.
     """
-    legs = session.exec(
-        select(
-            LiveExecutionModel.id,
-            LiveExecutionModel.actual_price,
-            LiveExecutionModel.filled_qty,
-            LiveExecutionModel.actual_price_observed,
-        ).where(LiveExecutionModel.signal_id == signal_id)
-    ).all()
+    legs_query = select(
+        LiveExecutionModel.id,
+        LiveExecutionModel.actual_price,
+        LiveExecutionModel.filled_qty,
+        LiveExecutionModel.actual_price_observed,
+    ).where(LiveExecutionModel.signal_id == signal_id)
+    if broker_order_id is not None:
+        legs_query = legs_query.where(
+            LiveExecutionModel.broker_order_id == broker_order_id
+        )
+    legs = session.exec(legs_query).all()
     local_notional = 0.0
     for leg_id, price, qty, observed in legs:
         if not execution_price_is_usable(price, observed):
@@ -3214,6 +3221,8 @@ def record_live_broker_side_close_fill(
     dedupe_key: str,
     broker_fill_id: int | None = None,
     close_side: str | None = None,
+    cumulative_filled_qty: float | None = None,
+    cumulative_avg_price: float | None = None,
 ) -> float:
     """Record a broker-side close against the parent signal's deployment ledger (#144).
 
@@ -3245,6 +3254,16 @@ def record_live_broker_side_close_fill(
     ``buy`` nor ``sell``, ``close_side`` contradicts the reducing side the parent's action
     implies (a fill that would *extend* the position must never be recorded as a close), the
     quantity is not finite and positive, or the caller supplied no timestamp.
+
+    Two caps keep the ledger honest inside the same ``BEGIN IMMEDIATE``: a fill is never
+    booked past the broker order's own cumulative filled quantity (``cumulative_filled_qty``,
+    scoped to this ``broker_order_id`` so a sibling leg's fills do not count), and never past
+    the parent signal's filled quantity minus what its close signal already carries - so a
+    double-booked fill (two dedupe keys for one broker fill) cannot drive the ledger below
+    zero. When ``cumulative_avg_price`` is supplied and the caller's price is unusable, the
+    missing slice's price is derived from the broker's cumulative average exactly the way
+    :func:`save_live_execution_up_to_cumulative` does (``derived``, or
+    ``derived_unavailable`` with the quantity still recorded).
     """
     normalized_parent = str(parent_signal_id or "").strip()
     normalized_reason = str(close_reason or "").strip()
@@ -3284,6 +3303,13 @@ def record_live_broker_side_close_fill(
         return 0.0
     if stamp.tzinfo is None or stamp.tzinfo.utcoffset(stamp) is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
+    if cumulative_filled_qty is not None:
+        cumulative_filled_qty = float(cumulative_filled_qty)
+        if not (math.isfinite(cumulative_filled_qty) and cumulative_filled_qty > 0.0):
+            raise ValueError(
+                "cumulative_filled_qty must be finite and positive, got "
+                f"{cumulative_filled_qty!r}"
+            )
 
     init_db()
     with get_session() as session:
@@ -3362,10 +3388,102 @@ def record_live_broker_side_close_fill(
                     if close_signal is None:
                         raise
 
+            # #144: two caps, both read inside this BEGIN IMMEDIATE so a concurrent fill
+            # cannot slip between the check and the insert. First the broker order's own
+            # cumulative, scoped to THIS leg's broker_order_id so a sibling leg's fills on
+            # the same close signal do not count against it; then the parent's filled
+            # quantity minus what the close signal already carries, so no double-booked
+            # fill (two dedupe keys for one broker fill) can drive the ledger below zero.
+            broker_key = str(broker_order_id or "")
+            recorded_for_order = 0.0
+            if broker_key:
+                recorded_for_order = float(
+                    session.exec(
+                        select(
+                            func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)
+                        ).where(
+                            LiveExecutionModel.signal_id == close_signal_id,
+                            LiveExecutionModel.broker_order_id == broker_key,
+                        )
+                    ).one()
+                    or 0.0
+                )
+            if cumulative_filled_qty is not None:
+                order_remaining = float(cumulative_filled_qty) - recorded_for_order
+                if order_remaining <= 0.0:
+                    # The leg's broker cumulative is already fully booked: a delayed
+                    # stream event after a reconcile pass, or a redelivery under a new key.
+                    session.rollback()
+                    return 0.0
+                quantity = min(quantity, order_remaining)
+            parent_filled_qty = float(
+                session.exec(
+                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                        LiveExecutionModel.signal_id == normalized_parent
+                    )
+                ).one()
+                or 0.0
+            )
+            already_closed_qty = float(
+                session.exec(
+                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                        LiveExecutionModel.signal_id == close_signal_id
+                    )
+                ).one()
+                or 0.0
+            )
+            unclosed_qty = parent_filled_qty - already_closed_qty
+            if unclosed_qty <= 0.0:
+                session.rollback()
+                logger.warning(
+                    "Refusing to record a broker-side close beyond the parent signal's "
+                    "filled quantity: %s of %s is already closed (parent_signal_id=%s, "
+                    "close_reason=%s, broker_order_id=%s)",
+                    already_closed_qty,
+                    parent_filled_qty,
+                    normalized_parent,
+                    normalized_reason,
+                    broker_key,
+                )
+                return 0.0
+            quantity = min(quantity, unclosed_qty)
+
+            actual_price = float(actual_price or 0.0)
+            price_observed = actual_price_observed
+            if (
+                cumulative_avg_price is not None
+                and cumulative_filled_qty is not None
+                and not execution_price_is_usable(actual_price, price_observed)
+            ):
+                # The caller knows the broker's average over this leg's WHOLE cumulative
+                # but not the missing slice's price (a partial backfill): derive it the
+                # way `save_live_execution_up_to_cumulative` does, scoped to this leg's
+                # own earlier fills so a sibling leg's notional stays out.
+                cumulative_avg_price = float(cumulative_avg_price)
+                if not (math.isfinite(cumulative_avg_price) and cumulative_avg_price > 0.0):
+                    raise ValueError(
+                        "cumulative_avg_price must be finite and positive, got "
+                        f"{cumulative_avg_price!r}"
+                    )
+                remainder_price = _derive_remainder_price(
+                    session,
+                    close_signal_id,
+                    cumulative_avg_price=cumulative_avg_price,
+                    cumulative_qty=float(cumulative_filled_qty),
+                    missing_qty=float(cumulative_filled_qty) - recorded_for_order,
+                    broker_order_id=broker_key or None,
+                )
+                if remainder_price is None:
+                    actual_price = 0.0
+                    price_observed = PRICE_DERIVED_UNAVAILABLE
+                else:
+                    actual_price = remainder_price
+                    price_observed = PRICE_DERIVED
+
             execution = LiveExecution(
                 signal_id=UUID(close_signal_id),
-                actual_price=float(actual_price or 0.0),
-                actual_price_observed=actual_price_observed,
+                actual_price=actual_price,
+                actual_price_observed=price_observed,
                 filled_qty=quantity,
                 commission=commission,
                 timestamp=stamp,
