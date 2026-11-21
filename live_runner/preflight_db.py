@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from live_runner.deployment_policy import (
+    KNOWN_SIGNAL_SOURCES,
     normalize_signal_source,
     untradeable_signal_source_reason,
 )
@@ -175,13 +176,6 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
     )
 
 
-#: The signal sources the daemon recognises at all -- the vocabulary of the DB column
-#: and the models. Anything else is a stored value it cannot route as configured:
-#: reported as an error (exit 1), which is not the same question as whether the
-#: daemon can *trade* it (``live_runner.deployment_policy``: only ``discord`` can).
-_KNOWN_SIGNAL_SOURCES = frozenset({"internal", "discord"})
-
-
 def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
     """What makes this ACTIVE row untradeable as configured, independent of the YAML."""
     errors: list[str] = []
@@ -197,7 +191,10 @@ def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
         )
     if not row.timeframe.strip():
         errors.append(f"DB deployment {row.label}: has no timeframe configured.")
-    if normalize_signal_source(row.signal_source) not in _KNOWN_SIGNAL_SOURCES:
+    # "recognised", not "tradeable": `internal` is recognised and untradeable,
+    # so this is the vocabulary question (KNOWN_SIGNAL_SOURCES) and not the daemon's
+    # routing question (TRADEABLE_SIGNAL_SOURCES) the warning further down asks.
+    if normalize_signal_source(row.signal_source) not in KNOWN_SIGNAL_SOURCES:
         errors.append(
             f"DB deployment {row.label}: signal_source {row.signal_source!r} is not 'internal' or "
             "'discord'; the daemon compares the stored text verbatim, so this row does not route "

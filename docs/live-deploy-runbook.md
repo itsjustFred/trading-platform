@@ -446,11 +446,13 @@ holds for any stored `signal_source` that is neither `internal` nor `discord`.
 
 The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
 `untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
-Sentry's LoggingIntegration sends ERROR, so the alert is an event there too. It is not repeated on every
-tick of the (permanent) sync loop: the first tick of every daemon start reports each affected row, and a
-row is reported again only when its status or signal source changes, so restarting or repointing is what
-you see again. The daemon does not block or stop: the operator stops the row or moves it to a Discord
-signal source.
+Where Sentry is configured (a DSN: `initialize_sentry` is a no-op without one), its `LoggingIntegration`
+sends ERROR as an event, so the alert reaches Sentry too and the tag makes it filterable there.
+
+It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
+each affected row, and a row is reported again only when its status or signal source changes, so restarting
+or repointing is what you see again. The daemon does not block or stop: the operator stops the row or moves
+it to a Discord signal source.
 
 Both preflights warn for these rows using the same definition
 (`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
@@ -461,8 +463,9 @@ them, but they see different things:
 - **`--check-db` preflight** (`live_runner/preflight_db.py`): reads the ACTIVE rows out of SQLite instead.
   It warns for an untradeable row whose YAML twin is *tradeable* (Discord) or absent, because the YAML
   side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
-  the pair and a second warning for the same row would only double-count. A stored `signal_source` that
-  is neither `internal` nor `discord` still fails this preflight (exit 1) rather than warning.
+  the pair and a second warning for the same row would only double-count. A stored `signal_source` outside
+  `KNOWN_SIGNAL_SOURCES` (`internal` plus everything the daemon can trade) still fails this preflight (exit
+  1) rather than warning, because nothing routes the row as configured.
 
 A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
 design, not by accident.

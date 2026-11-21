@@ -1232,6 +1232,62 @@ def test_active_unknown_signal_source_is_reported_as_untradeable(monkeypatch) ->
     assert errors[0][2]["extra"]["data"]["alert"] == "untradeable_active_deployment"
 
 
+def test_already_warned_reports_a_row_once_then_only_on_change(monkeypatch) -> None:
+    """The suppression the sync loop relies on, pinned at the function itself.
+
+    The loop tests drive it in situ; this is the contract in isolation, so a change
+    to the dedupe key cannot pass the loop tests and break here.
+    """
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    already_warned: dict[str, str] = {}
+    deployment = _internal_deployment()
+
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert len(errors) == 1
+    reported_reason = errors[0][2]["extra"]["data"]["untradeable_reason"]
+    assert already_warned == {str(deployment.id): reported_reason}
+
+    # A different kind of untradeable (repointed to a source with no runner) is a
+    # new condition, not a repeat of the one already reported.
+    deployment.signal_source = "webhook"
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert len(errors) == 2
+    assert "webhook" in str(errors[1][1])
+
+
+def test_already_warned_forgets_a_row_that_is_no_longer_untradeable(monkeypatch) -> None:
+    """Stopping the row (or making it tradeable) must not silence a later repeat."""
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    already_warned: dict[str, str] = {}
+    deployment = _internal_deployment()
+
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    deployment.status = "STOPPED"
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert already_warned == {}
+
+    deployment.status = "ACTIVE"
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert len(errors) == 2
+
+
 @dataclass
 class _RecordingLogger:
     """The logger the daemon uses, keeping every level for an assertion."""

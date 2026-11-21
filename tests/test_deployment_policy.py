@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 
 from live_runner.deployment_policy import (
+    DEFAULT_SIGNAL_SOURCE,
+    KNOWN_SIGNAL_SOURCES,
     TRADEABLE_SIGNAL_SOURCES,
     normalize_deployment_status,
     normalize_signal_source,
@@ -41,6 +43,20 @@ def test_status_is_a_known_one_or_unknown() -> None:
     assert normalize_deployment_status("DISABLED") == "UNKNOWN"
     assert normalize_deployment_status("") == "UNKNOWN"
     assert normalize_deployment_status(None) == "UNKNOWN"
+
+
+def test_the_recognised_vocabulary_contains_every_tradeable_source() -> None:
+    """`internal` is recognised and untradeable, so the two sets differ by it alone.
+
+    The DB preflight errors (exit 1) on a source outside the recognised set, so a
+    new runner added to the tradeable set must land in this one too or the same
+    row would warn on one side and fail the preflight on the other.
+    """
+    assert KNOWN_SIGNAL_SOURCES == TRADEABLE_SIGNAL_SOURCES | {DEFAULT_SIGNAL_SOURCE}
+    assert KNOWN_SIGNAL_SOURCES == frozenset({"discord", "internal"})
+    assert TRADEABLE_SIGNAL_SOURCES <= KNOWN_SIGNAL_SOURCES
+    assert DEFAULT_SIGNAL_SOURCE in KNOWN_SIGNAL_SOURCES
+    assert DEFAULT_SIGNAL_SOURCE not in TRADEABLE_SIGNAL_SOURCES
 
 
 def test_tradeable_source_has_no_reason() -> None:

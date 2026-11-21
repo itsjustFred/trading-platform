@@ -13,9 +13,19 @@ deliberately: the two preflights are read-only paths (``preflight_db`` opens
 sqlite with ``mode=ro``), and importing the daemon to reach a six-line predicate
 pulled both broker adapters and the Discord stack in with it, and initialised
 Sentry under the daemon's service name on every preflight run.
+
+It answers two different questions, and the difference is the point: whether the
+daemon can *trade* a source (``TRADEABLE_SIGNAL_SOURCES``, one source today), and
+whether a stored value is one the rest of the system *recognises*
+(``KNOWN_SIGNAL_SOURCES``, which adds the ``internal`` default). Neither set is a
+free-standing literal: the second is derived from the first plus the default, so
+adding a runner cannot half-land.
 """
 
 from __future__ import annotations
+
+#: The DB column default and the pydantic model default for "no source chosen".
+DEFAULT_SIGNAL_SOURCE = "internal"
 
 #: Signal sources the daemon has a runner for. Discord is the only one today; a
 #: new source becomes tradeable by being added here and nowhere else. Every
@@ -27,8 +37,10 @@ TRADEABLE_SIGNAL_SOURCES: frozenset[str] = frozenset({"discord"})
 #: is none of them, so it normalises to the ``UNKNOWN`` bucket below.
 KNOWN_DEPLOYMENT_STATUSES: frozenset[str] = frozenset({"ACTIVE", "PAUSED", "STOPPED"})
 
-#: The DB column default and the pydantic model default for "no source chosen".
-DEFAULT_SIGNAL_SOURCE = "internal"
+#: The sources the DB column and the models recognise: every source with a runner
+#: plus the default. Derived, so a new tradeable source is not also flagged as an
+#: unrecognised one by the DB preflight.
+KNOWN_SIGNAL_SOURCES: frozenset[str] = TRADEABLE_SIGNAL_SOURCES | {DEFAULT_SIGNAL_SOURCE}
 
 
 def normalize_deployment_status(status: object) -> str:
