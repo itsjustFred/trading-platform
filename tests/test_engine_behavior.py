@@ -370,6 +370,88 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "from (99k at fill), not the creation-time figure (100k)"
         )
 
+    def test_resized_limit_order_records_its_fill_time_basis(self, tmp_path: Path):
+        """The mirror rule for a LIMIT order, which is re-sized at fill too.
+
+        Entry 1 is a MARKET order with a 5-point stop (95) that fills at 100
+        for 200 shares; a LONG LIMIT at 98 (stop 96.5) is created on bar 1
+        while the realized cash is still 100k, and fills on bar 2 — the bar
+        entry 1 stops out on, so the ledger reads 99k by then. The LIMIT is
+        re-sized from its trigger price against that fill-time basis: 1% of
+        99,000 over the 1.5-point stop = 660 shares, so the recorded basis
+        must be 99,000. Leaving the creation-time figure (100k) on the order
+        hands the shared-equity replay a coefficient ``quantity /
+        equity_at_entry`` that no longer matches the quantity it re-scales.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 97.0, 96.0, 96.0, 96.0],
+                "high": [100.5, 100.5, 97.5, 96.5, 96.5, 96.5],
+                "low": [99.5, 99.5, 94.5, 96.0, 96.0, 96.0],
+                "close": [100.0, 100.0, 96.0, 96.0, 96.0, 96.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([True] + [False] * 5, index=frame.index)
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss})
+
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
+        original_fill = engine._fill_pending_orders
+        # The engine's own order factory emits MARKET orders only, so the
+        # LIMIT leg is created here (sized from its trigger price, the
+        # pending-order estimate that the fill-time re-size replaces).
+
+        def create_limit(row: pd.Series, i: int) -> None:
+            from runner.engine import Order, OrderType
+
+            engine.pending_orders.append(
+                Order(
+                    symbol="PROBE",
+                    direction="LONG",
+                    order_type=OrderType.LIMIT,
+                    created_index=i,
+                    created_time=engine._to_iso(row["timestamp"]),
+                    quantity=engine._calculate_position_size(
+                        entry_price=98.0,
+                        stop_loss_price=96.5,
+                        direction="LONG",
+                    ),
+                    limit_price=98.0,
+                    stop_loss=96.5,
+                )
+            )
+
+        def patched_fill(row: pd.Series, i: int) -> None:
+            if i == 1:
+                create_limit(row, i)
+            original_fill(row, i)
+
+        engine._fill_pending_orders = patched_fill  # type: ignore[method-assign]
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "entry 1 and the limit leg"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(200.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over its 5-point stop = 200 shares"
+        )
+        assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 2"
+        limit = engine.closed_trades[1]
+        assert limit.entry_price == pytest.approx(98.0, rel=1e-9), "limit fills at its trigger"
+        assert limit.quantity == pytest.approx(660.0, rel=1e-9), (
+            "the re-size uses the fill-time ledger: 1% of 99,000 over the "
+            "1.5-point stop = 660 shares, where the creation-time 100k would "
+            "have given 666.67"
+        )
+        assert limit.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+            "a re-sized LIMIT order records the fill-time basis (99k after "
+            "entry 1's stop), not the creation-time figure (100k)"
+        )
+
     def test_aggregate_exposure_denominator_is_realized_cash(self, tmp_path: Path):
         """The aggregate-exposure fraction must use the realized denominator.
 
@@ -516,6 +598,57 @@ class TestSizingEquityExcludesUnrealizedPnl:
         )
         assert trades[1].meta["equity_at_entry"] == pytest.approx(
             round(100_000.0 - entry_fee, 2), rel=1e-9
+        )
+
+    def test_finalized_fees_are_not_held_back_twice(self, tmp_path: Path):
+        """A closed trade's fee is in the ledger, so it is not held back again.
+
+        Entry 1 (200 shares @ 100, fee_rate 0.001) stops out at 95 on bar 2:
+        the leg books −1,000 gross and finalization backs out the round-trip
+        fee 0.001 x (100 + 95) x 200 = 39. Entry 2 is sized on bar 3, when the
+        only ledger entries are those, so its basis is 100,000 − 1,000 − 39 =
+        98,961 — its entry leg is no longer owed, and holding it back a second
+        time would read 98,941.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 95.5, 96.0, 96.0, 96.0],
+                "high": [100.5, 100.5, 96.0, 96.5, 96.5, 96.5],
+                "low": [99.5, 99.5, 94.5, 95.5, 95.5, 95.5],
+                "close": [100.0, 100.0, 95.0, 96.0, 96.0, 96.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([True, False, False, True, False, False], index=frame.index)
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss})
+
+        config = _config(tmp_path, parameters={"fee_rate": 0.001})
+        engine = TradeEngine(config, symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(200.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over its 5-point stop = 200 shares"
+        )
+        assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 2"
+        assert first.fees == pytest.approx(39.0, rel=1e-9), (
+            "the round-trip fee is 0.001 x (100 + 95) x 200 = 39"
+        )
+        second = engine.closed_trades[1]
+        assert second.meta["equity_at_entry"] == pytest.approx(98_961.0, rel=1e-9), (
+            "the basis is the net realized cash 100,000 − 1,000 − 39; the "
+            "closed trade's entry leg must not be held back a second time "
+            "(which would read 98,941)"
+        )
+        assert second.quantity == pytest.approx(989.61 / 1.92, rel=1e-9), (
+            "entry 2 sizes from 98,961: 1% of it over the 2% fallback stop "
+            "(1.92) = 515.421875 shares"
         )
 
 
