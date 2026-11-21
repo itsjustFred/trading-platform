@@ -5464,7 +5464,7 @@ async def run_daemon(
             # database work cannot finish must not hand the lock on. Blocking the loop thread here
             # cannot deadlock - none of the daemon's worker functions calls back into the loop.
             _join_default_executor(WORKER_JOIN_TIMEOUT_SECONDS)
-        except BaseException as exc:
+        except BaseException:
             # Interrupted mid-join (a signal, a KeyboardInterrupt), or the join budget expired
             # with a worker still running. Releasing now would hand the next daemon the overlap
             # this lock exists to prevent, so the process keeps the lock and the OS releases it
@@ -5474,15 +5474,15 @@ async def run_daemon(
             # the OS lock while the workers still write.
             joined = False
             keep_for_process_lifetime(lock)
-            if isinstance(exc, WorkerJoinTimeout):
-                # The join gave up, so the abandoned threads are still in the executor and the
-                # pieces of the interpreter that wait for them are still armed: `asyncio.run`
-                # would spend its own 300s budget closing this loop and the interpreter's exit
-                # would then join the same threads with no budget at all. Detaching the executor
-                # is what `EventLoop.close()` does too, and it is what makes leaving the process
-                # the caller's job (`daemon_cli`) rather than the interpreter's.
-                with contextlib.suppress(AttributeError):
-                    asyncio.get_running_loop()._default_executor = None
+            # The join gave up or was interrupted, so abandoned threads may still be in the
+            # executor and the pieces of the interpreter that wait for them are still armed:
+            # `asyncio.run` would spend its own 300s budget closing this loop and the
+            # interpreter's exit would then join the same threads with no budget at all.
+            # Detaching the executor is what `EventLoop.close()` does too, and it is what makes
+            # leaving the process the caller's job (`daemon_cli` exits 4 on a WorkerJoinTimeout)
+            # rather than the interpreter's.
+            with contextlib.suppress(AttributeError):
+                asyncio.get_running_loop()._default_executor = None
             raise
         finally:
             if joined:
