@@ -1668,6 +1668,74 @@ def test_the_base_commit_guard_must_not_be_a_comment_line() -> None:
         )
 
 
+def test_a_truncated_report_is_diagnosable_from_the_run_log(tmp_path) -> None:
+    """The posted report is the tail of the agent's stream, anchored on the last `**Summary:**`
+    line anywhere in that stream - the extraction all three agent workflows share, and one that a
+    later line at column 0 moves down: the skill's own template quoted back inside a Mitigation
+    block starts a comment at the quote, and the report's summary and every severity section before
+    it are dropped while the verdict still parses and the status is still written `success`. The
+    anchor itself is the siblings' too, so it is not changed in this PR. What is pinned here is
+    that the truncation cannot happen unnoticed: the byte counts are logged and the raw stream is
+    an artifact of the run, so a comment that lost its opening sections is a run someone can
+    reconstruct and read."""
+    body = _run(_find_step(_agent_job(_load(PREMORTEM))[1], r"^Run pre-mortem agent$"))
+    block = re.search(
+        r"^\s*start=\$\(.*?^.*bytes of streamed messages[^\n]*\n", body, flags=re.S | re.M
+    )
+    assert block, "the extraction and the byte counts are not one contiguous block"
+    assert "verdict=" not in block.group(0), "the captured block runs past the byte counts"
+    out = tmp_path / "out.md"
+    report = (
+        "**Summary:** the real summary line.\n\n### Severe\n- the scenario\n\n"
+        "**Verdict: BLOCK** - harden. Human sign-off required.\n"
+    )
+    # A later line at column 0, quoting the skill's own template back: the anchor moves here.
+    quoted = (
+        "**Summary:** <one line: risk surface>\n\n### Mitigation\n"
+        "**Summary:** the template quoted back\n\n"
+        "**Verdict: BLOCK** - harden. Human sign-off required.\n"
+    )
+    (tmp_path / "out.md.raw").write_text(
+        "streamed preamble\n\n" + report + "\n---\n\n" + quoted, encoding="utf-8"
+    )
+    script = f'out="{out.as_posix()}"\n{block.group(0)}'
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    notice = [line for line in result.stdout.splitlines() if "pre-mortem report is" in line]
+    assert notice, (
+        f"the run log does not record how much of the stream was posted: {result.stdout!r}"
+    )
+    counts = re.search(r"is (\d+) of the agent's (\d+) bytes", notice[0])
+    assert counts, f"the notice names no byte counts: {notice[0]!r}"
+    kept, total = (int(counts.group(1)), int(counts.group(2)))
+    assert kept == out.stat().st_size, (
+        f"the logged kept count {kept} is not the posted report's {out.stat().st_size} bytes"
+    )
+    assert total == out.with_suffix(".md.raw").stat().st_size, (
+        f"the logged total {total} is not the raw stream's size"
+    )
+    assert kept < total, "the notice would not describe a truncation"
+    assert f"{total - kept} bytes" in notice[0], (
+        f"the notice does not name how much was dropped: {notice[0]!r}"
+    )
+    # The raw stream is uploaded beside the comment, so the dropped part is reachable: the
+    # comment alone cannot show what the stream carried.
+    uploads = [
+        step
+        for step in _steps(_agent_job(_load(PREMORTEM))[1])
+        if str(step.get("uses", "")).startswith("actions/upload-artifact")
+    ]
+    assert uploads, "the agent job uploads no artifact"
+    paths = uploads[0]["with"]["path"]
+    assert "comment.md" in paths and "comment.md.raw" in paths, (
+        f"the uploaded artifact drops the raw stream: {paths!r}"
+    )
+
+
 @needs_bash
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 def test_the_selection_reads_the_base_skill_when_the_base_has_one(probe_repo, tmp_path) -> None:

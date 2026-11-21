@@ -560,6 +560,19 @@ jobs:
             exit 1
           fi
           tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
+          # The posted report is the tail of the agent's stream, and the anchor above is a
+          # heuristic: it takes the *last* line starting `**Summary:**` anywhere in the stream,
+          # so a later one at column 0 - the skill's own template quoted back inside a
+          # Mitigation block, say - moves the anchor down and the comment then starts at the
+          # quote instead of at the report. That is the shared extraction all three agent
+          # workflows carry (the two siblings' identical line is on main here), so it is not
+          # changed in this PR. What *is* diagnosable has to be diagnosable without the stream:
+          # the raw output is uploaded with the comment below, and the byte counts are logged, so
+          # a comment that lost its opening sections is a run someone can reconstruct and read
+          # rather than one whose report silently changed shape.
+          kept=$(wc -c < "$out" | tr -d '[:space:]')
+          total=$(wc -c < "$out.raw" | tr -d '[:space:]')
+          echo "::notice::The pre-mortem report is ${kept} of the agent's ${total} bytes of output; $((total - kept)) bytes of streamed messages and tool output are not posted (the raw output is an artifact of this run)."
           # The verdict must be the last non-empty line (a verdict quoted from the
           # diff elsewhere in the output does not count), and it must be one of
           # the four the skill allows. What follows the verdict word must start with
@@ -619,7 +632,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: agent-pre-mortem
-          path: ${{ runner.temp }}/premortem/comment.md
+          # The posted comment, and the agent's raw stdout beside it. The comment is the tail of
+          # that stream, so a run whose report lost its opening sections is only diagnosable
+          # against what the stream actually carried - and the stream is not in the log, which
+          # carries the bounded 4000-byte echo of a failed run's output instead.
+          path: |
+            ${{ runner.temp }}/premortem/comment.md
+            ${{ runner.temp }}/premortem/comment.md.raw
           retention-days: 14
 
   # Posts the comment and sets the status. Runs no repo code. Also reports a
