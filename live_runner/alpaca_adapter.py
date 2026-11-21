@@ -1630,6 +1630,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         differently from the one that was validated.
         """
         from alpaca.common.enums import Sort
+        from alpaca.data.enums import Adjustment, DataFeed
         from alpaca.data.requests import StockBarsRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -1677,8 +1678,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     timeframe, bounded_limit, slack_multiplier=slack_multiplier
                 ),
                 limit=1000,
-                adjustment="raw",  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
-                feed="iex",  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+                # alpaca-py's own enum members, not the wire strings: the
+                # request model declares these fields as `Adjustment`/`DataFeed`,
+                # so a misspelled or deleted member is a type error instead of a
+                # runtime validation failure buried in a broker call. Both are
+                # `str` enums, so the serialised request is byte-identical.
+                adjustment=Adjustment.RAW,
+                feed=DataFeed.IEX,
                 # Newest first. The response is capped at `limit`, so an
                 # ascending request over a widened window would return the
                 # oldest bars in it. Sorted back to ascending below.
@@ -1743,6 +1749,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         or non-numeric side raises instead of returning an invented price; the
         daemon additionally rejects zero, non-finite and crossed quotes.
         """
+        from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockLatestQuoteRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -1752,7 +1759,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca adapter must be connected before requesting a quote")
         request = StockLatestQuoteRequest(
             symbol_or_symbols=[normalized_symbol],
-            feed="iex",  # type: ignore[arg-type]  # "iex" is the wire value get_market_data sends
+            # The alpaca-py `DataFeed` member, not the wire string, for the same
+            # reason as `get_market_data` above; `DataFeed` is a `str` enum, so
+            # the request this sends is unchanged.
+            feed=DataFeed.IEX,
         )
         response = await asyncio.to_thread(
             self._historical_data_client.get_stock_latest_quote, request
