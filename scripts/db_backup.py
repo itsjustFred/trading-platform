@@ -497,14 +497,15 @@ def restore_db(
     """Restore ``db_path`` from a verified backup, atomically and only while stopped.
 
     Order matters: verify the backup, refuse a live daemon *before* any connection could touch
-    the live file, snapshot the current database (the only copy of anything written since the
-    last backup), stage the restore beside the target so a failed copy never leaves a
-    half-written database, then swap sidecar files out and ``os.replace`` into place.
+    the live file, stage the restore beside the target so a failed copy never leaves a
+    half-written database, snapshot the current database (the only copy of anything written
+    since the last backup - taken after staging so rotation cannot prune the file being
+    restored), then swap sidecar files out and ``os.replace`` into place.
     """
-    db_path = Path(db_path)
+    db_path = Path(db_path).resolve()
     backup_path = Path(backup_path)
     info = verify_backup(backup_path)
-    if db_path.exists() and backup_path.resolve() == db_path.resolve():
+    if db_path.exists() and backup_path.resolve() == db_path:
         raise BackupVerificationError(f"refusing to restore a database onto itself: {db_path}")
     _assert_daemon_stopped(db_path, force=force)
     if db_path.is_file():
@@ -518,14 +519,14 @@ def restore_db(
 
     current_migrations = _read_migrations_quiet(db_path)
 
-    snapshot: Path | None = None
-    snapshot_dir = Path(backup_dir) if backup_dir is not None else default_backup_dir(db_path)
-    if safety_snapshot and db_path.is_file():
-        snapshot = backup_db(db_path, snapshot_dir, keep=keep).path
-
+    # Stage first, snapshot second: the staged copy consumes the backup file completely before
+    # the snapshot's rotation could prune it, and a snapshot failure still leaves the live
+    # database untouched. ``db_path`` is resolved above so ``os.replace`` swaps the real file,
+    # never a symlink standing in for it.
     db_path.parent.mkdir(parents=True, exist_ok=True)
     staged = db_path.with_name(f"{db_path.name}.restore-tmp")
     staged.unlink(missing_ok=True)
+    snapshot: Path | None = None
     try:
         source = sqlite3.connect(str(backup_path))
         target = sqlite3.connect(str(staged))
@@ -535,6 +536,11 @@ def restore_db(
             target.close()
             source.close()
         verify_backup(staged)
+        snapshot_dir = (
+            Path(backup_dir) if backup_dir is not None else default_backup_dir(db_path)
+        )
+        if safety_snapshot and db_path.is_file():
+            snapshot = backup_db(db_path, snapshot_dir, keep=keep).path
     except Exception:
         staged.unlink(missing_ok=True)
         for suffix in ("-wal", "-shm", "-journal"):
