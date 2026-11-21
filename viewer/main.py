@@ -5276,7 +5276,11 @@ def _serialize_live_deployment_payload(
         str(deployment.status or "").strip().upper() == "STOPPED"
         and stopped_enforced_at is None
     )
-    conflicts = list(broker_order_conflicts or [])
+    # None means "this response did not read the conflict ledger", which is a different
+    # statement from "there is none" - the same distinction that makes
+    # `exposure_may_be_open` worth reporting. A create, update or re-point response never
+    # reads conflicts, so it must not answer for them.
+    conflicts = None if broker_order_conflicts is None else list(broker_order_conflicts)
     halted_for_conflict = bool(conflicts) and (
         str(deployment.status or "").strip().upper() != "ACTIVE"
     )
@@ -5292,7 +5296,8 @@ def _serialize_live_deployment_payload(
         ),
         "exposure_may_be_open": exposure_may_be_open,
         # (#126) broker order ids recorded as conflicting for this deployment's
-        # signals: a broker order may exist that the ledger does not track.
+        # signals: a broker order may exist that the ledger does not track. None when
+        # this response did not read them (see above).
         "broker_order_conflicts": conflicts,
         "halted_for_broker_order_conflict": halted_for_conflict,
         "signal_source_type": deployment.signal_source_type,
@@ -13287,7 +13292,10 @@ async def get_live_deployments() -> list[dict[str, Any]]:
     )
     return [
         _serialize_live_deployment_payload(
-            deployment, conflicts_by_deployment.get(str(deployment.id))
+            # Read, and none: an empty list. `None` means the ledger was not read at
+            # all (see the serializer), which is a different answer to give.
+            deployment,
+            conflicts_by_deployment.get(str(deployment.id), []),
         )
         for deployment in deployments
     ]
@@ -13360,14 +13368,14 @@ async def get_live_dashboard() -> dict[str, Any]:
             {
                 **_serialize_live_deployment_payload(
                     deployment,
-                    conflicts_by_deployment.get(str(deployment.id)),
+                    conflicts_by_deployment.get(str(deployment.id), []),
                 ),
                 "capital_allocation": round(allocation, 6),
                 "account_equity": round(account_equity, 2),
             }
         )
 
-        recent_fills.sort(key=lambda item: str(item.get("execution_timestamp") or ""), reverse=True)
+    recent_fills.sort(key=lambda item: str(item.get("execution_timestamp") or ""), reverse=True)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "accounts": account_payloads,

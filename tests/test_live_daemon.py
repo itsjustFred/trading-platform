@@ -1292,6 +1292,55 @@ def test_paused_deployment_executes_an_exit_only_signal(monkeypatch, isolated_db
     ]
 
 
+def test_a_paused_deployment_closes_a_plain_sell_that_cannot_be_a_short(
+    monkeypatch,
+) -> None:
+    """#126 review: the exit classification is per deployment, not per message.
+
+    A plain SELL is a full exit on a deployment that cannot short and a short entry on
+    one that can, and which of the two is decided by `_trade_signal_to_live_signal` -
+    after the dispatch gates. Gate it from the raw message instead and the close on the
+    can't-short deployment is dropped as an entry, leaving the position open.
+    """
+    deployment = _discord_deployment("PAUSED")
+    deployment.settings = {"allow_short": False}
+
+    assert daemon._signal_is_exit("sell", {}, deployment) is True
+    entry_deployment = _discord_deployment("PAUSED")
+    entry_deployment.settings = {"allow_short": True}
+    assert daemon._signal_is_exit("sell", {}, entry_deployment) is False
+    # A parsed exit instruction is reduce-only whatever the deployment allows (#121).
+    parsed = _exit_signal().metadata
+    assert daemon._signal_is_exit("sell", dict(parsed), entry_deployment) is True
+    assert daemon._signal_is_exit("buy", dict(parsed), deployment) is True
+
+
+def test_a_bad_allow_short_never_reaches_the_dispatch_gate(monkeypatch) -> None:
+    """The classification reads a strict boolean: one it cannot parse skips the signal."""
+    deployment = _discord_deployment("ACTIVE")
+    deployment.settings = {"allow_short": "eanbled"}
+
+    with pytest.raises(ValueError, match="Invalid boolean value for allow_short"):
+        daemon._signal_is_exit("sell", {}, deployment)
+
+    adapter = _SignalSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+    assert claims == []
+
+
 def test_stopped_deployment_does_not_dispatch_an_exit(monkeypatch) -> None:
     """STOPPED stays out: its exposure is closed by the cancel/flatten sweeps."""
     adapter = _ExitSubmittingAdapter()

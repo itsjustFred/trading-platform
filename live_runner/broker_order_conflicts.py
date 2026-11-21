@@ -28,10 +28,10 @@ from __future__ import annotations
 from typing import Any
 
 from shared.database import (
+    CONFLICT_HALT_PAUSED,
     deployments_with_broker_order_conflicts,
-    get_live_deployment,
+    pause_live_deployment_for_order_conflict,
     resolve_live_signal_broker_order_conflicts,
-    update_live_deployment_status,
 )
 from shared.logging import get_logger
 
@@ -61,23 +61,28 @@ def check_broker_order_conflicts() -> dict[str, Any]:
 def enforce_broker_order_conflict_halts() -> list[dict[str, Any]]:
     """Re-pause every deployment that still carries an unresolved conflict.
 
-    Returns one entry per deployment that had to be halted by this call, in the
-    shape the caller logs. A deployment already PAUSED is left exactly as it is:
-    re-writing it would move ``updated_at`` on every pass and stamp a fresh halt
-    over a pause an operator set themselves.
+    Returns one entry per deployment that had to be halted by this call, in the shape
+    the caller logs.
 
-    A status the daemon does not know (anything but ACTIVE, PAUSED or STOPPED) is
-    halted like an ACTIVE one: an unknown status must not be traded from, and
-    ``update_live_deployment_status`` refuses to write it at all.
+    The decision is one conditional write rather than a read and then a write, because a
+    status can change between them: an operator setting ``STOPPED`` in that window would
+    be turned into ``PAUSED`` - a *weaker* state, whose `stopped_enforced_at` the write
+    clears, so a deployment that had just cancelled and flattened would report a stop
+    that never got proved. The write re-tests the row status in the same statement, so
+    the halt only lands on a row that still reads as unhalted.
+
+    A deployment already PAUSED is left exactly as it is: re-writing it would move
+    ``updated_at`` on every pass and stamp a fresh halt over a pause an operator set
+    themselves. A status the daemon does not know (anything but ACTIVE, PAUSED and
+    STOPPED) is halted like an ACTIVE one - an unknown status must not be traded from,
+    and it is not a state the halt can quietly accept.
     """
     halted: list[dict[str, Any]] = []
     for deployment_id, conflicts in deployments_with_broker_order_conflicts(
         limit=CONFLICT_SCAN_LIMIT
     ).items():
-        if _deployment_is_paused(deployment_id):
-            continue
         try:
-            update_live_deployment_status(deployment_id, "PAUSED")
+            paused_now = pause_live_deployment_for_order_conflict(deployment_id)
         except Exception as exc:
             # The halt is the safety property. Failing to write it must be loud and
             # must not stop the remaining deployments from being re-halted.
@@ -101,18 +106,11 @@ def enforce_broker_order_conflict_halts() -> list[dict[str, Any]]:
                 },
             )
             continue
+        if paused_now != CONFLICT_HALT_PAUSED:
+            # Already halted (PAUSED, STOPPED, or gone): nothing new to report.
+            continue
         halted.append(_halt_record(deployment_id, conflicts))
     return halted
-
-
-def _deployment_is_paused(deployment_id: str) -> bool:
-    """True when the deployment's row already reads PAUSED or STOPPED."""
-    deployment = get_live_deployment(deployment_id)
-    if deployment is None:
-        # A deleted deployment has nothing left to halt; its conflict rows are still
-        # reported by the health read.
-        return True
-    return str(deployment.status or "").strip().upper() in {"PAUSED", "STOPPED"}
 
 
 def resolve_broker_order_conflicts(deployment_id: str) -> list[dict[str, Any]]:

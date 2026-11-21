@@ -516,18 +516,25 @@ what may be *opened* is still decided per signal, so no entry can come out of it
 
 1. Look the conflicting id up at the broker (open orders and positions). This is
    a manual step: nothing in the platform queries the broker for the conflicting
-   id yet, so a position nobody tracks has to be found by hand.
-2. Close whatever the ledger does not track, at the broker, and account for it in
-   the ledger if it belongs to this platform.
-3. Record the resolution: `POST
+   id yet, so a position nobody tracks has to be found by hand. Keep the order id
+   in the reason you record below - it is the only external reference to what was
+   reconciled.
+2. **Cancel first, then close.** A conflicting id that is still resting at the broker
+   is an order the platform will never manage: cancel it at the broker and confirm it
+   reached a terminal state before you record anything. Cancelling is not closing - a
+   working order can still fill, and a fill of a cancelled order is exactly the untracked
+   position this runbook exists for.
+3. Close whatever did fill and the ledger does not track, at the broker, and account
+   for it in the ledger if it belongs to this platform.
+4. Record the resolution: `POST
    /api/live/deployments/{id}/broker-order-conflicts/resolve` with
    `{"confirmed_deployment_id": id, "reason": "<what you found>"}`. The reason is
    required and audited; the call clears every recorded conflict for the
    deployment (a partial clear would still leave it halted) and reports the
    in-flight submission drain with it.
-4. Resume: `PUT /api/live/deployments/{id}/status` → `ACTIVE`, which does its own
-   broker re-verification. The halt re-asserts at the next tick until step 3 has
+5. Resume: `PUT /api/live/deployments/{id}/status` → `ACTIVE`, which does its own
+   broker re-verification. The halt re-asserts at the next tick until step 4 has
    recorded the resolution, so a resume that does not stick means the conflict is
    still recorded - and a duplicate still being redelivered can re-record it even
-   after step 3, because the conflict ledger's own read-modify-write wins that race
+   after step 4, because the conflict ledger's own read-modify-write wins that race
    on purpose.

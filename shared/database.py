@@ -2538,6 +2538,41 @@ def _pause_live_deployment_for_conflict(session: Session, deployment_id: object)
     return CONFLICT_HALT_PAUSED
 
 
+def pause_live_deployment_for_order_conflict(deployment_id: str) -> str:
+    """Pause one deployment for an unresolved broker order id conflict, atomically.
+
+    The periodic half of the halt (the detection half is
+    :func:`_reconcile_existing_live_signal`, which writes inside its own transaction).
+    Same rule, one conditional statement: the ``WHERE`` re-tests the row status, so a
+    deployment that became ``STOPPED`` between a caller's decision and this call cannot
+    be turned into ``PAUSED`` - a weaker state, whose write clears
+    ``stopped_enforced_at`` and would report a stop that never got proved.
+
+    Returns:
+
+    * :data:`CONFLICT_HALT_PAUSED` - this call wrote the pause;
+    * :data:`CONFLICT_HALT_ALREADY_HALTED` - nothing to do (already PAUSED or STOPPED,
+      already deleted, or no such deployment).
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    now = _utcnow_naive()
+    init_db()
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET status = 'PAUSED', stopped_enforced_at = NULL, updated_at = :now "
+                "WHERE id = :deployment_id "
+                "AND UPPER(status) NOT IN ('PAUSED', 'STOPPED')"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
+        session.commit()
+    return CONFLICT_HALT_PAUSED if int(result.rowcount or 0) == 1 else CONFLICT_HALT_ALREADY_HALTED
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -3640,17 +3675,23 @@ def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
     Returns ``[]`` for an unknown signal or one with no recorded conflict, so a caller
     can tell "nothing to resolve" from "resolved" without reading the row.
 
-    Resolving while a duplicate is still being redelivered can lose the race: the
-    conflict ledger's own read-modify-write takes the write lock, so a redelivery that
-    lands after this clear re-records the conflict and the daemon re-pauses the
-    deployment at the next tick. That is the fail-closed direction, and the operator
-    sees it in the same health read.
+    A duplicate that lands *after* this commit still re-records the conflict, and the
+    daemon re-pauses the deployment at the next tick. That is the fail-closed direction
+    and the operator sees it in the same health read; a duplicate that commits *before*
+    this read is the one the write lock covers, because it has to be seen rather than
+    clobbered.
     """
     normalized = str(signal_id or "").strip()
     if not normalized:
         return []
     init_db()
     with get_session() as session:
+        # Take the write lock before reading, exactly like the conflict ledger's own
+        # read-modify-write does. Without it a duplicate committing between this read
+        # and this write would be clobbered by a stale copy of the metadata: the operator
+        # would be told the conflict was resolved and the recording that replaced it
+        # would have vanished with no record anywhere.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
         record = session.get(LiveSignalModel, normalized)
         if record is None:
             return []

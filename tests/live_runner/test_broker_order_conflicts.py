@@ -134,11 +134,12 @@ def test_enforce_reports_a_status_write_it_cannot_make(conflict, monkeypatch, ca
     """A halt that cannot be written must be loud, and must not stop the others."""
     update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
 
-    def _refuse(_deployment_id, _status):
+    def _refuse(_deployment_id):
         raise RuntimeError("database is locked")
 
     monkeypatch.setattr(
-        "live_runner.broker_order_conflicts.update_live_deployment_status", _refuse
+        "live_runner.broker_order_conflicts.pause_live_deployment_for_order_conflict",
+        _refuse,
     )
 
     with caplog.at_level(logging.ERROR):

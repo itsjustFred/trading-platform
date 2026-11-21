@@ -522,13 +522,32 @@ def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatc
     halted = payload[0]
     assert halted["broker_order_conflicts"] == [conflict]
     assert halted["halted_for_broker_order_conflict"] is True
-    # A deployment with no conflict is not reported as halted for one...
+    # A deployment with no conflict is not reported as halted for one (the ledger was
+    # read for it, and it holds nothing)...
     assert payload[1]["broker_order_conflicts"] == []
     assert payload[1]["halted_for_broker_order_conflict"] is False
     # ...and a conflict alone does not imply a halt: a still-ACTIVE deployment carrying
     # one is a conflict the halt is about to land on, and saying otherwise would hide it.
     assert payload[2]["broker_order_conflicts"] == [conflict]
     assert payload[2]["halted_for_broker_order_conflict"] is False
+
+
+def test_an_unread_conflict_ledger_is_not_reported_as_confirmed_empty(monkeypatch) -> None:
+    """A create response never reads the ledger, so it must not answer for it."""
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+    )
+    payload = viewer_main_module._serialize_live_deployment_payload(deployment)
+
+    assert payload["broker_order_conflicts"] is None
+    assert payload["halted_for_broker_order_conflict"] is False
 
 
 def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):

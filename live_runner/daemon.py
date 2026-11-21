@@ -2210,6 +2210,27 @@ def _dispatch_statuses(*, is_exit: bool) -> frozenset[str]:
     return EXIT_DISPATCH_STATUSES if is_exit else ENTRY_DISPATCH_STATUSES
 
 
+def _signal_is_exit(
+    action: str,
+    metadata: Mapping[str, object] | None,
+    deployment: LiveDeploymentConfig,
+) -> bool:
+    """Whether this deployment will dispatch the signal as a close (#126).
+
+    :func:`live_runner.exit_signals.is_exit_order` alone is not the whole answer: a
+    plain SELL on a deployment that cannot short is a full exit too, and that is
+    decided per deployment, in :func:`_trade_signal_to_live_signal` (which stamps
+    ``exit_only``) - *after* the dispatch gates have already run. Answering it the
+    same way here is what keeps "dispatched as an exit" and "gated as an exit" from
+    drifting apart, and therefore what lets a pause reject entries while still
+    closing a position a plain sell was about to close.
+    """
+    if is_exit_order(action, metadata):
+        return True
+    closes_only = str(action or "").strip().lower() in {"sell", "short"}
+    return closes_only and not _deployment_allows_short(deployment)
+
+
 def _dispatchable_discord_deployments_for_account(
     account_id: str,
     deployments: list[LiveDeploymentConfig],
@@ -2518,7 +2539,24 @@ async def _prepare_discord_signal_for_submission(
     let the deployment close what it holds (#126 decision), so no gate below can ask
     "is this deployment ACTIVE" alone.
     """
-    is_exit = is_exit_order(trade_signal.action, trade_signal.metadata)
+    try:
+        is_exit = _signal_is_exit(trade_signal.action, trade_signal.metadata, deployment)
+    except ValueError:
+        # A strict boolean this deployment cannot parse (e.g. a typo'd allow_short)
+        # means nothing may be dispatched to it. Same handling as the conversion-time
+        # check: skip the deployment, and never default an unreadable config into an
+        # order.
+        logger.exception(
+            "Invalid deployment boolean config; skipping deployment",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+        return None
     # B2 (owner decision): stale signals trade immediately on outdated
     # information — discard anything older than one deployment-timeframe
     # candle instead.
@@ -2677,7 +2715,7 @@ async def _submit_normalized_discord_signal(
         )
         return
 
-    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    is_exit = _signal_is_exit(live_signal.action, live_signal.metadata, deployment)
     if is_exit:
         # Exits of every deployment on this account and symbol go one after the
         # other, from sizing to the persisted order (see ``_exit_lock``).
@@ -3121,15 +3159,33 @@ async def _dispatch_discord_trade_signal(
     # the first match silently starved every other ACTIVE deployment sharing the
     # channel/symbol — the one that traded was picked by DB row order.
     signal_author_id = str(trade_signal.metadata.get("discord_author_id", "")).strip().lower()
-    # One decision for the whole fan-out: an exit/close message may still reach a PAUSED
-    # deployment, an entry may not (#126 decision). Computed from the parsed message, so
-    # "dispatched as an exit" and "gated as an exit" are the same test.
-    signal_is_exit = is_exit_order(trade_signal.action, trade_signal.metadata)
     dispatched_to_any = False
     # Resolve the broker-reported account number once: routing must be validated
     # against broker identity, not the local account id.
     account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
+        # Classified per deployment, not once for the fan-out: a plain SELL closes on a
+        # deployment that cannot short and is a short entry on one that can (#121), so a
+        # single answer here would drop a close on one of them (#126 decision).
+        try:
+            signal_is_exit = _signal_is_exit(
+                trade_signal.action, trade_signal.metadata, deployment
+            )
+        except ValueError:
+            # Same refusal as the wait-boolean one above, and the same shape: a config
+            # that cannot be read must not fall through to a sibling deployment, so this
+            # drops the signal for the whole channel.
+            logger.exception(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "strategy_name": deployment.strategy_name,
+                    }
+                },
+            )
+            return
         if not _deployment_can_dispatch(deployment, is_exit=signal_is_exit):
             continue
         if not _deployment_matches_stockkit_route(
