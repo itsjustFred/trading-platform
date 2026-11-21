@@ -931,6 +931,10 @@ def test_the_excusal_fails_closed_on_an_unreadable_book() -> None:
     assert outcome.complete is False
     assert outcome.failed == ("AAPL:cancel:sl-leg:cancel rejected",)
     assert client.close_calls == []
+    # The excusal verified: the flatten's listing, the excusal's own re-read and the
+    # restore's re-read. A test that only checked the outcome would also pass if the
+    # excusal verified nothing at all.
+    assert reads["all"] == 3
 
 
 def test_flatten_refuses_a_full_held_leg_page() -> None:
