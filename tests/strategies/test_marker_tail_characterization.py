@@ -364,7 +364,69 @@ def test_strategy_output_matches_pre_refactor_golden(strategy, expected):
     assert [int(i) for i in exits[exits].index.tolist()] == exp["exits"], (
         f"{strategy}: exit bars changed"
     )
-    assert drawings == exp["drawings"], f"{strategy}: drawings changed"
+    # json.dumps is order-sensitive: dict == would ignore key order, but the
+    # serialized contract (and the fixture's insertion order) pins it.
+    assert json.dumps(drawings) == json.dumps(exp["drawings"]), (
+        f"{strategy}: drawings changed"
+    )
     assert _indicators_sha256(indicators) == exp["indicators_sha256"], (
         f"{strategy}: indicators_dict changed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mixed-format string timestamps (pre-refactor parity)
+# ---------------------------------------------------------------------------
+#
+# The pre-refactor entry/exit tails parsed ``df.loc[mask[mask].index,
+# "timestamp"]`` — only each group's own rows — so pandas inferred the
+# datetime format from the signal rows alone. The shared helper must keep
+# that subset parse (``parse="subset"``): a string ``timestamp`` column
+# whose FIRST row uses a different format would otherwise poison the
+# whole-column parse and silently drop every marker. Expected values below
+# were captured from the pre-refactor trend_following on this exact frame.
+
+_MIXED_TS_EXPECTED = {
+    "entries": [368],
+    "exits": [651],
+    "drawings": [
+        {
+            "type": "marker",
+            "time": "2024-01-04T00:00:00+00:00",
+            "position": "belowBar",
+            "shape": "arrowUp",
+            "color": "#22c55e",
+            "text": "Entry",
+        },
+        {
+            "type": "marker",
+            "time": "2024-10-13T00:00:00+00:00",
+            "position": "aboveBar",
+            "shape": "arrowDown",
+            "color": "#ef4444",
+            "text": "Exit",
+        },
+    ],
+    "indicators_sha256": "b5722c248554d1fce223ea4650f66883746642ad066f6199a2054fc7e7fc267e",
+}
+
+
+def test_mixed_format_string_timestamps_match_pre_refactor():
+    """trend_following on a mixed-format string ``timestamp`` column must
+    emit the same markers the pre-refactor tail did (subset parse)."""
+    df = _updipcrash_frame()
+    ts = pd.DatetimeIndex(df["timestamp"])
+    strings = pd.Series(ts.strftime("%Y-%m-%dT%H:%M:%SZ"), index=df.index)
+    strings.iloc[0] = "01.01.2023 00:00"  # odd format on a non-signal row
+    df["timestamp"] = strings
+
+    module = _load_strategy_module(
+        "strategies/trend_following/trend_following.py", "mt_tf_mixed_ts"
+    )
+    entries, exits, indicators, drawings = module.generate_signals(df, {})
+
+    exp = _MIXED_TS_EXPECTED
+    assert [int(i) for i in entries[entries].index.tolist()] == exp["entries"]
+    assert [int(i) for i in exits[exits].index.tolist()] == exp["exits"]
+    assert json.dumps(drawings) == json.dumps(exp["drawings"])
+    assert _indicators_sha256(indicators) == exp["indicators_sha256"]
