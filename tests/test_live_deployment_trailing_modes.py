@@ -232,6 +232,22 @@ def test_signal_config_processor_wins_over_a_settings_processor(monkeypatch) -> 
         _check(deployment, broker="alpaca")
 
 
+def test_the_deployments_overrides_reach_the_processor_that_is_built() -> None:
+    """The bot config and the deployment's overrides are what the daemon merges,
+    so a nonsense override pair must refuse the deployment here too."""
+    with pytest.raises(ValueError, match="could not be built"):
+        _check(
+            _deployment(
+                {
+                    "signal_processor": "ramjet",
+                    # No ``trailing_mode``: the override check has nothing to
+                    # say, and the processor refuses the pair on its own.
+                    "signal_processor_config": {"trailing_percent": 0.02},
+                }
+            )
+        )
+
+
 def test_an_explicit_override_is_left_to_the_override_check(monkeypatch) -> None:
     """The override check already gates an explicit mode; this one must not
     rebuild the processor for it (and must not double-report it)."""

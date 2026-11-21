@@ -233,12 +233,13 @@ class LiveDeploymentConfig(BaseModel):
     def signal_processor_name(self) -> str:
         """Registered signal-processor id of this deployment, ``""`` when none.
 
-        One definition, on the model: the daemon's signal-processor gate, the
+        One definition, on the model: the daemon's signal-processor gate and the
         deployment-validation stages (``create_live_deployment``, the YAML
-        parser) and the promotion gate all resolve the id from the same place,
-        so a deployment whose processor cannot be found or whose processor
-        asks for a trailing mode its broker cannot execute (#150) is caught in
-        every one of them instead of only in some.
+        parser) resolve the id from the same place, so a processor that cannot
+        be built, or whose own default trailing mode the deployment's broker
+        cannot execute (#150), is caught at deployment validation instead of
+        per signal. The promotion gate hashes this id and is not a trailing
+        gate; it reads the same value through ``live_runner.promotion``.
         """
         configured = self.signal_config or {}
         settings = self.settings or {}
