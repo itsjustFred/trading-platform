@@ -10,12 +10,15 @@ positions and working orders are account-level), the two views on a schedule:
   not treated as untracked entries/exits);
 * protective stops vs open broker positions, for adapters that can list them.
 
-Unreadable broker state is a mismatch (fail closed), but never flaps: a pause
+Unreadable broker state is a mismatch (fail closed), but never flaps: a halt
 requires ``consecutive_mismatches`` (default 2) consecutive bad passes, and a
-clean pass resets the streak. The pause is the ordinary deployment status
-transition to ``PAUSED`` - the same control an operator uses - so the existing
-dispatch claim, submission drain and STOPPED enforcement keep their semantics.
-The latest pass is written to a JSON report the viewer serves read-only.
+clean pass resets the streak *and* releases the halt. The halt is entry-only:
+it sets a persisted flag the dispatch path checks before submitting an entry,
+so exits, in-flight orders and trailing stops keep working - a PAUSED status
+would have frozen all of them, including the exits a mismatch is meant to
+protect. The halt and its release are written to the live control audit
+trail. The latest pass is written to a JSON report the viewer serves
+read-only.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ import math
 import os
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,11 +36,14 @@ from live_runner.base_adapter import BaseLiveAdapter, BrokerOrderView, Protectiv
 from live_runner.exit_signals import DEFAULT_QTY_TOLERANCE, usable_qty_tolerance
 from shared import constants as shared_constants
 from shared.database import (
+    ENTRIES_HALT_ACTOR,
     get_account_net_filled_qty_by_deployment,
     list_live_account_filled_symbols,
     list_live_account_order_expectations,
     list_live_deployments,
-    update_live_deployment_status,
+    record_live_control_audit,
+    resume_live_deployment_entries_halt,
+    set_live_deployment_entries_halt,
 )
 from shared.logging import get_logger
 from shared.models import LiveDeploymentConfig
@@ -50,6 +56,16 @@ MIN_RECONCILIATION_INTERVAL_SECONDS = 30
 MAX_RECONCILIATION_INTERVAL_SECONDS = 86_400
 MAX_CONSECUTIVE_MISMATCHES = 10
 RECONCILIATION_REPORT_FILENAME = "broker_reconciliation_report.json"
+#: Upper bound on one broker read (positions, working orders, protective
+#: stops). A hung call must surface as an unreadable pass, not stall the loop
+#: forever with a stale report and no alert.
+BROKER_READ_TIMEOUT_SECONDS = 60.0
+#: How far back an unfilled signal may still count as an order the ledger
+#: expects to be working. Both live order paths are short-lived - Alpaca
+#: submits DAY orders and cTrader submits IMMEDIATE_OR_CANCEL - so anything
+#: older than this is a cancelled/expired/rejected historical order, not a
+#: working one, and must not become a permanent ``missing_working_order``.
+ORDER_EXPECTATION_MAX_AGE = timedelta(days=7)
 
 
 def default_reconciliation_report_path() -> Path:
@@ -95,7 +111,7 @@ class AccountReconciliationReport:
     findings: tuple[ReconciliationFinding, ...] = ()
     consecutive_mismatches: int = 0
     required_mismatches: int = DEFAULT_CONSECUTIVE_MISMATCHES
-    paused_deployment_ids: tuple[str, ...] = ()
+    entries_halted_deployment_ids: tuple[str, ...] = ()
 
     @property
     def mismatches(self) -> bool:
@@ -110,7 +126,7 @@ class AccountReconciliationReport:
             "mismatches": self.mismatches,
             "consecutive_mismatches": self.consecutive_mismatches,
             "required_mismatches": self.required_mismatches,
-            "paused_deployment_ids": list(self.paused_deployment_ids),
+            "entries_halted_deployment_ids": list(self.entries_halted_deployment_ids),
             "findings": [finding.to_dict() for finding in self.findings],
         }
 
@@ -130,11 +146,15 @@ class BrokerStateSnapshot:
         return self.error is None
 
 
-PauseDeployment = Callable[[str], Awaitable[None]]
+HaltEntries = Callable[[str, Mapping[str, Any]], Awaitable[None]]
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_SETTING_TRUE = {"1", "true", "yes", "on"}
+_SETTING_FALSE = {"0", "false", "no", "off"}
 
 
 def _setting_bool(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
@@ -143,7 +163,18 @@ def _setting_bool(settings: Mapping[str, Any], key: str, *, default: bool) -> bo
         return default
     if isinstance(raw, bool):
         return raw
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    text = str(raw).strip().lower()
+    if text in _SETTING_TRUE:
+        return True
+    if text in _SETTING_FALSE:
+        return False
+    # Fail closed: an unrecognised value (a typo like "flase") must not
+    # silently *disable* reconciliation - fall back to the safe default.
+    logger.warning(
+        "Ignoring unrecognised broker reconciliation boolean setting",
+        extra={"data": {"key": key, "value": raw, "using": default}},
+    )
+    return default
 
 
 def _setting_int(
@@ -202,6 +233,65 @@ def reconciliation_config_for_deployment(
         consecutive_mismatches=consecutive,
         enabled=_setting_bool(settings, "broker_reconciliation_enabled", default=True),
     )
+
+
+def validate_broker_reconciliation_settings(settings: Mapping[str, Any] | None) -> None:
+    """Refuse unusable reconciliation settings at deployment creation (#303).
+
+    Runtime parsing fails closed on bad values, but a typo stored in the
+    database is still a configuration error the operator should see when they
+    write it, not months later in a log line. Mirrors what
+    :func:`reconciliation_config_for_deployment` accepts.
+    """
+    from live_runner.exit_signals import MAX_QTY_TOLERANCE
+
+    values = settings or {}
+    for key, default, minimum, maximum in (
+        (
+            "broker_reconciliation_interval_seconds",
+            DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+            MIN_RECONCILIATION_INTERVAL_SECONDS,
+            MAX_RECONCILIATION_INTERVAL_SECONDS,
+        ),
+        (
+            "broker_reconciliation_consecutive_mismatches",
+            DEFAULT_CONSECUTIVE_MISMATCHES,
+            1,
+            MAX_CONSECUTIVE_MISMATCHES,
+        ),
+    ):
+        raw = values.get(key)
+        if raw is None:
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{key} must be an integer within [{minimum}, {maximum}], got {raw!r}"
+            ) from exc
+        if isinstance(raw, bool) or not minimum <= parsed <= maximum:
+            raise ValueError(
+                f"{key} must be an integer within [{minimum}, {maximum}], got {raw!r}"
+            )
+    raw_enabled = values.get("broker_reconciliation_enabled")
+    if raw_enabled is not None and not isinstance(raw_enabled, bool):
+        if str(raw_enabled).strip().lower() not in _SETTING_TRUE | _SETTING_FALSE:
+            raise ValueError(
+                "broker_reconciliation_enabled must be a boolean or one of "
+                f"{sorted(_SETTING_TRUE | _SETTING_FALSE)}, got {raw_enabled!r}"
+            )
+    raw_tolerance = values.get("broker_reconciliation_qty_tolerance")
+    if raw_tolerance is not None:
+        if (
+            isinstance(raw_tolerance, bool)
+            or not isinstance(raw_tolerance, (int, float))
+            or not math.isfinite(float(raw_tolerance))
+            or not 0.0 <= float(raw_tolerance) <= MAX_QTY_TOLERANCE
+        ):
+            raise ValueError(
+                "broker_reconciliation_qty_tolerance must be a finite number "
+                f"within [0, {MAX_QTY_TOLERANCE}], got {raw_tolerance!r}"
+            )
 
 
 def effective_reconciliation_config(
@@ -291,13 +381,33 @@ def _parse_positions(rows: Iterable[Mapping[str, Any]]) -> tuple[dict[str, float
 async def _broker_state(adapter: BaseLiveAdapter) -> BrokerStateSnapshot:
     """Read positions, working orders and protective stops; any failure is unreadable."""
     try:
-        positions = tuple(await adapter.get_positions())
+        positions = tuple(
+            await asyncio.wait_for(
+                adapter.get_positions(), timeout=BROKER_READ_TIMEOUT_SECONDS
+            )
+        )
+    except TimeoutError:
+        return BrokerStateSnapshot(
+            error=f"positions unreadable: timed out after {BROKER_READ_TIMEOUT_SECONDS}s"
+        )
     except Exception as exc:
         return BrokerStateSnapshot(error=f"positions unreadable: {exc}")
     try:
-        orders = tuple(await adapter.list_reconciliation_orders())
+        orders = tuple(
+            await asyncio.wait_for(
+                adapter.list_reconciliation_orders(),
+                timeout=BROKER_READ_TIMEOUT_SECONDS,
+            )
+        )
     except NotImplementedError as exc:
         return BrokerStateSnapshot(error=f"working orders unreadable: {exc}")
+    except TimeoutError:
+        return BrokerStateSnapshot(
+            error=(
+                f"working orders unreadable: timed out after "
+                f"{BROKER_READ_TIMEOUT_SECONDS}s"
+            )
+        )
     except Exception as exc:
         return BrokerStateSnapshot(error=f"working orders unreadable: {exc}")
 
@@ -306,10 +416,23 @@ async def _broker_state(adapter: BaseLiveAdapter) -> BrokerStateSnapshot:
     list_stops = getattr(adapter, "list_protective_stops", None)
     if callable(list_stops):
         try:
-            stops = tuple(await list_stops())
+            stops = tuple(
+                await asyncio.wait_for(
+                    list_stops(), timeout=BROKER_READ_TIMEOUT_SECONDS
+                )
+            )
             stops_supported = True
         except NotImplementedError:
             stops_supported = False
+        except TimeoutError:
+            return BrokerStateSnapshot(
+                positions=positions,
+                orders=orders,
+                error=(
+                    f"protective stops unreadable: timed out after "
+                    f"{BROKER_READ_TIMEOUT_SECONDS}s"
+                ),
+            )
         except Exception as exc:
             return BrokerStateSnapshot(
                 positions=positions,
@@ -325,19 +448,45 @@ async def _broker_state(adapter: BaseLiveAdapter) -> BrokerStateSnapshot:
 
 
 def _order_expectations(
-    rows: Iterable[Mapping[str, Any]], tolerance_for: Callable[[str], float]
+    rows: Iterable[Mapping[str, Any]],
+    tolerance_for: Callable[[str], float],
+    *,
+    expected_deployment_ids: set[str],
+    now: datetime,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Signals the ledger still expects to be working, and tracked broker ids."""
+    """Signals the ledger still expects to be working, and tracked broker ids.
+
+    Every persisted id stays *tracked* (a working broker order the ledger knows
+    is never "untracked"), but only rows that can still be working count as
+    *expected*: the deployment must be one reconciliation is watching
+    (ACTIVE/PAUSED - a STOPPED or deleted deployment's leftovers were already
+    enforced away) and the signal must be younger than
+    ``ORDER_EXPECTATION_MAX_AGE``. Both live order paths expire fast (Alpaca
+    DAY, cTrader IOC), so an older unfilled row is a cancelled, expired or
+    rejected historical order - expecting it forever would pause a healthy
+    account on every pass.
+    """
     expected: list[dict[str, Any]] = []
     tracked_ids: set[str] = set()
+    cutoff = now - ORDER_EXPECTATION_MAX_AGE
     for row in rows:
         signal_id = str(row.get("signal_id") or "").strip()
         broker_order_id = str(row.get("broker_order_id") or "").strip()
         if signal_id:
             tracked_ids.add(signal_id)
+        if broker_order_id:
+            tracked_ids.add(broker_order_id)
+        deployment_id = str(row.get("deployment_id") or "").strip()
+        if deployment_id not in expected_deployment_ids:
+            continue
+        timestamp = row.get("timestamp")
+        if isinstance(timestamp, datetime):
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            if timestamp < cutoff:
+                continue
         if not broker_order_id:
             continue
-        tracked_ids.add(broker_order_id)
         requested = _requested_qty(row.get("metadata") or {})
         filled = float(row.get("filled_qty") or 0.0)
         symbol = str(row.get("symbol") or "").strip().upper()
@@ -398,7 +547,12 @@ def compare_account_state(
     def tolerance_for(symbol: str) -> float:
         return _position_qty_tolerance(adapter, symbol, config.qty_tolerance)
 
-    expected_orders, tracked_ids = _order_expectations(order_rows, tolerance_for)
+    expected_orders, tracked_ids = _order_expectations(
+        order_rows,
+        tolerance_for,
+        expected_deployment_ids={str(deployment.id) for deployment in deployments},
+        now=_utcnow(),
+    )
     summary["expected_working_orders"] = expected_orders
 
     for symbol in sorted(symbols):
@@ -428,6 +582,10 @@ def compare_account_state(
         if not order.protection:
             broker_non_protection_ids.update(ids)
     tracked_set = set(tracked_ids)
+    # ``protection`` only suppresses the *untracked* finding: an order the
+    # ledger expects may legitimately be flagged protection (a reduce-side
+    # exit can look like one to the adapter), so expectations match against
+    # every broker id, protection marks included.
 
     for order in snapshot.orders:
         if order.protection:
@@ -451,7 +609,7 @@ def compare_account_state(
     for expected in expected_orders:
         ids = {expected["broker_order_id"], expected["signal_id"]}
         ids.discard("")
-        if not (ids & broker_non_protection_ids):
+        if not (ids & broker_order_ids):
             findings.append(
                 _finding(
                     "missing_working_order",
@@ -495,8 +653,21 @@ def compare_account_state(
     return findings, summary
 
 
-async def _default_pause_deployment(deployment_id: str) -> None:
-    await asyncio.to_thread(update_live_deployment_status, deployment_id, "PAUSED")
+async def _default_halt_entries(deployment_id: str, detail: Mapping[str, Any]) -> None:
+    await asyncio.to_thread(set_live_deployment_entries_halt, deployment_id, detail)
+
+
+async def _audit_entries_halt(
+    action: str, deployment_id: str, account_id: str, **detail: Any
+) -> None:
+    await asyncio.to_thread(
+        record_live_control_audit,
+        action=action,
+        target_type="live_deployment",
+        target_id=deployment_id,
+        actor=ENTRIES_HALT_ACTOR,
+        detail={"account_id": account_id, **detail},
+    )
 
 
 class BrokerReconciliationManager:
@@ -506,12 +677,12 @@ class BrokerReconciliationManager:
         self,
         *,
         report_path: Path | None = None,
-        pause_deployment: PauseDeployment | None = None,
+        halt_entries: HaltEntries | None = None,
     ) -> None:
         self._streaks: dict[str, int] = {}
         self._reports: dict[str, AccountReconciliationReport] = {}
         self._report_path = report_path or default_reconciliation_report_path()
-        self._pause_deployment = pause_deployment or _default_pause_deployment
+        self._halt_entries = halt_entries or _default_halt_entries
 
     @property
     def report_path(self) -> Path:
@@ -558,34 +729,72 @@ class BrokerReconciliationManager:
             summary: dict[str, Any] = {}
         else:
             snapshot = await _broker_state(adapter)
-            findings, summary = await asyncio.to_thread(
-                compare_account_state,
-                account_id=account_id,
-                snapshot=snapshot,
-                deployments=deployments,
-                config=config,
-                adapter=adapter,
-            )
+            try:
+                findings, summary = await asyncio.to_thread(
+                    compare_account_state,
+                    account_id=account_id,
+                    snapshot=snapshot,
+                    deployments=deployments,
+                    config=config,
+                    adapter=adapter,
+                )
+            except Exception as exc:
+                # A comparison failure (DB error, malformed stored row) is
+                # unreadable broker-vs-ledger state: it must count as a
+                # mismatch pass, not escape the loop and silently skip the
+                # streak, the report and the alert.
+                logger.warning(
+                    "Broker reconciliation comparison failed",
+                    extra={
+                        "data": {
+                            "alert": "broker_reconciliation_compare_failed",
+                            "account_id": account_id,
+                            "error": str(exc),
+                        }
+                    },
+                )
+                findings = [
+                    _finding(
+                        "broker_state_unreadable",
+                        account_id=account_id,
+                        error=f"comparison failed: {exc}",
+                    )
+                ]
+                summary = {}
 
         mismatched = bool(findings)
         streak = self._streaks.get(account_id, 0) + 1 if mismatched else 0
         self._streaks[account_id] = streak
 
-        paused: list[str] = []
+        halted: list[str] = []
         active = self._active_deployments(deployments)
-        should_pause = mismatched and streak >= config.consecutive_mismatches and bool(active)
-        if should_pause:
+        should_halt = mismatched and streak >= config.consecutive_mismatches and bool(active)
+        if should_halt:
             for deployment in active:
                 deployment_id = str(deployment.id)
                 try:
-                    await self._pause_deployment(deployment_id)
-                    paused.append(deployment_id)
+                    await self._halt_entries(
+                        deployment_id,
+                        {
+                            "by": ENTRIES_HALT_ACTOR,
+                            "at": _utcnow().isoformat(),
+                            "account_id": account_id,
+                            "consecutive_mismatches": streak,
+                        },
+                    )
+                    halted.append(deployment_id)
+                    await _audit_entries_halt(
+                        "broker_reconciliation_entries_halt",
+                        deployment_id,
+                        account_id,
+                        consecutive_mismatches=streak,
+                    )
                 except Exception as exc:
                     logger.error(
-                        "Broker reconciliation could not pause deployment",
+                        "Broker reconciliation could not halt deployment entries",
                         extra={
                             "data": {
-                                "alert": "broker_reconciliation_pause_failed",
+                                "alert": "broker_reconciliation_halt_failed",
                                 "account_id": account_id,
                                 "deployment_id": deployment_id,
                                 "error": str(exc),
@@ -594,11 +803,37 @@ class BrokerReconciliationManager:
                     )
                     findings.append(
                         _finding(
-                            "pause_failed",
+                            "halt_failed",
                             account_id=account_id,
                             deployment_id=deployment_id,
                             error=str(exc),
                         )
+                    )
+        elif not mismatched:
+            # A clean pass releases a halt the reconciler itself set. The
+            # helper only clears a marker it owns, so an operator's own flag
+            # (or a halt on a deployment that left ACTIVE/PAUSED) is untouched.
+            for deployment in deployments:
+                deployment_id = str(deployment.id)
+                try:
+                    if await asyncio.to_thread(
+                        resume_live_deployment_entries_halt, deployment_id
+                    ):
+                        await _audit_entries_halt(
+                            "broker_reconciliation_entries_resume",
+                            deployment_id,
+                            account_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Broker reconciliation could not release an entry halt",
+                        extra={
+                            "data": {
+                                "account_id": account_id,
+                                "deployment_id": deployment_id,
+                                "error": str(exc),
+                            }
+                        },
                     )
 
         if mismatched:
@@ -613,7 +848,7 @@ class BrokerReconciliationManager:
                         "account_id": account_id,
                         "consecutive_mismatches": streak,
                         "required_mismatches": config.consecutive_mismatches,
-                        "paused_deployment_ids": paused,
+                        "entries_halted_deployment_ids": halted,
                         "summary": summary,
                         "findings": [finding.to_dict() for finding in findings],
                     }
@@ -633,7 +868,7 @@ class BrokerReconciliationManager:
             findings=tuple(findings),
             consecutive_mismatches=streak,
             required_mismatches=config.consecutive_mismatches,
-            paused_deployment_ids=tuple(paused),
+            entries_halted_deployment_ids=tuple(halted),
         )
         self._reports[account_id] = report
         return report
@@ -666,6 +901,13 @@ class BrokerReconciliationManager:
                 config=config,
             )
             reports[account_id] = report
+        # Accounts no longer reconciled (deployments deleted, stopped, or moved)
+        # must not keep a streak or a served report: a recreated deployment
+        # would otherwise inherit the old account's mismatch count.
+        for account_id in [a for a in self._streaks if a not in by_account]:
+            self._streaks.pop(account_id, None)
+        for account_id in [a for a in self._reports if a not in by_account]:
+            self._reports.pop(account_id, None)
         self.write_report()
         return reports
 
@@ -688,9 +930,17 @@ async def run_broker_reconciliation_loop(
     current_deployments: Callable[[], Iterable[LiveDeploymentConfig]],
     *,
     manager: BrokerReconciliationManager | None = None,
+    deployments_ready: asyncio.Event | None = None,
 ) -> None:
-    """Scheduled pass driver; interval comes from deployment settings (#303)."""
+    """Scheduled pass driver; interval comes from deployment settings (#303).
+
+    ``deployments_ready`` gates the first pass on the daemon's initial
+    deployment sync: reconciling an empty snapshot would write an empty report
+    and wait a full interval before the real accounts are ever checked.
+    """
     manager = manager or BrokerReconciliationManager()
+    if deployments_ready is not None:
+        await deployments_ready.wait()
     while True:
         try:
             deployments = list(current_deployments())

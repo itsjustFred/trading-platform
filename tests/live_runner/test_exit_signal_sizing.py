@@ -1823,3 +1823,38 @@ def test_a_stale_exit_is_logged_at_warning_an_entry_at_info(caplog, exit_signal)
     level = logging.WARNING if exit_signal else logging.INFO
     assert _records_at(caplog, level, "stale discord signal")
     assert not _records_at(caplog, logging.INFO if exit_signal else logging.WARNING, "stale")
+
+
+def test_entries_are_skipped_while_the_reconciliation_halt_is_set(
+    monkeypatch, caplog
+) -> None:
+    """#303: the entry-only halt blocks new entries but never exits."""
+    import live_runner.daemon as daemon
+
+    deployment = _deployment(allow_short=True)
+    adapter = _Adapter([])
+    monkeypatch.setattr(daemon, "live_deployment_entries_halted", lambda _id: True)
+    entry = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata=dict(_sell_trade_signal().metadata),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _run_submit(adapter, deployment, entry)
+
+    assert adapter.submitted == []
+    assert any(
+        "entries are halted by broker reconciliation" in record.getMessage()
+        for record in caplog.records
+    )
+
+    # An exit on the same halted deployment still reaches the broker.
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter.positions = [{"symbol": "AAPL", "qty": 10.0}]
+    _run_submit(adapter, deployment, _exit_trade_signal())
+    assert len(adapter.submitted) == 1

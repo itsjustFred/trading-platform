@@ -107,6 +107,7 @@ from shared.database import (
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
+    live_deployment_entries_halted,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
     renew_live_deployment_submission,
@@ -2635,6 +2636,23 @@ async def _submit_normalized_discord_signal(
         return
 
     is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    if not is_exit and await asyncio.to_thread(
+        live_deployment_entries_halted, str(deployment.id)
+    ):
+        # Entry-only halt (#303): broker reconciliation froze new entries on
+        # this deployment but exits must keep flowing, so the check sits
+        # after the exit classification and reads the flag fresh from the DB.
+        logger.warning(
+            "Skipping entry signal: deployment entries are halted by broker reconciliation",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                }
+            },
+        )
+        return
     if is_exit:
         # Exits of every deployment on this account and symbol go one after the
         # other, from sizing to the persisted order (see ``_exit_lock``).
@@ -5052,6 +5070,7 @@ async def sync_deployments_loop(
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
     deployment_snapshot: list[LiveDeploymentConfig] | None = None,
+    first_sync_complete: asyncio.Event | None = None,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
     # Seeded from the database, not empty. Every restart used to re-run cancel
@@ -5167,6 +5186,11 @@ async def sync_deployments_loop(
                 deployments_by_account,
                 accounts_env_values=accounts_env_values,
             )
+            if first_sync_complete is not None:
+                # The snapshot and adapters now reflect the DB: background
+                # loops gated on this event (broker reconciliation, #303) may
+                # take their first real pass.
+                first_sync_complete.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5197,6 +5221,7 @@ async def run_daemon(
     await scheduler.start()
 
     deployment_snapshot: list[LiveDeploymentConfig] = []
+    first_sync_complete = asyncio.Event()
     sync_task = asyncio.create_task(
         sync_deployments_loop(
             active_adapters,
@@ -5204,6 +5229,7 @@ async def run_daemon(
             active_discord_tasks,
             accounts_env=accounts_env,
             deployment_snapshot=deployment_snapshot,
+            first_sync_complete=first_sync_complete,
         ),
         name="deployment-sync-loop",
     )
@@ -5232,6 +5258,7 @@ async def run_daemon(
         run_broker_reconciliation_loop(
             active_adapters,
             current_deployments=lambda: list(deployment_snapshot),
+            deployments_ready=first_sync_complete,
         ),
         name="broker-reconciliation",
     )

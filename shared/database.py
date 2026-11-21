@@ -3301,7 +3301,11 @@ def list_live_account_order_expectations(account_id: str) -> list[dict[str, Any]
             "symbol": str(symbol or "").strip().upper(),
             "action": str(action or "").strip().lower(),
             "broker_order_id": str(broker_order_id or "").strip(),
-            "metadata": dict(metadata_json or {}),
+            # A stored non-object metadata value must not raise here: the
+            # reconciliation loop treats a comparison failure as an
+            # unreadable pass, and an unreadable *requested qty* already
+            # fails closed (the order stays expected). Normalise instead.
+            "metadata": dict(metadata_json) if isinstance(metadata_json, dict) else {},
             "timestamp": timestamp,
             "filled_qty": float(filled_qty or 0.0),
         }
@@ -4159,6 +4163,7 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.broker_reconciliation import validate_broker_reconciliation_settings
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -4166,6 +4171,9 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Same for the broker-reconciliation settings (#303): a typo'd boolean
+    # or out-of-range interval is refused here, not silently defaulted later.
+    validate_broker_reconciliation_settings(deployment.settings)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
@@ -4221,6 +4229,86 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+#: ``settings`` key the broker reconciler uses for its entry-only halt (#303).
+#: The value is a small marker dict; only a marker written by the reconciler
+#: itself is cleared automatically (see :func:`resume_live_deployment_entries_halt`).
+ENTRIES_HALT_SETTINGS_KEY = "broker_reconciliation_entries_halted"
+ENTRIES_HALT_ACTOR = "broker_reconciliation"
+
+
+def set_live_deployment_entries_halt(
+    deployment_id: str, detail: Mapping[str, Any] | None
+) -> bool:
+    """Set (``detail``) or clear (``None``) the entry-only halt flag.
+
+    Persisted in ``settings`` so the halt survives a daemon restart without a
+    schema change. Returns ``False`` when the deployment does not exist.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        if detail is None:
+            settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        else:
+            settings[ENTRIES_HALT_SETTINGS_KEY] = dict(detail)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def live_deployment_entries_halted(deployment_id: str) -> bool:
+    """Fresh read of the entry-halt flag; a read failure counts as halted.
+
+    Entries are the dangerous direction, so an unreadable deployment row must
+    fail closed here - the caller blocks the entry rather than trading on a
+    stale answer. A missing row reads as *not* halted: the ACTIVE-status gate
+    upstream already refuses dispatch for a deployment that is gone, and this
+    flag can only exist on a row that does.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return True
+    if deployment is None:
+        return False
+    return bool((deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY))
+
+
+def resume_live_deployment_entries_halt(deployment_id: str) -> bool:
+    """Clear the halt only when the broker reconciler set it.
+
+    Returns ``True`` when a reconciler-owned halt was actually removed, so the
+    caller can audit the resume. An operator-set or unmarked value is left
+    alone.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        halt = settings.get(ENTRIES_HALT_SETTINGS_KEY)
+        if not isinstance(halt, dict) or halt.get("by") != ENTRIES_HALT_ACTOR:
+            return False
+        settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
 def update_live_deployment_status(
     deployment_id: str, status: str
 ) -> LiveDeploymentConfig | None:
@@ -4233,6 +4321,15 @@ def update_live_deployment_status(
         if record is None:
             return None
         record.status = next_status
+        if next_status == "ACTIVE":
+            # Resuming is the operator's explicit "trade again": it also
+            # releases a broker-reconciliation entry halt. A still-mismatched
+            # account is re-halted on the next pass, so this cannot hide a
+            # live divergence - it only ends the halt early by decision.
+            settings = dict(record.settings_json or {})
+            if ENTRIES_HALT_SETTINGS_KEY in settings:
+                settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+                record.settings_json = settings
         if next_status != "STOPPED":
             # Clear the enforcement stamp in the *same* transaction as the
             # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle

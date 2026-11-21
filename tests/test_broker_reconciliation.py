@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
+
+import pytest
 
 from live_runner.base_adapter import BrokerOrderView, ProtectiveStop
 from live_runner.broker_reconciliation import (
@@ -13,9 +15,13 @@ from live_runner.broker_reconciliation import (
     load_reconciliation_report,
 )
 from shared.database import (
+    ENTRIES_HALT_SETTINGS_KEY,
     get_live_deployment,
+    list_live_control_audit,
+    resume_live_deployment_entries_halt,
     save_live_execution,
     save_live_signal,
+    set_live_deployment_entries_halt,
     update_live_deployment_status,
 )
 from shared.models import LiveDeploymentConfig, LiveExecution, LiveSignal
@@ -96,13 +102,13 @@ def _fill(signal_id: str, *, broker_order_id: str, qty: float) -> None:
     )
 
 
-def _manager(tmp_path: Path, paused: list[str]) -> BrokerReconciliationManager:
-    async def pause(deployment_id: str) -> None:
-        paused.append(deployment_id)
-        update_live_deployment_status(deployment_id, "PAUSED")
+def _manager(tmp_path: Path, halted: list[str]) -> BrokerReconciliationManager:
+    async def halt(deployment_id: str, detail: dict) -> None:
+        halted.append(deployment_id)
+        set_live_deployment_entries_halt(deployment_id, detail)
 
     return BrokerReconciliationManager(
-        report_path=tmp_path / "report.json", pause_deployment=pause
+        report_path=tmp_path / "report.json", halt_entries=halt
     )
 
 
@@ -131,21 +137,22 @@ def test_clean_account_reconciles_and_writes_report(isolated_db, tmp_path) -> No
         positions=[{"symbol": "AAPL", "qty": 10.0}],
         stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
     )
-    paused: list[str] = []
-    manager = _manager(tmp_path, paused)
+    halted: list[str] = []
+    manager = _manager(tmp_path, halted)
 
     reports = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
 
     report = reports[ACCOUNT_ID]
     assert report.ok is True
     assert report.findings == ()
-    assert paused == []
+    assert halted == []
     assert get_live_deployment(DEPLOYMENT_ID).status == "ACTIVE"
+    assert ENTRIES_HALT_SETTINGS_KEY not in (get_live_deployment(DEPLOYMENT_ID).settings or {})
     payload = json.loads(manager.report_path.read_text())
     assert payload["accounts"][ACCOUNT_ID]["ok"] is True
 
 
-def test_position_mismatch_pauses_only_after_two_consecutive_passes(
+def test_position_mismatch_halts_entries_only_after_two_consecutive_passes(
     isolated_db, tmp_path, caplog
 ) -> None:
     database, _engine, _data_dir = isolated_db
@@ -168,23 +175,31 @@ def test_position_mismatch_pauses_only_after_two_consecutive_passes(
         positions=[{"symbol": "AAPL", "qty": 9.0}],
         stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
     )
-    paused: list[str] = []
-    manager = _manager(tmp_path, paused)
+    halted: list[str] = []
+    manager = _manager(tmp_path, halted)
 
     with caplog.at_level("WARNING"):
         first = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
         second = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
 
     assert first[ACCOUNT_ID].consecutive_mismatches == 1
-    assert first[ACCOUNT_ID].paused_deployment_ids == ()
+    assert first[ACCOUNT_ID].entries_halted_deployment_ids == ()
     assert second[ACCOUNT_ID].consecutive_mismatches == 2
-    assert second[ACCOUNT_ID].paused_deployment_ids == (DEPLOYMENT_ID,)
-    assert paused == [DEPLOYMENT_ID]
-    assert get_live_deployment(DEPLOYMENT_ID).status == "PAUSED"
+    assert second[ACCOUNT_ID].entries_halted_deployment_ids == (DEPLOYMENT_ID,)
+    assert halted == [DEPLOYMENT_ID]
+    # The halt is entry-only: the deployment stays ACTIVE so exits, in-flight
+    # orders and trailing stops keep working.
+    current = get_live_deployment(DEPLOYMENT_ID)
+    assert current.status == "ACTIVE"
+    assert (current.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY, {}).get("by") == (
+        "broker_reconciliation"
+    )
     assert any(
         getattr(record, "data", {}).get("alert") == "broker_reconciliation_mismatch"
         for record in caplog.records
     )
+    audit_actions = {row["action"] for row in list_live_control_audit(target_id=DEPLOYMENT_ID)}
+    assert "broker_reconciliation_entries_halt" in audit_actions
 
 
 def test_clean_pass_resets_the_mismatch_streak(isolated_db, tmp_path) -> None:
@@ -208,8 +223,8 @@ def test_clean_pass_resets_the_mismatch_streak(isolated_db, tmp_path) -> None:
         positions=[{"symbol": "AAPL", "qty": 9.0}],
         stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
     )
-    paused: list[str] = []
-    manager = _manager(tmp_path, paused)
+    halted: list[str] = []
+    manager = _manager(tmp_path, halted)
 
     _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
     adapter.positions = [{"symbol": "AAPL", "qty": 10.0}]
@@ -220,25 +235,25 @@ def test_clean_pass_resets_the_mismatch_streak(isolated_db, tmp_path) -> None:
     assert clean[ACCOUNT_ID].ok is True
     assert clean[ACCOUNT_ID].consecutive_mismatches == 0
     assert again[ACCOUNT_ID].consecutive_mismatches == 1
-    assert paused == []
+    assert halted == []
 
 
-def test_unreadable_broker_state_is_a_mismatch_and_pauses_after_threshold(
+def test_unreadable_broker_state_is_a_mismatch_and_halts_after_threshold(
     isolated_db, tmp_path
 ) -> None:
     database, _engine, _data_dir = isolated_db
     _seed_db(database)
     deployment = _deployment()
     adapter = FakeAdapter(positions_error=RuntimeError("broker down"))
-    paused: list[str] = []
-    manager = _manager(tmp_path, paused)
+    halted: list[str] = []
+    manager = _manager(tmp_path, halted)
 
     first = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
     second = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
 
     assert first[ACCOUNT_ID].unreadable is True
-    assert second[ACCOUNT_ID].paused_deployment_ids == (DEPLOYMENT_ID,)
-    assert paused == [DEPLOYMENT_ID]
+    assert second[ACCOUNT_ID].entries_halted_deployment_ids == (DEPLOYMENT_ID,)
+    assert halted == [DEPLOYMENT_ID]
 
 
 def test_missing_working_order_and_untracked_order_are_findings(
@@ -329,3 +344,269 @@ def test_reconciliation_endpoint_returns_read_only_report(viewer_client, monkeyp
     response = viewer_client.get("/api/live/reconciliation")
     assert response.status_code == 200
     assert response.json() == payload
+
+
+def _unfilled_signal(
+    deployment_id: str,
+    *,
+    broker_order_id: str,
+    timestamp: datetime | None = None,
+    symbol: str = "AAPL",
+) -> str:
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=deployment_id,
+            symbol=symbol,
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=timestamp or datetime.now(timezone.utc),
+            metadata={"broker_order_id": broker_order_id, "qty": 10.0},
+        )
+    )
+    return signal_id
+
+
+def test_historical_unfilled_order_is_not_expected(isolated_db, tmp_path) -> None:
+    """A cancelled/expired order from weeks ago must not pause a healthy account."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    _unfilled_signal(DEPLOYMENT_ID, broker_order_id="ord-ancient", timestamp=old)
+
+    deployment = _deployment()
+    adapter = FakeAdapter(positions=[], orders=[])
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
+
+
+def test_stopped_deployments_orders_are_not_expected(isolated_db, tmp_path) -> None:
+    """Leftover unfilled orders of a STOPPED deployment were already enforced away."""
+    database, _engine, _data_dir = isolated_db
+    stopped_id = str(uuid4())
+    _seed_db(database)
+    seed_live_deployments(database, [stopped_id], account_id=ACCOUNT_ID)
+    update_live_deployment_status(stopped_id, "STOPPED")
+    _unfilled_signal(stopped_id, broker_order_id="ord-stopped")
+
+    deployment = _deployment()
+    adapter = FakeAdapter(positions=[], orders=[])
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
+
+
+def test_expected_order_matches_a_protection_flagged_broker_order(
+    isolated_db, tmp_path
+) -> None:
+    """An expected working order stays matched even when the adapter marks it
+    protection: the flag only suppresses the *untracked* finding."""
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    _unfilled_signal(DEPLOYMENT_ID, broker_order_id="ord-exit")
+
+    deployment = _deployment()
+    adapter = FakeAdapter(
+        positions=[],
+        orders=[
+            BrokerOrderView(
+                order_id="ord-exit",
+                client_order_id="",
+                symbol="AAPL",
+                side="sell",
+                qty=10.0,
+                order_type="market",
+                protection=True,
+            )
+        ],
+    )
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert report[ACCOUNT_ID].ok is True
+    assert report[ACCOUNT_ID].findings == ()
+
+
+def test_broker_read_timeout_is_an_unreadable_pass(isolated_db, tmp_path, monkeypatch) -> None:
+    import live_runner.broker_reconciliation as recon
+
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    monkeypatch.setattr(recon, "BROKER_READ_TIMEOUT_SECONDS", 0.05)
+
+    class SlowAdapter(FakeAdapter):
+        async def get_positions(self):
+            await asyncio.sleep(5)
+            return []
+
+    deployment = _deployment()
+    manager = _manager(tmp_path, [])
+
+    report = _reconcile(manager, [deployment], {ACCOUNT_ID: SlowAdapter()})
+
+    assert report[ACCOUNT_ID].unreadable is True
+    assert "timed out" in report[ACCOUNT_ID].findings[0].detail["error"]
+
+
+def test_comparison_failure_fails_closed_as_unreadable(isolated_db, tmp_path, monkeypatch) -> None:
+    import live_runner.broker_reconciliation as recon
+
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+
+    def _boom(**_kwargs):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(recon, "compare_account_state", _boom)
+    deployment = _deployment()
+    adapter = FakeAdapter(positions=[], orders=[])
+    halted: list[str] = []
+    manager = _manager(tmp_path, halted)
+
+    first = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+    second = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert first[ACCOUNT_ID].unreadable is True
+    assert second[ACCOUNT_ID].entries_halted_deployment_ids == (DEPLOYMENT_ID,)
+    assert halted == [DEPLOYMENT_ID]
+
+
+def test_accounts_that_leave_the_snapshot_lose_streak_and_report(
+    isolated_db, tmp_path
+) -> None:
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    deployment = _deployment()
+    adapter = FakeAdapter(positions=[{"symbol": "AAPL", "qty": 9.0}], stops=[])
+    manager = _manager(tmp_path, [])
+
+    _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+    assert ACCOUNT_ID in manager.latest_report()["accounts"]
+
+    # The deployment is gone (deleted/stopped): nothing may keep its streak.
+    _reconcile(manager, [], {})
+
+    assert manager.latest_report()["accounts"] == {}
+
+
+def test_unrecognised_enabled_value_fails_closed_to_enabled() -> None:
+    from live_runner.broker_reconciliation import reconciliation_config_for_deployment
+
+    config = reconciliation_config_for_deployment(
+        _deployment(settings={"broker_reconciliation_enabled": "flase"})
+    )
+    assert config.enabled is True
+    disabled = reconciliation_config_for_deployment(
+        _deployment(settings={"broker_reconciliation_enabled": "false"})
+    )
+    assert disabled.enabled is False
+
+
+def test_clean_pass_releases_a_reconciler_entry_halt(isolated_db, tmp_path) -> None:
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    signal_id, _ = save_live_signal(
+        LiveSignal(
+            id=uuid4(),
+            deployment_id=DEPLOYMENT_ID,
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"broker_order_id": "ord-1", "qty": 10.0},
+        )
+    )
+    _fill(signal_id, broker_order_id="ord-1", qty=10.0)
+
+    deployment = _deployment()
+    adapter = FakeAdapter(
+        positions=[{"symbol": "AAPL", "qty": 9.0}],
+        stops=[ProtectiveStop(order_id="stop-1", symbol="AAPL", side="sell", stop_price=95.0)],
+    )
+    manager = _manager(tmp_path, [])
+    _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+    _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+    assert ENTRIES_HALT_SETTINGS_KEY in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+    adapter.positions = [{"symbol": "AAPL", "qty": 10.0}]
+    clean = _reconcile(manager, [deployment], {ACCOUNT_ID: adapter})
+
+    assert clean[ACCOUNT_ID].ok is True
+    assert ENTRIES_HALT_SETTINGS_KEY not in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+    audit_actions = {
+        row["action"] for row in list_live_control_audit(target_id=DEPLOYMENT_ID)
+    }
+    assert "broker_reconciliation_entries_resume" in audit_actions
+
+
+def test_operator_resume_clears_the_entry_halt(isolated_db, tmp_path) -> None:
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    set_live_deployment_entries_halt(
+        DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now", "account_id": ACCOUNT_ID}
+    )
+    assert ENTRIES_HALT_SETTINGS_KEY in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+
+    assert ENTRIES_HALT_SETTINGS_KEY not in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+
+def test_resume_helper_refuses_a_foreign_halt_marker(isolated_db) -> None:
+    database, _engine, _data_dir = isolated_db
+    _seed_db(database)
+    set_live_deployment_entries_halt(DEPLOYMENT_ID, {"by": "operator", "reason": "manual"})
+
+    assert resume_live_deployment_entries_halt(DEPLOYMENT_ID) is False
+    assert ENTRIES_HALT_SETTINGS_KEY in (get_live_deployment(DEPLOYMENT_ID).settings or {})
+
+
+def test_validate_reconciliation_settings_accepts_good_values() -> None:
+    from live_runner.broker_reconciliation import validate_broker_reconciliation_settings
+
+    validate_broker_reconciliation_settings(
+        {
+            "broker_reconciliation_interval_seconds": 600,
+            "broker_reconciliation_consecutive_mismatches": 3,
+            "broker_reconciliation_enabled": "false",
+            "broker_reconciliation_qty_tolerance": 0.5,
+        }
+    )
+    validate_broker_reconciliation_settings({})
+    validate_broker_reconciliation_settings(None)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"broker_reconciliation_interval_seconds": 5},
+        {"broker_reconciliation_interval_seconds": "soon"},
+        {"broker_reconciliation_consecutive_mismatches": 0},
+        {"broker_reconciliation_enabled": "flase"},
+        {"broker_reconciliation_qty_tolerance": "wide"},
+        {"broker_reconciliation_qty_tolerance": 2.0},
+    ],
+)
+def test_validate_reconciliation_settings_refuses_bad_values(settings) -> None:
+    from live_runner.broker_reconciliation import validate_broker_reconciliation_settings
+
+    with pytest.raises(ValueError, match="broker_reconciliation"):
+        validate_broker_reconciliation_settings(settings)
+
+
+def test_create_live_deployment_refuses_bad_reconciliation_settings(isolated_db) -> None:
+    from shared.database import create_live_deployment
+
+    with pytest.raises(ValueError, match="broker_reconciliation"):
+        create_live_deployment(
+            _deployment(settings={"broker_reconciliation_enabled": "flase"})
+        )
