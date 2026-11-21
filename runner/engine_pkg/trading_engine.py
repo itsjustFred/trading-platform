@@ -194,6 +194,7 @@ class TradeEngine:
         # the signal frame's column order. Appending one candidate per column
         # made two levels that share the "tp_pct" fraction, so a 50% exit
         # fraction closed the whole position at the take-profit level.
+        # (rank, price): 0 = canonical take_profit, 1 = tp_price alias.
         plain_tp: tuple[int, float] | None = None
         for key in row.index:
             lower = str(key).lower()
