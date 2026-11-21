@@ -832,6 +832,259 @@ def test_a_halt_set_while_the_entry_is_being_prepared_stops_the_submit(
     assert claims == []
 
 
+def _run_submit_path(
+    account: str,
+    adapter: _EntryAdapter,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Run one signal through ``_prepare_claim_and_submit_signal``.
+
+    Returns the lease events in order, so a test can tell "the halt gate
+    refused before the claim" from "the order reached the broker".
+    """
+    import live_runner.daemon as daemon
+    from risk import TradeSignal
+
+    events: list[str] = []
+    monkeypatch.setattr(
+        daemon,
+        "claim_live_deployment_submission",
+        lambda *a, **k: events.append("claimed") or "token",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "release_live_deployment_submission",
+        lambda *a, **k: events.append("released") or True,
+        raising=False,
+    )
+    asyncio.run(
+        daemon._prepare_claim_and_submit_signal(
+            account,
+            adapter,
+            deployment,
+            TradeSignal(
+                action=live_signal.action,
+                symbol=live_signal.symbol,
+                entry_price=float(live_signal.theoretical_price),
+                stop_loss=95.0,
+                take_profit=110.0,
+                timeframe="1h",
+            ),
+            live_signal,
+            is_exit=is_exit,
+        )
+    )
+    return events
+
+
+@pytest.mark.parametrize("mode", [mode.value for mode in KillSwitchMode])
+def test_a_halt_never_blocks_an_exit_on_the_submit_path(
+    isolated_db_sandbox, account, monkeypatch, mode: str
+) -> None:
+    """The last-moment gate is entry-only: an exit must still reach the broker.
+
+    ``prepare_order_with_risk`` routes exits away before its own halt gate, but
+    the submission path runs a second gate after preparation. That gate must
+    skip exits too, or an operator who sets even the harmless ``entries`` mode -
+    or hits the fail-closed unreadable-state case - is locked into every open
+    position, which is the opposite of what a halt is for.
+    """
+    deployment = _deployment()
+    adapter = _EntryAdapter(positions=[{"symbol": "AAPL", "qty": 5.0}])
+    _patch_exit_ledger(monkeypatch, deployment, 5.0)
+    set_live_kill_switch(account, mode, actor="operator")
+
+    events = _run_submit_path(
+        account, adapter, deployment, _exit_signal(deployment),
+        is_exit=True, monkeypatch=monkeypatch,
+    )
+
+    assert events == ["claimed", "released"]
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0][1] == 5.0
+
+
+def test_an_unreadable_halt_state_never_blocks_an_exit_on_the_submit_path(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    """Fail closed refuses entries; it must not trap open positions either."""
+    import live_runner.kill_switch as kill_switch
+
+    deployment = _deployment()
+    adapter = _EntryAdapter(positions=[{"symbol": "AAPL", "qty": 5.0}])
+    _patch_exit_ledger(monkeypatch, deployment, 5.0)
+
+    def _unreadable() -> dict[str, str]:
+        raise OSError("database is unavailable")
+
+    monkeypatch.setattr(kill_switch, "read_live_kill_switch_scopes", _unreadable)
+
+    events = _run_submit_path(
+        account, adapter, deployment, _exit_signal(deployment),
+        is_exit=True, monkeypatch=monkeypatch,
+    )
+
+    assert events == ["claimed", "released"]
+    assert len(adapter.submitted) == 1
+
+
+@pytest.mark.parametrize("mode", [mode.value for mode in KillSwitchMode])
+def test_an_entry_is_refused_on_the_submit_path_while_halted(
+    isolated_db_sandbox, account, monkeypatch, mode: str
+) -> None:
+    """The counterpart: every halt mode still refuses the entry end to end."""
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    set_live_kill_switch(account, mode, actor="operator")
+
+    events = _run_submit_path(
+        account, adapter, deployment, _entry_signal(deployment),
+        is_exit=False, monkeypatch=monkeypatch,
+    )
+
+    assert adapter.submitted == []
+    assert events == []
+
+
+def test_an_unreadable_halt_state_refuses_the_entry_on_the_submit_path(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    import live_runner.kill_switch as kill_switch
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+
+    def _unreadable() -> dict[str, str]:
+        raise OSError("database is unavailable")
+
+    monkeypatch.setattr(kill_switch, "read_live_kill_switch_scopes", _unreadable)
+
+    events = _run_submit_path(
+        account, adapter, deployment, _entry_signal(deployment),
+        is_exit=False, monkeypatch=monkeypatch,
+    )
+
+    assert adapter.submitted == []
+    assert events == []
+
+
+def test_a_halt_written_during_the_claim_still_stops_the_entry(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    """The claim awaited the database, so the halt is read once more after it.
+
+    A halt written in that window is invisible to the pre-claim gate; the
+    post-claim read is the last checkpoint before ``adapter.submit_order``. The
+    refusal releases the lease it just took - the order never reached the
+    broker, so nothing is in flight.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.kill_switch import KillSwitchMode, LiveHaltError
+    from risk import TradeSignal
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    events: list[str] = []
+
+    def _claim(*_args: Any, **_kwargs: Any) -> str:
+        # The halt lands while the claim is in flight - after every gate that
+        # ran before it.
+        set_live_kill_switch(account, "entries", actor="operator")
+        events.append("claimed")
+        return "token"
+
+    monkeypatch.setattr(
+        daemon, "claim_live_deployment_submission", _claim, raising=False
+    )
+    monkeypatch.setattr(
+        daemon,
+        "release_live_deployment_submission",
+        lambda *a, **k: events.append("released") or True,
+        raising=False,
+    )
+
+    asyncio.run(
+        daemon._prepare_claim_and_submit_signal(
+            account,
+            adapter,
+            deployment,
+            TradeSignal(
+                action="buy",
+                symbol="AAPL",
+                entry_price=100.0,
+                stop_loss=95.0,
+                take_profit=110.0,
+                timeframe="1h",
+            ),
+            _entry_signal(deployment),
+            is_exit=False,
+        )
+    )
+
+    assert adapter.submitted == []
+    assert events == ["claimed", "released"]
+
+
+def test_submit_order_with_risk_rechecks_the_halt_before_submitting(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    """The lease-less path gets the same last-moment gate as the leased one.
+
+    ``live_smoke`` submits through ``submit_order_with_risk``, which has no
+    claim to protect - but a halt written while the order was being sized must
+    still stop it. The first read (inside ``prepare_order_with_risk``) passes;
+    the recheck refuses.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.kill_switch import KillSwitchMode, LiveHaltError
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    real_refuse = daemon.refuse_entry_while_halted
+    reads = {"count": 0}
+
+    async def _refuse(*args: Any, **kwargs: Any) -> None:
+        reads["count"] += 1
+        if reads["count"] > 1:
+            raise LiveHaltError(
+                "halted", account_id=account, mode=KillSwitchMode.ENTRIES
+            )
+        return await real_refuse(*args, **kwargs)
+
+    monkeypatch.setattr(daemon, "refuse_entry_while_halted", _refuse)
+
+    with pytest.raises(LiveHaltError):
+        _submit_entry(deployment, adapter)
+
+    assert adapter.submitted == []
+
+
+def test_submit_order_with_risk_never_blocks_an_exit(
+    isolated_db_sandbox, account, monkeypatch
+) -> None:
+    """The recheck is entry-only here too: closing is never halted."""
+    import live_runner.daemon as daemon
+
+    deployment = _deployment()
+    adapter = _EntryAdapter(positions=[{"symbol": "AAPL", "qty": 5.0}])
+    _patch_exit_ledger(monkeypatch, deployment, 5.0)
+    set_live_kill_switch(account, "flatten", actor="operator")
+
+    asyncio.run(
+        daemon.submit_order_with_risk(
+            adapter, deployment, _exit_signal(deployment)
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0][1] == 5.0
+
+
 def test_a_halt_written_while_the_daemon_is_running_is_enforced(
     isolated_db_sandbox, account
 ) -> None:

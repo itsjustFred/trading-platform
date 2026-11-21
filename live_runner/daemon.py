@@ -2104,6 +2104,15 @@ async def submit_order_with_risk(
         account_balance=account_balance,
         pip_value=pip_value,
     )
+    # The same last-moment halt gate the leased submission path runs: this
+    # caller has no claim to protect, but a halt written while the order was
+    # being sized must still stop it. Entries only - an exit is never blocked.
+    if not is_exit_order(signal.action, signal.metadata or {}):
+        await refuse_entry_while_halted(
+            deployment.account_id,
+            deployment_id=str(deployment.id),
+            symbol=signal.symbol,
+        )
     return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
@@ -2778,29 +2787,31 @@ async def _prepare_claim_and_submit_signal(
     # reads, so an operator who halted the account while this entry was being
     # sized must not have the order land anyway - that window is exactly when the
     # halt is being used. Nothing has been claimed at this point, so a refusal
-    # costs no submission lease.
-    try:
-        await refuse_entry_while_halted(
-            account_id,
-            deployment_id=str(deployment.id),
-            symbol=live_signal.symbol,
-        )
-    except LiveHaltError as exc:
-        logger.warning(
-            "Entry refused by the kill switch at the submission gate; nothing was "
-            "sent to the broker and the submission lease was never claimed",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "deployment_id": str(deployment.id),
-                    "symbol": live_signal.symbol,
-                    "halt_mode": exc.mode.value if exc.mode is not None else None,
-                    "halt_state_unreadable": exc.state_unreadable,
-                    "reason": str(exc),
-                }
-            },
-        )
-        return
+    # costs no submission lease. Exits skip it for the same reason they skip the
+    # gate in `prepare_order_with_risk`: a halt must never trap an open position.
+    if not is_exit:
+        try:
+            await refuse_entry_while_halted(
+                account_id,
+                deployment_id=str(deployment.id),
+                symbol=live_signal.symbol,
+            )
+        except LiveHaltError as exc:
+            logger.warning(
+                "Entry refused by the kill switch at the submission gate; nothing was "
+                "sent to the broker and the submission lease was never claimed",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "halt_mode": exc.mode.value if exc.mode is not None else None,
+                        "halt_state_unreadable": exc.state_unreadable,
+                        "reason": str(exc),
+                    }
+                },
+            )
+            return
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
@@ -2827,6 +2838,43 @@ async def _prepare_claim_and_submit_signal(
             },
         )
         return
+
+    # The claim itself awaited the database, so a halt written while it ran is
+    # still unseen by the gate above. Read the halt one last time now that the
+    # lease is held: a refusal releases the lease (the order never reached the
+    # broker, so nothing is in flight) and this is the last checkpoint before
+    # `adapter.submit_order`. Exits skip it for the same reason as above.
+    if not is_exit:
+        try:
+            await refuse_entry_while_halted(
+                account_id,
+                deployment_id=str(deployment.id),
+                symbol=live_signal.symbol,
+            )
+        except LiveHaltError as exc:
+            try:
+                await asyncio.to_thread(
+                    release_live_deployment_submission, claim_token
+                )
+            except Exception:
+                # The lease expires on its own; never let the cleanup turn a
+                # handled refusal into an exception that aborts the fan-out.
+                logger.exception("Could not release the submission lease")
+            logger.warning(
+                "Entry refused by the kill switch after the submission claim; "
+                "released the lease and nothing was sent to the broker",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "halt_mode": exc.mode.value if exc.mode is not None else None,
+                        "halt_state_unreadable": exc.state_unreadable,
+                        "reason": str(exc),
+                    }
+                },
+            )
+            return
 
     renew_task = asyncio.create_task(
         _renew_submission_claim_until_cancelled(claim_token),
