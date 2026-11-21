@@ -59,14 +59,14 @@ def _ohlc_from_close(close):
     return c * 0.999, c * 1.002, c * 0.998, c
 
 
-def _mkdf(ts, o, h, l, c, vol=1000.0):
+def _mkdf(ts, o, h, lo, c, vol=1000.0):
     c = np.asarray(c, float)
     return pd.DataFrame(
         {
             "timestamp": pd.DatetimeIndex(ts),
             "open": np.asarray(o, float),
             "high": np.asarray(h, float),
-            "low": np.asarray(l, float),
+            "low": np.asarray(lo, float),
             "close": c,
             "volume": np.full(len(c), float(vol)),
         }
@@ -83,8 +83,8 @@ def _trend_frame(rows: int = 900, start: str = "2022-01-01") -> pd.DataFrame:
         price += drift + rng.normal(0, 0.15)
         closes.append(price)
     ts = pd.date_range(start, periods=rows, freq="D", tz="UTC")
-    o, h, l, c = _ohlc_from_close(closes)
-    return _mkdf(ts, o, h, l, c)
+    o, h, lo, c = _ohlc_from_close(closes)
+    return _mkdf(ts, o, h, lo, c)
 
 
 def _updipcrash_frame(rows: int = 700, start: str = "2023-01-01") -> pd.DataFrame:
@@ -99,8 +99,8 @@ def _updipcrash_frame(rows: int = 700, start: str = "2023-01-01") -> pd.DataFram
             price += 0.5
         closes.append(price)
     ts = pd.date_range(start, periods=rows, freq="D", tz="UTC")
-    o, h, l, c = _ohlc_from_close(closes)
-    return _mkdf(ts, o, h, l, c)
+    o, h, lo, c = _ohlc_from_close(closes)
+    return _mkdf(ts, o, h, lo, c)
 
 
 def _crash_recover_frame(rows: int = 260, start: str = "2023-01-01") -> pd.DataFrame:
@@ -115,8 +115,8 @@ def _crash_recover_frame(rows: int = 260, start: str = "2023-01-01") -> pd.DataF
             price += 0.05
         closes.append(price)
     ts = pd.date_range(start, periods=rows, freq="D", tz="UTC")
-    o, h, l, c = _ohlc_from_close(closes)
-    return _mkdf(ts, o, h, l, c)
+    o, h, lo, c = _ohlc_from_close(closes)
+    return _mkdf(ts, o, h, lo, c)
 
 
 def _gap_frame(rows: int = 200, start: str = "2023-01-01") -> pd.DataFrame:
@@ -135,16 +135,16 @@ def _hourly_trend_frame(rows: int = 3000, start: str = "2024-01-01") -> pd.DataF
     rng = np.random.RandomState(11)
     closes = 100 + np.cumsum(rng.normal(0.05, 0.4, rows))
     ts = pd.date_range(start, periods=rows, freq="h", tz="UTC")
-    o, h, l, c = _ohlc_from_close(closes)
-    return _mkdf(ts, o, h, l, c)
+    o, h, lo, c = _ohlc_from_close(closes)
+    return _mkdf(ts, o, h, lo, c)
 
 
 def _random_walk_frame(rows: int = 800, seed: int = 16, start: str = "2024-01-01") -> pd.DataFrame:
     rng = np.random.RandomState(seed)
     closes = 100 + np.cumsum(rng.normal(0, 1.2, rows))
     ts = pd.date_range(start, periods=rows, freq="D", tz="UTC")
-    o, h, l, c = _ohlc_from_close(closes)
-    return _mkdf(ts, o, h, l, c)
+    o, h, lo, c = _ohlc_from_close(closes)
+    return _mkdf(ts, o, h, lo, c)
 
 
 def _supertrend_frame(rows: int = 600) -> pd.DataFrame:
@@ -157,8 +157,8 @@ def _supertrend_frame(rows: int = 600) -> pd.DataFrame:
         c[i] = 212.0 - (i - 420) * 1.5
     c = c.astype(float)
     ts = pd.date_range("2024-01-01", periods=rows, freq="D", tz="UTC")
-    o, h, l, cl = _ohlc_from_close(c)
-    return _mkdf(ts, o, h, l, cl)
+    o, h, lo, cl = _ohlc_from_close(c)
+    return _mkdf(ts, o, h, lo, cl)
 
 
 def _us100_frame(days: int = 3) -> pd.DataFrame:
@@ -166,8 +166,8 @@ def _us100_frame(days: int = 3) -> pd.DataFrame:
     ts = pd.date_range("2024-03-04 05:00", periods=days * 276, freq="5min", tz="UTC")
     rng = np.random.RandomState(1)
     closes = 100 + np.cumsum(rng.normal(0.02, 0.3, len(ts)))
-    o, h, l, c = _ohlc_from_close(closes)
-    return _mkdf(ts, o, h, l, c)
+    o, h, lo, c = _ohlc_from_close(closes)
+    return _mkdf(ts, o, h, lo, c)
 
 
 def _ivb_frame() -> pd.DataFrame:
