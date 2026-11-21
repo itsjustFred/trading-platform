@@ -2217,7 +2217,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal, rebate_logged=self._rebate_logged_deal_ids),
+            commission=_deal_commission(
+                deal,
+                # ``getattr``: tests build partial adapters via ``__new__`` without
+                # ``__init__``; a missing set only means the ERROR is not deduped.
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
@@ -3560,7 +3565,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `actual_price` treats a non-answer as a price.
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal, rebate_logged=self._rebate_logged_deal_ids),
+            commission=_deal_commission(
+                deal,
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
