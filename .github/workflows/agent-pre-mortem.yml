@@ -150,6 +150,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Pinned, and the extraction below is written against this pin: `opencode run --standalone
+  # --archived` is expected to print the assistant messages, the report to start at a column-0
+  # `**Summary:**` line and to end with the verdict on its last non-empty line. A release that
+  # prefixes the streamed lines, prints reasoning or reorders the messages breaks all three, and
+  # every PR's stage then fails closed with "does not end with a valid verdict line" until a
+  # human reads a log. So a bump means reading the extraction below against the new version's
+  # output before it lands, not after.
   OPENCODE_VERSION: "2.2.7"
   MODEL: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}

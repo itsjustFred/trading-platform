@@ -48,7 +48,17 @@ What is pinned here:
   already current;
 - the base-commit guard of the skill selection is asserted on its non-comment line, and a copy
   with that line commented out fails the assertion - the substring check it replaced passed with
-  the guard disabled in this workflow at once;
+  the guard disabled in this workflow at once - and the selection itself is *executed* against a
+  real repository with a real base commit, for every branch it documents and both failures it
+  must refuse: the base path lookup is a plain assignment, so `errexit` applies to it, and only an
+  empty listing takes the PR's own copy. A string assertion cannot tell a lookup that stops the job
+  from one that quietly falls through, which is the defect that round found;
+- the extraction is diagnosable: a comment that lost its opening sections (the anchor is a
+  heuristic, shared with the siblings) has a logged byte count and the raw stream beside it as an
+  artifact, so a truncated report is a run someone can reconstruct and read; and the head is read
+  again *immediately before* the comment write, with the work that builds the write behind that
+  read - the window is the write itself, which no API can close; and the documented rerun for the
+  current head is the bare `pr_number` form the refusal names, not the `head_sha` one it refuses;
 - whose rules ran is printed by the pre-mortem, so a verdict produced by the PR's own skill copy
   (the fallback while the base branch has none) is never indistinguishable from the base's - the
   siblings are pinned by the PR that owns their hunks, which this PR no longer touches;
