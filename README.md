@@ -7,13 +7,14 @@ Universal backtesting framework — run strategies across multiple engines (vect
 ```bash
 # Clone and setup
 git clone <repo-url> && cd trading-platform
-python -m venv .venv
 
-# Activate virtual environment
+# Install dependencies (the locked environment; CI runs uv sync --frozen --all-extras)
+uv sync --all-extras
+
+# Alternative without uv: a virtualenv plus a pip install
+python -m venv .venv
 source .venv/bin/activate        # Linux/macOS / Git Bash
 # .venv\Scripts\activate         # Windows (PowerShell / cmd)
-
-# Install dependencies
 pip install -e ".[all]"
 # or: pip install -r requirements.txt
 
@@ -90,17 +91,15 @@ python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.j
 # Build data catalog
 python -m data_tools.catalog_builder -o "$DATA_DIR/catalog.json"
 
-# Migrate CSV data to Parquet
-python -m data_tools.migrate_csv --execute
-
 # Grid testing for strategy optimization
-python -m runner.backtest_grid --strategy strategies/example_sma.py --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
+python -m runner.backtest_grid --strategy strategies/example_sma/example_sma.py --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
 
-# Portfolio optimization
-python -m runner.portfolio_optimizer --backtest-ids bt_001,bt_002,bt_003
+# Portfolio optimization (one ID per argument, not comma-separated)
+python -m runner.portfolio_optimizer --backtest-ids bt_001 bt_002 bt_003
 
-# Walk-forward validation
-python -m runner.cli walkforward --strategy example_sma --train-months 12 --test-months 3
+# Walk-forward validation (--symbols, --start and --end are required)
+python -m runner.cli walkforward --strategy strategies/example_sma/example_sma.py \
+  --symbols AAPL --start 2024-01-01 --end 2025-12-31 --train-months 12 --test-months 3
 ```
 
 ## Advanced Workflows
