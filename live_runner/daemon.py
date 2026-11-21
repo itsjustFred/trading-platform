@@ -5342,10 +5342,11 @@ async def run_daemon(
     build - the 2026-11-21 incident, where a ``--help`` invocation started a second daemon that
     migrated the live database under the old one. The operating system owns the lock and releases
     it when this process exits, including on SIGKILL, so a killed daemon never blocks a restart. On
-    a clean exit the daemon drains its executor threads first, so it never releases the lock while
-    its own database work is still in flight either. That drain shuts the loop's default executor
-    down - as :func:`asyncio.run` does at exit anyway - so an embedder must give each daemon run
-    its own event loop.
+    a clean exit the daemon joins its worker threads first, so it never releases the lock while its
+    own database work is still in flight either; if that join is itself interrupted, the process
+    keeps the lock and the OS releases it on death. Joining shuts the loop's default executor down
+    - as :func:`asyncio.run` does at exit anyway - so an embedder must give each daemon run its
+    own event loop.
     """
     lock = SingleInstanceLock(daemon_lock_path())
     try:
@@ -5359,26 +5360,30 @@ async def run_daemon(
     try:
         await _run_daemon_locked(accounts_env=accounts_env)
     finally:
+        joined = True
         try:
-            with contextlib.suppress(Exception):
-                # Join the daemon's worker threads before the lock goes: an `asyncio.to_thread`
-                # body that is still writing (the startup discovery, a loop iteration's database
-                # work) outlives its cancelled await, and a daemon that released the lock while
-                # its own thread was still writing would hand the next daemon exactly the overlap
-                # this lock exists to prevent.
-                #
-                # The join is synchronous and unbounded on purpose: an await could be interrupted
-                # by the next cancellation and abandoned, and a stop whose in-flight database work
-                # cannot finish must not hand the lock on (the OS still releases the lock if the
-                # process has to be killed to end it). Blocking the loop thread here cannot
-                # deadlock - none of the daemon's worker functions calls back into the loop.
-                executor = getattr(asyncio.get_running_loop(), "_default_executor", None)
-                if executor is not None:
-                    executor.shutdown(wait=True)
+            # Join the daemon's worker threads before the lock goes: an `asyncio.to_thread` body
+            # that is still writing (the startup discovery, a loop iteration's database work)
+            # outlives its cancelled await, and a daemon that released the lock while its own
+            # thread was still writing would hand the next daemon exactly the overlap this lock
+            # exists to prevent.
+            #
+            # The join is synchronous and unbounded on purpose: an await could be interrupted by
+            # the next cancellation and abandoned, and a stop whose in-flight database work cannot
+            # finish must not hand the lock on. Blocking the loop thread here cannot deadlock -
+            # none of the daemon's worker functions calls back into the loop.
+            executor = getattr(asyncio.get_running_loop(), "_default_executor", None)
+            if executor is not None:
+                executor.shutdown(wait=True)
+        except BaseException:
+            # Interrupted mid-join (a signal, a KeyboardInterrupt) with workers still writing.
+            # Releasing now would hand the next daemon the overlap this lock exists to prevent,
+            # so the process keeps the lock and the OS releases it when the process dies.
+            joined = False
+            raise
         finally:
-            # Released even when the join is interrupted: the contract is that the lock never
-            # outlives the daemon.
-            lock.release()
+            if joined:
+                lock.release()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

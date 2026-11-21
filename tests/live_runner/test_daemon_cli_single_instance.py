@@ -17,6 +17,7 @@ The tests pin the contract that prevents a repeat:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import subprocess
 import sys
@@ -163,6 +164,60 @@ class TestSingleInstanceGuard:
             asyncio.run(daemon.run_daemon())
 
         SingleInstanceLock(daemon.daemon_lock_path()).acquire().release()
+
+    @pytest.mark.timeout(60)
+    def test_the_lock_is_kept_when_the_worker_join_is_interrupted(
+        self, monkeypatch: Any, tmp_data_dir: Path
+    ) -> None:
+        """An interrupted join must not release the lock with workers still writing.
+
+        The process is on its way out in that state and the OS releases the lock with it; handing
+        the lock on would give the next daemon exactly the overlap this guard exists to prevent.
+        """
+        from live_runner import daemon
+
+        class _JoinInterrupted(BaseException):
+            """Stands in for the signal that interrupts the join (a KeyboardInterrupt).
+
+            A plain BaseException rather than KeyboardInterrupt itself: asyncio re-raises a
+            KeyboardInterrupt out of ``run_forever`` instead of delivering it through the future,
+            which would end the test session rather than this test. The production cleanup branches
+            on ``BaseException`` either way.
+            """
+
+        class _InterruptedJoin:
+            """Runs the submitted work inline, then interrupts the join - a signal landing mid-join."""
+
+            def submit(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+                future = concurrent.futures.Future()
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:  # noqa: BLE001 - relayed through the future
+                    future.set_exception(exc)
+                return future
+
+            def shutdown(self, *, wait: bool) -> None:
+                raise _JoinInterrupted("interrupted mid-join")
+
+        def _stop_at_discovery(**_kwargs: Any) -> list[Any]:
+            raise RuntimeError("discovery reached")
+
+        monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _stop_at_discovery)
+        loop = asyncio.new_event_loop()
+        monkeypatch.setattr(loop, "_default_executor", _InterruptedJoin(), raising=False)
+        try:
+            task = loop.create_task(daemon.run_daemon())
+            with pytest.raises(_JoinInterrupted):
+                loop.run_until_complete(task)
+        finally:
+            # Detach the fake before closing: loop.close() shuts the executor down again.
+            loop._default_executor = None
+            loop.close()
+
+        # The lock was not released in-process: the process must die holding it.
+        contender = SingleInstanceLock(daemon.daemon_lock_path())
+        with pytest.raises(SingleInstanceError):
+            contender.acquire()
 
     @pytest.mark.timeout(60)
     def test_the_lock_outlives_in_flight_startup_database_work(
@@ -378,6 +433,31 @@ class TestRealEntryPoint:
         assert not (data_dir / "backtests.db").exists(), "--help created the live database file"
         assert not (data_dir / "backtests.db.lock").exists(), "--help took the single-instance lock"
         assert not (data_dir / "logs").exists(), "the heavy daemon module was imported for --help"
+
+    def test_importing_the_daemon_does_not_initialize_the_database(self, tmp_path: Path) -> None:
+        """A fresh interpreter imports the daemon and initializes nothing.
+
+        The guard acquires inside ``run_daemon``, so anything that opened or migrated the database
+        at import time would put a refused daemon ahead of the guard. The engine in
+        ``shared.database`` is created lazily, and this pins that rather than assuming it: the
+        refusal test proves the same thing through the real entry point, and this proves it for
+        every other way the module gets imported (a debugger, a script, an agent).
+        """
+        data_dir = tmp_path / "data"
+        result = subprocess.run(
+            [sys.executable, "-c", "import live_runner.daemon"],
+            cwd=REPO_ROOT,
+            env=_daemon_child_env(data_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, result.stderr
+        written = sorted(p.name for p in data_dir.iterdir())
+        assert written == ["logs"], (
+            f"importing the daemon wrote more than its log directory: {written}"
+        )
 
     def test_an_unknown_argument_exits_two(self, tmp_path: Path) -> None:
         data_dir = tmp_path / "data"
