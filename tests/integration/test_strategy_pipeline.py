@@ -10,10 +10,25 @@ import pytest
 
 from tests.validators.backtest_validator import BacktestExpectation, BacktestResultValidator
 
-API_BASE_URL = os.getenv("BASE_URL", "http://localhost:5556")
+# The viewer this suite drives. Deliberately without a default: a hardcoded localhost port made a
+# bare ``pytest`` (no ``-m "not slow"``, so this module is collected and skipped in one step) POST
+# real backtest runs to whatever viewer happened to be listening. Naming no port means the suite
+# does nothing unless someone points it at a viewer on purpose.
+INTEGRATION_BASE_URL_ENV_VAR = "TP_INTEGRATION_BASE_URL"
 POLL_INTERVAL_SECONDS = 2.0
 POLL_TIMEOUT_SECONDS = 120.0
 MIN_STRATEGIES = 5
+
+
+def _integration_base_url() -> str:
+    base_url = os.getenv(INTEGRATION_BASE_URL_ENV_VAR, "").strip().rstrip("/")
+    if not base_url:
+        raise pytest.skip.Exception(
+            f"{INTEGRATION_BASE_URL_ENV_VAR} is not set, so no viewer is being pointed at;"
+            f" set it to the viewer's base URL to run the integration suite",
+            allow_module_level=True,
+        )
+    return base_url
 
 
 @dataclass(slots=True)
@@ -22,9 +37,9 @@ class DiscoveryResult:
     error: str | None = None
 
 
-def _discover_strategy_matrix() -> DiscoveryResult:
+def _discover_strategy_matrix(base_url: str) -> DiscoveryResult:
     try:
-        with httpx.Client(base_url=API_BASE_URL, timeout=20.0) as client:
+        with httpx.Client(base_url=base_url, timeout=20.0) as client:
             response = client.get("/api/strategies")
         response.raise_for_status()
     except Exception as exc:  # pragma: no cover - network/setup issue
@@ -101,16 +116,23 @@ def _poll_task_completion(client: httpx.Client, task_id: str) -> dict[str, Any]:
     )
 
 
-_DISCOVERY = _discover_strategy_matrix()
-STRATEGY_TEST_MATRIX = _DISCOVERY.matrix
+# Discovery happens here rather than at import, and only when the opt-in is set: collecting this
+# module happens even when it is deselected, and import-time discovery was what let a bare
+# ``pytest`` talk to a viewer nobody pointed at.
+API_BASE_URL = _integration_base_url()
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
-if _DISCOVERY.error:
-    pytest.skip(_DISCOVERY.error, allow_module_level=True)
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if "case" not in metafunc.fixturenames:
+        return
+    discovery = _discover_strategy_matrix(API_BASE_URL)
+    if discovery.error:
+        pytest.skip(discovery.error, allow_module_level=True)
+    metafunc.parametrize("case", discovery.matrix, ids=lambda case: case["name"])
 
 
-@pytest.mark.parametrize("case", STRATEGY_TEST_MATRIX, ids=lambda c: c["name"])
 def test_strategy_pipeline(case: dict[str, Any]) -> None:
     with httpx.Client(base_url=API_BASE_URL, timeout=30.0) as client:
         run_response = client.post(

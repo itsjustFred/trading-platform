@@ -120,7 +120,7 @@ def test_sessionfinish_fails_the_run_when_a_watched_repo_dir_changed(
     suite_conftest.pytest_sessionfinish(session)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
     err = capsys.readouterr().err
-    assert "logs/live-runner.log" in err and "created:" in err
+    assert str(fake_logs) in err and "created: live-runner.log" in err
     # The guard cannot attribute the change to the suite, so the message must not claim it did.
     assert "the test session modified" not in err
     assert "cannot tell which" in err
@@ -252,13 +252,15 @@ def test_a_caller_named_accounts_env_is_used_verbatim(tmp_path: Path) -> None:
 def test_the_sandbox_accounts_env_carries_no_credentials() -> None:
     """The outcome the isolation exists for: no test can pass because of a real account.
 
-    Discovery goes through the production reader, so this also proves the patched path is the one
-    the reader is really given - a redirect that only changed the constant would show up here.
+    The file view is asserted, not the overlaid one: ``load_accounts_env_values`` also fills keys
+    the file does not define from the process environment, which is not the checkout's.
     """
-    from live_runner.credential_env import load_accounts_env_values
+    from live_runner.credential_env import load_accounts_env_values, read_accounts_env_file
     from live_runner.service_discovery import discover_discord_bots_from_env
 
-    assert load_accounts_env_values(ISOLATED_ACCOUNTS_ENV) == {}
+    assert read_accounts_env_file(ISOLATED_ACCOUNTS_ENV) == {}
+    assert load_accounts_env_values(ISOLATED_ACCOUNTS_ENV, environ={}) == {}
+    # Discovery reads the patched constant, so it sees no bot the checkout could have configured.
     assert discover_discord_bots_from_env() == []
 
 
@@ -506,9 +508,9 @@ def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
             "-m",
             "pytest",
             "-q",
+            "-rs",
             "-p",
             "no:cacheprovider",
-            "--collect-only",
             "tests/integration/test_strategy_pipeline.py",
         ],
         cwd=str(Path(__file__).resolve().parents[1]),
@@ -519,8 +521,8 @@ def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
         check=False,
     )
     combined = result.stdout + result.stderr
-    assert "TP_INTEGRATION_BASE_URL" in combined, combined
-    assert "skipped" in combined.lower(), combined
+    assert "TP_INTEGRATION_BASE_URL is not set" in combined, combined
+    assert "1 skipped" in combined, combined
 
 
 # --- end-to-end: the real pytest process must exit non-zero ----------------------------------- #
@@ -623,7 +625,8 @@ def test_real_pytest_process_exits_nonzero_when_a_test_writes_the_repo_logs_dir(
 
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
     assert "ERROR: the repo directories" in result.stderr
-    assert "logs/live-runner.log" in result.stderr
+    assert "created: live-runner.log" in result.stderr
+    assert "logs" in result.stderr
 
 
 @pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
