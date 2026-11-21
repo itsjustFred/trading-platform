@@ -126,10 +126,14 @@ def _repo_secret_path(raw_path: object) -> Path | None:
     """The checkout's real secret file ``raw_path`` names, or ``None``.
 
     The path is resolved before the name is compared, so a symlink to a secret file is caught by its
-    target and not by the name someone gave the link. Nothing is cached: a cache keyed on the path
+    target and not by the name someone gave the link. ``open`` is the hottest audit event in the
+    process, so the resolve - a ``realpath`` that stats every component - runs only when it can
+    change the answer: the resolved name differs from the given one only when the final component
+    is a symlink, and a match is only possible when that name (given or resolved) is a secret file
+    name. A plain file named anything else cannot resolve to a secret, so it returns ``None``
+    after one ``lstat`` instead of a full resolution. Nothing is cached: a cache keyed on the path
     alone would hand back the previous answer for a path that is a symlink now, and the cwd a
-    relative path resolves against can change inside a session. ``open`` is the hottest audit event
-    in the process, and this resolution is what the guard costs per call.
+    relative path resolves against can change inside a session.
     """
     if isinstance(raw_path, int) or raw_path is None:
         return None
@@ -138,6 +142,8 @@ def _repo_secret_path(raw_path: object) -> Path | None:
             raw_path = os.fsdecode(raw_path)
         candidate = Path(os.fspath(raw_path))
     except (TypeError, ValueError):
+        return None
+    if candidate.name not in _SECRET_FILE_NAMES and not os.path.islink(candidate):
         return None
     try:
         resolved = candidate.resolve()
