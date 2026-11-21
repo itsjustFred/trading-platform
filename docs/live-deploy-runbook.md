@@ -445,9 +445,17 @@ to start the daemon instead (#310).
 exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lock`, or the
 `DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
 exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
-was killed (even `kill -9`) releases it on death and never blocks the next start. On a clean stop
-the daemon first waits for its in-flight database work, so the lock is never handed on while its own
-writes are still running. A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
+was killed (even `kill -9`) releases it on death and never blocks the next start. The data
+directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` on a
+network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
+disconnects its broker adapters and then waits - bounded, `WORKER_JOIN_TIMEOUT_SECONDS` = 30s - for
+its in-flight database work, so the lock is never handed on while its own writes are still
+running; if a worker thread is still stuck after the budget the daemon logs CRITICAL and exits 4
+with the lock held until the process dies. `systemctl stop` sends SIGTERM, which this build does
+not handle: the daemon dies immediately with no drain (graceful SIGTERM shutdown is a separate
+change). Deploy this build as stop, deploy, start - the first rollout is **not** protected against
+a daemon already running an older, lockless build: stop the old daemon before starting this one.
+A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
 therefore retries a refused start every `RestartSec` and logs the refusal each time: that is the
 signal to find and stop the other daemon, not to delete the lock file - the file is a handle, the
 lock is the kernel's.
