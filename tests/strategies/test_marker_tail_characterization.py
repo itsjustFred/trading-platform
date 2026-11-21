@@ -12,7 +12,8 @@ payload — on deterministic synthetic frames, so the extraction cannot
 silently change a single strategy's output. The expected values in
 ``tests/fixtures/strategy_marker_tail/expected_outputs.json`` and
 ``tests/fixtures/strategy_marker_tail/indicators/`` were captured from the
-pre-refactor implementations; they must keep matching after the helper
+pre-refactor implementations (gzipped ``.json.gz`` — ~2.8 MB of float
+series compressed to ~0.5 MB); they must keep matching after the helper
 lands. Indicator floats are compared element-wise with an explicit
 relative tolerance (``_compare_canonical``): cross-arch SIMD/ULP drift —
 amplified by cancellation on near-zero values — made a bit-exact hash
@@ -24,6 +25,7 @@ gets its VIX series monkeypatched (it is fail-closed without one).
 
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
 import math
@@ -316,9 +318,7 @@ def _canon_float(x):
     tolerance (``_compare_canonical``) instead of a bit-exact hash.
     """
     if isinstance(x, float):
-        if np.isnan(x):
-            return None
-        return x
+        return None if np.isnan(x) else x
     return x
 
 
@@ -351,6 +351,8 @@ def _canonical_payload(indicators: dict):
 # still failing on any change a strategy refactor could meaningfully make
 # (entries/exits/drawings remain bit-exact regardless).
 _INDICATORS_REL_TOL = 1e-7
+# abs_tol also swallows changes between values below ~1e-9 in magnitude
+# (e.g. 1e-10 vs 5e-10); harmless for price-scale indicators.
 _INDICATORS_ABS_TOL = 1e-9
 
 
@@ -379,6 +381,16 @@ def _compare_canonical(expected, actual, path: str = "$") -> list[str]:
             if len(mismatches) >= 10:
                 return mismatches
         return mismatches
+    # Type-strict before the float branch: the json hash this replaced told
+    # bool/int/float apart (True != 1 != 1.0 in JSON), and Python's == does
+    # not — a bool->int or int->float change in a strategy would otherwise
+    # pass silently.
+    if type(expected) is not type(actual):
+        mismatches.append(
+            f"{path}: type {type(expected).__name__} != {type(actual).__name__} "
+            f"({expected!r} vs {actual!r})"
+        )
+        return mismatches
     if (
         isinstance(expected, float)
         and isinstance(actual, float)
@@ -400,12 +412,21 @@ def expected() -> dict:
     return json.loads(FIXTURE_PATH.read_text())
 
 
+def _read_gz_json(path: Path):
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 @pytest.fixture(scope="module")
 def expected_indicators() -> dict:
-    """Per-strategy canonical ``indicators_dict`` payloads (pre-refactor)."""
+    """Per-strategy canonical ``indicators_dict`` payloads (pre-refactor).
+
+    Stored gzipped: the raw JSON was ~2.8 MB of float series for a
+    one-off refactor characterisation.
+    """
     return {
-        path.stem: json.loads(path.read_text())
-        for path in sorted(INDICATORS_FIXTURE_DIR.glob("*.json"))
+        path.name[: -len(".json.gz")]: _read_gz_json(path)
+        for path in sorted(INDICATORS_FIXTURE_DIR.glob("*.json.gz"))
     }
 
 
@@ -488,7 +509,9 @@ _MIXED_TS_EXPECTED = {
 }
 
 
-_MIXED_TS_INDICATORS_FIXTURE = INDICATORS_FIXTURE_DIR / "trend_following_mixed_ts.json"
+_MIXED_TS_INDICATORS_FIXTURE = (
+    INDICATORS_FIXTURE_DIR / "trend_following_mixed_ts.json.gz"
+)
 
 
 def test_mixed_format_string_timestamps_match_pre_refactor():
@@ -509,10 +532,49 @@ def test_mixed_format_string_timestamps_match_pre_refactor():
     assert [int(i) for i in entries[entries].index.tolist()] == exp["entries"]
     assert [int(i) for i in exits[exits].index.tolist()] == exp["exits"]
     assert json.dumps(drawings) == json.dumps(exp["drawings"])
-    expected_indicators = json.loads(_MIXED_TS_INDICATORS_FIXTURE.read_text())
+    expected_indicators = _read_gz_json(_MIXED_TS_INDICATORS_FIXTURE)
     mismatches = _compare_canonical(
         expected_indicators, _canonical_payload(indicators)
     )
     assert not mismatches, "mixed-ts indicators_dict changed\n" + "\n".join(
         mismatches[:10]
     )
+
+
+# ---------------------------------------------------------------------------
+# _compare_canonical unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compare_canonical_is_type_strict():
+    """bool/int/float/None must not compare equal across types.
+
+    The json hash this replaced distinguished ``true``, ``1`` and ``1.0``;
+    Python's ``==`` does not, so the comparator checks types first.
+    """
+    assert _compare_canonical([True], [1])
+    assert _compare_canonical([1], [True])
+    assert _compare_canonical([1.0], [1])
+    assert _compare_canonical([1], [1.0])
+    assert _compare_canonical([True], [1.0])
+    assert _compare_canonical({"a": None}, {"a": 0.0})
+    assert _compare_canonical({"a": None}, {"a": False})
+    # Same-type equal values still pass.
+    assert _compare_canonical([True], [True]) == []
+    assert _compare_canonical([1], [1]) == []
+    assert _compare_canonical([None], [None]) == []
+    assert _compare_canonical(["x"], ["x"]) == []
+
+
+def test_compare_canonical_float_tolerance_edges():
+    """Within rel_tol passes, beyond it fails."""
+    assert _compare_canonical([1.0], [1.0 + _INDICATORS_REL_TOL / 2]) == []
+    mismatches = _compare_canonical([1.0], [1.0 + _INDICATORS_REL_TOL * 10])
+    assert mismatches and "!=" in mismatches[0]
+    # abs_tol covers tiny magnitudes where rel_tol is meaningless.
+    assert _compare_canonical([1e-10], [1e-10 + _INDICATORS_ABS_TOL / 2]) == []
+
+
+def test_compare_canonical_dict_key_set_mismatch():
+    mismatches = _compare_canonical({"a": 1, "b": 2}, {"a": 1, "c": 2})
+    assert mismatches and "key sets differ" in mismatches[0]
