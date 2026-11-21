@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import os
 import subprocess
 import sys
@@ -311,6 +312,231 @@ class TestSingleInstanceGuard:
             after.wait(timeout=10)
 
 
+class _LoopsStopped(Exception):
+    """Stands in for the daemon's loops ending: a crash, or a stop from outside."""
+
+
+class _StreamAdapterStub:
+    """A broker adapter whose listener thread never ends by itself.
+
+    Alpaca's shape (``alpaca_adapter.py:2801``): ``listen_executions`` runs
+    ``TradingStream.run`` through ``asyncio.to_thread``, so the stream occupies one executor thread
+    for its whole life. Cancelling the listener task does not stop that thread - only a stream close
+    does, which is what ``disconnect()`` performs.
+
+    ``releases`` decides whether this stream closes when it is told to: a healthy one (``True``)
+    proves the join finishes because the daemon disconnected it, and a stuck one (``False``) proves
+    what the join does when it cannot finish.
+    """
+
+    def __init__(self, *, releases: bool) -> None:
+        self._releases = releases
+        self.disconnect_calls: list[str] = []
+        self._released = threading.Event()
+
+    async def listen_executions(self) -> None:
+        await asyncio.to_thread(self._stream_thread_body)
+
+    def _stream_thread_body(self) -> None:
+        # Bounded so that a test which never releases the stream still leaves a thread that
+        # terminates: an unbounded wait here would hold the interpreter's exit path open for good.
+        assert self._released.wait(120), "the stream thread was never released"
+
+    def disconnect(self) -> None:
+        self.disconnect_calls.append("daemon_shutdown")
+        if self._releases:
+            self._released.set()
+
+    def release(self) -> None:
+        """Test-side teardown: let the stuck thread finish so nothing is left running."""
+        self._released.set()
+
+
+class _FakeScheduler:
+    """Scheduler stand-in: ``start()`` lists services from the database, which this path must
+    not."""
+
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+
+def _no_thread_call(*_args: Any, **_kwargs: Any) -> list[Any]:
+    return []
+
+
+async def _idle_loop(*_args: Any, **_kwargs: Any) -> None:
+    return None
+
+
+def _stub_the_daemons_loops(monkeypatch: Any, adapter: _StreamAdapterStub) -> None:
+    """Replace everything in ``_run_daemon_locked`` that would touch the database or the network.
+
+    The one loop left real is the deployment sync: it registers ``adapter`` and starts its listener
+    task, exactly as the running daemon does, then stops (raises) so the shutdown path under test
+    runs. Everything else is idle, so the ``gather`` ends on the first task - the one that matters.
+    """
+    from live_runner import daemon
+
+    async def _sync_loop(
+        active_adapters: dict[str, Any],
+        active_listener_tasks: dict[str, Any],
+        active_discord_tasks: dict[str, Any],
+        **_kwargs: Any,
+    ) -> None:
+        active_adapters["account-1"] = adapter
+        active_listener_tasks["account-1"] = asyncio.create_task(
+            adapter.listen_executions(), name="listener-account-1"
+        )
+        # Let the listener reach its to_thread before this loop stops: the shutdown path has to
+        # find a thread that is already blocked inside the stream.
+        await asyncio.sleep(0)
+        raise _LoopsStopped("the daemon's loops stopped")
+
+    monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _no_thread_call)
+    monkeypatch.setattr(daemon, "_recover_failed_services", _no_thread_call)
+    monkeypatch.setattr(daemon, "ServiceScheduler", _FakeScheduler)
+    monkeypatch.setattr(daemon, "sync_deployments_loop", _sync_loop)
+    monkeypatch.setattr(daemon, "sync_services_loop", _idle_loop)
+    monkeypatch.setattr(daemon, "_poll_balances", _idle_loop)
+    monkeypatch.setattr(daemon, "run_trailing_stops_loop", _idle_loop)
+    monkeypatch.setattr(daemon, "_backfill_commissions_loop", _idle_loop)
+
+
+class TestShutdownJoin:
+    """What the daemon does after its loops stop: the streams it leaves, and the join it waits."""
+
+    @pytest.mark.timeout(60)
+    def test_a_stopping_daemon_disconnects_its_adapters_and_joins_its_workers(
+        self, monkeypatch: Any, tmp_data_dir: Path
+    ) -> None:
+        """A cancelled listener never stops its own worker thread; only a disconnect does.
+
+        Without the disconnect the join waits forever for a thread inside the broker stream, and
+        the process stops trading while holding the single-instance lock - the state a
+        ``Restart=always`` unit cannot recover from, because the process never dies.
+        """
+        from live_runner import daemon
+
+        adapter = _StreamAdapterStub(releases=True)
+        _stub_the_daemons_loops(monkeypatch, adapter)
+
+        with pytest.raises(_LoopsStopped):
+            asyncio.run(daemon.run_daemon())
+
+        assert adapter.disconnect_calls == ["daemon_shutdown"], (
+            "the daemon left its broker stream open, so its worker thread could not finish"
+        )
+        # The join finished because the thread did: the lock is handed on, and a second daemon can
+        # take it in this very process.
+        SingleInstanceLock(daemon.daemon_lock_path()).acquire().release()
+
+    @pytest.mark.timeout(60)
+    def test_a_worker_thread_that_never_returns_costs_the_daemon_its_join_budget(
+        self, monkeypatch: Any, tmp_data_dir: Path
+    ) -> None:
+        """A stream that ignores its close must not wait for the join forever.
+
+        The budget expires, the CRITICAL line leaves the process, the lock stays held by the dying
+        process and the loop stops carrying the executor - so ``asyncio.run``'s own close (and the
+        interpreter's teardown) cannot spend 300s and then join the same thread forever.
+        """
+        from live_runner import daemon
+
+        adapter = _StreamAdapterStub(releases=False)
+        monkeypatch.setattr(daemon, "WORKER_JOIN_TIMEOUT_SECONDS", 0.5)
+        _stub_the_daemons_loops(monkeypatch, adapter)
+        # The console handler's stream is bound when the logger is first created, which depends on
+        # which test imported the daemon first - capture the records on the logger itself instead
+        # of asserting on a particular fd.
+        records: list[logging.LogRecord] = []
+
+        class _RecordCapture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        capture = _RecordCapture()
+        daemon.logger.addHandler(capture)
+        loop = asyncio.new_event_loop()
+        task = loop.create_task(daemon.run_daemon())
+        try:
+            with pytest.raises(daemon.WorkerJoinTimeout) as excinfo:
+                loop.run_until_complete(task)
+        finally:
+            daemon.logger.removeHandler(capture)
+            loop.close()
+            adapter.release()
+
+        assert "still running" in str(excinfo.value)
+        # The executor is detached: `asyncio.run`'s close returns at once instead of waiting for
+        # the threads this join already gave up on, and the exit path becomes the caller's job.
+        assert loop._default_executor is None
+        critical = [r for r in records if r.levelno >= logging.CRITICAL]
+        assert any("giving up on its worker threads" in r.getMessage() for r in critical), (
+            "an operator saw nothing about the join that never finished"
+        )
+        # The lock is kept, and anchored to the process rather than to the dying frame.
+        contender = SingleInstanceLock(daemon.daemon_lock_path())
+        with pytest.raises(SingleInstanceError):
+            contender.acquire()
+        anchored = [item.lock_path for item in process_lifetime_locks()]
+        assert daemon.daemon_lock_path() in anchored, (
+            "the expired-join lock is held only by the dying frame, task and traceback; "
+            f"garbage collection would release it. anchored={anchored}"
+        )
+
+
+class _LeftTheProcess(BaseException):
+    """Stands in for the process leaving through ``os._exit``."""
+
+
+class TestExitCodes:
+    """The refusal codes the daemon and a ``systemctl`` unit key on."""
+
+    def test_a_worker_join_timeout_leaves_the_process_at_once(
+        self, monkeypatch: Any, capsys: Any, tmp_path: Path
+    ) -> None:
+        """Exit code 4 has to arrive, and the process has to leave to arrive at all.
+
+        Returning normally would leave the interpreter's teardown joining the abandoned worker
+        threads with no deadline, which is the hang this exit code exists to end.
+        """
+        from live_runner import daemon
+
+        async def _join_that_never_finishes(**_kwargs: Any) -> None:
+            raise daemon.WorkerJoinTimeout(
+                "the daemon's worker threads are still running after 30s"
+            )
+
+        monkeypatch.setattr(daemon, "run_daemon", _join_that_never_finishes)
+        exits: list[int] = []
+
+        def _leave_without_returning(code: int) -> None:
+            """Stands in for ``os._exit``: the mark of the real one is that it never returns."""
+            exits.append(int(code))
+            raise _LeftTheProcess(code)
+
+        monkeypatch.setattr(os, "_exit", _leave_without_returning)
+
+        with pytest.raises(_LeftTheProcess):
+            daemon_cli.main([])
+
+        assert exits == [daemon_cli.EXIT_WORKER_JOIN_TIMEOUT], (
+            "the process did not leave immediately after reporting the expired join"
+        )
+        assert "still running" in capsys.readouterr().err
+
+    def test_the_exit_codes_stay_distinct(self) -> None:
+        """An operator tells "start over" (3) from "its outcome is unknown" (4)."""
+        assert daemon_cli.EXIT_ALREADY_RUNNING == 3
+        assert daemon_cli.EXIT_WORKER_JOIN_TIMEOUT == 4
+
+
 class TestLockPath:
     def test_the_lock_sits_next_to_the_live_database(self, tmp_data_dir: Path) -> None:
         from live_runner import daemon
@@ -391,6 +617,49 @@ class TestLockPath:
 
         assert daemon.daemon_lock_path() == db_file.with_name("live.db.lock")
 
+    def test_the_lock_normalizes_the_localhost_authority_of_a_file_uri(
+        self, monkeypatch: Any, tmp_path: Path
+    ) -> None:
+        """``file://localhost/abs/db.db`` is ``/abs/db.db``: SQLite accepts only an empty or
+        ``localhost`` authority, and keeping ``//localhost`` in the path would lock a directory
+        the database is not in - a second daemon could then take a second lock."""
+        from live_runner import daemon
+
+        db_file = tmp_path / "live.db"
+        monkeypatch.setenv(
+            "DATABASE_URL", f"sqlite:///file://localhost{db_file.as_posix()}?uri=true"
+        )
+
+        assert daemon.daemon_lock_path() == db_file.with_name("live.db.lock")
+
+    def test_the_lock_keeps_the_file_prefix_without_uri_mode(
+        self, monkeypatch: Any
+    ) -> None:
+        """``sqlite:///file:live.db`` without ``uri=true`` opens a literal ``file:live.db``.
+
+        The ``file:`` prefix is URI syntax only in URI mode; stripping it anyway would put the
+        lock beside ``live.db`` while the engine opens ``file:live.db`` - two spellings of what
+        the driver sees as two different files."""
+        from live_runner import daemon
+
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///file:live.db")
+
+        expected = Path("file:live.db").resolve().with_name("file:live.db.lock")
+        assert daemon.daemon_lock_path() == expected
+
+    def test_the_lock_falls_back_to_the_data_dir_for_a_named_memory_uri(
+        self, monkeypatch: Any, tmp_data_dir: Path
+    ) -> None:
+        """``file:memdb1?mode=memory&cache=shared&uri=true`` is an in-memory database: it has no
+        file to sit beside, so the lock falls back to ``DATA_DIR`` like ``:memory:`` does."""
+        from live_runner import daemon
+
+        monkeypatch.setenv(
+            "DATABASE_URL", "sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"
+        )
+
+        assert daemon.daemon_lock_path() == tmp_data_dir / "backtests.db.lock"
+
     def test_the_lock_falls_back_to_the_data_dir_for_an_in_memory_url(
         self, monkeypatch: Any, tmp_data_dir: Path
     ) -> None:
@@ -423,6 +692,39 @@ def _daemon_child_env(data_dir: Path) -> dict[str, str]:
 def _run_daemon_process(args: list[str], data_dir: Path, timeout: float = 120.0) -> Any:
     return subprocess.run(
         [sys.executable, "-m", "live_runner.daemon", *args],
+        cwd=REPO_ROOT,
+        env=_daemon_child_env(data_dir),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+#: The refusal tests' child. It drives the real ``daemon_cli.main([])`` - real argument parsing,
+#: real ``run_daemon``, real lock acquisition - but ``_run_daemon_locked`` is replaced by a stub
+#: that exits 99 loudly. The stub is the point: these tests exist to prove the guard refuses
+#: *before the body runs*, and a regression that let the body run must fail loudly here, never
+#: start a real daemon - the child's ``DEFAULT_ACCOUNTS_ENV`` is the checkout's real
+#: ``.accounts.env``, so an unguarded body would log into the real brokers (#313 review).
+_REFUSAL_CHILD = """
+import sys
+
+from live_runner import daemon, daemon_cli
+
+
+async def _stubbed_daemon_body(**_kwargs):
+    print("the daemon body ran: the single-instance guard did not refuse", file=sys.stderr)
+    raise SystemExit(99)
+
+
+daemon._run_daemon_locked = _stubbed_daemon_body
+sys.exit(daemon_cli.main([]))
+"""
+
+
+def _run_refusal_process(data_dir: Path, timeout: float = 120.0) -> Any:
+    return subprocess.run(
+        [sys.executable, "-c", _REFUSAL_CHILD],
         cwd=REPO_ROOT,
         env=_daemon_child_env(data_dir),
         capture_output=True,
@@ -490,7 +792,7 @@ class TestRealEntryPoint:
         holder = spawn_holder(lock_path, hold_seconds=90.0)
         try:
             await_held(holder)
-            result = _run_daemon_process([], data_dir)
+            result = _run_refusal_process(data_dir)
         finally:
             holder.kill()
             holder.wait(timeout=10)
@@ -520,7 +822,10 @@ class TestRealEntryPoint:
         holder = spawn_holder(lock_path, hold_seconds=90.0)
         try:
             await_held(holder)
-            _run_daemon_process([], data_dir)
+            result = _run_refusal_process(data_dir)
+            # The literal 3 for the same reason as above: a child that crashed or reached the
+            # stubbed body (exit 99) must not pass for a refusal.
+            assert result.returncode == 3, f"stdout={result.stdout}\nstderr={result.stderr}"
             contender = SingleInstanceLock(lock_path)
             with pytest.raises(SingleInstanceError):
                 contender.acquire()

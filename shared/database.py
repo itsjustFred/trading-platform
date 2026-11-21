@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -113,6 +113,27 @@ def _is_sqlite_url(url: str) -> bool:
     return url.strip().lower().startswith("sqlite")
 
 
+#: Query values SQLAlchemy's ``asbool`` coercion reads as true for the ``uri`` parameter - the
+#: spelling that turns a ``file:`` database name into a SQLite URI filename.
+_SQLITE_URI_TRUE_VALUES = frozenset({"true", "yes", "on", "y", "t", "1"})
+
+
+def _sqlite_uri_file_path(body: str) -> str:
+    """The path inside a ``file:`` URI body, after ``uri=true`` was established.
+
+    ``file:/abs/db``, ``file:rel/db`` and ``file::memory:`` name their text after the prefix
+    directly. ``file://<authority>/<path>`` carries an authority SQLite accepts only when it is
+    empty or ``localhost`` (``file://localhost/abs/db`` is ``/abs/db``); any other authority is
+    refused by SQLite itself, so there is no file to name and the empty string is returned.
+    """
+    if not body.startswith("//"):
+        return body
+    authority, separator, path = body[2:].partition("/")
+    if authority not in ("", "localhost"):
+        return ""
+    return separator + path if separator else ""
+
+
 def sqlite_url_file(url: str) -> str:
     """The file part of a SQLite URL: query string and fragment stripped, percent-decoding undone.
 
@@ -122,18 +143,34 @@ def sqlite_url_file(url: str) -> str:
     kept ``?timeout=30`` in the path, and a ``Path`` carrying it is not a file: a working database
     was reported as "Database file not found".
 
-    Empty when the URL names no file (``sqlite://``); the caller decides what that means.
+    Empty when the URL names no file (``sqlite://``, or a ``file:`` URI in ``mode=memory``); the
+    caller decides what that means.
 
     ``sqlite:///file:/abs/db.db?uri=true`` is SQLAlchemy's URI form for the same database as
-    ``sqlite:////abs/db.db`` - the ``file:`` prefix is URI syntax the SQLite driver parses, not part
-    of the path. Keeping it would resolve the file to a nonexistent ``file:`` directory, so a
-    caller acting on the file (the daemon's lock) would sit beside a path nothing opens.
+    ``sqlite:////abs/db.db``. The ``file:`` prefix is URI syntax the SQLite driver parses - and
+    only when ``uri=true`` enables URI filenames: without it the driver opens a literal file
+    named ``file:live.db``, so the prefix is kept. In URI mode the ``localhost`` authority of
+    ``file://localhost/...`` is normalised away and ``mode=memory`` names an in-memory database,
+    which has no file at all.
     """
-    without_params = url.partition("?")[0].partition("#")[0]
-    file_part = unquote(without_params.split("///", 1)[1]) if "///" in without_params else ""
-    if file_part.startswith("file:"):
-        file_part = file_part[len("file:") :]
-    return file_part
+    head, _, query = url.partition("?")
+    head = head.partition("#")[0]
+    raw_part = head.split("///", 1)[1] if "///" in head else ""
+    params = parse_qsl(query.partition("#")[0], keep_blank_values=True)
+    uri_mode = any(
+        key == "uri" and value.strip().lower() in _SQLITE_URI_TRUE_VALUES
+        for key, value in params
+    )
+    if raw_part.startswith("file:"):
+        if not uri_mode:
+            return unquote(raw_part)
+        if any(
+            key == "mode" and value.strip().lower() == "memory" for key, value in params
+        ):
+            # ``file:memdb1?mode=memory&cache=shared&uri=true`` is a named in-memory database.
+            return ""
+        return unquote(_sqlite_uri_file_path(raw_part[len("file:") :]))
+    return unquote(raw_part)
 
 
 def live_db_path() -> Path:

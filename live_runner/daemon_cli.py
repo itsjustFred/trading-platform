@@ -13,15 +13,20 @@ dependency-free ``shared.single_instance``, and the heavy ``live_runner.daemon``
 only once the arguments say "start".
 
 Exit codes: 0 (clean exit, or ``--help``), 1 (anything the daemon itself raised), 2 (argparse usage
-error), 3 (the single-instance lock is held by another daemon).
+error), 3 (the single-instance lock is held by another daemon), 4 (the daemon's worker threads are
+still running and may still be writing, so its outcome is unknown).
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import logging
+import os
 import sys
 from collections.abc import Sequence
+from typing import NoReturn
 
 from shared.single_instance import SingleInstanceError
 
@@ -29,6 +34,11 @@ from shared.single_instance import SingleInstanceError
 #: operator - and a ``systemctl`` unit with ``Restart=always`` - can tell "another daemon is
 #: already running" from "the command was wrong".
 EXIT_ALREADY_RUNNING = 3
+
+#: The daemon stopped but its worker threads are still running. The lock stays held by the dying
+#: process (the OS releases it on death), so a unit with ``Restart=always`` picks the daemon up on
+#: the next pass instead of sitting on a process that no longer trades anything.
+EXIT_WORKER_JOIN_TIMEOUT = 4
 
 DAEMON_PROG = "python -m live_runner.daemon"
 
@@ -51,6 +61,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
 
+def _leave_now(exit_code: int) -> NoReturn:
+    """Leave the process immediately, so the daemon can report ``exit_code`` at all.
+
+    The interpreter's own teardown would join every worker thread the daemon gave up on - with no
+    deadline - which is the hang this exit path exists to avoid. Flushing the log handlers is on
+    this side of the exit because ``os._exit`` runs no ``atexit`` hook, and a CRITICAL line that
+    never left the process is no use to an operator reading a journal. The service loggers do not
+    propagate to the root logger, so every logger's handlers are flushed, not just the root's.
+    """
+    loggers = [logging.getLogger(), *logging.root.manager.loggerDict.values()]
+    for logger in loggers:
+        for handler in getattr(logger, "handlers", []):
+            with contextlib.suppress(Exception):
+                handler.flush()
+    os._exit(exit_code)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse the arguments, then start the daemon. Returns the process exit code."""
     build_parser().parse_args(argv)  # --help exits 0, an unknown argument exits 2: both here
@@ -63,4 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SingleInstanceError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING
+    except daemon.WorkerJoinTimeout as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        _leave_now(EXIT_WORKER_JOIN_TIMEOUT)
     return 0
