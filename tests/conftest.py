@@ -24,9 +24,12 @@ TEST_DATA_DIR = _SESSION_DATA_DIR
 
 os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
-# A developer's shell must never turn the test suite into an alert source: the
-# ops alert sink reads OPS_ALERT_WEBHOOK_URL from the environment.
-os.environ.pop("OPS_ALERT_WEBHOOK_URL", None)
+# A developer's shell or .env must never turn the test suite into an alert
+# source: the ops alert sink reads OPS_ALERT_WEBHOOK_URL from the environment.
+# Set it blank rather than popping it: shared.constants load_dotenv() fills in
+# missing variables from .env, but never overrides one that is already set, and
+# create_sink_from_env treats blank as disabled.
+os.environ["OPS_ALERT_WEBHOOK_URL"] = ""
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
