@@ -1,0 +1,662 @@
+"""The suite must stay inside its sandbox.
+
+In the main checkout this repo is the live platform: ``data/`` is its database and market data,
+``logs/`` is the log read during a live incident, and ``.accounts.env`` / ``.env`` hold the real
+broker and Discord credentials. A test that resolves any of those reads or writes production state,
+and - worse - a test that *passes* because of a real credential is a result nobody can reproduce.
+
+``conftest`` therefore points every one of those at a throwaway session directory and fails the run
+at session end if the suite escaped. These tests pin both halves, plus the two guards that have no
+directory to watch: the network must stay on localhost, and the integration suite must not discover
+over HTTP while it is being imported.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import socket
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+import dotenv
+import pytest
+
+import tests.conftest as suite_conftest
+from tests.conftest import (
+    ISOLATED_ACCOUNTS_ENV,
+    ISOLATED_DOTENV_FILE,
+    REPO_ACCOUNTS_ENV,
+    REPO_DATA_DIR,
+    REPO_ENV_FILE,
+    REPO_LOG_DIR,
+    TEST_DATA_DIR,
+    TEST_LOG_DIR,
+    diff_snapshots,
+    snapshot_tree,
+)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    return path.resolve() == root or root in path.resolve().parents
+
+
+class _Config:  # no ``workerinput`` attribute: behaves like the controller
+    pass
+
+
+class _Session:
+    config = _Config()
+    exitstatus = pytest.ExitCode.OK
+
+
+# --- the watched directories ------------------------------------------------------------------ #
+
+
+def test_the_watched_repo_directories_are_data_and_logs() -> None:
+    """``logs/`` was not watched before, and a run wrote 18 files into the live one."""
+    assert [Path(root).name for root in suite_conftest.WATCHED_REPO_DIRS] == ["data", "logs"]
+
+
+def test_env_data_dir_is_not_the_repo_data_dir() -> None:
+    for var in ("DATA_DIR", "TRADING_DATA_DIR"):
+        resolved = Path(os.environ[var]).resolve()
+        assert not _is_under(resolved, REPO_DATA_DIR), f"{var} points into the repo data dir"
+
+
+def test_env_log_dir_is_not_the_repo_log_dir() -> None:
+    resolved = Path(os.environ["LOG_DIR"]).resolve()
+    assert not _is_under(resolved, REPO_LOG_DIR), "LOG_DIR points into the repo logs dir"
+
+
+def test_env_data_dir_is_the_conftest_session_dir() -> None:
+    """Forced, not ``setdefault``: a production DATA_DIR exported in the shell must not survive."""
+    assert Path(os.environ["DATA_DIR"]).resolve() == TEST_DATA_DIR
+
+
+def test_env_log_dir_is_the_conftest_session_dir() -> None:
+    """Same rule as DATA_DIR: the viewer's LOG_DIR must not survive into the suite."""
+    assert Path(os.environ["LOG_DIR"]).resolve() == TEST_LOG_DIR
+
+
+def test_platform_constants_resolve_outside_the_repo_data_and_log_dirs() -> None:
+    import shared.constants as constants
+    import shared.database as database
+    import shared.logging as shared_logging
+    import viewer.main as viewer
+
+    for name, path in (
+        ("constants.DATA_DIR", constants.DATA_DIR),
+        ("constants.OPTIMIZATIONS_DIR", constants.OPTIMIZATIONS_DIR),
+        ("constants.LOG_DIR", constants.LOG_DIR),
+        ("shared.logging.LOG_DIR", shared_logging.LOG_DIR),
+        ("viewer.LOG_DIR", viewer.LOG_DIR),
+        ("viewer.TASK_LOGS_DIR", viewer.TASK_LOGS_DIR),
+        ("database.DATA_DIR", database.DATA_DIR),
+        ("database.DB_PATH", database.DB_PATH),
+    ):
+        assert not _is_under(Path(path), REPO_DATA_DIR), f"{name} points into the repo data dir"
+        assert not _is_under(Path(path), REPO_LOG_DIR), f"{name} points into the repo log dir"
+
+
+def test_sessionfinish_fails_the_run_when_a_watched_repo_dir_changed(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """Both watched directories, not just ``data/``: writing the live-runner log is the same lie."""
+    fake_data = tmp_path / "data"
+    fake_data.mkdir()
+    fake_logs = tmp_path / "logs"
+    fake_logs.mkdir()
+    watched = {str(fake_data): snapshot_tree(fake_data), str(fake_logs): snapshot_tree(fake_logs)}
+    monkeypatch.setattr(suite_conftest, "_REPO_TREES_BEFORE", watched)
+
+    session = _Session()
+    suite_conftest.pytest_sessionfinish(session)
+    assert session.exitstatus == pytest.ExitCode.OK
+
+    (fake_logs / "live-runner.log").write_text("submitted order AAPL qty=1", encoding="utf-8")
+    suite_conftest.pytest_sessionfinish(session)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    err = capsys.readouterr().err
+    assert "logs/live-runner.log" in err and "created:" in err
+    # The guard cannot attribute the change to the suite, so the message must not claim it did.
+    assert "the test session modified" not in err
+    assert "cannot tell which" in err
+
+
+def test_the_directory_guard_is_not_run_by_an_xdist_worker(tmp_path: Path) -> None:
+    """A worker would snapshot a tree its siblings are still writing into.
+
+    The other three guards do run in workers: a worker is a separate process in which the tests
+    really ran, so a violation recorded there must still fail the run.
+    """
+
+    class _WorkerConfig:
+        workerinput = {"id": "gw0"}
+
+    class _WorkerSession:
+        config = _WorkerConfig()
+        exitstatus = pytest.ExitCode.OK
+
+    watched = tmp_path / "data"
+    watched.mkdir()
+    (watched / "written-during-the-session.txt").write_text("x", encoding="utf-8")
+    original = suite_conftest._REPO_TREES_BEFORE
+    suite_conftest._REPO_TREES_BEFORE = {str(watched): {}}
+    try:
+        session = _WorkerSession()
+        suite_conftest.pytest_sessionfinish(session)
+    finally:
+        suite_conftest._REPO_TREES_BEFORE = original
+    assert session.exitstatus == pytest.ExitCode.OK
+
+
+def test_snapshot_diff_reports_created_modified_and_deleted(tmp_path: Path) -> None:
+    (tmp_path / "keep.txt").write_text("a")
+    (tmp_path / "change.txt").write_text("a")
+    (tmp_path / "gone.txt").write_text("a")
+    before = snapshot_tree(tmp_path)
+
+    (tmp_path / "change.txt").write_text("longer")
+    (tmp_path / "gone.txt").unlink()
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "new.txt").write_text("x")
+
+    assert diff_snapshots(before, snapshot_tree(tmp_path)) == [
+        "created: sub",
+        "created: sub/new.txt",
+        "deleted: gone.txt",
+        "modified: change.txt",
+    ]
+
+
+def test_snapshot_of_an_unchanged_or_missing_tree_is_clean(tmp_path: Path) -> None:
+    (tmp_path / "f").write_text("a")
+    assert diff_snapshots(snapshot_tree(tmp_path), snapshot_tree(tmp_path)) == []
+    assert snapshot_tree(tmp_path / "missing") == {}
+
+
+# --- .accounts.env ---------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("module_name", "attribute"), suite_conftest.ACCOUNTS_ENV_MODULES, ids=lambda case: str(case)
+)
+def test_every_accounts_env_module_points_at_the_session_sandbox(
+    module_name: str, attribute: str
+) -> None:
+    """Every copy, not just the one a test happens to import.
+
+    Each of these modules resolves the checkout's real credential file, and a copy imported into
+    another module (or into a function's default argument) binds the value at import time.
+    """
+    module = importlib.import_module(module_name)
+    value = Path(getattr(module, attribute))
+    assert value == ISOLATED_ACCOUNTS_ENV, f"{module_name}.{attribute} is {value}"
+    assert not _is_under(value, REPO_ACCOUNTS_ENV.parent)
+    # A file that exists here would be the same leak in a different directory: a test that needs
+    # credentials writes its own under tmp_path.
+    assert not value.exists(), f"{module_name}.{attribute} resolves to an existing file"
+
+
+def test_the_resolver_defaults_are_not_frozen_at_the_repo_path() -> None:
+    """The defect that made the leak possible: a default *argument* binds at import time.
+
+    ``def f(accounts_env=DEFAULT_ACCOUNTS_ENV)`` keeps the path the module resolved when it was
+    imported, so patching the module constant afterwards leaves the signature reading the real
+    file. These three entry points therefore resolve at call time instead.
+    """
+    import inspect
+
+    import live_runner.account_discovery as account_discovery
+    import live_runner.daemon as daemon
+    import live_runner.preflight as preflight
+
+    for module, function_name, parameter in (
+        (account_discovery, "discover_configured_accounts", "accounts_env"),
+        (preflight, "run_live_preflight", "accounts_env_path"),
+        (daemon, "sync_services_loop", "accounts_env"),
+        (daemon, "sync_deployments_loop", "accounts_env"),
+        (daemon, "run_daemon", "accounts_env"),
+    ):
+        default = inspect.signature(getattr(module, function_name)).parameters[parameter].default
+        assert default is None, f"{module.__name__}.{function_name} froze a default: {default!r}"
+
+
+def test_the_accounts_env_override_env_var_wins() -> None:
+    """The documented operator escape hatch, and the reason the resolver exists."""
+    from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
+
+    monkeypatched = {ACCOUNTS_ENV_ENV_VAR: "/somewhere/else/.accounts.env"}
+    original = os.environ.get(ACCOUNTS_ENV_ENV_VAR)
+    os.environ.update(monkeypatched)
+    try:
+        assert resolve_accounts_env_path(None) == Path("/somewhere/else/.accounts.env")
+    finally:
+        if original is None:
+            os.environ.pop(ACCOUNTS_ENV_ENV_VAR, None)
+        else:
+            os.environ[ACCOUNTS_ENV_ENV_VAR] = original
+
+
+def test_a_caller_named_accounts_env_is_used_verbatim(tmp_path: Path) -> None:
+    from live_runner.credential_env import resolve_accounts_env_path
+
+    named = tmp_path / "named.accounts.env"
+    assert resolve_accounts_env_path(named) == named
+    assert resolve_accounts_env_path(str(named)) == named
+
+
+def test_the_sandbox_accounts_env_carries_no_credentials() -> None:
+    """The outcome the isolation exists for: no test can pass because of a real account.
+
+    Discovery goes through the production reader, so this also proves the patched path is the one
+    the reader is really given - a redirect that only changed the constant would show up here.
+    """
+    from live_runner.credential_env import load_accounts_env_values
+    from live_runner.service_discovery import discover_discord_bots_from_env
+
+    assert load_accounts_env_values(ISOLATED_ACCOUNTS_ENV) == {}
+    assert discover_discord_bots_from_env() == []
+
+
+def test_no_imported_module_still_resolves_the_real_accounts_env() -> None:
+    offenders = suite_conftest._accounts_env_readers()
+    assert offenders == [], (
+        "these modules still resolve the real .accounts.env: " + ", ".join(offenders)
+    )
+
+
+def test_the_reader_sweep_detects_a_planted_reference(monkeypatch) -> None:
+    """The positive control: a sweep with nothing to find must be able to find something."""
+    planted = types.ModuleType("planted_accounts_env_leak")
+    planted.DEFAULT_ACCOUNTS_ENV = REPO_ACCOUNTS_ENV
+    planted.SOME_ACCOUNTS_ENV_NOTE = REPO_ACCOUNTS_ENV.parent / "notes.txt"
+    monkeypatch.setitem(sys.modules, planted.__name__, planted)
+    try:
+        assert suite_conftest._accounts_env_readers() == [
+            "planted_accounts_env_leak.DEFAULT_ACCOUNTS_ENV"
+        ]
+    finally:
+        sys.modules.pop(planted.__name__, None)
+
+
+def test_sessionfinish_fails_the_run_when_a_module_resolves_the_real_accounts_env(
+    monkeypatch, capsys
+) -> None:
+    planted = types.ModuleType("planted_sessionfinish_leak")
+    planted.DEFAULT_ACCOUNTS_ENV = str(REPO_ACCOUNTS_ENV)
+    monkeypatch.setitem(sys.modules, planted.__name__, planted)
+    try:
+        session = _Session()
+        suite_conftest.pytest_sessionfinish(session)
+    finally:
+        sys.modules.pop(planted.__name__, None)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert "still resolve the real" in capsys.readouterr().err
+
+
+# --- .env ------------------------------------------------------------------------------------- #
+
+
+def test_the_repo_dotenv_file_is_redirected_to_the_session_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """``shared.constants`` and ``viewer.main`` load ``PROJECT_ROOT/.env`` at import time.
+
+    Nothing can intervene before that load, so it is redirected rather than prevented: the call
+    still happens, on the empty session file. An unrelated path must reach the real loader.
+    """
+    loaded: list[Path | None] = []
+
+    def _record(path=None, *_args, **_kwargs):
+        loaded.append(Path(path) if path is not None else None)
+        return {}
+
+    monkeypatch.setattr(suite_conftest, "_real_load_dotenv", _record)
+    dotenv.load_dotenv(REPO_ENV_FILE)
+    dotenv.load_dotenv(tmp_path / "unrelated.env")
+    assert loaded == [ISOLATED_DOTENV_FILE, tmp_path / "unrelated.env"]
+
+
+def test_the_session_dotenv_substitute_is_empty() -> None:
+    """If it held anything, the suite would run against invented configuration."""
+    assert ISOLATED_DOTENV_FILE.read_text(encoding="utf-8") == ""
+
+
+def test_the_secret_file_matcher_only_names_the_real_files(tmp_path: Path) -> None:
+    """The positive control for the read guard: same file name, different tree, no match."""
+    assert suite_conftest._repo_secret_path(REPO_ACCOUNTS_ENV) == REPO_ACCOUNTS_ENV
+    assert suite_conftest._repo_secret_path(REPO_ENV_FILE) == REPO_ENV_FILE
+    assert suite_conftest._repo_secret_path(f"{REPO_ACCOUNTS_ENV}") == REPO_ACCOUNTS_ENV
+    assert suite_conftest._repo_secret_path(REPO_ACCOUNTS_ENV.as_uri()) is None
+    assert suite_conftest._repo_secret_path(tmp_path / ".accounts.env") is None
+    assert suite_conftest._repo_secret_path(tmp_path / ".env") is None
+    assert suite_conftest._repo_secret_path(REPO_ACCOUNTS_ENV.with_name("accounts.env")) is None
+    assert suite_conftest._repo_secret_path(3) is None
+    assert suite_conftest._repo_secret_path(None) is None
+
+
+def test_sessionfinish_fails_the_run_when_a_repo_secret_file_was_opened(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(suite_conftest, "_REPO_SECRET_OPENS", [str(REPO_ACCOUNTS_ENV)])
+    session = _Session()
+    suite_conftest.pytest_sessionfinish(session)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    err = capsys.readouterr().err
+    assert "opened the checkout's real credential file" in err
+    assert "write its own under tmp_path" in err
+
+
+def test_no_repo_secret_file_has_been_opened_so_far() -> None:
+    """The live half of the guard, asserted at the point the suite is furthest along.
+
+    The session-end check is the one that fails a run; this makes the same assertion inside a test,
+    so a leak introduced earlier in this very module fails here with the offending paths.
+    """
+    assert suite_conftest.repo_secret_opens() == ()
+
+
+# --- the integration suite must not discover over HTTP while importing ------------------------ #
+
+
+def test_the_integration_module_names_no_default_port() -> None:
+    """A hardcoded port is what made a bare ``pytest`` talk to a live viewer."""
+    source = (Path(__file__).resolve().parents[1] / "tests" / "integration").joinpath(
+        "test_strategy_pipeline.py"
+    ).read_text(encoding="utf-8")
+    assert "TP_INTEGRATION_BASE_URL" in source
+    assert "5556" not in source, "the integration module still carries a default port"
+    assert "_discover_strategy_matrix" in source
+
+
+# --- the network ------------------------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["localhost", "127.0.0.1", "::1", "127.0.0.2", "0.0.0.0", "::", None],
+)
+def test_a_local_address_is_not_a_network_violation(host: str | None) -> None:
+    assert suite_conftest._is_local_host(host) is True
+
+
+@pytest.mark.parametrize(
+    "host", ["api.alpaca.markets", "35.221.23.121", "live.ctrader.com", "example.com", "10.0.0.1"]
+)
+def test_a_remote_address_is_a_network_violation(host: str) -> None:
+    assert suite_conftest._is_local_host(host) is False
+
+
+def test_a_loopback_name_lookup_is_allowed() -> None:
+    # Real resolver call: the guard must not stand between the suite and localhost.
+    socket.getaddrinfo("localhost", 80)
+
+
+def test_a_loopback_connect_is_allowed_through_to_the_os(monkeypatch) -> None:
+    """The guard stops the *network*, not localhost: the OS refusal still has to arrive."""
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    probe = socket.socket()
+    try:
+        with pytest.raises(OSError) as refused:
+            probe.connect(("127.0.0.1", 1))
+    finally:
+        probe.close()
+    assert not isinstance(refused.value, suite_conftest.SuiteHermeticityViolation)
+    assert suite_conftest.network_violations() == ()
+
+
+def test_a_remote_name_lookup_is_refused(monkeypatch) -> None:
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match="api.alpaca.markets"):
+        socket.getaddrinfo("api.alpaca.markets", 443)
+    assert suite_conftest.network_violations() == ("name lookup 'api.alpaca.markets'",)
+
+
+def test_a_remote_connect_is_refused(monkeypatch) -> None:
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    probe = socket.socket()
+    try:
+        with pytest.raises(suite_conftest.SuiteHermeticityViolation, match="35.221.23.121"):
+            probe.connect(("35.221.23.121", 443))
+    finally:
+        probe.close()
+    assert suite_conftest.network_violations() == ("connect '35.221.23.121'",)
+
+
+def test_a_unix_socket_connect_is_not_a_network_violation(monkeypatch) -> None:
+    """A filesystem socket has no network in it, and pytest's own transports use one."""
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        with pytest.raises(OSError):  # no such socket, refused by the OS and not by the guard
+            probe.connect("/definitely/not/a/socket.sock")
+    finally:
+        probe.close()
+    assert suite_conftest.network_violations() == ()
+
+
+def test_sessionfinish_fails_the_run_when_the_network_was_reached(monkeypatch, capsys) -> None:
+    """A guard that only raises is swallowed by the first ``except Exception`` it meets."""
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", ["connect 'api.alpaca.markets'"])
+    session = _Session()
+    suite_conftest.pytest_sessionfinish(session)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert "attempted to reach the network" in capsys.readouterr().err
+
+
+def test_no_network_violation_has_been_recorded_so_far() -> None:
+    violations = suite_conftest.network_violations()
+    assert violations == (), (
+        "the suite already reached outside localhost: " + ", ".join(violations)
+    )
+
+
+# --- the integration suite must not discover over HTTP while importing ------------------------ #
+
+
+def test_the_integration_module_makes_no_connection_while_importing() -> None:
+    """Discovery at import time ran during collection, deselected or not.
+
+    A bare ``pytest`` (no ``-m "not slow"``) therefore POSTed real backtest runs to whatever
+    viewer was listening on the default port. Discovery now needs TP_INTEGRATION_BASE_URL and
+    happens inside a fixture, so importing the module must touch no socket at all.
+    """
+    source = (
+        "import socket\n"
+        "attempts = []\n"
+        "real_connect = socket.socket.connect\n"
+        "real_lookup = socket.getaddrinfo\n"
+        "def _connect(self, address):\n"
+        "    attempts.append(('connect', address))\n"
+        "    raise OSError('blocked')\n"
+        "def _lookup(host, *rest):\n"
+        "    attempts.append(('lookup', host))\n"
+        "    raise OSError('blocked')\n"
+        "socket.socket.connect = _connect\n"
+        "socket.getaddrinfo = _lookup\n"
+        "import tests.integration.test_strategy_pipeline as module\n"
+        "print('ATTEMPTS', attempts)\n"
+        "print('IMPORTED', module.__name__)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TP_INTEGRATION_BASE_URL": "http://127.0.0.1:5556"},
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ATTEMPTS []" in result.stdout, result.stdout + result.stderr
+    assert "IMPORTED tests.integration.test_strategy_pipeline" in result.stdout
+
+
+def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
+    """No default port: an unset TP_INTEGRATION_BASE_URL skips the module instead of guessing."""
+    env = {k: v for k, v in os.environ.items() if k != "TP_INTEGRATION_BASE_URL"}
+    env.pop("BASE_URL", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--collect-only",
+            "tests/integration/test_strategy_pipeline.py",
+        ],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+        check=False,
+    )
+    combined = result.stdout + result.stderr
+    assert "TP_INTEGRATION_BASE_URL" in combined, combined
+    assert "skipped" in combined.lower(), combined
+
+
+# --- end-to-end: the real pytest process must exit non-zero ----------------------------------- #
+#
+# The tests above assert that ``pytest_sessionfinish`` mutates a fake session's exit status. That
+# does not prove pytest honours the mutation, which is what makes a leak fail CI. These run a real
+# pytest process in a throwaway project whose ``tests/conftest.py`` is this file's conftest, so
+# ``PROJECT_ROOT`` (and therefore the guarded directories and files) is the throwaway tree.
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _run_throwaway_suite(
+    tmp_path: Path,
+    test_source: str,
+    extra_args: tuple[str, ...] = (),
+    seed_files: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    project = tmp_path / "project"
+    (project / "tests").mkdir(parents=True)
+    (project / "data").mkdir()
+    (project / "logs").mkdir()
+    for name, content in (seed_files or {}).items():
+        (project / name).write_text(content, encoding="utf-8")
+    (project / "tests" / "conftest.py").write_text(
+        Path(suite_conftest.__file__).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project / "tests" / "test_throwaway.py").write_text(test_source, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(_PROJECT_ROOT)}
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            *extra_args,
+            "tests/test_throwaway.py",
+        ],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("secret", [".accounts.env", ".env"])
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_nonzero_when_a_test_reads_a_repo_secret_file(
+    tmp_path: Path, secret: str, extra_args: tuple[str, ...]
+) -> None:
+    """The guard the audit hook exists for: a real run fails, in one process and across xdist."""
+    leak = (
+        "from pathlib import Path\n"
+        "def test_reads_a_secret_file():\n"
+        f"    (Path(__file__).resolve().parents[1] / {secret!r}).read_text(encoding='utf-8')\n"
+    )
+    result = _run_throwaway_suite(
+        tmp_path,
+        leak,
+        extra_args,
+        seed_files={secret: "ALPACA_API_KEY=fake\n"},
+    )
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
+    assert "opened the checkout's real credential file" in result.stderr
+    assert secret in result.stderr
+
+
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_nonzero_when_a_test_reaches_the_network(
+    tmp_path: Path, extra_args: tuple[str, ...]
+) -> None:
+    """The Alpaca discovery test that made this necessary: it resolved a live host and connected."""
+    leak = (
+        "import socket\n"
+        "def test_reaches_the_network():\n"
+        "    socket.getaddrinfo('api.alpaca.markets', 443)\n"
+    )
+    result = _run_throwaway_suite(tmp_path, leak, extra_args)
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
+    assert "attempted to reach the network" in result.stderr
+    assert "api.alpaca.markets" in result.stderr
+
+
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_nonzero_when_a_test_writes_the_repo_logs_dir(
+    tmp_path: Path, extra_args: tuple[str, ...]
+) -> None:
+    leak = (
+        "from pathlib import Path\n"
+        "def test_leaks():\n"
+        "    (Path(__file__).resolve().parents[1] / 'logs' / 'live-runner.log').write_text('x')\n"
+    )
+    result = _run_throwaway_suite(tmp_path, leak, extra_args)
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
+    assert "ERROR: the repo directories" in result.stderr
+    assert "logs/live-runner.log" in result.stderr
+
+
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_nonzero_when_a_test_writes_the_repo_data_dir(
+    tmp_path: Path, extra_args: tuple[str, ...]
+) -> None:
+    leak = (
+        "from pathlib import Path\n"
+        "def test_leaks():\n"
+        "    (Path(__file__).resolve().parents[1] / 'data' / 'backtests.db').write_text('x')\n"
+    )
+    result = _run_throwaway_suite(tmp_path, leak, extra_args)
+
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
+    assert "ERROR: the repo directories" in result.stderr and "changed during" in result.stderr
+    assert "created: backtests.db" in result.stderr
+
+
+@pytest.mark.parametrize("extra_args", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_real_pytest_process_exits_zero_when_nothing_leaves_the_sandbox(
+    tmp_path: Path, extra_args: tuple[str, ...]
+) -> None:
+    """The control: a run that touches neither the watched trees nor the network stays green."""
+    clean = (
+        "import os, socket\n"
+        "from pathlib import Path\n"
+        "def test_writes_only_to_the_session_dir():\n"
+        "    (Path(os.environ['DATA_DIR']) / 'ok.txt').write_text('x')\n"
+        "    (Path(os.environ['LOG_DIR']) / 'ok.log').write_text('x')\n"
+        "def test_names_localhost_only():\n"
+        "    socket.getaddrinfo('localhost', 5556)\n"
+    )
+    result = _run_throwaway_suite(tmp_path, clean, extra_args)
+
+    assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
+    assert "ERROR" not in result.stderr
