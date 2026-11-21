@@ -146,6 +146,48 @@ def test_signal_markers_drops_unparseable_timestamps():
     ]
 
 
+def test_signal_markers_subset_parse_skips_unparseable_masked_rows():
+    """``parse="subset"``: an unparseable timestamp ON a masked row is
+    skipped and does not consume a ``limit`` slot (the pre-refactor tail's
+    ``.dropna()`` before ``iloc[:limit]``)."""
+    df = _df(5)
+    df["timestamp"] = df["timestamp"].astype(str)
+    df.loc[df.index[0], "timestamp"] = "garbage"  # masked AND unparseable
+    mask = pd.Series(True, index=df.index)
+
+    drawings = signal_markers(
+        df,
+        [(mask, "belowBar", "arrowUp", "#fff", "x", 2)],
+        parse="subset",
+    )
+
+    # Without dropna the NaT row would emit a "NaT" marker and eat a slot.
+    assert [d["time"] for d in drawings] == [
+        "2024-01-01T01:00:00+00:00",
+        "2024-01-01T02:00:00+00:00",
+    ]
+
+
+def test_signal_markers_column_parse_skips_unparseable_masked_rows():
+    """``parse="column"``: same contract — a coerced-NaT masked row is
+    skipped and does not count against ``limit``."""
+    df = _df(5)
+    df["timestamp"] = df["timestamp"].astype(str)
+    df.loc[df.index[0], "timestamp"] = "garbage"
+    mask = pd.Series(True, index=df.index)
+
+    drawings = signal_markers(
+        df,
+        [(mask, "belowBar", "arrowUp", "#fff", "x", 2)],
+        parse="column",
+    )
+
+    assert [d["time"] for d in drawings] == [
+        "2024-01-01T01:00:00+00:00",
+        "2024-01-01T02:00:00+00:00",
+    ]
+
+
 def test_signal_markers_accepts_non_utc_input():
     df = _df(2)
     df["timestamp"] = [
