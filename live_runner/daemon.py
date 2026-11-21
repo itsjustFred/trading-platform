@@ -39,6 +39,11 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
+from live_runner.deployment_policy import (
+    normalize_deployment_status,
+    signal_source_can_trade,
+    untradeable_signal_source_reason,
+)
 from live_runner.exit_signals import (
     DEFAULT_QTY_TOLERANCE,
     EXIT_POSITION_SIDE_KEY,
@@ -2199,7 +2204,9 @@ def _active_discord_deployments_for_account(
         for deployment in deployments
         if deployment.account_id == account_id
         and _normalize_deployment_status(deployment.status) == "ACTIVE"
-        and str(deployment.signal_source or "internal").lower() == "discord"
+        # The same set the untradeable-row warning reads (#242): a source is
+        # routed because this process can run it, and for no other reason.
+        and signal_source_can_trade(deployment.signal_source)
     ]
 
 
@@ -4283,11 +4290,10 @@ def _start_missing_tasks(
         )
 
 
-def _normalize_deployment_status(status: str) -> str:
-    normalized_status = str(status or "").upper()
-    if normalized_status in {"ACTIVE", "PAUSED", "STOPPED"}:
-        return normalized_status
-    return "UNKNOWN"
+# #242: the status/source vocabulary is shared with both preflights (they must
+# never disagree about what "ACTIVE" and "tradeable" mean). Kept under the name
+# every call site in this module already uses.
+_normalize_deployment_status = normalize_deployment_status
 
 
 def _log_deployment_status_observations(
@@ -4804,47 +4810,39 @@ async def _load_db_accounts_and_deployments(
     return accounts, deployments
 
 
-# A deployment nothing can trade (#242): the daemon only runs Discord signals.
-_TRADEABLE_SIGNAL_SOURCES = frozenset({"discord"})
-
-
-def _untradeable_active_signal_source_reason(
-    signal_source: object,
-) -> str | None:
-    """Why an ACTIVE deployment on this signal source can never trade, or None.
-
-    ``live_runner.daemon`` is the single definition: the daemon logs it at startup
-    and the preflights report it, so the three can never disagree about what is
-    untradeable (#242). ``signal_source`` is the value as stored/configured; the
-    empty string is the ``internal`` default the DB column and the models use.
-    """
-    source = str(signal_source or "internal").lower()
-    if source in _TRADEABLE_SIGNAL_SOURCES:
-        return None
-    if source == "internal":
-        return (
-            "signal source 'internal' has no live strategy runner; "
-            "only Discord signals are traded"
-        )
-    return f"signal source '{source}' is neither 'internal' nor 'discord' and has no runner"
-
-
 def _warn_untradeable_active_deployments(
     deployments: Sequence[LiveDeploymentConfig],
+    already_warned: dict[str, str] | None = None,
 ) -> None:
-    """Log ERROR for each ACTIVE deployment no runner can trade (#242).
+    """Alert (ERROR, which Sentry turns into an event) per untradeable ACTIVE deployment (#242).
 
     An ``internal`` deployment (or any signal source other than ``discord``)
     has no live strategy runner behind it: it can be ACTIVE, hold an adapter and
     an execution listener, and still never place an order. The daemon does not
     block on this -- the operator stops or repoints the row -- but silence makes
     an untradeable ACTIVE deployment look live.
+
+    The definition of "untradeable" is ``live_runner.deployment_policy``'s,
+    so the daemon log and both preflights cannot drift apart.
+
+    ``already_warned`` is the operator's memory of what this process already
+    reported, keyed by deployment id: the same reason for the same row is not
+    repeated on every sync tick (a daemon polls forever), but a row that becomes
+    untradeable, stops being it, or changes how it is untradeable is reported
+    again. Pass None to log every row unconditionally (what the unit tests do).
     """
+    still_untradeable: dict[str, str] = {}
     for deployment in deployments:
         if _normalize_deployment_status(deployment.status) != "ACTIVE":
             continue
-        reason = _untradeable_active_signal_source_reason(deployment.signal_source)
+        reason = untradeable_signal_source_reason(deployment.signal_source)
         if reason is None:
+            continue
+        deployment_id = str(deployment.id)
+        # A change of state, never a repeat of one already reported: the reason
+        # also encodes the signal source, so repointing a row re-warns it.
+        if already_warned is not None and already_warned.get(deployment_id) == reason:
+            still_untradeable[deployment_id] = reason
             continue
         signal_source = str(deployment.signal_source or "internal").lower()
         logger.error(
@@ -4854,14 +4852,24 @@ def _warn_untradeable_active_deployments(
             f"{deployment.account_id}): {reason}",
             extra={
                 "data": {
-                    "deployment_id": str(deployment.id),
+                    "deployment_id": deployment_id,
                     "account_id": deployment.account_id,
                     "strategy_name": deployment.strategy_name,
                     "signal_source": signal_source,
                     "untradeable_reason": reason,
+                    # #242 asks for an alert, not just a log line. In this daemon the
+                    # alert *is* the ERROR record (Sentry's LoggingIntegration sends
+                    # event_level=ERROR); tagging it makes it filterable there.
+                    "alert": "untradeable_active_deployment",
                 }
             },
         )
+        still_untradeable[deployment_id] = reason
+    if already_warned is not None:
+        # Drop rows that are no longer ACTIVE/untradeable, so a row that comes
+        # back to it is alerted again instead of staying quiet.
+        already_warned.clear()
+        already_warned.update(still_untradeable)
 
 
 async def _ensure_adapter_for_active_account(
@@ -5084,7 +5092,7 @@ def _discord_active_account_ids(
         deployment.account_id
         for deployment in deployments
         if _normalize_deployment_status(deployment.status) == "ACTIVE"
-        and str(deployment.signal_source or "internal").lower() == "discord"
+        and signal_source_can_trade(deployment.signal_source)
         and _deployment_has_discord_channel(deployment)
     }
 

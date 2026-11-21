@@ -448,7 +448,7 @@ Every deployment-sync iteration logs this at ERROR, once per affected deployment
 signal source (`"ACTIVE live deployment cannot trade"`, `untradeable_reason` in the log `data`). The daemon
 does not block or stop: the operator stops the row or moves it to a Discord signal source. Both preflights
 (yaml and `--check-db`) warn for the same rows, using the daemon's own definition
-(`live_runner.daemon._untradeable_active_signal_source_reason`), so a clean preflight no longer hides them.
+(`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides them.
 
 A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
 design, not by accident.
