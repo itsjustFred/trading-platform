@@ -1804,8 +1804,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         # While a session is open the newest bar should be at most ~one
         # trading day behind; three bar-steps floor keeps tiny timeframes
-        # from tripping on ordinary bar jitter.
-        limit_minutes = max(3.0 * step_minutes, 1440.0)
+        # from tripping on ordinary bar jitter. The 780-minute floor is
+        # roughly two NYSE sessions — 1440 trading minutes would let a dead
+        # equity feed go unnoticed for nearly four sessions.
+        limit_minutes = max(3.0 * step_minutes, 780.0)
         trading_age = calendar.trading_minutes_between(newest, now)
         if trading_age > limit_minutes:
             raise ValueError(

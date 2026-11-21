@@ -130,16 +130,25 @@ class VenueCalendar:
     ) -> int:
         count = 0
         step = pd.Timedelta(minutes=step_minutes)
-        for iv in self.trading_intervals(start, end):
+        intervals = self.trading_intervals(start, end)
+        for index, iv in enumerate(intervals):
             first = max(start, iv.open)
             last = min(end, iv.close - pd.Timedelta(microseconds=1))
             if last < first:
                 continue
             if self.grid_anchor == "session_open":
-                offset = math.ceil(
-                    (first - iv.open).total_seconds() / (step_minutes * 60.0)
+                # The first interval's open is clipped at the query boundary;
+                # anchoring the bar grid to the CLIPPED open would shift every
+                # expected bar. Recover the session's true open instead.
+                anchor_open = (
+                    self._session_open_anchor(iv.open)
+                    if index == 0 and iv.open == start
+                    else iv.open
                 )
-                instant = iv.open + pd.Timedelta(minutes=offset * step_minutes)
+                offset = math.ceil(
+                    (first - anchor_open).total_seconds() / (step_minutes * 60.0)
+                )
+                instant = anchor_open + pd.Timedelta(minutes=offset * step_minutes)
             else:
                 # Epoch-aligned grid (UTC clock bars).
                 epoch = pd.Timestamp(0, tz=UTC)
@@ -151,6 +160,23 @@ class VenueCalendar:
                 count += 1
                 instant += step
         return count
+
+    def _session_open_anchor(self, clipped_open: pd.Timestamp) -> pd.Timestamp:
+        """The unclipped session open behind a boundary-clipped interval open.
+
+        ``trading_intervals`` clips every interval to the query range, so an
+        interval starting exactly at ``start`` may really have opened earlier.
+        Re-querying a window that reaches back before the clip recovers the
+        session's true open; the grid then aligns to the session, not to the
+        arbitrary segment boundary.
+        """
+        probe_start = clipped_open - pd.Timedelta(days=2)
+        probe_end = clipped_open + pd.Timedelta(microseconds=1)
+        candidates = self.trading_intervals(probe_start, probe_end)
+        for cand in reversed(candidates):
+            if cand.open <= clipped_open < cand.close:
+                return cand.open
+        return clipped_open
 
     def _expected_daily_bars(
         self, start: pd.Timestamp, end: pd.Timestamp, step_minutes: float

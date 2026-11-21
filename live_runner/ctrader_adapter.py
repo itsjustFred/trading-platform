@@ -1539,11 +1539,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             holidays = list(getattr(detail, "holiday", []) or [])
             if not schedule and not holidays:
                 return
-            timezone_name = str(
-                getattr(detail, "scheduleTimeZone", "")
-                or getattr(detail, "schedule_timezone", "")
-                or ""
-            )
+            timezone_name = str(getattr(detail, "scheduleTimeZone", "") or "")
+            if not timezone_name.strip():
+                # Schedule seconds are relative to the broker zone; caching
+                # them as UTC would misplace every session boundary, so an
+                # absent timezone means no cache — the venue stays unresolved
+                # and coverage fails closed.
+                return
             payload = venue_calendar.ctrader_schedule_payload(
                 symbol=name,
                 schedule=schedule,

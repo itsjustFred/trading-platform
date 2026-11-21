@@ -1298,7 +1298,9 @@ def _calendar_segment_coverage_passes(
     max_gap_multiplier: float,
 ) -> bool:
     """Density + trading-minute gap checks under one venue calendar."""
-    if step_minutes >= 1440.0:
+    if 1440.0 <= step_minutes < 10080.0:
+        # Daily bars are labelled by trading date; weekly (1w) and larger
+        # fall through to the grid path, which counts bar-start instants.
         expected_dates = calendar.daily_bar_dates(start_ts, end_ts)
         if not expected_dates:
             return True  # window fully closed: no daily bar is expected
@@ -1314,9 +1316,19 @@ def _calendar_segment_coverage_passes(
             for stamp in stamps
             if calendar.daily_bar_date(stamp) in expected_dates
         )
-        limit_minutes = step_minutes * max_gap_multiplier
+        # The gap limit is measured in MISSING DAILY BARS, not trading
+        # minutes: scaling 1440 minutes by the multiplier would let ~11 NYSE
+        # sessions go missing before failing. A gap spanning more than
+        # ``max_gap_multiplier`` bar slots fails, matching the intraday rule.
         for prev, cur in zip(valid, valid[1:]):
-            if calendar.trading_minutes_between(prev, cur) > limit_minutes:
+            prev_day = calendar.daily_bar_date(prev)
+            cur_day = calendar.daily_bar_date(cur)
+            if prev_day is None or cur_day is None:
+                continue
+            skipped = sum(
+                1 for day in expected_dates if prev_day < day < cur_day
+            )
+            if skipped + 1 > max_gap_multiplier:
                 return False
         return True
 
