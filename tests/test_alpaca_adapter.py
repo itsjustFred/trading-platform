@@ -806,9 +806,80 @@ def test_a_held_leg_left_working_is_reported_as_still_working() -> None:
     (problem,) = outcome.failed
     assert problem.startswith("AAPL:orders-still-working:")
     assert "sl-leg" in problem
+    # One entry per resting order: the take profit is listed as an open order and as
+    # a resting leg, and a double entry would hide which orders actually remain.
+    assert problem.count("tp-leg") == 1
     assert client.close_calls == []
     # The leg still protects the position, so no second stop is placed on it.
     assert client.submitted == []
+
+
+def test_a_lost_cancel_reply_still_counts_as_a_removed_protection() -> None:
+    """The broker removed the order but the reply was lost: the re-read is the proof.
+
+    The stop leg is this position's only order, so nothing else in the sweep makes
+    the protection "removed": the excusal itself has to. Otherwise a refused close
+    would report the position as protected and leave it naked.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)],
+        take_profit_filled=True,
+        oco_siblings=False,
+        close_error=RuntimeError("broker refused to close"),
+    )
+    real_cancel = client.cancel_order_by_id
+
+    def _lose_the_reply(order_id: str) -> None:
+        real_cancel(order_id)
+        raise RuntimeError("no reply to the cancel")
+
+    client.cancel_order_by_id = _lose_the_reply  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert outcome.failed == ("AAPL:close:broker refused to close",)
+    assert not any("NO-STOP-RESTORED" in item for item in outcome.failed)
+    restored = [order for order in client.orders if order.order_type == "stop"]
+    assert [(order.stop_price, order.qty) for order in restored] == [(95.0, 10.0)]
+
+
+def test_the_excusal_fails_closed_on_an_unreadable_book() -> None:
+    """A refused cancel is only excused by a book, and a book it could not read.
+
+    The re-read that decides it is itself an order listing, so it can fail. Failing
+    the cancel then keeps the sweep's failure report and the stop restore, instead of
+    silently excusing a cancel nobody verified.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)], oco_siblings=False
+    )
+    real_cancel = client.cancel_order_by_id
+    real_get = client.get_orders
+    reads = {"all": 0}
+
+    def _lose_the_book_on_the_second_all_listing(filter=None):  # noqa: A002
+        status = str(getattr(getattr(filter, "status", None), "value", "open")).lower()
+        if status == "all":
+            reads["all"] += 1
+            if reads["all"] > 1:
+                raise RuntimeError("order book unreachable")
+        return real_get(filter)
+
+    client.get_orders = _lose_the_book_on_the_second_all_listing  # type: ignore[method-assign]
+
+    def _refuse_the_stop_leg(order_id: str) -> None:
+        if order_id == "sl-leg":
+            raise RuntimeError("cancel rejected")
+        real_cancel(order_id)
+
+    client.cancel_order_by_id = _refuse_the_stop_leg  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert outcome.failed == ("AAPL:cancel:sl-leg:cancel rejected",)
+    assert client.close_calls == []
 
 
 def test_flatten_refuses_a_full_held_leg_page() -> None:
