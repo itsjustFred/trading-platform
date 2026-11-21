@@ -3638,6 +3638,12 @@ def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
 
     Returns ``[]`` for an unknown signal or one with no recorded conflict, so a caller
     can tell "nothing to resolve" from "resolved" without reading the row.
+
+    Resolving while a duplicate is still being redelivered can lose the race: the
+    conflict ledger's own read-modify-write takes the write lock, so a redelivery that
+    lands after this clear re-records the conflict and the daemon re-pauses the
+    deployment at the next tick. That is the fail-closed direction, and the operator
+    sees it in the same health read.
     """
     normalized = str(signal_id or "").strip()
     if not normalized:

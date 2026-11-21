@@ -528,4 +528,6 @@ what may be *opened* is still decided per signal, so no entry can come out of it
 4. Resume: `PUT /api/live/deployments/{id}/status` → `ACTIVE`, which does its own
    broker re-verification. The halt re-asserts at the next tick until step 3 has
    recorded the resolution, so a resume that does not stick means the conflict is
-   still recorded.
+   still recorded - and a duplicate still being redelivered can re-record it even
+   after step 3, because the conflict ledger's own read-modify-write wins that race
+   on purpose.
