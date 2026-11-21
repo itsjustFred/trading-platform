@@ -223,14 +223,6 @@ class TestPreflightResultSerialization:
         assert jsonable["accounts"][0]["warnings"] == ["test warning"]
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
 # ── ACTIVE deployments no runner can trade (#242) ────────────────────────────
 
 
@@ -276,3 +268,7 @@ def test_non_active_non_discord_deployment_does_not_warn():
 
     assert errors == []
     assert warnings == []
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

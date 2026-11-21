@@ -5121,6 +5121,10 @@ async def sync_deployments_loop(
     deployment_snapshot: list[LiveDeploymentConfig] | None = None,
 ) -> None:
     known_deployment_statuses: dict[str, str] = {}
+    # #242: what this process has already alerted about, keyed by deployment id, so
+    # an untradeable ACTIVE row is reported on the first tick of every start and
+    # again whenever it changes, but not on every tick of a loop that runs for days.
+    already_warned_untradeable: dict[str, str] = {}
     # Seeded from the database, not empty. Every restart used to re-run cancel
     # and flatten for deployments that were already stopped, because this set
     # was process-local while the stamp it mirrors is persisted.
@@ -5151,6 +5155,11 @@ async def sync_deployments_loop(
                 # selected credential signature actually changed.
                 _clear_discord_auth_blocked_accounts()
             accounts, deployments = await _load_db_accounts_and_deployments()
+            # #242: an ACTIVE row nothing can trade gets a broker adapter and an
+            # execution listener, so it looks live in the log and the dashboard.
+            _warn_untradeable_active_deployments(
+                deployments, already_warned=already_warned_untradeable
+            )
             if deployment_snapshot is not None:
                 # Shared with the trailing-stop loop (#167) so it never has to
                 # query deployments itself. Replaced in place: the reader

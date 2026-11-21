@@ -298,8 +298,17 @@ def diff_db_and_yaml(
     for row in db_rows:
         errors.extend(_db_row_errors(row, db_account_ids))
         reason = untradeable_signal_source_reason(row.signal_source)
-        if reason is not None and row.key not in yaml_active:
-                    warnings.append(
+        # The YAML twin already reports this row when *it* is the untradeable one
+        # (`_validate_deployments` warns for every ACTIVE non-Discord entry), so
+        # repeating it here would double-count. Silently skipping whenever a twin
+        # exists does not work: a Discord twin is tradeable, so the YAML check is
+        # quiet about it and this row's own untradeable value would go unreported.
+        yaml_twin = yaml_active.get(row.key)
+        twin_is_untradeable = yaml_twin is not None and (
+            untradeable_signal_source_reason(yaml_twin.signal_source) is not None
+        )
+        if reason is not None and not twin_is_untradeable:
+            warnings.append(
                 f"DB deployment {row.label}: {reason}; it will never trade. "
                 "Stop it or move it to a Discord signal source."
             )

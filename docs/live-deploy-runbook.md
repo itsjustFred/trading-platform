@@ -444,11 +444,25 @@ with status `ACTIVE` has no live strategy runner behind it: it still gets a brok
 listener, so the dashboard and the listener log make it look live, but it will never place an order. The same
 holds for any stored `signal_source` that is neither `internal` nor `discord`.
 
-Every deployment-sync iteration logs this at ERROR, once per affected deployment, with its id, account and
-signal source (`"ACTIVE live deployment cannot trade"`, `untradeable_reason` in the log `data`). The daemon
-does not block or stop: the operator stops the row or moves it to a Discord signal source. Both preflights
-(yaml and `--check-db`) warn for the same rows, using the daemon's own definition
-(`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides them.
+The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
+`untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
+Sentry's LoggingIntegration sends ERROR, so the alert is an event there too. It is not repeated on every
+tick of the (permanent) sync loop: the first tick of every daemon start reports each affected row, and a
+row is reported again only when its status or signal source changes, so restarting or repointing is what
+you see again. The daemon does not block or stop: the operator stops the row or moves it to a Discord
+signal source.
+
+Both preflights warn for these rows using the same definition
+(`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
+them, but they see different things:
+
+- **yaml preflight** (`live_runner/preflight.py`): warns for every ACTIVE non-Discord deployment in the
+  `live_deployments.yaml` it validates.
+- **`--check-db` preflight** (`live_runner/preflight_db.py`): reads the ACTIVE rows out of SQLite instead.
+  It warns for an untradeable row whose YAML twin is *tradeable* (Discord) or absent, because the YAML
+  side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
+  the pair and a second warning for the same row would only double-count. A stored `signal_source` that
+  is neither `internal` nor `discord` still fails this preflight (exit 1) rather than warning.
 
 A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
 design, not by accident.
