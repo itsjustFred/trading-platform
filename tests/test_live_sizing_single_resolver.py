@@ -981,7 +981,7 @@ def test_discord_path_rejects_deviation_before_claiming(monkeypatch, caplog):
     monkeypatch.setattr(
         daemon,
         "claim_live_deployment_submission",
-        lambda deployment_id, token: claims.append(token) or True,
+        lambda deployment_id, token, *, refuse_entries_halt=False: claims.append(token) or True,
     )
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: None)
     monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda deployment: True)
@@ -1007,7 +1007,8 @@ def test_discord_path_rejects_deviation_before_claiming(monkeypatch, caplog):
 
 def test_discord_path_submits_when_quote_is_close(monkeypatch):
     monkeypatch.setattr(
-        daemon, "claim_live_deployment_submission", lambda deployment_id, token: True
+        daemon, "claim_live_deployment_submission",
+        lambda deployment_id, token, *, refuse_entries_halt=False: True,
     )
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: None)
     monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda deployment: True)
