@@ -45,8 +45,8 @@ CONFLICT_SCAN_LIMIT = 10_000
 def check_broker_order_conflicts() -> dict[str, Any]:
     """Return the unresolved broker order id conflicts as a health-check payload.
 
-    ``status`` is ``ok`` or ``error``; ``deployment_ids`` names the halted
-    deployments; ``conflicts`` carries one entry per signal with the tracked id, the
+    ``status`` is ``ok`` or ``error``; ``deployment_ids`` names the deployments still
+    carrying one; ``conflicts`` carries one entry per signal with the tracked id, the
     conflicting ids and the deployment and symbol they belong to.
     """
     grouped = deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT)

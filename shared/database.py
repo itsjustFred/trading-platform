@@ -2594,19 +2594,19 @@ def _reconcile_existing_live_signal(
     # a position, so the affected deployment is paused here and cannot place further
     # entries. Committing the pause separately would leave a crash between the two commits
     # with a persisted conflict on a still-ACTIVE deployment.
-    paused_now = _pause_live_deployment_for_conflict(session, existing.deployment_id)
+    halt_now = _pause_live_deployment_for_conflict(session, existing.deployment_id)
     # Ends the write transaction opened above; a no-op commit when nothing changed.
     session.commit()
     logger.error(
         "ALERT: conflicting broker_order_id for duplicate live signal: an untracked "
         "broker order may exist and the deployment was halted. Resolve the conflict "
         "with the broker before reactivating the deployment "
-        "(signal_id=%s, deployment_id=%s, tracked=%s, conflicting=%s, paused=%s)",
+        "(signal_id=%s, deployment_id=%s, tracked=%s, conflicting=%s, halt=%s)",
         existing.id,
         existing.deployment_id,
         existing_broker_id,
         new_broker_id,
-        paused_now,
+        halt_now,
         extra={
             "data": {
                 "alert": "live_broker_order_id_conflict",
@@ -2618,7 +2618,7 @@ def _reconcile_existing_live_signal(
                 # What this call did to the halt: "PAUSED" when it wrote the pause, and
                 # "already-halted" when the deployment was already PAUSED/STOPPED, so a
                 # redelivery is not reported as a fresh halt.
-                "deployment_halt": paused_now,
+                "deployment_halt": halt_now,
             }
         },
     )
@@ -3626,8 +3626,10 @@ def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
 
     The way out of a conflict halt (#126): while a conflict stays recorded the daemon
     keeps the deployment paused, so a resolution cannot be a status write and nothing
-    else. This removes the key from the signal's metadata (and its broker_order_id
-    mirror, which the conflict ledger also maintains) and returns the ids it removed.
+    else. This removes the key from the signal's metadata and returns the ids it
+    removed. A malformed value stored under the key (not a list) is removed too: it
+    keeps the signal in every conflict listing, and nothing can be reconciled against
+    a spelling the ledger refuses to read.
 
     The caller is an explicit operator action - the viewer's resolve endpoint, which
     requires a confirmation naming the deployment and audits the call. It is not
@@ -3659,10 +3661,13 @@ def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
 def deployments_with_broker_order_conflicts(limit: int = 200) -> dict[str, list[dict[str, Any]]]:
     """Unresolved broker order id conflicts, grouped by deployment id.
 
-    The read behind the halt: the daemon re-pauses every deployment that still carries
-    an unresolved conflict (:func:`live_runner.daemon.enforce_broker_order_conflicts`) and
-    the viewer reports them to operators. One query for the whole fleet, so neither side
-    scans signals per deployment.
+    The read behind the halt: the daemon's conflict enforcement re-pauses every
+    deployment that still carries an unresolved conflict, and the viewer reports them
+    to operators. One query for the whole fleet, so neither side scans signals per
+    deployment. Both callers are periodic (a 60 s service-sync tick and an HTTP
+    request), so the cost to remember is the one already documented on
+    ``list_live_signal_broker_order_conflicts``: the scan behind this has no index for
+    the JSON key.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for conflict in list_live_signal_broker_order_conflicts(limit=limit):

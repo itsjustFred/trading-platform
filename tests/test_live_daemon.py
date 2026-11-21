@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -636,6 +638,69 @@ def test_connect_active_accounts_runs_concurrently(monkeypatch) -> None:
     asyncio.run(_run())
 
     assert set(started) == {"slow", "fast"}
+
+
+def test_a_paused_account_still_gets_a_discord_listener_for_its_exits(
+    monkeypatch,
+) -> None:
+    """#126 decision, the layer the signal gates live on top of.
+
+    The account's adapter and its Discord listener were ACTIVE-only, so an account whose
+    deployments were all paused lost both and every exit on it was dropped at the task
+    level - the position a conflict-forced pause must not leave open. An entry is still
+    refused at the signal gates, and the per-account trading task stays off, so nothing
+    trades from here.
+    """
+    account_id = "acc-1"
+    account = LiveAccountConfig(id=account_id, broker="alpaca", name="paused account")
+    deployment = _discord_deployment("PAUSED")
+    active_adapters: dict[str, object] = {}
+    active_discord_tasks: dict[str, asyncio.Task[None]] = {}
+    listener_accounts: list[str] = []
+
+    async def _load_state():
+        return [account], [deployment]
+
+    monkeypatch.setattr(daemon, "_load_db_accounts_and_deployments", _load_state)
+    monkeypatch.setattr(daemon, "_create_adapter_for_account", lambda _a, **_k: None)
+
+    async def _connect_stub(connected_id, *_args, **_kwargs):
+        adapter = _TrackingAdapter()
+        active_adapters[connected_id] = adapter
+        return adapter
+
+    monkeypatch.setattr(daemon, "_ensure_adapter_for_active_account", _connect_stub)
+
+    async def _listener_stub(listener_id, *_args, **_kwargs):
+        listener_accounts.append(listener_id)
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(daemon, "_run_discord_listener_with_retries", _listener_stub)
+
+    async def _stop_after_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            daemon.sync_deployments_loop(
+                active_adapters,
+                {},
+                active_discord_tasks,
+                accounts_env=Path("/nonexistent/accounts.env"),
+                interval_seconds=0,
+            )
+        )
+    started_tasks = list(active_discord_tasks.values())
+    for task in started_tasks:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        asyncio.gather(*started_tasks)
+
+    assert account_id in active_adapters, "a paused account has no adapter to close with"
+    assert account_id in active_discord_tasks
+    assert listener_accounts == [account_id]
 
 
 def test_discord_auth_error_detector_matches_improper_token_message() -> None:
