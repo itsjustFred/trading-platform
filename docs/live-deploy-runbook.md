@@ -264,13 +264,55 @@ reuses its hashing and atomic-write helpers. A missing, unreadable or malformed
 ledger, a missing strategy file or unreadable `STRATEGY_META`, an unknown
 processor: all mean `experimental`, and the deployment is refused on real money.
 
+### The evidence files are re-hashed on every check (#260)
+
+A promotion also records the **path and SHA256 of each of the three evidence
+files**: the optimization result, the paper-trading report and the parity
+report. They are re-opened and re-hashed every time the promotion is checked,
+so a result or a report edited after the promotion -- or deleted -- makes the
+code `experimental` again, exactly like a changed strategy file. Without that,
+the verdict could stand on a file nobody had looked at since the promotion.
+
+- An evidence file inside the repository is recorded as a repository-relative
+  POSIX path, so the ledger stays portable across checkouts.
+- An evidence file outside the repository (a data directory, a machine-local
+  report) is recorded absolutely, and only verifies where that file still
+  exists: a promotion is then in force only on the machine that recorded it. That
+  is the safest reading available -- the alternative would be a path nothing can
+  resolve elsewhere, recorded as if it could.
+- The optimizer writes its result to `DATA_DIR/optimizations` (git-ignored, so
+  `<repo>/data/optimizations` while `DATA_DIR` is unset), so a machine that trades
+  real money needs that data directory: without the recorded files the promotion
+  is refused there rather than waved through. `runner/portfolio_optimizer.py`
+  still writes its own hardcoded `<repo>/data/optimizations` and ignores a
+  configured `DATA_DIR`, so check where the tool that produced the result put it
+  -- the recorded path is the one every check re-hashes.
+- Ledgers written before #260 record the file *names* only. Such a record cannot
+  be re-verified, so it is refused until the promotion is recorded again with the
+  current CLI (one command, the same evidence): the new record replaces the old
+  one for the same parameter set, and records of other parameter sets are kept.
+  A promotion recorded this way is what the ledger holds from then on.
+- Re-recording needs the evidence files themselves, so an evidence file that was
+  cleaned up (an old `DATA_DIR/optimizations` run, a scratch paper report) has no
+  recovery shortcut: re-run what produced it -- the optimization for the
+  out-of-sample part, the paper run for the paper report, the parity harness for
+  the parity report -- and record the promotion again with the new files. The
+  command exits non-zero naming the missing file, and writes nothing, so a
+  half-re-recorded promotion is not possible.
+- Before deploying this change, look for `*.promoted.json` ledgers (they sit next
+  to the promoted file) and re-record every one of them: each pre-#260 ledger
+  drops its deployment to `experimental` on the first check after the upgrade and
+  the daemon then refuses its entry orders until it is re-recorded. Check the
+  evidence files still exist first; the runbook of an upgrade that must not stop
+  trading is to re-record and only then restart the daemon.
+
 ### Recording a promotion (CLI only)
 
 ```bash
 uv run python -m runner.cli promote \
     --strategy example_sma \
     --promoted-by "Jane Doe" \
-    --optimization-result optimizations/opt-123.json \
+    --optimization-result data/optimizations/opt-123.json \
     --paper-account-id 10105152 --paper-broker ctrader \
     --paper-start 2026-08-01 --paper-end 2026-10-15 --paper-trades 42 \
     --paper-report docs/reports/paper_example_sma.csv \
@@ -279,12 +321,28 @@ uv run python -m runner.cli promote \
     --parity-report docs/reports/parity_example_sma.json
 ```
 
+The paths are the ones this repository uses: `data/optimizations` is
+`DATA_DIR/optimizations` with `DATA_DIR` unset (the default) -- pass the path the
+optimizer actually wrote wherever `DATA_DIR` points.
+
+An evidence file no other checkout can see makes a promotion that is not
+portable: the ledger has to be committed and its evidence files have to exist
+where the ledger is in force. This repository ignores every `*.csv`, so the
+`--paper-report` above is git-ignored and a promotion recorded with it would be
+refused on the next clone. Such a report belongs outside the repository (recorded
+absolutely, in force on that machine only) or as a copy that git tracks.
+
 For a signal bot use `--signal-processor ramjet` and pass the deployment's
 `signal_processor_config` as `--params '{...}'` (`--params` is refused for a
 strategy). The out-of-sample evidence is read from the result file, not typed
-in. Both report files must exist; their SHA256 is recorded. Every argument is
-mandatory, and the command exits non-zero without writing anything if any
-evidence is missing or below a threshold.
+in. All three files must exist; their path and SHA256 are recorded and re-hashed
+on every check. Every argument is mandatory, and the command exits non-zero
+without writing anything if any evidence is missing, below a threshold, or
+cannot be named for the ledger.
+
+Re-record a promotion that was made before #260 (same command, same evidence)
+to bind the evidence files; see "The evidence files are re-hashed on every
+check" above.
 
 ### Enforcement points (fail closed)
 

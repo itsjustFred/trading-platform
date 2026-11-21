@@ -32,9 +32,11 @@ keys, because a typo there would silently leave a default in force.
 
 The recorded evidence is re-validated on every check against the thresholds in
 force, so a hand-edited ledger whose recorded numbers the checks would refuse
-does not pass. The check does not re-open the optimization result or the
-reports that evidence names: their SHA256s are recorded for audit and are not
-re-verified when the promotion is checked.
+does not pass. Each piece of evidence also names the file it was read from, and
+that file is re-opened and re-hashed on every check (#260): a missing or
+unreadable file, or one byte of change, means ``experimental``. A record that
+does not name its evidence files -- written before #260 -- cannot be
+re-verified, so it is refused until the promotion is recorded again.
 
 This module only knows files, parameters and ledgers. What a live deployment
 hashes and which parameters it binds is decided in
@@ -106,6 +108,19 @@ def _require_number(value: Any, label: str) -> float:
     if not math.isfinite(number):
         raise InvalidPromotionError(f"{label} must be finite")
     return number
+
+
+def _recorded_path(data: Mapping[str, Any], key: str) -> str:
+    """A recorded evidence path: absent or empty reads as "", a non-string is malformed.
+
+    An empty path is not refused here: :meth:`PromotionEvidence.missing_evidence_paths`
+    reports it, with its key and the recovery, as a record that does not name its
+    file.
+    """
+    value = data.get(key, "")
+    if not isinstance(value, str):
+        raise InvalidPromotionError(f"'{key}' must be a string")
+    return value.strip()
 
 
 def _require_sha256(data: Mapping[str, Any], key: str) -> str:
@@ -279,6 +294,8 @@ class OutOfSampleEvidence:
     test_end: str
     test_trade_count: int
     overfitting_passed: bool
+    #: Where the result file is, in :func:`recorded_evidence_path` form (#260).
+    result_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -300,6 +317,7 @@ class OutOfSampleEvidence:
             test_end=_require_text(data, "test_end"),
             test_trade_count=_require_int(data, "test_trade_count"),
             overfitting_passed=passed,
+            result_path=_recorded_path(data, "result_path"),
         )
 
     def problems(
@@ -361,6 +379,8 @@ class PaperTradingEvidence:
     trade_count: int
     report_file: str
     report_sha256: str
+    #: Where the report file is, in :func:`recorded_evidence_path` form (#260).
+    report_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -377,6 +397,7 @@ class PaperTradingEvidence:
             trade_count=_require_int(data, "trade_count"),
             report_file=_require_text(data, "report_file"),
             report_sha256=_require_sha256(data, "report_sha256"),
+            report_path=_recorded_path(data, "report_path"),
         )
 
     def problems(self, thresholds: PromotionThresholds, *, now: datetime) -> list[str]:
@@ -412,12 +433,15 @@ class ParityEvidence:
     deviations: Mapping[str, float]
     report_file: str
     report_sha256: str
+    #: Where the report file is, in :func:`recorded_evidence_path` form (#260).
+    report_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "reference": self.reference,
             "deviations": dict(self.deviations),
             "report_file": self.report_file,
+            "report_path": self.report_path,
             "report_sha256": self.report_sha256,
         }
 
@@ -438,6 +462,7 @@ class ParityEvidence:
             deviations=deviations,
             report_file=_require_text(data, "report_file"),
             report_sha256=_require_sha256(data, "report_sha256"),
+            report_path=_recorded_path(data, "report_path"),
         )
 
     def problems(self, thresholds: PromotionThresholds) -> list[str]:
@@ -504,6 +529,36 @@ class PromotionEvidence:
             *self.parity.problems(thresholds),
         ]
 
+    def missing_evidence_paths(self) -> list[str]:
+        """Ledger keys of the evidence parts whose file path is not recorded."""
+        missing: list[str] = []
+        if not self.out_of_sample.result_path:
+            missing.append("out_of_sample.result_path")
+        if not self.paper_trading.report_path:
+            missing.append("paper_trading.report_path")
+        if not self.parity.report_path:
+            missing.append("parity.report_path")
+        return missing
+
+    def file_problems(self) -> list[str]:
+        """Why the files the evidence names no longer back this promotion (#260).
+
+        Every part of the evidence is re-hashed where it was read from, so a
+        result or a report altered after the promotion -- or deleted -- refuses
+        the promotion instead of being taken on trust.
+        """
+        checks = (
+            ("out of sample", self.out_of_sample.result_path, self.out_of_sample.result_sha256),
+            ("paper trading", self.paper_trading.report_path, self.paper_trading.report_sha256),
+            ("parity", self.parity.report_path, self.parity.report_sha256),
+        )
+        found: list[str] = []
+        for label, recorded_path, expected_sha256 in checks:
+            problem = _evidence_file_problem(label, recorded_path, expected_sha256)
+            if problem is not None:
+                found.append(problem)
+        return found
+
 
 def _read_optimization_result(path: Path) -> Mapping[str, Any]:
     try:
@@ -549,7 +604,8 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
 
     Nothing here is typed in by the promoter: the verdict, the test window and
     the trade count are taken from the file the optimizer wrote (#164), and the
-    file's SHA256 is recorded so the ledger names exactly one result.
+    file's path and SHA256 are recorded so the ledger names exactly one result
+    and re-hashes it on every check (#260).
     """
     path = Path(result_path)
     payload = _read_optimization_result(path)
@@ -567,6 +623,7 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
         {
             "optimization_id": str(payload.get("id") or path.stem),
             "result_file": path.name,
+            "result_path": recorded_evidence_path(path),
             "result_sha256": _sha256_of(path),
             # Only the file name: results record an absolute path of the
             # machine that ran them. Both separators are handled by hand so a
@@ -581,12 +638,64 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
     )
 
 
-def report_reference(report_path: Path | str) -> tuple[str, str]:
-    """``(file name, sha256)`` of an evidence report, which has to exist."""
+def recorded_evidence_path(path: Path | str) -> str:
+    """The ledger form of an evidence file path.
+
+    Repository-relative POSIX when the file is inside the repository, so the
+    ledger stays portable: every checkout of the repository resolves it to the
+    same file. A file outside the repository is recorded absolutely, and only
+    verifies where that file still exists -- a promotion is then in force only
+    on the machine that recorded it, which is the safest available reading of
+    evidence the repository cannot carry.
+    """
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _evidence_file(recorded_path: str) -> Path:
+    """The file a recorded evidence path names, resolved at check time.
+
+    An absolute path stands for itself; a relative one is resolved against the
+    repository root of the process that runs the check.
+    """
+    return PROJECT_ROOT.joinpath(Path(recorded_path))
+
+
+def _evidence_file_problem(label: str, recorded_path: str, expected_sha256: str) -> str | None:
+    """Why the file this evidence names no longer backs it, or ``None`` if it does.
+
+    The ledger is hand-editable JSON, so a recorded path can be anything at all:
+    a path the OS cannot even resolve (an embedded NUL raises ``ValueError`` on
+    open, not ``OSError``), a directory, a device or a FIFO. Every one of those is
+    reported as a reason -- :func:`promotion_status` promises never to raise for
+    bad input -- and a file is only opened once it is known to be a regular file,
+    so opening a FIFO cannot wedge the caller (the daemon runs this check on every
+    entry order).
+    """
+    path = _evidence_file(recorded_path)
+    try:
+        if not path.is_file():
+            return f"{label}: the evidence file {recorded_path} is missing or unreadable"
+        actual = _sha256_of(path)
+    except (OSError, ValueError) as exc:
+        return (
+            f"{label}: the evidence file {recorded_path} is missing or unreadable "
+            f"({type(exc).__name__})"
+        )
+    if actual != expected_sha256:
+        return f"{label}: the evidence file {recorded_path} changed after the promotion"
+    return None
+
+
+def report_reference(report_path: Path | str) -> tuple[str, str, str]:
+    """``(file name, recorded path, sha256)`` of an evidence report, which has to exist."""
     path = Path(report_path)
     if not path.is_file():
         raise InvalidPromotionError(f"evidence report not found: {path}")
-    return path.name, _sha256_of(path)
+    return path.name, recorded_evidence_path(path), _sha256_of(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -656,6 +765,18 @@ def _record_problem(
         return f"the promotion record is malformed: {exc}"
     if promoted_at > now + _FUTURE_SKEW:
         return "the promotion record is dated in the future"
+    unbound = evidence.missing_evidence_paths()
+    if unbound:
+        # Written before #260: the evidence was named (result_file / report_file)
+        # but its path was not recorded, so nothing can be re-verified. Refused
+        # until the promotion is recorded again.
+        return (
+            "the record does not name the file(s) its evidence was read from "
+            f"({', '.join(unbound)}); record the promotion again with the current CLI"
+        )
+    file_problems = evidence.file_problems()
+    if file_problems:
+        return "the recorded evidence files no longer match: " + "; ".join(file_problems)
     problems = evidence.problems(
         thresholds,
         kind=kind,
@@ -777,10 +898,11 @@ def promote(
 ) -> dict[str, Any]:
     """Record a promotion of the current content of ``path`` with ``parameters``.
 
-    Refuses (``InvalidPromotionError``) unless the reviewer is named and all
-    three pieces of evidence are present and meet the thresholds in force. A
-    promotion of the same parameter set replaces the earlier one; promotions of
-    a previous version of the file are dropped, they can never match again.
+    Refuses (``InvalidPromotionError``) unless the reviewer is named, every
+    piece of evidence names the file it was read from, and all of them are
+    present and meet the thresholds in force. A promotion of the same parameter
+    set replaces the earlier one; promotions of a previous version of the file
+    are dropped, they can never match again.
     """
     target = Path(path)
     if kind not in PROMOTION_KINDS:
@@ -790,6 +912,14 @@ def promote(
     reviewer = _valid_reviewer(promoted_by)
     if not isinstance(evidence, PromotionEvidence):
         raise InvalidPromotionError("evidence must be a complete PromotionEvidence")
+    unbound = evidence.missing_evidence_paths()
+    if unbound:
+        # Without the path there is nothing to re-hash on the next check, so the
+        # promotion would be a promise about a file nobody can find again.
+        raise InvalidPromotionError(
+            "the promotion evidence must name the file each part was read from, "
+            f"missing: {', '.join(unbound)}"
+        )
     active_thresholds = thresholds or load_promotion_thresholds()
     moment = _utc_now(now)
 
@@ -798,13 +928,16 @@ def promote(
     bound_parameters_sha256 = parameters_hash(bound_parameters)
     # Round-trip through the ledger form so exactly what is written is checked.
     recorded_evidence = PromotionEvidence.from_mapping(evidence.to_dict())
-    problems = recorded_evidence.problems(
-        active_thresholds,
-        kind=kind,
-        file_name=target.name,
-        parameters_sha256=bound_parameters_sha256,
-        now=moment,
-    )
+    problems = [
+        *recorded_evidence.file_problems(),
+        *recorded_evidence.problems(
+            active_thresholds,
+            kind=kind,
+            file_name=target.name,
+            parameters_sha256=bound_parameters_sha256,
+            now=moment,
+        ),
+    ]
     if problems:
         raise InvalidPromotionError("promotion refused: " + "; ".join(problems))
 

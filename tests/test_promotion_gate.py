@@ -7,7 +7,10 @@ Enforcement-point tests (preflight, daemon, viewer) live in
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +28,6 @@ from runner.promotion_cli import record_promotion
 from runner.promotion_gate import (
     LEDGER_VERSION,
     InvalidPromotionError,
-    OutOfSampleEvidence,
     PaperTradingEvidence,
     ParityEvidence,
     PromotionEvidence,
@@ -38,8 +40,11 @@ from runner.promotion_gate import (
     parameters_hash,
     promote,
     promotion_status,
+    recorded_evidence_path,
+    require_promoted,
 )
 from shared.models import LiveDeploymentConfig
+from tests.conftest import TEST_DATA_DIR
 
 STRATEGY_NAME = "alpha"
 DEFAULTS = {"fast": 10, "slow": 30, "mode": "trend"}
@@ -52,7 +57,8 @@ STRATEGY_SOURCE = (
     "def generate_signals(data, params):\n"
     "    return data\n"
 )
-_SHA = "a" * 64
+#: Where the evidence files of a promotion are written by :func:`good_evidence`.
+EVIDENCE_SUBDIR = "evidence"
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +84,30 @@ def make_signal_bots_root(root: Path) -> Path:
     return root
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+#: Evidence root for the callers that have no ``tmp_path`` of their own. It lives in the
+#: suite's throwaway ``DATA_DIR`` (``tests/conftest.py``), which is per-process and
+#: removed at exit, so a test never writes outside ``tmp_path`` or ``DATA_DIR``.
+_EVIDENCE_SCRATCH_ROOT = TEST_DATA_DIR / "promotion-evidence"
+
+
+def _evidence_scratch_dir() -> Path:
+    """A unique directory for the evidence files of one promotion.
+
+    The ledger records the path and the hash of every evidence file, so evidence
+    whose files do not exist cannot be recorded or re-checked. Callers that
+    tamper with the files pass a directory under ``tmp_path`` instead; this
+    scratch tree serves the ones that have none and goes with the session data
+    directory.
+    """
+    directory = _EVIDENCE_SCRATCH_ROOT / uuid.uuid4().hex
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def good_evidence(
     *,
     strategy_file: str = f"{STRATEGY_NAME}.py",
@@ -89,45 +119,78 @@ def good_evidence(
     paper_days: int = 70,
     paper_trades: int = 40,
     deviations: dict[str, float] | None = None,
+    evidence_dir: Path | None = None,
 ) -> PromotionEvidence:
+    """Evidence whose files exist, so the ledger can record and re-hash them (#260)."""
     moment = now or datetime.now(timezone.utc)
+    directory = evidence_dir if evidence_dir is not None else _evidence_scratch_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    bound = DEFAULTS if parameters is None else parameters
     test_end = moment - timedelta(days=100)
-    return PromotionEvidence(
-        out_of_sample=OutOfSampleEvidence(
-            optimization_id="opt-1",
-            result_file="opt-1.json",
-            result_sha256=_SHA,
-            strategy_file=strategy_file,
-            parameters_sha256=parameters_hash(DEFAULTS if parameters is None else parameters),
-            test_start=(test_end - timedelta(days=test_days)).isoformat(),
-            test_end=test_end.isoformat(),
-            test_trade_count=test_trades,
-            overfitting_passed=overfitting_passed,
+    # The payload shape the optimizer writes (#164), so the out-of-sample part
+    # is read off the file exactly as the CLI reads it, hash and path included.
+    result_path = directory / "opt-1.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "id": "opt-1",
+                "strategy": {"path": f"/work/strategies/{strategy_file}"},
+                "effective_best_parameters": bound,
+                "final_test_period": {
+                    "start": (test_end - timedelta(days=test_days)).isoformat(),
+                    "end": test_end.isoformat(),
+                },
+                "final_test_stats": {"total_trades": test_trades},
+                "three_way": {"overfitting": {"passed": overfitting_passed}},
+            }
         ),
+        encoding="utf-8",
+    )
+    paper_report = directory / "paper.csv"
+    paper_report.write_text("trade_id,pnl\n1,0.4\n", encoding="utf-8")
+    parity_report = directory / "parity.json"
+    parity_report.write_text(json.dumps({"total_return": 0.01}), encoding="utf-8")
+    return PromotionEvidence(
+        out_of_sample=out_of_sample_evidence_from_result(result_path),
         paper_trading=PaperTradingEvidence(
             account_id="paper-1",
             broker="ctrader",
             start=(moment - timedelta(days=paper_days + 1)).isoformat(),
             end=(moment - timedelta(days=1)).isoformat(),
             trade_count=paper_trades,
-            report_file="paper.csv",
-            report_sha256=_SHA,
+            report_file=paper_report.name,
+            report_path=recorded_evidence_path(paper_report),
+            report_sha256=_sha256(paper_report),
         ),
         parity=ParityEvidence(
             reference="lean",
             deviations={"total_return": 0.01} if deviations is None else deviations,
-            report_file="parity.json",
-            report_sha256=_SHA,
+            report_file=parity_report.name,
+            report_path=recorded_evidence_path(parity_report),
+            report_sha256=_sha256(parity_report),
         ),
     )
 
 
-def promote_strategy_file(strategies_dir: Path, name: str = STRATEGY_NAME) -> dict[str, Any]:
+def promote_strategy_file(
+    strategies_dir: Path,
+    name: str = STRATEGY_NAME,
+    evidence_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Promote one strategy file, its evidence in a directory of its own.
+
+    The default is per kind (``evidence/strategy``), so promoting a strategy and
+    a signal bot in the same test cannot have one overwrite the other's files.
+    """
     return promote(
         strategies_dir / name / f"{name}.py",
         kind="strategy",
         parameters=DEFAULTS,
-        evidence=good_evidence(strategy_file=f"{name}.py"),
+        evidence=good_evidence(
+            strategy_file=f"{name}.py",
+            evidence_dir=evidence_dir
+            or strategies_dir.parent / EVIDENCE_SUBDIR / "strategy",
+        ),
         promoted_by="Fred (reviewer)",
         root=strategies_dir,
     )
@@ -158,14 +221,18 @@ def ramjet_deployment(processor_config: dict[str, Any] | None = None) -> LiveDep
     )
 
 
-def promote_ramjet_bot() -> Any:
+def promote_ramjet_bot(evidence_dir: Path | None = None) -> Any:
     """Promote the ramjet signal bot of the ``bots_root`` tree (no processor overrides)."""
     target = deployment_promotion_target(ramjet_deployment())
     promote(
         target.path,
         kind=target.kind,
         parameters=target.parameters,
-        evidence=good_evidence(strategy_file="ramjet_strategy.py"),
+        evidence=good_evidence(
+            strategy_file="ramjet_strategy.py",
+            evidence_dir=evidence_dir
+            or target.root.parent / EVIDENCE_SUBDIR / "signal-bot",
+        ),
         promoted_by="Fred (reviewer)",
         root=target.root,
     )
@@ -965,3 +1032,306 @@ def test_cli_promote_command_is_registered_and_exits_non_zero_on_refusal(
         parsed.func(parsed)
     assert excinfo.value.code == 1
     assert "Promotion refused" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# The evidence files are re-hashed on every check (#260)
+# --------------------------------------------------------------------------- #
+
+
+def _strip_evidence_paths(ledger: Path) -> None:
+    """Drop the recorded evidence paths: how a ledger written before #260 reads."""
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    for record in data["promotions"]:
+        for section in record["evidence"].values():
+            section.pop("result_path", None)
+            section.pop("report_path", None)
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_the_ledger_records_the_path_of_every_evidence_file(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The ledger names the file each piece of evidence was read from (#260)."""
+    record = record_promotion(_cli_args(tmp_path))["record"]
+    evidence = record["evidence"]
+    assert evidence["out_of_sample"].get("result_path") == (
+        _optimizer_result(tmp_path).resolve().as_posix()
+    )
+    paper_report = (tmp_path / "paper.csv").resolve().as_posix()
+    parity_report = (tmp_path / "parity.json").resolve().as_posix()
+    assert evidence["paper_trading"].get("report_path") == paper_report
+    assert evidence["parity"].get("report_path") == parity_report
+    assert _status(strategies_dir).is_production
+
+
+def test_evidence_paths_are_recorded_relative_to_the_repository(
+    strategies_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger stays portable: an evidence file in the repository is recorded relatively."""
+    import runner.promotion_gate as gate
+
+    monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
+    args = _cli_args(tmp_path)
+    record = record_promotion(args)["record"]
+    evidence = record["evidence"]
+    assert evidence["out_of_sample"].get("result_path") == "opt-7.json"
+    assert evidence["paper_trading"].get("report_path") == "paper.csv"
+    assert evidence["parity"].get("report_path") == "parity.json"
+    # The relative form resolves against the repository tree of the checking process.
+    assert _status(strategies_dir).is_production
+    # ... which is what fails closed when that file is gone.
+    Path(args.optimization_result).unlink()
+    assert not _status(strategies_dir).is_production
+
+
+def test_an_altered_evidence_file_refuses_the_promotion(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The files the evidence names are re-hashed, so an edit after the fact is caught (#260)."""
+    args = _cli_args(tmp_path)
+    record_promotion(args)
+    assert _status(strategies_dir).is_production
+    evidence_files = [
+        Path(args.optimization_result),
+        Path(args.paper_report),
+        Path(args.parity_report),
+    ]
+    originals = {path: path.read_bytes() for path in evidence_files}
+    for path in evidence_files:
+        path.write_bytes(path.read_bytes() + b" ")
+        status = _status(strategies_dir)
+        assert not status.is_production, path.name
+        assert "changed after the promotion" in status.reason, path.name
+        path.write_bytes(originals[path])
+    # Restoring the bytes restores the promotion: the check is a re-hash, not a one-way trip.
+    assert _status(strategies_dir).is_production
+
+
+def test_an_altered_evidence_file_refuses_a_promotion_recorded_through_the_api(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The same re-hash on the direct ``promote`` path, without the CLI."""
+    evidence_dir = tmp_path / EVIDENCE_SUBDIR
+    promote_strategy_file(strategies_dir, evidence_dir=evidence_dir)
+    assert _status(strategies_dir).is_production
+    paper_report = evidence_dir / "paper.csv"
+    paper_report.write_text("trade_id,pnl\n1,0.9\n", encoding="utf-8")
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "paper trading" in status.reason
+
+
+def test_promotion_refuses_an_evidence_file_that_vanished_before_recording(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """Exactly what is written is checked, so the file must still be there to record it."""
+    evidence_dir = tmp_path / EVIDENCE_SUBDIR
+    evidence = good_evidence(evidence_dir=evidence_dir)
+    (evidence_dir / "opt-1.json").unlink()
+    with pytest.raises(InvalidPromotionError, match="missing or unreadable"):
+        promote(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            kind="strategy",
+            parameters=DEFAULTS,
+            evidence=evidence,
+            promoted_by="Fred",
+            root=strategies_dir,
+        )
+    assert not ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py").exists()
+
+
+def test_a_missing_evidence_file_refuses_the_promotion(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    args = _cli_args(tmp_path)
+    record_promotion(args)
+    assert _status(strategies_dir).is_production
+    Path(args.parity_report).unlink()
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+
+
+def test_an_evidence_path_that_cannot_be_a_path_is_refused_not_raised(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """A hand-edited ledger is bad input: ``promotion_status`` refuses it, it does not raise.
+
+    The function promises "never raises for bad input", and only
+    ``StrategyNotPromotedError`` is caught on the live paths (preflight, daemon
+    entry preparation, viewer). A recorded path with an embedded NUL makes
+    ``read_bytes`` raise ``ValueError``: it has to be reported as ``experimental``.
+    """
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path="a\x00b"))
+    status = _status(strategies_dir)
+    assert status.stage == "experimental"
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+    assert "a\x00b" in status.reason
+    # The one enforcement function refuses instead of crashing the caller.
+    with pytest.raises(StrategyNotPromotedError, match="experimental"):
+        require_promoted(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            DEFAULTS,
+            kind="strategy",
+            root=strategies_dir,
+        )
+
+
+def test_an_evidence_path_that_names_a_directory_is_refused(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """Only a regular file backs a promotion: a directory is "missing or unreadable" too."""
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(
+        strategies_dir,
+        lambda r: r["evidence"]["parity"].update(report_path=str(tmp_path)),
+    )
+    status = _status(strategies_dir)
+    assert not status.is_production
+    # Exactly that reason: opening it failed is reported with the exception's
+    # type name, and "not a regular file" is not an exception at all.
+    assert status.reason.endswith("is missing or unreadable")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions")
+def test_an_unreadable_evidence_file_reports_what_went_wrong(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """A file that exists but cannot be read keeps the cause the sibling keeps."""
+    record_promotion(_cli_args(tmp_path))
+    report = tmp_path / "parity.json"
+    report.chmod(0o000)
+    try:
+        status = _status(strategies_dir)
+    finally:
+        report.chmod(0o644)
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+    assert "PermissionError" in status.reason
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_an_evidence_path_that_names_a_fifo_is_refused_without_reading_it(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """Opening a FIFO blocks until a writer appears: the check must not open one.
+
+    The daemon runs this check on every entry order, so a hand-edited ledger
+    naming a FIFO must not wedge the money path.
+    """
+    fifo = tmp_path / "parity-fifo"
+    os.mkfifo(fifo)
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(
+        strategies_dir,
+        lambda r: r["evidence"]["parity"].update(
+            report_path=recorded_evidence_path(fifo),
+            report_sha256=_sha256(tmp_path / "parity.json"),
+        ),
+    )
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+
+
+def test_a_record_that_does_not_name_its_evidence_files_is_refused(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """A ledger written before #260 cannot be re-verified, so it is refused until re-recorded."""
+    record_promotion(_cli_args(tmp_path))
+    _strip_evidence_paths(ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py"))
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "does not name the file" in status.reason
+    assert "record the promotion again" in status.reason
+
+
+def test_a_record_with_an_evidence_path_of_the_wrong_type_is_malformed(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path=42))
+    status = _status(strategies_dir)
+    assert not status.is_production
+    # The classification, not only the refusal: a coerced path would fail later
+    # with a different reason.
+    assert "malformed" in status.reason
+    assert "'report_path' must be a string" in status.reason
+
+
+def test_an_empty_evidence_path_is_a_record_that_does_not_name_its_file(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """``""`` and absent read the same: the record does not name its file."""
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path=""))
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "does not name the file" in status.reason
+    assert "parity.report_path" in status.reason
+
+
+def test_promoting_a_strategy_and_a_bot_keeps_both_promotions(
+    strategies_dir: Path, bots_root: Path
+) -> None:
+    """Two promotions in one test keep their own evidence files.
+
+    The helpers share a ``tmp_path``, so an evidence directory they shared would
+    have the second promotion overwrite the first's files -- and the first
+    re-check would then refuse it.
+    """
+    promote_strategy_file(strategies_dir)
+    target = promote_ramjet_bot()
+    assert _status(strategies_dir).is_production
+    assert (
+        promotion_status(
+            target.path, target.parameters, kind=target.kind, root=target.root
+        ).is_production
+    )
+
+
+def test_a_recorded_path_round_trips_through_the_repository_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ledger form of a path is portable: POSIX separators, root-relative.
+
+    ``pytest`` only runs on the Linux leg of CI, so this is the standing guard
+    for the path handling on every platform: a repository file is recorded
+    relative, with forward slashes (what ``PureWindowsPath.as_posix`` produces on
+    Windows), and the relative form resolves back against the repository root of
+    the checking process while an absolute one stands for itself.
+    """
+    import runner.promotion_gate as gate
+
+    monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
+    evidence = tmp_path / "evidence" / "nested.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text("{}", encoding="utf-8")
+    recorded = recorded_evidence_path(evidence)
+    assert recorded == "evidence/nested.json"
+    assert "\\" not in recorded
+    assert gate._evidence_file(recorded) == evidence
+    outside = tmp_path.parent / "outside.json"
+    absolute = recorded_evidence_path(outside)
+    assert Path(absolute).is_absolute()
+    assert gate._evidence_file(absolute) == outside
+
+
+def test_promotion_refuses_evidence_that_does_not_name_its_file(strategies_dir: Path) -> None:
+    """Recording a promotion has to name the file each part was read from (#260)."""
+    data = good_evidence().to_dict()
+    data["out_of_sample"]["result_path"] = ""
+    evidence = PromotionEvidence.from_mapping(data)
+    with pytest.raises(InvalidPromotionError, match="name the file"):
+        promote(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            kind="strategy",
+            parameters=DEFAULTS,
+            evidence=evidence,
+            promoted_by="Fred",
+            root=strategies_dir,
+        )
+    assert not ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py").exists()
