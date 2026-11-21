@@ -479,6 +479,36 @@ class TestInstall:
         backend.wait_for(1)
         assert backend.sent[0]["message"] == "shutdown error"
 
+    def test_daemon_startup_failure_still_delivers_one_alert(
+        self, monkeypatch, tmp_path
+    ):
+        """A crash before the main loop must page and must not leak the sink."""
+        import asyncio
+
+        import live_runner.daemon as daemon_module
+
+        backend = FakeBackend()
+        assert install_alert_sink(sink=_sink(backend)) is not None
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("accounts database is on fire")
+
+        monkeypatch.setattr(
+            daemon_module, "_discover_and_register_discord_services", _boom
+        )
+        with pytest.raises(RuntimeError, match="accounts database is on fire"):
+            asyncio.run(
+                daemon_module.run_daemon(accounts_env=tmp_path / "accounts.env")
+            )
+        backend.wait_for(1)
+        time.sleep(0.2)
+        assert len(backend.sent) == 1
+        assert backend.sent[0]["message"] == "Live daemon failed to start"
+        assert "RuntimeError" in backend.sent[0]["exception"]
+        # run_daemon's finally closed the sink; nothing stays installed.
+        assert alerts._ALERT_SINK is None
+        assert alerts._ALERT_HANDLER is None
+
 
 class TestFormatting:
     def test_format_includes_level_service_location_and_data(self):
