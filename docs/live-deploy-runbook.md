@@ -33,12 +33,19 @@ sourced `.accounts.env` / a systemd `EnvironmentFile`.
   same marker and scope is still suppressed until the window expires. For records without a
   marker the key is logger + level + message template (not the formatted message) plus the same
   scope identifiers.
+- `OPS_ALERT_MIN_LEVEL` (default `ERROR`) — minimum level for level-triggered alerts, as a level
+  name (`CRITICAL`) or number. Raise it to `CRITICAL` to page only on emergencies; an explicit
+  `data.alert` marker still bypasses the floor because it is a deliberate operator alert. An
+  invalid value falls back to `ERROR` rather than muting the channel.
+- `OPS_ALERT_EVENTS` (unset = everything) — comma-separated allowlist of event classes. An entry
+  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name (e.g.
+  `trading.live.daemon`); when set, only matching records page, so routine errors can be filtered
+  without touching call sites. The allowlist applies to markers too.
 
-What is alerted: every `ERROR`/`CRITICAL` record, plus any record carrying `data.alert` (the
-explicit operator-alert marker, e.g. `exit_ledger_mismatch`) at any level — `data.alert` markers
-route even when `LOG_LEVEL` would keep the record out of the file/console output. Which specific
-events should page — and whether WARNING-level refusals should join them — is an open maintainer
-decision tracked on the issue; the handler makes that a filter change, not a call-site change.
+What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
+any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
+at any level — `data.alert` markers route even when `LOG_LEVEL` would keep the record out of the
+file/console output — filtered by `OPS_ALERT_EVENTS` when that allowlist is set.
 
 Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
 webhook drops and counts alerts; it can never block or raise into a trading path. A failed send

@@ -378,6 +378,147 @@ class TestLogHandler:
             sink.close()
 
 
+class TestFiltering:
+    """OPS_ALERT_MIN_LEVEL / OPS_ALERT_EVENTS: routine errors can be filtered
+    without touching call sites. Default stays "every ERROR pages"."""
+
+    def test_min_level_filters_below_threshold(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink, min_level=logging.CRITICAL)
+        logger = logging.getLogger("trading.test-alerts-minlevel")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            logger.error("routine error")
+            logger.critical("real emergency")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["level"] for a in backend.sent] == ["CRITICAL"]
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
+    def test_alert_marker_bypasses_the_level_floor(self):
+        """A deliberate ``data.alert`` marker is not a routine error: it pages
+        even when MIN_LEVEL is raised above the record's own level."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink, min_level=logging.CRITICAL)
+        logger = logging.getLogger("trading.test-alerts-marker-floor")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            logger.warning(
+                "deliberate marker", extra={"data": {"alert": "m1"}}
+            )
+            backend.wait_for(1)
+            assert backend.sent[0]["alert"] == "m1"
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
+    def test_events_allowlist_matches_marker_or_logger_name(self):
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink, allowed_events=frozenset({"exit_ledger_mismatch"})
+        )
+        marked = logging.getLogger("trading.test-alerts-allow-marked")
+        plain = logging.getLogger("trading.test-alerts-allow-plain")
+        for logger in (marked, plain):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+            logger.addHandler(handler)
+        try:
+            plain.error("routine error")
+            marked.error(
+                "ledger gap", extra={"data": {"alert": "exit_ledger_mismatch"}}
+            )
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a.get("alert") for a in backend.sent] == [
+                "exit_ledger_mismatch"
+            ]
+        finally:
+            for logger in (marked, plain):
+                logger.removeHandler(handler)
+            sink.close()
+
+    def test_events_allowlist_matches_the_logger_name(self):
+        """Listing a logger name allows every alert-worthy record it emits."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink, allowed_events=frozenset({"trading.test-alerts-allow-logger"})
+        )
+        allowed = logging.getLogger("trading.test-alerts-allow-logger")
+        other = logging.getLogger("trading.test-alerts-allow-other")
+        for logger in (allowed, other):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+            logger.addHandler(handler)
+        try:
+            other.error("filtered out")
+            allowed.error("pages")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["message"] for a in backend.sent] == ["pages"]
+        finally:
+            for logger in (allowed, other):
+                logger.removeHandler(handler)
+            sink.close()
+
+    def test_invalid_min_level_falls_back_to_error(self):
+        assert alerts._parse_min_level("bogus") == logging.ERROR
+        assert alerts._parse_min_level("") == logging.ERROR
+        assert alerts._parse_min_level("critical") == logging.CRITICAL
+        assert alerts._parse_min_level("30") == logging.WARNING
+        assert alerts._parse_min_level(None) == logging.ERROR
+
+    def test_empty_events_value_means_no_allowlist(self):
+        assert alerts._parse_event_allowlist(None) is None
+        assert alerts._parse_event_allowlist("") is None
+        assert alerts._parse_event_allowlist(" , ") is None
+        assert alerts._parse_event_allowlist(" a, b ,,c ") == frozenset(
+            {"a", "b", "c"}
+        )
+
+    def test_install_reads_the_filter_from_env(self):
+        backend = FakeBackend()
+        # Loggers must exist before install: the handler attach scans the
+        # loggerDict once, it does not retro-fit later getLogger() calls.
+        denied = logging.getLogger("trading.test-alerts-env-denied")
+        allowed = logging.getLogger("trading.test-alerts-env-allowed")
+        for logger in (denied, allowed):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+        sink = install_alert_sink(
+            sink=_sink(backend),
+            env={
+                "OPS_ALERT_MIN_LEVEL": "CRITICAL",
+                "OPS_ALERT_EVENTS": "trading.test-alerts-env-allowed",
+            },
+        )
+        assert sink is not None
+        try:
+            denied.error("filtered by allowlist")
+            allowed.error("filtered by level? no - ERROR < CRITICAL")
+            allowed.critical("pages")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["message"] for a in backend.sent] == ["pages"]
+        finally:
+            alerts._reset_for_tests()
+
+
 class TestInstall:
     def test_disabled_without_webhook_env(self):
         assert create_sink_from_env(env={}) is None

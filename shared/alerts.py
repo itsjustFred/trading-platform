@@ -20,6 +20,14 @@ Design constraints, all deliberate for a live-trading process:
   sink is installed at all; logging behaviour is exactly what it was before.
   The backend is pluggable so tests (and a future non-Discord channel) inject
   a fake.
+- **Configurable filtering.** ``OPS_ALERT_MIN_LEVEL`` raises (or, unusually,
+  lowers) the level at which records page - default ``ERROR``, so out of the
+  box every ERROR/CRITICAL record alerts. ``OPS_ALERT_EVENTS`` is a
+  comma-separated allowlist of event classes - a record's ``data.alert``
+  marker or its logger name - and when set, only matching records page. Both
+  filters live here, so routine errors can be silenced without touching call
+  sites; an explicit ``data.alert`` marker still bypasses the level floor (it
+  is a deliberate operator alert) but not the allowlist.
 
 ``install_alert_sink`` attaches the handler to every ``trading.*`` service
 logger that exists now and, through a hook in ``shared.logging.get_logger``,
@@ -48,6 +56,13 @@ DEFAULT_MAX_PER_MINUTE = 12
 #: Identical alerts (same dedup key) are suppressed for this long.
 DEDUP_SECONDS_ENV = "OPS_ALERT_DEDUP_SECONDS"
 DEFAULT_DEDUP_SECONDS = 300.0
+#: Minimum level for level-triggered alerts: name (``ERROR``) or number.
+#: Default ERROR, so every ERROR/CRITICAL record alerts out of the box.
+MIN_LEVEL_ENV = "OPS_ALERT_MIN_LEVEL"
+DEFAULT_MIN_LEVEL = logging.ERROR
+#: Comma-separated allowlist of event classes (``data.alert`` marker or logger
+#: name). Unset/empty means every alert-worthy record may page.
+EVENTS_ENV = "OPS_ALERT_EVENTS"
 #: Bound on queued alerts; a full queue drops and counts.
 DEFAULT_QUEUE_SIZE = 256
 #: Backend call timeout. Runs on the worker thread, never on a caller.
@@ -292,18 +307,79 @@ def create_sink_from_env(
     )
 
 
+_LEVEL_NAMES = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.CRITICAL,
+}
+
+
+def _parse_min_level(value: str | None, default: int = DEFAULT_MIN_LEVEL) -> int:
+    """Level name or number; anything unrecognised falls back to ``default``.
+
+    An invalid value must not silently mute the channel, so the fallback is the
+    default (ERROR), never "alert nothing".
+    """
+    if value is None:
+        return default
+    text = str(value).strip().upper()
+    if not text:
+        return default
+    if text in _LEVEL_NAMES:
+        return _LEVEL_NAMES[text]
+    try:
+        level = int(text)
+    except ValueError:
+        return default
+    return level if level > 0 else default
+
+
+def _parse_event_allowlist(value: str | None) -> frozenset[str] | None:
+    """Comma-separated event classes; unset or empty means no allowlist."""
+    if value is None:
+        return None
+    entries = frozenset(
+        token.strip() for token in str(value).split(",") if token.strip()
+    )
+    return entries or None
+
+
+def _alert_filter_from_env(
+    values: Mapping[str, str],
+) -> tuple[int, frozenset[str] | None]:
+    return (
+        _parse_min_level(values.get(MIN_LEVEL_ENV)),
+        _parse_event_allowlist(values.get(EVENTS_ENV)),
+    )
+
+
 class AlertLogHandler(logging.Handler):
     """Routes alert-worthy records into an :class:`AlertSink`.
 
-    Alert-worthy means ERROR or CRITICAL, or any record whose ``data`` carries
-    an ``alert`` key (the explicit operator-alert marker used e.g. by
-    ``exit_ledger_mismatch``). ``emit`` never raises and never blocks: the sink
+    Alert-worthy means ``min_level`` or above (default ERROR), or any record
+    whose ``data`` carries an ``alert`` key (the explicit operator-alert
+    marker used e.g. by ``exit_ledger_mismatch``) - markers bypass the level
+    floor because they are deliberate. When ``allowed_events`` is set, the
+    record's ``data.alert`` marker or its logger name must be listed or the
+    record does not page. ``emit`` never raises and never blocks: the sink
     queue is bounded and ``put_nowait`` drops on overflow.
     """
 
-    def __init__(self, sink: AlertSink) -> None:
+    def __init__(
+        self,
+        sink: AlertSink,
+        *,
+        min_level: int = DEFAULT_MIN_LEVEL,
+        allowed_events: frozenset[str] | None = None,
+    ) -> None:
         super().__init__(level=logging.NOTSET)
         self._sink = sink
+        self._min_level = min_level
+        self._allowed_events = allowed_events
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -311,7 +387,11 @@ class AlertLogHandler(logging.Handler):
             alert_name = (
                 str(data.get("alert")) if isinstance(data, Mapping) and data.get("alert") else None
             )
-            if record.levelno < logging.ERROR and alert_name is None:
+            if alert_name is None and record.levelno < self._min_level:
+                return
+            if self._allowed_events is not None and not (
+                {alert_name, record.name} & self._allowed_events
+            ):
                 return
             # Redact before anything leaves the process: record.data and
             # getMessage() are raw, the JSON formatter only redacts at format
@@ -380,10 +460,14 @@ def install_alert_sink(
     global _ALERT_HANDLER, _ALERT_SINK
     if _ALERT_SINK is not None:
         return _ALERT_SINK
-    _ALERT_SINK = sink or create_sink_from_env(env=env)
+    values = env if env is not None else os.environ
+    _ALERT_SINK = sink or create_sink_from_env(env=values)
     if _ALERT_SINK is None:
         return None
-    _ALERT_HANDLER = AlertLogHandler(_ALERT_SINK)
+    min_level, allowed_events = _alert_filter_from_env(values)
+    _ALERT_HANDLER = AlertLogHandler(
+        _ALERT_SINK, min_level=min_level, allowed_events=allowed_events
+    )
     _ALERT_HANDLER.setFormatter(logging.Formatter("%(message)s"))
     # Loggers created through shared.logging.get_logger keep LOG_LEVEL on their
     # file/console handlers, so lowering the logger itself does not change what

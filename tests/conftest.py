@@ -30,6 +30,10 @@ os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
 # missing variables from .env, but never overrides one that is already set, and
 # create_sink_from_env treats blank as disabled.
 os.environ["OPS_ALERT_WEBHOOK_URL"] = ""
+# Same reasoning for the alert filters: a developer's environment must not
+# change which records the suite's alert-sink tests see.
+os.environ["OPS_ALERT_MIN_LEVEL"] = ""
+os.environ["OPS_ALERT_EVENTS"] = ""
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
