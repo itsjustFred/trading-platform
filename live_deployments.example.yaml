@@ -16,6 +16,14 @@ deployments:
     status: PAUSED
     signal_source: internal
     signal_config: {}
+    # Optional periodic broker reconciliation (#303). Broker state is
+    # account-level, so the strictest settings across an account's deployments
+    # win. Defaults are conservative; see docs/live-deploy-runbook.md.
+    # settings:
+    #   broker_reconciliation_interval_seconds: 300
+    #   broker_reconciliation_qty_tolerance: null   # null = adapter precision
+    #   broker_reconciliation_consecutive_mismatches: 2
+    #   broker_reconciliation_enabled: true
 
   - strategy_name: fx_breakout
     account_id: ctrader-demo

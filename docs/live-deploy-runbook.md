@@ -173,6 +173,53 @@ clean-up.
   `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
   cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
+## Periodic Broker Reconciliation (#303)
+
+The daemon runs `live_runner/broker_reconciliation.py` on the deployment sync
+snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
+
+- the signed ledger quantity per symbol (`live_executions` fills by deployment)
+  with the broker's net position for that symbol;
+- broker order ids/client order ids the ledger still expects to be working with
+  the adapter's normalized working-order view (bracket legs and attached
+  stop/target orders are marked as protection, not untracked entries/exits);
+- protective stops with open broker positions when the adapter can list them.
+
+Unreadable broker state is a mismatch (fail closed), but it must not flap: a
+deployment is paused only after `broker_reconciliation_consecutive_mismatches`
+consecutive bad passes (default `2`), and a clean pass resets the streak. The
+pause is the ordinary `PAUSED` status transition, so the existing dispatch
+claim, submission drain and STOPPED enforcement keep their semantics; exits
+remain governed by the same rules as an operator pause.
+
+Settings live in deployment `settings` (see `live_deployments.example.yaml`).
+Broker state is account-level, so the strictest values across an account's
+deployments win:
+
+- `broker_reconciliation_interval_seconds` (default `300`, bounds 30-86400)
+- `broker_reconciliation_qty_tolerance` (`null` = adapter precision, strict
+  default when unknown)
+- `broker_reconciliation_consecutive_mismatches` (default `2`, bounds 1-10)
+- `broker_reconciliation_enabled` (default `true`; the account reconciles unless
+  every deployment on it opts out)
+
+The latest pass is written to
+`$DATA_DIR/live/broker_reconciliation_report.json` and served read-only at
+`GET /api/live/reconciliation`. Every mismatch logs the structured diff; the
+pause threshold logs at ERROR with `alert=broker_reconciliation_mismatch`.
+
+### Open decision
+
+Interval, tolerance and the consecutive-mismatch count are maintainer decisions.
+The shipped defaults are deliberately conservative (5-minute interval, adapter
+precision or the strict 1e-9 quantity tolerance, two consecutive mismatches)
+because a false pause is recoverable while a missed broker/ledger divergence is
+not. Whether account-level mismatches should pause *all* ACTIVE deployments on
+the account (current conservative choice) or only the deployments whose ledger
+rows implicate the symbol is also open; the account-wide pause is kept because
+broker positions and working orders are netted per account and cannot be
+attributed to one deployment safely.
+
 ## Strategy Promotion Gate (#165)
 
 Only code a named human reviewer promoted to `production` may trade on a

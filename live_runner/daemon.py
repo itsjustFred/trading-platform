@@ -31,6 +31,7 @@ from live_runner.base_adapter import (
     is_unbounded_tp,
     validate_live_quote_prices,
 )
+from live_runner.broker_reconciliation import run_broker_reconciliation_loop
 from live_runner.credential_env import (
     accounts_env_mtime,
     discord_bot_env_canonical_name,
@@ -5227,9 +5228,21 @@ async def run_daemon(
     commission_task = asyncio.create_task(
         _backfill_commissions_loop(active_adapters), name="commission-backfill"
     )
+    reconciliation_task = asyncio.create_task(
+        run_broker_reconciliation_loop(
+            active_adapters,
+            current_deployments=lambda: list(deployment_snapshot),
+        ),
+        name="broker-reconciliation",
+    )
     try:
         await asyncio.gather(
-            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+            sync_task,
+            service_sync_task,
+            balance_task,
+            trailing_task,
+            commission_task,
+            reconciliation_task,
         )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
@@ -5253,6 +5266,7 @@ async def run_daemon(
             balance_task,
             trailing_task,
             commission_task,
+            reconciliation_task,
         ):
             if not task.done():
                 task.cancel()
@@ -5263,6 +5277,7 @@ async def run_daemon(
                 balance_task,
                 trailing_task,
                 commission_task,
+                reconciliation_task,
                 return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):

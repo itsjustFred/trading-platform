@@ -256,6 +256,17 @@ abgerundet** (`floor`), damit das tatsächliche Risiko nie über dem gesizten Bu
 liegt: ein Stop von 1,6 Ticks geht als 1 Tick raus. Ein Stop unter einem Tick wird
 abgelehnt (ValueError vor dem Senden), ein Take-Profit unter einem Tick wird als ein
 Tick gesendet (nie 0).
+## Periodische Broker-Reconciliation (#303)
+
+`live_runner/broker_reconciliation.py` vergleicht periodisch die lokale
+Ledger-Wahrheit (`live_executions`-Fills je Deployment) mit dem Broker-Stand je
+Account: Netto-Position je Symbol, erwartete Working Orders und protective
+Stops. Nicht lesbarer Broker-Stand gilt als Mismatch (fail closed), pausiert
+aber erst nach `broker_reconciliation_consecutive_mismatches` aufeinander
+folgenden Fehl-Pässen (Default 2); ein sauberer Pass setzt den Zähler zurück.
+Der Report liegt read-only unter `GET /api/live/reconciliation`. Details und
+offene Maintainer-Entscheidungen: `docs/live-deploy-runbook.md`.
+
 ## Implizite Divergenz
 
 Der Unterschied bei `enforce_stop_direction` führt dazu, dass:

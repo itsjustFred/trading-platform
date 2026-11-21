@@ -78,6 +78,7 @@ os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
+from live_runner.broker_reconciliation import load_reconciliation_report
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
@@ -1704,6 +1705,7 @@ _QUIET_EXACT_PATHS = {
     "/api/data/tasks",
     "/api/live/accounts",
     LIVE_DEPLOYMENTS_PATH,
+    "/api/live/reconciliation",
 }
 _QUIET_PREFIX_PATHS = (
     "/api/tasks/",
@@ -13229,6 +13231,13 @@ async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
     deployments = await asyncio.to_thread(list_live_deployments)
     return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
+
+
+@app.get("/api/live/reconciliation")
+async def get_live_broker_reconciliation() -> dict[str, Any]:
+    """Latest periodic broker-reconciliation report (#303), read-only."""
+    _log_live_endpoint_request("/api/live/reconciliation")
+    return await asyncio.to_thread(load_reconciliation_report)
 
 
 @app.get("/api/live/dashboard")
