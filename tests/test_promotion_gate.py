@@ -10,6 +10,7 @@ import argparse
 import atexit
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import uuid
@@ -43,6 +44,7 @@ from runner.promotion_gate import (
     promote,
     promotion_status,
     recorded_evidence_path,
+    require_promoted,
 )
 from shared.models import LiveDeploymentConfig
 
@@ -1142,6 +1144,71 @@ def test_a_missing_evidence_file_refuses_the_promotion(
     record_promotion(args)
     assert _status(strategies_dir).is_production
     Path(args.parity_report).unlink()
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+
+
+def test_an_evidence_path_that_cannot_be_a_path_is_refused_not_raised(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """A hand-edited ledger is bad input: ``promotion_status`` refuses it, it does not raise.
+
+    The function promises "never raises for bad input", and only
+    ``StrategyNotPromotedError`` is caught on the live paths (preflight, daemon
+    entry preparation, viewer). A recorded path with an embedded NUL makes
+    ``read_bytes`` raise ``ValueError``: it has to be reported as ``experimental``.
+    """
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path="a\x00b"))
+    status = _status(strategies_dir)
+    assert status.stage == "experimental"
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+    assert "a\x00b" in status.reason
+    # The one enforcement function refuses instead of crashing the caller.
+    with pytest.raises(StrategyNotPromotedError, match="experimental"):
+        require_promoted(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            DEFAULTS,
+            kind="strategy",
+            root=strategies_dir,
+        )
+
+
+def test_an_evidence_path_that_names_a_directory_is_refused(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """Only a regular file backs a promotion: a directory is "missing or unreadable" too."""
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(
+        strategies_dir,
+        lambda r: r["evidence"]["parity"].update(report_path=str(tmp_path)),
+    )
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_an_evidence_path_that_names_a_fifo_is_refused_without_reading_it(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """Opening a FIFO blocks until a writer appears: the check must not open one.
+
+    The daemon runs this check on every entry order, so a hand-edited ledger
+    naming a FIFO must not wedge the money path.
+    """
+    fifo = tmp_path / "parity-fifo"
+    os.mkfifo(fifo)
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(
+        strategies_dir,
+        lambda r: r["evidence"]["parity"].update(
+            report_path=recorded_evidence_path(fifo),
+            report_sha256=_sha256(tmp_path / "parity.json"),
+        ),
+    )
     status = _status(strategies_dir)
     assert not status.is_production
     assert "missing or unreadable" in status.reason

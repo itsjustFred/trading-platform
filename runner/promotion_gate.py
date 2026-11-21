@@ -660,12 +660,26 @@ def _evidence_file(recorded_path: str) -> Path:
 
 
 def _evidence_file_problem(label: str, recorded_path: str, expected_sha256: str) -> str | None:
-    """Why the file this evidence names no longer backs it, or ``None`` if it does."""
+    """Why the file this evidence names no longer backs it, or ``None`` if it does.
+
+    The ledger is hand-editable JSON, so a recorded path can be anything at all:
+    a path the OS cannot even resolve (an embedded NUL raises ``ValueError`` on
+    open, not ``OSError``), a directory, a device or a FIFO. Every one of those is
+    reported as a reason -- :func:`promotion_status` promises never to raise for
+    bad input -- and a file is only opened once it is known to be a regular file,
+    so opening a FIFO cannot wedge the caller (the daemon runs this check on every
+    entry order).
+    """
     path = _evidence_file(recorded_path)
     try:
+        if not path.is_file():
+            return f"{label}: the evidence file {recorded_path} is missing or unreadable"
         actual = _sha256_of(path)
-    except OSError:
-        return f"{label}: the evidence file {recorded_path} is missing or unreadable"
+    except (OSError, ValueError) as exc:
+        return (
+            f"{label}: the evidence file {recorded_path} is missing or unreadable "
+            f"({type(exc).__name__})"
+        )
     if actual != expected_sha256:
         return f"{label}: the evidence file {recorded_path} changed after the promotion"
     return None
