@@ -453,42 +453,64 @@ def _process_symbol(
             # fills at the signal-exit convention price; "level" fills at
             # exit_price (a missing/unusable level falls back to the market
             # fill and is flagged). Unspecified keeps the legacy rule — a
-            # usable exit_price is a level.
-            exit_order_type, order_type_invalid = _exit_order_type_at(
-                exit_order_type_series, i
-            )
-            if order_type_invalid:
-                _warn_once(
-                    (symbol, config.timeframe, "exit_order_type_invalid"),
-                    "%s/%s: unrecognized exit_order_type value; expected "
-                    "'market' or 'level'. Falling back to the legacy rule "
-                    "(a usable exit_price fills at the level).",
-                    symbol,
-                    config.timeframe,
-                    warning_keys=warning_keys,
-                )
+            # usable exit_price is a level. The order type is only evaluated
+            # on a real exit signal: the forced end-of-data close on the last
+            # bar keeps the convention fill and ignores exit_price entirely,
+            # matching native's end_of_data close.
+            is_signal_exit = bool(exits.iloc[i])
+            exit_order_type = None
+            order_type_invalid = False
+            level_missing_price = False
+            level_unreachable = False
             effective_exit_price_series = exit_price_series
-            exit_level_missing_price = False
-            if exit_order_type == contract.EXIT_ORDER_TYPE_MARKET:
+            if is_terminal_bar and not is_signal_exit:
                 effective_exit_price_series = None
-            elif exit_order_type == contract.EXIT_ORDER_TYPE_LEVEL and (
-                contract.usable_exit_price(
-                    exit_price_series.iloc[i]
-                    if exit_price_series is not None
-                    else None
+            if is_signal_exit:
+                exit_order_type, order_type_invalid = _exit_order_type_at(
+                    exit_order_type_series, i
                 )
-                is None
+                if order_type_invalid:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_order_type_invalid"),
+                        "%s/%s: unrecognized exit_order_type value; expected "
+                        "'market' or 'level'. Falling back to the legacy rule "
+                        "(a usable exit_price fills at the level).",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                if exit_order_type == contract.EXIT_ORDER_TYPE_MARKET:
+                    effective_exit_price_series = None
+                elif exit_order_type == contract.EXIT_ORDER_TYPE_LEVEL and (
+                    contract.usable_exit_price(
+                        exit_price_series.iloc[i]
+                        if exit_price_series is not None
+                        else None
+                    )
+                    is None
+                ):
+                    effective_exit_price_series = None
+                    level_missing_price = True
+            # A level the exit bar never traded through could not have filled
+            # — fall back to the market fill rather than book a fantasy price.
+            # This applies to every level fill, explicit or legacy implicit.
+            level_fill_price = (
+                contract.usable_exit_price(effective_exit_price_series.iloc[i])
+                if effective_exit_price_series is not None
+                else None
+            )
+            if (
+                level_fill_price is not None
+                and is_signal_exit
+                and not contract.exit_level_reachable(
+                    direction=direction,
+                    level=level_fill_price,
+                    high=exit_row.get("high"),
+                    low=exit_row.get("low"),
+                )
             ):
                 effective_exit_price_series = None
-                exit_level_missing_price = True
-                _warn_once(
-                    (symbol, config.timeframe, "exit_level_missing_price"),
-                    "%s/%s: exit_order_type='level' but no usable exit_price "
-                    "on the exit bar; falling back to the market fill.",
-                    symbol,
-                    config.timeframe,
-                    warning_keys=warning_keys,
-                )
+                level_unreachable = True
             exit_price = _resolve_exit_price(
                 exit_row,
                 i,
@@ -503,8 +525,10 @@ def _process_symbol(
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
-            if exit_level_missing_price:
-                trade_meta["exit_level_missing_price"] = True
+            if exit_order_type is not None:
+                # Canonical value, matching native's position.meta — the
+                # indicator extraction above may have recorded the raw cell.
+                trade_meta["exit_order_type"] = exit_order_type
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
             take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
             risk_target_usd: float | None = None
@@ -534,6 +558,32 @@ def _process_symbol(
                 exit_ts = intrabar_exit["time"]
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
+            elif is_signal_exit:
+                # The level governed the exit only when no protective
+                # stop/TP superseded the signal exit — flag and warn then,
+                # never for trades that actually left on a stop or TP.
+                if level_missing_price:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_missing_price"),
+                        "%s/%s: exit_order_type='level' but no usable "
+                        "exit_price on the exit bar; falling back to the "
+                        "market fill.",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_missing_price"] = True
+                if level_unreachable:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_unreachable"),
+                        "%s/%s: exit level %.6f is outside the exit bar's "
+                        "traded range; falling back to the market fill.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_unreachable"] = True
 
             sizing = _size_trade(
                 config=config,
@@ -1403,9 +1453,13 @@ def _resolve_exit_price(
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
     if exit_price_series is not None:
-        exit_price = exit_price_series.iloc[exit_idx]
-        if pd.notna(exit_price) and float(exit_price) > 0:
-            return float(exit_price)
+        # Same usability rule as the explicit ``level`` contract
+        # (contract.usable_exit_price): positive, finite — an inf/NaN level
+        # falls back to the convention fill instead of booking a fantasy
+        # price.
+        level = contract.usable_exit_price(exit_price_series.iloc[exit_idx])
+        if level is not None:
+            return level
     fill_at_open = str(signal_exit_fill or "close").lower() == "open"
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")

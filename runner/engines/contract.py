@@ -45,6 +45,7 @@ __all__ = [
     "normalize_exit_order_type",
     "exit_order_type_is_present",
     "usable_exit_price",
+    "exit_level_reachable",
     "EXIT_ORDER_TYPE_MARKET",
     "EXIT_ORDER_TYPE_LEVEL",
     "EngineStatsKeys",
@@ -186,11 +187,50 @@ def usable_exit_price(value: Any) -> float | None:
         return None
     try:
         price = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(price) or price <= 0:
         return None
     return price
+
+
+def exit_level_reachable(
+    *,
+    direction: str,
+    level: float,
+    high: Any,
+    low: Any,
+) -> bool:
+    """True when the exit bar traded through ``level`` so a resting level
+    exit could actually have filled.
+
+    A ``level`` exit is a resting limit order: a LONG exit sells at ``level``
+    and fills only when the bar's high reaches it; a SHORT exit buys and
+    fills only when the bar's low reaches it. A level outside the traded
+    range could never have filled — filling there anyway would book a
+    fantasy price, so callers fall back to the market fill, warn once and
+    flag the trade ``meta["exit_level_unreachable"]``.
+
+    A level on the *marketable* side of the range (e.g. a LONG level below
+    the bar's low) still fills at the level: that is pessimistic, never a
+    fantasy fill, and matches the gap-through-level convention used for
+    stops. Missing or non-finite bar extremes fail closed (unreachable).
+    ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` — an unknown
+    direction would invert the reachability test, so it raises ``ValueError``
+    like :func:`resolve_same_bar_exit`.
+    """
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError(f"direction must be 'LONG' or 'SHORT', got {direction!r}")
+    try:
+        hi = float(high)
+        lo = float(low)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (math.isfinite(hi) and math.isfinite(lo)):
+        return False
+    if direction == "LONG":
+        return hi >= level
+    return lo <= level
 
 
 # ─── Date filter convention (F9) ────────────────────────────────────────────

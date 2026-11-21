@@ -32,6 +32,7 @@ from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import (
     EXIT_ORDER_TYPE_LEVEL,
+    exit_level_reachable,
     exit_order_type_is_present,
     flag_missing_intrabar,
     normalize_exit_order_type,
@@ -833,16 +834,38 @@ class TradeEngine:
         next_positions: list[Position] = []
 
         for position in self.positions:
-            if level_exit_price is not None:
+            position_level = level_exit_price
+            level_unreachable = False
+            if position_level is not None and not exit_level_reachable(
+                direction=position.direction,
+                level=position_level,
+                high=row.get("high"),
+                low=row.get("low"),
+            ):
+                # A level the exit bar never traded through could not have
+                # filled — fall back to the market fill rather than book a
+                # fantasy price.
+                position_level = None
+                level_unreachable = True
+                self._warn_exit_order_once(
+                    "exit_level_unreachable",
+                    "%s: exit_order_type='level' price %.6f is outside the "
+                    "exit bar's traded range; falling back to the market fill.",
+                    self.symbol,
+                    level_exit_price,
+                )
+            if position_level is not None:
                 # A level fill trades at the level itself — no spread, like
                 # the stop/TP legs.
-                fill_price = level_exit_price
+                fill_price = position_level
             else:
                 fill_price = base_exit + (
                     spread if position.direction == "SHORT" else 0.0
                 )
             if level_missing_price:
                 position.meta["exit_level_missing_price"] = True
+            if level_unreachable:
+                position.meta["exit_level_unreachable"] = True
             if order_type is not None:
                 position.meta["exit_order_type"] = order_type
             self._close_partial(

@@ -226,8 +226,11 @@ def _exit_order_type_strategy_text(
     *,
     order_type: str | None,
     exit_price: float | None,
+    direction: str = "LONG",
+    entry_bar: int = 2,
+    exit_bar: int = 7,
 ) -> str:
-    """Entry on bar 2, signal exit on bar 7 with explicit exit order type."""
+    """Entry on ``entry_bar``, signal exit on ``exit_bar`` with explicit exit order type."""
     order_expr = "None" if order_type is None else repr(order_type)
     price_expr = "None" if exit_price is None else repr(exit_price)
     return f'''
@@ -242,19 +245,19 @@ def generate_signals(df, params):
     n = len(df)
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
-    entries.iloc[2] = True
-    exits.iloc[7] = True
-    indicators = {{"direction": pd.Series(["LONG"] * n, index=df.index)}}
+    entries.iloc[{entry_bar}] = True
+    exits.iloc[{exit_bar}] = True
+    indicators = {{"direction": pd.Series(["{direction}"] * n, index=df.index)}}
     indicators["exit_reason"] = pd.Series([None] * n, index=df.index, dtype=object)
-    indicators["exit_reason"].iloc[7] = "signal"
+    indicators["exit_reason"].iloc[{exit_bar}] = "signal"
     indicators["exit_order_type"] = pd.Series(
         [None] * n, index=df.index, dtype=object
     )
-    indicators["exit_order_type"].iloc[7] = ORDER_TYPE
+    indicators["exit_order_type"].iloc[{exit_bar}] = ORDER_TYPE
     indicators["exit_price"] = pd.Series(
         [None] * n, index=df.index, dtype=object
     )
-    indicators["exit_price"].iloc[7] = EXIT_PRICE
+    indicators["exit_price"].iloc[{exit_bar}] = EXIT_PRICE
     return entries, exits, indicators, []
 '''
 
@@ -362,6 +365,189 @@ def generate_signals(df, params):
 
         assert native.trades[0].exits[0].price == pytest.approx(107.0)
         assert vectorbt.trades[0].exits[0].price == pytest.approx(105.5)
+
+    def test_level_whitespace_spelling_fills_at_price(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_order_type_strategy_text(
+            order_type=" level ", exit_price=105.5
+        )
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_ws")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            assert result.trades[0].exits[0].price == pytest.approx(105.5)
+
+    def test_short_level_fills_at_price_on_both_engines(self, tmp_path: Path):
+        # Bar 7 trades 106.75..107.25; a SHORT exit is a buy limit that
+        # fills when the bar's low reaches the level — 107.1 is inside.
+        frame = _frame()
+        text = _exit_order_type_strategy_text(
+            order_type="level", exit_price=107.1, direction="SHORT"
+        )
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_short")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            assert result.trades[0].direction == "SHORT"
+            assert result.trades[0].exits[0].price == pytest.approx(107.1)
+
+
+class TestExitLevelReachability:
+    """A ``level`` the exit bar never traded through cannot have filled.
+
+    Both engines fall back to the market fill, warn once and flag the trade
+    ``meta["exit_level_unreachable"]`` instead of booking a fantasy price.
+    """
+
+    def test_unreachable_long_level_falls_back_flagged(self, tmp_path: Path):
+        # Bar 7 trades 106.75..107.25; a LONG exit level at 500 never printed.
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type="level", exit_price=500.0)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_unreach_long")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.0)
+            assert trade.meta.get("exit_level_unreachable") is True
+            assert trade.meta.get("exit_order_type") == "level"
+
+    def test_unreachable_short_level_falls_back_flagged(self, tmp_path: Path):
+        # A SHORT exit is a buy limit: it fills only when the bar's low
+        # reaches the level. 50 sits below bar 7's low (106.75).
+        frame = _frame()
+        text = _exit_order_type_strategy_text(
+            order_type="level", exit_price=50.0, direction="SHORT"
+        )
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_unreach_short")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.0)
+            assert trade.meta.get("exit_level_unreachable") is True
+
+    def test_implicit_exit_price_unreachable_falls_back_vectorbt(self, tmp_path: Path):
+        # vectorbt's legacy rule (usable exit_price = level) gets the same
+        # reachability guard; native never reads exit_price implicitly.
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type=None, exit_price=500.0)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_implicit")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        assert native.trades[0].exits[0].price == pytest.approx(107.0)
+        trade = vectorbt.trades[0]
+        assert trade.exits[0].price == pytest.approx(107.0)
+        assert trade.meta.get("exit_level_unreachable") is True
+
+    def test_terminal_bar_close_ignores_exit_columns(self, tmp_path: Path):
+        # exit_order_type/exit_price on every bar but NO exit signal: the
+        # forced end-of-data close must use the convention fill in both
+        # engines (native's end_of_data close reads neither column).
+        frame = _frame()
+        text = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[2] = True
+    indicators = {"direction": pd.Series(["LONG"] * n, index=df.index)}
+    indicators["exit_order_type"] = pd.Series(
+        ["level"] * n, index=df.index, dtype=object
+    )
+    indicators["exit_price"] = pd.Series(
+        [105.5] * n, index=df.index, dtype=float
+    )
+    return entries, exits, indicators, []
+'''
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_terminal")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        expected = float(frame["close"].iloc[-1])
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(expected)
+            assert "exit_level_unreachable" not in trade.meta
+
+    def test_missing_level_superseded_by_stop_is_not_flagged(self, tmp_path: Path):
+        # vectorbt only: with intrabar data a stop/TP touched on the trigger
+        # bar supersedes the signal exit, so a missing level must NOT warn
+        # or flag — the trade never left on the signal exit.
+        frame = _frame()
+        intrabar = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(
+                    "2024-01-01 07:00", periods=12, freq="5min", tz="UTC"
+                ),
+                "open": [107.0] * 12,
+                "high": [107.2] * 12,
+                "low": [106.9] * 11 + [99.5],
+                "close": [107.0] * 11 + [99.6],
+                "volume": [100.0] * 12,
+            }
+        )
+        _write_ohlcv(tmp_path, "CEC", frame)
+        _write_ohlcv(tmp_path, "CEC", intrabar, timeframe="5m")
+        text = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[2] = True
+    exits.iloc[7] = True
+    indicators = {"direction": pd.Series(["LONG"] * n, index=df.index)}
+    indicators["stop_loss"] = pd.Series([float("nan")] * n, index=df.index)
+    indicators["stop_loss"].iloc[2] = 100.0
+    indicators["exit_order_type"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_order_type"].iloc[7] = "level"
+    indicators["exit_price"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    return entries, exits, indicators, []
+'''
+        strategy_path = _write_strategy(tmp_path, "exit_lvl_stop", text)
+        payload = {
+            "strategy_name": "exit_lvl_stop",
+            "symbols": ["CEC"],
+            "timeframe": "1h",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "initial_capital": 100_000.0,
+            "risk_per_trade_pct": 0.01,
+            "modeling_resolution": "5m",
+            "data_dir": str(tmp_path),
+            "parameters": {},
+        }
+        result = VectorbtAdapter().run(
+            BacktestConfig(**with_zero_fees(payload)), strategy_path
+        )
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exits[0].reason == "stop_loss"
+        assert trade.exits[0].price == pytest.approx(100.0)
+        assert "exit_level_missing_price" not in trade.meta
+        assert "exit_level_unreachable" not in trade.meta
 
 
 class TestNativeWarmupLoad:
@@ -588,3 +774,44 @@ class TestSharedEquityReplayMath:
         replayed, _, _ = replay_shared_equity([a, b, d], 100_000.0)
         by_id = {t.id: t for t in replayed}
         assert by_id[1].quantity == pytest.approx(100.0)
+
+
+class TestExitOrderContractHelpers:
+    """Unit tests for the shared ``exit_order_type`` parsing helpers."""
+
+    def test_usable_exit_price_rejects_overflow(self):
+        from runner.engines import contract
+
+        assert contract.usable_exit_price(10**400) is None
+        assert contract.usable_exit_price(float("inf")) is None
+        assert contract.usable_exit_price("105.5") == pytest.approx(105.5)
+        assert contract.usable_exit_price(-1.0) is None
+        assert contract.usable_exit_price(None) is None
+
+    def test_exit_level_reachable_respects_direction(self):
+        from runner.engines import contract
+
+        high, low = 107.25, 106.75
+        # LONG exit (sell limit) needs the bar's high to reach the level.
+        assert contract.exit_level_reachable(
+            direction="LONG", level=107.0, high=high, low=low
+        )
+        assert not contract.exit_level_reachable(
+            direction="LONG", level=500.0, high=high, low=low
+        )
+        # SHORT exit (buy limit) needs the bar's low to reach the level.
+        assert contract.exit_level_reachable(
+            direction="SHORT", level=107.0, high=high, low=low
+        )
+        assert not contract.exit_level_reachable(
+            direction="SHORT", level=50.0, high=high, low=low
+        )
+        # Missing extremes fail closed.
+        assert not contract.exit_level_reachable(
+            direction="LONG", level=107.0, high=None, low=low
+        )
+        assert not contract.exit_level_reachable(
+            direction="SHORT", level=107.0, high=high, low=float("nan")
+        )
+        with pytest.raises(ValueError, match="direction"):
+            contract.exit_level_reachable(direction="SIDEWAYS", level=107.0, high=high, low=low)

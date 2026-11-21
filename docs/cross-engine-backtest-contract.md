@@ -90,15 +90,37 @@ or `level` (case-insensitive):
   without a usable (positive, finite) `exit_price` falls back to the market
   fill, logs a warning once and flags the trade
   `meta["exit_level_missing_price"]`.
+- a `level` the exit bar never traded through (e.g. above the bar's high for
+  a LONG exit, below the low for a SHORT exit — `contract.exit_level_reachable`)
+  could not have filled: it falls back to the market fill, warns once and
+  flags `meta["exit_level_unreachable"]`. This applies to every level fill,
+  explicit `level` and vectorbt's legacy implicit `exit_price` alike. A level
+  on the *marketable* side of the range still fills at the level (pessimistic,
+  never a fantasy fill — the same convention as gap-through-level stops).
 - absent or unrecognized — the **legacy fallback** applies per engine:
   vectorbt treats a usable `exit_price` as a level fill; native fills at the
   convention price and ignores `exit_price` (an unrecognized non-empty value
   warns once). PyneCore does not consume the series — its exits are
   Pine-native orders, re-priced by `_apply_fill_parity` (§5).
 
-The parsing lives in `runner.engines.contract`
-(`normalize_exit_order_type`, `usable_exit_price`) so every engine reads the
-same spelling table.
+Per-engine support for `exit_order_type` / `exit_price` on signal exits:
+
+| engine | `exit_order_type` | `exit_price` without it |
+|---|---|---|
+| native (`TradeEngine`) | `market`/`level` honored; absent/unrecognized → market fill | ignored |
+| vectorbt | `market`/`level` honored; absent/unrecognized → legacy rule | usable value → level fill (legacy) |
+| pynecore | not consumed — Pine-native orders, `_apply_fill_parity` (§5) | n/a |
+| signal_replay | not consumed — replays recorded fills | n/a |
+| lean | not consumed | n/a |
+| live (`live_runner/`) | **not consumed** — every signal exit is a market order, so a strategy emitting `level` diverges between backtest and live | n/a |
+
+The order type is evaluated only on a real exit signal in every consumer: the
+forced end-of-data close fills at the convention price and ignores
+`exit_price`/`exit_order_type` entirely, matching native's `end_of_data`
+close. The parsing lives in `runner.engines.contract`
+(`normalize_exit_order_type`, `usable_exit_price`, `exit_level_reachable`) —
+native and vectorbt read the same spelling table; the other engines listed
+above do not consume the series at all.
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
