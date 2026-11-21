@@ -5361,26 +5361,23 @@ async def run_daemon(
     finally:
         try:
             with contextlib.suppress(Exception):
-                # Drain the default executor before the lock goes: an `asyncio.to_thread`
+                # Join the daemon's worker threads before the lock goes: an `asyncio.to_thread`
                 # body that is still writing (the startup discovery, a loop iteration's database
                 # work) outlives its cancelled await, and a daemon that released the lock while
                 # its own thread was still writing would hand the next daemon exactly the overlap
-                # this lock exists to prevent. The join is unbounded on purpose: a stop whose
-                # in-flight database work cannot finish must not hand the lock on, and the OS
-                # still releases the lock if the process has to be killed to end it. A second
-                # cancellation must not abandon the join either, so it is awaited under a shield
-                # and the loop keeps waiting until the threads are gone.
-                drain = asyncio.ensure_future(
-                    asyncio.get_running_loop().shutdown_default_executor()
-                )
-                while not drain.done():
-                    try:
-                        await asyncio.shield(drain)
-                    except asyncio.CancelledError:
-                        continue
+                # this lock exists to prevent.
+                #
+                # The join is synchronous and unbounded on purpose: an await could be interrupted
+                # by the next cancellation and abandoned, and a stop whose in-flight database work
+                # cannot finish must not hand the lock on (the OS still releases the lock if the
+                # process has to be killed to end it). Blocking the loop thread here cannot
+                # deadlock - none of the daemon's worker functions calls back into the loop.
+                executor = getattr(asyncio.get_running_loop(), "_default_executor", None)
+                if executor is not None:
+                    executor.shutdown(wait=True)
         finally:
-            # Released even when the drain is itself interrupted: the contract is that the lock
-            # never outlives the daemon.
+            # Released even when the join is interrupted: the contract is that the lock never
+            # outlives the daemon.
             lock.release()
 
 
