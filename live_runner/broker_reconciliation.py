@@ -341,19 +341,26 @@ def _requested_qty(metadata: Mapping[str, Any]) -> float | None:
 def _position_qty_tolerance(
     adapter: BaseLiveAdapter, symbol: str, configured: float | None
 ) -> float:
-    if configured is not None:
-        return usable_qty_tolerance(configured)
     method = getattr(adapter, "position_qty_tolerance", None)
-    raw = DEFAULT_QTY_TOLERANCE
+    precision: float | None = None
     if callable(method):
         try:
-            raw = method(symbol)
+            precision = usable_qty_tolerance(method(symbol))
         except Exception as exc:
             logger.warning(
                 "Adapter could not report quantity precision; using strict default",
                 extra={"data": {"symbol": symbol, "error": str(exc)}},
             )
-    return usable_qty_tolerance(raw)
+    if configured is not None:
+        configured_tolerance = usable_qty_tolerance(configured)
+        # An explicit tolerance may tighten the check but must never loosen it
+        # past the precision the adapter can actually represent.
+        if precision is not None:
+            return min(configured_tolerance, precision)
+        return configured_tolerance
+    if precision is not None:
+        return precision
+    return usable_qty_tolerance(DEFAULT_QTY_TOLERANCE)
 
 
 def _parse_positions(rows: Iterable[Mapping[str, Any]]) -> tuple[dict[str, float], str | None]:

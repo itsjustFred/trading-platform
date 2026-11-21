@@ -610,3 +610,25 @@ def test_create_live_deployment_refuses_bad_reconciliation_settings(isolated_db)
         create_live_deployment(
             _deployment(settings={"broker_reconciliation_enabled": "flase"})
         )
+
+
+def test_explicit_tolerance_never_exceeds_adapter_precision() -> None:
+    from live_runner.broker_reconciliation import _position_qty_tolerance
+
+    class PrecisionAdapter(FakeAdapter):
+        def position_qty_tolerance(self, symbol: str) -> float:
+            return 0.01
+
+    class NoPrecisionAdapter(FakeAdapter):
+        position_qty_tolerance = None  # type: ignore[assignment]
+
+    adapter = PrecisionAdapter()
+    # Loose explicit tolerance is reduced to what the adapter can represent.
+    assert _position_qty_tolerance(adapter, "AAPL", 0.5) == pytest.approx(0.01)
+    # A tighter explicit tolerance is kept.
+    assert _position_qty_tolerance(adapter, "AAPL", 1e-12) == pytest.approx(1e-12)
+    # No explicit tolerance still means adapter precision.
+    assert _position_qty_tolerance(adapter, "AAPL", None) == pytest.approx(0.01)
+    # An adapter that cannot report precision keeps honouring the setting.
+    assert _position_qty_tolerance(NoPrecisionAdapter(), "AAPL", 0.5) == pytest.approx(0.5)
+    assert _position_qty_tolerance(NoPrecisionAdapter(), "AAPL", None) == pytest.approx(1e-9)
