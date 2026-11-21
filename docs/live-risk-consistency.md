@@ -219,12 +219,20 @@ Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
 als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
 `base_adapter.commission_from_signed_cash_flow` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
 backfillt CFEE als positive Kosten.
-Seit #285 ist der Wert schreibseitig abgesichert: `LiveExecution.commission` und
-`LiveExecutionModel.commission` validieren über `shared.models.validate_commission_cost`
-und werfen `ValueError`/`ValidationError` bei negativem oder nicht-endlichem Wert -
-`commission_from_signed_cash_flow` ist die einzige Sanktionierung der Vorzeichen-Umrechnung,
-aber auch ihr Ergebnis (z. B. ein cTrader-Rebate, das negativ wird) darf nicht gespeichert
-werden. `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative Werte ebenfalls ab.
+Seit #285 ist der Wert schreibseitig abgesichert: `LiveExecution.commission` validiert
+über `shared.models.validate_commission_cost` (`mode="before"`; `bool` und numerische
+Strings werden ebenfalls abgelehnt) und wirft `ValidationError` bei negativem oder
+nicht-endlichem Wert; an der Persistierungsschwelle prüft
+`LiveExecutionModel.from_live_execution` erneut und wirft `ValueError`. Abgesichert ist
+nur dieser Funnel - ein direktes `LiveExecutionModel(...)` oder `session.add` validiert
+nicht. `commission_from_signed_cash_flow` ist die einzige zulässige Umrechnung der
+Vorzeichen-Konvention; ihr negatives Ergebnis (d. h. ein cTrader-Rebate) wird vom Adapter
+als `commission=NULL` („Gebühr unbekannt") plus ERROR-Log gespeichert, damit der Fill
+nicht verloren geht - die eigentliche Rebate-Darstellung ist eine offene
+Maintainer-Entscheidung. `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative
+Werte ebenfalls ab. Der Lese-Pfad (`LiveExecutionModel.to_live_execution`) baut ein
+`LiveExecution` und validiert damit erneut: eine negativ gespeicherte Zeile wirft beim
+Lesen, statt still falsches Net-PnL zu liefern.
 Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) trugen das rohe negative
 Vorzeichen; `init_db` wandelt sie einmalig per Migration
 (`_migrate_ctrader_commission_to_cost`, `abs` des gespeicherten Werts) in einen positiven

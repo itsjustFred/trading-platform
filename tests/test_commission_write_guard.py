@@ -35,8 +35,9 @@ def _execution(commission: float | None) -> LiveExecution:
     )
 
 
-@pytest.mark.parametrize("bad", [-0.01, -1.0, math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("bad", [-0.01, -1.0, math.nan, math.inf, -math.inf, True, "1.5"])
 def test_live_execution_refuses_an_unusable_commission(bad: float) -> None:
+    """`mode="before"` sees the raw value: `True` and `"1.5"` must not be coerced first."""
     with pytest.raises(ValidationError, match="commission"):
         _execution(bad)
 
@@ -70,6 +71,10 @@ def test_the_write_guard_itself() -> None:
         validate_commission_cost(-1.0)
     with pytest.raises(ValueError, match="finite"):
         validate_commission_cost(math.nan)
+    with pytest.raises(ValueError, match="finite"):
+        validate_commission_cost(True)
+    with pytest.raises(ValueError, match="finite"):
+        validate_commission_cost("1.5")
 
 
 @pytest.fixture
@@ -123,21 +128,20 @@ def test_save_live_execution_up_to_cumulative_refuses_a_negative_commission(data
         database.save_live_execution_up_to_cumulative(_tampered_execution(signal_id, -1.0), 5.0)
 
 
-def test_ctrader_rebate_cannot_be_stored() -> None:
-    """A cTrader rebate converts to a negative cost, which the write guard refuses.
-
-    ``_deal_commission`` still reports the broker's sign faithfully; the refusal happens
-    where the adapter builds the ``LiveExecution`` it persists - loudly, not as a stored
-    wrong-sign row.
-    """
+def test_ctrader_rebate_is_stored_as_unknown_fee(caplog) -> None:
+    """A cTrader rebate converts to a negative cost; ``_deal_commission`` maps it to
+    ``None`` ("fee unknown") and logs ERROR with the deal id instead of letting the
+    write guard refuse the whole fill (#285)."""
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOADeal
 
     from live_runner.ctrader_adapter import _deal_commission
 
-    deal = ProtoOADeal(commission=1234, moneyDigits=3)  # +1.234 cash flow: a rebate
-    assert _deal_commission(deal) == pytest.approx(-1.234)
-    with pytest.raises(ValidationError, match="commission"):
-        _execution(_deal_commission(deal))
+    deal = ProtoOADeal(dealId=42, commission=1234, moneyDigits=3)  # +1.234 cash flow: a rebate
+    with caplog.at_level("ERROR"):
+        assert _deal_commission(deal) is None
+    assert any("rebate" in r.message and "42" in r.message for r in caplog.records)
+    # The fill itself still validates and stores, with commission NULL.
+    assert _execution(None).commission is None
 
 
 def test_ctrader_charge_still_passes_the_guard() -> None:

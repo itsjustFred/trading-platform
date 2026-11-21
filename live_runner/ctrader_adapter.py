@@ -530,8 +530,8 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
-def _deal_commission(deal: Any | None) -> float:
-    """A deal's commission in account currency, as a positive cost.
+def _deal_commission(deal: Any | None) -> float | None:
+    """A deal's commission in account currency, as a positive cost — or ``None``.
 
     cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
     positive cost, the ``live_executions.commission`` convention shared with Alpaca (see
@@ -542,6 +542,14 @@ def _deal_commission(deal: Any | None) -> float:
     integer records a 2-digit-account commission of 3.50 as 350. A deal that carries no
     commission (an unset int64 reads as ``0``) is ``0.0`` without consulting ``moneyDigits``, so
     only a real charge can trigger the "digits missing" fallback warning.
+
+    A positive broker cash flow is a REBATE: the converted cost is negative, which the
+    ``commission`` write guard refuses. Refusing the ``LiveExecution`` would drop the whole
+    fill — the stream caller retains the event for reconciliation forever and the row never
+    reaches ``live_executions``, the lost-fill the persist path exists to prevent — so the
+    rebate is stored as ``None`` ("fee unknown"; readers already treat it as net-PnL
+    incomplete) and logged at ERROR with the deal id and the raw value. How a rebate should
+    be represented is an open maintainer decision (#285); until then the fill is kept.
     """
     if deal is None:
         return 0.0
@@ -549,7 +557,18 @@ def _deal_commission(deal: Any | None) -> float:
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
     if not raw or not math.isfinite(raw):
         return 0.0
-    return commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
+    cost = commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
+    if cost < 0:
+        logger.error(
+            "cTrader deal %s reported a rebate: commission=%r converts to cost=%r, which "
+            "the write guard refuses; storing commission=NULL so the fill is kept and "
+            "net PnL stays flagged incomplete (#285)",
+            _deal_id_or_none(deal),
+            raw,
+            cost,
+        )
+        return None
+    return cost
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"

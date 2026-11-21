@@ -720,6 +720,15 @@ class LiveExecutionModel(SQLModel, table=True):
         )
 
     def to_live_execution(self) -> LiveExecution:
+        """Rehydrate the domain model — the ``commission`` guard runs again on read.
+
+        ``LiveExecution`` validates ``commission`` (#285), so a row stored before the
+        guard existed (or written around it, e.g. via ``session.add``) with a negative
+        cost raises ``ValidationError`` here instead of silently flipping
+        ``gross - commission`` net PnL. ``init_db``'s one-time
+        ``_migrate_ctrader_commission_to_cost`` already ``abs``-converted legacy
+        negatives, so this only fires on genuinely corrupt data.
+        """
         return LiveExecution(
             id=self.id,
             signal_id=self.signal_id,
@@ -1972,8 +1981,8 @@ def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
     accounts whose broker is ``ctrader`` are touched, NULL (unknown) and zero stay as they are, and
     a row whose broker cannot be determined (orphan) is left alone.
 
-    ``abs`` is not safe to repeat blindly once the fixed adapter runs: a rebate is stored as a
-    NEGATIVE cost and a second pass would turn it into a charge. So the conversion is recorded in
+    ``abs`` is not safe to repeat blindly: any negative row still in the table is legacy or
+    corrupt data, and a second pass would flip its sign. So the conversion is recorded in
     ``schema_data_migrations`` and runs exactly once; ``init_db`` runs on every process start.
 
     Returns True when the conversion ran. No-ops when it is already recorded.

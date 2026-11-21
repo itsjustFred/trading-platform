@@ -366,12 +366,21 @@ def validate_commission_cost(value: float | None) -> float | None:
     everywhere, so a wrong sign silently flips it. Broker-signed cash flows are converted
     with ``live_runner.base_adapter.commission_from_signed_cash_flow`` before they get
     here - that helper decides the sign, this guard decides what may be stored. A broker
-    rebate therefore cannot be stored: the conversion yields a negative cost and this
-    guard refuses it.
+    rebate therefore cannot be stored as a negative cost: the cTrader adapter maps it to
+    ``None`` (fee unknown) before it reaches this guard.
+
+    Runs in ``mode="before"`` on the field, so ``True`` and numeric strings like ``"1.5"``
+    are refused here instead of being silently coerced to ``1.0``/``1.5`` first.
     """
     if value is None:
         return None
-    if isinstance(value, bool) or not math.isfinite(value):
+    if isinstance(value, bool):
+        raise ValueError(f"commission must be a finite number, got {value!r}")
+    try:
+        finite = math.isfinite(value)
+    except TypeError:
+        raise ValueError(f"commission must be a finite number, got {value!r}") from None
+    if not finite:
         raise ValueError(f"commission must be finite, got {value!r}")
     if value < 0:
         raise ValueError(f"commission must be a non-negative cost, got {value!r}")
@@ -429,7 +438,7 @@ class LiveExecution(BaseModel):
     # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
-    @field_validator("commission")
+    @field_validator("commission", mode="before")
     @classmethod
     def _commission_is_a_non_negative_cost(cls, value: float | None) -> float | None:
         return validate_commission_cost(value)
