@@ -23,6 +23,7 @@ from live_runner.account_routing import (
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    EXIT_REPROTECTION_METADATA_KEY,
     BaseLiveAdapter,
     LivePipValue,
     LiveQuote,
@@ -1742,6 +1743,9 @@ async def prepare_exit_intent_order(
         "tp_price",
         "stop_price",
         "resolved_stop_loss",
+        # Adapter-owned crash-recovery state (#145): only the adapter may
+        # stamp it, after it has released the broker-side protection itself.
+        EXIT_REPROTECTION_METADATA_KEY,
     ):
         metadata.pop(key, None)
     # Stamp the instruction actually executed, so the persisted signal records

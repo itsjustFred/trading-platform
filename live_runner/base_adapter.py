@@ -15,6 +15,15 @@ from shared.models import LiveSignal
 #: (adapters) must never compare divergent spellings again.
 EXIT_ONLY_RISK_SIZING_MODE = "exit_only"
 
+#: Metadata key an adapter stamps on an exit-only signal when the exit had to
+#: release broker-side protection (bracket legs reserve the position's shares)
+#: before it could be submitted (#145). The value records the side and the
+#: SL/TP levels the remainder must be re-protected at, so a crash between the
+#: release and the re-place is recoverable on the next adapter connect. Only
+#: the adapter writes it: producers must not forge it (the daemon pops it from
+#: incoming signal metadata like every other adapter-owned key).
+EXIT_REPROTECTION_METADATA_KEY = "exit_reprotection"
+
 #: Explicit unbounded-take-profit policy (C1 owner decision). Set ONLY by
 #: the originating processor (RocketFuel exits on the opposite signal) —
 #: never inferred. Matched via :func:`is_unbounded_tp`, not string

@@ -3366,6 +3366,87 @@ def _list_unfilled_exit_orders(
     return pending
 
 
+def list_pending_exit_reprotections(
+    account_id: str, *, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Exit-only signals of an account carrying an ``exit_reprotection`` marker.
+
+    The marker is written by the Alpaca adapter when an exit had to release
+    bracket protection before submitting (#145): if the process died between
+    the release and the re-place, the remainder may be unprotected and the
+    marker records the levels to restore. Rows are newest first; each carries
+    ``signal_id``, ``symbol``, ``deployment_id``, ``timestamp`` and ``marker``
+    (the recorded dict). Only signals that are themselves exit-only qualify -
+    a forged marker on an entry signal is inert.
+    """
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import (
+        EXIT_ONLY_RISK_SIZING_MODE,
+        EXIT_REPROTECTION_METADATA_KEY,
+    )
+
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+    init_db()
+    marker_present = func.json_extract(
+        LiveSignalModel.metadata_json, f"$.{EXIT_REPROTECTION_METADATA_KEY}"
+    ).is_not(None)
+    statement = (
+        select(LiveSignalModel)
+        .join(
+            LiveDeploymentModel,
+            LiveDeploymentModel.id == LiveSignalModel.deployment_id,
+        )
+        .where(LiveDeploymentModel.account_id == normalized_account_id)
+        .where(marker_present)
+        .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+        .limit(max(int(limit), 1))
+    )
+    with get_session() as session:
+        rows = session.exec(statement).all()
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = dict(row.metadata_json or {})
+        recorded = metadata.get(EXIT_REPROTECTION_METADATA_KEY)
+        if not isinstance(recorded, dict):
+            continue
+        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+            continue
+        pending.append(
+            {
+                "signal_id": str(row.id),
+                "symbol": str(row.symbol or "").strip().upper(),
+                "deployment_id": str(row.deployment_id),
+                "timestamp": row.timestamp,
+                "marker": dict(recorded),
+            }
+        )
+    return pending
+
+
+def clear_live_signal_metadata_key(signal_id: str, key: str) -> bool:
+    """Remove one key from a signal's persisted metadata (best-effort cleanup)."""
+    normalized_signal_id = str(signal_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_signal_id or not normalized_key:
+        return False
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return False
+        metadata = dict(record.metadata_json or {})
+        if normalized_key not in metadata:
+            return True
+        del metadata[normalized_key]
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return True
+
+
 def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
     """Persist the broker order id on a signal right after submission (crash recovery)."""
     normalized_signal_id = str(signal_id or "").strip()

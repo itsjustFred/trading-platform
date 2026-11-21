@@ -5151,6 +5151,9 @@ def _alpaca_bracket_adapter(monkeypatch):
     adapter._trading_client = SimpleNamespace(
         get_account=lambda: SimpleNamespace(cash="100000", equity="100000"),
         submit_order=_submit_order,
+        # The real client always lists orders; the exit path (#145) reads the
+        # working book to find protection that reserves the position's shares.
+        get_orders=lambda filter=None: [],  # noqa: A002 - mirrors alpaca-py
     )
 
     def _save(signal):
