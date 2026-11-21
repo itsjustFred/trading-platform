@@ -356,14 +356,35 @@ def test_the_repo_dotenv_file_is_redirected_to_the_session_file(
     """
     loaded: list[Path | None] = []
 
-    def _record(path=None, *_args, **_kwargs):
-        loaded.append(Path(path) if path is not None else None)
+    def _record(path=None, **_kwargs):
+        target = path if path is not None else _kwargs.get("dotenv_path")
+        loaded.append(Path(target) if target is not None else None)
         return {}
 
     monkeypatch.setattr(suite_conftest, "_real_load_dotenv", _record)
     dotenv.load_dotenv(REPO_ENV_FILE)
+    dotenv.load_dotenv(dotenv_path=REPO_ENV_FILE)
     dotenv.load_dotenv(tmp_path / "unrelated.env")
-    assert loaded == [ISOLATED_DOTENV_FILE, tmp_path / "unrelated.env"]
+    assert loaded == [
+        ISOLATED_DOTENV_FILE,
+        ISOLATED_DOTENV_FILE,
+        tmp_path / "unrelated.env",
+    ]
+
+
+def test_a_symlink_to_a_secret_file_is_matched_by_its_target(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A link is caught by what it points at, not by the name someone gave it."""
+    link = tmp_path / "innocent-name"
+    link.symlink_to(REPO_ACCOUNTS_ENV)
+    assert suite_conftest._repo_secret_path(link) == REPO_ACCOUNTS_ENV
+    # An attempt is refused *and* recorded, so the deliberate one below must not reach the
+    # session-level guard.
+    monkeypatch.setattr(suite_conftest, "_REPO_SECRET_OPENS", [])
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"\.accounts.env"):
+        link.read_text(encoding="utf-8")
+
 
 
 def test_the_session_dotenv_substitute_is_empty() -> None:
@@ -392,11 +413,11 @@ def test_sessionfinish_fails_the_run_when_a_repo_secret_file_was_opened(
     suite_conftest.pytest_sessionfinish(session)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
     err = capsys.readouterr().err
-    assert "opened the checkout's real credential file" in err
+    assert "tried to open the checkout's real credential file" in err
     assert "write its own under tmp_path" in err
 
 
-def test_no_repo_secret_file_has_been_opened_so_far() -> None:
+def test_no_repo_secret_file_has_been_touched_so_far() -> None:
     """The live half of the guard, asserted at the point the suite is furthest along.
 
     The session-end check is the one that fails a run; this makes the same assertion inside a test,
@@ -495,10 +516,11 @@ def test_a_unix_socket_connect_is_not_a_network_violation(monkeypatch) -> None:
     "call",
     [
         lambda: socket.gethostbyname("api.alpaca.markets"),
-        # An IP literal, so the datagram path is the one under test and not a name lookup.
+        lambda: socket.gethostbyaddr(b"193.123.232.1"),
         lambda: socket.socket().sendto(b"x", ("35.221.23.121", 443)),
+        lambda: socket.socket().sendmsg([b"x"], (), 0, ("35.221.23.121", 443)),
     ],
-    ids=["gethostbyname", "sendto"],
+    ids=["gethostbyname", "gethostbyaddr", "sendto", "sendmsg"],
 )
 def test_a_datagram_or_bare_lookup_is_refused_too(monkeypatch, call) -> None:
     """UDP and a DNS-only lookup reach the network without a ``connect``."""
@@ -506,6 +528,16 @@ def test_a_datagram_or_bare_lookup_is_refused_too(monkeypatch, call) -> None:
     with pytest.raises(suite_conftest.SuiteHermeticityViolation):
         call()
     assert len(suite_conftest.network_violations()) == 1
+
+
+@pytest.mark.parametrize("host", [b"localhost", b"127.0.0.1"])
+def test_a_byte_form_local_name_stays_local(host: bytes) -> None:
+    assert suite_conftest._is_local_host(host) is True
+
+
+@pytest.mark.parametrize("host", [b"api.alpaca.markets", b"35.221.23.121"])
+def test_a_byte_form_remote_name_is_still_refused(host: bytes) -> None:
+    assert suite_conftest._is_local_host(host) is False
 
 
 def test_every_daemon_discovery_call_names_the_resolved_accounts_env() -> None:
@@ -733,7 +765,7 @@ def test_real_pytest_process_exits_nonzero_when_a_test_reads_a_repo_secret_file(
     )
 
     assert result.returncode == pytest.ExitCode.TESTS_FAILED, result.stdout + result.stderr
-    assert "opened the checkout's real credential file" in result.stderr
+    assert "tried to open the checkout's real credential file" in result.stderr
     assert secret in result.stderr
 
 

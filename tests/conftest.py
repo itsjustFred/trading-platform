@@ -79,7 +79,11 @@ _NETWORK_VIOLATIONS: list[str] = []
 
 
 def repo_secret_opens() -> tuple[str, ...]:
-    """Every open of the checkout's real ``.accounts.env`` / ``.env`` seen this session."""
+    """Every attempt this session made to open the checkout's real ``.accounts.env`` / ``.env``.
+
+    An attempt is refused before the system call, so this is the backstop for the case where the
+    refusal is swallowed by an ``except Exception`` in the code under test.
+    """
     return tuple(_REPO_SECRET_OPENS)
 
 
@@ -88,11 +92,14 @@ def network_violations() -> tuple[str, ...]:
     return tuple(_NETWORK_VIOLATIONS)
 
 
+@lru_cache(maxsize=8192)
 def _repo_secret_path(raw_path: object) -> Path | None:
     """The checkout's real secret file ``raw_path`` names, or ``None``.
 
-    The name is checked before the path is resolved: ``open`` is the hottest audit event in the
-    process and most calls are imports of ``.pyc`` files.
+    The path is resolved before the name is compared, so a symlink to a secret file is caught by its
+    target and not by the name someone gave the link. ``open`` is the hottest audit event in the
+    process, so the answer is cached per path: the suite opens the same ``.pyc`` files thousands of
+    times, and the cache hit is what makes a full resolve on every open affordable.
     """
     if isinstance(raw_path, int) or raw_path is None:
         return None
@@ -102,11 +109,12 @@ def _repo_secret_path(raw_path: object) -> Path | None:
         candidate = Path(os.fspath(raw_path))
     except (TypeError, ValueError):
         return None
-    if candidate.name not in _SECRET_FILE_NAMES:
-        return None
     try:
         resolved = candidate.resolve()
     except OSError:
+        return None
+    # Both spellings of the name: a symlink keeps its own, its target keeps the real one.
+    if candidate.name not in _SECRET_FILE_NAMES and resolved.name not in _SECRET_FILE_NAMES:
         return None
     return resolved if resolved in _REPO_SECRET_FILES else None
 
@@ -118,6 +126,9 @@ def _is_local_host(host: object) -> bool:
     """
     if host is None:
         return True
+    if isinstance(host, bytes):
+        # The socket calls accept a name either way round, and a name stays a name when decoded.
+        host = os.fsdecode(host)
     if not isinstance(host, str):
         return False
     candidate = host.strip("[]").strip().lower()
@@ -163,10 +174,10 @@ def _audit_hook(event: str, args: tuple) -> None:
         host = address[0] if isinstance(address, (tuple, list)) and address else address
         _refuse_remote_host(host, "connect")
         return
-    if event in ("socket.getaddrinfo", "socket.gethostbyname"):
+    if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr"):
         _refuse_remote_host(args[0] if args else None, "name lookup")
         return
-    if event in ("socket.sendto",):
+    if event in ("socket.sendto", "socket.sendmsg"):
         address = args[1] if len(args) > 1 else None
         if isinstance(address, (str, bytes)):
             return  # AF_UNIX path
@@ -185,8 +196,26 @@ _real_load_dotenv = dotenv.load_dotenv
 
 
 def _redirected_load_dotenv(path=None, *args, **kwargs):
-    if _repo_secret_path(path) == REPO_ENV_FILE:
-        path = ISOLATED_DOTENV_FILE
+    """``dotenv.load_dotenv`` with the checkout's ``.env`` redirected to the session file.
+
+    The path is read from either calling convention - ``load_dotenv(p)`` and
+    ``load_dotenv(dotenv_path=p)`` are the same call, and a redirect that only saw the first would
+    let the second load the real file. A call that names no path at all is resolved through the
+    library's own discovery, which walks up from the caller and would find the checkout's file.
+    """
+    named = kwargs.pop("dotenv_path", None)
+    target = path if path is not None else named
+    if target is None:
+        try:
+            discovered = dotenv.find_dotenv(usecwd=False)
+        except Exception:  # pragma: no cover - discovery is best effort
+            discovered = ""
+        target = discovered or None
+    if _repo_secret_path(target) == REPO_ENV_FILE:
+        if named is not None:
+            kwargs["dotenv_path"] = ISOLATED_DOTENV_FILE
+        else:
+            path = ISOLATED_DOTENV_FILE
     return _real_load_dotenv(path, *args, **kwargs)
 
 
@@ -371,10 +400,12 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
         shown = "\n  ".join(dict.fromkeys(secret_opens))
         _fail_session(
             session,
-            f"\n\nERROR: the test session opened the checkout's real credential file(s):\n  {shown}"
-            "\nconftest points every DEFAULT_ACCOUNTS_ENV at the session sandbox and redirects the"
-            " .env load. Something opened the file directly: a test that needs credentials must"
-            " write its own under tmp_path.",
+            "\n\nERROR: the test session tried to open the checkout's real credential"
+            f" file(s):\n  {shown}"
+            "\nconftest points every DEFAULT_ACCOUNTS_ENV at the session sandbox and redirects"
+            " the .env load. Something named the file directly: a test that needs credentials must"
+            " write its own under tmp_path. Each attempt also raised SuiteHermeticityViolation,"
+            " which broad exception handlers can swallow.",
         )
 
     readers = _accounts_env_readers()
