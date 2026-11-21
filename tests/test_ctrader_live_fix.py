@@ -1199,6 +1199,78 @@ def test_an_unreadable_order_status_is_detected_from_the_wire() -> None:
     )
 
 
+def test_an_unrecognised_status_is_treated_as_working(caplog) -> None:
+    """A status this client cannot name must still be cancelled, not left resting.
+
+    The broker's unnameable status arrives in the wire's unknown fields while
+    the typed ``orderStatus`` still reads ACCEPTED, so the sweep sends a
+    cancel - the direction that leaves nothing resting - and logs that the
+    status was uninterpretable.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    wire = ProtoOAOrder()
+    wire.orderId = 701
+    wire.orderType = ProtoOAOrderType.LIMIT
+    wire.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    wire.tradeData.CopyFrom(_trade_data())
+    raw = bytearray(wire.SerializeToString())
+    # Field 4 is orderStatus; value 9 is a status this build has no name for.
+    raw += bytes([4 << 3 | 0, 9])
+    parsed = ProtoOAOrder()
+    parsed.ParseFromString(bytes(raw))
+
+    adapter = _control_adapter()
+
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(parsed) is True
+    assert any("no name for" in record.getMessage() for record in caplog.records)
+
+
+def test_no_status_enum_treats_every_order_as_working(caplog) -> None:
+    """Without the enum there is no way to tell working from terminal."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter()
+    adapter._ProtoOAOrderStatus = None
+
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(_order(702, ProtoOAOrderType.LIMIT)) is True
+    assert any("no order-status enum" in record.getMessage() for record in caplog.records)
+
+
+def test_an_order_with_no_status_field_is_treated_as_working(caplog) -> None:
+    """A status that was never sent is "cannot tell", so it is cancelled."""
+    adapter = _control_adapter()
+    order = SimpleNamespace(orderId=703, orderType=2)
+
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(order) is True
+    assert any("no status field" in record.getMessage() for record in caplog.records)
+
+
+def test_a_terminal_or_unparsable_status_is_not_working(caplog) -> None:
+    """The one path that resolves *against* cancelling, pinned so it stays loud."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    adapter = _control_adapter()
+
+    filled = _order(704, ProtoOAOrderType.LIMIT, status=ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(filled) is False
+
+    unparseable = SimpleNamespace(orderId=705, orderType=2, orderStatus="ACCEPTED?")
+    assert adapter._is_working_order(unparseable) is False
+    assert any("not an integer" in record.getMessage() for record in caplog.records)
+
+
 def test_the_base_adapter_does_not_claim_the_controls() -> None:
     from live_runner.base_adapter import BaseLiveAdapter
 

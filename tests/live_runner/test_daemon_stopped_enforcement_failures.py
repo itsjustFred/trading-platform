@@ -30,8 +30,10 @@ from tests.test_daemon_control_plane import (
     DEPLOYMENT_ID,
     _ControlAdapter,
     _deployment,
-    _enforce as _enforce_with_known_account,
     _seed,
+)
+from tests.test_daemon_control_plane import (
+    _enforce as _enforce_with_known_account,
 )
 
 _KNOWN_ACCOUNT = {ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")}

@@ -317,7 +317,9 @@ def test_ctrader_an_unparsable_demo_flag_raises_so_the_account_is_skipped() -> N
     env = {**_CTRADER_KEYS, "CTRADER_DEMO": "perhaps"}
 
     with pytest.raises(ValueError, match="Invalid boolean value for CTRADER_DEMO"):
-        daemon._create_adapter_for_account(_ctrader_account(ctid="9000001"), accounts_env_values=env)
+        daemon._create_adapter_for_account(
+            _ctrader_account(ctid="9000001"), accounts_env_values=env
+        )
 
 
 @pytest.mark.parametrize("broker", ["mt5", "tradestation"])
