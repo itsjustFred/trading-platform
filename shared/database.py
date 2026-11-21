@@ -4078,6 +4078,7 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.pre_submit_caps import validate_pre_submit_cap_settings
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -4085,6 +4086,9 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Same for the pre-submit hard caps (#302): a malformed cap must not sit
+    # in the database until the first order is refused by it.
+    validate_pre_submit_cap_settings(deployment.settings)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)

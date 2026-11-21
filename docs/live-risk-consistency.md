@@ -210,6 +210,53 @@ Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
 Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
+## Pre-Submit-Hart-Caps (#302)
+
+`live_runner/pre_submit_caps.py::enforce_pre_submit_caps()` ist die letzte
+Prüfung vor jedem Broker-Submit — nach dem Sizing, nach dem
+Submission-Claim, unmittelbar vor `adapter.submit_order()`. Sie wird an beiden
+Submit-Chokepoints aufgerufen (`submit_order_with_risk()` und der Discord-
+Dispatch in `_prepare_claim_and_submit_signal()`) und ist **unabhängig vom
+Sizing-Code**: jede Größe wird erneut aus Broker-Wahrheit
+(`get_quote`/`get_pip_value`/`get_balance`) und den trusted `settings` des
+Deployments abgeleitet, nie aus Signal-Metadata.
+
+Abgelehnt wird (fail-closed, ERROR-Alert `pre_submit_cap_refusal` plus
+Audit-Eintrag über `record_live_control_audit`), wenn
+
+| Regel | Bedingung |
+|-------|-----------|
+| `qty_cap` | `qty > pre_submit_max_qty` (nur wenn konfiguriert) |
+| `price_deviation` | `|entry - quote_side| / quote_side > pre_submit_max_price_deviation_fraction` (Ask für Buy, Bid für Sell, absolut in beide Richtungen) |
+| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` |
+| `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
+
+Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
+Cap-Settings, Quote/Pip-Value/Balance nicht abrufbar oder unbrauchbar
+(`broker_facts_unavailable` / `broker_facts_unusable` / `invalid_cap_config` /
+`missing_stop_loss` / `unresolved_levels` / `invalid_qty`). Exit-only-Orders
+(`risk_sizing_mode == "exit_only"`) laufen nie durch die Caps — sie reduzieren
+Exposure, und eine Cap darf einen Flatten nicht blockieren.
+
+Settings pro Deployment (deployment = account + symbols, also der
+Per-Account/-Per-Symbol-Scope), validiert beim Anlegen
+(`validate_pre_submit_cap_settings` in `create_live_deployment`) und erneut
+fail-closed beim Submit:
+
+| Setting | Default | Gültig |
+|---------|---------|--------|
+| `pre_submit_max_qty` | **unbegrenzt** | `> 0`, endlich (kein universeller Default: Share, Lot und 0.01-Lot sind verschiedene Instrumente) |
+| `pre_submit_max_notional_equity_fraction` | **1.0** | `> 0` (Order-Notional als Bruchteil des Account-Equity) |
+| `pre_submit_max_price_deviation_fraction` | **0.02** | `> 0` |
+| `pre_submit_max_risk_multiple` | **2.0** | `> 0` (Vielfaches des konfigurierten `max_risk_per_trade`-Risikos) |
+| `pre_submit_symbol_caps` | — | Mapping `SYMBOL -> {gleiche Keys}`, überschreibt nur für dieses Symbol |
+
+Die Defaults sind konservative Backstops gegen Sizing-Bugs (Basis: #146
+~1000x, #184 100x), keine Trading-Policy — die finalen Werte sind eine offene
+Maintainer-Entscheidung. Ein Timeout von 30 s
+(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) begrenzt die drei Broker-Lesungen;
+bei Timeout wird abgelehnt.
+
 ## Commission-Vorzeichen (#184 Finding 14)
 
 `live_executions.commission` ist bei **allen** Brokern ein **positiver Kostenwert**
