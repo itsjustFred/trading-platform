@@ -418,12 +418,27 @@ def close_alert_sink(timeout: float = SHUTDOWN_FLUSH_SECONDS) -> None:
     ``timeout``; the worker is a daemon thread either way.
     """
     global _ALERT_HANDLER, _ALERT_SINK
-    if _ALERT_HANDLER is not None:
-        for existing in list(logging.Logger.manager.loggerDict.values()):
-            if isinstance(existing, logging.Logger) and _ALERT_HANDLER in existing.handlers:
-                existing.removeHandler(_ALERT_HANDLER)
-    if _ALERT_SINK is not None:
-        _ALERT_SINK.close(timeout=timeout)
+    handler = _ALERT_HANDLER
+    sink = _ALERT_SINK
+    if handler is not None:
+        # Hold the handler lock across detach and drain: an emit already running
+        # on another thread finishes its queue submit before the worker is
+        # stopped, so its alert cannot be stranded in a queue nobody drains.
+        # Bounded by ``timeout`` via the worker join inside ``sink.close``.
+        handler.acquire()
+        try:
+            for existing in list(logging.Logger.manager.loggerDict.values()):
+                if (
+                    isinstance(existing, logging.Logger)
+                    and handler in existing.handlers
+                ):
+                    existing.removeHandler(handler)
+            if sink is not None:
+                sink.close(timeout=timeout)
+        finally:
+            handler.release()
+    elif sink is not None:
+        sink.close(timeout=timeout)
     # Restore the configured level on managed loggers that install lowered.
     from shared.logging import LOG_LEVEL, managed_service_loggers
 
