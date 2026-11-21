@@ -3217,12 +3217,12 @@ def record_live_broker_side_close_fill(
 ) -> float:
     """Record a broker-side close against the parent signal's deployment ledger (#144).
 
-    Alpaca bracket stop/target legs and cTrader position SL/TP closes are orders the platform
-    never submitted, so their fills arrive with no signal of ours to attribute them to. Left
-    unrecorded they shrink the broker position while every ledger still counts the shares, and
-    #142's guard then reports a mismatch on every later exit for that account and symbol: the
-    exit is capped at the broker position, which on a netted account can be another deployment's
-    share.
+    A broker-side close - an Alpaca bracket's stop/target leg, and (once that path lands) a
+    cTrader position's SL/TP close - is an order the platform never submitted, so its fill arrives
+    with no signal of ours to attribute it to. Left unrecorded it shrinks the broker position
+    while every ledger still counts the shares, and #142's guard then reports a mismatch on every
+    later exit for that account and symbol: the exit is capped at the broker position, which on a
+    netted account can be another deployment's share.
 
     The close is carried by a signal of the parent's own deployment whose action is the
     *reducing* side (a sell for a buy entry), so the deployment's signed net filled quantity
