@@ -5283,8 +5283,19 @@ def _serialize_live_deployment_payload(
     # statement from "there is none" - the same distinction that makes
     # `exposure_may_be_open` worth reporting. A create, update or re-point response never
     # reads conflicts, so it must not answer for them.
-    conflicts = None if broker_order_conflicts is None else list(broker_order_conflicts)
-    halted_for_conflict = bool(conflicts) and (
+    read_conflicts = None if broker_order_conflicts is None else list(broker_order_conflicts)
+    conflicts = None
+    conflicts_truncated = False
+    if read_conflicts is not None:
+        # An HTTP payload has to be bounded, and a deployment with a pathological
+        # conflict backlog must not drag the whole deployments list with it. So the
+        # list is cut at the cap the dashboard already uses and the cut is *said*: a
+        # silently shortened list would read as "these are all of them" to the operator
+        # deciding whether to resolve, and the halt itself is unaffected - it is decided
+        # by the presence of any conflict, never by the count.
+        conflicts = read_conflicts[:MAX_BROKER_ORDER_CONFLICT_ROWS]
+        conflicts_truncated = len(read_conflicts) > MAX_BROKER_ORDER_CONFLICT_ROWS
+    halted_for_conflict = bool(read_conflicts) and (
         str(deployment.status or "").strip().upper() != "ACTIVE"
     )
     payload = {
@@ -5302,6 +5313,7 @@ def _serialize_live_deployment_payload(
         # signals: a broker order may exist that the ledger does not track. None when
         # this response did not read them (see above).
         "broker_order_conflicts": conflicts,
+        "broker_order_conflicts_truncated": conflicts_truncated,
         "halted_for_broker_order_conflict": halted_for_conflict,
         "signal_source_type": deployment.signal_source_type,
         "signal_source_id": deployment.signal_source_id,

@@ -815,6 +815,52 @@ def test_resolving_keeps_both_warnings_when_nothing_resolved_and_a_drain_did_not
     assert "no recorded broker order id conflict" in warning
 
 
+def test_a_long_conflict_list_is_bounded_and_says_that_it_was_cut(monkeypatch) -> None:
+    """#311 nit: a bounded payload has to say it is bounded.
+
+    A deployment can carry more conflicts than one response should carry, and a silently
+    shortened list reads as "these are all of them" to an operator deciding whether to
+    resolve. The cut is reported, and the halt flag still answers from the whole list -
+    it is the presence of a conflict that halts a deployment, never the count.
+    """
+    from viewer.main import (
+        MAX_BROKER_ORDER_CONFLICT_ROWS,
+        _serialize_live_deployment_payload,
+    )
+
+    deployment = LiveDeploymentConfig(
+        id="55555555-5555-5555-5555-555555555555",
+        strategy_name="live_strategy",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="PAUSED",
+    )
+    every_conflict = [
+        {
+            "signal_id": f"{index}" * 8,
+            "deployment_id": str(deployment.id),
+            "symbol": "AAPL",
+            "broker_order_id": "BRK-AAA",
+            "conflicting_broker_order_ids": [f"BRK-{index}"],
+        }
+        for index in range(MAX_BROKER_ORDER_CONFLICT_ROWS + 5)
+    ]
+
+    payload = _serialize_live_deployment_payload(deployment, every_conflict)
+
+    assert len(payload["broker_order_conflicts"]) == MAX_BROKER_ORDER_CONFLICT_ROWS
+    assert payload["broker_order_conflicts_truncated"] is True
+    assert payload["halted_for_broker_order_conflict"] is True
+
+    short = _serialize_live_deployment_payload(deployment, every_conflict[:1])
+    assert short["broker_order_conflicts_truncated"] is False
+    # An unread ledger is still "unknown", not "none" - and not "a truncated none".
+    unread = _serialize_live_deployment_payload(deployment)
+    assert unread["broker_order_conflicts"] is None
+    assert unread["broker_order_conflicts_truncated"] is False
+
+
 def test_an_unread_conflict_ledger_is_not_reported_as_confirmed_empty(monkeypatch) -> None:
     """A create response never reads the ledger, so it must not answer for it."""
     import viewer.main as viewer_main_module
