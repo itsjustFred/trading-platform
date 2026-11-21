@@ -574,7 +574,7 @@ def test_a_wrong_side_stop_does_not_count_as_protection() -> None:
     )
     adapter = _adapter(client)
 
-    restored = asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0))
+    restored = asyncio.run(adapter._restore_stop(client, "AAPL", 190.0))
 
     assert restored is True
     submitted = [order for order in client.submitted if order.stop_price == 190.0]
@@ -598,7 +598,7 @@ def test_a_reducing_side_stop_is_not_duplicated() -> None:
     )
     adapter = _adapter(client)
 
-    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 190.0)) is True
     assert client.submitted == []
 
 
@@ -724,7 +724,8 @@ def test_a_position_whose_qty_cannot_be_read_is_not_treated_as_flat() -> None:
 
     Reading it as zero would skip the restore and report the position protected
     while nothing protects it - the other half of fail-closed on a broker row this
-    adapter cannot read.
+    adapter cannot read. Sizing a stop from it is just as wrong, so the restore
+    refuses instead and the flatten reports the position as unprotected.
     """
     client = _FakeTradingClient(
         positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")],
@@ -732,18 +733,23 @@ def test_a_position_whose_qty_cannot_be_read_is_not_treated_as_flat() -> None:
     )
     adapter = _adapter(client)
 
-    assert asyncio.run(adapter._position_is_flat("AAPL")) is False
-    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
-    submitted = [order for order in client.submitted if order.stop_price == 190.0]
-    assert len(submitted) == 1
+    live = asyncio.run(adapter._live_position("AAPL"))
+
+    assert live.flat is False, "an unreadable quantity must not pass as flat"
+    assert live.stop_qty is None, "a stop must not be sized from an unreadable position"
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 190.0)) is False
+    assert client.submitted == []
 
 
-def test_position_is_flat_sees_an_open_position_on_that_symbol() -> None:
-    """The other half: a live position is not flat, so the restore is allowed."""
+def test_the_live_position_reads_the_broker_row() -> None:
+    """The other half: a live position is not flat, and it can be sized from."""
     client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)], orders=[])
+    adapter = _adapter(client)
 
-    assert asyncio.run(_adapter(client)._position_is_flat("AAPL")) is False
-    assert asyncio.run(_adapter(client)._position_is_flat("MSFT")) is True
+    live = asyncio.run(adapter._live_position("AAPL"))
+
+    assert (live.flat, live.stop_qty, live.stop_side) == (False, 10.0, "sell")
+    assert asyncio.run(adapter._live_position("MSFT")).flat is True
 
 
 def test_a_flat_position_is_not_given_a_stop() -> None:
@@ -756,7 +762,7 @@ def test_a_flat_position_is_not_given_a_stop() -> None:
     client = _FakeTradingClient(orders=[], positions=[])
     adapter = _adapter(client)
 
-    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 190.0)) is True
     assert client.submitted == []
 
 
@@ -1084,12 +1090,16 @@ def test_a_lost_cancel_reply_still_counts_as_a_removed_protection() -> None:
     assert [(order.stop_price, order.qty) for order in restored] == [(95.0, 10.0)]
 
 
-def test_the_excusal_fails_closed_on_an_unreadable_book() -> None:
-    """A refused cancel is only excused by a book, and a book it could not read.
+def test_a_refused_cancel_is_settled_by_id_without_a_fresh_book() -> None:
+    """The excusal is one read by id, not a book listing per refused cancel.
 
-    The re-read that decides it is itself an order listing, so it can fail. Failing
-    the cancel then keeps the sweep's failure report and the stop restore, instead of
-    silently excusing a cancel nobody verified.
+    A terminal state read by id already proves the order is not resting, so the
+    excusal no longer re-lists the page-limited nested history for every refusal:
+    on a mature account a sweep with two refusals would issue two 20-page nested
+    listings, and a rate limit there fails the sweep closed. The refusal is settled
+    by id instead - where this leg still reads as ``held``, so the refusal stands -
+    and the flatten's failure report, the untouched close and the stop restore are
+    all still there.
     """
     client = _BracketPositionClient(
         positions=[_FakePosition("AAPL", 10.0)], oco_siblings=False
@@ -1120,10 +1130,37 @@ def test_the_excusal_fails_closed_on_an_unreadable_book() -> None:
     assert outcome.complete is False
     assert outcome.failed == ("AAPL:cancel:sl-leg:cancel rejected",)
     assert client.close_calls == []
-    # The excusal verified: the flatten's listing, the excusal's own re-read and the
-    # restore's re-read. A test that only checked the outcome would also pass if the
-    # excusal verified nothing at all.
-    assert reads["all"] == 3
+    # Two ``status=all`` listings: the flatten's own book and the restore's re-read.
+    # The refusal cost none of its own - a test that only checked the outcome would
+    # also pass if the excusal verified nothing at all.
+    assert reads["all"] == 2
+    # The restore went ahead on a book it could not read: the position is live, and a
+    # stop placed beside an order nobody could list beats a naked position.
+    restored = [order for order in client.orders if order.order_type == "stop"]
+    assert [(order.stop_price, order.qty) for order in restored] == [(95.0, 10.0)]
+
+
+def test_a_refused_cancel_is_not_excused_by_a_broker_that_cannot_find_the_order() -> None:
+    """A 404 proves nothing: the refusal stands rather than being excused."""
+    client = _BracketPositionClient(positions=[], oco_siblings=False)
+    real_cancel = client.cancel_order_by_id
+
+    def _refuse_the_stop_leg(order_id: str) -> None:
+        if order_id == "sl-leg":
+            raise RuntimeError("cancel rejected")
+        real_cancel(order_id)
+
+    client.cancel_order_by_id = _refuse_the_stop_leg  # type: ignore[method-assign]
+
+    def _lose_the_order(order_id: str):
+        raise RuntimeError(f"404: order {order_id} not found")
+
+    client.get_order_by_id = _lose_the_order  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is False
+    assert any("sl-leg" in item for item in outcome.failed)
 
 
 def test_flatten_refuses_a_full_held_leg_page() -> None:
