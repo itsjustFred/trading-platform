@@ -217,7 +217,7 @@ def test_a_standing_halt_cannot_be_weakened_by_a_re_write(
 
 
 def test_two_racing_halt_writes_cannot_downgrade_each_other(
-    isolated_db_sandbox, account: str, monkeypatch: pytest.MonkeyPatch
+    isolated_db_sandbox, account: str
 ) -> None:
     """A CLI ``flatten`` racing a viewer ``orders`` must not lose to it.
 
@@ -227,62 +227,55 @@ def test_two_racing_halt_writes_cannot_downgrade_each_other(
     (BEGIN IMMEDIATE), so the second writer reads the first one's committed
     mode and is refused as a weakening.
 
-    The interleaving is pinned with events, not sleeps: the flatten writer
-    signals from inside the write lock (``_utcnow_naive`` runs after
-    ``BEGIN IMMEDIATE`` and the row read), the orders writer starts only then
-    and blocks on the lock, and the flatten writer releases once the orders
-    write is queued. No scheduling luck decides who reads whose snapshot.
+    Pinned with a third connection holding the write lock, like
+    ``test_a_resume_waits_for_the_write_lock_before_it_reads_the_row``: while
+    it is held the row is escalated to ``flatten`` and the lock released. An
+    orders write that read the row before the flip (no BEGIN IMMEDIATE) sees
+    ``entries``, judges the write legal, and its commit lands after the
+    release - silently stepping the halt down to ``orders``. One that waited
+    on the lock reads ``flatten`` and is refused as a weakening, so the scope
+    stays ``flatten`` either way the scheduler interleaves the threads.
     """
+    import sqlite3
     import threading
+    import time
 
-    import shared.database as database
+    database, _engine, _data_dir = isolated_db_sandbox
 
     set_live_kill_switch(account, "entries", actor="operator")
 
-    real_utcnow = database._utcnow_naive
-    flatten_holds_lock = threading.Event()
-    orders_queued = threading.Event()
-
-    def _slow_utcnow() -> object:
-        # Only the flatten writer rendezvous here: it is the first and only
-        # _utcnow_naive call on that thread inside set_live_kill_switch, made
-        # while BEGIN IMMEDIATE is held. The orders writer's own call happens
-        # after it acquires the lock and must not wait.
-        if threading.current_thread().name == "flatten-writer":
-            flatten_holds_lock.set()
-            orders_queued.wait(timeout=30)
-        return real_utcnow()
-
-    monkeypatch.setattr(database, "_utcnow_naive", _slow_utcnow)
-
+    blocker = sqlite3.connect(str(database.DB_PATH), timeout=30)
     outcomes: dict[str, object] = {}
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
 
-    def _write(mode: str, key: str) -> None:
-        if key == "orders":
-            # Start only once the flatten writer provably holds the write
-            # lock; this call then blocks on BEGIN IMMEDIATE until the
-            # flatten commit lands, however the scheduler interleaves us.
-            flatten_holds_lock.wait(timeout=30)
-            orders_queued.set()
-        try:
-            set_live_kill_switch(account, mode, actor=f"operator-{key}")
-            outcomes[key] = "written"
-        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
-            outcomes[key] = exc
+        def _write() -> None:
+            try:
+                outcomes["orders"] = set_live_kill_switch(
+                    account, "orders", actor="operator-orders"
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                outcomes["orders"] = exc
 
-    flatten_thread = threading.Thread(
-        target=_write, args=("flatten", "flatten"), name="flatten-writer"
-    )
-    orders_thread = threading.Thread(
-        target=_write, args=("orders", "orders"), name="orders-writer"
-    )
-    flatten_thread.start()
-    orders_thread.start()
-    flatten_thread.join(timeout=30)
-    orders_thread.join(timeout=30)
+        orders_thread = threading.Thread(target=_write, name="orders-writer")
+        orders_thread.start()
+        # Long enough for an unserialized write to read the row and queue on
+        # the commit; the locked write is still waiting to begin.
+        time.sleep(1.0)
 
-    assert not flatten_thread.is_alive() and not orders_thread.is_alive()
-    assert outcomes["flatten"] == "written"
+        # Escalate the standing halt to flatten and release: what the orders
+        # write observes next is this committed mode.
+        blocker.execute(
+            "UPDATE live_kill_switch SET mode = 'flatten' WHERE scope = ?",
+            (account,),
+        )
+        blocker.commit()
+
+        orders_thread.join(timeout=30)
+    finally:
+        blocker.close()
+
+    assert not orders_thread.is_alive()
     assert isinstance(outcomes["orders"], ValueError)
     assert read_live_kill_switch_scopes() == {account: "flatten"}
 
