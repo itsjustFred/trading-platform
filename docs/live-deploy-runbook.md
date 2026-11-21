@@ -150,7 +150,12 @@ results stop predicting live behaviour:
 - Cleanup: in-memory progress is dropped as soon as the position is gone at the broker (stop or
   take profit hit, exit signal, manual close) or its deployment is no longer ACTIVE. A partial
   exit keeps the trail on the remaining quantity — see the stop-quantity rule below for the one
-  case where it pauses.
+  case where it pauses. A partially filled bracket parent is the same shape: while its stop leg
+  keeps the *order* quantity (which is what a partial parent fill leaves behind), the trail is
+  paused for the whole trade, not just for the filled part, and only a resize of that leg ends
+  it. Whether Alpaca sizes a partially filled bracket's stop leg to the filled quantity or to the
+  order quantity is unverified — it is part of the paper run the "Paper verification pending"
+  note below is waiting for.
 - Stop quantity: an amendment moves a stop's price, never its quantity. After a partial exit a
   bracket stop leg can still be sized to the original entry, and what Alpaca does when such a stop
   triggers (cap, oversell, reject) has **not** been verified on paper (#258). A stop whose
@@ -159,9 +164,12 @@ results stop predicting live behaviour:
   untrailed until it is resized to the quantity held`, with account, symbol, signal, stop order
   id, stop quantity and position quantity) as an ERROR with one Sentry event
   (`component=live_trailing_stops`) on every transition into the mismatch — so a second partial
-  exit after a resize is reported again — and amends nothing. A repeat while the mismatch lasts
-  is silent: the state has not changed and one event per transition is the alert. Only a manual
-  resize ends the pause, which is why the transition is an ERROR rather than a WARNING: nobody
+  exit after a resize is reported again — and amends nothing. The pause covers the whole trade,
+  not only the over-covered part: while the stop cannot sell the position it protects, nothing
+  about it is trusted, so no close is trailed at all until the leg is resized. A repeat while the
+  mismatch lasts is silent: the state has not changed and one event per transition is the alert.
+  Only a manual resize ends the pause, which is why the transition is an ERROR rather than a
+  WARNING: nobody
   reads a warning that says a live position is no longer trailed. It is not a failure: no retry,
   no give-up, and no bar is consumed, so the moment the stop is resized to the quantity held (by
   hand today) the trail resumes and applies every close it skipped (up to 50). The pause also
@@ -205,6 +213,11 @@ clean-up.
   probe runs (a bracket entry, a partial exit, then a trail trigger, in market hours), a stop that
   covers more than the position holds is left untrailed rather than resized — see "Stop quantity"
   above.
+- Still **not** covered (#258): how a *partially filled* bracket parent sizes its stop leg — to the
+  quantity that filled or to the quantity that was ordered. The first pauses the trail for the whole
+  trade (the leg covers more than the position holds) and only a resize ends it; the second leaves
+  the leg matching the position and the trail continues. The probe above has to observe it, so the
+  bracket entry of that run is filled in two parts.
 
 ## Strategy Promotion Gate (#165)
 
