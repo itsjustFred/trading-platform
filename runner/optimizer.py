@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from data_tools.auto_download import ensure_backtest_data, has_sufficient_segment_coverage
 from runner.cli import _detect_date_range
-from runner.engines.base import BacktestConfig
+from runner.engines.base import BacktestConfig, warn_if_engine_frozen
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.optimization_diagnostics import (
     ThreeWaySplit,
@@ -2030,6 +2030,7 @@ def _run_vectorbt_backtest(config: BacktestConfig, strategy_path: Path) -> Backt
         modeling_resolution=config.modeling_resolution,
         log_callback=lambda message: None,
     )
+    warn_if_engine_frozen("vectorbt", stacklevel=2)
     result = VectorbtAdapter().run(config, str(strategy_path))
     result.stats = {**result.stats, **compute_stats_for_result(result)}
     return result
