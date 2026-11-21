@@ -83,7 +83,9 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # not the current head; the comment guard then keeps a newer result in place. The
 # SHA must be a full 40-hex SHA that is one of that PR's own commits - a typo or
 # another PR's head is refused, so no foreign diff is ever analysed under this
-# PR's name:
+# PR's name - and the *current* head is refused too: its bucket is named after
+# the commit, so it would run beside the push analysing that same diff instead of
+# superseding it. Re-running the current head is `-f pr_number=<N>` alone:
 #   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
 # A dispatch can only name a ref that carries this workflow file. This PR is the
 # one that adds it, so until it merges into the default branch the manual rerun is
