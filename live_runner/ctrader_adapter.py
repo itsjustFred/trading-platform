@@ -1174,6 +1174,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         try:
             payload = self._Protobuf.extract(message)
         except Exception as exc:  # except-kind: money-decision
+            if payload_type == self._execution_payload_type:
+                self._reconciliation_required = True
+                self._reconciliation_retry_at = 0.0
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
             return
 
@@ -1496,12 +1499,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             detail_res = await self._send_request_with_refresh_retry(
                 detail_req, timeout_seconds=15
             )
-        except Exception:  # except-kind: money-decision
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
-                "cTrader symbol-props fetch failed; using fallback scales",
-                extra={"data": {"account_id": self.ctid_trader_account_id}},
+                "cTrader symbol-props fetch failed; refusing fallback scales",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": str(exc),
+                    }
+                },
             )
-            return
+            raise
         if not isinstance(detail_res, ProtoOASymbolByIdRes):
             return
         # Archived entries first so live properties always win on collision.
