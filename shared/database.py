@@ -2505,7 +2505,9 @@ def _pause_live_deployment_for_conflict(session: Session, deployment_id: object)
 
     Writes through the caller's ``session`` rather than :func:`update_live_deployment_status`
     so the halt and the conflict record that justifies it commit together; a second
-    session would take its own write lock inside the open transaction and deadlock.
+    session would take its own write lock inside the open transaction and deadlock. The
+    row write itself is the shared one (:func:`_apply_live_deployment_status_row`), so
+    the stamp and timestamp rules cannot drift between the two writers.
 
     Refuses (:data:`CONFLICT_HALT_ALREADY_HALTED`) when the row is already PAUSED - a
     redelivered conflict re-halts nothing - and when it is STOPPED, which is a stronger
@@ -2527,12 +2529,11 @@ def _pause_live_deployment_for_conflict(session: Session, deployment_id: object)
     current_status = str(row.status or "").strip().upper()
     if current_status in {"PAUSED", "STOPPED"}:
         return CONFLICT_HALT_ALREADY_HALTED
-    row.status = "PAUSED"
-    # Same write the STOPPED -> PAUSED transition in `update_live_deployment_status`
-    # makes: leaving the enforcement stamp behind would let the row report a proven stop
-    # for a deployment that is only paused.
-    row.stopped_enforced_at = None
-    row.updated_at = _utcnow_naive()
+    # The same row write `update_live_deployment_status` performs, in this transaction
+    # rather than through a second session: a conflict halt that took its own write lock
+    # inside this one would deadlock, and one that committed separately would leave a
+    # crash between the two commits with a persisted conflict on a still-ACTIVE row.
+    _apply_live_deployment_status_row(row, "PAUSED")
     session.add(row)
     return CONFLICT_HALT_PAUSED
 
@@ -4271,6 +4272,28 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> None:
+    """Write a deployment's status (and the fields that go with it) on a loaded row.
+
+    One definition for every writer of `live_deployments.status`, in-session and
+    session-of-its-own alike, so the two rules that travel with a status change cannot
+    drift apart between them. Those rules are what makes a status readable afterwards:
+    an unchanged `updated_at` hides the write, and a `stopped_enforced_at` left on a
+    non-STOPPED row makes the next skip of the stop enforcement look proven (see the
+    STOPPED -> PAUSED -> STOPPED cycle below).
+    """
+    row.status = status
+    if status != "STOPPED":
+        # Clear the enforcement stamp in the *same* transaction as the status change.
+        # Without this a STOPPED -> PAUSED -> STOPPED cycle keeps the old stamp, and the
+        # second stop is skipped as "already enforced" while its positions are still
+        # open. Doing it in one commit matters: a crash between the two writes must not
+        # leave a non-STOPPED deployment carrying a stamp that disables the next
+        # enforcement.
+        row.stopped_enforced_at = None
+    row.updated_at = _utcnow_naive()
+
+
 def update_live_deployment_status(
     deployment_id: str, status: str
 ) -> LiveDeploymentConfig | None:
@@ -4282,17 +4305,7 @@ def update_live_deployment_status(
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return None
-        record.status = next_status
-        if next_status != "STOPPED":
-            # Clear the enforcement stamp in the *same* transaction as the
-            # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle
-            # keeps the old stamp, and the second stop is skipped as "already
-            # enforced" while its positions are still open. Doing it in one
-            # commit matters: a crash between the two writes must not leave a
-            # non-STOPPED deployment carrying a stamp that disables the next
-            # enforcement.
-            record.stopped_enforced_at = None
-        record.updated_at = _utcnow_naive()
+        _apply_live_deployment_status_row(record, next_status)
         session.add(record)
         session.commit()
         session.refresh(record)
