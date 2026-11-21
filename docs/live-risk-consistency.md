@@ -217,7 +217,9 @@ Prüfung vor dem Broker-Submit der Daemon-Pfade — nach dem Sizing, nach dem
 Submission-Claim, unmittelbar vor `adapter.submit_order()`. Sie wird an beiden
 Submit-Chokepoints aufgerufen (`submit_order_with_risk()` und der Discord-
 Dispatch in `_prepare_claim_and_submit_signal()`); direkte Submits aus
-`scripts/live_smoke.py` und `live_runner/test_signal_trigger.py` umgehen sie.
+`scripts/live_smoke.py` und `live_runner/test_signal_trigger.py` umgehen sie
+bewusst — beides Operator-Werkzeuge für manuelle Tests, kein Daemon-Pfad; ein
+Fehler dort hat damit kein Cap-Backstop.
 **Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value und
 Balance werden hier erneut gelesen (`get_quote`/`get_pip_value`/`get_balance`),
 die Quote dabei mit demselben Frische-Gate wie der Entry-Deviation-Check
