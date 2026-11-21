@@ -664,16 +664,30 @@ def run_backtest(
         # ``reb_date``; the published portfolio value still marks through
         # ``reb_date``'s close.
         gate_loc = returns.index.get_loc(reb_date)
-        gate_weights, _ = _drift_weights(returns.index[gate_loc - 1])
+        gate_bar = returns.index[gate_loc - 1]
+        # ``_price_returns`` drops a bar (and the next) when any ticker's close is
+        # missing, so the gate mark can be older than QC's previous-session snapshot.
+        # Not look-ahead — just staler than the 10:00 HoldingsValue read — but it must
+        # be visible rather than silent.
+        prev_session_bar = prices.index[prices.index.get_loc(reb_date) - 1]
+        if gate_bar != prev_session_bar:
+            logger.warning(
+                "Rebalance %s: the 2%% drift gate marks through %s, not the previous "
+                "session %s — dropped return bars (missing closes) make the snapshot "
+                "staler than QC's 10:00 HoldingsValue read",
+                reb_date.date(),
+                gate_bar.date(),
+                prev_session_bar.date(),
+            )
+        gate_weights, _ = _drift_weights(gate_bar)
         drifted_weights = advance_portfolio_value(reb_date)
         current_portfolio_value = portfolio_value_at_rebalance
         # QC's Rebalance runs at 10:00 (AfterMarketOpen 30) on daily data: History() and the
         # SMA only contain bars up to the PREVIOUS close, while the MarketOnClose fill happens
         # at ``reb_date``'s close. The decision window therefore ends before ``reb_date``'s own
         # return; using it would be a one-day look-ahead (it flips the hedge in 2020-03/2022-03).
-        loc = gate_loc
-        hist_start = max(0, loc - lookback_corr)
-        ret_matrix = returns.iloc[hist_start:loc].T.values
+        hist_start = max(0, gate_loc - lookback_corr)
+        ret_matrix = returns.iloc[hist_start:gate_loc].T.values
         if ret_matrix.shape[1] < lookback_corr:
             logger.warning(
                 "Rebalance %s: covariance window has %d of %d return observations "
@@ -873,6 +887,7 @@ def run_backtest(
         "portfolio_value": portfolio_value,
         "portfolio_target_signals": portfolio_target_signals,
         "trades": trades,
+        "rebalance_schedule": rebalance_schedule,
         "stats": stats,
         "initial_capital": float(initial_cash),
     }
