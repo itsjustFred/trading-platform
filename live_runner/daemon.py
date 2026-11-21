@@ -7,12 +7,27 @@ import inspect
 import math
 import os
 import re
+import sys
+import threading
 import uuid
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+if __name__ == "__main__":
+    # `python -m live_runner.daemon` runs THIS module, imports first: everything below (pandas, the
+    # broker SDKs, shared.database, the logger factory, Sentry) loads before any statement in this
+    # file. Answering the CLI here, before those imports, is what makes `--help` side-effect free:
+    # an agent - or an operator typo in a script - exits with usage instead of opening the live
+    # database, running the migrations and starting a second daemon (#310).
+    #
+    # Nested inside this guard, above the heavy imports: this path loads only
+    # `live_runner.daemon_cli`, which imports the standard library alone.
+    from live_runner.daemon_cli import main as _daemon_cli_main
+
+    raise SystemExit(_daemon_cli_main(sys.argv[1:]))
 
 import pandas as pd
 
@@ -106,6 +121,7 @@ from shared.database import (
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
+    live_db_path,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
     renew_live_deployment_submission,
@@ -124,6 +140,11 @@ from shared.models import (
     ServiceType,
 )
 from shared.sentry import capture_exception, initialize_sentry
+from shared.single_instance import (
+    SingleInstanceError,
+    SingleInstanceLock,
+    keep_for_process_lifetime,
+)
 from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
     validate_live_deployment_trailing_override,
@@ -138,6 +159,21 @@ _ACCOUNT_NOT_AUTHORIZED_LOG = "Account %s not authorized for token, skipping"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
+
+
+def daemon_lock_path() -> Path:
+    """The single-instance lock file: a sibling of the SQLite file this daemon trades (#310).
+
+    Resolved through ``live_db_path`` so the lock sits next to the file the engine really opens
+    (``DATABASE_URL`` when it names a SQLite file, ``DATA_DIR/backtests.db`` otherwise) - a lock
+    beside some other file would exclude nobody.
+    """
+    resolved = live_db_path().resolve()
+    # Both the directory and the file name come from the resolved path: a symlink can rename as
+    # well as redirect, and two spellings of one database must not be two locks.
+    return resolved.with_name(f"{resolved.name}.lock")
+
+
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
 # A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
@@ -5176,10 +5212,86 @@ async def sync_deployments_loop(
         await asyncio.sleep(interval_seconds)
 
 
-async def run_daemon(
+#: How long the daemon waits for its own worker threads to finish joining before it stops waiting
+#: for them. The join covers ``asyncio.to_thread`` bodies - the startup discovery's database reads
+#: and writes, and a loop iteration's own - which normally finish in milliseconds. One still running
+#: after this budget is inside a call that is not coming back (a broker stream thread whose socket
+#: never closes), and a process that trades nothing must not wait for it while holding the
+#: single-instance lock.
+WORKER_JOIN_TIMEOUT_SECONDS = 30.0
+
+
+class WorkerJoinTimeout(RuntimeError):
+    """The daemon's worker threads are still running after the join budget ran out.
+
+    Raised instead of releasing the single-instance lock: a worker thread that is still running
+    may still write to the one database this process was allowed to touch, so the lock stays held
+    and the operating system releases it when this process dies (see ``run_daemon``).
+    """
+
+
+def _join_default_executor(timeout: float) -> None:
+    """Wait for the loop's worker threads, bounded by ``timeout`` seconds.
+
+    ``asyncio.to_thread`` runs its body on the loop's default executor, and cancelling the await
+    never stops that thread: it finishes the call it is inside and only then returns. So the daemon
+    joins its worker threads before it lets the single-instance lock go - but the join has to end,
+    because a thread inside a call that never returns would otherwise wait here forever, holding
+    the lock the next daemon needs.
+
+    The join runs on a dedicated thread so it can be timed out from here: ``shutdown(wait=True)``
+    offers no deadline of its own. That thread is a daemon thread, so a join that expires leaves
+    no non-daemon thread behind to hold the interpreter's exit path open again.
+    """
+    executor = getattr(asyncio.get_running_loop(), "_default_executor", None)
+    if executor is None:
+        # CPython's loop object stores the executor it created for ``to_thread`` under a private
+        # attribute, so this is the one spelling of the check available. A loop object that does
+        # not expose it (a foreign implementation such as uvloop) has no default executor of ours
+        # to join - and ``to_thread`` work would not be on one either.
+        return
+    finished = threading.Event()
+    failure: list[BaseException] = []
+
+    def _join() -> None:
+        try:
+            executor.shutdown(wait=True)
+        except BaseException as exc:  # noqa: BLE001 - relayed to the loop thread below
+            failure.append(exc)
+        finally:
+            finished.set()
+
+    joiner = threading.Thread(target=_join, name="live-daemon-worker-join", daemon=True)
+    joiner.start()
+    if not finished.wait(timeout):
+        logger.critical(
+            "Live daemon is giving up on its worker threads after %ss",
+            timeout,
+            extra={
+                "data": {
+                    "join_budget_seconds": timeout,
+                    "single_instance_lock": "kept",
+                }
+            },
+        )
+        raise WorkerJoinTimeout(
+            f"the daemon's worker threads are still running after {timeout}s; their work may "
+            "still be in flight and its outcome is unknown"
+        )
+    if failure:
+        # The only thing that lands here is an exception from ``executor.shutdown`` itself,
+        # raised on the joiner thread and relayed to this one. A signal does not: it is
+        # delivered to the main thread, which is parked in ``finished.wait`` and sees the
+        # interrupt directly - the same "workers may still be writing" outcome as an expired
+        # budget, handled by the caller's ``BaseException`` branch.
+        raise failure[0]
+
+
+async def _run_daemon_locked(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
 ) -> None:
+    """The daemon's body; it runs only while this process holds the single-instance lock (#310)."""
     logger.info(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},
@@ -5284,6 +5396,20 @@ async def run_daemon(
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
                 await source.disconnect(failed=False)
+        # B1: close the broker sessions too, before the loop's executor is joined. A listener task
+        # that was cancelled above is still blocking a worker thread inside the stream it is
+        # listening on (Alpaca's ``TradingStream.run`` is a blocking call with no asyncio-native
+        # alternative), and cancelling the await never stops that thread: the stream has to be
+        # told to close, or the join in ``run_daemon`` waits for a thread that is never coming
+        # back - a daemon that no longer trades anything while holding the single-instance lock.
+        for account_id, adapter in list(active_adapters.items()):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    _disconnect_adapter(
+                        adapter, account_id=account_id, reason="daemon_shutdown"
+                    ),
+                    timeout=WORKER_JOIN_TIMEOUT_SECONDS,
+                )
         with contextlib.suppress(Exception):
             await scheduler.stop()
         logger.info(
@@ -5298,9 +5424,80 @@ async def run_daemon(
         )
 
 
-def main() -> None:
-    asyncio.run(run_daemon())
+async def run_daemon(
+    *,
+    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+) -> None:
+    """Run the live daemon under the single-instance lock (#310).
+
+    The lock is acquired here, before the first database touch and every broker connect (both
+    happen inside ``_run_daemon_locked``), so a second daemon is refused with a
+    ``SingleInstanceError`` instead of running the schema and data migrations underneath a running
+    build - the 2026-11-21 incident, where a ``--help`` invocation started a second daemon that
+    migrated the live database under the old one. The operating system owns the lock and releases
+    it when this process exits, including on SIGKILL, so a killed daemon never blocks a restart. On
+    a clean exit the daemon joins its worker threads first, so it never releases the lock while its
+    own database work is still in flight either; if that join is interrupted or does not finish
+    inside ``WORKER_JOIN_TIMEOUT_SECONDS``, the process keeps the lock and the OS releases it on
+    death. Joining shuts the loop's default executor down - as :func:`asyncio.run` does at exit
+    anyway - so an embedder must give each daemon run its own event loop.
+    """
+    lock = SingleInstanceLock(daemon_lock_path())
+    try:
+        lock.acquire()
+    except SingleInstanceError:
+        logger.error(
+            "Refusing to start: another live daemon holds the single-instance lock %s",
+            lock.lock_path,
+        )
+        raise
+    try:
+        await _run_daemon_locked(accounts_env=accounts_env)
+    finally:
+        joined = True
+        try:
+            # Join the daemon's worker threads before the lock goes: an `asyncio.to_thread` body
+            # that is still writing (the startup discovery, a loop iteration's database work)
+            # outlives its cancelled await, and a daemon that released the lock while its own
+            # thread was still writing would hand the next daemon exactly the overlap this lock
+            # exists to prevent.
+            #
+            # The join is bounded (``WORKER_JOIN_TIMEOUT_SECONDS``) and synchronous: an await could
+            # be interrupted by the next cancellation and abandoned, and a stop whose in-flight
+            # database work cannot finish must not hand the lock on. Blocking the loop thread here
+            # cannot deadlock - none of the daemon's worker functions calls back into the loop.
+            _join_default_executor(WORKER_JOIN_TIMEOUT_SECONDS)
+        except BaseException:
+            # Interrupted mid-join (a signal, a KeyboardInterrupt), or the join budget expired
+            # with a worker still running. Releasing now would hand the next daemon the overlap
+            # this lock exists to prevent, so the process keeps the lock and the OS releases it
+            # when the process dies. The lock is anchored to the process here: the coroutine
+            # frame, the task and the traceback that held the last reference all die with this
+            # exception, and garbage collection would otherwise close the descriptor and release
+            # the OS lock while the workers still write.
+            joined = False
+            keep_for_process_lifetime(lock)
+            # The join gave up or was interrupted, so abandoned threads may still be in the
+            # executor and the pieces of the interpreter that wait for them are still armed:
+            # `asyncio.run` would spend its own 300s budget closing this loop and the
+            # interpreter's exit would then join the same threads with no budget at all.
+            # Detaching the executor is what `EventLoop.close()` does too, and it is what makes
+            # leaving the process the caller's job (`daemon_cli` exits 4 on a WorkerJoinTimeout)
+            # rather than the interpreter's.
+            with contextlib.suppress(AttributeError):
+                asyncio.get_running_loop()._default_executor = None
+            raise
+        finally:
+            if joined:
+                lock.release()
 
 
-if __name__ == "__main__":
-    main()
+def main(argv: Sequence[str] | None = None) -> int:
+    """Start the daemon and return the process exit code.
+
+    Kept for embedders; ``python -m live_runner.daemon`` goes through ``live_runner.daemon_cli``,
+    which parses the arguments before this module's heavy imports (#310).
+    """
+    from live_runner.daemon_cli import main as _cli_main
+
+    return _cli_main(argv)

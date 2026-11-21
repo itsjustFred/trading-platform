@@ -433,7 +433,36 @@ set -o pipefail
 uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date -u +%Y%m%dT%H%M%SZ).log"
 ```
 
-> NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
+The daemon takes no options: deployments come from the database (`live_deployments` via
+`shared/database.list_live_deployments`), not from `live_deployments.yaml`, and there is no
+`--config`. An unknown option is a usage error (exit 2), never a silently ignored argument.
+
+`python -m live_runner.daemon --help` is safe to run anywhere, at any time: it prints the usage
+and exits 0 without opening the database, running migrations, or connecting to a broker. It used
+to start the daemon instead (#310).
+
+**One daemon per database.** Before the first migration or broker connect, the daemon takes an
+exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lock`, or the
+`DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
+exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
+was killed (even `kill -9`) releases it on death and never blocks the next start. The data
+directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` - or
+the directory of a SQLite `DATABASE_URL` file - on a network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
+disconnects its broker adapters and then waits - bounded, `WORKER_JOIN_TIMEOUT_SECONDS` = 30s - for
+its in-flight database work, so the lock is never handed on while its own writes are still
+running; if a worker thread is still stuck after the budget the daemon logs CRITICAL and exits 4
+with the lock held until the process dies. `systemctl stop` sends SIGTERM, which this build does
+not handle: the daemon dies immediately with no drain (graceful SIGTERM shutdown is a separate
+change). Deploy this build as stop, deploy, start - the first rollout is **not** protected against
+a daemon already running an older, lockless build: stop the old daemon before starting this one.
+A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
+therefore retries a refused start every `RestartSec` and logs the refusal each time: that is the
+signal to find and stop the other daemon, not to delete the lock file - the file is a handle, the
+lock is the kernel's.
+
+**A newer build runs data migrations.** Starting a build whose schema or one-time data migrations
+the running build does not have yet applies them on startup (see "Commission sign migration
+(cTrader, #205)"). Roll out as stop, deploy, start: never run an old and a new build side by side.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
