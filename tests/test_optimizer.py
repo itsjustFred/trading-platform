@@ -1158,6 +1158,53 @@ class TestRiskAdjustedObjective:
             assert terms["drawdown_factor"] == 0.0
             assert value == 0.0
 
+    def test_unparseable_drawdown_is_unmeasurable(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #320: a value that does not parse is as unmeasurable as None.
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": "abc"},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.0
+        assert value == 0.0
+
+    def test_absent_drawdown_key_is_unmeasurable(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #320: "unmeasurable" is broader than corrupt artifacts - a stats
+        # dict with no max_drawdown_pct key at all (e.g. a run whose equity
+        # curve has fewer than two points, which runner/stats.py declares
+        # undefined) takes the same worst-case haircut.
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.0
+        assert value == 0.0
+
+    def test_drawdown_unmeasurable_classifier(self) -> None:
+        from runner.optimizer import _drawdown_unmeasurable
+
+        assert _drawdown_unmeasurable({"max_drawdown_pct": -0.25}) is False
+        assert _drawdown_unmeasurable({"max_drawdown_pct": "0.1"}) is False
+        assert _drawdown_unmeasurable({"max_drawdown_pct": "abc"}) is True
+        assert _drawdown_unmeasurable({"max_drawdown_pct": float("nan")}) is True
+        assert _drawdown_unmeasurable({"max_drawdown_pct": None}) is True
+        assert _drawdown_unmeasurable({}) is True
+        assert (
+            _drawdown_unmeasurable(
+                {"max_drawdown_pct": 0.0, "undefined_metrics": ["max_drawdown_pct"]}
+            )
+            is True
+        )
+        # Percent-scale stays "measurable" so the scale guard still raises.
+        assert _drawdown_unmeasurable({"max_drawdown_pct": -40.0}) is False
+
     def test_measured_drawdown_still_haircuts(self) -> None:
         from runner.optimizer import _risk_adjusted_metric_value
 
