@@ -462,6 +462,7 @@ def _process_symbol(
             order_type_invalid = False
             level_missing_price = False
             level_unreachable = False
+            level_gapped = False
             effective_exit_price_series = exit_price_series
             if is_terminal_bar and not is_signal_exit:
                 effective_exit_price_series = None
@@ -491,26 +492,42 @@ def _process_symbol(
                 ):
                     effective_exit_price_series = None
                     level_missing_price = True
-            # A level the exit bar never traded through could not have filled
-            # — fall back to the market fill rather than book a fantasy price.
-            # This applies to every level fill, explicit or legacy implicit.
+            # A level is only honored inside the exit bar's traded range.
+            # Beyond it on the untraded side the order could never have
+            # filled — fall back to the market fill rather than book a
+            # fantasy price. Beyond it on the marketable side the order was
+            # marketable at the open, so it fills at the bar's open
+            # (gap-through-level). This applies to every level fill,
+            # explicit or legacy implicit.
             level_fill_price = (
                 contract.usable_exit_price(effective_exit_price_series.iloc[i])
                 if effective_exit_price_series is not None
                 else None
             )
-            if (
-                level_fill_price is not None
-                and is_signal_exit
-                and not contract.exit_level_reachable(
+            if level_fill_price is not None and is_signal_exit:
+                # A-H4 (D3)/A-L5: a SHORT exit buys the ask, so reachability
+                # is judged on the ask range when ask-side data is enabled —
+                # mirroring native _close_position/_ask_bar.
+                bar_high = exit_row.get("high")
+                bar_low = exit_row.get("low")
+                if direction != "LONG":
+                    ask_high, ask_low = _vbt_ask_bar(exit_row, resolved_parameters)
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                level_disposition = contract.exit_level_disposition(
                     direction=direction,
                     level=level_fill_price,
-                    high=exit_row.get("high"),
-                    low=exit_row.get("low"),
+                    high=bar_high,
+                    low=bar_low,
                 )
-            ):
-                effective_exit_price_series = None
-                level_unreachable = True
+                if level_disposition == contract.EXIT_LEVEL_UNREACHABLE:
+                    effective_exit_price_series = None
+                    level_unreachable = True
+                elif level_disposition == contract.EXIT_LEVEL_GAPPED:
+                    effective_exit_price_series = None
+                    level_gapped = True
             exit_price = _resolve_exit_price(
                 exit_row,
                 i,
@@ -518,6 +535,7 @@ def _process_symbol(
                 signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
                 parameters=resolved_parameters,
                 direction=direction,
+                gap_open=level_gapped,
             )
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             if is_terminal_bar and not bool(exits.iloc[i]):
@@ -584,6 +602,17 @@ def _process_symbol(
                         warning_keys=warning_keys,
                     )
                     trade_meta["exit_level_unreachable"] = True
+                if level_gapped:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_gapped"),
+                        "%s/%s: exit level %.6f gapped the exit bar's open; "
+                        "filling at the open instead of the level.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_gapped"] = True
 
             sizing = _size_trade(
                 config=config,
@@ -1443,16 +1472,19 @@ def _resolve_exit_price(
     signal_exit_fill: str = "close",
     parameters: dict[str, Any] | None = None,
     direction: str | None = None,
+    gap_open: bool = False,
 ) -> float:
     # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
     # Signal exits stay on the trigger bar (see
     # _prepare_next_open_execution_data) and fill at its close (or open with
     # signal_exit_fill="open", mirroring native _close_position); stop/TP
     # legs resolve via the intrabar walk at their levels. An explicit
-    # strategy exit_price level always wins.
+    # strategy exit_price level always wins — except a level that gapped
+    # the bar's open (gap_open=True), which fills at the open under the
+    # gap-through-level convention regardless of signal_exit_fill.
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
-    if exit_price_series is not None:
+    if exit_price_series is not None and not gap_open:
         # Same usability rule as the explicit ``level`` contract
         # (contract.usable_exit_price): positive, finite — an inf/NaN level
         # falls back to the convention fill instead of booking a fantasy
@@ -1460,7 +1492,7 @@ def _resolve_exit_price(
         level = contract.usable_exit_price(exit_price_series.iloc[exit_idx])
         if level is not None:
             return level
-    fill_at_open = str(signal_exit_fill or "close").lower() == "open"
+    fill_at_open = gap_open or str(signal_exit_fill or "close").lower() == "open"
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")
     open_ok = open_value is not None and pd.notna(open_value)

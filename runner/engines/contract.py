@@ -45,7 +45,10 @@ __all__ = [
     "normalize_exit_order_type",
     "exit_order_type_is_present",
     "usable_exit_price",
-    "exit_level_reachable",
+    "exit_level_disposition",
+    "EXIT_LEVEL_IN_RANGE",
+    "EXIT_LEVEL_GAPPED",
+    "EXIT_LEVEL_UNREACHABLE",
     "EXIT_ORDER_TYPE_MARKET",
     "EXIT_ORDER_TYPE_LEVEL",
     "EngineStatsKeys",
@@ -194,29 +197,44 @@ def usable_exit_price(value: Any) -> float | None:
     return price
 
 
-def exit_level_reachable(
+#: ``exit_level_disposition`` outcomes for a level exit against the exit
+#: bar's traded range (see :func:`exit_level_disposition`).
+EXIT_LEVEL_IN_RANGE = "in_range"
+EXIT_LEVEL_GAPPED = "gapped"
+EXIT_LEVEL_UNREACHABLE = "unreachable"
+
+
+def exit_level_disposition(
     *,
     direction: str,
     level: float,
     high: Any,
     low: Any,
-) -> bool:
-    """True when the exit bar traded through ``level`` so a resting level
-    exit could actually have filled.
+) -> str:
+    """Classify a ``level`` exit against the exit bar's traded range.
 
-    A ``level`` exit is a resting limit order: a LONG exit sells at ``level``
-    and fills only when the bar's high reaches it; a SHORT exit buys and
-    fills only when the bar's low reaches it. A level outside the traded
-    range could never have filled — filling there anyway would book a
-    fantasy price, so callers fall back to the market fill, warn once and
-    flag the trade ``meta["exit_level_unreachable"]``.
+    A ``level`` exit is a resting limit order priced at ``level``. Against
+    the bar's traded ``[low, high]`` range (the ASK range for a SHORT exit
+    when ask-side data is enabled — callers supply the relevant extremes):
 
-    A level on the *marketable* side of the range (e.g. a LONG level below
-    the bar's low) still fills at the level: that is pessimistic, never a
-    fantasy fill, and matches the gap-through-level convention used for
-    stops. Missing or non-finite bar extremes fail closed (unreachable).
+    - :data:`EXIT_LEVEL_IN_RANGE` — ``low <= level <= high``: the bar traded
+      through the level, so the resting order fills AT the level.
+    - :data:`EXIT_LEVEL_GAPPED` — the level sits beyond the bar on the
+      *marketable* side (below ``low`` for a LONG exit, above ``high`` for a
+      SHORT exit): the order was immediately marketable, so under the
+      gap-through-level convention it fills at the bar's OPEN — never at a
+      price worse than the open for the strategy, and flagged
+      ``meta["exit_level_gapped"]``.
+    - :data:`EXIT_LEVEL_UNREACHABLE` — the level sits beyond the bar on the
+      *untraded* side (above ``high`` for a LONG exit, below ``low`` for a
+      SHORT exit): the order could never have filled. Callers fall back to
+      the market fill, warn once and flag the trade
+      ``meta["exit_level_unreachable"]`` — filling at the level anyway
+      would book a fantasy price.
+
+    Missing or non-finite bar extremes fail closed (``unreachable``).
     ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` — an unknown
-    direction would invert the reachability test, so it raises ``ValueError``
+    direction would invert the classification, so it raises ``ValueError``
     like :func:`resolve_same_bar_exit`.
     """
     if direction not in ("LONG", "SHORT"):
@@ -225,12 +243,15 @@ def exit_level_reachable(
         hi = float(high)
         lo = float(low)
     except (TypeError, ValueError, OverflowError):
-        return False
+        return EXIT_LEVEL_UNREACHABLE
     if not (math.isfinite(hi) and math.isfinite(lo)):
-        return False
-    if direction == "LONG":
-        return hi >= level
-    return lo <= level
+        return EXIT_LEVEL_UNREACHABLE
+    if lo <= level <= hi:
+        return EXIT_LEVEL_IN_RANGE
+    marketable = (direction == "LONG" and level < lo) or (
+        direction == "SHORT" and level > hi
+    )
+    return EXIT_LEVEL_GAPPED if marketable else EXIT_LEVEL_UNREACHABLE
 
 
 # ─── Date filter convention (F9) ────────────────────────────────────────────

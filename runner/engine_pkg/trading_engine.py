@@ -31,8 +31,10 @@ from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import (
+    EXIT_LEVEL_GAPPED,
+    EXIT_LEVEL_UNREACHABLE,
     EXIT_ORDER_TYPE_LEVEL,
-    exit_level_reachable,
+    exit_level_disposition,
     exit_order_type_is_present,
     flag_missing_intrabar,
     normalize_exit_order_type,
@@ -832,32 +834,75 @@ class TradeEngine:
         base_exit = float(row["open"]) if fill_at_open else float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
+        ask_high, ask_low = self._ask_bar(row)
 
         for position in self.positions:
             position_level = level_exit_price
             level_unreachable = False
-            if position_level is not None and not exit_level_reachable(
-                direction=position.direction,
-                level=position_level,
-                high=row.get("high"),
-                low=row.get("low"),
-            ):
-                # A level the exit bar never traded through could not have
-                # filled — fall back to the market fill rather than book a
-                # fantasy price.
-                position_level = None
-                level_unreachable = True
-                self._warn_exit_order_once(
-                    "exit_level_unreachable",
-                    "%s: exit_order_type='level' price %.6f is outside the "
-                    "exit bar's traded range; falling back to the market fill.",
-                    self.symbol,
-                    level_exit_price,
+            level_gapped = False
+            if position_level is not None:
+                # A-H4/A-L5: a SHORT exit buys the ask, so reachability is
+                # judged on the ask range when ask-side data is enabled —
+                # the same side _check_stops and _update_equity use.
+                bar_high = row.get("high")
+                bar_low = row.get("low")
+                if position.direction != "LONG":
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                disposition = exit_level_disposition(
+                    direction=position.direction,
+                    level=position_level,
+                    high=bar_high,
+                    low=bar_low,
                 )
+                if disposition == EXIT_LEVEL_UNREACHABLE:
+                    # A level the exit bar never traded through could not
+                    # have filled — fall back to the market fill rather
+                    # than book a fantasy price.
+                    position_level = None
+                    level_unreachable = True
+                    self._warn_exit_order_once(
+                        "exit_level_unreachable",
+                        "%s: exit_order_type='level' price %.6f is outside the "
+                        "exit bar's traded range; falling back to the market fill.",
+                        self.symbol,
+                        level_exit_price,
+                    )
+                elif disposition == EXIT_LEVEL_GAPPED:
+                    # The level sat beyond the bar on the marketable side:
+                    # the resting order was marketable at the open, so it
+                    # fills at the bar's open (gap-through-level), never at
+                    # the level itself.
+                    position_level = None
+                    level_gapped = True
+                    self._warn_exit_order_once(
+                        "exit_level_gapped",
+                        "%s: exit_order_type='level' price %.6f gapped the "
+                        "exit bar's open; filling at the open instead of the "
+                        "level.",
+                        self.symbol,
+                        level_exit_price,
+                    )
             if position_level is not None:
                 # A level fill trades at the level itself — no spread, like
                 # the stop/TP legs.
                 fill_price = position_level
+            elif level_gapped:
+                # Gap-through-level: marketable at the open. A SHORT buy
+                # lifts the ask (open + spread); a LONG sell hits the bid.
+                open_value = row.get("open")
+                gap_base = (
+                    float(open_value)
+                    if open_value is not None and pd.notna(open_value)
+                    else float(row["close"])
+                )
+                fill_price = gap_base + (
+                    self._bar_spread(row)
+                    if position.direction != "LONG"
+                    else 0.0
+                )
             else:
                 fill_price = base_exit + (
                     spread if position.direction == "SHORT" else 0.0
@@ -866,6 +911,8 @@ class TradeEngine:
                 position.meta["exit_level_missing_price"] = True
             if level_unreachable:
                 position.meta["exit_level_unreachable"] = True
+            if level_gapped:
+                position.meta["exit_level_gapped"] = True
             if order_type is not None:
                 position.meta["exit_order_type"] = order_type
             self._close_partial(

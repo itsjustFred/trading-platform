@@ -13,6 +13,7 @@ spread/ask) and A-H2 (entry_stop), plus the unified D4 exit convention
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -284,14 +285,15 @@ class TestExitOrderType:
 
     def test_level_fills_at_exit_price_on_both_engines(self, tmp_path: Path):
         frame = _frame()
-        text = _exit_order_type_strategy_text(order_type="Level", exit_price=105.5)
+        # 107.1 sits inside bar 7's range (106.75..107.25).
+        text = _exit_order_type_strategy_text(order_type="Level", exit_price=107.1)
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_level")
 
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
         for result in (native, vectorbt):
-            assert result.trades[0].exits[0].price == pytest.approx(105.5)
+            assert result.trades[0].exits[0].price == pytest.approx(107.1)
 
     def test_level_without_usable_price_falls_back_flagged(self, tmp_path: Path):
         frame = _frame()
@@ -310,14 +312,14 @@ class TestExitOrderType:
         # No exit_order_type: vectorbt honors a usable exit_price as a level
         # (legacy), native fills at the convention close (legacy).
         frame = _frame()
-        text = _exit_order_type_strategy_text(order_type=None, exit_price=105.5)
+        text = _exit_order_type_strategy_text(order_type=None, exit_price=107.1)
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_legacy")
 
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
         assert native.trades[0].exits[0].price == pytest.approx(107.0)
-        assert vectorbt.trades[0].exits[0].price == pytest.approx(105.5)
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(107.1)
 
     def test_level_via_dataframe_columns(self, tmp_path: Path):
         # DataFrame-output strategies carry exit_order_type/exit_price as
@@ -334,7 +336,7 @@ def generate_signals(df, params):
     entries[2] = True
     exits[7] = True
     exit_price = [float("nan")] * n
-    exit_price[7] = 105.5
+    exit_price[7] = 107.1
     exit_order_type = [None] * n
     exit_order_type[7] = "level"
     return pd.DataFrame(
@@ -353,23 +355,23 @@ def generate_signals(df, params):
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
         for result in (native, vectorbt):
-            assert result.trades[0].exits[0].price == pytest.approx(105.5)
+            assert result.trades[0].exits[0].price == pytest.approx(107.1)
 
     def test_unrecognized_order_type_falls_back_to_legacy(self, tmp_path: Path):
         frame = _frame()
-        text = _exit_order_type_strategy_text(order_type="bogus", exit_price=105.5)
+        text = _exit_order_type_strategy_text(order_type="bogus", exit_price=107.1)
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_bogus")
 
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
         assert native.trades[0].exits[0].price == pytest.approx(107.0)
-        assert vectorbt.trades[0].exits[0].price == pytest.approx(105.5)
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(107.1)
 
     def test_level_whitespace_spelling_fills_at_price(self, tmp_path: Path):
         frame = _frame()
         text = _exit_order_type_strategy_text(
-            order_type=" level ", exit_price=105.5
+            order_type=" level ", exit_price=107.1
         )
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_ws")
 
@@ -377,7 +379,10 @@ def generate_signals(df, params):
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
         for result in (native, vectorbt):
-            assert result.trades[0].exits[0].price == pytest.approx(105.5)
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.1)
+            # Canonical spelling, not the raw " level " cell.
+            assert trade.meta.get("exit_order_type") == "level"
 
     def test_short_level_fills_at_price_on_both_engines(self, tmp_path: Path):
         # Bar 7 trades 106.75..107.25; a SHORT exit is a buy limit that
@@ -548,6 +553,250 @@ def generate_signals(df, params):
         assert trade.exits[0].price == pytest.approx(100.0)
         assert "exit_level_missing_price" not in trade.meta
         assert "exit_level_unreachable" not in trade.meta
+
+
+def _gap_frame(*, spread: float = 0.0) -> pd.DataFrame:
+    """12 hourly bars whose exit bar (index 7) opens away from its close.
+
+    Bar 7: open 108.0, high 108.25, low 106.75, close 107.0 — so a
+    gap-through-level fill at the OPEN (108.0) is distinguishable from the
+    market-fallback CLOSE (107.0).
+    """
+    closes = [100.0 + i for i in range(12)]
+    opens = list(closes)
+    opens[7] = 108.0
+    data: dict[str, list] = {
+        "timestamp": pd.date_range("2024-01-01", periods=12, freq="h", tz="UTC"),
+        "open": opens,
+        "high": [max(o, c) + 0.25 for o, c in zip(opens, closes)],
+        "low": [min(o, c) - 0.25 for o, c in zip(opens, closes)],
+        "close": closes,
+        "volume": [1000.0] * 12,
+    }
+    if spread:
+        data["spread_price"] = [spread] * 12
+    return pd.DataFrame(data)
+
+
+_UNREACHABLE_TWO_TRADE_TEXT = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[2] = True
+    exits.iloc[5] = True
+    entries.iloc[8] = True
+    exits.iloc[10] = True
+    indicators = {"direction": pd.Series(["LONG"] * n, index=df.index)}
+    indicators["exit_reason"] = pd.Series([None] * n, index=df.index, dtype=object)
+    indicators["exit_reason"].iloc[5] = "signal"
+    indicators["exit_reason"].iloc[10] = "signal"
+    indicators["exit_order_type"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_order_type"].iloc[5] = "level"
+    indicators["exit_order_type"].iloc[10] = "level"
+    indicators["exit_price"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_price"].iloc[5] = 500.0
+    indicators["exit_price"].iloc[10] = 500.0
+    return entries, exits, indicators, []
+'''
+
+
+_PYRAMID_TEXT = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[2] = True
+    entries.iloc[3] = True
+    exits.iloc[7] = True
+    indicators = {"direction": pd.Series(["LONG"] * n, index=df.index)}
+    indicators["exit_reason"] = pd.Series([None] * n, index=df.index, dtype=object)
+    indicators["exit_reason"].iloc[7] = "signal"
+    indicators["exit_order_type"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_order_type"].iloc[7] = "level"
+    indicators["exit_price"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_price"].iloc[7] = 500.0
+    return entries, exits, indicators, []
+'''
+
+
+class TestExitLevelGapped:
+    """A ``level`` beyond the exit bar on the marketable side gapped the
+    open: both engines fill at the bar's OPEN (gap-through-level
+    convention) and flag ``meta["exit_level_gapped"]`` — never at the
+    level, which the bar never traded.
+    """
+
+    def test_gapped_long_level_fills_at_open_flagged(self, tmp_path: Path):
+        # Bar 7: low 106.75 — a LONG sell limit at 106.0 was marketable at
+        # the open (108.0), not a fill at 106.0.
+        frame = _gap_frame()
+        text = _exit_order_type_strategy_text(order_type="level", exit_price=106.0)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_gapped_long")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(108.0)
+            assert trade.meta.get("exit_level_gapped") is True
+            assert "exit_level_unreachable" not in trade.meta
+
+    def test_gapped_short_level_fills_at_open_flagged(self, tmp_path: Path):
+        # A SHORT buy limit at 109.0 sat above bar 7's high (108.25):
+        # marketable at the open -> fill at the open.
+        frame = _gap_frame()
+        text = _exit_order_type_strategy_text(
+            order_type="level", exit_price=109.0, direction="SHORT"
+        )
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_gapped_short")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(108.0)
+            assert trade.meta.get("exit_level_gapped") is True
+
+    def test_gapped_short_level_pays_spread_on_open_fill(self, tmp_path: Path):
+        # A gapped SHORT exit buys the ask: open + spread, like every other
+        # SHORT open-side fill.
+        frame = _gap_frame(spread=0.5)
+        params = {"spread_price_col": "spread_price"}
+        text = _exit_order_type_strategy_text(
+            order_type="level", exit_price=109.0, direction="SHORT"
+        )
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_gapped_sprd")
+
+        native = _native_result(frame, strategy_fn, parameters=params)
+        vectorbt = _vectorbt_result(tmp_path, frame, text, parameters=params)
+
+        for result in (native, vectorbt):
+            assert result.trades[0].exits[0].price == pytest.approx(108.5)
+
+    def test_gapped_level_via_native_adapter(self, tmp_path: Path):
+        # End-to-end through NativeAdapter (OHLCV loaded from data_dir).
+        frame = _gap_frame()
+        _write_ohlcv(tmp_path, "CEC", frame)
+        text = _exit_order_type_strategy_text(order_type="level", exit_price=106.0)
+        strategy_path = _write_strategy(tmp_path, "exit_lvl_gapped_ad", text)
+        config = BacktestConfig(risk_per_trade_pct=0.01,
+            strategy_name="contract",
+            symbols=["CEC"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_capital=100_000.0,
+            modeling_resolution="main_timeframe",
+            data_dir=str(tmp_path),
+            parameters={"fees": "zero"},
+        )
+        result = NativeAdapter().run(config, strategy_path)
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exits[0].price == pytest.approx(108.0)
+        assert trade.meta.get("exit_level_gapped") is True
+
+    def test_short_level_reachability_uses_ask_range(self, tmp_path: Path):
+        # With ask_ohlc enabled a SHORT exit is judged on the ASK range:
+        # level 106.9 sits inside the BID range (106.75..107.25) but below
+        # the ask low (107.0), so the buy limit could never have filled.
+        frame = _frame()
+        frame["ask_high"] = frame["high"] + 0.5
+        frame["ask_low"] = frame["low"] + 0.25
+        params = {"ask_ohlc": True}
+        text = _exit_order_type_strategy_text(
+            order_type="level", exit_price=106.9, direction="SHORT"
+        )
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_ask")
+
+        native = _native_result(frame, strategy_fn, parameters=params)
+        vectorbt = _vectorbt_result(tmp_path, frame, text, parameters=params)
+
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.0)
+            assert trade.meta.get("exit_level_unreachable") is True
+
+        # Without ask_ohlc the same level is inside the bid range and fills.
+        native_bid = _native_result(frame, strategy_fn)
+        vectorbt_bid = _vectorbt_result(tmp_path, frame, text)
+        for result in (native_bid, vectorbt_bid):
+            assert result.trades[0].exits[0].price == pytest.approx(106.9)
+            assert "exit_level_unreachable" not in result.trades[0].meta
+
+    def test_unreachable_level_warns_once_per_run(self, tmp_path: Path, caplog):
+        # Two trades with the same unreachable level: warn-once must fire
+        # exactly once per engine run, not once per trade.
+        frame = _frame()
+        strategy_fn = _load_strategy_fn(
+            _UNREACHABLE_TWO_TRADE_TEXT, tmp_path, "exit_lvl_warn_once"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            native = _native_result(frame, strategy_fn)
+        native_msgs = [
+            r.getMessage() for r in caplog.records if "traded range" in r.getMessage()
+        ]
+        assert len(native.trades) == 2
+        assert len(native_msgs) == 1
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            vectorbt = _vectorbt_result(tmp_path, frame, _UNREACHABLE_TWO_TRADE_TEXT)
+        vbt_msgs = [
+            r.getMessage() for r in caplog.records if "traded range" in r.getMessage()
+        ]
+        assert len(vectorbt.trades) == 2
+        assert len(vbt_msgs) == 1
+
+    def test_level_with_signal_exit_fill_open_and_spread(self, tmp_path: Path):
+        # signal_exit_fill="open" + spread must not leak into a level fill:
+        # an in-range level still fills AT the level on both engines.
+        frame = _frame(spread=0.5)
+        params = {"spread_price_col": "spread_price"}
+        text = _exit_order_type_strategy_text(order_type="level", exit_price=107.1)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_openfill")
+
+        native = _native_result(
+            frame, strategy_fn, signal_exit_fill="open", parameters=params
+        )
+        vectorbt = _vectorbt_result(
+            tmp_path, frame, text, signal_exit_fill="open", parameters=params
+        )
+
+        for result in (native, vectorbt):
+            assert result.trades[0].exits[0].price == pytest.approx(107.1)
+
+    def test_native_pyramiding_positions_flagged(self, tmp_path: Path):
+        # Native holds several concurrent positions: one exit signal with
+        # an unreachable level must fall back and flag EVERY open position.
+        frame = _frame()
+        strategy_fn = _load_strategy_fn(_PYRAMID_TEXT, tmp_path, "exit_lvl_pyramid")
+
+        native = _native_result(frame, strategy_fn)
+
+        assert len(native.trades) == 2
+        for trade in native.trades:
+            assert trade.exits[0].price == pytest.approx(107.0)
+            assert trade.meta.get("exit_level_unreachable") is True
 
 
 class TestNativeWarmupLoad:
@@ -788,30 +1037,37 @@ class TestExitOrderContractHelpers:
         assert contract.usable_exit_price(-1.0) is None
         assert contract.usable_exit_price(None) is None
 
-    def test_exit_level_reachable_respects_direction(self):
+    def test_exit_level_disposition_classifies_range(self):
         from runner.engines import contract
 
         high, low = 107.25, 106.75
-        # LONG exit (sell limit) needs the bar's high to reach the level.
-        assert contract.exit_level_reachable(
-            direction="LONG", level=107.0, high=high, low=low
+        c = contract.exit_level_disposition
+
+        def d(direction: str, level: float) -> str:
+            return c(direction=direction, level=level, high=high, low=low)
+
+        # Inside the traded range: the resting order fills at the level.
+        assert d("LONG", 107.0) == contract.EXIT_LEVEL_IN_RANGE
+        assert d("SHORT", 107.0) == contract.EXIT_LEVEL_IN_RANGE
+        # Marketable side (LONG below the low, SHORT above the high): the
+        # order was marketable at the open -> gap-through-level open fill.
+        assert d("LONG", 105.0) == contract.EXIT_LEVEL_GAPPED
+        assert d("SHORT", 500.0) == contract.EXIT_LEVEL_GAPPED
+        # Untraded side (LONG above the high, SHORT below the low): the
+        # order could never have filled -> market fallback, flagged.
+        assert d("LONG", 500.0) == contract.EXIT_LEVEL_UNREACHABLE
+        assert d("SHORT", 50.0) == contract.EXIT_LEVEL_UNREACHABLE
+        # Range edges are in-range, not gapped.
+        assert d("LONG", low) == contract.EXIT_LEVEL_IN_RANGE
+        assert d("SHORT", high) == contract.EXIT_LEVEL_IN_RANGE
+        # Missing/non-finite extremes fail closed.
+        assert (
+            c(direction="LONG", level=107.0, high=None, low=low)
+            == contract.EXIT_LEVEL_UNREACHABLE
         )
-        assert not contract.exit_level_reachable(
-            direction="LONG", level=500.0, high=high, low=low
-        )
-        # SHORT exit (buy limit) needs the bar's low to reach the level.
-        assert contract.exit_level_reachable(
-            direction="SHORT", level=107.0, high=high, low=low
-        )
-        assert not contract.exit_level_reachable(
-            direction="SHORT", level=50.0, high=high, low=low
-        )
-        # Missing extremes fail closed.
-        assert not contract.exit_level_reachable(
-            direction="LONG", level=107.0, high=None, low=low
-        )
-        assert not contract.exit_level_reachable(
-            direction="SHORT", level=107.0, high=high, low=float("nan")
+        assert (
+            c(direction="SHORT", level=107.0, high=high, low=float("nan"))
+            == contract.EXIT_LEVEL_UNREACHABLE
         )
         with pytest.raises(ValueError, match="direction"):
-            contract.exit_level_reachable(direction="SIDEWAYS", level=107.0, high=high, low=low)
+            c(direction="SIDEWAYS", level=107.0, high=high, low=low)

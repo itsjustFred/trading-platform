@@ -90,13 +90,18 @@ or `level` (case-insensitive):
   without a usable (positive, finite) `exit_price` falls back to the market
   fill, logs a warning once and flags the trade
   `meta["exit_level_missing_price"]`.
-- a `level` the exit bar never traded through (e.g. above the bar's high for
-  a LONG exit, below the low for a SHORT exit — `contract.exit_level_reachable`)
-  could not have filled: it falls back to the market fill, warns once and
-  flags `meta["exit_level_unreachable"]`. This applies to every level fill,
-  explicit `level` and vectorbt's legacy implicit `exit_price` alike. A level
-  on the *marketable* side of the range still fills at the level (pessimistic,
-  never a fantasy fill — the same convention as gap-through-level stops).
+- a `level` outside the exit bar's traded range is never booked at the
+  level (`contract.exit_level_disposition`, evaluated on the ask range for
+  a SHORT exit when `ask_ohlc` data is enabled). On the *untraded* side —
+  above the bar's high for a LONG exit, below the low for a SHORT exit —
+  the order could never have filled: it falls back to the market fill,
+  warns once and flags `meta["exit_level_unreachable"]`. On the
+  *marketable* side — below the low for a LONG exit, above the high for a
+  SHORT exit — the resting order was marketable at the open, so under the
+  gap-through-level convention (the same rule as gap-through stops) it
+  fills at the bar's **open** and flags `meta["exit_level_gapped"]`. This
+  applies to every level fill, explicit `level` and vectorbt's legacy
+  implicit `exit_price` alike.
 - absent or unrecognized — the **legacy fallback** applies per engine:
   vectorbt treats a usable `exit_price` as a level fill; native fills at the
   convention price and ignores `exit_price` (an unrecognized non-empty value
@@ -118,7 +123,7 @@ The order type is evaluated only on a real exit signal in every consumer: the
 forced end-of-data close fills at the convention price and ignores
 `exit_price`/`exit_order_type` entirely, matching native's `end_of_data`
 close. The parsing lives in `runner.engines.contract`
-(`normalize_exit_order_type`, `usable_exit_price`, `exit_level_reachable`) —
+(`normalize_exit_order_type`, `usable_exit_price`, `exit_level_disposition`) —
 native and vectorbt read the same spelling table; the other engines listed
 above do not consume the series at all.
 
