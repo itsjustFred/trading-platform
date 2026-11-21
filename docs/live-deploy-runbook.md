@@ -493,6 +493,12 @@ sweeps. This applies to every pause, manual ones included. Consequence: a
 deployment halted for a conflict can still close the position the ledger *does*
 know about; it just cannot add anything.
 
+For that to be reachable the account has to stay wired up: the broker adapter, the
+Discord listener and the per-account task set are kept for an account whose
+deployments are all `PAUSED` (they were selected from an `ACTIVE`-only account
+set, which dropped every exit at the task level). Those tasks dispatch and record;
+what may be *opened* is still decided per signal, so no entry can come out of it.
+
 **Where an operator sees it**
 
 - `GET /api/live/deployments`: `broker_order_conflicts` and
