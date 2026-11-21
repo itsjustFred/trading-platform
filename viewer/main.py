@@ -14129,7 +14129,10 @@ async def halt_live_kill_switch(
     except Exception as exc:
         # A database failure is not a client error, but the attempt still
         # belongs in the audit trail: an operator asking "did anyone try to
-        # halt this" must not get silence because the write 500'd.
+        # halt this" must not get silence because the write 500'd. The original
+        # failure is logged first so an audit problem can never be the
+        # exception the caller sees instead of it.
+        logger.exception("Kill switch halt write failed")
         await _audit_live_control(
             action="kill_switch.halt",
             target_type="live_kill_switch",
@@ -14216,7 +14219,10 @@ async def resume_live_kill_switch(
         raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     except Exception as exc:
         # Same rule as the halt route: a failed write is still an attempt, and
-        # the audit trail is where an operator looks for it.
+        # the audit trail is where an operator looks for it. The original
+        # failure is logged first so an audit problem can never be the
+        # exception the caller sees instead of it.
+        logger.exception("Kill switch resume write failed")
         await _audit_live_control(
             action="kill_switch.resume",
             target_type="live_kill_switch",

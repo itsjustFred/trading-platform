@@ -226,37 +226,56 @@ def test_two_racing_halt_writes_cannot_downgrade_each_other(
     commit wins, silently stepping the halt down. The write is serialized
     (BEGIN IMMEDIATE), so the second writer reads the first one's committed
     mode and is refused as a weakening.
+
+    The interleaving is pinned with events, not sleeps: the flatten writer
+    signals from inside the write lock (``_utcnow_naive`` runs after
+    ``BEGIN IMMEDIATE`` and the row read), the orders writer starts only then
+    and blocks on the lock, and the flatten writer releases once the orders
+    write is queued. No scheduling luck decides who reads whose snapshot.
     """
     import threading
-    import time
 
     import shared.database as database
 
     set_live_kill_switch(account, "entries", actor="operator")
 
     real_utcnow = database._utcnow_naive
+    flatten_holds_lock = threading.Event()
+    orders_queued = threading.Event()
 
     def _slow_utcnow() -> object:
-        # Both threads read the row, then pause before writing, so without the
-        # write lock they would both pass the check on the same 'entries'
-        # snapshot. The stagger makes the 'orders' write commit last.
-        time.sleep(0.4)
+        # Only the flatten writer rendezvous here: it is the first and only
+        # _utcnow_naive call on that thread inside set_live_kill_switch, made
+        # while BEGIN IMMEDIATE is held. The orders writer's own call happens
+        # after it acquires the lock and must not wait.
+        if threading.current_thread().name == "flatten-writer":
+            flatten_holds_lock.set()
+            orders_queued.wait(timeout=30)
         return real_utcnow()
 
     monkeypatch.setattr(database, "_utcnow_naive", _slow_utcnow)
 
     outcomes: dict[str, object] = {}
 
-    def _write(mode: str, key: str, delay: float) -> None:
-        time.sleep(delay)
+    def _write(mode: str, key: str) -> None:
+        if key == "orders":
+            # Start only once the flatten writer provably holds the write
+            # lock; this call then blocks on BEGIN IMMEDIATE until the
+            # flatten commit lands, however the scheduler interleaves us.
+            flatten_holds_lock.wait(timeout=30)
+            orders_queued.set()
         try:
             set_live_kill_switch(account, mode, actor=f"operator-{key}")
             outcomes[key] = "written"
         except Exception as exc:  # noqa: BLE001 - recorded for the assertion
             outcomes[key] = exc
 
-    flatten_thread = threading.Thread(target=_write, args=("flatten", "flatten", 0.0))
-    orders_thread = threading.Thread(target=_write, args=("orders", "orders", 0.15))
+    flatten_thread = threading.Thread(
+        target=_write, args=("flatten", "flatten"), name="flatten-writer"
+    )
+    orders_thread = threading.Thread(
+        target=_write, args=("orders", "orders"), name="orders-writer"
+    )
     flatten_thread.start()
     orders_thread.start()
     flatten_thread.join(timeout=30)
@@ -266,6 +285,144 @@ def test_two_racing_halt_writes_cannot_downgrade_each_other(
     assert outcomes["flatten"] == "written"
     assert isinstance(outcomes["orders"], ValueError)
     assert read_live_kill_switch_scopes() == {account: "flatten"}
+
+
+def test_a_resume_racing_a_re_halt_cannot_interleave_into_a_lost_update(
+    isolated_db_sandbox, account: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``clear_live_kill_switch`` holds the same write lock as the halt write.
+
+    A resume that read the row before a re-halt committed must not land its
+    ``cleared_at`` over the new episode: without BEGIN IMMEDIATE the clear's
+    stale snapshot can commit last and silently lift a halt that was just
+    re-armed. Serialized, the re-halt waits for the clear and then re-arms the
+    scope as a new episode - the halt the operator asked for is the halt that
+    stands.
+
+    The interleaving is pinned with events, like the halt-vs-halt race above:
+    the clear writer signals from inside the write lock (``_utcnow_naive``
+    runs after ``BEGIN IMMEDIATE`` and the row read), the re-halt starts only
+    then and blocks on the lock, and the clear releases once the re-halt is
+    queued.
+    """
+    import threading
+
+    import shared.database as database
+
+    set_live_kill_switch(account, "entries", actor="operator")
+
+    real_utcnow = database._utcnow_naive
+    clear_holds_lock = threading.Event()
+    halt_queued = threading.Event()
+
+    def _slow_utcnow() -> object:
+        # Only the clear writer rendezvous here: its _utcnow_naive call is the
+        # one inside BEGIN IMMEDIATE after the row read. The re-halt's own
+        # call happens once it holds the lock and must not wait.
+        if threading.current_thread().name == "clear-writer":
+            clear_holds_lock.set()
+            halt_queued.wait(timeout=30)
+        return real_utcnow()
+
+    monkeypatch.setattr(database, "_utcnow_naive", _slow_utcnow)
+
+    outcomes: dict[str, object] = {}
+
+    def _clear() -> None:
+        try:
+            outcomes["clear"] = clear_live_kill_switch(
+                account, actor="operator-resume"
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+            outcomes["clear"] = exc
+
+    def _halt() -> None:
+        # Start only once the clear writer provably holds the write lock;
+        # this call then blocks on BEGIN IMMEDIATE until the clear commits.
+        clear_holds_lock.wait(timeout=30)
+        halt_queued.set()
+        try:
+            outcomes["halt"] = set_live_kill_switch(
+                account, "flatten", actor="operator-halt"
+            )
+        except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+            outcomes["halt"] = exc
+
+    clear_thread = threading.Thread(target=_clear, name="clear-writer")
+    halt_thread = threading.Thread(target=_halt, name="halt-writer")
+    clear_thread.start()
+    halt_thread.start()
+    clear_thread.join(timeout=30)
+    halt_thread.join(timeout=30)
+
+    assert not clear_thread.is_alive() and not halt_thread.is_alive()
+    assert outcomes["clear"] is True
+    assert outcomes["halt"].mode == "flatten"  # type: ignore[union-attr]
+    # The re-halt re-armed the scope after the clear committed: the halt the
+    # operator asked for is the halt that stands, not one the resume erased.
+    assert read_live_kill_switch_scopes() == {account: "flatten"}
+
+
+def test_a_resume_waits_for_the_write_lock_before_it_reads_the_row(
+    isolated_db_sandbox, account: str
+) -> None:
+    """``clear_live_kill_switch`` takes BEGIN IMMEDIATE like the halt write.
+
+    A resume whose row read ran *before* a concurrent write committed would
+    act on a stale snapshot and could stamp ``cleared_at`` over a halt that
+    was re-armed in between - the resume erasing a halt the operator asked
+    for. BEGIN IMMEDIATE makes the read itself wait for the writer, so the
+    clear always observes the last committed state.
+
+    Pinned with a third connection holding the write lock: while it is held
+    the row is flipped to cleared and the lock released. A clear that read
+    the row before the flip (no BEGIN IMMEDIATE) reports ``True`` and stamps
+    its own ``cleared_by`` over the committed clear; one that waited reports
+    ``False`` - there was nothing left to clear.
+    """
+    import sqlite3
+    import threading
+    import time
+
+    database, _engine, _data_dir = isolated_db_sandbox
+
+    set_live_kill_switch(account, "entries", actor="operator")
+
+    blocker = sqlite3.connect(str(database.DB_PATH), timeout=30)
+    outcomes: dict[str, object] = {}
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+
+        def _clear() -> None:
+            try:
+                outcomes["clear"] = clear_live_kill_switch(
+                    account, actor="operator-resume"
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
+                outcomes["clear"] = exc
+
+        clear_thread = threading.Thread(target=_clear, name="clear-writer")
+        clear_thread.start()
+        # Long enough for an unserialized clear to finish its row read and
+        # queue on the commit; the locked clear is still waiting to begin.
+        time.sleep(1.0)
+
+        # Commit a clear of our own while the lock is held, then release:
+        # what the resume observes next is this committed state.
+        blocker.execute(
+            "UPDATE live_kill_switch SET cleared_at = ?, cleared_by = 'raw-sql' "
+            "WHERE scope = ?",
+            (database._utcnow_naive().isoformat(sep=" "), account),
+        )
+        blocker.commit()
+
+        clear_thread.join(timeout=30)
+    finally:
+        blocker.close()
+
+    assert not clear_thread.is_alive()
+    assert outcomes["clear"] is False
+    assert read_live_kill_switch_scopes() == {}
 
 
 def test_an_escalation_is_not_attributed_to_whoever_escalated(
