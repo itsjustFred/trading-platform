@@ -82,6 +82,13 @@ _ALPACA_HELD_LEG_PAGE_LIMIT = 20
 #: still fill (#198). A leg whose cancel has settled says so in the listing.
 _RESTING_LEG_STATUSES = frozenset({"held", "pending_cancel"})
 
+#: Terminal states in which an order left the book without executing. Only these let a
+#: refuse-cancel be excused: a ``filled``/``partially_filled`` order executed (a stop that
+#: fills on a position that is already flat opens a short), and a broker row that cannot be
+#: read at all proves nothing. Verified on paper 2026-11-20: the leg Alpaca removes as the
+#: OCO sibling of a cancelled take profit is still readable by id, as ``canceled``.
+_GONE_WITHOUT_EXECUTING = frozenset({"canceled", "expired", "rejected", "done"})
+
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
@@ -2458,23 +2465,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         only read those would leave exactly the leg that can still trigger - and
         a triggered sell-stop with nothing to sell opens a short.
 
-        The legs are looked up for the symbols the open listing itself names
-        (``_resting_leg_symbols``), not account-wide: a bracket's legs rest and die
-        together, so a ``held`` stop leg is always a sibling of a leg that *is*
-        listed. That keeps the sweep off the account's whole order history, which on a
-        mature account would fill a 500-row page every time.
+        The legs are looked up account-wide. A bracket's take profit names the symbol a
+        `held` stop leg rests on, but an OTO entry - which the adapter submits for an
+        unbounded take profit - has a stop leg and no take-profit sibling, so the symbols
+        the open listing names are not enough. The lookup's 20-page budget bounds the
+        history it reads.
         """
         client = await self._require_trading_client()
         open_orders = await self._list_open_orders(client)
-        leg_symbols = self._resting_leg_symbols(open_orders)
         open_symbols = {
             str(position.get("symbol") or "").strip().upper()
             for position in await self.get_positions()
             if not _is_flat(_position_qty(position))
         }
         orders = self._merge_held_legs(
-            open_orders,
-            await self._list_resting_legs(client, symbols=leg_symbols),
+            open_orders, await self._list_resting_legs(client)
         )
         completed = 0
         unidentified: list[str] = []
@@ -2492,9 +2497,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # The broker's OCO may already have removed this leg with the
                 # sibling just cancelled; a refusal for an order that is no
                 # longer resting is not a failure the daemon must retry forever.
-                if await self._cancel_already_gone(
-                    client, order_id, symbols=leg_symbols
-                ):
+                if await self._cancel_already_gone(client, order_id):
                     continue
                 failed.append(f"{order_id}:{exc}")
                 continue
@@ -2547,16 +2550,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return list(stops.values())
 
     async def _list_filled_parents_with_held_legs(
-        self, client: Any, symbols: set[str]
+        self, client: Any, symbols: set[str] | None
     ) -> list[Any]:
         """Filled bracket parents that still have a bracket leg resting at the broker.
 
         Observed on Alpaca paper (2026-11-16): once a bracket entry fills, the stop leg
         stays ``held`` and is absent from every ``status=open`` listing, nested or flat.
         It is only reachable as a leg of the filled parent in a ``status=all`` listing,
-        and it can be replaced like any working stop. The lookup is always scoped to
-        ``symbols`` - the positions being acted on, or the symbols a sweep has to look
-        at - so no caller can turn it into a scan of the account's whole order history.
+        and it can be replaced like any working stop. ``symbols`` scopes the lookup (the
+        positions being acted on); ``None`` looks account-wide, which only the orphan sweep
+        may ask for: its whole job is symbols that no longer have a position, and an OTO
+        entry's stop leg has no take-profit sibling that ``status=open`` would name. The
+        20-page budget bounds even the account-wide history.
 
         The listing is newest-first and capped at 500 rows, so one call is only the
         newest 500 orders of the account's whole history - a mature account fills that
@@ -2569,7 +2574,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         missing stop would be reported as "no stop" for a position that does have one.
         """
         get_orders = getattr(client, "get_orders", None)
-        if not symbols or not callable(get_orders):
+        if not callable(get_orders):
+            return []
+        if symbols is not None and not symbols:
             return []
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
@@ -2579,7 +2586,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         for _ in range(_ALPACA_HELD_LEG_PAGE_LIMIT):
             request = GetOrdersRequest(
                 status=QueryOrderStatus.ALL,
-                symbols=sorted(symbols),
+                symbols=sorted(symbols) if symbols is not None else None,
                 nested=True,
                 limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
                 until=until,
@@ -2618,7 +2625,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
 
     async def _list_resting_legs(
-        self, client: Any, *, symbols: set[str]
+        self, client: Any, *, symbols: set[str] | None = None
     ) -> list[Any]:
         """The bracket legs themselves, the ones no ``status=open`` listing shows (#245).
 
@@ -2636,7 +2643,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
 
     async def _list_working_book(
-        self, client: Any, *, symbols: set[str]
+        self, client: Any, *, symbols: set[str] | None = None
     ) -> list[Any]:
         """Every order still resting at the broker, or a hard failure - never a partial book.
 
@@ -2674,40 +2681,49 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     listed.add(leg_id)
         return orders
 
-    @staticmethod
-    def _resting_leg_symbols(open_orders: list[Any]) -> set[str]:
-        """Symbols whose bracket legs may be resting without any ``status=open`` row.
-
-        A bracket is an OCO pair, so the two legs rest and die together: the take-profit
-        leg is listed by ``status=open`` while the stop leg is not. Any symbol with a
-        working order therefore already names a symbol that can carry a ``held`` stop
-        leg, which is what lets the orphan sweep look for those legs without scanning
-        the account's whole order history.
-        """
-        return {
-            symbol for symbol in (_order_symbol(order) for order in open_orders) if symbol
-        }
-
     async def _cancel_already_gone(
-        self, client: Any, order_id: str, *, symbols: set[str]
+        self, client: Any, order_id: str, *, symbols: set[str] | None = None
     ) -> bool:
         """Whether a refused cancel was for an order that is no longer resting.
 
         A bracket is an OCO pair: cancelling one leg cancels the other at the broker,
         so the second cancel of the pair is refused for an order the broker has already
-        removed (the paper probe saw the stop leg disappear with the take profit). That
-        refusal is not a dropped cancel - the inspection below is the proof - and a
-        sweep that reported it as one would fail, and in the flatten restore a stop on,
-        every real bracket. Only the broker's own book proves it, and an unreadable
-        book proves nothing: it then answers "not gone" and the refusal stands.
+        removed (paper probe 2026-11-20: the sibling the take profit took with it reads
+        back by id as ``canceled``). That refusal is not a dropped cancel - the inspection
+        below is the proof - and a sweep that reported it as one would fail, and in the
+        flatten restore a stop on, every real bracket.
+
+        "Not resting" is not itself the proof: an order also leaves the book by executing,
+
+        and a stop that fills on a position that is already flat opens a short. The excusal
+
+        therefore also resolves the id to its terminal state, and only an order that left
+
+        without executing counts. An unreadable book, an unreadable row or a broker that
+
+        cannot find the order proves nothing, and answers "not gone" so the refusal stands.
+
         """
         try:
             book = await self._list_working_book(client, symbols=symbols)
         except Exception:  # pragma: no cover - fail closed
             return False
-        return not any(
+        if any(
             _control_order_id(_order_attr(order, "id")) == order_id for order in book
-        )
+        ):
+            return False
+        return await self._left_the_book_without_executing(client, order_id)
+
+    async def _left_the_book_without_executing(self, client: Any, order_id: str) -> bool:
+        """Whether the broker reports *order_id* as left without executing."""
+        get_order = getattr(client, "get_order_by_id", None)
+        if not callable(get_order):
+            return False
+        try:
+            order = await asyncio.to_thread(get_order, order_id)
+        except Exception:  # pragma: no cover - fail closed
+            return False
+        return _order_status(order) in _GONE_WITHOUT_EXECUTING
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         value = float(price)

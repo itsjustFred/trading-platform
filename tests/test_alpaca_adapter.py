@@ -18,8 +18,10 @@ import pytest
 from live_runner import alpaca_adapter as alpaca_module
 from live_runner.alpaca_adapter import (
     _ALPACA_HELD_LEG_LOOKUP_LIMIT,
+    _RESTING_LEG_STATUSES,
     AlpacaLiveAdapter,
     _alpaca_market_data_start,
+    _order_legs,
 )
 from live_runner.base_adapter import is_order_not_submitted
 from shared.models import LiveSignal
@@ -78,6 +80,7 @@ class _FakeTradingClient:
         self.close_error = close_error
         self.submit_error = submit_error
         self.order_filters: list[object] = []
+        self.history: dict[str, _FakeOrder] = {}
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
         # alpaca-py's server-side default page size is 50.
@@ -90,6 +93,16 @@ class _FakeTradingClient:
             return (list(self.orders) + list(self.parents))[:limit]
         # ``status=open``: top-level working orders only, legs never included.
         return list(self.orders)[:limit]
+
+    def get_order_by_id(self, order_id: str):
+        for order in (*self.orders, *self.parents, *self.history.values()):
+            if getattr(order, "id", None) == order_id:
+                return order
+        for order in (*self.orders, *self.parents, *self.history.values()):
+            for leg in _order_legs(order):
+                if getattr(leg, "id", None) == order_id:
+                    return leg
+        raise RuntimeError(f"404: order {order_id} not found")
 
     def get_all_positions(self):
         return list(self.positions)
@@ -160,9 +173,14 @@ class _BracketPositionClient(_FakeTradingClient):
     Paper probe 2026-11-16: on a fresh bracket the take-profit leg is ``new`` and
     is the only thing any ``status=open`` listing returns, while the stop leg stays
     ``held`` and is reachable only under the filled parent in a ``status=all``
-    listing. Cancelling one leg cancels the other at the broker - the bracket's
-    OCO, which is what the probe saw - and ``oco_siblings=False`` models a broker
-    that leaves the sibling working; a sweep has to cope with both.
+    listing.
+
+    Paper probe 2026-11-20: cancelling the take profit takes the stop leg with it,
+    and both then read back by id as ``canceled`` - still there, terminal, not
+    working. So a cancel that removes an order here marks it ``canceled`` rather
+    than deleting it, and it refuses the cancel of an order that is already
+    terminal. ``oco_siblings=False`` models a broker that leaves the sibling
+    working; a sweep has to cope with both.
     """
 
     def __init__(
@@ -209,31 +227,37 @@ class _BracketPositionClient(_FakeTradingClient):
         )
         self.parent = parent
         self.oco_siblings = oco_siblings
+        # Every order this broker ever held, which is what get_order_by_id answers from:
+        # a terminal order is still readable, the paper probe showed.
+        self.history = {order.id: order for order in (parent, take_profit, stop)}
 
     def cancel_order_by_id(self, order_id: str) -> None:
+        order = self.history.get(order_id)
+        if order is not None and not _working(order):
+            # A non-working order cannot be cancelled, and the broker says so rather
+            # than accepting it silently.
+            self.cancelled.append(order_id)
+            raise RuntimeError(f"422: order {order_id} is not cancelable")
+        if order is None:
+            self.cancelled.append(order_id)
+            raise RuntimeError(f"404: order {order_id} is not working")
         self.cancelled.append(order_id)
-        leg = next((item for item in self.parent.legs if item.id == order_id), None)
-        if leg is not None:
-            if not self.cancel_settles:
-                leg.status = "pending_cancel"
-                return
-            self.parent.legs = [item for item in self.parent.legs if item.id != order_id]
-            self.orders = [order for order in self.orders if order.id != order_id]
-            if self.oco_siblings:
-                # The bracket is an OCO pair: the sibling goes with it, as it did
-                # in the paper probe.
-                self.parent.legs = []
+        if not self.cancel_settles:
+            order.status = "pending_cancel"
             return
-        if any(order.id == order_id for order in self.orders):
-            if not self.cancel_settles:
-                for order in self.orders:
-                    if order.id == order_id:
-                        order.status = "pending_cancel"
-            else:
-                self.orders = [order for order in self.orders if order.id != order_id]
-            return
-        # Alpaca refuses a cancel for an order it no longer has working.
-        raise RuntimeError(f"404: order {order_id} is not working")
+        order.status = "canceled"
+        self.orders = [item for item in self.orders if item.id != order_id]
+        if self.oco_siblings and order in self.parent.legs:
+            # The bracket is an OCO pair: the sibling goes with it, as it did in the
+            # paper probe - and it stays readable, as canceled.
+            for leg in self.parent.legs:
+                leg.status = "canceled"
+
+    def get_order_by_id(self, order_id: str):
+        order = self.history.get(order_id)
+        if order is None:
+            raise RuntimeError(f"404: order {order_id} not found")
+        return order
 
 
 class _FullHeldLegPageClient(_FakeTradingClient):
@@ -270,12 +294,20 @@ def _status_all_requests(client: _FakeTradingClient) -> list[object]:
     ]
 
 
+#: Statuses no further cancel or fill can come from.
+_TERMINAL_STATUSES = frozenset(
+    {"canceled", "expired", "rejected", "done", "filled", "partially_filled"}
+)
+
+
+def _working(order: object) -> bool:
+    """Whether a cancel can still be sent for this order."""
+    return str(getattr(order, "status", "new")).strip().lower() not in _TERMINAL_STATUSES
+
+
 def _resting(order: object) -> bool:
-    """Whether an order still rests at the broker (``held``/``pending_cancel``)."""
-    return str(getattr(order, "status", "new")).strip().lower() in {
-        "held",
-        "pending_cancel",
-    }
+    """Whether a bracket leg still rests at the broker (the adapter's own set)."""
+    return str(getattr(order, "status", "new")).strip().lower() in _RESTING_LEG_STATUSES
 
 
 def _adapter(client: _FakeTradingClient) -> AlpacaLiveAdapter:
@@ -683,6 +715,33 @@ def test_close_all_positions_reports_a_partial_flatten() -> None:
     assert "AAPL" in outcome.failed
 
 
+def test_a_position_whose_qty_cannot_be_read_is_not_treated_as_flat() -> None:
+    """An unreadable quantity must not pass as flat in the restore either.
+
+    Reading it as zero would skip the restore and report the position protected
+    while nothing protects it - the other half of fail-closed on a broker row this
+    adapter cannot read.
+    """
+    client = _FakeTradingClient(
+        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")],
+        orders=[],
+    )
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._position_is_flat("AAPL")) is False
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
+    submitted = [order for order in client.submitted if order.stop_price == 190.0]
+    assert len(submitted) == 1
+
+
+def test_position_is_flat_sees_an_open_position_on_that_symbol() -> None:
+    """The other half: a live position is not flat, so the restore is allowed."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)], orders=[])
+
+    assert asyncio.run(_adapter(client)._position_is_flat("AAPL")) is False
+    assert asyncio.run(_adapter(client)._position_is_flat("MSFT")) is True
+
+
 def test_a_flat_position_is_not_given_a_stop() -> None:
     """A restored stop on a flat position is the orphan the sweeps remove.
 
@@ -865,6 +924,34 @@ def test_a_held_leg_left_working_is_reported_as_still_working() -> None:
     assert client.submitted == []
 
 
+def test_a_refused_cancel_is_not_excused_for_an_order_that_filled() -> None:
+    """The excusal is for an order that left *without* executing.
+
+    Absent from the resting book is not by itself proof of a cancel: an order also
+    leaves the book by executing, and the sell stop that fills on a flat position
+    opens a short. Excusing that cancel would let the orphan sweep report a complete
+    sweep over a position the broker just opened, so the id is resolved to its
+    terminal state and only ``canceled``/``expired``/``rejected`` excuse it.
+    """
+    client = _BracketPositionClient(positions=[], oco_siblings=False)
+    real_cancel = client.cancel_order_by_id
+
+    def _refuse_a_cancel_that_filled(order_id: str) -> None:
+        if order_id == "sl-leg":
+            # The stop filled as the cancel was sent: the broker refuses the cancel
+            # and keeps the order as filled.
+            client.history["sl-leg"].status = "filled"
+            raise RuntimeError("422: order is already filled")
+        real_cancel(order_id)
+
+    client.cancel_order_by_id = _refuse_a_cancel_that_filled  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is False
+    assert any("sl-leg" in item for item in outcome.failed)
+
+
 def test_a_lost_cancel_reply_still_counts_as_a_removed_protection() -> None:
     """The broker removed the order but the reply was lost: the re-read is the proof.
 
@@ -965,10 +1052,10 @@ def test_cancel_orphaned_protections_cancels_a_held_stop_leg() -> None:
     held_leg_requests = _status_all_requests(client)
     assert held_leg_requests, "the held stop leg must come from a status=all listing"
     assert held_leg_requests[0].nested is True
-    # Scoped to the symbol the open listing names: a bracket's legs rest and die
-    # together, so the take profit that ``status=open`` shows is the sibling every
-    # held stop leg has. No account-wide history scan on a mature account.
-    assert [str(symbol) for symbol in held_leg_requests[0].symbols] == ["AAPL"]
+    # Account-wide, and bounded: a bracket's take profit names the symbol a held stop
+    # leg rests on, but an OTO entry - which the adapter submits for an unbounded take
+    # profit - has a stop leg and no take-profit sibling to derive the symbol from.
+    assert not held_leg_requests[0].symbols
 
 
 def test_cancel_orphaned_protections_leaves_a_held_stop_leg_of_a_live_position() -> None:
