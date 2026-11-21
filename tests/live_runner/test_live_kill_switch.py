@@ -1086,7 +1086,6 @@ def test_a_halt_written_during_the_claim_still_stops_the_entry(
     broker, so nothing is in flight.
     """
     import live_runner.daemon as daemon
-    from live_runner.kill_switch import KillSwitchMode, LiveHaltError
     from risk import TradeSignal
 
     deployment = _deployment()
