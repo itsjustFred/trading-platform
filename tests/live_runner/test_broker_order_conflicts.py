@@ -11,7 +11,9 @@ affected deployment is halted. These tests pin the two facts that keep it fail c
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +23,7 @@ from live_runner.broker_order_conflicts import (
 )
 from shared.database import (
     get_live_deployment,
+    mark_live_deployment_stopped_enforced,
     save_live_signal,
     update_live_deployment_status,
 )
@@ -150,6 +153,194 @@ def test_enforce_reports_a_status_write_it_cannot_make(conflict, monkeypatch, ca
     alerts = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert [r.data["alert"] for r in alerts] == ["live_broker_order_id_conflict_halt_failed"]
     assert alerts[0].data["deployment_id"] == DEPLOYMENT_ID
+
+
+def test_a_service_sync_tick_repauses_a_resumed_conflicted_deployment(
+    conflict, monkeypatch
+) -> None:
+    """The wiring, not just the function: one tick undoes an operator's ACTIVE write.
+
+    Enforcement was unit-tested while nothing drove the loop that calls it, so the call
+    site could be deleted and the suite stayed green. This runs one
+    ``sync_services_loop`` iteration with the conflict present and the deployment
+    resumed - and with service discovery failing, which is the case that matters: the
+    re-halt used to sit *after* ``scheduler.sync_services`` in one shared ``try``, so a
+    bad service row or a failed credential reload skipped it on every tick and only
+    warned "Service sync iteration failed".
+    """
+    import live_runner.daemon as daemon
+
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    assert get_live_deployment(DEPLOYMENT_ID).status == "ACTIVE"
+
+    monkeypatch.setattr(daemon, "list_services", lambda **_kwargs: [])
+
+    async def _services_raise(_services) -> None:
+        raise RuntimeError("a service row is unreadable")
+
+    class _Scheduler:
+        async def sync_services(self, _services) -> None:
+            raise RuntimeError("a service row is unreadable")
+
+    async def _no_discord_services(**_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(daemon, "_sync_discord_bot_services", _no_discord_services)
+
+    async def _stop_after_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            daemon.sync_services_loop(
+                {},
+                {},
+                _Scheduler(),
+                accounts_env=Path("/nonexistent/accounts.env"),
+                interval_seconds=0,
+            )
+        )
+
+    assert get_live_deployment(DEPLOYMENT_ID).status == "PAUSED"
+
+
+def test_the_halt_enforcement_failure_is_loud_and_does_not_stop_the_tick(
+    conflict, monkeypatch, caplog
+) -> None:
+    """A failed enforcement must be an ERROR, and the tick still syncs the services."""
+    import live_runner.daemon as daemon
+
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+
+    def _blow_up() -> list[dict[str, object]]:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(daemon, "enforce_broker_order_conflict_halts", _blow_up)
+    monkeypatch.setattr(daemon, "list_services", lambda **_kwargs: [])
+    synced: list[object] = []
+
+    class _Scheduler:
+        async def sync_services(self, services) -> None:
+            synced.append(services)
+
+    async def _services_raise(_services) -> None:
+        raise AssertionError("the tick stopped at the failed enforcement")
+
+    monkeypatch.setattr(daemon, "_sync_discord_bot_services", _services_raise)
+
+    async def _stop_after_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            daemon.sync_services_loop(
+                {},
+                {},
+                _Scheduler(),
+                accounts_env=Path("/nonexistent/accounts.env"),
+                interval_seconds=0,
+            )
+        )
+
+    alerts = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert alerts, "a failed halt enforcement must not pass as a silent tick"
+    assert alerts[0].data["alert"] == "live_broker_order_id_conflict_enforce_failed"
+    # The rest of the tick still ran: the halt failing must not also freeze the services.
+    assert synced == [[]]
+
+
+def test_the_conflict_scan_uses_the_shared_limit_everywhere(
+    conflict, monkeypatch
+) -> None:
+    """Both reads of the ledger carry the shared scan limit, not a local default.
+
+    The health read and the enforcement each want every conflict in the fleet: a
+    200-row default would leave an older conflict unread, so a deployment resumed by an
+    operator is never re-paused and never reported.
+    """
+    import live_runner.broker_order_conflicts as conflicts_module
+
+    limits: list[int] = []
+
+    def _grouped(*args, **kwargs):
+        limits.append(args[0] if args else kwargs.get("limit"))
+        return {}
+
+    monkeypatch.setattr(
+        conflicts_module, "deployments_with_broker_order_conflicts", _grouped
+    )
+
+    assert check_broker_order_conflicts()["status"] == "ok"
+    assert enforce_broker_order_conflict_halts() == []
+    assert limits == [conflicts_module.CONFLICT_SCAN_LIMIT] * 2
+
+
+def test_enforce_never_downgrades_a_stopped_deployment(conflict) -> None:
+    """A STOPPED row is a stronger operator intent; the halt may not weaken it.
+
+    The database guards this with one conditional UPDATE, but the enforcement layer
+    reads the row first and then tells the operator what happened, so its own copy of
+    the rule has to be pinned: a downgrade clears ``stopped_enforced_at`` and takes the
+    deployment out of the cancel-and-flatten sweep.
+    """
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    mark_live_deployment_stopped_enforced(DEPLOYMENT_ID)
+    stamp = get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at
+    assert stamp is not None
+
+    halted = enforce_broker_order_conflict_halts()
+
+    assert halted == []
+    assert get_live_deployment(DEPLOYMENT_ID).status == "STOPPED"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at == stamp
+
+
+def test_a_failed_halt_does_not_skip_the_next_deployment(conflict, monkeypatch) -> None:
+    """One unwritable halt must cost that deployment only, not the rest of the fleet."""
+    import live_runner.broker_order_conflicts as conflicts_module
+
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    update_live_deployment_status(OTHER_DEPLOYMENT_ID, "ACTIVE")
+
+    def _grouped(*_args, **_kwargs):
+        conflict_row = {
+            "signal_id": "11111111-1111-1111-1111-111111111111",
+            "deployment_id": DEPLOYMENT_ID,
+            "symbol": "AAPL",
+            "broker_order_id": "BRK-AAA",
+            "conflicting_broker_order_ids": ["BRK-BBB"],
+        }
+        return {
+            DEPLOYMENT_ID: [conflict_row],
+            OTHER_DEPLOYMENT_ID: [dict(conflict_row, deployment_id=OTHER_DEPLOYMENT_ID)],
+        }
+
+    monkeypatch.setattr(
+        conflicts_module, "deployments_with_broker_order_conflicts", _grouped
+    )
+
+    # The real write for the second deployment: this test is about the loop continuing
+    # past a failure, not about a stubbed status.
+    real_halt = conflicts_module.pause_live_deployment_for_order_conflict
+
+    def _halt(deployment_id: str) -> str:
+        if deployment_id == DEPLOYMENT_ID:
+            raise RuntimeError("database is locked")
+        return real_halt(deployment_id)
+
+    monkeypatch.setattr(
+        conflicts_module, "pause_live_deployment_for_order_conflict", _halt
+    )
+
+    halted = enforce_broker_order_conflict_halts()
+
+    assert [row["deployment_id"] for row in halted] == [OTHER_DEPLOYMENT_ID]
+    assert get_live_deployment(DEPLOYMENT_ID).status == "ACTIVE"
+    assert get_live_deployment(OTHER_DEPLOYMENT_ID).status == "PAUSED"
 
 
 def test_resolve_clears_the_recordings_so_the_halt_can_be_lifted(

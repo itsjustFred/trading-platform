@@ -4020,6 +4020,44 @@ async def sync_services_loop(
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
+        # Fail closed (#126): a deployment with an unresolved broker order id conflict
+        # stays halted. This is the tick that re-pauses it if a status write, a restore
+        # or an older build left it trading, so the halt is never only the one write
+        # that happened when the conflict was recorded.
+        #
+        # First in the iteration and inside its own `try`, because the rest of the tick
+        # can fail on its own: service discovery, a bad service row or a credential
+        # reload raised before this point would skip the re-halt entirely, and a warning
+        # about a failed service sync is not something anyone reads as "a deployment
+        # with an untracked broker order went back to trading".
+        try:
+            halted = await asyncio.to_thread(enforce_broker_order_conflict_halts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The halt is the safety property. Failing to write it must be loud, and it
+            # must not stop this loop from going on to keep the services in sync.
+            logger.error(
+                "ALERT: could not enforce the broker order id conflict halts; an "
+                "untracked broker order may exist and a deployment may be trading",
+                extra={
+                    "data": {
+                        "alert": "live_broker_order_id_conflict_enforce_failed",
+                        "error": str(exc),
+                    }
+                },
+            )
+        else:
+            if halted:
+                # The alert itself is ERROR, from the enforcement: this tick only records
+                # that the halt was re-asserted.
+                logger.info(
+                    "Re-halted %d deployment(s) for unresolved broker order id "
+                    "conflicts (deployment_ids=%s)",
+                    len(halted),
+                    [row["deployment_id"] for row in halted],
+                    extra={"data": {"halted": halted}},
+                )
         try:
             current_mtime = _accounts_env_mtime(accounts_env)
             if current_mtime != accounts_env_mtime:
@@ -4040,21 +4078,6 @@ async def sync_services_loop(
 
             services = await asyncio.to_thread(list_services)
             await scheduler.sync_services(services)
-            # Fail closed (#126): a deployment with an unresolved broker order id
-            # conflict stays halted. This is the tick that re-pauses it if a status
-            # write, a restore or an older build left it trading, so the halt is never
-            # only the one write that happened when the conflict was recorded.
-            halted = await asyncio.to_thread(enforce_broker_order_conflict_halts)
-            if halted:
-                # The alert itself is ERROR, from the enforcement: this tick only records
-                # that the halt was re-asserted.
-                logger.info(
-                    "Re-halted %d deployment(s) for unresolved broker order id "
-                    "conflicts (deployment_ids=%s)",
-                    len(halted),
-                    [row["deployment_id"] for row in halted],
-                    extra={"data": {"halted": halted}},
-                )
             await _sync_discord_bot_services(
                 services,
                 active_discord_bots=active_discord_bots,
