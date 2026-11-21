@@ -567,7 +567,9 @@ def test_alpaca_discord_redelivery_submits_once_with_canonical_signal_id(monkeyp
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
+            persisted_order_ids.append((sid, oid)) or True
+        ),
     )
 
     first = LiveSignal(
@@ -646,7 +648,9 @@ def test_alpaca_redelivery_recovers_accepted_order_without_resubmitting(monkeypa
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
+            persisted_order_ids.append((sid, oid)) or True
+        ),
     )
 
     assert asyncio.run(adapter.submit_order(signal, qty=1.0)) == _alpaca_order_id(
@@ -761,7 +765,11 @@ def test_alpaca_broker_order_id_persistence_failure_is_not_success(monkeypatch):
     persistence_calls: list[tuple[str, str]] = []
 
     def _fail_persistence(
-        signal_id: str, broker_order_id: str, **_kwargs: object
+        signal_id: str,
+        broker_order_id: str,
+        *,
+        submitted_at: datetime | None = None,
+        acknowledged_at: datetime | None = None,
     ) -> bool:
         assert signal_id == canonical_signal_id, (
             "Alpaca broker order id was persisted against the noncanonical signal row"
@@ -2826,7 +2834,9 @@ def test_ctrader_reconcile_recovers_accepted_order_before_local_id_persistence(m
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
+            persisted_order_ids.append((sid, oid)) or True
+        ),
     )
     saved: list[LiveExecution] = []
     monkeypatch.setattr(module, "save_live_execution", lambda e: saved.append(e) or True)
@@ -2998,7 +3008,9 @@ def test_ctrader_redelivery_recovers_accepted_order_without_resubmitting(monkeyp
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
+            persisted_order_ids.append((sid, oid)) or True
+        ),
     )
 
     class _OrderListReq:
@@ -3132,7 +3144,9 @@ def test_ctrader_submit_order_with_id_persists_and_returns_id(monkeypatch):
     monkeypatch.setattr(
         module,
         "set_live_signal_broker_order_id",
-        lambda sid, oid, **_kw: persisted_order_ids.append((sid, oid)) or True,
+        lambda sid, oid, *, submitted_at=None, acknowledged_at=None: (
+            persisted_order_ids.append((sid, oid)) or True
+        ),
     )
 
     class _NewOrderReq:

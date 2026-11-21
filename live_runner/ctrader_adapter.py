@@ -1475,13 +1475,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     def _requested_order_qty(self, order: Any, symbol: str) -> float | None:
         """The order's requested volume converted to qty units (#134).
 
-        ``order.volume`` is in broker volume units; it is converted with the
-        same symbol scale the fill uses. ``None`` when the order is absent or
-        states no positive volume - never an invented quantity.
+        ``ProtoOAOrder`` carries no root ``volume``: the requested volume lives
+        in ``order.tradeData.volume`` in broker volume units, converted with
+        the same symbol scale the fill uses. ``None`` when the order is absent
+        or states no positive volume - never an invented quantity.
         """
         if order is None:
             return None
-        volume = _to_float(getattr(order, "volume", 0), default=0.0)
+        trade_data = getattr(order, "tradeData", None)
+        volume = _to_float(getattr(trade_data, "volume", 0), default=0.0)
         if volume <= 0.0:
             return None
         return _broker_volume_to_qty(volume, self._scale_for(symbol).volume_per_qty)

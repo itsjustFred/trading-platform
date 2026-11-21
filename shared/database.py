@@ -613,13 +613,18 @@ def _lift_optional_datetime(value: Any) -> datetime | None:
     elif isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
     else:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError, TypeError):
+        # Producer-controlled stamps can name dates no datetime can hold
+        # (e.g. year 1 with a non-UTC offset); "unknown", never a raise.
+        return None
 
 
 #: Metadata keys projected into the ``live_signals`` quote-snapshot columns
@@ -651,20 +656,40 @@ _LIVE_SIGNAL_TIMING_METADATA_KEYS = {
 
 
 def _live_signal_quote_snapshot_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Column values for the #134 quote snapshot, lifted from signal metadata."""
-    fields: dict[str, Any] = {}
-    for key in _LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS:
-        fields[key] = _lift_optional_float(metadata.get(key))
-    for key in _LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS:
-        fields[key] = _lift_optional_text(metadata.get(key))
-    fields["entry_quote_time"] = _lift_optional_datetime(metadata.get("entry_quote_time"))
-    for column, keys in _LIVE_SIGNAL_TIMING_METADATA_KEYS.items():
-        value = None
-        for key in keys:
-            value = _lift_optional_datetime(metadata.get(key))
-            if value is not None:
-                break
-        fields[column] = value
+    """Column values for the #134 quote snapshot, lifted from signal metadata.
+
+    Analytics only: this projection runs inside the order path, so it must
+    never raise - a malformed producer value degrades the whole snapshot to
+    NULLs with a warning rather than vetoing the trade.
+    """
+    field_names = (
+        list(_LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS)
+        + list(_LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS)
+        + ["entry_quote_time"]
+        + list(_LIVE_SIGNAL_TIMING_METADATA_KEYS)
+    )
+    fields: dict[str, Any] = {name: None for name in field_names}
+    try:
+        for key in _LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS:
+            fields[key] = _lift_optional_float(metadata.get(key))
+        for key in _LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS:
+            fields[key] = _lift_optional_text(metadata.get(key))
+        fields["entry_quote_time"] = _lift_optional_datetime(
+            metadata.get("entry_quote_time")
+        )
+        for column, keys in _LIVE_SIGNAL_TIMING_METADATA_KEYS.items():
+            value = None
+            for key in keys:
+                value = _lift_optional_datetime(metadata.get(key))
+                if value is not None:
+                    break
+            fields[column] = value
+    except Exception:
+        logger.warning(
+            "Live signal quote snapshot projection failed; storing NULLs",
+            extra={"data": {"error": "projection_failed"}},
+        )
+        return {name: None for name in field_names}
     return fields
 
 
@@ -5521,12 +5546,16 @@ def _live_slippage_decomposition(
     * ``signal_delay_bps``: the same-side quote at submit vs the signal's
       theoretical price, in basis points of the theoretical price.
     * ``execution_slippage_bps``: the fill price vs that same-side quote.
-    * ``spread_bps``: ``(ask - bid) / mid`` at submit.
+    * ``spread_bps``: ``(ask - bid) / mid`` at submit - the quote width, a
+      separate measure that is *not* additive to the other two.
 
     All three are **adverse-positive**: a positive value is a cost, for buys
-    and sells alike (for a sell the direction is applied). Their sum is the
-    adverse-positive total cost - ``slippage_bps`` for a buy, ``-slippage_bps``
-    for a sell under the legacy signed ``actual - theoretical`` convention.
+    and sells alike (for a sell the direction is applied). Only
+    ``signal_delay_bps + execution_slippage_bps`` reconstructs the
+    adverse-positive total cost - ``slippage_bps`` for a buy,
+    ``-slippage_bps`` for a sell under the legacy signed
+    ``actual - theoretical`` convention. The spread sits *inside* both terms,
+    so adding ``spread_bps`` would double-count it.
     Each is ``None`` independently when its inputs are missing -
     an unusable fill price hides only ``execution_slippage_bps``, and a signal
     with no quote snapshot hides all three and sets ``quote_snapshot_missing``.

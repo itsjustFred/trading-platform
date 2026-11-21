@@ -227,8 +227,10 @@ Ablehnung nicht. Pro Fill werden `live_executions.order_type` und
 `list_live_signal_executions_for_deployments` zerlegt den Legacy-Slippage
 (`actual - theoretical`) in `signal_delay_bps` (Quote beim Submit vs.
 Signalpreis), `execution_slippage_bps` (Fill vs. dasselbe Quote) und
-`spread_bps`; alle drei sind adverse-positiv und einzeln `NULL`, wenn ihre
-Eingaben fehlen. Ein Fill ohne nutzbares Quote-Snapshot setzt
+`spread_bps` (die Spreadbreite, nicht additiv); alle drei sind
+adverse-positiv und einzeln `NULL`, wenn ihre Eingaben fehlen. Nur
+`signal_delay_bps + execution_slippage_bps` ergibt die Gesamtkosten - die
+Spread liegt in beiden Termen und würde doppelt gezählt. Ein Fill ohne nutzbares Quote-Snapshot setzt
 `quote_snapshot_missing=true` - fehlende Daten werden markiert, nie als 0
 gedeutet.
 

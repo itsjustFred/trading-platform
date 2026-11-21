@@ -808,16 +808,19 @@ def test_ctrader_stream_fill_records_order_context(isolated_db) -> None:
     adapter._symbol_name_to_id = {"EURUSD": 1}
     adapter._order_id_to_symbol[45678] = "EURUSD"
 
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    stream_order = ProtoOAOrder()
+    stream_order.orderId = 45678
+    stream_order.clientOrderId = signal_id
+    stream_order.orderType = 1
+    stream_order.tradeData.volume = 500_000
+    stream_order.executedVolume = 500_000
+    stream_order.utcLastUpdateTimestamp = 1_700_000_000_000
+
     event = SimpleNamespace(
         executionType=1,
-        order=SimpleNamespace(
-            orderId=45678,
-            clientOrderId=signal_id,
-            orderType=1,
-            volume=500_000,
-            executedVolume=500_000,
-            utcLastUpdateTimestamp=1_700_000_000_000,
-        ),
+        order=stream_order,
         deal=SimpleNamespace(
             dealId=6001,
             orderId=45678,
@@ -899,7 +902,11 @@ def test_ctrader_reconciled_fill_records_order_context(isolated_db) -> None:
         utcLastUpdateTimestamp=0,
         commission=0,
     )
-    order = SimpleNamespace(orderType=1, volume=500_000)
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.orderType = 1
+    order.tradeData.volume = 500_000
     details = SimpleNamespace(order=[order], deal=[deal])
     from uuid import UUID
 
@@ -967,3 +974,152 @@ def test_ctrader_submit_stamps_order_timing(db, monkeypatch) -> None:
     assert row.order_submitted_at is not None
     assert row.broker_ack_at is not None
     assert row.order_submitted_at <= row.broker_ack_at
+
+
+def test_ctrader_requested_qty_reads_trade_data_volume_real_proto(tmp_path) -> None:
+    """``ProtoOAOrder`` has no root ``volume``: the requested volume lives in
+    ``tradeData.volume``. A fake shaped like the old (wrong) field hid the
+    NULL-in-production bug, so this test uses the real protobuf message."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+
+    order = ProtoOAOrder()
+    order.orderId = 45678
+    order.orderType = 1
+    order.tradeData.volume = 500_000
+    assert adapter._requested_order_qty(order, "EURUSD") == pytest.approx(500.0)
+
+    empty = ProtoOAOrder()
+    empty.orderId = 45679
+    empty.orderType = 1
+    assert adapter._requested_order_qty(empty, "EURUSD") is None
+    assert adapter._requested_order_qty(None, "EURUSD") is None
+
+
+def test_extreme_producer_timestamps_degrade_to_null_never_raise(db) -> None:
+    """#337 blocker: producer-controlled stamps run through
+    ``_lift_optional_datetime`` inside ``save_live_signal``, which the
+    adapters call from ``order_not_submitted`` - a raise there refuses the
+    order, exits included. Entries and exits must persist with NULL stamps."""
+    bad_values = [
+        "0001-01-01T00:00:00+05:00",  # parses, then OverflowError in astimezone
+        12345,                        # non-string, non-datetime
+        {"not": "a date"},
+        "not-a-date-at-all",
+    ]
+    for action in ("buy", "sell"):
+        for bad in bad_values:
+            signal = _signal(
+                action=action,
+                metadata={
+                    "signal_timestamp": bad,
+                    "received_at": bad,
+                    "received_at_local": bad,
+                    "entry_quote_time": bad,
+                },
+            )
+            db.save_live_signal(signal)  # must not raise
+            row = _signal_row(db, signal)
+            assert row.producer_at is None
+            assert row.message_received_at is None
+            assert row.entry_quote_time is None
+
+
+def test_conversion_overwrites_payload_received_at_local() -> None:
+    """``received_at_local`` is a local receipt stamp: a payload value must
+    never reach persistence (``setdefault`` used to let it win)."""
+    from live_runner.daemon import _trade_signal_to_live_signal
+    from risk.models import TradeSignal
+    from tests.test_live_execution_safety import _deployment
+
+    deployment = _deployment()
+    for action in ("buy", "sell"):
+        signal = TradeSignal(
+            action=action,
+            symbol="AAPL",
+            entry_price=100.0,
+            stop_loss=98.0 if action == "buy" else None,
+            take_profit=104.0 if action == "buy" else None,
+            timeframe="1h",
+            metadata={
+                "received_at_local": "1999-01-01T00:00:00+00:00",
+                "signal_timestamp": "0001-01-01T00:00:00+05:00",
+            },
+        )
+        converted = _trade_signal_to_live_signal(signal, deployment)
+        stamped = datetime.fromisoformat(converted.metadata["received_at_local"])
+        assert stamped.year >= 2026
+        # The hostile producer stamp is preserved as raw metadata for audit but
+        # must not break the projection: it lifts to NULL, never raises.
+        fields = db_live_signal_quote_snapshot_fields_for_test(converted)
+        assert fields["producer_at"] is None
+        assert fields["message_received_at"] is not None
+
+
+def db_live_signal_quote_snapshot_fields_for_test(signal):
+    from shared.database import _live_signal_quote_snapshot_fields
+
+    return _live_signal_quote_snapshot_fields(signal.metadata)
+
+
+def test_refusal_log_precedes_rejection_persist(monkeypatch) -> None:
+    """#337 should-fix: the operator-visible log must come before the
+    rejection write, which is also bounded - a contended database can never
+    hold the refusal path (or the per-symbol exit lock) hostage."""
+    import logging
+
+    import live_runner.daemon as daemon_mod
+    from live_runner.exit_signals import ExitBelowStepError
+    from tests.test_live_execution_safety import _deployment
+
+    deployment = _deployment()
+    live_signal = _signal(action="sell")
+    events: list[str] = []
+
+    class _OrderProbe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            events.append("log")
+
+    daemon_logger = logging.getLogger("trading.live-runner")
+    probe = _OrderProbe()
+    daemon_logger.addHandler(probe)
+
+    async def _below_step(*_args, **_kwargs):
+        raise ExitBelowStepError(
+            "below step", requested_qty=0.001, qty_step=0.01
+        )
+
+    def _metadata(*_args, **_kwargs):
+        events.append("persist")
+        return None
+
+    def _save_rejection(*_args, **_kwargs):
+        events.append("persist-write")
+        return True
+
+    monkeypatch.setattr(daemon_mod, "prepare_order_with_risk", _below_step)
+    monkeypatch.setattr(daemon_mod, "get_live_signal_metadata", _metadata)
+    monkeypatch.setattr(daemon_mod, "save_live_signal_rejection", _save_rejection)
+
+    try:
+        asyncio.run(
+            daemon_mod._prepare_claim_and_submit_signal(
+                "acct-quote-snapshot",
+                None,
+                deployment,
+                SimpleNamespace(),
+                live_signal,
+                is_exit=True,
+            )
+        )
+    finally:
+        daemon_logger.removeHandler(probe)
+
+    assert events.index("log") < events.index("persist")
+    assert events.index("persist") < events.index("persist-write")

@@ -2172,14 +2172,13 @@ def _trade_signal_to_live_signal(
     metadata["source"] = str(metadata.get("source") or "discord")
     # #134: the submit/ack stamps are written by the broker path after the
     # order returns - a payload value under these names must never survive to
-    # persistence. ``received_at_local`` is the local receipt stamp: the
-    # Discord source sets it at parse time; anything else gets the conversion
-    # time, the best receipt proxy this layer can honestly claim.
+    # persistence. ``received_at_local`` is the local receipt stamp and is
+    # overwritten unconditionally: the Discord source stamps it at parse time,
+    # but any other producer could smuggle an arbitrary value through metadata,
+    # and an analytics column must never be trusted from the payload.
     metadata.pop("order_submitted_at", None)
     metadata.pop("broker_ack_at", None)
-    metadata.setdefault(
-        "received_at_local", datetime.now(timezone.utc).isoformat()
-    )
+    metadata["received_at_local"] = datetime.now(timezone.utc).isoformat()
     _mint_signal_idempotency_key(signal, deployment, metadata)
     if is_exit_intent(metadata):
         # A parsed exit is reduce-only whatever the deployment allows: on a
@@ -2695,17 +2694,24 @@ async def _persist_submission_rejection(
     - so no second row is written.
     """
     try:
-        existing = await asyncio.to_thread(
-            get_live_signal_metadata, str(live_signal.id)
+        # Bounded: this runs on the refusal path, possibly inside the
+        # per-symbol exit lock, so a contended database must not delay the
+        # operator-visible log or the fan-out to sibling deployments.
+        existing = await asyncio.wait_for(
+            asyncio.to_thread(get_live_signal_metadata, str(live_signal.id)),
+            timeout=5.0,
         )
         if existing is not None:
             return
-        await asyncio.to_thread(
-            save_live_signal_rejection,
-            live_signal,
-            stage=stage,
-            reason=str(exc),
-            extra_metadata=_entry_gate_record(exc),
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                save_live_signal_rejection,
+                live_signal,
+                stage=stage,
+                reason=str(exc),
+                extra_metadata=_entry_gate_record(exc),
+            ),
+            timeout=5.0,
         )
     except Exception:
         logger.warning(
@@ -2757,15 +2763,12 @@ async def _prepare_claim_and_submit_signal(
         )
         return
     except ExitBelowStepError as exc:
+        _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
         await _persist_submission_rejection(
             deployment, live_signal, stage="prepare_exit", exc=exc
         )
-        _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
         return
     except ExitInFlightError as exc:
-        await _persist_submission_rejection(
-            deployment, live_signal, stage="prepare_exit", exc=exc
-        )
         # An error, not a skipped signal: nothing was sent and this deployment's
         # position stays open (a later exit signal is sized once the earlier
         # exit is over, but this one is not queued). An operator has to look.
@@ -2783,14 +2786,11 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
         return
     except Exception as exc:
-        await _persist_submission_rejection(
-            deployment,
-            live_signal,
-            stage="prepare_exit" if is_exit else "prepare",
-            exc=exc,
-        )
         if is_exit:
             # A refused exit leaves this deployment's position open: an operator
             # has to look at it, so it is an error, not a skipped signal (#121).
@@ -2807,17 +2807,23 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
-            return
-        logger.warning(
-            "Discord signal refused before submission; nothing was sent to the broker",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "deployment_id": str(deployment.id),
-                    "symbol": live_signal.symbol,
-                    "error": str(exc),
-                }
-            },
+        else:
+            logger.warning(
+                "Discord signal refused before submission; nothing was sent to the broker",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "error": str(exc),
+                    }
+                },
+            )
+        await _persist_submission_rejection(
+            deployment,
+            live_signal,
+            stage="prepare_exit" if is_exit else "prepare",
+            exc=exc,
         )
         return
 
@@ -2873,19 +2879,13 @@ async def _prepare_claim_and_submit_signal(
                 if isinstance(exc, ExitBelowStepError):
                     # The adapter's own floor found less than one step to close:
                     # an ignored exit, like the daemon's own check, not a failure.
-                    await _persist_submission_rejection(
-                        deployment, prepared_signal, stage="submit_exit", exc=exc
-                    )
                     _log_exit_below_step(
                         account_id, deployment, prepared_signal.symbol, exc
                     )
+                    await _persist_submission_rejection(
+                        deployment, prepared_signal, stage="submit_exit", exc=exc
+                    )
                     return
-                await _persist_submission_rejection(
-                    deployment,
-                    prepared_signal,
-                    stage="submit_exit" if is_exit else "submit",
-                    exc=exc,
-                )
                 # A refused exit leaves the position open (#121): error, so an
                 # operator sees it. A refused entry opened nothing: warning.
                 log = logger.error if is_exit else logger.warning
@@ -2907,6 +2907,12 @@ async def _prepare_claim_and_submit_signal(
                             "error": str(exc),
                         }
                     },
+                )
+                await _persist_submission_rejection(
+                    deployment,
+                    prepared_signal,
+                    stage="submit_exit" if is_exit else "submit",
+                    exc=exc,
                 )
                 return
             # **Do not release the lease.** The broker may have accepted the
