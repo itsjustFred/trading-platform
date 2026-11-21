@@ -447,7 +447,8 @@ holds for any stored `signal_source` that is neither `internal` nor `discord`.
 The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
 `untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
 Where Sentry is configured (a DSN: `initialize_sentry` is a no-op without one), its `LoggingIntegration`
-sends ERROR as an event, so the alert reaches Sentry too and the tag makes it filterable there.
+sends ERROR as an event, so the alert reaches Sentry too — as a field of the record's `data` (an extra on the
+event), not as a Sentry tag, so filter it on `untradeable_reason`/`alert` as event data.
 
 It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
 each affected row, and a row is reported again only when its status or signal source changes, so restarting
@@ -465,7 +466,10 @@ them, but they see different things:
   side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
   the pair and a second warning for the same row would only double-count. A stored `signal_source` outside
   `KNOWN_SIGNAL_SOURCES` (`internal` plus everything the daemon can trade) still fails this preflight (exit
-  1) rather than warning, because nothing routes the row as configured.
+  1) rather than warning, because nothing routes the row as configured. Adding a source to the daemon's
+  tradeable set does not make it storable: `LiveDeploymentConfig.signal_source` is a Literal over
+  `internal`/`discord` and the DB read coerces anything else to `internal`, so a new source is a
+  model-and-migration change (`live_runner/deployment_policy.py` says so where the set is defined).
 
 A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
 design, not by accident.

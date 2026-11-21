@@ -18,8 +18,13 @@ It answers two different questions, and the difference is the point: whether the
 daemon can *trade* a source (``TRADEABLE_SIGNAL_SOURCES``, one source today), and
 whether a stored value is one the rest of the system *recognises*
 (``KNOWN_SIGNAL_SOURCES``, which adds the ``internal`` default). Neither set is a
-free-standing literal: the second is derived from the first plus the default, so
-adding a runner cannot half-land.
+free-standing literal: the second is derived from the first plus the default, so a
+new runner cannot be traded by the daemon while the DB preflight still rejects it
+as unrecognised. What widening the tradeable set does *not* do is make a value
+storable: ``shared.models.LiveDeploymentConfig.signal_source`` is a Literal over
+``internal``/``discord`` and ``shared.database`` coerces anything else to
+``internal`` on read, so a genuinely new source is a model-and-migration change
+that starts here rather than one this module completes.
 """
 
 from __future__ import annotations
@@ -27,9 +32,12 @@ from __future__ import annotations
 #: The DB column default and the pydantic model default for "no source chosen".
 DEFAULT_SIGNAL_SOURCE = "internal"
 
-#: Signal sources the daemon has a runner for. Discord is the only one today; a
-#: new source becomes tradeable by being added here and nowhere else. Every
-#: routing gate in the daemon and both preflights ask this set.
+#: Signal sources the daemon has a runner for. Discord is the only one today;
+#: adding a source here makes the daemon route and trade it, but it is not the
+#: only place a vocabulary has to widen: the model that validates a stored
+#: deployment (``LiveDeploymentConfig.signal_source``, a Literal in
+#: ``shared.models``) and the DB write path have to accept it too. Every routing
+#: gate in the daemon and both preflights ask this set.
 TRADEABLE_SIGNAL_SOURCES: frozenset[str] = frozenset({"discord"})
 
 #: The statuses a live deployment can hold. ``shared.models`` pins them on the

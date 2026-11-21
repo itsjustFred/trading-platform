@@ -4858,8 +4858,10 @@ def _warn_untradeable_active_deployments(
                     "signal_source": signal_source,
                     "untradeable_reason": reason,
                     # #242 asks for an alert, not just a log line. In this daemon the
-                    # alert *is* the ERROR record (Sentry's LoggingIntegration sends
-                    # event_level=ERROR); tagging it makes it filterable there.
+                    # alert *is* the ERROR record: Sentry's LoggingIntegration sends
+                    # event_level=ERROR (where a DSN is configured), and this field
+                    # rides in the record's data -- a log field and Sentry extra,
+                    # not a Sentry tag.
                     "alert": "untradeable_active_deployment",
                 }
             },
