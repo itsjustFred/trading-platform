@@ -852,9 +852,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
 
     async def _reconcile_signal_fill(self, signal_id: str) -> bool:
+        # Re-read the client instead of relying on `connect()` having set it:
+        # mypy drops member narrowing across the method boundary (this runs as
+        # the last step of `connect`, from `reconcile_executions` and from the
+        # sweeps), and an unconnected adapter must fail loudly here rather than
+        # read as "signal not found" for every signal in the pass.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter is not connected; cannot reconcile order fills"
+            )
         try:
             order = await asyncio.to_thread(
-                self._trading_client.get_order_by_client_id, signal_id  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
+                trading_client.get_order_by_client_id, signal_id
             )
         except Exception:
             # Unknown to this account or not found.
@@ -1247,12 +1257,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return float(stop_loss), float("nan")
             return float("nan"), float("nan")
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
-            if math.isnan(value) or math.isinf(value) or value <= 0:  # type: ignore[arg-type,operator]  # value validated at runtime / narrowed by an earlier guard
+            # `missing` above already raised or returned for every None, so this
+            # is unreachable today; it is stated rather than ignored so the
+            # arithmetic below type-checks without a suppression.
+            if value is None:
+                continue
+            if math.isnan(value) or math.isinf(value) or value <= 0:
                 raise ValueError(
                     f"Invalid {name} price for {signal.symbol}: {value!r}; "
                     "refusing to submit."
                 )
-        return float(stop_loss), float(take_profit)  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+        # The `missing` scan drained both of None (raise, then early return), so
+        # these are prices; mypy cannot correlate that scan with this return.
+        return float(stop_loss), float(take_profit)  # type: ignore[arg-type]
 
     def _normalize_bracket_entry(self, signal: LiveSignal, qty: float) -> tuple[LiveSignal, float]:
         """Bring an entry onto the grid Alpaca accepts for bracket/OTO orders.
@@ -1575,7 +1592,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
+        # Re-read after the await: `connect()` is what establishes the client, and
+        # mypy drops member narrowing across it, so without this a failed connect
+        # would raise AttributeError instead of saying the adapter is not ready.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
         balance = _to_float(getattr(account, "cash", None), default=0.0)
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
@@ -1600,7 +1625,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)  # type: ignore[union-attr]  # connect() establishes the client; mypy cannot follow it
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
         currency = str(getattr(account, "currency", "") or "").strip().upper()
         if currency != "USD":
             raise ValueError(
@@ -1646,15 +1676,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(
                 "Alpaca adapter must be connected before requesting market data"
             )
+        # Bound after the guard and used by the closures below: mypy does not
+        # carry a member narrowing into a nested function, so reaching through
+        # `self` there would need a suppression (and would read the attribute
+        # twice, which a concurrent disconnect could turn into None).
+        historical_client = self._historical_data_client
 
         def _fetch_crypto(slack_multiplier: float) -> pd.DataFrame:
             from alpaca.data.historical import CryptoHistoricalDataClient
             from alpaca.data.requests import CryptoBarsRequest
 
-            if self._crypto_data_client is None:
-                self._crypto_data_client = CryptoHistoricalDataClient(
+            crypto_client = self._crypto_data_client
+            if crypto_client is None:
+                crypto_client = CryptoHistoricalDataClient(
                     self.api_key, self.secret_key
                 )
+                self._crypto_data_client = crypto_client
             request = CryptoBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,
@@ -1664,9 +1701,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 limit=1000,
                 sort=Sort.DESC,
             )
-            # The alpaca-py response is a ``BarSet`` with a ``.df``; the installed
-            # union also admits a plain dict, which mypy sees instead.
-            return self._crypto_data_client.get_crypto_bars(request).df  # type: ignore[union-attr]
+            # `get_crypto_bars` is declared `BarSet | RawData`: the RawData
+            # branch only happens when the client was built with
+            # `use_raw_data=True`, which this adapter never does (see the
+            # construction above), so the answer is the BarSet and `.df` is on
+            # it. Stated because mypy cannot see that construction flag.
+            return crypto_client.get_crypto_bars(request).df  # type: ignore[union-attr]
 
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
             if is_crypto:
@@ -1690,7 +1730,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # oldest bars in it. Sorted back to ascending below.
                 sort=Sort.DESC,
             )
-            return self._historical_data_client.get_stock_bars(request).df  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
+            return historical_client.get_stock_bars(request).df
 
         frame = await asyncio.to_thread(_fetch, 1.0)
         if frame is not None and len(frame.index) < bounded_limit:
@@ -2058,14 +2098,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         def accepted_pending_cancel(order_id: str | None, order: Any) -> bool:
             return order_id in cancel_accepted and _order_status(order) == "pending_cancel"
 
+        # `_control_order_id` returns ``str | None``, so the None case is filtered
+        # in the comprehension (as in `pending_cancel` below) instead of being
+        # discarded from the finished set, which the checker cannot model.
         still_working = {
             order_id
             for order in remaining
-            if (order_id := _control_order_id(_order_attr(order, "id"))) not in protected
+            if (order_id := _control_order_id(_order_attr(order, "id"))) is not None
+            and order_id not in protected
             and not accepted_pending_cancel(order_id, order)
         }
-        still_working.discard(None)
-        failed.extend(sorted(still_working))  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+        failed.extend(sorted(still_working))
         pending_cancel = sorted(
             {
                 order_id
@@ -2565,7 +2608,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """Return open positions with pricing and unrealized PnL."""
         if not self._connected or self._trading_client is None:
             await self.connect()
-        rows = await asyncio.to_thread(self._trading_client.get_all_positions)  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
+        # Re-read after the await, for the same reason as `get_balance`: a
+        # `connect()` that left the client unset must raise, not AttributeError.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before listing positions"
+            )
+        rows = await asyncio.to_thread(trading_client.get_all_positions)
         payload: list[dict[str, Any]] = []
         for row in rows:
             raw_qty = getattr(row, "qty", None)
@@ -2813,7 +2863,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # alternative in alpaca-py). The thread is released when run
                 # returns/raises; on error the stream is stopped below before
                 # discard so a healthy stream never leaks a thread per retry.
-                await asyncio.to_thread(self._trading_stream.run)  # type: ignore[union-attr]  # Optional client/outcome is guarded by the caller; mypy cannot follow it
+                # Bound above in the `is None` branch and re-assigned on
+                # reconnect, so mypy still sees `Any | None` here even though the
+                # `is None` check just established it.
+                await asyncio.to_thread(self._trading_stream.run)  # type: ignore[union-attr]
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

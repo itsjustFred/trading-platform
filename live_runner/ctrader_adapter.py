@@ -669,7 +669,12 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+                # `msvcrt` is a Windows-only stdlib module (typeshed gates it on
+                # `sys_platform == "win32"`), so mypy on the Linux CI runner cannot
+                # see its members at all: `attr-defined` is about the platform, not
+                # about a runtime value. The `os.name == "nt"` guard is what makes
+                # this branch reachable only where the module exists.
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
                 break
             except OSError:
                 time.sleep(0.05)
@@ -677,7 +682,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # Windows-only module, see the lock call above
         return
 
     import fcntl
@@ -750,7 +755,18 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             pass
         _ASYNCIO_REACTOR_VALIDATED = True
 
-    from twisted.internet import reactor
+    from twisted.internet import reactor as _reactor
+
+    # `twisted.internet.reactor` is a *module* at import time and the installed
+    # reactor *instance* at run time: `installReactor()` rebinds
+    # sys.modules["twisted.internet.reactor"] to the instance, which is why
+    # `__class__.__module__` names the reactor class below. The static type is
+    # therefore the module, so `running`/`startRunning` are genuinely not on it.
+    # Take it as Any instead of two `# type: ignore[attr-defined]` comments:
+    # those are unused whenever Twisted's own (partial) types are absent, and
+    # `warn_unused_ignores` turns an unused ignore into a failure - so the same
+    # source would type-check in CI and fail in a dev-extra-only checkout.
+    reactor: Any = _reactor
 
     reactor_module = reactor.__class__.__module__
     if "asyncioreactor" not in reactor_module:
@@ -758,8 +774,8 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             f"Unsupported Twisted reactor already installed: {reactor_module}. "
             "Expected asyncio reactor."
         )
-    if not reactor.running:  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
-        reactor.startRunning(installSignalHandlers=False)  # type: ignore[attr-defined]  # platform- or library-specific attribute not visible to mypy on this platform
+    if not reactor.running:
+        reactor.startRunning(installSignalHandlers=False)
 
 
 class CTraderLiveAdapter(BaseLiveAdapter):
@@ -3479,7 +3495,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+                    # mypy's `to_thread` signature demands a callable returning
+                    # non-Optional (`Callable[[str, str], str]`) and rejects this
+                    # one's `str | None` result; the lookup genuinely returns
+                    # None for an unknown order and the `or ""` below handles
+                    # it. The arguments themselves are both str.
+                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]
                     self.account_config_id,
                     str(order_id),
                 )
