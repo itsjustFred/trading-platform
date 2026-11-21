@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
@@ -931,7 +931,7 @@ def _detect_rocket_fuel_signal_type(content: str) -> str | None:
     return None
 
 
-def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
+def _resolve_action(content: str, *, signal_type: str | None) -> Literal["buy", "sell"] | None:
     if signal_type in {"overbought_alert", "death_cross_warning"}:
         return None
     # A buy-side negation vetoes the inferred BUY before it is applied.
@@ -1161,7 +1161,10 @@ def _parse_trade_signal_from_message(
         )
         return None
 
+    # Declared, not inferred: both branches produce a direction the trade model
+    # accepts, so the None check below leaves a value `TradeSignal` can take.
     signal_type = None
+    action: Literal["buy", "sell"] | None
     if _is_ramjet_signal(body):
         # Still subject to the negation guard. This branch sets the action
         # outright, so "oversold buy signal - do not buy this yet" was a long on
@@ -1174,7 +1177,7 @@ def _parse_trade_signal_from_message(
         signal_type = "ram_jet_oversold_buy"
     else:
         signal_type = _detect_rocket_fuel_signal_type(body)
-        action = _resolve_action(body, signal_type=signal_type)  # type: ignore[assignment]  # name reused with a wider type across branches
+        action = _resolve_action(body, signal_type=signal_type)
     if action is None:
         return None
 
@@ -1201,7 +1204,7 @@ def _parse_trade_signal_from_message(
         default_timeframe=default_timeframe,
     )
     return TradeSignal(
-        action=action,  # type: ignore[arg-type]  # value validated at runtime / narrowed by an earlier guard
+        action=action,
         symbol=symbol,
         entry_price=float(price),
         stop_loss=levels.stop_loss,
