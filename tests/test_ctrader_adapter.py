@@ -352,6 +352,42 @@ def test_stale_execution_callback_cannot_request_reconciliation() -> None:
     assert adapter._reconciliation_required is False
 
 
+def test_execution_payload_decode_failure_requires_reconciliation() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    current_client = object()
+    adapter._client = current_client
+    adapter._execution_payload_type = 200
+    adapter._heartbeat_payload_type = -1
+
+    def extract(_message):
+        raise ValueError("undecodable execution payload")
+
+    adapter._Protobuf = SimpleNamespace(extract=extract)
+
+    adapter._on_message(current_client, SimpleNamespace(payloadType=200))
+
+    assert adapter._reconciliation_required is True
+    assert adapter._reconciliation_retry_at == 0.0
+
+
+def test_symbol_props_fetch_failure_fails_closed() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    async def fail_send(_request, *, timeout_seconds: int = 15):
+        raise RuntimeError("symbol props unavailable")
+
+    adapter._send_request_with_refresh_retry = fail_send
+
+    with pytest.raises(RuntimeError, match="symbol props unavailable"):
+        asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 1}))
+
+    assert adapter._symbol_props == {}
+
+
 def test_unmapped_execution_fill_is_not_acknowledged_as_persisted(monkeypatch) -> None:
     from live_runner import ctrader_adapter as module
 
