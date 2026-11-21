@@ -93,6 +93,8 @@ from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
 from shared.constants import normalize_timeframe
 from shared.database import (
+    LIVE_DISPATCH_ENTRY_STATUSES,
+    LIVE_DISPATCH_EXIT_STATUSES,
     LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
@@ -2194,15 +2196,19 @@ def _trade_signal_to_live_signal(
 
 #: Statuses a deployment may open a new position from. Only ACTIVE: a pause or a stop
 #: blocks entries in every wording of the rule.
-ENTRY_DISPATCH_STATUSES = frozenset({"ACTIVE"})
+#:
+#: Derived from the shared tuple in ``shared/database.py`` so this gate, the atomic
+#: submission claim's SQL and the conflict halt's exempt set always widen together.
+ENTRY_DISPATCH_STATUSES = frozenset(LIVE_DISPATCH_ENTRY_STATUSES)
 
 #: Statuses a deployment may close a position from. PAUSED is included on purpose (#126
-#: decision): "stop opening new positions" (`base_adapter.py:226`) must not also stop a
+#: decision): "stop opening new positions" (the PAUSED row of the "Operator safety
+#: controls" comment in `base_adapter.py`) must not also stop a
 #: deployment closing what it already holds, or a pause forced by a broker-order-id
 #: conflict would leave the known position open until its stop - exactly the exposure
 #: the conflict could not explain. STOPPED keeps its own cancel-and-flatten enforcement
 #: and is absent: a stopped deployment is closed by the sweeps, not by signal.
-EXIT_DISPATCH_STATUSES = frozenset({"ACTIVE", "PAUSED"})
+EXIT_DISPATCH_STATUSES = frozenset(LIVE_DISPATCH_EXIT_STATUSES)
 
 
 def _dispatch_statuses(*, is_exit: bool) -> frozenset[str]:

@@ -253,18 +253,20 @@ def test_the_halt_enforcement_failure_is_loud_and_does_not_stop_the_tick(
     assert synced == [[]]
 
 
-def test_the_conflict_scan_uses_the_shared_limit_everywhere(
+def test_the_safety_reads_of_the_ledger_are_not_capped(
     conflict, monkeypatch
 ) -> None:
-    """Both reads of the ledger carry the shared scan limit, not a local default.
+    """The health read and the enforcement ask for the whole ledger, not a slice.
 
-    The health read and the enforcement each want every conflict in the fleet: a
-    200-row default would leave an older conflict unread, so a deployment resumed by an
-    operator is never re-paused and never reported.
+    A cap is only honest where the caller can see that it bit: the resolution reports
+    what it cleared, the enforcement reports what it halted. Neither can tell an older
+    conflict it never read from one that does not exist, so a truncated read would leave
+    a deployment that still carries a conflict running - and the operator resolving it
+    would be told there was nothing to resolve.
     """
     import live_runner.broker_order_conflicts as conflicts_module
 
-    limits: list[int] = []
+    limits: list[int | None] = []
 
     def _grouped(*args, **kwargs):
         limits.append(args[0] if args else kwargs.get("limit"))
@@ -276,7 +278,23 @@ def test_the_conflict_scan_uses_the_shared_limit_everywhere(
 
     assert check_broker_order_conflicts()["status"] == "ok"
     assert enforce_broker_order_conflict_halts() == []
-    assert limits == [conflicts_module.CONFLICT_SCAN_LIMIT] * 2
+    assert limits == [None, None]
+
+
+def test_a_conflict_older_than_a_payload_cap_is_still_read_by_the_safety_paths(
+    conflict,
+) -> None:
+    """The same conflict through the real reads: no cap, no truncation, no silence.
+
+    The viewer caps its payload by an explicit limit that it reports as truncated; this
+    pins that the ledger itself does not decide, for the reads where a missing conflict
+    means a running deployment.
+    """
+    health = check_broker_order_conflicts()
+
+    assert health["deployment_ids"] == [DEPLOYMENT_ID]
+    assert enforce_broker_order_conflict_halts() == []
+    assert get_live_deployment(DEPLOYMENT_ID).status == "PAUSED"
 
 
 def test_enforce_never_downgrades_a_stopped_deployment(conflict) -> None:
@@ -365,7 +383,20 @@ def test_resolve_clears_the_recordings_so_the_halt_can_be_lifted(
     update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
     assert enforce_broker_order_conflict_halts() == []
     assert get_live_deployment(DEPLOYMENT_ID).status == "ACTIVE"
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # The resolve is an operator action on a money-path record, so it is logged with the
+    # deployment it cleared and what it cleared. Asserting the records rather than a
+    # non-empty list: a truthy list of *anything* cannot fail.
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [record.data["deployment_id"] for record in warnings] == [DEPLOYMENT_ID]
+    assert warnings[0].data["resolved"] == [
+        {
+            "signal_id": signal_id,
+            "deployment_id": DEPLOYMENT_ID,
+            "symbol": "AAPL",
+            "broker_order_id": "BRK-AAA",
+            "conflicting_broker_order_ids": ["BRK-BBB"],
+        }
+    ]
 
 
 def test_resolve_clears_every_conflict_of_the_deployment(active_deployment) -> None:

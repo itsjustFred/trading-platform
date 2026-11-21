@@ -787,6 +787,74 @@ def test_a_paused_deployment_takes_a_claim_only_for_an_exit(isolated_db_sandbox)
     ) is False
 
 
+def test_an_exit_claim_is_accepted_while_the_deployment_is_active(
+    isolated_db_sandbox,
+) -> None:
+    """The widened claim must not narrow what it widened.
+
+    A running deployment answers an exit through the same `allow_paused=True` claim, and
+    its SQL filter reads `IN ('ACTIVE', 'PAUSED')`. Every exit-path test around this one
+    stubs the claim, so a filter that shrank to PAUSED alone would refuse every close on a
+    running deployment - no order reaching the broker - with a green suite.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+
+    assert (
+        database.claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-active-exit", allow_paused=True
+        )
+        is True
+    )
+    # The lease is still single: an exit may not take a second one while it works.
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-active-exit-2", allow_paused=True
+    ) is False
+    assert database.release_live_deployment_submission("tok-active-exit") is True
+
+    # And an entry on the same ACTIVE row still takes the un-widened filter.
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-entry") is True
+
+
+def test_the_exit_gates_all_read_the_one_status_set(isolated_db_sandbox) -> None:
+    """#311 nit: three modules each carried their own copy of the exit status set.
+
+    The daemon's dispatch statuses, the atomic claim's SQL filter and the halt's exempt
+    set answer the same question ("which statuses may still close a position"), and a copy
+    that forgets to widen stops a close reaching the broker with a green suite. They now
+    derive from one tuple; this pins that they still agree after any change to it.
+    """
+    import live_runner.daemon as daemon
+    from shared.database import LIVE_DISPATCH_EXIT_STATUSES
+
+    assert daemon.EXIT_DISPATCH_STATUSES == frozenset(LIVE_DISPATCH_EXIT_STATUSES)
+    assert daemon.ENTRY_DISPATCH_STATUSES == frozenset({"ACTIVE"})
+
+    # The claim's own filter, through the real SQL: every shared status takes a claim and
+    # anything outside it does not.
+    database, _, _ = isolated_db_sandbox
+    for index, status in enumerate(LIVE_DISPATCH_EXIT_STATUSES):
+        if index == 0:
+            _seed(database, status=status)
+        else:
+            update_live_deployment_status(DEPLOYMENT_ID, status)
+        assert (
+            database.claim_live_deployment_submission(
+                DEPLOYMENT_ID, f"tok-shared-{index}", allow_paused=True
+            )
+            is True
+        )
+        database.release_live_deployment_submission(f"tok-shared-{index}")
+
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert (
+        database.claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-outside", allow_paused=True
+        )
+        is False
+    )
+
+
 def test_stamp_is_refused_while_an_expired_but_unreleased_lease_exists(
     isolated_db_sandbox,
 ) -> None:

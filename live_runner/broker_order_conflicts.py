@@ -37,9 +37,16 @@ from shared.logging import get_logger
 
 logger = get_logger("live-runner")
 
-#: ``deployments_with_broker_order_conflicts`` caps in SQL; the health read wants the
-#: whole fleet, not the most recent slice.
+#: Bound the *payload* reads of the conflict ledger (the viewer's dashboard and
+#: deployment lists) to this many signal rows. It is a presentation limit and it says so
+#: where it bites; the reads that must not silently truncate the truth - the health read
+#: and the halt enforcement below - pass no limit at all.
 CONFLICT_SCAN_LIMIT = 10_000
+
+#: What those reads pass instead: no cap. A truncation here would be invisible, and it
+#: would leave a deployment the resolution cannot clear while the halt is not re-asserted
+#: on it - the two properties this module exists to hold.
+CONFLICT_SCAN_UNCAPPED = None
 
 
 def check_broker_order_conflicts() -> dict[str, Any]:
@@ -48,8 +55,12 @@ def check_broker_order_conflicts() -> dict[str, Any]:
     ``status`` is ``ok`` or ``error``; ``deployment_ids`` names the deployments still
     carrying one; ``conflicts`` carries one entry per signal with the tracked id, the
     conflicting ids and the deployment and symbol they belong to.
+
+    The read is uncapped on purpose: a health read that answered ``ok`` because older
+    conflicts had been trimmed off the end is worse than no health read, and the scan
+    behind it is the same either way.
     """
-    grouped = deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT)
+    grouped = deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_UNCAPPED)
     conflicts = [conflict for rows in grouped.values() for conflict in rows]
     return {
         "status": "error" if conflicts else "ok",
@@ -76,10 +87,15 @@ def enforce_broker_order_conflict_halts() -> list[dict[str, Any]]:
     themselves. A status the daemon does not know (anything but ACTIVE, PAUSED and
     STOPPED) is halted like an ACTIVE one - an unknown status must not be traded from,
     and it is not a state the halt can quietly accept.
+
+    The ledger is read with no cap: a truncated read would leave a deployment that still
+    carries an unresolved conflict running, and would let a resolution clear a conflict
+    it never saw. Nothing here can tell from the response that it was trimmed, so it
+    must not be.
     """
     halted: list[dict[str, Any]] = []
     for deployment_id, conflicts in deployments_with_broker_order_conflicts(
-        limit=CONFLICT_SCAN_LIMIT
+        limit=CONFLICT_SCAN_UNCAPPED
     ).items():
         try:
             paused_now = pause_live_deployment_for_order_conflict(deployment_id)
@@ -129,7 +145,7 @@ def resolve_broker_order_conflicts(deployment_id: str) -> list[dict[str, Any]]:
     if not normalized:
         return []
     cleared: list[dict[str, Any]] = []
-    for conflict in deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT).get(
+    for conflict in deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_UNCAPPED).get(
         normalized, []
     ):
         removed = resolve_live_signal_broker_order_conflicts(str(conflict["signal_id"]))

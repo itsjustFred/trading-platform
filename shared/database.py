@@ -2496,6 +2496,30 @@ def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
 CONFLICT_HALT_PAUSED = "PAUSED"
 CONFLICT_HALT_ALREADY_HALTED = "already-halted"
 
+#: The status a deployment may open a new position from (#126 decision: a pause or a stop
+#: blocks entries in every wording of the rule).
+LIVE_DISPATCH_ENTRY_STATUSES: tuple[str, ...] = ("ACTIVE",)
+
+#: The statuses a deployment may close a position from. PAUSED is included on purpose
+#: (#126 decision): "stop opening new positions" must not also stop a deployment closing
+#: what it already holds, or a pause forced by a broker-order-id conflict would leave the
+#: known position open until its stop. STOPPED keeps its own cancel-and-flatten
+#: enforcement and is absent.
+#:
+#: One definition for every gate that has to answer it, here and not next to any one of
+#: them, because the three callers live in three modules and widening the exit rule in one
+#: of them only is how a close silently stops reaching the broker: the daemon's dispatch
+#: statuses (:data:`live_runner.daemon.EXIT_DISPATCH_STATUSES`), the atomic submission
+#: claim's SQL filter (:func:`claim_live_deployment_submission`) and the halt's
+#: "already halted" set (:func:`pause_live_deployment_for_order_conflict`) all derive from
+#: this tuple. The values are module constants written here, never caller text, so no
+#: request payload can widen them.
+LIVE_DISPATCH_EXIT_STATUSES: tuple[str, ...] = ("ACTIVE", "PAUSED")
+
+#: The statuses a conflict halt never touches: they are a stronger operator intent (or a
+#: row that is already halted), so a re-pause must leave them exactly as they are.
+CONFLICT_HALT_EXEMPT_STATUSES: tuple[str, ...] = ("PAUSED", "STOPPED")
+
 
 def _pause_live_deployment_for_conflict(session: Session, deployment_id: object) -> str:
     """Halt the deployment named by a conflicted signal, in the caller's transaction.
@@ -2559,13 +2583,16 @@ def pause_live_deployment_for_order_conflict(deployment_id: str) -> str:
         return CONFLICT_HALT_ALREADY_HALTED
     now = _utcnow_naive()
     init_db()
+    # The same shared tuple the daemon's halt set and the claim filter read, so the three
+    # copies of "which statuses stop a conflict re-pause" cannot widen apart.
+    halt_exempt_list = ", ".join(f"'{status}'" for status in CONFLICT_HALT_EXEMPT_STATUSES)
     with get_session() as session:
         result = session.execute(
             text(
                 "UPDATE live_deployments "
                 "SET status = 'PAUSED', stopped_enforced_at = NULL, updated_at = :now "
                 "WHERE id = :deployment_id "
-                "AND UPPER(status) NOT IN ('PAUSED', 'STOPPED')"
+                f"AND UPPER(status) NOT IN ({halt_exempt_list})"
             ),
             {"now": now, "deployment_id": normalized},
         )
@@ -3616,11 +3643,16 @@ def _newest_filled_entry_signal(
         offset += len(rows)
 
 
-def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
+def list_live_signal_broker_order_conflicts(limit: int | None = 200) -> list[dict[str, Any]]:
     """Signals whose duplicate delivery carried a different broker order id.
 
     Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
     should be checked against the broker's open orders and positions.
+
+    ``limit=None`` reads every conflicted signal. It is for the reads that must not
+    silently truncate the truth - the halt enforcement and the health read - and it
+    costs no extra work: the scan behind this is a full table scan either way, so the
+    cap only bounds the rows that come back, not the query.
     """
     init_db()
     # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
@@ -3633,13 +3665,13 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
     conflict_count = func.json_array_length(
         LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
     )
+    statement = (
+        select(LiveSignalModel).where(conflict_count > 0).order_by(LiveSignalModel.timestamp.desc())
+    )
+    if limit is not None:
+        statement = statement.limit(max(1, int(limit)))
     with get_session() as session:
-        rows = session.exec(
-            select(LiveSignalModel)
-            .where(conflict_count > 0)
-            .order_by(LiveSignalModel.timestamp.desc())
-            .limit(max(1, int(limit)))
-        ).all()
+        rows = session.exec(statement).all()
     conflicts: list[dict[str, Any]] = []
     for row in rows:
         ids = _conflicting_broker_order_ids(row.metadata_json or {})
@@ -3706,7 +3738,9 @@ def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
     return removed
 
 
-def deployments_with_broker_order_conflicts(limit: int = 200) -> dict[str, list[dict[str, Any]]]:
+def deployments_with_broker_order_conflicts(
+    limit: int | None = 200,
+) -> dict[str, list[dict[str, Any]]]:
     """Unresolved broker order id conflicts, grouped by deployment id.
 
     The read behind the halt: the daemon's conflict enforcement re-pauses every
@@ -3716,6 +3750,12 @@ def deployments_with_broker_order_conflicts(limit: int = 200) -> dict[str, list[
     request), so the cost to remember is the one already documented on
     ``list_live_signal_broker_order_conflicts``: the scan behind this has no index for
     the JSON key.
+
+    ``limit=None`` reads the whole ledger. The enforcement uses it on purpose: a cap
+    that silently dropped an older conflict would leave a deployment the resolution
+    cannot clear and the halt never re-asserts, and that truncation would be invisible
+    in the response. Bounded callers (an HTTP payload) keep an explicit limit and say
+    so, rather than inheriting a default nobody asked for.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for conflict in list_live_signal_broker_order_conflicts(limit=limit):
@@ -4480,11 +4520,12 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
-    # Both spellings are literals chosen here, never caller text, so the status set
-    # cannot be widened by anything but this flag.
-    status_filter = (
-        "UPPER(status) IN ('ACTIVE', 'PAUSED')" if allow_paused else "UPPER(status) = 'ACTIVE'"
-    )
+    # Built from the shared status tuple, never from caller text, so the set cannot be
+    # widened by anything but this flag - and so the daemon's dispatch statuses and this
+    # filter cannot drift apart.
+    allowed = LIVE_DISPATCH_EXIT_STATUSES if allow_paused else LIVE_DISPATCH_ENTRY_STATUSES
+    status_list = ", ".join(f"'{status}'" for status in allowed)
+    status_filter = f"UPPER(status) IN ({status_list})"
     with get_session() as session:
         session.exec(
             delete(LiveDeploymentSubmissionClaimModel).where(
