@@ -364,12 +364,15 @@ Account-(User-)Token unverändert. Eine falsche Kombination antwortet mit
 
 ### Raw-Signal-Archiv (#308)
 
-Jede von `DiscordSignalSource` evaluierte Nachricht aus einem
-vertrauten Signal-Bot-Channel wird append-only archiviert, parse sie nun in
-`TradeSignal` geparst wird oder vom Parser abgelehnt wurde. Ohne dieses
-Archiv existieren die Rohsignale nur im Log-Stream und nur ab dem Tag der
-Aufzeichnung — Backtests und Meta-Labeling der Bots (nitro, ramjet,
-rocketfuel) brauchen die historische Rohdatenmenge.
+Jede von `DiscordSignalSource` gepollte Nachricht aus einem
+Signal-Bot-Channel wird append-only archiviert — ob sie nun in einen
+`TradeSignal` geparst wird oder vom Parser abgelehnt wurde. Auch Nachrichten
+von Autoren außerhalb der Trusted-Author-Allowlist werden archiviert (für
+die Impostor-Auditierbarkeit) und tragen `author_trusted: false`; Inhalte
+werden nicht redigiert. Ohne dieses Archiv existieren die Rohsignale nur im
+Log-Stream und nur ab dem Tag der Aufzeichnung — Backtests und
+Meta-Labeling der Bots (nitro, ramjet, rocketfuel) brauchen die
+historische Rohdatenmenge.
 
 **Speicherort und Format.** JSON Lines unter
 `DATA_DIR / "signal_log" / "discord_signals-<YYYY-MM-DD>.jsonl"` (eine Datei
@@ -381,22 +384,30 @@ Repo bereits neben der DB (`DATA_DIR / "backtests"`, `"grid_results"`,
 `"signals"`), das Format passt also in das bestehende Persistenz-Layout.
 Implementierung: `live_runner/signal_archive.py`.
 
+Jeder Record trägt `schema_version` (aktuell `1`). Die Offline-Pipeline muss
+Zeilen, die nicht parsen (z. B. eine durch einen Absturz abgeschnittene
+Zeile), überspringen und auf `discord_message_id` deduplizieren — ein
+Daemon-Neustart kann zuletzt gepollte Nachrichten erneut archivieren.
+
 **Record-Typen.**
 
 - `discord_signal_received` — einmal pro polled Nachricht: Roh-Content,
-  Autor (ID, Username, Bot-Flag), Channel, Message-ID, `message_created_at`,
-  Empfangszeit (`received_at`/`logged_at`), Bot-Name, Account, Service,
-  `parse_status` (`parsed`/`rejected`), `refusal_reason`/`refusal_detail`
+  Autor (ID, Username, Bot-Flag, `author_trusted`), Channel, Message-ID,
+  `message_created_at`, Archivierzeit (`logged_at`), Bot-Name, Account,
+  Service, `parse_status` (`parsed`/`rejected`),
+  `refusal_reason`/`refusal_detail`
   (z. B. `untrusted_author`, `non_entry_rejection`, `malformed_levels`),
   die geparsten Felder (`signal`: action, symbol, entry, SL, TP, timeframe,
-  signal_type) und receipt-time `features`.
+  signal_type) und receipt-time `features` (Clock-Features: Stunde/Wochentag
+  UTC, Content-Länge, explizites SL/TP, Exit-Flag).
 - `discord_signal_decision` — einmal pro (Signal, Deployment): Outcome
   `traded` / `refused` / `ignored` / `unknown`, `reason` (z. B.
   `deployment_not_active`, `symbol_not_covered`, `author_not_allowed`,
   `unmapped_channel`, `stale_signal`, `signal_gate_rejected`,
   `invalid_deployment_config`, `submission_claim_failed`,
   `broker_refused_pre_request`, `broker_submit_outcome_unknown`,
-  `nothing_to_exit`, `exit_below_step`, `exit_in_flight`), `detail`,
+  `nothing_to_exit`, `exit_below_step`, `exit_in_flight`,
+  `unhandled_error`), `detail`,
   `broker_order_id`, `signal_age_seconds`, Deployment-/Strategy-IDs und
   `features`.
 
@@ -407,16 +418,22 @@ und zählt ihn (`dropped`), Schreibfehler zählen `write_errors`/`enqueue_errors
  und warnen — nichts davon blockiert, verzögert oder wirft in den
 Signalpfad. Abschalten mit `TP_SIGNAL_ARCHIVE=0`.
 
-**Market-Features ohne Netzwerk.** Die Decision-Records tragen Features, die
-nur aus bereits vorhandenen Daten kommen: die OHLCV-Frame, die eh für den
-Signal-Processor gebaut wird — ATR(14) samt Perzentil-Rang im Frame,
-Abstände zu SMA20/SMA50 und VWAP (nur wenn `volume` vorhanden), Gap der
-letzten Bar, grobe Trend-Regime (`above_sma50`/`below_sma50`) — plus
-Prozessor-Metadaten (Processor-ATR, Supertrend-Entry-State, Slippage,
-Trailing-Mode) und Clock-Features (Stunde/Wochentag UTC, Content-Länge,
-explizites SL/TP, Exit-Flag). Bewusst **nicht** drin, weil sie extra Daten
-bräuchten (Follow-ups): Bid/Ask-Spread (braucht Quotes), session-ankererter
-VWAP, Multi-Window-Perzentile.
+**Market-Features — offline, nicht auf dem Signal-Pfad.** Produktiv
+tragen Discord-Signale heute keine OHLCV-Frame (`signal.metadata["market_data"]`
+wird von keinem Producer gesetzt); die Decision-Records erhalten deshalb
+keine Market-Features. Die Feature-Berechnung
+(`market_features_from_frame`) läuft netzwerkfrei über eine bereits
+vorhandene OHLCV-Frame — ATR(14) samt Perzentil-Rang im Frame, Abstände zu
+SMA20/SMA50 und VWAP (nur wenn `volume` vorhanden), Gap der letzten Bar,
+grobe Trend-Regime (`above_sma50`/`below_sma50`) — und ist damit auch für
+die spätere Offline-Berechnung aus historischen OHLCV-Daten per
+`message_created_at` nutzbar (außer Spread, der Quotes bräuchte). Zusätzlich
+schreibt der Decision-Record Prozessor-Metadaten, wenn ein Processor läuft
+(Processor-ATR, Supertrend-Entry-State, Slippage, Trailing-Mode). Die
+Clock-/Parse-Features (Stunde/Wochentag UTC, Content-Länge, explizites
+SL/TP, Exit-Flag) stehen im `discord_signal_received`-Record. Bewusst
+**nicht** drin, weil sie extra Daten bräuchten (Follow-ups): Bid/Ask-Spread
+(braucht Quotes), session-ankererter VWAP, Multi-Window-Perzentile.
 
 **Nächste Schritte (Issue #308, separat).** Jeder Signal bekommt später ein
 Triple-Barrier-Label mit den SL/TP des Bots; daraus wird ein
