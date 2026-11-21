@@ -4351,15 +4351,21 @@ def claim_live_deployment_submission(
     token: str,
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    allow_paused: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
-    Two independent facts have to hold, and both are decided by the database
+    Three independent facts have to hold, and the first two are decided by the database
     rather than by a status snapshot taken earlier in the dispatch:
 
-    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
-      live row, so a PAUSE that committed first wins the race);
+    * the deployment is in a dispatchable status (the ``INSERT ... SELECT`` reads
+      the live row, so a PAUSE that committed first wins the race) - ``ACTIVE``
+      always, and ``PAUSED`` only when ``allow_paused`` is set;
     * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    ``allow_paused`` is for exits only (the #126 decision): a PAUSED deployment closes
+    what it holds but opens nothing. The caller is the daemon's claim site, which knows
+    the signal kind; leaving it at the default keeps a plain status gate for entries.
 
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
@@ -4374,6 +4380,11 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    # Both spellings are literals chosen here, never caller text, so the status set
+    # cannot be widened by anything but this flag.
+    status_filter = (
+        "UPPER(status) IN ('ACTIVE', 'PAUSED')" if allow_paused else "UPPER(status) = 'ACTIVE'"
+    )
     with get_session() as session:
         session.exec(
             delete(LiveDeploymentSubmissionClaimModel).where(
@@ -4389,7 +4400,7 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                    f"WHERE id = :deployment_id AND {status_filter}"
                 ),
                 {
                     "token": normalized_token,
