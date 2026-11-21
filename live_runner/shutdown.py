@@ -322,8 +322,14 @@ class ShutdownCoordinator:
         self._reactor_release_abandoned = False
         self._event = asyncio.Event()
         self._idle = asyncio.Event()
-        if self._inflight == 0:
-            self._idle.set()
+        # The ledger too: a previous run whose drain timed out can leave work
+        # counted that never got its ``end_submission`` (the submission was
+        # abandoned with the task holding it). Carrying that count into the next
+        # run makes its drain wait for a submission nobody is running, time out,
+        # and report ``1`` for a shutdown that had nothing to reconcile - so the
+        # count is reset with the flag, and the idle event follows it.
+        self._inflight = 0
+        self._idle.set()
 
     def request(self, reason: str) -> bool:
         """Request shutdown. Returns False if one was already requested."""

@@ -73,6 +73,7 @@ from live_runner.shutdown import (
     EXIT_OK,
     EXIT_PATH_TIMEOUT_SECONDS,
     ShutdownCoordinator,
+    SubmissionRefusedError,
     close_the_loop_bounded,
     release_twisted_reactor_threads_bounded,
 )
@@ -2090,16 +2091,32 @@ async def submit_order_with_risk(
 ) -> str:
     """Prepare an order and submit it, for callers with no lease to protect.
 
+    The submission registers itself on the shutdown ledger (``_broker_mutation``)
+    instead of trusting its caller to: broker work that is not counted in flight
+    is work the shutdown drain does not wait for, and cancelling it mid-request
+    leaves the broker outcome unknown. A future in-daemon caller therefore cannot
+    bypass the ledger by calling this directly - the only way to send an order is
+    through a counted submission.
+
+    Refused with ``SubmissionRefusedError`` once a shutdown was requested: the
+    alternative is sending an order through connections that are being torn down,
+    outside the drain that would have waited for it.
     """
-    prepared_signal, prepared_qty = await prepare_order_with_risk(
-        adapter,
-        deployment,
-        signal,
-        current_exposure=current_exposure,
-        account_balance=account_balance,
-        pip_value=pip_value,
-    )
-    return await adapter.submit_order(prepared_signal, qty=prepared_qty)
+    async with _broker_mutation() as admitted:
+        if not admitted:
+            raise SubmissionRefusedError(
+                "order submission refused: the daemon is shutting down; nothing "
+                "was sent to the broker and its outcome is not unknown"
+            )
+        prepared_signal, prepared_qty = await prepare_order_with_risk(
+            adapter,
+            deployment,
+            signal,
+            current_exposure=current_exposure,
+            account_balance=account_balance,
+            pip_value=pip_value,
+        )
+        return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(

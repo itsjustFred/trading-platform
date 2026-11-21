@@ -50,6 +50,7 @@ from live_runner.shutdown import (
     FORCED_EXIT_CODE,
     WORST_CASE_SHUTDOWN_SECONDS,
     ShutdownCoordinator,
+    SubmissionRefusedError,
     close_the_loop_bounded,
     release_twisted_reactor_threads,
     release_twisted_reactor_threads_bounded,
@@ -475,6 +476,116 @@ def test_bind_gives_a_new_run_a_clean_slate() -> None:
         return coordinator.requested
 
     assert asyncio.run(_probe()) is False
+
+
+def test_bind_clears_the_in_flight_count_a_timed_out_drain_left_behind() -> None:
+    """A new run must not inherit the previous one's abandoned submissions.
+
+    A drain that timed out leaves work counted that never got its
+    ``end_submission``: the submission was abandoned together with the task that
+    held it. The coordinator is process-wide, so the next run would start with
+    that count on the ledger, wait the whole drain for a submission nobody is
+    running, and report ``EXIT_CLEANUP_TIMEOUT`` for a shutdown that had nothing
+    to reconcile - a ``1`` the operator reads as "a broker outcome is unknown".
+    """
+
+    async def _probe() -> tuple[int, bool]:
+        coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+        coordinator.bind(asyncio.get_running_loop())
+        coordinator.begin_submission()  # abandoned with its task by a timed-out drain
+        coordinator.request("run_daemon_exit")
+        # The next run in this process binds the same coordinator.
+        coordinator.bind(asyncio.get_running_loop())
+        drained = await coordinator.wait_idle(timeout=0.05)
+        return coordinator.inflight, drained
+
+    assert asyncio.run(_probe()) == (0, True)
+
+
+def test_submit_order_with_risk_counts_itself_in_flight(
+    isolated_db_sandbox: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submission nobody registered is one the drain does not wait for.
+
+    ``submit_order_with_risk`` is the one place a caller outside the signal path
+    sends an order (the smoke script, and any future in-daemon caller). If it
+    left the ledger to its caller, that caller could submit an order that no
+    drain waits for: it would be cancelled under the broker request and the
+    daemon could never say whether the order reached the broker. The broker call
+    itself observes the count, which is the only way to prove the registration
+    covers the request and not just the preparation.
+    """
+    database, _, _ = isolated_db_sandbox
+    deployment = _seed_deployment(database)
+    coordinator = _new_coordinator()
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _GateAdapter()
+    seen: list[int] = []
+    real_submit = adapter.submit_order
+
+    async def _observing_submit(signal: Any, *, qty: float | None = None) -> str:
+        seen.append(coordinator.inflight)
+        return await real_submit(signal, qty=qty)
+
+    adapter.submit_order = _observing_submit  # type: ignore[method-assign]
+
+    async def _probe() -> tuple[int, int, int]:
+        coordinator.bind(asyncio.get_running_loop())
+        live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+        submission = asyncio.create_task(
+            daemon.submit_order_with_risk(
+                adapter,  # type: ignore[arg-type]
+                deployment,
+                live_signal,
+                account_balance=100_000.0,
+            )
+        )
+        # The broker call is held open (like a real one in flight at a signal).
+        await asyncio.wait_for(adapter.entered.wait(), timeout=10)
+        counted_during = coordinator.inflight
+        adapter.release.set()
+        await asyncio.wait_for(submission, timeout=10)
+        return adapter.submit_calls, counted_during, coordinator.inflight
+
+    calls, counted_during, inflight_after = asyncio.run(_probe())
+
+    assert calls == 1, "the order must still reach the broker"
+    assert seen == [1], "the broker request must be counted in flight while it runs"
+    assert counted_during == 1, "the drain must see it while the broker has not answered"
+    assert inflight_after == 0, "the ledger must be clear once the broker answered"
+
+
+def test_submit_order_with_risk_is_refused_on_shutdown(
+    isolated_db_sandbox: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the stop flag is set, the helper must refuse, not send.
+
+    Refused rather than sent: an order sent after the flag would go out through
+    the connections the shutdown is tearing down, and - before this gate existed
+    in the helper - outside the ledger that the drain waits for, so its broker
+    outcome could never be reported.
+    """
+    database, _, _ = isolated_db_sandbox
+    deployment = _seed_deployment(database)
+    coordinator = _new_coordinator()
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _GateAdapter()
+    live_signal = daemon._trade_signal_to_live_signal(_trade_signal(), deployment)
+    coordinator.request("SIGTERM")
+
+    with pytest.raises(SubmissionRefusedError, match="shutting down"):
+        asyncio.run(
+            daemon.submit_order_with_risk(
+                adapter,  # type: ignore[arg-type]
+                deployment,
+                live_signal,
+                account_balance=100_000.0,
+            )
+        )
+
+    assert adapter.submit_calls == 0, "nothing may reach the broker"
+    assert adapter.writes == []
+    assert coordinator.inflight == 0, "a refusal must not be left counted in flight"
 
 
 def test_pending_submission_wakes_the_drain_through_wait() -> None:
