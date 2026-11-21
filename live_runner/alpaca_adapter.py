@@ -2528,7 +2528,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Called after a successful flatten, when every symbol is flat: what
         remains are the SL/TP legs detached from the positions they protected.
         An order on a symbol that still has a position is never touched, so this
-        cannot disarm a live position. A bracket's held stop leg is in scope
+        cannot disarm a live position - and a leg's symbol is read from the
+        parent it rests under when the leg itself carries none, because an empty
+        symbol would read as "no position" and cancel a live position's stop.
+        A bracket's held stop leg is in scope
         (#245): it is absent from every ``status=open`` listing, so a sweep that
         only read those would leave exactly the leg that can still trigger - and
         a triggered sell-stop with nothing to sell opens a short.
