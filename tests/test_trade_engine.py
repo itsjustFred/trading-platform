@@ -14,6 +14,7 @@ from runner.engines.contract import parse_date_bound
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from shared.constants import DATA_DIR
+from tests.helpers import TEST_OHLCV_DIR_ENV, resolve_ohlcv_root
 
 
 def _to_utc_datetime(value: object) -> datetime | None:
@@ -434,15 +435,25 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
     - an empty store no longer passes the test (both engines returning zero
       trades is a failure, not "assert True");
     - divergence is capped at one trade, not 30%.
+
+    The dataset comes from the documented local opt-in (``TP_TEST_OHLCV_DIR``),
+    resolved by the same shared helper the strategy data gate uses. It always
+    did read ``DATA_DIR/ohlcv``, which the suite pins to a per-process temp
+    directory, so it could never run even where a developer has the dataset:
+    it skipped with a message that never named the way in.
     """
     strategy_path = Path("strategies/example_sma/example_sma.py").resolve()
     if not strategy_path.exists():
         pytest.skip("example_sma strategy not found")
 
-    ohlcv_root = DATA_DIR / "ohlcv"
+    ohlcv_root = resolve_ohlcv_root(DATA_DIR)
     parquet_files = list(ohlcv_root.rglob("**/1h.parquet"))
     if not parquet_files:
-        pytest.skip("No local 1h OHLCV parquet data available")
+        pytest.skip(
+            f"No local 1h OHLCV parquet data under {ohlcv_root}: set "
+            f"{TEST_OHLCV_DIR_ENV}=/path/to/ohlcv to run this real-data smoke "
+            f"test (the suite's DATA_DIR is a throwaway temp directory)"
+        )
 
     selected = next(
         (
@@ -453,7 +464,10 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         None,
     )
     if selected is None:
-        pytest.skip("No local 1h OHLCV parquet data covering 2024-01-01..2025-12-31")
+        pytest.skip(
+            f"No local 1h OHLCV parquet data under {ohlcv_root} covering "
+            f"2024-01-01..2025-12-31 (set {TEST_OHLCV_DIR_ENV}=/path/to/ohlcv)"
+        )
 
     symbol = selected.parent.name
     cfg = BacktestConfig(risk_per_trade_pct=0.01,
@@ -464,6 +478,10 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         end_date="2025-12-31",
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
+        # The engines append "ohlcv" to data_dir, so this is the PARENT of the
+        # OHLCV root above: the suite's DATA_DIR by default, or the directory
+        # an exported TP_TEST_OHLCV_DIR names its shards from.
+        data_dir=str(ohlcv_root.parent),
         parameters={"fees": "zero"},
     )
 
