@@ -1635,6 +1635,17 @@ def _premortem_verdict(output: str, tmp_path) -> str:
         # Anything else after the verdict still invalidates it.
         ("**Summary:** x\n**Verdict: PASS** — ok\ntrailing chatter\n", ""),
         ("**Summary:** x\n> **Verdict: PASS** quoted\n", ""),
+        # A verdict word with a suffix is not that verdict: the reason follows a
+        # space or punctuation, so `PASSed` and `BLOCKED` are refused rather than
+        # matched as PASS and BLOCK - a verdict the model never wrote would be posted
+        # and mapped to a status state.
+        ("**Summary:** x\n**Verdict: PASSed** — looks fine\n", ""),
+        ("**Summary:** x\n**Verdict: BLOCKED** — harden\n", ""),
+        ("**Summary:** x\n**Verdict: INCOMPLETELY**\n", ""),
+        # The documented verdicts still match with each documented annotation shape.
+        ("**Summary:** x\n**Verdict: BLOCK** — harden. Human sign-off required.\n", "BLOCK"),
+        ("**Summary:** x\n**Verdict: CHANGES-REQUESTED (1 severe)**\n", "CHANGES-REQUESTED"),
+        ("**Summary:** x\n**Verdict: INCOMPLETE** — inputs missing.\n", "INCOMPLETE"),
     ],
 )
 def test_pre_mortem_verdict_extraction(output: str, expected: str, tmp_path) -> None:

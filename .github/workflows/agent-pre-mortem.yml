@@ -529,7 +529,13 @@ jobs:
           tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
           # The verdict must be the last non-empty line (a verdict quoted from the
           # diff elsewhere in the output does not count), and it must be one of
-          # the four the skill allows.
+          # the four the skill allows. What follows the verdict word must start with
+          # something that is not a letter, an underscore or a hyphen, so
+          # `Verdict: PASSed` and `Verdict: BLOCKED` - a word the skill does not
+          # allow, wearing a suffix that reads like the reason - are refused instead
+          # of matching as PASS and BLOCK: posting a verdict the model never wrote
+          # and mapping it to a state is a status nobody can explain. An annotation
+          # that begins with a space, a dash or punctuation is still accepted.
           # A sign-off note the model put on its own line after the verdict (the
           # skill asks for it on the verdict line) is tolerated: it is skipped
           # when looking for the verdict, and stays in the posted comment.
@@ -537,7 +543,7 @@ jobs:
             | grep -vxE '[[:space:]*_]*Human sign-off required\.[[:space:]*_]*' \
             | tail -n 1)
           verdict=$(printf '%s\n' "$last" | tr -d '*' \
-            | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^A-Z-].*)?$/\1/p')
+            | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^[:alpha:]_-].*)?$/\1/p')
           if [ -z "$verdict" ]; then
             echo "::error::Pre-mortem output does not end with a valid verdict line; not posting."
             cat "$out.raw"
