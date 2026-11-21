@@ -110,9 +110,11 @@ export function classifyOptimizationOosEvidence(
     const reason =
       normalizedStatus === "no_oos_requested"
         ? "No out-of-sample window was requested for this optimization."
-        : normalizedStatus === "unavailable"
-          ? "The OOS status is unavailable, so OOS evidence cannot be validated."
-          : "The out-of-sample evaluation did not have sufficient overlap.";
+        : normalizedStatus === "insufficient_oos_bars"
+          ? "The out-of-sample holdout had too few daily observations to support a decision."
+          : normalizedStatus === "unavailable"
+            ? "The OOS status is unavailable, so OOS evidence cannot be validated."
+            : "The out-of-sample evaluation did not have sufficient overlap.";
     return unavailableEvidence(metricKey, reason);
   }
 

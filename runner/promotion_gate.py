@@ -553,6 +553,15 @@ def out_of_sample_evidence_from_result(result_path: Path | str) -> OutOfSampleEv
     """
     path = Path(result_path)
     payload = _read_optimization_result(path)
+    # #133: an undersized OOS holdout is not promotion evidence. Results
+    # written before the status field existed carry no key and fall through
+    # to the overfitting verdict, which already gates them.
+    oos_status = payload.get("oos_status")
+    if oos_status is not None and str(oos_status).strip().lower() != "available":
+        raise InvalidPromotionError(
+            f"optimization result's out-of-sample status is {oos_status!r}, "
+            "not 'available'; the holdout cannot support a promotion decision"
+        )
     passed = _overfitting_verdict(payload)
     test_period, trades = _test_segment(payload)
     strategy = payload.get("strategy")

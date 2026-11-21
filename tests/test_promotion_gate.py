@@ -577,6 +577,8 @@ def test_out_of_sample_evidence_reads_the_final_holdout_not_the_validation_windo
         ({"final_test_stats": {"total_trades": None}}, "total_trades"),
         ({"strategy": {}}, "strategy file"),
         ({"effective_best_parameters": None}, "effective_best_parameters"),
+        ({"oos_status": "insufficient_oos_bars"}, "out-of-sample status"),
+        ({"oos_status": "insufficient_overlap"}, "out-of-sample status"),
     ],
 )
 def test_out_of_sample_evidence_refuses_a_result_without_the_verdict(

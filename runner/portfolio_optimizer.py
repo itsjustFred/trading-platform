@@ -623,7 +623,11 @@ def _build_optimization_result(
     if oos_sharpe is not None:
         oos_status = "available"
     elif oos_requested:
-        if oos_daily_observations < min_oos_daily_observations:
+        if oos_daily_observations == 0:
+            # No common timestamp at all: the curves never overlapped in the
+            # test window, which is a different failure than too-few-days.
+            oos_status = "insufficient_overlap"
+        elif oos_daily_observations < min_oos_daily_observations:
             # Enough aligned rows may exist, but too few distinct DAYS: the
             # OOS statistics would be computed on noise (#133).
             oos_status = "insufficient_oos_bars"

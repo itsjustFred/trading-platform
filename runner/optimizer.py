@@ -885,13 +885,17 @@ def run_optimization(
         )
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
+    oos_daily_observations = int(winner_test_row.get("test_daily_observations") or 0)
     # Flags the winner's overfitting risk; it never changes the selection or
-    # drops the result.
+    # drops the result. An OOS holdout below the daily-observation minimum is
+    # itself an overfitting/insufficient-evidence failure.
     overfitting = _overfitting_payload(
         winner_row=winner_row,
         train_stats=best_train_stats,
         selectable_rows=selectable_rows,
         config=config,
+        oos_daily_observations=oos_daily_observations,
+        min_oos_daily_observations=config.min_oos_daily_observations,
     )
 
     now = datetime.now(timezone.utc)
@@ -951,13 +955,10 @@ def run_optimization(
         "final_test_stats": _json_safe(final_test_stats),
         "oos_status": (
             "available"
-            if int(winner_test_row.get("test_daily_observations") or 0)
-            >= config.min_oos_daily_observations
+            if oos_daily_observations >= config.min_oos_daily_observations
             else "insufficient_oos_bars"
         ),
-        "oos_daily_observations": int(
-            winner_test_row.get("test_daily_observations") or 0
-        ),
+        "oos_daily_observations": oos_daily_observations,
         "min_oos_daily_observations": config.min_oos_daily_observations,
         "three_way": {
             "segments": split.as_dict(),
@@ -1578,6 +1579,8 @@ def _overfitting_payload(
     train_stats: Mapping[str, Any],
     selectable_rows: Sequence[Mapping[str, Any]],
     config: OptimizationConfig,
+    oos_daily_observations: int | None = None,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> dict[str, Any]:
     """The winner's train->validation degradation and deflated Sharpe (#164).
 
@@ -1627,8 +1630,32 @@ def _overfitting_payload(
         max_degradation=config.max_train_validation_degradation,
         min_deflated_sharpe=config.min_deflated_sharpe,
     )
+    checks = dict(verdict.get("checks") or {})
+    reasons = list(verdict.get("reasons") or [])
+    passed = bool(verdict.get("passed"))
+    if (
+        oos_daily_observations is not None
+        and oos_daily_observations < min_oos_daily_observations
+    ):
+        # #133: too few distinct daily OOS observations means the holdout
+        # cannot support a promotion decision; the verdict must say so rather
+        # than leaving oos_status as a label the gate never reads.
+        checks["oos_daily_observations"] = {
+            "value": int(oos_daily_observations),
+            "threshold": int(min_oos_daily_observations),
+            "passed": False,
+            "computable": True,
+        }
+        reasons.append(
+            f"out-of-sample holdout has {int(oos_daily_observations)} daily "
+            f"observations, below the required {int(min_oos_daily_observations)}"
+        )
+        passed = False
     return {
         **verdict,
+        "passed": passed,
+        "checks": checks,
+        "reasons": reasons,
         "degradation": _safe_float_or_none(degradation),
         "deflated_sharpe": _safe_float_or_none(deflated),
         "metric": TARGET_METRIC_ALIASES.get(config.target_metric, config.target_metric),
@@ -2177,6 +2204,11 @@ def _run_risk_parity_covariance_optimization(
     test_daily_observations = daily_observation_count(
         point.time for point in test_result.equity_curve
     )
+    oos_status = (
+        "available"
+        if test_daily_observations >= config.min_oos_daily_observations
+        else "insufficient_oos_bars"
+    )
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -2219,12 +2251,13 @@ def _run_risk_parity_covariance_optimization(
             "diversification_ratio": selection["best_diversification_ratio"],
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
-        "test_stats": _json_safe(test_stats),
-        "oos_status": (
-            "available"
-            if test_daily_observations >= config.min_oos_daily_observations
-            else "insufficient_oos_bars"
+        # This path has no overfitting verdict to carry the failure, so an
+        # undersized OOS holdout withholds its statistics entirely rather
+        # than leaving them readable as if they were evidence.
+        "test_stats": (
+            _json_safe(test_stats) if oos_status == "available" else {}
         ),
+        "oos_status": oos_status,
         "oos_daily_observations": test_daily_observations,
         "min_oos_daily_observations": config.min_oos_daily_observations,
         "risk_parity": _json_safe(selection),

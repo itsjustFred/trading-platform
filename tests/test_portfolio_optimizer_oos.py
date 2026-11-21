@@ -800,3 +800,38 @@ class TestMinOosDailyObservations:
         # Same window passes once the minimum is lowered.
         sharpe, _dd = _compute_oos_metrics(curves, weights, min_daily_observations=5)
         assert sharpe is not None
+
+
+class TestOosStatusLabels:
+    """#133: no-overlap is not the same failure as too-few-daily-bars."""
+
+    def _build(self, *, oos_daily_observations: int, min_obs: int = 20):
+        from runner.portfolio_optimizer import _build_optimization_result
+
+        return _build_optimization_result(
+            backtest_ids=["a", "b"],
+            best_weights=np.array([0.5, 0.5]),
+            sharpe=1.0,
+            max_drawdown=0.1,
+            correlation_matrix=np.eye(2),
+            n_trials=2,
+            train_months=None,
+            test_months=1,
+            oos_metrics=(None, None),
+            oos_daily_observations=oos_daily_observations,
+            min_oos_daily_observations=min_obs,
+        )[0]
+
+    def test_zero_overlap_reports_insufficient_overlap(self) -> None:
+        result = self._build(oos_daily_observations=0)
+        assert result["oos_status"] == "insufficient_overlap"
+
+    def test_few_daily_observations_reports_insufficient_oos_bars(self) -> None:
+        result = self._build(oos_daily_observations=5)
+        assert result["oos_status"] == "insufficient_oos_bars"
+
+    def test_enough_observations_but_no_metrics_is_insufficient_overlap(
+        self,
+    ) -> None:
+        result = self._build(oos_daily_observations=25)
+        assert result["oos_status"] == "insufficient_overlap"

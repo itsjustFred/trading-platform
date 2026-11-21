@@ -1275,3 +1275,59 @@ class TestMatrixOverviewContracts:
         assert "avg_sharpe" not in entry
         assert entry["best_sharpe"] == 2.0
         assert entry["total_trades"] == 30
+
+
+def test_risk_parity_withholds_test_stats_below_oos_minimum(
+    monkeypatch, tmp_path: Path
+):
+    """#133: with no overfitting verdict to carry the failure, the risk-parity
+    path withholds OOS statistics instead of publishing them as evidence."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 3
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["oos_status"] == "insufficient_oos_bars"
+    assert payload["oos_daily_observations"] == 3
+    assert payload["min_oos_daily_observations"] == 20
+    assert payload["test_stats"] == {}

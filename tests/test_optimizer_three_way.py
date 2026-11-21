@@ -990,3 +990,62 @@ def test_old_two_way_optimization_payload_still_loads(
     assert summary["test_stats"] == {"sharpe_ratio": 1.2}
     assert summary["oos_comparison"] == old_payload["oos_comparison"]
     assert "three_way" not in summary, "an old artifact must not gain a new section"
+
+
+def test_insufficient_oos_daily_observations_fail_the_overfitting_verdict(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#133: an undersized OOS holdout must fail the verdict, not just label."""
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 3.0, 2: 4.0},
+            "test": {1: 5.0, 2: 6.0},
+        },
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 5
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["oos_status"] == "insufficient_oos_bars"
+    assert payload["oos_daily_observations"] == 5
+    overfitting = payload["three_way"]["overfitting"]
+    assert overfitting["passed"] is False
+    assert overfitting["checks"]["oos_daily_observations"] == {
+        "value": 5,
+        "threshold": 20,
+        "passed": False,
+        "computable": True,
+    }
+    assert any("daily observations" in reason for reason in overfitting["reasons"])
+
+
+def test_configurable_oos_minimum_admits_a_smaller_holdout(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, min_oos_daily_observations=3)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 3.0, 2: 4.0},
+            "test": {1: 5.0, 2: 6.0},
+        },
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 5
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["oos_status"] == "available"
+    overfitting = payload["three_way"]["overfitting"]
+    assert "oos_daily_observations" not in overfitting["checks"]
