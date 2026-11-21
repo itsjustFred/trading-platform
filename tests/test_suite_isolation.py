@@ -8,13 +8,14 @@ and - worse - a test that *passes* because of a real credential is a result nobo
 ``conftest`` therefore points every one of those at a throwaway session directory and fails the run
 at session end if the suite escaped. These tests pin both halves, plus the two guards that have no
 directory to watch: the network must stay on localhost, and the integration suite must not discover
-over HTTP while it is being imported.
+over HTTP while it is being imported or collected.
 """
 
 from __future__ import annotations
 
 import ast
 import importlib
+import io
 import os
 import socket
 import subprocess
@@ -246,6 +247,50 @@ def test_the_suite_drops_an_inherited_accounts_env_override() -> None:
     assert os.environ["DATA_DIR"] == str(TEST_DATA_DIR)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "TP_ACCOUNTS_ENV",
+        "DATABASE_URL",
+        "ALPACA_API_KEY",
+        "ALPACA_INTRADAY_START",
+        "CTRADER_APP_SECRET",
+        "DISCORD_BOT_RAMJET_TOKEN",
+        "DISCORD_TRUSTED_AUTHOR_IDS",
+        "SENTRY_DSN",
+        "GITHUB_TOKEN",
+        "NIM_API_KEY",
+    ],
+)
+def test_external_credential_shaped_env_vars_are_cleared(name: str) -> None:
+    assert suite_conftest._is_external_credential_env(name) is True
+    assert name not in os.environ
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "DATA_DIR",
+        "TRADING_DATA_DIR",
+        "LOG_DIR",
+        "TP_INTEGRATION_BASE_URL",
+        "TP_TEST_OHLCV_DIR",
+        "TRADING_PRODUCTION_DB",
+        "PATH",
+    ],
+)
+def test_suite_configuration_env_vars_are_not_credential_shaped(name: str) -> None:
+    assert suite_conftest._is_external_credential_env(name) is False
+
+
+def test_no_external_credential_env_var_is_set() -> None:
+    """The autouse fixture cleared before this test; a direct ``os.environ`` write cannot leak."""
+    leaked = [
+        name for name in os.environ if suite_conftest._is_external_credential_env(name)
+    ]
+    assert leaked == []
+
+
 def test_the_accounts_env_override_env_var_wins_over_the_default(tmp_path: Path) -> None:
     """The documented operator escape hatch, and the reason the resolver exists."""
     from live_runner.credential_env import ACCOUNTS_ENV_ENV_VAR, resolve_accounts_env_path
@@ -354,11 +399,11 @@ def test_the_repo_dotenv_file_is_redirected_to_the_session_file(
     Nothing can intervene before that load, so it is redirected rather than prevented: the call
     still happens, on the empty session file. An unrelated path must reach the real loader.
     """
-    loaded: list[Path | None] = []
+    loaded: list[tuple[Path | None, object]] = []
 
-    def _record(path=None, **_kwargs):
+    def _record(path=None, stream=None, *_args, **_kwargs):
         target = path if path is not None else _kwargs.get("dotenv_path")
-        loaded.append(Path(target) if target is not None else None)
+        loaded.append((Path(target) if target is not None else None, stream))
         return {}
 
     monkeypatch.setattr(suite_conftest, "_real_load_dotenv", _record)
@@ -366,10 +411,47 @@ def test_the_repo_dotenv_file_is_redirected_to_the_session_file(
     dotenv.load_dotenv(dotenv_path=REPO_ENV_FILE)
     dotenv.load_dotenv(tmp_path / "unrelated.env")
     assert loaded == [
-        ISOLATED_DOTENV_FILE,
-        ISOLATED_DOTENV_FILE,
-        tmp_path / "unrelated.env",
+        (ISOLATED_DOTENV_FILE, None),
+        (ISOLATED_DOTENV_FILE, None),
+        (tmp_path / "unrelated.env", None),
     ]
+
+
+def test_a_dotenv_stream_of_none_still_redirects_discovery(monkeypatch) -> None:
+    """``stream=None`` is not a stream: discovery still has to find the redirected file."""
+    loaded: list[Path | None] = []
+
+    def _record(path=None, stream=None, *_args, **_kwargs):
+        loaded.append(Path(path) if path is not None else None)
+        return {}
+
+    monkeypatch.setattr(suite_conftest, "_real_load_dotenv", _record)
+    monkeypatch.setattr(dotenv, "find_dotenv", lambda usecwd: str(REPO_ENV_FILE))
+
+    dotenv.load_dotenv(stream=None)
+    dotenv.load_dotenv(None, None)
+
+    assert loaded == [ISOLATED_DOTENV_FILE, ISOLATED_DOTENV_FILE]
+
+
+def test_a_supplied_dotenv_stream_skips_file_discovery(monkeypatch) -> None:
+    """A real stream is the caller's file: no path discovery and no redirect."""
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def _record(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {}
+
+    def _no_discovery(*_args, **_kwargs):
+        raise AssertionError("file discovery must not run for a supplied stream")
+
+    monkeypatch.setattr(suite_conftest, "_real_load_dotenv", _record)
+    monkeypatch.setattr(dotenv, "find_dotenv", _no_discovery)
+    stream = io.StringIO("X=1\n")
+
+    dotenv.load_dotenv(stream=stream)
+
+    assert calls == [((None, stream), {})]
 
 
 def test_a_symlink_to_a_secret_file_is_matched_by_its_target(
@@ -437,6 +519,9 @@ def test_the_integration_module_names_no_default_port() -> None:
     assert "TP_INTEGRATION_BASE_URL" in source
     assert "5556" not in source, "the integration module still carries a default port"
     assert "_discover_strategy_matrix" in source
+    assert "pytest_generate_tests" not in source, (
+        "discovery must wait for test setup: collection runs even for deselected tests"
+    )
 
 
 # --- the network ------------------------------------------------------------------------------ #
@@ -517,16 +602,29 @@ def test_a_unix_socket_connect_is_not_a_network_violation(monkeypatch) -> None:
     [
         lambda: socket.gethostbyname("api.alpaca.markets"),
         lambda: socket.gethostbyaddr(b"193.123.232.1"),
+        lambda: socket.getnameinfo(("35.221.23.121", 443), 0),
         lambda: socket.socket().sendto(b"x", ("35.221.23.121", 443)),
-        lambda: socket.socket().sendmsg([b"x"], (), 0, ("35.221.23.121", 443)),
     ],
-    ids=["gethostbyname", "gethostbyaddr", "sendto", "sendmsg"],
+    ids=["gethostbyname", "gethostbyaddr", "getnameinfo", "sendto"],
 )
 def test_a_datagram_or_bare_lookup_is_refused_too(monkeypatch, call) -> None:
     """UDP and a DNS-only lookup reach the network without a ``connect``."""
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
     with pytest.raises(suite_conftest.SuiteHermeticityViolation):
         call()
+    assert len(suite_conftest.network_violations()) == 1
+
+
+@pytest.mark.skipif(not hasattr(socket.socket, "sendmsg"), reason="sendmsg is Unix-only")
+def test_a_remote_sendmsg_is_refused(monkeypatch) -> None:
+    """``sendmsg`` carries its destination in a different argument shape than ``sendto``."""
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        with pytest.raises(suite_conftest.SuiteHermeticityViolation):
+            probe.sendmsg([b"x"], (), 0, ("35.221.23.121", 443))
+    finally:
+        probe.close()
     assert len(suite_conftest.network_violations()) == 1
 
 
@@ -697,6 +795,63 @@ def test_the_integration_module_is_skipped_without_the_opt_in() -> None:
     combined = result.stdout + result.stderr
     assert "TP_INTEGRATION_BASE_URL is not set" in combined, combined
     assert "1 skipped" in combined, combined
+
+
+def test_a_deselected_integration_test_makes_no_http_call() -> None:
+    """``-m "not slow"`` still collects the module; it must not still discover over HTTP."""
+    import http.server
+    import threading
+
+    hits: list[str] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def _record(self) -> None:
+            hits.append(self.path)
+            body = b"[]"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = _record
+        do_POST = _record
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-m",
+                "not slow",
+                "-p",
+                "no:cacheprovider",
+                "tests/integration/test_strategy_pipeline.py",
+            ],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "TP_INTEGRATION_BASE_URL": base_url},
+            timeout=300,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    combined = result.stdout + result.stderr
+    assert hits == [], combined
+    assert "deselected" in combined, combined
 
 
 # --- end-to-end: the real pytest process must exit non-zero ----------------------------------- #

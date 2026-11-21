@@ -3334,7 +3334,7 @@ def _create_adapter_for_account(
                 account_id=account_identifier,
                 demo=demo,
                 account_config_id=account.id,
-                accounts_env_path=accounts_env_path or DEFAULT_ACCOUNTS_ENV,
+                accounts_env_path=_accounts_env_file(accounts_env_path or None),
                 connect_max_attempts=1,
             )
         except Exception as exc:

@@ -774,8 +774,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--accounts-env",
-        default=str(DEFAULT_ACCOUNTS_ENV),
-        help="Path to .accounts.env-style credential file.",
+        default=None,
+        help=(
+            "Path to .accounts.env-style credential file "
+            "(default: TP_ACCOUNTS_ENV or the project file)."
+        ),
     )
     parser.add_argument(
         "--check-connectivity",
@@ -803,13 +806,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A named database is a request to validate it; ignoring the flag would print the same
         # green document as a run that never looked at the DB.
         args.check_db = True
+    # Resolve once here so the preflight, the crash redaction and the result document all name the
+    # same file: TP_ACCOUNTS_ENV applies only when --accounts-env was not given.
+    accounts_env = resolve_accounts_env_path(args.accounts_env, default=DEFAULT_ACCOUNTS_ENV)
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
     try:
         result = run_live_preflight(
             args.config,
-            accounts_env_path=args.accounts_env,
+            accounts_env_path=accounts_env,
             check_connectivity=args.check_connectivity,
             check_db=args.check_db,
             db_path=args.db_path,
@@ -819,7 +825,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the stdout contract: a failed result document, traceback on stderr. Both
         # the traceback and the document are redacted, so an expanded value that
         # reached the exception text is printed nowhere.
-        redact = _crash_redaction(Path(args.accounts_env))
+        redact = _crash_redaction(accounts_env)
         crash_traceback = _crash_traceback(exc, redact=redact)
         crash_log = "Live preflight crashed"
         if crash_traceback is not None:
@@ -843,7 +849,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = LivePreflightResult(
             ok=False,
             config_path=str(args.config),
-            accounts_env_path=str(args.accounts_env),
+            accounts_env_path=str(accounts_env),
             accounts=[],
             deployment_errors=[_crash_message(exc, redact=redact)],
             db_deployments=db_report,

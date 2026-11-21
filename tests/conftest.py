@@ -48,6 +48,36 @@ ISOLATED_DOTENV_FILE = _SESSION_ROOT / ".env"
 # ``live_runner/credential_env.py``). Imported here rather than from that module because this file
 # must not import production code before the redirects below are installed.
 ACCOUNTS_ENV_ENV_VAR = "TP_ACCOUNTS_ENV"
+# Exported broker, Discord, Sentry and database configuration is as much a leak as the files
+# above: ``load_accounts_env_values`` overlays ``os.environ`` under the accounts file, so a real
+# ``ALPACA_API_KEY`` in the shell would make a test pass for a reason CI cannot reproduce.
+_EXTERNAL_ENV_NAMES = {ACCOUNTS_ENV_ENV_VAR, "DATABASE_URL"}
+_EXTERNAL_ENV_NAMESPACES = ("ALPACA_", "CTRADER_", "DISCORD_", "SENTRY_")
+_EXTERNAL_ENV_MARKERS = (
+    "API_KEY",
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PRIVATE_KEY",
+    "ACCESS_KEY",
+    "DSN",
+)
+
+
+def _is_external_credential_env(name: str) -> bool:
+    return (
+        name in _EXTERNAL_ENV_NAMES
+        or name.startswith(_EXTERNAL_ENV_NAMESPACES)
+        or any(marker in name for marker in _EXTERNAL_ENV_MARKERS)
+    )
+
+
+def _clear_external_credential_env() -> None:
+    for name in [name for name in os.environ if _is_external_credential_env(name)]:
+        os.environ.pop(name, None)
+
+
+_clear_external_credential_env()
 for _session_dir in (TEST_DATA_DIR, TEST_LOG_DIR):
     _session_dir.mkdir(parents=True, exist_ok=True)
 ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
@@ -177,6 +207,13 @@ def _audit_hook(event: str, args: tuple) -> None:
     if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr"):
         _refuse_remote_host(args[0] if args else None, "name lookup")
         return
+    if event == "socket.getnameinfo":
+        address = args[0] if args else None
+        if isinstance(address, (str, bytes)):
+            return  # AF_UNIX path
+        host = address[0] if isinstance(address, (tuple, list)) and address else address
+        _refuse_remote_host(host, "reverse name lookup")
+        return
     if event in ("socket.sendto", "socket.sendmsg"):
         address = args[1] if len(args) > 1 else None
         if isinstance(address, (str, bytes)):
@@ -195,19 +232,19 @@ sys.addaudithook(_audit_hook)
 _real_load_dotenv = dotenv.load_dotenv
 
 
-def _redirected_load_dotenv(path=None, *args, **kwargs):
+def _redirected_load_dotenv(path=None, stream=None, *args, **kwargs):
     """``dotenv.load_dotenv`` with the checkout's ``.env`` redirected to the session file.
 
     The path is read from either calling convention - ``load_dotenv(p)`` and
     ``load_dotenv(dotenv_path=p)`` are the same call, and a redirect that only saw the first would
     let the second load the real file. A caller that supplies a stream reads from it, so the file
-    is not discovered for one. A caller that names neither is resolved through the library's own
-    discovery, which walks up from this file and would find the checkout's.
+    is not discovered for one - and ``stream=None`` is not a stream. A caller that names neither
+    is resolved through the library's own discovery, which walks up from this file and would find
+    the checkout's.
     """
     named = kwargs.pop("dotenv_path", None)
     target = path if path is not None else named
-    has_stream = bool(args) or "stream" in kwargs
-    if target is None and not has_stream:
+    if stream is None and target is None:
         try:
             discovered = dotenv.find_dotenv(usecwd=False)
         except Exception:  # pragma: no cover - discovery is best effort
@@ -217,7 +254,7 @@ def _redirected_load_dotenv(path=None, *args, **kwargs):
     # argument is how a redirect ends up applied to one of them and not the other.
     if _repo_secret_path(target) == REPO_ENV_FILE:
         target = ISOLATED_DOTENV_FILE
-    return _real_load_dotenv(target, *args, **kwargs)
+    return _real_load_dotenv(target, stream, *args, **kwargs)
 
 
 dotenv.load_dotenv = _redirected_load_dotenv
@@ -490,6 +527,12 @@ def _make_sandbox_db(monkeypatch, tmp_path: Path, *, create_schema: bool):
         yield database, engine, data_dir
     finally:
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _no_external_credentials():
+    """Keep a credential-shaped variable set without ``monkeypatch`` out of the next test."""
+    _clear_external_credential_env()
 
 
 @pytest.fixture(autouse=True)

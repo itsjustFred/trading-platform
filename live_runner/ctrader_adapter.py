@@ -30,7 +30,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
     validate_live_quote_prices,
 )
-from live_runner.credential_env import resolve_env_value
+from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
 from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
 from shared.database import (
     find_live_signal_id_by_broker_order_id,
@@ -790,8 +790,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self.app_secret = app_secret or resolve_env_value(env_values, "CTRADER_APP_SECRET")
         self.access_token = access_token or resolve_env_value(env_values, "CTRADER_ACCESS_TOKEN")
         self.refresh_token = refresh_token or resolve_env_value(env_values, "CTRADER_REFRESH_TOKEN")
-        self.accounts_env_path = (
-            Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
+        self.accounts_env_path = resolve_accounts_env_path(
+            accounts_env_path or None, default=DEFAULT_ACCOUNTS_ENV
         )
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0

@@ -116,25 +116,28 @@ def _poll_task_completion(client: httpx.Client, task_id: str) -> dict[str, Any]:
     )
 
 
-# Discovery happens here rather than at import, and only when the opt-in is set: collecting this
-# module happens even when it is deselected, and import-time discovery was what let a bare
-# ``pytest`` talk to a viewer nobody pointed at.
-API_BASE_URL = _integration_base_url()
+# Discovery is deferred to test setup, not done at import or collection: collecting this module
+# happens even when the test is deselected (``-m "not slow"``), and a collection-time lookup was
+# still an HTTP call to a viewer nobody asked to run. Naming no port means the suite does nothing
+# unless someone points it at a viewer on purpose.
+@pytest.fixture
+def integration_base_url() -> str:
+    return _integration_base_url()
+
+
+@pytest.fixture
+def strategy_matrix(integration_base_url: str) -> list[dict[str, Any]]:
+    discovery = _discover_strategy_matrix(integration_base_url)
+    if discovery.error:
+        pytest.skip(discovery.error)
+    return discovery.matrix
+
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 
-def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
-    if "case" not in metafunc.fixturenames:
-        return
-    discovery = _discover_strategy_matrix(API_BASE_URL)
-    if discovery.error:
-        pytest.skip(discovery.error, allow_module_level=True)
-    metafunc.parametrize("case", discovery.matrix, ids=lambda case: case["name"])
-
-
-def test_strategy_pipeline(case: dict[str, Any]) -> None:
-    with httpx.Client(base_url=API_BASE_URL, timeout=30.0) as client:
+def _run_strategy_case(base_url: str, case: dict[str, Any]) -> None:
+    with httpx.Client(base_url=base_url, timeout=30.0) as client:
         run_response = client.post(
             "/api/backtests/run",
             json={
@@ -179,3 +182,16 @@ def test_strategy_pipeline(case: dict[str, Any]) -> None:
         BacktestExpectation(min_trades=0),
     )
     assert validation["passed"], validation
+
+
+def test_strategy_pipeline(
+    integration_base_url: str, strategy_matrix: list[dict[str, Any]]
+) -> None:
+    """Run every discovered strategy and report all failures, not just the first."""
+    failures: list[str] = []
+    for case in strategy_matrix:
+        try:
+            _run_strategy_case(integration_base_url, case)
+        except Exception as exc:
+            failures.append(f"{case['name']}: {type(exc).__name__}: {exc}")
+    assert not failures, "strategy pipeline failures:\n" + "\n".join(failures)
