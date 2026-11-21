@@ -1171,6 +1171,55 @@ def test_flatten_refuses_a_full_held_leg_page() -> None:
         asyncio.run(_adapter(client).close_all_positions())
 
 
+def test_the_orphan_sweep_verifies_the_cancels_it_sent() -> None:
+    """An accepted cancel is not a removed leg, and the sweep has to check.
+
+    Alpaca keeps a cancel it accepted listed as ``pending_cancel`` until it settles,
+    and a leg that is still listed can still fill. The daemon gates the STOPPED stamp
+    on this sweep being complete, so a sweep that counted the acknowledgement as done
+    would let a deployment be stamped stopped over a leg that can open a short.
+    """
+    client = _BracketPositionClient(positions=[], cancel_settles=False)
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is False
+    assert sorted(outcome.failed) == [
+        "sl-leg:still-working",
+        "tp-leg:still-working",
+    ]
+    assert outcome.completed == 2, "the broker did accept both cancels"
+    # The held leg is only visible under its filled parent, so the verification
+    # cannot be an open-orders re-read: it has to be the whole working book.
+    verified_with = [
+        request
+        for request in client.order_filters
+        if str(getattr(getattr(request, "status", None), "value", "open")).lower()
+        == "all"
+    ]
+    assert len(verified_with) == 2
+    assert verified_with[-1].nested is True
+
+
+def test_the_orphan_sweep_reports_a_verification_it_could_not_make() -> None:
+    """A book that cannot be read cannot vouch for the legs it removed."""
+    client = _BracketPositionClient(positions=[])
+    real_get = client.get_orders
+
+    def _lose_the_book_on_the_second_all_listing(filter=None):  # noqa: A002
+        status = str(getattr(getattr(filter, "status", None), "value", "open")).lower()
+        if status == "all" and client.cancelled:
+            raise RuntimeError("order book unreachable")
+        return real_get(filter)
+
+    client.get_orders = _lose_the_book_on_the_second_all_listing  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is False
+    assert any(item.startswith("verify:") for item in outcome.failed)
+
+
 def test_cancel_orphaned_protections_cancels_a_held_stop_leg() -> None:
     """A stop leg that outlives its position must not survive a stop.
 
