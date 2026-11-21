@@ -2160,10 +2160,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         Taken from the protection about to be cancelled, so the position is
         restored to the stop the strategy chose rather than one invented from a
         stale quote. A nested stop leg is checked too, because a bracket's stop
-        is sometimes only visible there.
+        is sometimes only visible there. The book is already scoped to *symbol*
+        by the caller, and a held leg placed on it through its parent carries no
+        symbol of its own - so an empty top-level symbol is this symbol's order,
+        not another symbol's.
         """
         for order in orders:
-            if _order_symbol(order) != symbol:
+            if _order_symbol(order) not in {"", symbol}:
                 continue
             for candidate in (order, *_order_legs(order)):
                 candidate_symbol = _order_symbol(candidate)
@@ -2200,11 +2203,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         not a protection: treating it as one after the position's own sell stop was
         cancelled reports the position as protected while it is naked. Only a stop
         on the reducing side counts, and a bracket's leg counts only if that leg
-        itself is on the reducing side.
+        itself is on the reducing side. The book is already scoped to *symbol*
+        by the caller, and a held leg placed on it through its parent carries no
+        symbol of its own - so an empty top-level symbol is this symbol's order,
+        not another symbol's.
         """
         wanted = "buy" if str(side).strip().lower() == "buy" else "sell"
         for order in orders:
-            if _order_symbol(order) != symbol:
+            if _order_symbol(order) not in {"", symbol}:
                 continue
             for candidate in (order, *_order_legs(order)):
                 candidate_symbol = _order_symbol(candidate)
@@ -2297,7 +2303,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return False
         try:
-            working = await self._list_working_book(client, symbols={symbol})
+            working = await self._working_book_on_symbol(client, symbol)
         except Exception as exc:
             # Not restoring is the bounded failure. The re-read is what proves no stop
             # still works, and a book nobody could read proves nothing - the held-leg
@@ -2815,7 +2821,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         and the close is then refused for that reservation - a flatten that cannot
         finish. The leg lookup is scoped to *symbol* already, so a leg without a
         symbol of its own belongs to this flatten; one whose parent names another
-        symbol is still left out.
+        symbol is still left out. A leg is placed by object identity as well as
+        by id: the lookup above was scoped to this symbol's parents, so a leg it
+        returns belongs here even when its id cannot be read - and dropping it
+        would let the flatten close over a protection nobody verified.
         """
         open_orders = await self._list_open_orders(client)
         legs = await self._list_resting_legs(client, symbols={symbol})
@@ -2825,10 +2834,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             for resting in legs
             if (leg_id := _control_order_id(_order_attr(resting.leg, "id"))) is not None
         }
+        leg_symbols_by_object = {
+            id(resting.leg): _order_symbol(resting.leg) or _order_symbol(resting.parent)
+            for resting in legs
+        }
         on_symbol = []
         for order in orders:
             order_id = _control_order_id(_order_attr(order, "id"))
-            if (_order_symbol(order) or leg_symbols.get(order_id or "", "")) == symbol:
+            resolved = (
+                _order_symbol(order)
+                or leg_symbols_by_object.get(id(order))
+                or leg_symbols.get(order_id or "", "")
+            )
+            if resolved == symbol:
                 on_symbol.append(order)
         return on_symbol
 

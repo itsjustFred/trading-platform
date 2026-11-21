@@ -11,7 +11,6 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -621,10 +620,10 @@ def test_an_unreadable_working_book_does_not_restore_a_stop() -> None:
     client = _FakeTradingClient(positions=[_FakePosition("AAPL", 10.0)])
     adapter = _adapter(client)
 
-    async def _list_working_book(client: Any, *, symbols: set[str] | None) -> list[Any]:
+    def _unreadable_book(filter=None):  # noqa: A002 - mirrors alpaca-py
         raise RuntimeError("429: rate limit reached")
 
-    adapter._list_working_book = _list_working_book  # type: ignore[method-assign]
+    client.get_orders = _unreadable_book  # type: ignore[method-assign]
 
     assert asyncio.run(adapter._restore_stop(client, "AAPL", 190.0)) is False
     assert client.submitted == []
@@ -1303,6 +1302,85 @@ def test_the_flatten_resolves_a_held_leg_symbol_from_its_parent() -> None:
     assert outcome.failed == ()
     assert client.cancelled == ["tp-leg", "sl-leg"]
     assert client.close_calls == ["AAPL"]
+
+
+def test_a_refused_close_restores_a_symbol_less_held_stop_leg() -> None:
+    """The stop price must be read through the parent, not the leg's own symbol.
+
+    The flatten's book places a symbol-less held leg on this symbol through the
+    parent it rests under, but the leg is still a top-level entry whose own
+    symbol is empty. A stop-price lookup that filters on the order's own symbol
+    then finds nothing, and a refused close restores no stop at all - a naked
+    position reported as merely failed.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)],
+        oco_siblings=False,
+        close_error=RuntimeError("broker refused to close"),
+    )
+    client.parent.legs[1].symbol = ""
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.failed == ("AAPL:close:broker refused to close",)
+    assert not any("NO-STOP-RESTORED" in item for item in outcome.failed)
+    restored = [order for order in client.orders if order.order_type == "stop"]
+    assert [(order.stop_price, order.qty, order.side) for order in restored] == [
+        (95.0, 10.0, "sell")
+    ]
+
+
+def test_a_symbol_less_held_stop_the_broker_keeps_is_not_duplicated() -> None:
+    """A refused cancel leaves the leg working, and the restore must see it.
+
+    The broker refused the stop leg's cancel, so it still rests - placed on this
+    symbol through its parent, with no symbol of its own. Re-reading the book
+    for the restore has to resolve that leg the same way, or the restore places
+    a second stop beside it: two stops reduce the position twice, and the extra
+    one is an orphan the moment the first fills.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)], oco_siblings=False
+    )
+    client.parent.legs[1].symbol = ""
+    real_cancel = client.cancel_order_by_id
+
+    def _refuse_the_stop_leg(order_id: str) -> None:
+        if order_id == "sl-leg":
+            raise RuntimeError("cancel rejected")
+        real_cancel(order_id)
+
+    client.cancel_order_by_id = _refuse_the_stop_leg  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.failed == ("AAPL:cancel:sl-leg:cancel rejected",)
+    assert client.close_calls == []
+    # The leg the broker kept is the working stop: nothing may be submitted.
+    assert client.submitted == []
+
+
+def test_a_held_leg_with_no_readable_id_and_no_symbol_fails_the_flatten_closed() -> None:
+    """A leg nobody can name is still this flatten's order to verify.
+
+    The held-leg lookup was scoped to this symbol's parents, so a leg it
+    returns belongs to this flatten even when neither the leg nor its parent
+    yields a readable id or a symbol of its own. Dropping it would let the
+    flatten close over a protection nobody verified; keeping it means the
+    flatten refuses on the unreadable id instead.
+    """
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)], oco_siblings=False
+    )
+    client.parent.legs[1].id = None
+    client.parent.legs[1].symbol = ""
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    (problem,) = outcome.failed
+    assert problem.startswith("AAPL:unreadable-order:")
+    assert client.close_calls == []
 
 
 def test_flatten_refuses_a_full_held_leg_page() -> None:
