@@ -233,10 +233,13 @@ def _order_type(order: Any) -> str:
 def _bracket_leg_key(value: Any) -> str | None:
     """A bracket leg's order id as a map key, with or without a UUID shape.
 
-    Alpaca order ids are UUIDs and `_normalize_broker_order_id` proves that. The looser text form
-    keeps a broker (or a fake client) that answers with another id shape from silently dropping
-    the mapping: the leg's fill would then be refused as unattributable rather than recorded,
-    which is the one direction that cannot lose money.
+    Alpaca order ids are UUIDs and `_normalize_broker_order_id` proves that. The looser text
+    form keeps the registration side (submit response, nested reconcile legs, a trailed
+    stop's replacement id) from silently dropping the mapping for a broker - or a fake
+    client - that answers with another id shape. The stream path still requires the strict
+    UUID form before it consults the map, so a non-UUID leg id is learned but its fill is
+    refused as unattributable rather than recorded - the one direction that cannot lose
+    money.
     """
     normalized = _normalize_broker_order_id(value)
     if normalized is not None:
@@ -2860,24 +2863,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return None
         return event, order, client_order_id
 
-    def _parse_trade_update_event(
-        self, data: Any
-    ) -> tuple[str, Any, Any, UUID] | None:
-        """The ``(event, order, client_order_id, signal_uuid)`` of a fill of one of OUR orders."""
-        fill = self._trade_update_fill_order(data)
-        if fill is None:
-            return None
-        event, order, client_order_id = fill
-        try:
-            signal_uuid = UUID(str(client_order_id))
-        except ValueError:
-            logger.warning(
-                "Trade update client_order_id is not a UUID",
-                extra={"data": {"client_order_id": str(client_order_id)}},
-            )
-            return None
-        return event, order, client_order_id, signal_uuid
-
     async def _record_bracket_leg_fill(
         self,
         parent_signal_id: str,
@@ -2997,7 +2982,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             (
                 "Persisted Alpaca bracket leg close fill"
                 if persisted_qty > 0.0
-                else "Skipped duplicate Alpaca bracket leg close fill"
+                else "No new Alpaca bracket leg close fill persisted "
+                "(duplicate or refused; the reason is logged by the insert path)"
             ),
             extra={
                 "data": {

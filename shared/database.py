@@ -3519,9 +3519,9 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     the symbol. Another deployment's fills on the same (netted) broker position
     are not included, so an exit closes only this deployment's share.
 
-    Only fills attributed to one of the deployment's own signals are counted.
-    Fills of broker-side child orders that are not persisted against a signal
-    (for example a bracket's SL/TP leg) are not in the ledger; callers cap the
+    Only fills attributed to one of the deployment's own signals are counted. A
+    broker-side close that was never persisted (a bracket leg fill no adapter
+    path has booked yet, for example) is not in the ledger; callers cap the
     result at the broker position for that reason.
 
     Fails closed on a stored action other than buy/sell rather than guessing its

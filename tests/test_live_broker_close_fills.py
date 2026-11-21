@@ -172,6 +172,8 @@ def _leg_fill_update(
     *,
     leg_id: str = STOP_LEG_ID,
     qty: float = 10.0,
+    cumulative: float | None = None,
+    event: str = "fill",
     execution_id: str = "exec-leg-1",
     client_order_id: str | None = None,
     side: str = "sell",
@@ -182,9 +184,12 @@ def _leg_fill_update(
     ``client_order_id`` is what the broker puts on the leg order: Alpaca gives a child order its
     own id, and a leg that inherits the parent's client order id names the parent signal - both
     shapes reach this path, and neither may be booked against the parent signal itself.
+    ``cumulative`` is the leg order's ``filled_qty`` at the event - the broker's running total,
+    which differs from the event's own ``qty`` on every partial fill.
     """
+    cumulative = qty if cumulative is None else cumulative
     return SimpleNamespace(
-        event="fill",
+        event=event,
         qty=qty,
         price=price,
         fill_price=price,
@@ -198,7 +203,7 @@ def _leg_fill_update(
             order_type="stop",
             qty=qty,
             status="filled",
-            filled_qty=qty,
+            filled_qty=cumulative,
             filled_avg_price=price,
             filled_at=T1,
             updated_at=T1,
@@ -769,3 +774,339 @@ def test_a_ledger_that_matches_the_broker_again_raises_no_alert(database, caplog
 
     assert qty == pytest.approx(10.0)
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+# ─── review round: restart, trailing, caps and prices ─────────────────────────────────────────
+
+TRAIL_LEG_ID = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+TARGET_LEG_ID = "88888888-9999-4aaa-8bbb-cccccccccccc"
+
+
+def _close_execution_rows(database, parent_signal_id: str) -> list[tuple]:
+    """``(filled_qty, actual_price, actual_price_observed)`` of the close signal's fills."""
+    import sqlite3
+
+    connection = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        return list(
+            connection.execute(
+                "SELECT filled_qty, actual_price, actual_price_observed "
+                "FROM live_executions WHERE signal_id = ? ORDER BY rowid",
+                (database.broker_close_signal_id(parent_signal_id),),
+            )
+        )
+    finally:
+        connection.close()
+
+
+def test_reconcile_fetches_the_parent_with_nested_legs(database) -> None:
+    """The restart path must ask for the legs: by-client-id returns none (#144 review).
+
+    alpaca-py 0.44.0's ``get_order_by_client_id`` takes no ``nested`` option and the runbook
+    records that a bracket's legs are only reported nested in the parent - so without the
+    by-id nested fetch the leg -> signal map is never re-learned after a restart and leg
+    fills are dropped again.
+    """
+    parent = _persist_entry(database)
+    client = _FakeTradingClient({parent: _parent_order(legs=[_leg()])})
+    adapter = _alpaca_adapter(client=client)
+
+    assert asyncio.run(adapter.reconcile_executions()) >= 1
+
+    (order_id, request), = client.get_order_by_id_calls
+    assert order_id == PARENT_ORDER_ID
+    assert request.nested is True
+    assert client.get_order_by_client_id_calls == []
+    assert adapter._bracket_leg_order_id_to_signal_id[STOP_LEG_ID] == parent
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+
+
+def test_reconcile_falls_back_to_the_client_id_fetch_without_a_stored_order_id(
+    database,
+) -> None:
+    """A signal persisted before its broker order id was stored still reconciles."""
+    signal = LiveSignal(
+        deployment_id=DEP_ENTRY,
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=T0,
+        metadata={},
+    )
+    signal_id, created = database.save_live_signal(signal)
+    assert created
+    client = _FakeTradingClient({signal_id: _parent_order()})
+    adapter = _alpaca_adapter(client=client)
+
+    assert asyncio.run(adapter.reconcile_executions()) >= 1
+
+    assert client.get_order_by_id_calls == []
+    assert client.get_order_by_client_id_calls == [signal_id]
+
+
+def test_a_trailed_stop_fill_reduces_the_ledger(database) -> None:
+    """A trailed stop's replacement is a NEW leg order id; its fill must still book (#144).
+
+    ``amend_protective_stop`` replaces the order, so the leg id learned at submit is stale
+    from that moment. The adapter re-learns the new id against the same parent signal at
+    once rather than waiting for the next connect.
+    """
+    from live_runner.base_adapter import ProtectiveStop
+
+    parent = _persist_entry(database)
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+    asyncio.run(adapter.reconcile_executions())
+    assert adapter._bracket_leg_order_id_to_signal_id[STOP_LEG_ID] == parent
+
+    replaced = SimpleNamespace(id=TRAIL_LEG_ID, stop_price=96.5)
+    adapter._trading_client.replace_order_by_id = (
+        lambda order_id, order_data: replaced
+    )
+    stop = ProtectiveStop(
+        order_id=STOP_LEG_ID, symbol="AAPL", side="sell", stop_price=95.0, qty=10.0
+    )
+    amended = asyncio.run(adapter.amend_protective_stop(stop, 96.5))
+
+    assert amended.order_id == TRAIL_LEG_ID
+    assert STOP_LEG_ID not in adapter._bracket_leg_order_id_to_signal_id
+    assert adapter._bracket_leg_order_id_to_signal_id[TRAIL_LEG_ID] == parent
+
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(leg_id=TRAIL_LEG_ID, execution_id="exec-trailed")
+        )
+    )
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+
+
+def test_a_leg_still_open_at_connect_is_learned_and_its_later_fill_books(database) -> None:
+    """The restart case: the leg was working when the adapter connected, fills later."""
+    parent = _persist_entry(database)
+    client = _FakeTradingClient(
+        {parent: _parent_order(legs=[_leg(filled_qty=0.0, status="held")])}
+    )
+    adapter = _alpaca_adapter(client=client)
+
+    assert asyncio.run(adapter.reconcile_executions()) == 0
+    assert adapter._bracket_leg_order_id_to_signal_id[STOP_LEG_ID] == parent
+
+    asyncio.run(adapter._on_trade_update(_leg_fill_update()))
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+
+
+def test_sibling_legs_book_against_their_own_cumulative(database) -> None:
+    """Stop and target legs share one close signal; each leg's cumulative is its own (#144)."""
+    parent = _persist_entry(database)
+    legs = [
+        _leg(filled_qty=4.0),
+        _leg(order_id=TARGET_LEG_ID, order_type="limit", filled_qty=6.0),
+    ]
+    adapter = _alpaca_adapter({parent: _parent_order(legs=legs)})
+
+    asyncio.run(adapter.reconcile_executions())
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+    assert sorted(row[0] for row in _close_execution_rows(database, parent)) == [4.0, 6.0]
+
+
+def test_a_second_partial_leg_event_books_only_its_own_slice(database) -> None:
+    """Two partial fills of one leg: the event quantity, never the cumulative, is booked."""
+    parent = _persist_entry(database)
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+    adapter._register_bracket_legs(parent, _parent_order(legs=[_leg()]))
+
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(
+                qty=4.0, cumulative=4.0, event="partial_fill", execution_id=""
+            )
+        )
+    )
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(qty=6.0, cumulative=10.0, event="fill", execution_id="")
+        )
+    )
+    # A redelivery of the first slice is a skip, not a third row.
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(
+                qty=4.0, cumulative=4.0, event="partial_fill", execution_id=""
+            )
+        )
+    )
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+    assert [row[0] for row in _close_execution_rows(database, parent)] == [4.0, 6.0]
+
+
+def test_a_partially_filled_leg_is_backfilled_up_to_its_cumulative(database) -> None:
+    """A leg caught mid-fill reconciles its slice, then the rest once it completes."""
+    parent = _persist_entry(database)
+    partial = _alpaca_adapter(
+        {parent: _parent_order(legs=[_leg(filled_qty=4.0, status="partially_filled")])}
+    )
+    assert asyncio.run(partial.reconcile_executions()) >= 1
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(6.0)
+
+    complete = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+    assert asyncio.run(complete.reconcile_executions()) >= 1
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+    assert [row[0] for row in _close_execution_rows(database, parent)] == [4.0, 6.0]
+
+
+def test_a_reconciled_leg_close_records_a_usable_price(database) -> None:
+    """The fill price of a reconciled close is derived, never stored as 0.0 (#144)."""
+    parent = _persist_entry(database)
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+
+    asyncio.run(adapter.reconcile_executions())
+
+    (qty, price, observed), = _close_execution_rows(database, parent)
+    assert qty == pytest.approx(10.0)
+    assert price == pytest.approx(95.0)
+    assert observed == "derived"
+
+
+def test_a_partial_leg_backfill_derives_the_remainder_price(database) -> None:
+    """A backfill covering only part of the leg prices the missing slice, not 0.0.
+
+    The leg's ``filled_avg_price`` is the average over its whole cumulative: the first
+    slice was already recorded at 90, the leg's average is 95 over 10, so the missing 6
+    derive to (95*10 - 90*4) / 6.
+    """
+    parent = _persist_entry(database)
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+    adapter._register_bracket_legs(parent, _parent_order(legs=[_leg()]))
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(
+                qty=4.0, cumulative=4.0, event="partial_fill", price=90.0,
+                execution_id="",
+            )
+        )
+    )
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(6.0)
+
+    asyncio.run(adapter.reconcile_executions())
+
+    rows = _close_execution_rows(database, parent)
+    assert [row[0] for row in rows] == [4.0, pytest.approx(6.0)]
+    assert rows[0][1:] == (90.0, "observed")
+    assert rows[1][1] == pytest.approx((95.0 * 10.0 - 90.0 * 4.0) / 6.0)
+    assert rows[1][2] == "derived"
+
+
+def test_a_delayed_leg_event_after_reconcile_is_not_double_counted(database) -> None:
+    """A stale stream event whose slice reconcile already covered is skipped by the cap."""
+    parent = _persist_entry(database)
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[_leg()])})
+    asyncio.run(adapter.reconcile_executions())
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+
+    # The event snapshot predates the reconcile: its cumulative (4) is below what is
+    # already recorded for the leg (10), so nothing may be booked.
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(
+                qty=4.0, cumulative=4.0, event="partial_fill", execution_id=""
+            )
+        )
+    )
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+    assert [row[0] for row in _close_execution_rows(database, parent)] == [10.0]
+
+
+def test_a_close_is_capped_at_the_parent_signal_s_unclosed_quantity(database) -> None:
+    """No double-booked fill may drive the ledger below zero (#144 review).
+
+    Two distinct dedupe keys for closes of one 10-share parent: the second is capped at
+    what remains unclosed, so the ledger ends at exactly 0 rather than -3.
+    """
+    parent = _persist_entry(database)
+
+    first = database.record_live_broker_side_close_fill(
+        **_close_fill_kwargs(database, parent, qty=7.0, dedupe_key="k:leg-a:7")
+    )
+    second = database.record_live_broker_side_close_fill(
+        **_close_fill_kwargs(database, parent, qty=5.0, dedupe_key="k:leg-b:5")
+    )
+    third = database.record_live_broker_side_close_fill(
+        **_close_fill_kwargs(database, parent, qty=1.0, dedupe_key="k:leg-c:1")
+    )
+
+    assert first == pytest.approx(7.0)
+    assert second == pytest.approx(3.0)
+    assert third == pytest.approx(0.0)
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
+    assert [row[0] for row in _close_execution_rows(database, parent)] == [7.0, 3.0]
+
+
+def test_a_close_of_a_parent_with_no_position_sign_is_refused(database) -> None:
+    """A parent whose action is neither buy nor sell cannot be closed against.
+
+    ``LiveSignal`` validates action to buy/sell, so the row is written directly - the
+    refusal exists for rows that predate or bypass that validation.
+    """
+    parent = str(uuid4())
+    with database.get_session() as session:
+        session.add(
+            database.LiveSignalModel(
+                id=parent,
+                deployment_id=DEP_ENTRY,
+                symbol="AAPL",
+                action="hold",
+                theoretical_price=100.0,
+                timestamp=T0,
+                source="internal",
+            )
+        )
+        session.commit()
+
+    persisted = database.record_live_broker_side_close_fill(
+        **_close_fill_kwargs(database, parent)
+    )
+
+    assert persisted == pytest.approx(0.0)
+    assert database.get_live_signal_metadata(database.broker_close_signal_id(parent)) is None
+
+
+def test_a_broker_close_signal_does_not_displace_the_entry_for_trailing(database) -> None:
+    """The close row is bookkeeping, not an entry: trailing must still find the entry (#144)."""
+    parent = _persist_entry(database)
+    database.record_live_broker_side_close_fill(**_close_fill_kwargs(database, parent))
+
+    entries = database.find_latest_filled_live_entry_signals([DEP_ENTRY], ["AAPL"])
+
+    assert entries["AAPL"]["signal_id"] == parent
+
+
+def test_broker_close_fills_stay_out_of_the_trades_payload(database, monkeypatch) -> None:
+    """The live page must not price a broker close against a 0.0 theoretical (#144).
+
+    A 10-share stop at 95 would otherwise render as a -950 loss and pollute slippage.
+    """
+    import viewer.main as viewer_main
+
+    parent = _persist_entry(database)
+    database.record_live_broker_side_close_fill(**_close_fill_kwargs(database, parent))
+    monkeypatch.setattr(
+        viewer_main,
+        "list_live_deployments_for_account",
+        lambda _a: [SimpleNamespace(id=DEP_ENTRY, strategy_name="", account_id=ACCOUNT)],
+    )
+
+    payload = asyncio.run(viewer_main._live_trades_payload(ACCOUNT))
+
+    assert [row["signal_id"] for row in payload["trades"]] == [parent]
+    # The serializer still serves the close row (stats price it from actual prices) but
+    # never a slippage against a theoretical price the close does not have.
+    rows = database.list_live_signal_executions_for_deployments([DEP_ENTRY])
+    close_rows = [row for row in rows if row["source"] == "broker_close"]
+    assert len(close_rows) == 1
+    assert close_rows[0]["slippage"] is None
+    assert close_rows[0]["slippage_bps"] is None
