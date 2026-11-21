@@ -11,10 +11,7 @@ import yaml
 from live_runner.account_routing import validate_live_account_routes
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
-from shared.trailing import (
-    validate_deployment_signal_processor_trailing_mode,
-    validate_live_deployment_trailing_override,
-)
+from shared.trailing import validate_live_deployment_trailing_mode
 
 
 def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -123,20 +120,14 @@ def parse_live_deployments_config(
     account_ids = set(account_brokers)
     for deployment in deployments:
         # #150/#167 fail closed: live trailing support is per broker. An
-        # unknown account has no broker, which supports mode "none" only.
-        validate_live_deployment_trailing_override(
-            deployment.signal_config,
-            context=f"live deployment '{deployment.strategy_name}'",
-            broker=account_brokers.get(deployment.account_id),
-            timeframe=_signal_timeframe(deployment),
-        )
-        # The mode can also come from the bot's own config default (#150): the
-        # processor emits it with every signal, so it is checked here too.
-        validate_deployment_signal_processor_trailing_mode(
+        # unknown account has no broker, which supports mode "none" only. The
+        # mode is checked whether the deployment sets it explicitly or its
+        # signal processor emits it by default (the bot's own config).
+        validate_live_deployment_trailing_mode(
             deployment,
+            context=f"live deployment '{deployment.strategy_name}'",
             broker=account_brokers.get(deployment.account_id),
             timeframe=_signal_timeframe(deployment),
-            context=f"live deployment '{deployment.strategy_name}'",
         )
         if deployment.account_id not in account_ids:
             logger.warning(

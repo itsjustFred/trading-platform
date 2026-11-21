@@ -71,10 +71,7 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
-from shared.trailing import (
-    validate_deployment_signal_processor_trailing_mode,
-    validate_live_deployment_trailing_override,
-)
+from shared.trailing import validate_live_deployment_trailing_mode
 
 
 def _deployment_trailing_timeframe(deployment: Any) -> str:
@@ -4118,21 +4115,16 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             accounts_env_values=route_env,
         )
         # #150/#167 fail closed: live trailing support is per broker, and this
-        # is where the deployment's broker is first known.
-        validate_live_deployment_trailing_override(
-            deployment.signal_config,
-            context=f"live deployment '{deployment.strategy_name}'",
-            broker=account.broker,
-            timeframe=_deployment_trailing_timeframe(deployment),
-        )
-        # The mode can also come from the bot's own config default, which is
-        # where #150's defect came from: the processor emits it with every
-        # signal, so it is checked here too, before the deployment exists.
-        validate_deployment_signal_processor_trailing_mode(
+        # is where the deployment's broker is first known. Both the mode the
+        # deployment sets explicitly and the one its signal processor emits by
+        # default are checked (the bot's own config is where #150's defect came
+        # from), so a deployment that could never run its trail is refused here
+        # instead of signal by signal.
+        validate_live_deployment_trailing_mode(
             deployment,
+            context=f"live deployment '{deployment.strategy_name}'",
             broker=account.broker,
             timeframe=_deployment_trailing_timeframe(deployment),
-            context=f"live deployment '{deployment.strategy_name}'",
         )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
@@ -4517,21 +4509,15 @@ def update_live_deployment_account(
                 )
 
             # #150/#167 fail closed: the new account may sit on a broker that
-            # cannot execute the deployment's trailing mode.
+            # cannot execute the deployment's trailing mode — whether the mode
+            # comes from the deployment's own override or from the bot config
+            # its processor runs with.
             re_pointed = record.to_live_deployment()
-            validate_live_deployment_trailing_override(
-                re_pointed.signal_config,
-                context=f"live deployment '{record.strategy_name}' re-point",
-                broker=account.broker,
-                timeframe=_deployment_trailing_timeframe(re_pointed),
-            )
-            # A bot-config default is not visible in the deployment's own
-            # config, so it is checked against the new broker as well.
-            validate_deployment_signal_processor_trailing_mode(
+            validate_live_deployment_trailing_mode(
                 re_pointed,
+                context=f"live deployment '{record.strategy_name}' re-point",
                 broker=account.broker,
                 timeframe=_deployment_trailing_timeframe(re_pointed),
-                context=f"live deployment '{record.strategy_name}' re-point",
             )
 
             current_status = str(record.status or "").strip().upper()

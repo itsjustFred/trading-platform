@@ -125,9 +125,9 @@ from shared.models import (
 )
 from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
+    ANY_BROKER,
     TRAILING_SL_CONFIG_METADATA_KEY,
-    validate_deployment_signal_processor_trailing_mode,
-    validate_live_deployment_trailing_override,
+    validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
 from signal_bots.registry import get_signal_processor
@@ -4795,15 +4795,11 @@ async def _load_db_accounts_and_deployments(
     account_brokers = {account.id: account.broker for account in accounts}
     for deployment in deployments:
         try:
-            validate_live_deployment_trailing_override(
-                deployment.signal_config,
-                context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
-            )
-            validate_deployment_signal_processor_trailing_mode(
+            validate_live_deployment_trailing_mode(
                 deployment,
-                broker=account_brokers.get(deployment.account_id),
-                timeframe=_deployment_signal_timeframe(deployment),
                 context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+                broker=account_brokers.get(deployment.account_id, ANY_BROKER),
+                timeframe=_deployment_signal_timeframe(deployment),
             )
         except ValueError as exc:
             logger.error(

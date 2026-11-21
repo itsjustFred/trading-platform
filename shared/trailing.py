@@ -285,30 +285,43 @@ def validate_live_deployment_trailing_override(
         )
 
 
-def validate_deployment_signal_processor_trailing_mode(
+def validate_live_deployment_trailing_mode(
     deployment: "LiveDeploymentConfig",
     *,
+    context: str,
     broker: Any = ANY_BROKER,
     timeframe: Any = None,
-    context: str,
 ) -> None:
-    """Validate the trailing mode a deployment's signal processor asks for.
+    """Validate the trailing mode a live deployment would run, fail closed.
 
-    #150 fail closed, deployment-validation stage. The trailing mode is a
-    setting of the *bot* (``signal_bots/<bot>/config.yaml``), which is where the
-    issue's defect came from: the processor emits the mode with every signal, so
-    a bot whose default asks for something the live path cannot execute used to
-    be invisible until the first signal was refused at runtime. This stage reads
-    that mode from the processor the deployment actually runs — the bot config
-    merged with the deployment's overrides, exactly as the daemon builds it —
-    and rejects the deployment before it can trade anything.
+    #150, the deployment-validation stage: a mode that is unknown, or that the
+    live path cannot execute on this broker and timeframe, is rejected with a
+    ``ValueError`` before the deployment exists — it is never created and then
+    refused signal by signal. Callers that only validate a stored deployment
+    (the daemon's load path) catch the error and log it.
 
-    An explicit ``signal_processor_config.trailing_mode`` override is left to
-    :func:`validate_live_deployment_trailing_override`: that check already
-    covers it, and building the processor for it would only repeat the work.
+    The mode reaches a deployment through one of two places and both are
+    checked here:
+
+    - an explicit ``signal_processor_config.trailing_mode`` override
+      (:func:`validate_live_deployment_trailing_override`), and
+    - the signal processor's own default, read from the processor the
+      deployment actually runs — the bot config merged with the deployment's
+      overrides, exactly as the daemon builds it. The mode is a setting of the
+      *bot* (``signal_bots/<bot>/config.yaml``) and the processor emits it with
+      every signal, which is where the issue's defect came from: a bot default
+      that live cannot execute used to be invisible until the first signal was
+      refused at runtime.
+
     A deployment without a signal processor, and a processor that declares no
     trailing mode at all (e.g. RocketFuel), pass untouched.
     """
+    validate_live_deployment_trailing_override(
+        deployment.signal_config,
+        context=context,
+        broker=broker,
+        timeframe=timeframe,
+    )
     processor_name = deployment.signal_processor_name
     if not processor_name:
         return
@@ -330,6 +343,15 @@ def validate_deployment_signal_processor_trailing_mode(
         f"{context}: its signal processor '{processor_name}' requests trailing "
         f"mode {normalize_trailing_mode(mode)!r}"
     )
+    if broker is ANY_BROKER:
+        # Same two stages as the override check: without a broker only a mode
+        # no live broker runs can be refused, and the timeframe is unknown.
+        validate_trailing_mode(
+            mode,
+            supported=LIVE_ANY_BROKER_TRAILING_MODES,
+            context=where,
+        )
+        return
     effective = validate_trailing_mode(
         mode,
         supported=live_supported_trailing_modes(broker),

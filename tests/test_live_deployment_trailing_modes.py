@@ -20,7 +20,7 @@ import pytest
 from live_runner import daemon
 from shared.database import LiveDeploymentModel
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
-from shared.trailing import validate_deployment_signal_processor_trailing_mode
+from shared.trailing import ANY_BROKER, validate_live_deployment_trailing_mode
 
 #: The complete ``supertrend_flip`` parameter set the RamJet processor emits.
 _FLIP_OVERRIDES = {
@@ -64,11 +64,11 @@ def _deployment(
 
 
 def _check(deployment: LiveDeploymentConfig, *, broker: str = "alpaca") -> None:
-    validate_deployment_signal_processor_trailing_mode(
+    validate_live_deployment_trailing_mode(
         deployment,
+        context="test",
         broker=broker,
         timeframe=deployment.timeframe,
-        context="test",
     )
 
 
@@ -237,13 +237,8 @@ def _stored_row(signal_config: dict, timeframe: str = "5m") -> LiveDeploymentMod
     )
 
 
-def test_stored_row_with_a_flip_bot_default_still_loads_and_logs_an_error(
-    monkeypatch,
-) -> None:
-    """A row written before this check existed must not make the list raise."""
-    _bot_defaulting_to(monkeypatch, **_FLIP_OVERRIDES)
-    row = _stored_row({"signal_processor": "ramjet"})
-    deployment = row.to_live_deployment()
+def _load_stored_row(monkeypatch, deployment: LiveDeploymentConfig) -> list[tuple]:
+    """Run the daemon's load path over one stored deployment; return its errors."""
     errors: list[tuple] = []
     monkeypatch.setattr(
         daemon,
@@ -258,8 +253,19 @@ def test_stored_row_with_a_flip_bot_default_still_loads_and_logs_an_error(
     monkeypatch.setattr(daemon, "list_live_deployments", lambda: [deployment])
 
     _accounts, loaded = asyncio.run(daemon._load_db_accounts_and_deployments())
-
     assert [str(item.id) for item in loaded] == [str(deployment.id)]
+    return errors
+
+
+def test_stored_row_with_a_flip_bot_default_still_loads_and_logs_an_error(
+    monkeypatch,
+) -> None:
+    """A row written before this check existed must not make the list raise."""
+    _bot_defaulting_to(monkeypatch, **_FLIP_OVERRIDES)
+    deployment = _stored_row({"signal_processor": "ramjet"}).to_live_deployment()
+
+    errors = _load_stored_row(monkeypatch, deployment)
+
     assert len(errors) == 1
     msg, args, _kwargs = errors[0]
     assert "unsupported trailing mode" in msg
@@ -267,21 +273,37 @@ def test_stored_row_with_a_flip_bot_default_still_loads_and_logs_an_error(
 
 
 def test_stored_row_with_a_working_bot_default_loads_quietly(monkeypatch) -> None:
-    row = _stored_row({"signal_processor": "ramjet"})
-    deployment = row.to_live_deployment()
+    deployment = _stored_row({"signal_processor": "ramjet"}).to_live_deployment()
+
+    assert _load_stored_row(monkeypatch, deployment) == []
+
+
+def test_a_stored_row_on_an_unknown_account_is_not_charged_to_any_broker(
+    monkeypatch,
+) -> None:
+    """The load path must not refuse more than the signal-time gates do: an
+    account the list cannot resolve degrades to the "any live broker" stage."""
+    _bot_defaulting_to(monkeypatch, trailing_mode="percent", trailing_percent=0.02)
+    deployment = _stored_row({"signal_processor": "ramjet"}).to_live_deployment()
     errors: list[tuple] = []
     monkeypatch.setattr(
         daemon,
         "logger",
         SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
     )
-    monkeypatch.setattr(
-        daemon,
-        "list_live_accounts",
-        lambda: [LiveAccountConfig(id="acct-1", broker="alpaca")],
-    )
+    monkeypatch.setattr(daemon, "list_live_accounts", lambda: [])
     monkeypatch.setattr(daemon, "list_live_deployments", lambda: [deployment])
 
     asyncio.run(daemon._load_db_accounts_and_deployments())
 
     assert errors == []
+
+
+def test_the_any_broker_stage_still_refuses_a_mode_no_broker_runs(monkeypatch) -> None:
+    _bot_defaulting_to(monkeypatch, **_FLIP_OVERRIDES)
+    deployment = _deployment({"signal_processor": "ramjet"})
+
+    with pytest.raises(ValueError, match="supertrend_flip"):
+        validate_live_deployment_trailing_mode(
+            deployment, context="test", broker=ANY_BROKER, timeframe="5m"
+        )
