@@ -71,7 +71,10 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
-from shared.trailing import validate_live_deployment_trailing_override
+from shared.trailing import (
+    validate_deployment_signal_processor_trailing_mode,
+    validate_live_deployment_trailing_override,
+)
 
 
 def _deployment_trailing_timeframe(deployment: Any) -> str:
@@ -4122,6 +4125,15 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             broker=account.broker,
             timeframe=_deployment_trailing_timeframe(deployment),
         )
+        # The mode can also come from the bot's own config default, which is
+        # where #150's defect came from: the processor emits it with every
+        # signal, so it is checked here too, before the deployment exists.
+        validate_deployment_signal_processor_trailing_mode(
+            deployment,
+            broker=account.broker,
+            timeframe=_deployment_trailing_timeframe(deployment),
+            context=f"live deployment '{deployment.strategy_name}'",
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
@@ -4506,11 +4518,20 @@ def update_live_deployment_account(
 
             # #150/#167 fail closed: the new account may sit on a broker that
             # cannot execute the deployment's trailing mode.
+            re_pointed = record.to_live_deployment()
             validate_live_deployment_trailing_override(
-                record.to_live_deployment().signal_config,
+                re_pointed.signal_config,
                 context=f"live deployment '{record.strategy_name}' re-point",
                 broker=account.broker,
-                timeframe=_deployment_trailing_timeframe(record.to_live_deployment()),
+                timeframe=_deployment_trailing_timeframe(re_pointed),
+            )
+            # A bot-config default is not visible in the deployment's own
+            # config, so it is checked against the new broker as well.
+            validate_deployment_signal_processor_trailing_mode(
+                re_pointed,
+                broker=account.broker,
+                timeframe=_deployment_trailing_timeframe(re_pointed),
+                context=f"live deployment '{record.strategy_name}' re-point",
             )
 
             current_status = str(record.status or "").strip().upper()

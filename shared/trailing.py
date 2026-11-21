@@ -27,8 +27,12 @@ TP1, so a TP1 *partial* exit needs a different entry order structure first
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, annotations only
+    from shared.models import LiveDeploymentConfig
 
 #: Metadata key a signal processor uses to request trailing-stop behaviour.
 TRAILING_SL_CONFIG_METADATA_KEY = "trailing_sl_config"
@@ -278,6 +282,65 @@ def validate_live_deployment_trailing_override(
             timeframe,
             supported_timeframes=live_trailing_timeframes(broker),
             context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
+        )
+
+
+def validate_deployment_signal_processor_trailing_mode(
+    deployment: "LiveDeploymentConfig",
+    *,
+    broker: Any = ANY_BROKER,
+    timeframe: Any = None,
+    context: str,
+) -> None:
+    """Validate the trailing mode a deployment's signal processor asks for.
+
+    #150 fail closed, deployment-validation stage. The trailing mode is a
+    setting of the *bot* (``signal_bots/<bot>/config.yaml``), which is where the
+    issue's defect came from: the processor emits the mode with every signal, so
+    a bot whose default asks for something the live path cannot execute used to
+    be invisible until the first signal was refused at runtime. This stage reads
+    that mode from the processor the deployment actually runs — the bot config
+    merged with the deployment's overrides, exactly as the daemon builds it —
+    and rejects the deployment before it can trade anything.
+
+    An explicit ``signal_processor_config.trailing_mode`` override is left to
+    :func:`validate_live_deployment_trailing_override`: that check already
+    covers it, and building the processor for it would only repeat the work.
+    A deployment without a signal processor, and a processor that declares no
+    trailing mode at all (e.g. RocketFuel), pass untouched.
+    """
+    processor_name = deployment.signal_processor_name
+    if not processor_name:
+        return
+    processor_config = deployment.signal_config.get("signal_processor_config")
+    if isinstance(processor_config, Mapping) and "trailing_mode" in processor_config:
+        return
+    if not isinstance(processor_config, Mapping):
+        processor_config = {}
+    # Imported here, not at module level: the signal processors import
+    # ``shared.trailing``, so a module-level import of the registry would be a
+    # cycle (shared.trailing -> signal_bots.registry -> shared.trailing).
+    from signal_bots.registry import get_signal_processor
+
+    processor = get_signal_processor(processor_name, dict(processor_config))
+    mode = getattr(processor, "trailing_mode", None)
+    if mode is None:
+        return
+    where = (
+        f"{context}: its signal processor '{processor_name}' requests trailing "
+        f"mode {normalize_trailing_mode(mode)!r}"
+    )
+    effective = validate_trailing_mode(
+        mode,
+        supported=live_supported_trailing_modes(broker),
+        context=where,
+    )
+    if timeframe is not None:
+        validate_live_trailing_timeframe(
+            effective,
+            timeframe,
+            supported_timeframes=live_trailing_timeframes(broker),
+            context=where,
         )
 
 

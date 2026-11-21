@@ -11,7 +11,10 @@ import yaml
 from live_runner.account_routing import validate_live_account_routes
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
-from shared.trailing import validate_live_deployment_trailing_override
+from shared.trailing import (
+    validate_deployment_signal_processor_trailing_mode,
+    validate_live_deployment_trailing_override,
+)
 
 
 def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
@@ -126,6 +129,14 @@ def parse_live_deployments_config(
             context=f"live deployment '{deployment.strategy_name}'",
             broker=account_brokers.get(deployment.account_id),
             timeframe=_signal_timeframe(deployment),
+        )
+        # The mode can also come from the bot's own config default (#150): the
+        # processor emits it with every signal, so it is checked here too.
+        validate_deployment_signal_processor_trailing_mode(
+            deployment,
+            broker=account_brokers.get(deployment.account_id),
+            timeframe=_signal_timeframe(deployment),
+            context=f"live deployment '{deployment.strategy_name}'",
         )
         if deployment.account_id not in account_ids:
             logger.warning(

@@ -211,6 +211,23 @@ class LiveDeploymentConfig(BaseModel):
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def signal_processor_name(self) -> str:
+        """Registered signal-processor id of this deployment, ``""`` when none.
+
+        One definition, on the model: the daemon's signal-processor gate, the
+        deployment-validation stages (``create_live_deployment``, the YAML
+        parser) and the promotion gate all resolve the id from the same place,
+        so a deployment whose processor cannot be found or whose processor
+        asks for a trailing mode its broker cannot execute (#150) is caught in
+        every one of them instead of only in some.
+        """
+        configured = self.signal_config or {}
+        settings = self.settings or {}
+        return str(
+            configured.get("signal_processor") or settings.get("signal_processor") or ""
+        ).strip().lower()
+
     @model_validator(mode="after")
     def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
         # Issue #150 fail closed, first stage: only the account id is known

@@ -126,6 +126,7 @@ from shared.models import (
 from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
     TRAILING_SL_CONFIG_METADATA_KEY,
+    validate_deployment_signal_processor_trailing_mode,
     validate_live_deployment_trailing_override,
     validate_trailing_sl_config,
 )
@@ -4787,17 +4788,39 @@ async def _load_db_accounts_and_deployments(
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
     # #150: a stored deployment whose trailing override live cannot run is still
     # loaded (so it stays listed, stoppable and enforceable), but every signal
-    # it produces is refused by the live gates. Say so loudly at load time.
+    # it produces is refused by the live gates. Say so loudly at load time. The
+    # same holds for a mode that only comes from the bot's own config default:
+    # it is not visible in the deployment's config, so the processor that would
+    # emit it is built here and asked (its config file is a few KB).
+    account_brokers = {account.id: account.broker for account in accounts}
     for deployment in deployments:
         try:
             validate_live_deployment_trailing_override(
                 deployment.signal_config,
                 context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
             )
+            validate_deployment_signal_processor_trailing_mode(
+                deployment,
+                broker=account_brokers.get(deployment.account_id),
+                timeframe=_deployment_signal_timeframe(deployment),
+                context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+            )
         except ValueError as exc:
             logger.error(
                 "Stored live deployment has an unsupported trailing mode; its entry "
                 "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
+        except Exception as exc:
+            # The processor could not be built at all (unregistered id, a bot
+            # config that no longer loads). That is a configuration error too,
+            # and it must not cost the whole deployment list its sync tick: the
+            # signal-time gates still refuse every signal this deployment makes.
+            logger.error(
+                "Stored live deployment's signal processor could not be checked for a "
+                "trailing mode live cannot execute; its entry signals will be "
+                "refused: %s",
                 exc,
                 extra={"data": {"deployment_id": str(deployment.id)}},
             )
