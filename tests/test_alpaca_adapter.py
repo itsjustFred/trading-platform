@@ -1001,7 +1001,9 @@ def test_a_full_held_leg_page_pages_back_to_the_parent() -> None:
     The listing is newest-first, so the filled parent that owns a resting leg can sit
     behind a page of terminal orders - an account trading one bracket a day fills a
     500-row page within two years. The sweep pages back until a page comes back not
-    full, and a full page must not be read as "no parent".
+    full, and a full page must not be read as "no parent". The second page here returns
+    the boundary row again, as a cursor past the oldest row produces, and the book must
+    still hold each order once.
     """
     client = _BracketPositionClient(positions=[_FakePosition("AAPL", 10.0)])
     newest = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
@@ -1025,8 +1027,9 @@ def test_a_full_held_leg_page_pages_back_to_the_parent() -> None:
         client.order_filters.append(filter)
         pages["requests"] += 1
         if pages["requests"] > 1:
-            # Second page: the end of the history, the filled bracket parent on it.
-            return [client.parent]
+            # Second page: the end of the history, the filled bracket parent on it - and
+            # the boundary row again, as a cursor past it produces.
+            return [page_one[-1], client.parent]
         return page_one
 
     client.get_orders = _two_pages  # type: ignore[method-assign]
@@ -1034,9 +1037,12 @@ def test_a_full_held_leg_page_pages_back_to_the_parent() -> None:
     stops = asyncio.run(_adapter(client).list_protective_stops())
 
     assert [stop.order_id for stop in stops] == ["sl-leg"]
-    # It asked for a second page, bounded by the oldest order of the first.
+    # It asked for a second page, and the cursor is past the oldest row of the first -
+    # never short of it, where the parent we want could be the one order skipped.
     assert pages["requests"] == 2
-    assert _status_all_requests(client)[-1].until is not None
+    assert _status_all_requests(client)[-1].until == (
+        page_one[-1].submitted_at + timedelta(microseconds=1)
+    )
 
     outcome = asyncio.run(_adapter(client).close_all_positions())
 

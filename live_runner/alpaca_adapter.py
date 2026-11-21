@@ -250,13 +250,16 @@ def _stop_candidates(order: Any) -> Iterator[Any]:
             yield leg
 
 
-def _oldest_submitted_at(orders: list[Any]) -> datetime | None:
-    """The newest-first listing's oldest timestamp, one second earlier - or None.
+def _page_back_cursor(orders: list[Any]) -> datetime | None:
+    """The ``until`` that asks for the page before a newest-first listing's oldest row.
 
-    The second is a margin, so orders sharing that timestamp are not cut off by the
-    next page's ``until``: a row that comes back twice is deduplicated by id, a row
-    that is skipped is not recoverable. None when a row carries no readable
-    timestamp, which leaves the caller unable to page back.
+    The cursor goes *past* that timestamp by a microsecond, never before it: ``until``
+    bounds the window at the old end, so a cursor short of the oldest row would omit the
+    orders submitted in the gap, and the filled parent that owns the resting leg can be
+    one of them. A microsecond past it instead asks for the same rows again under every
+    inclusive/exclusive reading, and a row that comes back twice is deduplicated by id -
+    unlike a row that was skipped, which cannot be recovered. None when a row carries no
+    readable timestamp, which leaves the caller unable to page back.
     """
     oldest: datetime | None = None
     for order in orders:
@@ -266,7 +269,7 @@ def _oldest_submitted_at(orders: list[Any]) -> datetime | None:
                 stamp = stamp.replace(tzinfo=timezone.utc)
             if oldest is None or stamp < oldest:
                 oldest = stamp
-    return oldest - timedelta(seconds=1) if oldest is not None else None
+    return oldest + timedelta(microseconds=1) if oldest is not None else None
 
 
 def _protective_stop_of(
@@ -2592,7 +2595,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 collected[row_key or f"row-{len(collected)}"] = order
             if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
                 return self._parents_with_resting_legs(collected.values())
-            until = _oldest_submitted_at(result)
+            until = _page_back_cursor(result)
             if until is None:
                 raise RuntimeError(
                     "Alpaca's order rows carry no submitted timestamp, so the next page "
