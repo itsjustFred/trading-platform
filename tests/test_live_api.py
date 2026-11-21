@@ -487,6 +487,14 @@ def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatc
         "broker_order_id": "BRK-AAA",
         "conflicting_broker_order_ids": ["BRK-BBB"],
     }
+    conflicted_but_active = LiveDeploymentConfig(
+        id="77777777-7777-7777-7777-777777777777",
+        strategy_name="about_to_halt",
+        account_id="acct-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+    )
     monkeypatch.setattr(
         viewer_main_module,
         "list_live_deployments",
@@ -497,12 +505,15 @@ def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatc
             symbols=["AAPL"],
             timeframe="1h",
             status="ACTIVE",
-        )],
+        ), conflicted_but_active],
     )
     monkeypatch.setattr(
         viewer_main_module,
         "deployments_with_broker_order_conflicts",
-        lambda: {str(deployment.id): [conflict]},
+        lambda: {
+            str(deployment.id): [conflict],
+            str(conflicted_but_active.id): [conflict],
+        },
     )
 
     client = TestClient(viewer_main_module.app)
@@ -511,10 +522,13 @@ def test_live_deployments_reports_a_conflict_that_halted_a_deployment(monkeypatc
     halted = payload[0]
     assert halted["broker_order_conflicts"] == [conflict]
     assert halted["halted_for_broker_order_conflict"] is True
-    # A deployment with no conflict is not reported as halted for one, and a conflict
-    # alone does not imply a halt: an ACTIVE one is a conflict about to be halted.
+    # A deployment with no conflict is not reported as halted for one...
     assert payload[1]["broker_order_conflicts"] == []
     assert payload[1]["halted_for_broker_order_conflict"] is False
+    # ...and a conflict alone does not imply a halt: a still-ACTIVE deployment carrying
+    # one is a conflict the halt is about to land on, and saying otherwise would hide it.
+    assert payload[2]["broker_order_conflicts"] == [conflict]
+    assert payload[2]["halted_for_broker_order_conflict"] is False
 
 
 def test_live_dashboard_reports_broker_order_conflicts(monkeypatch):

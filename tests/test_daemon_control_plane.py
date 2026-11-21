@@ -757,6 +757,36 @@ def test_stamp_is_refused_while_a_live_submission_lease_exists(isolated_db_sandb
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
 
 
+def test_a_paused_deployment_takes_a_claim_only_for_an_exit(isolated_db_sandbox) -> None:
+    """#126 decision at the one gate the daemon cannot re-check afterwards.
+
+    The claim is the atomic status decision taken immediately before the broker call,
+    so an exit on a PAUSED deployment has to pass it or the widened dispatch statuses
+    would be undone at the last moment - and an entry must not pass it at all.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-entry") is False
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-exit", allow_paused=True
+    ) is True
+
+    # The lease is still single: an exit may not take a second one while it works, or
+    # two orders could reach the broker for one position.
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-exit-2", allow_paused=True
+    ) is False
+    assert database.release_live_deployment_submission("tok-exit") is True
+
+    # A STOPPED deployment is closed by the sweeps, so the widen applies to no status.
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-stopped", allow_paused=True
+    ) is False
+
+
 def test_stamp_is_refused_while_an_expired_but_unreleased_lease_exists(
     isolated_db_sandbox,
 ) -> None:

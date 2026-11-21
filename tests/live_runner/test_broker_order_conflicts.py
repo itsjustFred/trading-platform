@@ -57,6 +57,15 @@ def conflict(isolated_db) -> str:
     return DEPLOYMENT_ID
 
 
+@pytest.fixture
+def active_deployment(isolated_db) -> str:
+    """One deployment of the account, seeded ACTIVE so a conflict can halt it."""
+    database, _engine, _data_dir = isolated_db
+    seed_live_deployments(database, [DEPLOYMENT_ID])
+    update_live_deployment_status(DEPLOYMENT_ID, "ACTIVE")
+    return DEPLOYMENT_ID
+
+
 def test_check_reports_the_conflict_as_unhealthy(conflict) -> None:
     health = check_broker_order_conflicts()
 
@@ -165,6 +174,37 @@ def test_resolve_clears_the_recordings_so_the_halt_can_be_lifted(
     assert enforce_broker_order_conflict_halts() == []
     assert get_live_deployment(DEPLOYMENT_ID).status == "ACTIVE"
     assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_resolve_clears_every_conflict_of_the_deployment(active_deployment) -> None:
+    """A partial clear would still halt the deployment, and would not say why."""
+    from live_runner.broker_order_conflicts import resolve_broker_order_conflicts
+
+    save_live_signal(
+        _signal(discord_message_id="ord-two-1", broker_order_id="BRK-AAA")
+    )
+    save_live_signal(
+        _signal(discord_message_id="ord-two-1", broker_order_id="BRK-BBB")
+    )
+    save_live_signal(
+        _signal(discord_message_id="ord-two-2", broker_order_id="BRK-CCC")
+    )
+    save_live_signal(
+        _signal(discord_message_id="ord-two-2", broker_order_id="BRK-DDD")
+    )
+    assert len(check_broker_order_conflicts()["conflicts"]) == 2
+
+    cleared = resolve_broker_order_conflicts(DEPLOYMENT_ID)
+
+    assert sorted(row["conflicting_broker_order_ids"][0] for row in cleared) == [
+        "BRK-BBB",
+        "BRK-DDD",
+    ]
+    assert check_broker_order_conflicts() == {
+        "status": "ok",
+        "deployment_ids": [],
+        "conflicts": [],
+    }
 
 
 def test_resolve_reports_nothing_when_there_is_no_conflict(isolated_db) -> None:
