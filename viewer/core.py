@@ -1441,34 +1441,49 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         else None
     )
 
+    # A figure the producer named in `undefined_metrics` is unmeasured, not a
+    # measured zero: publish null so the client renders "—" (#256, the same
+    # rule #238 applied to the list payload). When trades exist the closed-trade
+    # sum is itself the measurement, so it stays a number even if the persisted
+    # endpoint figures were unmeasurable.
+    total_pnl_value = _defined_stat_value(raw, "total_pnl")
+    if result.trades:
+        net_profit = round(net_total, 2)
+        pnl_base = net_total
+    else:
+        net_profit = (
+            round(total_pnl_value, 2) if total_pnl_value is not None else None
+        )
+        pnl_base = total_pnl_value
+    initial_capital = result.meta.initial_capital or 100000
+
     # Persisted runner stats carry total_return as a FRACTION (the engine
     # definition is E_end / E_start - 1, see runner/stats.py) and
     # frontend/src/api/metricScale.ts declares it a "fraction" for this payload,
-    # so it is passed through unscaled. Fall back to the net figure when the
-    # engine did not record it.
-    total_return_fraction = _safe_float(raw.get("total_return"), float("nan"))
-    if not math.isfinite(total_return_fraction):
+    # so it is passed through unscaled. The net-figure fallback exists only for
+    # artifacts that never recorded the key: a `total_return` the producer
+    # declared undefined stays null rather than becoming a computed guess.
+    undefined_metrics = raw.get("undefined_metrics")
+    total_return_unmeasured = isinstance(
+        undefined_metrics, (list, tuple, set)
+    ) and "total_return" in undefined_metrics
+    total_return_measured = _safe_float(raw.get("total_return"), float("nan"))
+    if total_return_unmeasured:
+        total_return_fraction = None
+    elif math.isfinite(total_return_measured):
+        total_return_fraction = total_return_measured
+    else:
         total_return_fraction = (
-            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
-            / (result.meta.initial_capital or 100000)
+            pnl_base / initial_capital if pnl_base is not None else None
         )
 
     cagr_value = _defined_stat_value(raw, "cagr")
     stats = {
-        # Same rule as `avg_trade_pnl` below: a no-trade run's net profit comes
-        # from the persisted `total_pnl`, which is null when the curve's
-        # terminating point is unreadable (ruined) - `raw.get` would copy a NaN
-        # or a null straight into a payload the JSON response cannot render.
-        "net_profit": (
-            round(net_total, 2)
-            if result.trades
-            else _safe_float(raw.get("total_pnl"), 0.0)
-        ),
-        "net_profit_pct": round(
-            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
-            / (result.meta.initial_capital or 100000)
-            * 100,
-            2,
+        "net_profit": net_profit,
+        "net_profit_pct": (
+            round(pnl_base / initial_capital * 100, 2)
+            if pnl_base is not None
+            else None
         ),
         # Risk-adjusted ratios are named in `undefined_metrics` when the return
         # series was too short to compute them. `raw.get(key, 0)` published that
@@ -1477,10 +1492,12 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "sortino": _defined_stat_value(raw, "sortino_ratio"),
         "calmar": _defined_stat_value(raw, "calmar_ratio"),
         # A non-finite/undefined drawdown (a ruined run whose terminating equity
-        # point is unreadable or NaN, see runner/stats.py) must not reach the
-        # response as NaN: `JSONResponse` refuses it, so the page would 500 one
-        # field after the fix. It resolves to 0.0 like the other absent figures.
-        "max_drawdown_pct": round(_safe_float(raw.get("max_drawdown_pct"), 0.0) * 100, 2),
+        # point is unreadable or NaN, see runner/stats.py) is unmeasured, so it
+        # publishes null rather than a 0.0 the page would grade as flat. It must
+        # not reach the response as NaN either: `JSONResponse` refuses it.
+        "max_drawdown_pct": _defined_stat_value(
+            raw, "max_drawdown_pct", scale=100.0, digits=2
+        ),
         "win_rate": round(
             (win_rate if net_pnls else _safe_float(raw.get("win_rate"), 0.0)) * 100,
             1,
@@ -1491,17 +1508,25 @@ def _stats_payload_from_result(result: BacktestResult) -> dict:
         "losers": losers if net_pnls else raw.get("losers", 0),
         "avg_winner": round(avg_winner, 2) if net_pnls else raw.get("avg_winner", 0),
         "avg_loser": round(avg_loser, 2) if net_pnls else raw.get("avg_loser", 0),
-        "avg_trade_pnl": round(
-            (net_total if result.trades else _safe_float(raw.get("total_pnl"), 0.0))
-            / max(len(net_pnls) if net_pnls else raw.get("total_trades", 1), 1),
-            2,
+        "avg_trade_pnl": (
+            round(
+                pnl_base
+                / max(len(net_pnls) if net_pnls else raw.get("total_trades", 1), 1),
+                2,
+            )
+            if pnl_base is not None
+            else None
         ),
         "avg_bars_held": raw.get("avg_holding_bars", 0),
         "max_consecutive_losses": raw.get("max_consecutive_losses", 0),
         "best_trade": best_trade,
         "worst_trade": worst_trade,
         "cagr": round(cagr_value * 100, 2) if cagr_value is not None else None,
-        "total_return": round(total_return_fraction, 6),
+        "total_return": (
+            round(total_return_fraction, 6)
+            if total_return_fraction is not None
+            else None
+        ),
         "expectancy": 0,  # computed below
     }
     # Expectancy

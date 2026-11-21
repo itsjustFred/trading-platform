@@ -503,19 +503,22 @@ export interface OptimizationDetail {
 }
 
 export interface BacktestStats {
-  net_profit: number;
-  net_profit_pct: number;
+  // null when the producer could not measure the figure (named in the stats'
+  // undefined_metrics); the card renders an em dash instead of a measured 0.
+  net_profit: number | null;
+  net_profit_pct: number | null;
   // null when the return series was too short to compute the metric; the card
   // renders an em dash instead of grading it.
   cagr: number | null;
   sharpe: number | null;
   sortino: number | null;
-  max_drawdown_pct: number;
+  max_drawdown_pct: number | null;
   max_drawdown_duration: string;
   win_rate: number;
   profit_factor: number;
   total_trades: number;
-  avg_trade_pnl: number;
+  avg_trade_pnl: number | null;
+  total_return: number | null;
   avg_win: number;
   avg_loss: number;
   best_trade: number;

@@ -5062,7 +5062,10 @@ def _scalar_stats_for_save(
         # it is logged because a malformed number is a producer bug, not an absence.
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer outside float64 range (10**400) is
+            # stored JSON that cannot be read as a stat. Same rule as NaN:
+            # absence, so the stored column carries forward (#256).
             number = math.nan
         if math.isfinite(number):
             resolved[name] = number
@@ -5399,7 +5402,9 @@ def _stat_number_or_undefined(
         return None
     try:
         numeric = float(resolved)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a corrupt artifact can carry a JSON integer outside
+        # float64 range (10**400); that is unreadable, not a measurement (#256).
         return None
     return numeric if math.isfinite(numeric) else None
 
