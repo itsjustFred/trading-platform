@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -36,6 +36,7 @@ class _FakeOrder:
     stop_price: float | None = None
     status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
+    submitted_at: datetime | None = None
 
 
 @dataclass
@@ -236,14 +237,26 @@ class _BracketPositionClient(_FakeTradingClient):
 
 
 class _FullHeldLegPageClient(_FakeTradingClient):
-    """A newest-first page cut off before the parent that owns the held leg."""
+    """A history that never runs out: every page comes back full."""
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
         status = str(getattr(getattr(filter, "status", None), "value", "open")).lower()
         if status == "open":
             return list(self.orders)
+        self.order_filters.append(filter)
+        cursor = getattr(filter, "until", None) or datetime(
+            2026, 11, 20, 21, 0, tzinfo=timezone.utc
+        )
+        if cursor.tzinfo is None:
+            cursor = cursor.replace(tzinfo=timezone.utc)
         return [
-            _FakeOrder(f"old-{index}", "AAPL", "buy", status="filled")
+            _FakeOrder(
+                f"old-{index}",
+                "AAPL",
+                "buy",
+                status="filled",
+                submitted_at=cursor - timedelta(seconds=index + 1),
+            )
             for index in range(_ALPACA_HELD_LEG_LOOKUP_LIMIT)
         ]
 
@@ -670,6 +683,44 @@ def test_close_all_positions_reports_a_partial_flatten() -> None:
     assert "AAPL" in outcome.failed
 
 
+def test_a_flat_position_is_not_given_a_stop() -> None:
+    """A restored stop on a flat position is the orphan the sweeps remove.
+
+    The stop that was cancelled to unblock a close can have been the thing that closed
+    the position. Submitting it again then creates a sell-stop with no position behind
+    it, and when it triggers it opens a short.
+    """
+    client = _FakeTradingClient(orders=[], positions=[])
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._restore_stop(client, "AAPL", 10.0, "sell", 190.0)) is True
+    assert client.submitted == []
+
+
+def test_a_stop_that_fills_during_the_flatten_leaves_no_second_stop() -> None:
+    """The same guard, on the flatten's own path: the leg fills as it is cancelled."""
+    client = _BracketPositionClient(
+        positions=[_FakePosition("AAPL", 10.0)],
+        take_profit_filled=True,
+        close_error=RuntimeError("broker refused to close"),
+    )
+    real_cancel = client.cancel_order_by_id
+
+    def _fill_the_stop(order_id: str) -> None:
+        real_cancel(order_id)
+        # The leg filled instead of resting, so the position it protected is gone.
+        client.positions = []
+
+    client.cancel_order_by_id = _fill_the_stop  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    assert outcome.failed == ("AAPL:close:broker refused to close",)
+    assert not any("NO-STOP-RESTORED" in item for item in outcome.failed)
+    assert client.submitted == []
+
+
 def test_cancel_orphaned_protections_only_touches_flat_symbols() -> None:
     client = _FakeTradingClient(
         orders=[
@@ -883,7 +934,7 @@ def test_the_excusal_fails_closed_on_an_unreadable_book() -> None:
 
 
 def test_flatten_refuses_a_full_held_leg_page() -> None:
-    """A full page may have cut off the filled parent that owns the held leg."""
+    """A history longer than the page budget cannot be vouched for."""
     client = _FullHeldLegPageClient(positions=[_FakePosition("AAPL", 10.0)])
 
     with pytest.raises(RuntimeError, match="refusing to treat the list as complete"):
@@ -910,8 +961,10 @@ def test_cancel_orphaned_protections_cancels_a_held_stop_leg() -> None:
     held_leg_requests = _status_all_requests(client)
     assert held_leg_requests, "the held stop leg must come from a status=all listing"
     assert held_leg_requests[0].nested is True
-    # Flat symbols are the target, so the lookup cannot be scoped to a position.
-    assert not held_leg_requests[0].symbols
+    # Scoped to the symbol the open listing names: a bracket's legs rest and die
+    # together, so the take profit that ``status=open`` shows is the sibling every
+    # held stop leg has. No account-wide history scan on a mature account.
+    assert [str(symbol) for symbol in held_leg_requests[0].symbols] == ["AAPL"]
 
 
 def test_cancel_orphaned_protections_leaves_a_held_stop_leg_of_a_live_position() -> None:
@@ -929,11 +982,62 @@ def test_cancel_orphaned_protections_leaves_a_held_stop_leg_of_a_live_position()
 
 
 def test_cancel_orphaned_protections_refuses_a_full_held_leg_page() -> None:
-    """A full page may have cut off the filled parent that owns the held leg."""
-    client = _FullHeldLegPageClient(positions=[])
+    """A history longer than the page budget cannot be vouched for."""
+    client = _FullHeldLegPageClient(
+        positions=[], orders=[_FakeOrder("tp-open", "AAPL", "sell", order_type="limit")]
+    )
 
     with pytest.raises(RuntimeError, match="refusing to treat the list as complete"):
         asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+
+def test_a_full_held_leg_page_pages_back_to_the_parent() -> None:
+    """A full page is a mature account, not a truncated listing.
+
+    The listing is newest-first, so the filled parent that owns a resting leg can sit
+    behind a page of terminal orders - an account trading one bracket a day fills a
+    500-row page within two years. The sweep pages back until a page comes back not
+    full, and a full page must not be read as "no parent".
+    """
+    client = _BracketPositionClient(positions=[_FakePosition("AAPL", 10.0)])
+    newest = datetime(2026, 11, 20, 21, 0, tzinfo=timezone.utc)
+    page_one = [
+        _FakeOrder(
+            f"old-{index}",
+            "AAPL",
+            "buy",
+            status="filled",
+            submitted_at=newest - timedelta(seconds=index + 1),
+        )
+        for index in range(_ALPACA_HELD_LEG_LOOKUP_LIMIT)
+    ]
+    real_get = client.get_orders
+    pages = {"requests": 0}
+
+    def _two_pages(filter=None):  # noqa: A002 - mirrors alpaca-py
+        status = str(getattr(getattr(filter, "status", None), "value", "open")).lower()
+        if status == "open":
+            return real_get(filter)
+        client.order_filters.append(filter)
+        pages["requests"] += 1
+        if pages["requests"] > 1:
+            # Second page: the end of the history, the filled bracket parent on it.
+            return [client.parent]
+        return page_one
+
+    client.get_orders = _two_pages  # type: ignore[method-assign]
+
+    stops = asyncio.run(_adapter(client).list_protective_stops())
+
+    assert [stop.order_id for stop in stops] == ["sl-leg"]
+    # It asked for a second page, bounded by the oldest order of the first.
+    assert pages["requests"] == 2
+    assert _status_all_requests(client)[-1].until is not None
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert client.cancelled == ["tp-leg", "sl-leg"]
 
 
 def test_exit_only_qty_is_capped_to_the_broker_position(monkeypatch) -> None:

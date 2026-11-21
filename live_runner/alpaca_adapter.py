@@ -71,6 +71,12 @@ _TP_METADATA_KEYS = ("take_profit", "tp_price")
 #: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
 _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
 
+#: Pages of ``_ALPACA_HELD_LEG_LOOKUP_LIMIT`` newest orders scanned back when a held-leg page
+#: comes back full. A full page means the account's history reaches further back than one
+#: page, not that the page was cut off (an account trading one bracket a day fills a page in
+#: under two years); the budget is what stops a sweep from paging forever.
+_ALPACA_HELD_LEG_PAGE_LIMIT = 20
+
 #: States in which a bracket leg still rests at the broker: ``held`` is the OCO-inactive
 #: leg of a filled parent, ``pending_cancel`` one whose cancel has not settled yet and may
 #: still fill (#198). A leg whose cancel has settled says so in the listing.
@@ -242,6 +248,25 @@ def _stop_candidates(order: Any) -> Iterator[Any]:
     for leg in _order_legs(order):
         if _order_status(leg) == "held":
             yield leg
+
+
+def _oldest_submitted_at(orders: list[Any]) -> datetime | None:
+    """The newest-first listing's oldest timestamp, one second earlier - or None.
+
+    The second is a margin, so orders sharing that timestamp are not cut off by the
+    next page's ``until``: a row that comes back twice is deduplicated by id, a row
+    that is skipped is not recoverable. None when a row carries no readable
+    timestamp, which leaves the caller unable to page back.
+    """
+    oldest: datetime | None = None
+    for order in orders:
+        stamp = _order_attr(order, "submitted_at", None)
+        if isinstance(stamp, datetime):
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if oldest is None or stamp < oldest:
+                oldest = stamp
+    return oldest - timedelta(seconds=1) if oldest is not None else None
 
 
 def _protective_stop_of(
@@ -2137,6 +2162,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     return True
         return False
 
+    async def _position_is_flat(self, symbol: str) -> bool:
+        """Whether the broker reports no open quantity on *symbol* right now.
+
+        Only a *readable, zero* quantity counts as flat. A listing or a row that
+        cannot be read says "unknown", which answers False: the restore then keeps
+        its old behaviour rather than skipping on evidence it does not have.
+        """
+        try:
+            positions = await self.get_positions()
+        except Exception:  # pragma: no cover - defensive
+            return False
+        for position in positions:
+            if str(position.get("symbol") or "").strip().upper() != symbol:
+                continue
+            if position.get("qty_unparseable"):
+                return False
+            return _is_flat(_position_qty(position))
+        return True
+
     async def _restore_stop(
         self,
         client: Any,
@@ -2153,9 +2197,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         logged at CRITICAL because it means live unprotected exposure.
 
         Returns whether the position is protected afterwards, which is also true
-        when a stop still works at the broker. Re-submitting in that case would
-        leave two stops on one position, and the second becomes an orphan the
-        moment the first fills - an orphaned sell-stop opens a short.
+        when a stop still works at the broker or the position is already flat.
+        Re-submitting next to a working stop would leave two stops on one
+        position, and the second becomes an orphan the moment the first fills -
+        an orphaned sell-stop opens a short.
         """
         try:
             working = await self._list_working_book(client, symbols={symbol})
@@ -2169,6 +2214,17 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             logger.warning(
                 "Not restoring a stop: one still works at the broker",
                 extra={"data": {"symbol": symbol}},
+            )
+            return True
+        # The position may already be flat: the stop that was cancelled to unblock the
+        # close can have been the thing that closed it (a cancel accepted and then the
+        # stop filling, or a race with the fill). Restoring a stop onto a flat position
+        # then creates the orphan this file's sweeps exist to remove - a triggered
+        # sell-stop with nothing to sell opens a short.
+        if await self._position_is_flat(symbol):
+            logger.warning(
+                "Not restoring a stop: the broker reports the position flat",
+                extra={"data": {"symbol": symbol, "qty": qty}},
             )
             return True
         if stop_price is None:
@@ -2398,14 +2454,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         (#245): it is absent from every ``status=open`` listing, so a sweep that
         only read those would leave exactly the leg that can still trigger - and
         a triggered sell-stop with nothing to sell opens a short.
+
+        The legs are looked up for the symbols the open listing itself names
+        (``_resting_leg_symbols``), not account-wide: a bracket's legs rest and die
+        together, so a ``held`` stop leg is always a sibling of a leg that *is*
+        listed. That keeps the sweep off the account's whole order history, which on a
+        mature account would fill a 500-row page every time.
         """
         client = await self._require_trading_client()
-        orders = await self._list_working_book(client)
+        open_orders = await self._list_open_orders(client)
+        leg_symbols = self._resting_leg_symbols(open_orders)
         open_symbols = {
             str(position.get("symbol") or "").strip().upper()
             for position in await self.get_positions()
             if not _is_flat(_position_qty(position))
         }
+        orders = self._merge_held_legs(
+            open_orders,
+            await self._list_resting_legs(client, symbols=leg_symbols),
+        )
         completed = 0
         unidentified: list[str] = []
         failed: list[str] = []
@@ -2422,7 +2489,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # The broker's OCO may already have removed this leg with the
                 # sibling just cancelled; a refusal for an order that is no
                 # longer resting is not a failure the daemon must retry forever.
-                if await self._cancel_already_gone(client, order_id):
+                if await self._cancel_already_gone(
+                    client, order_id, symbols=leg_symbols
+                ):
                     continue
                 failed.append(f"{order_id}:{exc}")
                 continue
@@ -2475,55 +2544,78 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return list(stops.values())
 
     async def _list_filled_parents_with_held_legs(
-        self, client: Any, symbols: set[str] | None
+        self, client: Any, symbols: set[str]
     ) -> list[Any]:
         """Filled bracket parents that still have a bracket leg resting at the broker.
 
         Observed on Alpaca paper (2026-11-16): once a bracket entry fills, the stop leg
         stays ``held`` and is absent from every ``status=open`` listing, nested or flat.
         It is only reachable as a leg of the filled parent in a ``status=all`` listing,
-        and it can be replaced like any working stop. ``symbols`` restricts the lookup
-        to those symbols (the positions being acted on); ``None`` looks account-wide,
-        which is what the orphan sweep needs - its whole job is symbols that no longer
-        have a position. A failure to list is not swallowed: a missing stop would be
-        reported as "no stop" for a position that does have one.
+        and it can be replaced like any working stop. The lookup is always scoped to
+        ``symbols`` - the positions being acted on, or the symbols a sweep has to look
+        at - so no caller can turn it into a scan of the account's whole order history.
+
+        The listing is newest-first and capped at 500 rows, so one call is only the
+        newest 500 orders of the account's whole history - a mature account fills that
+        page with terminal orders. A full page therefore pages back over the history
+        until a page comes back not full (the end of the history) rather than failing:
+        an account that trades a bracket per day reaches 500 orders within a few months,
+        and a flatten that then failed would leave the position open. Only a history
+        longer than the page budget fails, because the pages past it hold orders this
+        lookup cannot vouch for. A failure to list is not swallowed either way: a
+        missing stop would be reported as "no stop" for a position that does have one.
         """
         get_orders = getattr(client, "get_orders", None)
-        if not callable(get_orders):
-            return []
-        if symbols is not None and not symbols:
+        if not symbols or not callable(get_orders):
             return []
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.trading.requests import GetOrdersRequest
 
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            symbols=sorted(symbols) if symbols is not None else None,
-            nested=True,
-            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+        collected: dict[str, Any] = {}
+        until: datetime | None = None
+        for _ in range(_ALPACA_HELD_LEG_PAGE_LIMIT):
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                symbols=sorted(symbols),
+                nested=True,
+                limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+                until=until,
+            )
+            result = await asyncio.to_thread(get_orders, filter=request)
+            if not isinstance(result, (list, tuple)):
+                raise RuntimeError(
+                    f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                    "refusing to report a clean sweep"
+                )
+            for order in result:
+                row_key = _control_order_id(_order_attr(order, "id"))
+                collected[row_key or f"row-{len(collected)}"] = order
+            if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+                return self._parents_with_resting_legs(collected.values())
+            until = _oldest_submitted_at(result)
+            if until is None:
+                raise RuntimeError(
+                    "Alpaca's order rows carry no submitted timestamp, so the next page "
+                    "cannot be asked for; refusing to treat the list as complete"
+                )
+        raise RuntimeError(
+            f"Alpaca's order history is longer than "
+            f"{_ALPACA_HELD_LEG_PAGE_LIMIT * _ALPACA_HELD_LEG_LOOKUP_LIMIT} orders; "
+            "refusing to treat the list as complete"
         )
-        result = await asyncio.to_thread(get_orders, filter=request)
-        if not isinstance(result, (list, tuple)):
-            raise RuntimeError(
-                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
-                "refusing to report a clean sweep"
-            )
-        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
-            # The listing is newest-first: a full page may have cut off the filled parent
-            # that owns the held stop leg, and "no stop" would then be a lie.
-            raise RuntimeError(
-                f"Alpaca returned {len(result)} orders, the page limit; "
-                "refusing to treat the list as complete"
-            )
+
+    @staticmethod
+    def _parents_with_resting_legs(orders: Any) -> list[Any]:
+        """Filled bracket parents that still have a bracket leg resting at the broker."""
         return [
             order
-            for order in result
+            for order in orders
             if _order_status(order) == "filled"
             and any(_order_status(leg) in _RESTING_LEG_STATUSES for leg in _order_legs(order))
         ]
 
     async def _list_resting_legs(
-        self, client: Any, *, symbols: set[str] | None = None
+        self, client: Any, *, symbols: set[str]
     ) -> list[Any]:
         """The bracket legs themselves, the ones no ``status=open`` listing shows (#245).
 
@@ -2541,7 +2633,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
 
     async def _list_working_book(
-        self, client: Any, *, symbols: set[str] | None = None
+        self, client: Any, *, symbols: set[str]
     ) -> list[Any]:
         """Every order still resting at the broker, or a hard failure - never a partial book.
 
@@ -2549,9 +2641,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ``held`` and is absent from every open listing, so a sweep built on it alone
         cannot see the leg - the one order that can still trigger on the position. That
         is the probe's ``orders-still-working``/``NO-STOP-RESTORED`` result: ``held``
-        legs of filled parents are added here, scoped to ``symbols`` when given.
+        legs of filled parents are added here, for the ``symbols`` the caller asks for.
         """
         orders = await self._list_open_orders(client)
+        legs = await self._list_resting_legs(client, symbols=symbols)
+        return self._merge_held_legs(orders, legs)
+
+    @staticmethod
+    def _merge_held_legs(open_orders: list[Any], legs: list[Any]) -> list[Any]:
+        """One entry per resting order: the open listing plus the legs it cannot show.
+
+        A broker can list the same leg both ways, and an entry listed twice would hide
+        which orders actually remain. An unreadable id cannot be matched, so it is always
+        kept - the sweep still has to report it rather than silently drop it.
+        """
+        orders = list(open_orders)
         listed = {
             order_id
             for order_id in (
@@ -2559,18 +2663,30 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             if order_id is not None
         }
-        for leg in await self._list_resting_legs(client, symbols=symbols):
+        for leg in legs:
             leg_id = _control_order_id(_order_attr(leg, "id"))
-            # A broker can list the same leg both ways; an unreadable id cannot be
-            # matched and is always kept, so the sweep still reports it.
             if leg_id is None or leg_id not in listed:
                 orders.append(leg)
                 if leg_id is not None:
                     listed.add(leg_id)
         return orders
 
+    @staticmethod
+    def _resting_leg_symbols(open_orders: list[Any]) -> set[str]:
+        """Symbols whose bracket legs may be resting without any ``status=open`` row.
+
+        A bracket is an OCO pair, so the two legs rest and die together: the take-profit
+        leg is listed by ``status=open`` while the stop leg is not. Any symbol with a
+        working order therefore already names a symbol that can carry a ``held`` stop
+        leg, which is what lets the orphan sweep look for those legs without scanning
+        the account's whole order history.
+        """
+        return {
+            symbol for symbol in (_order_symbol(order) for order in open_orders) if symbol
+        }
+
     async def _cancel_already_gone(
-        self, client: Any, order_id: str, *, symbols: set[str] | None = None
+        self, client: Any, order_id: str, *, symbols: set[str]
     ) -> bool:
         """Whether a refused cancel was for an order that is no longer resting.
 

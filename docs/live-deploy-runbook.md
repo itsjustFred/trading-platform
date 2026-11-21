@@ -168,20 +168,30 @@ clean-up.
   their `held` stop legs (fixed in this PR; before it a real bracket position reported "no stop").
 - The same leg, on the same account and shape, is what the STOPPED sweeps have to cancel: the
   flatten (`close_all_positions`) and the orphan-protection sweep (`cancel_orphaned_protections`)
-  now read the identical `status=all`, `nested=true` listing (scoped to the positions being
-  flattened, account-wide for the orphan sweep), the bounded page still fails closed, and a leg
-  in `pending_cancel` counts as resting (#245; before it the flatten returned
+  now read the identical `status=all`, `nested=true` listing for the symbols they act on, a leg in
+  `pending_cancel` counts as resting, and a refused cancel is excused when the broker's own book
+  no longer lists the order (#245; before it the flatten returned
   `orders-still-working ... NO-STOP-RESTORED` on every bracket position and an orphaned stop leg
-  could survive a stop). Cancelling one leg cancels the other at the broker, so a refused cancel
-  for an order the broker's own book no longer lists is excused - the second cancel of the pair
-  is that case, not a dropped cancel.
+  could survive a stop). Cancelling one leg cancels the other at the broker, so the second cancel
+  of a pair is refused for an order the broker has already removed - that is the OCO, not a
+  dropped cancel.
+- Both listings newest-500-rows at a time, and a mature account fills that page with terminal
+  orders, so a full page pages back through the history (bounded at 20 pages) instead of failing:
+  an account trading one bracket a day reaches 500 orders within two years, and a flatten that
+  failed on its own order book would leave the position open. Only a history longer than the
+  budget fails. The orphan sweep looks the legs up for the symbols the open listing names (a
+  bracket's legs rest and die together, so a `held` stop leg always has a sibling that *is*
+  listed), not account-wide.
+- A stop that filled while its leg was being cancelled ends the flatten with the position already
+  flat, and restoring a stop then would create the orphan these sweeps exist to remove, so the
+  restore re-reads the position first and skips itself on a flat one.
 - Paper check of #245 (2026-11-20, `ACC1`, endpoint host read as
-  `https://paper-api.alpaca.markets`, account `PA3FRGH7D9LI`, tiny order, nothing left behind after
-  the run). The filled-bracket shape could **not** be produced in that session: the equity market
-  was closed until the next Monday 09:30 ET, and the broker refuses both `bracket orders do not
-  support extended hours trading` (40310000) and crypto brackets (`crypto orders not allowed for
-  advanced order_class: otoco`). Verified live instead: both new requests (`status=all,
-  nested=true`, with and without `symbols`) are accepted and parsed against real alpaca-py
+  `https://paper-api.alpaca.markets`, 1 share of `F` as a resting limit bracket, nothing left
+  behind after the run). The filled-bracket shape could **not** be produced in that session: the
+  equity market was closed until the next Monday 09:30 ET, and the broker refuses both `bracket
+  orders do not support extended hours trading` (40310000) and crypto brackets (`crypto orders
+  not allowed for advanced order_class: otoco`). Verified live instead: the `status=all,
+  nested=true` request (scoped by `symbols`) is accepted and parsed against real alpaca-py
   objects, a `held` leg under a *not yet filled* parent is correctly not treated as a protection
   of a position, and the orphan sweep cancelled a resting bracket parent on a flat symbol and left
   no working order and no position behind. The flatten and the stop restore on the recorded
