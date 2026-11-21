@@ -1080,6 +1080,8 @@ class BacktestResult:
             resolved = p.resolve()
             if not resolved.is_relative_to(Path(root).resolve()):
                 raise ValueError(f"Backtest result path escapes root {root}: {path}")
+            # Read the canonical path the check just approved.
+            p = resolved
         if not p.is_file():
             raise FileNotFoundError(f"Backtest result file not found: {path}")
         return cls.from_json(p.read_text(encoding="utf-8"))

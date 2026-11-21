@@ -990,11 +990,22 @@ def test_backtest_result_load_root_confines_reads(tmp_path):
 
 
 def test_backtest_stats_endpoint_never_reads_outside_backtests_dir(
-    security_client, tmp_path
+    security_client, tmp_path, monkeypatch
 ):
-    """An id that escapes BACKTESTS_DIR is a 404, not a file read (#230)."""
+    """An id that escapes BACKTESTS_DIR is a 404, not a file read (#230).
+
+    The spy proves the stats handler's ``_load_result`` fallback never
+    reaches ``BacktestResult.load`` for a rejected id: containment refuses
+    before any file read, not merely after a failed open.
+    """
+    import viewer.main as viewer_app_module
+
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
+    # Pin the stored-row lookup to miss so the JSON fallback — the path the
+    # bare join used to take — is what the spy observes.
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda _id: None)
+    load_calls = _spy_backtest_result_load(monkeypatch)
 
     # A perfectly valid artifact parked OUTSIDE the backtests tree: if the
     # loader still joined the raw id it would be served.
@@ -1006,11 +1017,13 @@ def test_backtest_stats_endpoint_never_reads_outside_backtests_dir(
         assert response.status_code in {400, 404, 422}, (bad_id, response.status_code)
         assert response.status_code != 200
     assert secret.exists()
+    assert load_calls == []
 
     # The contained id still serves normally.
     _trades_result("real-run").save(backtests_dir / "real-run.trades.json")
     response = security_client.get("/api/backtest/real-run/stats")
     assert response.status_code == 200, response.text
+    assert load_calls == [str((backtests_dir / "real-run.trades.json").resolve())]
 
 
 def test_backtest_rename_refuses_an_id_that_escapes_backtests_dir(
@@ -1095,14 +1108,16 @@ def test_core_load_result_never_reads_outside_backtests_dir(monkeypatch, tmp_pat
 def test_main_load_result_never_reads_outside_backtests_dir(monkeypatch, tmp_path):
     """``viewer.main._load_result`` JSON fallback is contained the same way.
 
-    The SQLite lookup misses (empty test DB), so the JSON fallback is what
-    runs — exactly the path the bare join used to take.
+    The stored-row lookup is pinned to miss so the JSON fallback is what
+    runs — exactly the path the bare join used to take — regardless of what
+    other tests left in the shared test database.
     """
     import viewer.main as viewer_app_module
 
     backtests_dir = tmp_path / "backtests"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(viewer_app_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(viewer_app_module, "load_backtest_result", lambda _id: None)
     monkeypatch.setattr(viewer_app_module, "save_result_to_sqlite", lambda _r: None)
     calls = _spy_backtest_result_load(monkeypatch)
 
