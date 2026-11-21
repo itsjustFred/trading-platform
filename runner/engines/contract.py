@@ -24,6 +24,7 @@ with different semantics. It does not unify the three execution-timing models
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -41,6 +42,11 @@ __all__ = [
     "ohlcv_path_metadata",
     "normalize_intrabar_resolution",
     "resolve_intrabar_timeframe",
+    "normalize_exit_order_type",
+    "exit_order_type_is_present",
+    "usable_exit_price",
+    "EXIT_ORDER_TYPE_MARKET",
+    "EXIT_ORDER_TYPE_LEVEL",
     "EngineStatsKeys",
     "TIMEFRAME_ORDER",
     "ONE_LOWER_SPELLINGS",
@@ -125,6 +131,66 @@ def resolve_intrabar_timeframe(base_timeframe: str, intrabar_resolution: str | N
     if target_index >= base_index:
         return None
     return normalized
+
+
+# ─── Explicit exit order type ───────────────────────────────────────────────
+
+#: ``exit_order_type`` spellings for signal exits. ``"market"`` fills at the
+#: signal-exit convention price (see ``signal_exit_fill``); ``"level"`` fills
+#: at the strategy's ``exit_price``.
+EXIT_ORDER_TYPE_MARKET = "market"
+EXIT_ORDER_TYPE_LEVEL = "level"
+
+
+def normalize_exit_order_type(value: Any) -> str | None:
+    """Canonical ``exit_order_type`` for one exit signal, or ``None``.
+
+    Only the exact spellings ``market``/``level`` (case-insensitive, stripped)
+    are recognized. A missing/NA cell AND an unrecognized spelling both yield
+    ``None`` — callers distinguish them with :func:`exit_order_type_is_present`
+    to warn on typos while still applying the documented legacy fallback.
+    """
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    if text in {EXIT_ORDER_TYPE_MARKET, EXIT_ORDER_TYPE_LEVEL}:
+        return text
+    return None
+
+
+def exit_order_type_is_present(value: Any) -> bool:
+    """True when the raw cell carries a non-empty value (recognized or not)."""
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        return True
+    return str(value).strip() != ""
+
+
+def usable_exit_price(value: Any) -> float | None:
+    """A positive finite ``exit_price``, or ``None`` when unusable."""
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
 
 
 # ─── Date filter convention (F9) ────────────────────────────────────────────

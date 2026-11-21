@@ -396,6 +396,9 @@ def _process_symbol(
     direction_series = _find_direction_series(execution_signals, execution_indicators)
     exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
     exit_reason_series = _find_exit_reason_series(execution_signals, execution_indicators)
+    exit_order_type_series = _find_exit_order_type_series(
+        execution_signals, execution_indicators
+    )
 
     trades: list[Trade] = []
     in_trade = False
@@ -446,10 +449,50 @@ def _process_symbol(
                 # (in_trade=False above); skip before sizing/equity.
                 continue
             trade_counter += 1
+            # Explicit exit order type (#243): "market" ignores exit_price and
+            # fills at the signal-exit convention price; "level" fills at
+            # exit_price (a missing/unusable level falls back to the market
+            # fill and is flagged). Unspecified keeps the legacy rule — a
+            # usable exit_price is a level.
+            exit_order_type, order_type_invalid = _exit_order_type_at(
+                exit_order_type_series, i
+            )
+            if order_type_invalid:
+                _warn_once(
+                    (symbol, config.timeframe, "exit_order_type_invalid"),
+                    "%s/%s: unrecognized exit_order_type value; expected "
+                    "'market' or 'level'. Falling back to the legacy rule "
+                    "(a usable exit_price fills at the level).",
+                    symbol,
+                    config.timeframe,
+                    warning_keys=warning_keys,
+                )
+            effective_exit_price_series = exit_price_series
+            exit_level_missing_price = False
+            if exit_order_type == contract.EXIT_ORDER_TYPE_MARKET:
+                effective_exit_price_series = None
+            elif exit_order_type == contract.EXIT_ORDER_TYPE_LEVEL and (
+                contract.usable_exit_price(
+                    exit_price_series.iloc[i]
+                    if exit_price_series is not None
+                    else None
+                )
+                is None
+            ):
+                effective_exit_price_series = None
+                exit_level_missing_price = True
+                _warn_once(
+                    (symbol, config.timeframe, "exit_level_missing_price"),
+                    "%s/%s: exit_order_type='level' but no usable exit_price "
+                    "on the exit bar; falling back to the market fill.",
+                    symbol,
+                    config.timeframe,
+                    warning_keys=warning_keys,
+                )
             exit_price = _resolve_exit_price(
                 exit_row,
                 i,
-                exit_price_series,
+                effective_exit_price_series,
                 signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
                 parameters=resolved_parameters,
                 direction=direction,
@@ -460,6 +503,8 @@ def _process_symbol(
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+            if exit_level_missing_price:
+                trade_meta["exit_level_missing_price"] = True
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
             take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
             risk_target_usd: float | None = None
@@ -1061,6 +1106,18 @@ def _is_exit_column(name: str, explicit_roles: Mapping[str, str] | None = None) 
     )
 
 
+def _exit_order_type_at(
+    series: pd.Series | None, idx: int
+) -> tuple[str | None, bool]:
+    """``(canonical exit_order_type, unrecognized_value_present)`` at ``idx``."""
+    if series is None:
+        return None, False
+    raw = series.iloc[idx]
+    order_type = contract.normalize_exit_order_type(raw)
+    invalid = order_type is None and contract.exit_order_type_is_present(raw)
+    return order_type, invalid
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
@@ -1092,6 +1149,7 @@ def _prepare_next_open_execution_data(
             "entry_stop",
             "exit_price",
             "exit_reason",
+            "exit_order_type",
         }
         for column in signals.columns:
             if str(column).lower() not in canonical and str(column) not in roles:
@@ -1182,7 +1240,7 @@ def _infer_indicator_when(name: str, explicit_when: str) -> str:
 
 def _indicator_meta_key(name: str) -> str:
     lowered = name.lower()
-    if lowered in {"exit_price", "exit_reason"}:
+    if lowered in {"exit_price", "exit_reason", "exit_order_type"}:
         return lowered
     if lowered.startswith("exit_"):
         return name[5:]
@@ -1208,12 +1266,16 @@ def _find_indicator_series(
         return signals["exit_price"]
     if kind == "exit_reason" and "exit_reason" in signals.columns:
         return signals["exit_reason"]
+    if kind == "exit_order_type" and "exit_order_type" in signals.columns:
+        return signals["exit_order_type"]
     if kind == "atr":
         for column in signals.columns:
             if str(column).lower().startswith("atr"):
                 return signals[column]
 
-    desired_when = "exit" if kind in {"exit_price", "exit_reason"} else "entry"
+    desired_when = (
+        "exit" if kind in {"exit_price", "exit_reason", "exit_order_type"} else "entry"
+    )
     for name, (series, explicit_when) in indicators.items():
         when = _infer_indicator_when(name, explicit_when)
         if when != desired_when:
@@ -1231,6 +1293,8 @@ def _find_indicator_series(
         if kind == "exit_price" and lowered == "exit_price":
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
+            return series
+        if kind == "exit_order_type" and lowered == "exit_order_type":
             return series
         if kind == "entry_stop" and lowered == "entry_stop":
             return series
@@ -1266,6 +1330,12 @@ def _find_exit_price_series(signals: pd.DataFrame, indicators: IndicatorMap) -> 
 
 def _find_exit_reason_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="exit_reason")
+
+
+def _find_exit_order_type_series(
+    signals: pd.DataFrame, indicators: IndicatorMap
+) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="exit_order_type")
 
 
 def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:

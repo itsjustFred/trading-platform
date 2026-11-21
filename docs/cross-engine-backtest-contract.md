@@ -80,6 +80,26 @@ unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
 `close`/`open`) selects `open` to fill at the exit bar's open instead for
 MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
 
+**Explicit exit order type (#243).** A strategy may mark a signal exit with an
+exit-when `exit_order_type` series (signal column or indicator) taking `market`
+or `level` (case-insensitive):
+
+- `market` — the exit fills at the signal-exit convention price
+  (`signal_exit_fill`); any `exit_price` on that bar is ignored for pricing.
+- `level` — the exit fills at the strategy's `exit_price`. A `level` exit
+  without a usable (positive, finite) `exit_price` falls back to the market
+  fill, logs a warning once and flags the trade
+  `meta["exit_level_missing_price"]`.
+- absent or unrecognized — the **legacy fallback** applies per engine:
+  vectorbt treats a usable `exit_price` as a level fill; native fills at the
+  convention price and ignores `exit_price` (an unrecognized non-empty value
+  warns once). PyneCore does not consume the series — its exits are
+  Pine-native orders, re-priced by `_apply_fill_parity` (§5).
+
+The parsing lives in `runner.engines.contract`
+(`normalize_exit_order_type`, `usable_exit_price`) so every engine reads the
+same spelling table.
+
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
 `datetime.fromisoformat` and resolves a NAIVE result through `timestamp()` —

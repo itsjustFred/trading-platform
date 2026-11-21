@@ -30,7 +30,14 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
-from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
+from runner.engines.contract import (
+    EXIT_ORDER_TYPE_LEVEL,
+    exit_order_type_is_present,
+    flag_missing_intrabar,
+    normalize_exit_order_type,
+    resolve_same_bar_exit,
+    usable_exit_price,
+)
 from runner.fees import resolve_fee_model
 from shared.models import (
     BacktestResult,
@@ -81,6 +88,7 @@ class TradeEngine:
         self._realized_pnl = 0.0
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
+        self._warned_exit_order_keys: set[str] = set()
         self._intrabar = self._prepare_intrabar(intrabar_data)
         self._progress_callback = progress_callback
         self._progress_start = float(progress_start)
@@ -763,9 +771,49 @@ class TradeEngine:
         )
         self.closed_trades.append(trade)
 
-    def _close_position(self, row: pd.Series, i: int, reason: str) -> None:
+    def _warn_exit_order_once(self, key: str, message: str, *args: Any) -> None:
+        if key in self._warned_exit_order_keys:
+            return
+        self._warned_exit_order_keys.add(key)
+        logger.warning(message, *args)
+
+    def _close_position(
+        self,
+        row: pd.Series,
+        i: int,
+        reason: str,
+        *,
+        exit_order_type: Any = None,
+        exit_price: Any = None,
+    ) -> None:
         if not self.positions:
             return
+
+        # Explicit exit order type (#243): "level" fills the signal exit at the
+        # strategy's exit_price instead of the convention price; "market" and
+        # an unspecified value keep the legacy market fill (native never read
+        # exit_price before this contract existed).
+        order_type = normalize_exit_order_type(exit_order_type)
+        if order_type is None and exit_order_type_is_present(exit_order_type):
+            self._warn_exit_order_once(
+                "exit_order_type_invalid",
+                "%s: unrecognized exit_order_type value %r; expected 'market' "
+                "or 'level'. Falling back to the market fill.",
+                self.symbol,
+                exit_order_type,
+            )
+        level_exit_price: float | None = None
+        level_missing_price = False
+        if order_type == EXIT_ORDER_TYPE_LEVEL:
+            level_exit_price = usable_exit_price(exit_price)
+            if level_exit_price is None:
+                level_missing_price = True
+                self._warn_exit_order_once(
+                    "exit_level_missing_price",
+                    "%s: exit_order_type='level' but no usable exit_price on "
+                    "the exit bar; falling back to the market fill.",
+                    self.symbol,
+                )
 
         # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close
         # for signal exits — the exit fills at the trigger bar's close by
@@ -785,10 +833,21 @@ class TradeEngine:
         next_positions: list[Position] = []
 
         for position in self.positions:
-            exit_price = base_exit + (spread if position.direction == "SHORT" else 0.0)
+            if level_exit_price is not None:
+                # A level fill trades at the level itself — no spread, like
+                # the stop/TP legs.
+                fill_price = level_exit_price
+            else:
+                fill_price = base_exit + (
+                    spread if position.direction == "SHORT" else 0.0
+                )
+            if level_missing_price:
+                position.meta["exit_level_missing_price"] = True
+            if order_type is not None:
+                position.meta["exit_order_type"] = order_type
             self._close_partial(
                 position,
-                price=exit_price,
+                price=fill_price,
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,
@@ -1320,7 +1379,13 @@ class TradeEngine:
                 self._create_order(merged_row, i, direction)
 
             if bool(exits.iloc[i]):
-                self._close_position(row, i, reason="signal")
+                self._close_position(
+                    row,
+                    i,
+                    reason="signal",
+                    exit_order_type=merged_row.get("exit_order_type"),
+                    exit_price=merged_row.get("exit_price"),
+                )
 
             self._update_equity(row, i)
 

@@ -222,6 +222,148 @@ def generate_signals(df, params):
         assert config.signal_exit_fill == "close"
 
 
+def _exit_order_type_strategy_text(
+    *,
+    order_type: str | None,
+    exit_price: float | None,
+) -> str:
+    """Entry on bar 2, signal exit on bar 7 with explicit exit order type."""
+    order_expr = "None" if order_type is None else repr(order_type)
+    price_expr = "None" if exit_price is None else repr(exit_price)
+    return f'''
+import pandas as pd
+
+
+ORDER_TYPE = {order_expr}
+EXIT_PRICE = {price_expr}
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[2] = True
+    exits.iloc[7] = True
+    indicators = {{"direction": pd.Series(["LONG"] * n, index=df.index)}}
+    indicators["exit_reason"] = pd.Series([None] * n, index=df.index, dtype=object)
+    indicators["exit_reason"].iloc[7] = "signal"
+    indicators["exit_order_type"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_order_type"].iloc[7] = ORDER_TYPE
+    indicators["exit_price"] = pd.Series(
+        [None] * n, index=df.index, dtype=object
+    )
+    indicators["exit_price"].iloc[7] = EXIT_PRICE
+    return entries, exits, indicators, []
+'''
+
+
+class TestExitOrderType:
+    """Explicit ``exit_order_type`` on signal exits (#243).
+
+    ``market`` fills at the signal-exit convention price and ignores
+    ``exit_price``; ``level`` fills at ``exit_price``; absent keeps the
+    documented legacy rule per engine.
+    """
+
+    def test_market_ignores_exit_price_on_both_engines(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type="market", exit_price=105.5)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_market")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        # Bar 7 close is 107.0; the level 105.5 must be ignored.
+        for result in (native, vectorbt):
+            assert result.trades[0].exits[0].price == pytest.approx(107.0)
+
+    def test_level_fills_at_exit_price_on_both_engines(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type="Level", exit_price=105.5)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_level")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            assert result.trades[0].exits[0].price == pytest.approx(105.5)
+
+    def test_level_without_usable_price_falls_back_flagged(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type="level", exit_price=None)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_noprice")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.0)
+            assert trade.meta.get("exit_level_missing_price") is True
+
+    def test_unspecified_keeps_legacy_rule_per_engine(self, tmp_path: Path):
+        # No exit_order_type: vectorbt honors a usable exit_price as a level
+        # (legacy), native fills at the convention close (legacy).
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type=None, exit_price=105.5)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_legacy")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        assert native.trades[0].exits[0].price == pytest.approx(107.0)
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(105.5)
+
+    def test_level_via_dataframe_columns(self, tmp_path: Path):
+        # DataFrame-output strategies carry exit_order_type/exit_price as
+        # signal columns rather than indicators.
+        frame = _frame()
+        text = '''
+import pandas as pd
+
+
+def generate_signals(df, params):
+    n = len(df)
+    entries = [False] * n
+    exits = [False] * n
+    entries[2] = True
+    exits[7] = True
+    exit_price = [float("nan")] * n
+    exit_price[7] = 105.5
+    exit_order_type = [None] * n
+    exit_order_type[7] = "level"
+    return pd.DataFrame(
+        {
+            "entries": entries,
+            "exits": exits,
+            "exit_price": exit_price,
+            "exit_order_type": exit_order_type,
+        },
+        index=df.index,
+    )
+'''
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_df")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        for result in (native, vectorbt):
+            assert result.trades[0].exits[0].price == pytest.approx(105.5)
+
+    def test_unrecognized_order_type_falls_back_to_legacy(self, tmp_path: Path):
+        frame = _frame()
+        text = _exit_order_type_strategy_text(order_type="bogus", exit_price=105.5)
+        strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_bogus")
+
+        native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
+
+        assert native.trades[0].exits[0].price == pytest.approx(107.0)
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(105.5)
+
+
 class TestNativeWarmupLoad:
     """A-H4: NativeAdapter loads from warmup_start so indicators are warm."""
 
