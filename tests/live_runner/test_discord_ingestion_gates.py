@@ -3689,7 +3689,7 @@ class TestAuthorDiscoveryRecord:
         monkeypatch.setattr(
             module.service_discovery,
             "discover_discord_bots_from_env",
-            lambda: [entry["bot"] for entry in results],
+            lambda *_a, **_k: [entry["bot"] for entry in results],
         )
 
         # One observation per discovered bot, consumed in order. Handing every
@@ -4799,7 +4799,9 @@ def _patch_discovery(monkeypatch, module, results):
     monkeypatch.setattr(
         module.service_discovery,
         "discover_discord_bots_from_env",
-        lambda: [{"name": entry["bot"], "channel_id": entry["channel_id"]} for entry in results],
+        lambda *_a, **_k: [
+            {"name": entry["bot"], "channel_id": entry["channel_id"]} for entry in results
+        ],
     )
     queue = list(results)
 

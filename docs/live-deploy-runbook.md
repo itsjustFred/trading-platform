@@ -4,7 +4,9 @@ Status: credential-gated as of 2026-07-13.
 
 ## Preconditions
 
-- `.accounts.env` exists and remains gitignored.
+- `.accounts.env` exists and remains gitignored. Entry points that need a different file take it
+  as an explicit argument (preflight's `--accounts-env`, the daemon's `accounts_env` parameter);
+  there is no environment override, so every reader resolves the same path.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
@@ -326,6 +328,10 @@ must still be rotated when an account is retired or reassigned.
 uv sync --all-extras
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env
 ```
+
+The test suite never reads this file: `tests/conftest.py` points every default at a sandbox path and
+fails the run if anything opens the real one, so a local run and CI resolve the same credentials
+(none). A test that needs credentials writes its own under `tmp_path`.
 
 The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML. Add `--check-db`
 (read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db` and implies
