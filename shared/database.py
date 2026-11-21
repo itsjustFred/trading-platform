@@ -76,8 +76,7 @@ from shared.trailing import validate_live_deployment_trailing_mode
 
 def _deployment_trailing_timeframe(deployment: Any) -> str:
     """The timeframe a deployment signals on (signal_config override, else its own)."""
-    configured = (deployment.signal_config or {}).get("timeframe")
-    return str(configured or deployment.timeframe or "").strip()
+    return deployment.signal_timeframe
 
 
 logger = get_logger("database")

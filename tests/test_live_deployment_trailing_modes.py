@@ -33,10 +33,12 @@ _FLIP_OVERRIDES = {
 def _bot_defaulting_to(monkeypatch, **overrides: object) -> None:
     """As if ``signal_bots/ramjet/config.yaml`` carried these settings.
 
-    The registry merges the bot's config file with the deployment's overrides
-    and hands the payload to this factory, so the factory sees exactly what the
-    daemon would build. Patching the factory entry is the same seam the
-    health-check tests use.
+    The registry builds a processor by calling ``SIGNAL_PROCESSORS[id](config)``,
+    where ``config`` is the deployment's overrides merged into the bot config
+    file. Patching the factory entry is the seam the health-check tests use; the
+    factory here stands in for the bot's own ``config.yaml`` carrying another
+    default, which is what a following change to that file (e.g. #168 flipping
+    the RamJet default) would do.
     """
     from signal_bots.ramjet.processor import RamJetSignalProcessor
     from signal_bots.registry import SIGNAL_PROCESSORS
@@ -111,6 +113,91 @@ def test_a_percent_bot_default_needs_a_trailable_timeframe(monkeypatch) -> None:
     with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
         _check(deployment, broker="alpaca")
     _check(_deployment({"signal_processor": "ramjet"}), broker="alpaca")
+
+
+def test_creating_a_percent_default_on_an_untrailable_timeframe_is_refused(
+    isolated_db, monkeypatch
+) -> None:
+    """The create stage must apply the timeframe rule to the bot default too:
+    a row that every signal would be refused for must not exist at all."""
+    database, _engine, _data_dir = isolated_db
+    _ramjet_account(database)
+    _bot_defaulting_to(monkeypatch, trailing_mode="percent", trailing_percent=0.02)
+    deployment = _deployment({"signal_processor": "ramjet"}, timeframe="1d")
+    deployment.account_id = "acct-alpaca"
+
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        database.create_live_deployment(deployment)
+    assert database.get_live_deployment(str(deployment.id)) is None
+
+
+def test_yaml_percent_default_on_an_untrailable_timeframe_is_refused(
+    tmp_path, monkeypatch
+) -> None:
+    from live_runner.config_parser import parse_live_deployments_config
+
+    _bot_defaulting_to(monkeypatch, trailing_mode="percent", trailing_percent=0.02)
+    config = tmp_path / "live.yaml"
+    config.write_text(
+        """
+accounts:
+  - id: alp
+    broker: alpaca
+
+deployments:
+  - strategy_name: ramjet-live
+    account_id: alp
+    symbols: [AAPL]
+    timeframe: 1d
+    status: PAUSED
+    signal_source: discord
+    signal_config:
+      channel_id: "123"
+      signal_processor: ramjet
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="cannot be executed live on timeframe"):
+        parse_live_deployments_config(config)
+
+
+def test_a_stored_row_with_a_percent_default_on_an_untrailable_timeframe_is_reported(
+    monkeypatch,
+) -> None:
+    """Loudness gap, not a trading one: the signal-time gates still refuse, so
+    the load path must say why instead of staying quiet."""
+    _bot_defaulting_to(monkeypatch, trailing_mode="percent", trailing_percent=0.02)
+    deployment = _stored_row(
+        {"signal_processor": "ramjet"}, timeframe="1d"
+    ).to_live_deployment()
+
+    errors = _load_stored_row(monkeypatch, deployment)
+
+    assert len(errors) == 1
+    _msg, args, _kwargs = errors[0]
+    assert "cannot be executed live on timeframe" in str(args)
+
+
+def test_every_stage_resolves_a_blank_timeframe_override_the_same_way() -> None:
+    """A whitespace-only ``signal_config.timeframe`` used to resolve to "" at
+    deployment validation and to the deployment timeframe in the daemon, so the
+    same config was refused by one stage and accepted by another."""
+    deployment = _deployment(
+        {"signal_processor": "ramjet", "timeframe": "   "},
+        timeframe="5m",
+    )
+    from live_runner import config_parser as config_parser_module
+    from live_runner import daemon as daemon_module
+    from live_runner import trailing_stops as trailing_stops_module
+
+    resolvers = (
+        deployment.signal_timeframe,
+        config_parser_module._signal_timeframe(deployment),
+        daemon_module._deployment_signal_timeframe(deployment),
+        trailing_stops_module._signal_timeframe(deployment),
+    )
+    assert resolvers == ("5m", "5m", "5m", "5m")
 
 
 def test_an_explicit_override_is_left_to_the_override_check(monkeypatch) -> None:

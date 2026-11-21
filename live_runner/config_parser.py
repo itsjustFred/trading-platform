@@ -15,8 +15,8 @@ from shared.trailing import validate_live_deployment_trailing_mode
 
 
 def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = (deployment.signal_config or {}).get("timeframe")
-    return str(configured or deployment.timeframe or "").strip()
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 logger = get_logger("live-runner")

@@ -49,7 +49,7 @@ pro Bot.
     Deployment-Validierung wird der Modus sowohl aus einem expliziten Override
     (`signal_config.signal_processor_config.trailing_mode`) als auch aus dem Default der eigenen
     Bot-Config gelesen — der Prozessor des Deployments wird dafür genauso gebaut wie vom Daemon
-    (`shared/trailing.py: validate_deployment_signal_processor_trailing_mode`).
+    (`shared/trailing.py: validate_live_deployment_trailing_mode`).
   - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
     cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
     live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay

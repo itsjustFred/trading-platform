@@ -584,11 +584,8 @@ def _deployment_wait_for_candle_close(
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = deployment.signal_config or {}
-    configured_tf = str(configured.get("timeframe") or deployment.timeframe).strip()
-    if configured_tf:
-        return configured_tf
-    return deployment.timeframe
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:

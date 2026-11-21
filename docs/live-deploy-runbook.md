@@ -82,7 +82,7 @@ results stop predicting live behaviour:
   the deployment's broker cannot execute is just as fatal. Those three stages build the processor
   the deployment actually runs (bot config merged with the deployment's
   `signal_processor_config`, exactly as the daemon builds it) and ask it for the mode
-  (`shared.trailing.validate_deployment_signal_processor_trailing_mode`). A deployment that sets
+  (`shared.trailing.validate_live_deployment_trailing_mode`). A deployment that sets
   the override explicitly is covered by the check above and is not built twice.
 - Signal time: the signal-processor gate and the order-preparation gate both check the mode
   against the adapter that would submit the order (broker table and the adapter's own

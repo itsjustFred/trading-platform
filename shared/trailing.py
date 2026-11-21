@@ -230,6 +230,48 @@ class _AnyBroker:
 ANY_BROKER: Any = _AnyBroker()
 
 
+def _validate_trailing_mode_for_stage(
+    value: Any,
+    *,
+    broker: Any,
+    timeframe: Any,
+    context: str,
+) -> None:
+    """Validate one trailing mode against a broker, and a timeframe when known.
+
+    The two stages of the deployment contract, in one place so every gate that
+    reads a deployment's mode decides identically:
+
+    - ``ANY_BROKER`` (model validation, where only the account id is known —
+      and the daemon's load path, which must not refuse more than the
+      signal-time gates do): the mode must be one that at least one live broker
+      executes. The timeframe is unknown there, so it is not gated.
+    - a concrete broker (deployment creation, account re-point, YAML parse —
+      wherever the account is resolved): the mode must be supported by that
+      broker (``None``/unknown brokers fail closed to ``none`` only) and, when
+      a timeframe is given, trailable on it.
+    """
+    if broker is ANY_BROKER:
+        validate_trailing_mode(
+            value,
+            supported=LIVE_ANY_BROKER_TRAILING_MODES,
+            context=context,
+        )
+        return
+    mode = validate_trailing_mode(
+        value,
+        supported=live_supported_trailing_modes(broker),
+        context=context,
+    )
+    if timeframe is not None:
+        validate_live_trailing_timeframe(
+            mode,
+            timeframe,
+            supported_timeframes=live_trailing_timeframes(broker),
+            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
+        )
+
+
 def validate_live_deployment_trailing_override(
     signal_config: Any,
     *,
@@ -259,30 +301,13 @@ def validate_live_deployment_trailing_override(
     processor_config = signal_config.get("signal_processor_config")
     if not isinstance(processor_config, dict) or "trailing_mode" not in processor_config:
         return
-    if broker is ANY_BROKER:
-        supported = LIVE_ANY_BROKER_TRAILING_MODES
-        where = f"{context} signal_processor_config.trailing_mode (any live broker)"
-    else:
-        supported = live_supported_trailing_modes(broker)
-        broker_label = str(broker or "").strip().lower() or "unknown"
-        where = (
-            f"{context} signal_processor_config.trailing_mode "
-            f"on broker {broker_label!r}"
-        )
-    mode = validate_trailing_mode(
+    where = f"{context} signal_processor_config.trailing_mode"
+    _validate_trailing_mode_for_stage(
         processor_config.get("trailing_mode"),
-        supported=supported,
+        broker=broker,
+        timeframe=timeframe,
         context=where,
     )
-    # With a broker AND a timeframe (the stages that know both) the mode must
-    # also be trailable on that timeframe.
-    if broker is not ANY_BROKER and timeframe is not None:
-        validate_live_trailing_timeframe(
-            mode,
-            timeframe,
-            supported_timeframes=live_trailing_timeframes(broker),
-            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
-        )
 
 
 def validate_live_deployment_trailing_mode(
@@ -351,31 +376,15 @@ def validate_live_deployment_trailing_mode(
     mode = getattr(processor, "trailing_mode", None)
     if mode is None:
         return
-    where = (
-        f"{context}: its signal processor '{processor_name}' requests trailing "
-        f"mode {normalize_trailing_mode(mode)!r}"
-    )
-    if broker is ANY_BROKER:
-        # Same two stages as the override check: without a broker only a mode
-        # no live broker runs can be refused, and the timeframe is unknown.
-        validate_trailing_mode(
-            mode,
-            supported=LIVE_ANY_BROKER_TRAILING_MODES,
-            context=where,
-        )
-        return
-    effective = validate_trailing_mode(
+    _validate_trailing_mode_for_stage(
         mode,
-        supported=live_supported_trailing_modes(broker),
-        context=where,
+        broker=broker,
+        timeframe=timeframe,
+        context=(
+            f"{context}: its signal processor '{processor_name}' requests "
+            f"trailing mode {normalize_trailing_mode(mode)!r}"
+        ),
     )
-    if timeframe is not None:
-        validate_live_trailing_timeframe(
-            effective,
-            timeframe,
-            supported_timeframes=live_trailing_timeframes(broker),
-            context=where,
-        )
 
 
 def live_trailing_timeframes(broker: Any) -> frozenset[str]:

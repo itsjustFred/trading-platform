@@ -212,6 +212,24 @@ class LiveDeploymentConfig(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
     @property
+    def signal_timeframe(self) -> str:
+        """The timeframe this deployment signals on, trimmed, with a fallback.
+
+        ``signal_config.timeframe`` when it is not blank, else the deployment's
+        own timeframe. One definition, on the model: deployment validation, the
+        daemon's load path, the trailing loop and the signal-time gates all gate
+        a trailing mode on the timeframe, and three of them used to read a
+        whitespace-only override as "" while the daemon read it as the
+        deployment timeframe — so the same configuration was refused by one
+        stage and accepted by another.
+        """
+        configured = (self.signal_config or {}).get("timeframe")
+        override = str(configured or "").strip()
+        if override:
+            return override
+        return str(self.timeframe or "").strip()
+
+    @property
     def signal_processor_name(self) -> str:
         """Registered signal-processor id of this deployment, ``""`` when none.
 
