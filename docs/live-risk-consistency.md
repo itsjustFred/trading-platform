@@ -213,13 +213,16 @@ Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (di
 ## Pre-Submit-Hart-Caps (#302)
 
 `live_runner/pre_submit_caps.py::enforce_pre_submit_caps()` ist die letzte
-Prüfung vor jedem Broker-Submit — nach dem Sizing, nach dem
+Prüfung vor dem Broker-Submit der Daemon-Pfade — nach dem Sizing, nach dem
 Submission-Claim, unmittelbar vor `adapter.submit_order()`. Sie wird an beiden
 Submit-Chokepoints aufgerufen (`submit_order_with_risk()` und der Discord-
-Dispatch in `_prepare_claim_and_submit_signal()`) und ist **unabhängig vom
-Sizing-Code**: jede Größe wird erneut aus Broker-Wahrheit
-(`get_quote`/`get_pip_value`/`get_balance`) und den trusted `settings` des
-Deployments abgeleitet, nie aus Signal-Metadata.
+Dispatch in `_prepare_claim_and_submit_signal()`); direkte Submits aus
+`scripts/live_smoke.py` und `live_runner/test_signal_trigger.py` umgehen sie.
+**Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value und
+Balance werden hier erneut gelesen (`get_quote`/`get_pip_value`/`get_balance`),
+die Quote dabei mit demselben Frische-Gate wie der Entry-Deviation-Check
+(`max_entry_quote_age_seconds`). Menge und Preislevel stammen dagegen aus dem
+gesizeten Signal — nichts wird aus dem Payload neu erfunden.
 
 Abgelehnt wird (fail-closed, ERROR-Alert `pre_submit_cap_refusal` plus
 Audit-Eintrag über `record_live_control_audit`), wenn
@@ -231,16 +234,27 @@ Audit-Eintrag über `record_live_control_audit`), wenn
 | `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` |
 | `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
 
+Notional und Stop-Risk rechnen gegen das Account-**Equity**, während das
+Sizing gegen die **Balance** rechnet — bewusst verschiedene Basen: die Caps
+sind ein hartes Backstop gegen kaputte Größen, kein zweites Sizing.
+
 Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
-Cap-Settings, Quote/Pip-Value/Balance nicht abrufbar oder unbrauchbar
-(`broker_facts_unavailable` / `broker_facts_unusable` / `invalid_cap_config` /
-`missing_stop_loss` / `unresolved_levels` / `invalid_qty`). Exit-only-Orders
-(`risk_sizing_mode == "exit_only"`) laufen nie durch die Caps — sie reduzieren
+Cap-Settings, Quote/Pip-Value/Balance nicht abrufbar oder unbrauchbar,
+insbesondere eine Quote ohne verwertbare oder veraltete Broker-Zeit
+(`stale_quote`, gleiche Regel wie das Entry-Gate, `max_entry_quote_age_seconds`)
+(`broker_facts_unavailable` / `broker_facts_unusable` / `stale_quote` /
+`invalid_cap_config` / `invalid_entry_gate_config` / `missing_stop_loss` /
+`unresolved_levels` / `invalid_qty`). Ob ein Order ein Exit ist, entscheidet
+`is_exit_order` — dieselbe Klassifikation, nach der das Sizing dispatched —
+nie ein Payload-Marker: ein Entry mit `risk_sizing_mode="exit_only"` wird
+normal gecappt, und der Entry-Pfad entfernt `exit_only`/`risk_sizing_mode`
+vor dem Adapter. Exit-Orders laufen nie durch die Caps — sie reduzieren
 Exposure, und eine Cap darf einen Flatten nicht blockieren.
 
 Settings pro Deployment (deployment = account + symbols, also der
 Per-Account/-Per-Symbol-Scope), validiert beim Anlegen
-(`validate_pre_submit_cap_settings` in `create_live_deployment`) und erneut
+(`validate_pre_submit_cap_settings` in `create_live_deployment`: Typ,
+Endlichkeit, Positivität und eindeutige Symbol-Keys) und erneut
 fail-closed beim Submit:
 
 | Setting | Default | Gültig |

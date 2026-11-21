@@ -23,12 +23,18 @@ from live_runner.account_routing import (
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    LIVE_QUOTE_FUTURE_SKEW_SECONDS,
+    QUOTE_TIME_RULE_IN_FUTURE,
+    QUOTE_TIME_RULE_INVALID,
+    QUOTE_TIME_RULE_MISSING,
+    QUOTE_TIME_RULE_STALE,
     BaseLiveAdapter,
     LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
     is_order_not_submitted,
     is_unbounded_tp,
+    live_quote_time_rule,
     order_not_submitted,
     validate_live_quote_prices,
 )
@@ -978,8 +984,11 @@ def size_live_signal_for_submission(
 #: :func:`risk.live.entry_gate_settings` (#125).
 
 #: How far a quote time may lie in the future before it is treated as a clock
-#: or feed fault rather than skew between our clock and the broker's.
-ENTRY_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+#: or feed fault rather than skew between our clock and the broker's. The rule
+#: itself lives in :func:`live_runner.base_adapter.live_quote_time_rule` so the
+#: entry gate, the pip-value conversion check and the pre-submit caps (#302)
+#: share one implementation.
+ENTRY_QUOTE_FUTURE_SKEW_SECONDS = LIVE_QUOTE_FUTURE_SKEW_SECONDS
 
 
 def _utc_now() -> datetime:
@@ -1015,10 +1024,10 @@ _ENTRY_QUOTE_METADATA_KEYS = (
 #: the market is, so no price rule may be judged on it. The crossed-level rules
 #: come next: they name the more specific problem when the quote has also moved
 #: further than the deviation limit.
-ENTRY_GATE_RULE_QUOTE_TIME_MISSING = "quote_time_missing"
-ENTRY_GATE_RULE_QUOTE_TIME_INVALID = "quote_time_invalid"
-ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE = "quote_time_in_future"
-ENTRY_GATE_RULE_QUOTE_STALE = "quote_stale"
+ENTRY_GATE_RULE_QUOTE_TIME_MISSING = QUOTE_TIME_RULE_MISSING
+ENTRY_GATE_RULE_QUOTE_TIME_INVALID = QUOTE_TIME_RULE_INVALID
+ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE = QUOTE_TIME_RULE_IN_FUTURE
+ENTRY_GATE_RULE_QUOTE_STALE = QUOTE_TIME_RULE_STALE
 ENTRY_GATE_RULE_AT_STOP_LOSS = "quote_at_or_beyond_stop_loss"
 ENTRY_GATE_RULE_AT_TAKE_PROFIT = "quote_at_or_beyond_take_profit"
 ENTRY_GATE_RULE_TOWARD_STOP_LOSS = "deviation_toward_stop_loss"
@@ -1058,18 +1067,10 @@ def _quote_time_rule(
 
     Fails closed: a missing time, anything but a timezone-aware datetime, a
     time beyond the clock-skew allowance in the future, or a quote older than
-    the limit all reject.
+    the limit all reject. The rule itself is shared with the pre-submit caps
+    in :func:`live_runner.base_adapter.live_quote_time_rule`.
     """
-    if timestamp is None:
-        return ENTRY_GATE_RULE_QUOTE_TIME_MISSING, None
-    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
-        return ENTRY_GATE_RULE_QUOTE_TIME_INVALID, None
-    age = (now - timestamp).total_seconds()
-    if -age > ENTRY_QUOTE_FUTURE_SKEW_SECONDS:
-        return ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE, age
-    if age > max_age_seconds:
-        return ENTRY_GATE_RULE_QUOTE_STALE, age
-    return None, age
+    return live_quote_time_rule(timestamp, now=now, max_age_seconds=max_age_seconds)
 
 
 def _validated_quote_prices(quote: object, *, symbol: str) -> tuple[float, float]:
@@ -1836,6 +1837,15 @@ async def _resolve_account_balance(
     return account_balance
 
 
+#: Metadata keys an ENTRY order must never carry to the adapter: the raw
+#: broker-unit overrides (the risk-sized ``qty`` is binding, #79) and the
+#: exit-only markers (payload-controlled, and the adapters key on them to
+#: build a reduce-only order without SL/TP legs).
+_ENTRY_STRIPPED_METADATA_KEYS = frozenset(
+    {"volume", "ctrader_volume", "exit_only", "risk_sizing_mode"}
+)
+
+
 async def prepare_order_with_risk(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -2050,10 +2060,15 @@ async def prepare_order_with_risk(
     preserved_metadata = {
         key: value for key, value in metadata.items() if key not in sizing_keys
     }
+    # An entry never carries the exit markers to the adapter: a payload
+    # ``exit_only``/``risk_sizing_mode`` would flip it to a reduce-only order
+    # without SL/TP legs (and would have skipped the pre-submit caps). Real
+    # exits return early via ``prepare_exit_intent_order``, which stamps the
+    # markers itself.
     final_metadata = {
         key: value
         for key, value in {**sized_metadata, **preserved_metadata}.items()
-        if key not in {"volume", "ctrader_volume"}
+        if key not in _ENTRY_STRIPPED_METADATA_KEYS
     }
     # The gate's and the pip value's figures are written last: a payload value
     # under one of these keys can neither shadow nor survive them.

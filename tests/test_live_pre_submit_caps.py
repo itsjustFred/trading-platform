@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -189,6 +189,39 @@ def test_validate_cap_settings_accepts_deployment_settings_with_other_keys():
     )
 
 
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"pre_submit_max_qty": 0},
+        {"pre_submit_max_qty": -3.0},
+        {"pre_submit_max_notional_equity_fraction": 0},
+        {"pre_submit_max_price_deviation_fraction": -0.1},
+        {"pre_submit_max_risk_multiple": 0},
+        {"pre_submit_symbol_caps": {"AAPL": {"pre_submit_max_qty": 0}}},
+        {"pre_submit_symbol_caps": {"AAPL": {"pre_submit_max_risk_multiple": -1.0}}},
+    ],
+)
+def test_validate_cap_settings_rejects_nonpositive_values_at_creation(settings):
+    # A nonpositive cap stored at creation would refuse every entry of the
+    # deployment at the first signal; it must be refused when written.
+    with pytest.raises(ValueError):
+        validate_pre_submit_cap_settings(settings)
+
+
+def test_validate_cap_settings_rejects_case_duplicate_symbol_overrides():
+    # "AAPL" and "aapl" are the same symbol key; resolving by insertion order
+    # would make the effective cap depend on dict ordering.
+    with pytest.raises(ValueError):
+        validate_pre_submit_cap_settings(
+            {
+                "pre_submit_symbol_caps": {
+                    "AAPL": {"pre_submit_max_qty": 1.0},
+                    "aapl": {"pre_submit_max_qty": 2.0},
+                }
+            }
+        )
+
+
 # ── the checks ────────────────────────────────────────────────────────────────
 
 
@@ -355,6 +388,37 @@ def test_unusable_quote_refuses():
         )
 
 
+def test_stale_quote_refuses():
+    # The caps compare against a live quote: a cached spot older than the
+    # deployment's max_entry_quote_age_seconds must not pass.
+    deployment = _deployment()
+    broker = _Broker(
+        quote=LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc) - timedelta(seconds=3600),
+            source="test",
+        )
+    )
+    with pytest.raises(PreSubmitCapViolation, match="stale_quote"):
+        _run(
+            enforce_pre_submit_caps(
+                broker, deployment, _signal(deployment), qty=200.0, risk_config=_risk_config()
+            )
+        )
+
+
+def test_quote_without_a_timestamp_refuses():
+    deployment = _deployment()
+    broker = _Broker(quote=LiveQuote(bid=100.0, ask=100.0, timestamp=None, source="test"))
+    with pytest.raises(PreSubmitCapViolation, match="stale_quote"):
+        _run(
+            enforce_pre_submit_caps(
+                broker, deployment, _signal(deployment), qty=200.0, risk_config=_risk_config()
+            )
+        )
+
+
 def test_missing_stop_refuses():
     deployment = _deployment()
     broker = _Broker()
@@ -405,6 +469,24 @@ def test_exit_only_order_is_never_checked():
             broker, deployment, signal, qty=10**9, risk_config=_risk_config()
         )
     )
+
+
+def test_entry_carrying_exit_markers_is_still_capped():
+    """The exit bypass is the daemon's exit classification, not a payload
+    marker: an entry that claims ``risk_sizing_mode=exit_only`` is sized as an
+    entry and must still be capped."""
+    deployment = _deployment(pre_submit_max_qty=1.0)
+    broker = _Broker()
+    signal = _signal(
+        deployment,
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+    with pytest.raises(PreSubmitCapViolation, match="qty_cap"):
+        _run(
+            enforce_pre_submit_caps(
+                broker, deployment, signal, qty=200.0, risk_config=_risk_config()
+            )
+        )
 
 
 # ── alert + audit record ──────────────────────────────────────────────────────
@@ -467,3 +549,67 @@ def test_cap_refusal_is_marked_pre_request():
     else:  # pragma: no cover
         pytest.fail("the cap must refuse this order")
     assert broker.submitted == []
+
+
+def test_entry_path_strips_exit_markers_before_the_adapter():
+    """An entry carrying ``exit_only``/``risk_sizing_mode`` payload markers is
+    sized as an entry; the markers must not survive to the adapter, which keys
+    on them to build a reduce-only order without SL/TP legs."""
+    deployment = _deployment()
+    broker = _Broker()
+    signal = _signal(
+        deployment,
+        metadata={"exit_only": True, "risk_sizing_mode": "exit_only"},
+    )
+    _run(daemon.submit_order_with_risk(broker, deployment, signal))
+    assert len(broker.submitted) == 1
+    submitted_metadata = broker.submitted[0][0].metadata or {}
+    assert "exit_only" not in submitted_metadata
+    assert "risk_sizing_mode" not in submitted_metadata
+
+
+def test_claim_path_cap_refusal_releases_the_lease_and_never_submits(monkeypatch, caplog):
+    """The production chokepoint: a cap refusal inside
+    ``_prepare_claim_and_submit_signal`` must leave ``submit_order`` uncalled,
+    release the submission lease and log a pre-request refusal."""
+    import logging
+
+    from risk import TradeSignal
+
+    deployment = _deployment(pre_submit_max_qty=1.0)
+    broker = _Broker()
+    trade_signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+
+    released: list[str] = []
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *a, **k: True)
+    monkeypatch.setattr(
+        daemon,
+        "release_live_deployment_submission",
+        lambda token: released.append(token) or True,
+    )
+    monkeypatch.setattr(daemon, "renew_live_deployment_submission", lambda token: True)
+
+    with caplog.at_level(logging.WARNING):
+        _run(
+            daemon._prepare_claim_and_submit_signal(
+                "acc-1",
+                broker,
+                deployment,
+                trade_signal,
+                live_signal,
+                is_exit=False,
+            )
+        )
+
+    assert broker.submitted == []
+    assert released, "a provably pre-request refusal must release the submission lease"
+    assert "released the submission lease" in caplog.text

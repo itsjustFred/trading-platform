@@ -4,6 +4,14 @@ Sizing bugs have shipped before (cTrader ~1000x too large, #146; a 100x-off
 fallback scale, #184). Every gate upstream of this point is part of, or fed by,
 the sizing path; this module is the independent check that runs after sizing,
 after the submission claim, and immediately before ``adapter.submit_order``.
+It is wired into the daemon's two submit chokepoints (``submit_order_with_risk``
+and ``_prepare_claim_and_submit_signal``); direct submits such as
+``scripts/live_smoke.py`` and ``live_runner/test_signal_trigger.py`` bypass it.
+
+Only the broker facts are re-derived here — the live quote (with its freshness
+checked against ``max_entry_quote_age_seconds``), the pip value and the
+balance. The quantity and the price levels are the ones sizing resolved and
+are taken from the sized signal, never re-invented from payload metadata.
 
 It refuses — fail closed, with an ERROR alert and an audit record — when
 
@@ -15,15 +23,15 @@ It refuses — fail closed, with an ERROR alert and an audit record — when
 * the risk at the stop exceeds ``pre_submit_max_risk_multiple`` times the
   deployment's configured per-trade risk (``max_risk_per_trade`` of equity).
 
-Every figure is re-derived here from the broker (quote, pip value, balance)
-and the deployment's trusted ``settings`` — never from signal metadata beyond
-the trade descriptors (levels) that sizing itself is allowed to read. Any
-failure to verify (no quote, no pip value, unreadable balance, missing stop,
-invalid cap config) refuses the order.
+Any failure to verify (no quote, a stale or missing quote time, no pip value,
+unreadable balance, missing stop, invalid cap config) refuses the order.
 
-Exit-only orders (``risk_sizing_mode == "exit_only"``) are never checked: they
-reduce exposure, and a cap that could block a flatten would be a safety bug,
-not a safety feature.
+Whether an order is an exit is decided by the daemon's own classification
+(:func:`live_runner.exit_signals.is_exit_order`), never by a payload marker:
+an entry that claims ``risk_sizing_mode == "exit_only"`` is still capped, and
+the entry path strips the marker before it can reach the adapter. Exit orders
+are never checked: they reduce exposure, and a cap that could block a flatten
+would be a safety bug, not a safety feature.
 
 Caps are configured per deployment in ``settings`` (a deployment binds one
 account, so this is the per-account scope) with optional per-symbol overrides
@@ -36,15 +44,18 @@ from __future__ import annotations
 import asyncio
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Mapping, NoReturn
 
 from live_runner.base_adapter import (
-    EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
+    LiveQuote,
     coerce_positive_live_qty,
+    live_quote_time_rule,
     validate_live_quote_prices,
 )
-from risk.live import resolve_live_levels
+from live_runner.exit_signals import is_exit_order
+from risk.live import entry_gate_settings, resolve_live_levels
 from shared.logging import get_logger
 from shared.models import LiveDeploymentConfig, LiveSignal
 
@@ -147,27 +158,46 @@ def _parse_cap_overrides(
     return overrides
 
 
+def _require_positive_caps(overrides: Mapping[str, float | None], *, context: str) -> None:
+    """The same ``> 0`` rule :func:`pre_submit_cap_settings` enforces at submit.
+
+    Run at creation too: a nonpositive cap stored in settings would otherwise
+    sit there until the first order of the deployment is refused by it.
+    """
+    for key, value in overrides.items():
+        if value is not None and value <= 0:
+            raise ValueError(f"{context}: {key} must be > 0, got {value!r}")
+
+
 def validate_pre_submit_cap_settings(settings: Mapping[str, Any] | None) -> None:
     """Validate a deployment's pre-submit cap settings at creation time.
 
     Mirrors ``entry_gate_settings`` (#125): a malformed cap must be refused
     when the deployment is written, not discovered at the first order. The
-    per-symbol map is checked structurally here; the values are validated
-    again per symbol at enforcement.
+    full resolution runs here — type, finiteness and positivity — for the
+    deployment-wide keys and every per-symbol override.
     """
     values = settings or {}
-    _parse_cap_overrides(values, context="pre-submit cap settings", strict_keys=False)
+    base = _parse_cap_overrides(values, context="pre-submit cap settings", strict_keys=False)
+    _require_positive_caps(base, context="pre-submit cap settings")
     symbol_caps = values.get(_SYMBOL_CAPS_KEY)
     if symbol_caps is None:
         return
     if not isinstance(symbol_caps, Mapping):
-        raise ValueError(
-            f"{_SYMBOL_CAPS_KEY} must be a mapping, got {type(symbol_caps).__name__}"
-        )
+        raise ValueError(f"{_SYMBOL_CAPS_KEY} must be a mapping, got {type(symbol_caps).__name__}")
+    seen_symbols: set[str] = set()
     for symbol, overrides in symbol_caps.items():
-        if not str(symbol or "").strip():
+        canonical = str(symbol or "").strip().upper()
+        if not canonical:
             raise ValueError(f"{_SYMBOL_CAPS_KEY} has an empty symbol key")
-        _parse_cap_overrides(overrides, context=f"{_SYMBOL_CAPS_KEY}[{symbol!r}]")
+        if canonical in seen_symbols:
+            raise ValueError(
+                f"{_SYMBOL_CAPS_KEY} has duplicate symbol {symbol!r} "
+                "(symbol keys match case-insensitively)"
+            )
+        seen_symbols.add(canonical)
+        context = f"{_SYMBOL_CAPS_KEY}[{symbol!r}]"
+        _require_positive_caps(_parse_cap_overrides(overrides, context=context), context=context)
 
 
 def pre_submit_cap_settings(
@@ -230,12 +260,15 @@ def pre_submit_cap_settings(
     return caps
 
 
-def _is_exit_only(signal: LiveSignal) -> bool:
-    """The same marker both adapters key on for reduce-only orders."""
-    return (
-        str((signal.metadata or {}).get("risk_sizing_mode") or "")
-        == EXIT_ONLY_RISK_SIZING_MODE
-    )
+def _is_exit_order(signal: LiveSignal) -> bool:
+    """The daemon's own exit classification, never a payload marker.
+
+    ``is_exit_order`` is the same test ``prepare_order_with_risk`` dispatches
+    sizing on, so "sized as an exit" and "exempt from the caps" cannot drift
+    apart — and a payload ``risk_sizing_mode``/``exit_only`` on an entry
+    cannot switch the caps off.
+    """
+    return is_exit_order(signal.action, signal.metadata)
 
 
 async def _record_refusal_audit(data: Mapping[str, Any]) -> None:
@@ -275,9 +308,9 @@ async def enforce_pre_submit_caps(
     resolves it so this module never re-reads sizing policy.
 
     Raises :class:`PreSubmitCapViolation` (a ``ValueError``) on any refusal or
-    any failure to verify. Exit-only orders return immediately.
+    any failure to verify. Exit orders return immediately.
     """
-    if _is_exit_only(signal):
+    if _is_exit_order(signal):
         return
 
     async def _fail(rule: str, reason: str, figures: Mapping[str, Any] | None = None) -> NoReturn:
@@ -306,6 +339,10 @@ async def enforce_pre_submit_caps(
         caps = pre_submit_cap_settings(deployment.settings, symbol=signal.symbol)
     except ValueError as exc:
         await _fail("invalid_cap_config", str(exc))
+    try:
+        max_quote_age = entry_gate_settings(deployment.settings).max_quote_age_seconds
+    except ValueError as exc:
+        await _fail("invalid_entry_gate_config", str(exc))
 
     try:
         qty_value = coerce_positive_live_qty(qty, field_name="pre-submit order qty")
@@ -339,16 +376,21 @@ async def enforce_pre_submit_caps(
             {**base_figures, "entry_price": entry_price},
         )
 
+    quote_task = asyncio.create_task(adapter.get_quote(signal.symbol))
+    pip_task = asyncio.create_task(adapter.get_pip_value(signal.symbol))
+    balance_task = asyncio.create_task(adapter.get_balance())
     try:
         quote, pip_value, (_balance, equity) = await asyncio.wait_for(
-            asyncio.gather(
-                adapter.get_quote(signal.symbol),
-                adapter.get_pip_value(signal.symbol),
-                adapter.get_balance(),
-            ),
+            asyncio.gather(quote_task, pip_task, balance_task),
             timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
         )
     except Exception as exc:
+        # gather propagates the first failure but leaves the sibling reads
+        # running; cancel them so a hung broker call cannot outlive the
+        # refusal (wait_for already cancelled them on a timeout).
+        for task in (quote_task, pip_task, balance_task):
+            task.cancel()
+        await asyncio.gather(quote_task, pip_task, balance_task, return_exceptions=True)
         await _fail(
             "broker_facts_unavailable",
             "could not fetch the live quote, pip value and balance needed to "
@@ -382,6 +424,28 @@ async def enforce_pre_submit_caps(
         "pip_value": pip,
         "account_equity": equity_value,
     }
+
+    # Quote freshness, the same rule the entry-deviation gate applies (#125):
+    # the caps compare against a live quote, so a stale cached spot — or one
+    # with no usable broker time — must not pass.
+    quote_time = quote.timestamp if isinstance(quote, LiveQuote) else None
+    time_rule, quote_age = live_quote_time_rule(
+        quote_time, now=datetime.now(timezone.utc), max_age_seconds=max_quote_age
+    )
+    if time_rule is not None:
+        await _fail(
+            "stale_quote",
+            f"the broker quote is not current ({time_rule}): time {quote_time!r}, "
+            f"age {quote_age!r}s, limit {max_quote_age}s",
+            {
+                **figures,
+                "quote_time": (
+                    quote_time.isoformat() if isinstance(quote_time, datetime) else None
+                ),
+                "quote_age_seconds": quote_age,
+                "max_quote_age_seconds": max_quote_age,
+            },
+        )
 
     # Price deviation: the resolved entry against the side the order fills
     # against, as a fraction of the live quote. Absolute — a quote that ran
