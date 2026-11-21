@@ -28,6 +28,10 @@ from runner.optimization_diagnostics import (
     train_validation_degradation,
     walk_forward_train_validation_folds,
 )
+from runner.portfolio_optimizer import (
+    MIN_OOS_DAILY_OBSERVATIONS,
+    daily_observation_count,
+)
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result, daily_returns_moments
 from runner.universe_provenance import (
@@ -316,6 +320,11 @@ class OptimizationConfig(BaseModel):
     # This is an overfitting / selection-luck hint, not a judgement of
     # strategy quality: a low Sharpe can still be a useful portfolio component.
     min_deflated_sharpe: float = Field(default=0.90, gt=0.0, le=1.0)
+    # Minimum distinct DAILY observations in the OOS holdout before its
+    # statistics are trusted (#133). Intraday bars on the same day count once.
+    min_oos_daily_observations: int = Field(
+        default=MIN_OOS_DAILY_OBSERVATIONS, ge=1
+    )
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -940,7 +949,16 @@ def run_optimization(
         "validation_stats": _json_safe(validation_stats),
         "final_test_period": test_period,
         "final_test_stats": _json_safe(final_test_stats),
-        "oos_status": "available",
+        "oos_status": (
+            "available"
+            if int(winner_test_row.get("test_daily_observations") or 0)
+            >= config.min_oos_daily_observations
+            else "insufficient_oos_bars"
+        ),
+        "oos_daily_observations": int(
+            winner_test_row.get("test_daily_observations") or 0
+        ),
+        "min_oos_daily_observations": config.min_oos_daily_observations,
         "three_way": {
             "segments": split.as_dict(),
             "winner": {
@@ -1384,6 +1402,7 @@ def _evaluate_top_set_on_test(
             "test_metric_value": None,
             "test_stats": {},
             "test_failure_reason": None,
+            "test_daily_observations": 0,
         }
         # Same isolation as the validation pass: one candidate whose holdout
         # run fails is recorded, and the rest of the top set still reports.
@@ -1400,6 +1419,9 @@ def _evaluate_top_set_on_test(
             )
             stats = _canonical_stats(result)
             metric_value = _metric_value(stats, config.target_metric)
+            row["test_daily_observations"] = daily_observation_count(
+                point.time for point in result.equity_curve
+            )
         except (ValueError, RuntimeError, KeyError) as exc:
             row["test_failure_reason"] = f"{type(exc).__name__}: {exc}"
             rows.append(row)
@@ -2152,6 +2174,9 @@ def _run_risk_parity_covariance_optimization(
         strategy_path,
     )
     test_stats = _canonical_stats(test_result)
+    test_daily_observations = daily_observation_count(
+        point.time for point in test_result.equity_curve
+    )
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -2195,7 +2220,13 @@ def _run_risk_parity_covariance_optimization(
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
         "test_stats": _json_safe(test_stats),
-        "oos_status": "available",
+        "oos_status": (
+            "available"
+            if test_daily_observations >= config.min_oos_daily_observations
+            else "insufficient_oos_bars"
+        ),
+        "oos_daily_observations": test_daily_observations,
+        "min_oos_daily_observations": config.min_oos_daily_observations,
         "risk_parity": _json_safe(selection),
         "top_trials": [],
     }

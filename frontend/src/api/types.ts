@@ -414,6 +414,7 @@ export type OptimizationStatValue = number | string | boolean | null;
 export type OptimizationStatMap = Record<string, OptimizationStatValue>;
 export type OptimizationOosStatus =
   | "available"
+  | "insufficient_oos_bars"
   | "insufficient_overlap"
   | "no_oos_requested"
   | "unavailable";

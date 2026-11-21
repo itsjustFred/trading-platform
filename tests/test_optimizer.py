@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 import runner.optimizer as optimizer_module
 from data_tools.auto_download import has_ohlcv_bars_in_range
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
 def _optimization_config(*, train_split_pct: float) -> optimizer_module.OptimizationConfig:
@@ -283,6 +283,15 @@ def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
         "total_return": round(metric * 0.05, 6),
         "max_drawdown_pct": -0.1 if trade_count > 0 else 0.0,
     }
+    # #133: the OOS holdout needs >=20 distinct DAILY observations before its
+    # statistics are trusted; the mock curve carries 25 daily points.
+    equity_curve = [
+        EquityPoint(
+            time=f"2024-02-{day:02d}T00:00:00+00:00",
+            equity=100_000.0 + day,
+        )
+        for day in range(1, 26)
+    ]
     return BacktestResult(
         meta=BacktestMeta(
             id="trial-demo",
@@ -296,7 +305,7 @@ def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
             parameters=config.parameters,
         ),
         trades=trades,
-        equity_curve=[],
+        equity_curve=equity_curve,
         stats=stats,
     )
 

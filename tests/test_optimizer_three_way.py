@@ -59,10 +59,11 @@ def _write_base_backtest(backtests_dir: Path) -> None:
 
 
 def _equity_curve(start: str) -> list[EquityPoint]:
-    values = [100_000.0, 101_000.0, 100_500.0, 102_000.0, 101_500.0, 103_000.0]
-    day = 1 if start.startswith("2024-01") else 10
+    # #133: the OOS holdout needs >=20 distinct DAILY observations; the mock
+    # curve carries 25 daily points regardless of the (short) test period.
+    values = [100_000.0 + index for index in range(25)]
     return [
-        EquityPoint(time=f"2024-02-{day + index:02d}T00:00:00+00:00", equity=value)
+        EquityPoint(time=f"2024-02-{index + 1:02d}T00:00:00+00:00", equity=value)
         for index, value in enumerate(values)
     ]
 
