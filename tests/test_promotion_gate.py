@@ -965,3 +965,122 @@ def test_cli_promote_command_is_registered_and_exits_non_zero_on_refusal(
         parsed.func(parsed)
     assert excinfo.value.code == 1
     assert "Promotion refused" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# The evidence files are re-hashed on every check (#260)
+# --------------------------------------------------------------------------- #
+
+
+def _strip_evidence_paths(ledger: Path) -> None:
+    """Drop the recorded evidence paths: how a ledger written before #260 reads."""
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    for record in data["promotions"]:
+        for section in record["evidence"].values():
+            section.pop("result_path", None)
+            section.pop("report_path", None)
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_the_ledger_records_the_path_of_every_evidence_file(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The ledger names the file each piece of evidence was read from (#260)."""
+    record = record_promotion(_cli_args(tmp_path))["record"]
+    evidence = record["evidence"]
+    assert evidence["out_of_sample"].get("result_path") == (
+        _optimizer_result(tmp_path).resolve().as_posix()
+    )
+    assert evidence["paper_trading"].get("report_path") == (tmp_path / "paper.csv").resolve().as_posix()
+    assert evidence["parity"].get("report_path") == (tmp_path / "parity.json").resolve().as_posix()
+    assert _status(strategies_dir).is_production
+
+
+def test_evidence_paths_are_recorded_relative_to_the_repository(
+    strategies_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger stays portable: an evidence file in the repository is recorded relatively."""
+    import runner.promotion_gate as gate
+
+    monkeypatch.setattr(gate, "PROJECT_ROOT", tmp_path)
+    record = record_promotion(_cli_args(tmp_path))["record"]
+    evidence = record["evidence"]
+    assert evidence["out_of_sample"].get("result_path") == "opt-7.json"
+    assert evidence["paper_trading"].get("report_path") == "paper.csv"
+    assert evidence["parity"].get("report_path") == "parity.json"
+    # The relative form resolves against the repository tree of the checking process.
+    assert _status(strategies_dir).is_production
+
+
+def test_an_altered_evidence_file_refuses_the_promotion(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The files the evidence names are re-hashed, so an edit after the fact is caught (#260)."""
+    args = _cli_args(tmp_path)
+    record_promotion(args)
+    assert _status(strategies_dir).is_production
+    evidence_files = [
+        Path(args.optimization_result),
+        Path(args.paper_report),
+        Path(args.parity_report),
+    ]
+    originals = {path: path.read_bytes() for path in evidence_files}
+    for path in evidence_files:
+        path.write_bytes(path.read_bytes() + b" ")
+        status = _status(strategies_dir)
+        assert not status.is_production, path.name
+        assert "changed after the promotion" in status.reason, path.name
+        path.write_bytes(originals[path])
+    # Restoring the bytes restores the promotion: the check is a re-hash, not a one-way trip.
+    assert _status(strategies_dir).is_production
+
+
+def test_a_missing_evidence_file_refuses_the_promotion(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    args = _cli_args(tmp_path)
+    record_promotion(args)
+    assert _status(strategies_dir).is_production
+    Path(args.parity_report).unlink()
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "missing or unreadable" in status.reason
+
+
+def test_a_record_that_does_not_name_its_evidence_files_is_refused(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """A ledger written before #260 cannot be re-verified, so it is refused until re-recorded."""
+    record_promotion(_cli_args(tmp_path))
+    _strip_evidence_paths(ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py"))
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "does not name the file" in status.reason
+    assert "record the promotion again" in status.reason
+
+
+def test_a_record_with_an_evidence_path_of_the_wrong_type_is_malformed(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    record_promotion(_cli_args(tmp_path))
+    _rewrite_record(strategies_dir, lambda r: r["evidence"]["parity"].update(report_path=42))
+    status = _status(strategies_dir)
+    assert not status.is_production
+    assert "malformed" in status.reason
+
+
+def test_promotion_refuses_evidence_that_does_not_name_its_file(strategies_dir: Path) -> None:
+    """Recording a promotion has to name the file each part was read from (#260)."""
+    data = good_evidence().to_dict()
+    data["out_of_sample"]["result_path"] = ""
+    evidence = PromotionEvidence.from_mapping(data)
+    with pytest.raises(InvalidPromotionError, match="name the file"):
+        promote(
+            strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py",
+            kind="strategy",
+            parameters=DEFAULTS,
+            evidence=evidence,
+            promoted_by="Fred",
+            root=strategies_dir,
+        )
+    assert not ledger_path_for(strategies_dir / STRATEGY_NAME / f"{STRATEGY_NAME}.py").exists()
