@@ -131,7 +131,7 @@ Your final message is exactly this block, with no preamble and at most 1,000 wor
 
 Run this check silently; never print it.
 
-- Every changed hunk got the pre-mortem question; every changed symbol had its consumers read; every money-path and result-integrity file was covered by the procedure.
+- Every hunk you reached got the pre-mortem question, and every changed symbol in one had its consumers read; every hunk the time budget cut short is listed under "Not verified" - procedure 8 stops the clock before a large diff is exhausted, so the report says what it finished and what it did not. This checklist may be stricter than the procedure about what was read, never about what was not.
 - Every cited line was re-read with `git show <head>:<path>` and the quote matches that line. Every claim about other code (imports, helpers, tests, rules) has a quoted source (rule 8).
 - Every scenario has location, quote, Trigger, Impact, Caught by, Mitigation, severity and tag; every mitigation is small and concrete; every impact names one of the four harms.
 - Every scenario is grounded in the diff (rule 7); the dropped count and the mechanisms you dropped are stated under "Not verified"; at most one item sits under "Noticed outside this diff".

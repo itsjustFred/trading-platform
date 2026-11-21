@@ -891,6 +891,20 @@ def test_a_manual_rerun_refuses_a_head_sha_that_is_not_this_prs_commit() -> None
     )
 
 
+def test_the_pre_mortem_checklist_agrees_with_the_time_budget() -> None:
+    """The procedure stops at about 20 minutes and asks for a partial report, so the final
+    checklist may demand that every hunk *reached* was covered - and must not demand that every
+    changed hunk was: on a large diff that is impossible, and a pre-mortem that is told to claim
+    coverage it does not have is being asked to invent exactly the thing it must never invent. The
+    unreached work belongs under "Not verified", and the checklist says so."""
+    skill = (SKILLS / SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    section = skill.split("## Before you output", 1)[1]
+    assert "budget" in section, "the checklist does not mention the time budget it must respect"
+    assert "Not verified" in section, (
+        "the checklist does not defer unreached hunks to 'Not verified'"
+    )
+
+
 def test_a_dispatch_refuses_a_fork_a_draft_and_the_current_head() -> None:
     """A dispatch is the only path that reaches what a push never opens, and all three of its
     refusals are the difference between a run that says why it did nothing and a green run that
