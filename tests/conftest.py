@@ -24,6 +24,9 @@ TEST_DATA_DIR = _SESSION_DATA_DIR
 
 os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
+# A developer's shell must never turn the test suite into an alert source: the
+# ops alert sink reads OPS_ALERT_WEBHOOK_URL from the environment.
+os.environ.pop("OPS_ALERT_WEBHOOK_URL", None)
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:

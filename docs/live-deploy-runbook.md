@@ -15,18 +15,28 @@ Status: credential-gated as of 2026-07-13.
 ## Ops Alert Channel (#304)
 
 The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
-paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, wired in
-`live_runner/daemon.py` at startup.
+paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, installed
+by `run_daemon()` at daemon start (importing `live_runner.daemon` alone has no side effects).
+
+Set the variables in the environment the daemon runs with — e.g. exported before start or in the
+sourced `.accounts.env` / a systemd `EnvironmentFile`.
 
 - `OPS_ALERT_WEBHOOK_URL` — webhook URL. **Unset disables alerting entirely**; the daemon then
   behaves exactly as before. There is no other configuration needed to turn it on.
 - `OPS_ALERT_MAX_PER_MINUTE` (default `12`) — alerts per sliding minute; overflow is dropped and
   the drop count is folded into the next alert that does go out.
-- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — identical alerts inside this window send once.
+- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — alerts with the same dedup key inside this window
+  send once. The key is the `data.alert` marker plus the record's `account_id`,
+  `deployment_id`, `service_id` and `symbol` when present — so the same marker on a different
+  deployment is a different alert, but a changed payload (e.g. new mismatch quantities) under the
+  same marker and scope is still suppressed until the window expires. For records without a
+  marker the key is logger + level + message template (not the formatted message) plus the same
+  scope identifiers.
 
 What is alerted: every `ERROR`/`CRITICAL` record, plus any record carrying `data.alert` (the
-explicit operator-alert marker, e.g. `exit_ledger_mismatch`) at any level. Which specific events
-should page — and whether WARNING-level refusals should join them — is an open maintainer
+explicit operator-alert marker, e.g. `exit_ledger_mismatch`) at any level — `data.alert` markers
+route even when `LOG_LEVEL` would keep the record out of the file/console output. Which specific
+events should page — and whether WARNING-level refusals should join them — is an open maintainer
 decision tracked on the issue; the handler makes that a filter change, not a call-site change.
 
 Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow

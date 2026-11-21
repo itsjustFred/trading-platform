@@ -57,8 +57,13 @@ MAX_MESSAGE_CHARS = 1900
 
 _STOP_POLL_SECONDS = 0.2
 _DEDUP_STORE_PRUNE_AT = 1024
+#: Flush budget for queued alerts during daemon shutdown.
+SHUTDOWN_FLUSH_SECONDS = 2.0
 
 _logger = logging.getLogger("alerts")
+#: ``logging.Handler`` has no ``formatException`` (that lives on
+#: ``logging.Formatter``); exception-bearing records must render through one.
+_EXC_FORMATTER = logging.Formatter()
 
 
 class AlertBackend(Protocol):
@@ -79,7 +84,15 @@ class DiscordWebhookBackend:
 
         response = requests.post(
             self._webhook_url,
-            json={"content": format_alert_text(alert)},
+            # wait=true makes Discord return the created message (or an error)
+            # instead of an empty 204, so delivery failures stay observable.
+            params={"wait": "true"},
+            json={
+                "content": format_alert_text(alert),
+                # Error text can echo untrusted content; never let it ping the
+                # channel (@everyone, @here, role mentions).
+                "allowed_mentions": {"parse": []},
+            },
             timeout=self._timeout,
         )
         response.raise_for_status()
@@ -100,6 +113,8 @@ def format_alert_text(alert: Mapping[str, Any]) -> str:
             lines.append(f"data: {data!r}")
     if alert.get("dropped"):
         lines.append(f"({alert['dropped']} alert(s) dropped by rate limit or full queue)")
+    if alert.get("exception"):
+        lines.append(str(alert["exception"]))
     return "\n".join(lines)[:MAX_MESSAGE_CHARS]
 
 
@@ -197,8 +212,35 @@ class AlertSink:
                 self._dropped_since_last_send += 1
                 return
             dropped_note = self._dropped_since_last_send
+        alert = dict(payload)
+        if dropped_note:
+            alert["dropped"] = dropped_note
+        try:
+            self._backend.send(alert)
+        except Exception as exc:
+            # Dedup and rate-limit state are committed only after a successful
+            # send, so a failing webhook cannot mute the retry of this alert.
+            # Log the exception type (and HTTP status when present), never the
+            # exception itself: requests exceptions can embed the webhook URL,
+            # whose path segment is the channel secret.
+            with self._lock:
+                self._failed += 1
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            _logger.warning(
+                "ops alert backend send failed: %s%s",
+                type(exc).__name__,
+                f" HTTP {status}" if status is not None else "",
+            )
+            return
+        with self._lock:
+            self._sent += 1
             self._send_times.append(now)
             self._last_sent_by_key[dedup_key] = now
+            # Subtract only the snapshot taken before the send: drops that
+            # arrived while the backend was busy still belong to the next alert.
+            self._dropped_since_last_send = max(
+                0, self._dropped_since_last_send - dropped_note
+            )
             if len(self._last_sent_by_key) > _DEDUP_STORE_PRUNE_AT:
                 stale = [
                     key
@@ -207,19 +249,6 @@ class AlertSink:
                 ]
                 for key in stale:
                     del self._last_sent_by_key[key]
-        alert = dict(payload)
-        if dropped_note:
-            alert["dropped"] = dropped_note
-        try:
-            self._backend.send(alert)
-        except Exception as exc:
-            with self._lock:
-                self._failed += 1
-            _logger.warning("ops alert backend send failed: %r", exc)
-            return
-        with self._lock:
-            self._sent += 1
-            self._dropped_since_last_send = 0
 
 
 def _parse_positive_float(value: str | None, default: float) -> float:
@@ -297,11 +326,13 @@ class AlertLogHandler(logging.Handler):
                 "data": redact_value(data) if isinstance(data, Mapping) else None,
             }
             if record.exc_info and record.exc_info[0] is not None:
-                payload["exception"] = redact_text(self.formatException(record.exc_info))
+                payload["exception"] = redact_text(
+                    _EXC_FORMATTER.formatException(record.exc_info)
+                )
             if alert_name:
                 payload["alert"] = alert_name
             dedup_key = alert_name or _record_dedup_key(record)
-            if alert_name and isinstance(data, Mapping):
+            if isinstance(data, Mapping):
                 # The same alert on a different deployment/account/symbol is a
                 # different event: fold the stable identifiers into the key so
                 # one deployment's storm cannot mute another's first alert.
@@ -311,7 +342,9 @@ class AlertLogHandler(logging.Handler):
                     if data.get(key) is not None
                 }
                 if scope:
-                    dedup_key = f"{alert_name}|{json.dumps(scope, sort_keys=True, default=str)}"
+                    dedup_key = (
+                        f"{dedup_key}|{json.dumps(scope, sort_keys=True, default=str)}"
+                    )
             self._sink.submit(payload, dedup_key=dedup_key)
         except Exception:
             # Alerting must never break the code path that logged the record.
@@ -352,13 +385,23 @@ def install_alert_sink(
         return None
     _ALERT_HANDLER = AlertLogHandler(_ALERT_SINK)
     _ALERT_HANDLER.setFormatter(logging.Formatter("%(message)s"))
+    # Loggers created through shared.logging.get_logger keep LOG_LEVEL on their
+    # file/console handlers, so lowering the logger itself does not change what
+    # is written to disk or stdout — it only lets `data.alert` markers below
+    # LOG_LEVEL reach this handler. Foreign `trading.*` loggers keep their own
+    # level; ERROR records still alert through them.
+    from shared.logging import managed_service_loggers
+
+    managed = set(managed_service_loggers())
     for existing in list(logging.Logger.manager.loggerDict.values()):
-        if (
-            isinstance(existing, logging.Logger)
-            and existing.name.startswith("trading.")
-            and _ALERT_HANDLER not in existing.handlers
+        if not (
+            isinstance(existing, logging.Logger) and existing.name.startswith("trading.")
         ):
+            continue
+        if _ALERT_HANDLER not in existing.handlers:
             existing.addHandler(_ALERT_HANDLER)
+        if existing in managed:
+            existing.setLevel(logging.DEBUG)
     return _ALERT_SINK
 
 
@@ -367,14 +410,29 @@ def get_alert_handler() -> AlertLogHandler | None:
     return _ALERT_HANDLER
 
 
-def _reset_for_tests() -> None:
-    """Detach and stop everything ``install_alert_sink`` set up."""
+def close_alert_sink(timeout: float = SHUTDOWN_FLUSH_SECONDS) -> None:
+    """Detach the handler and drain/stop the sink.
+
+    Called from daemon shutdown so alerts logged while the process is stopping
+    (the most likely ones to matter) are not stranded in the queue. Bounded by
+    ``timeout``; the worker is a daemon thread either way.
+    """
     global _ALERT_HANDLER, _ALERT_SINK
     if _ALERT_HANDLER is not None:
         for existing in list(logging.Logger.manager.loggerDict.values()):
             if isinstance(existing, logging.Logger) and _ALERT_HANDLER in existing.handlers:
                 existing.removeHandler(_ALERT_HANDLER)
     if _ALERT_SINK is not None:
-        _ALERT_SINK.close()
+        _ALERT_SINK.close(timeout=timeout)
+    # Restore the configured level on managed loggers that install lowered.
+    from shared.logging import LOG_LEVEL, managed_service_loggers
+
+    for managed in managed_service_loggers():
+        managed.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     _ALERT_HANDLER = None
     _ALERT_SINK = None
+
+
+def _reset_for_tests() -> None:
+    """Detach and stop everything ``install_alert_sink`` set up."""
+    close_alert_sink(timeout=5.0)

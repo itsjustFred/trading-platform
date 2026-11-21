@@ -176,7 +176,7 @@ tests/               — Test suite
 | `UVICORN_HOST` | `0.0.0.0` | Recommended host for `python -m uvicorn viewer.main:app` |
 | `UVICORN_PORT` | `5556` | Recommended port for `python -m uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
-| `OPS_ALERT_WEBHOOK_URL` | — | Discord-compatible webhook for ops alerts from the live daemon (ERROR records and `alert=` records). Empty disables alerting |
+| `OPS_ALERT_WEBHOOK_URL` | — | Discord-compatible webhook for ops alerts from the live daemon (`ERROR`/`CRITICAL` records plus records carrying a `data.alert` marker). Empty disables alerting |
 | `OPS_ALERT_MAX_PER_MINUTE` | `12` | Ops alerts per sliding minute before overflow is dropped |
 | `OPS_ALERT_DEDUP_SECONDS` | `300` | Identical ops alerts inside this window are sent once |
 

@@ -29,12 +29,20 @@ from shared.alerts import (
 class FakeBackend:
     """Collects alerts; can be gated to simulate a slow/hung webhook."""
 
-    def __init__(self, *, gate: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        gate: threading.Event | None = None,
+        started: threading.Event | None = None,
+    ) -> None:
         self.sent: list[dict[str, Any]] = []
         self.gate = gate
+        self.started = started
         self._lock = threading.Lock()
 
     def send(self, alert: Mapping[str, Any]) -> None:
+        if self.started is not None:
+            self.started.set()
         if self.gate is not None:
             assert self.gate.wait(timeout=10)
         with self._lock:
@@ -165,13 +173,75 @@ class TestSinkDelivery:
         finally:
             sink.close()
 
+    def test_failed_send_does_not_consume_dedup_or_rate_slot(self):
+        """A failed webhook attempt must not mute the retry of the same alert."""
+
+        class FlakyBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self._fail_next = True
+
+            def send(self, alert: Mapping[str, Any]) -> None:
+                if self._fail_next:
+                    self._fail_next = False
+                    raise RuntimeError("webhook down")
+                super().send(alert)
+
+        backend = FlakyBackend()
+        # One send per minute: if the failed attempt consumed the slot or the
+        # dedup key, the identical retry below could never go out.
+        sink = AlertSink(backend, max_per_minute=1, dedup_seconds=60.0)
+        try:
+            sink.submit({"message": "same"}, dedup_key="k1")
+            sink.submit({"message": "same"}, dedup_key="k1")
+            stats = _wait_stats(sink, lambda s: s["sent"] == 1)
+            assert stats["failed"] == 1
+            assert backend.sent[0]["message"] == "same"
+        finally:
+            sink.close()
+
+    def test_drops_during_send_are_not_cleared_by_success(self):
+        """Drops counted while the backend was busy belong to the next alert."""
+        gate = threading.Event()
+        started = threading.Event()
+        backend = FakeBackend(gate=gate, started=started)
+        sink = AlertSink(backend, queue_size=2, dedup_seconds=0.0)
+        try:
+            sink.submit({"message": "in-flight"}, dedup_key="a")
+            assert started.wait(timeout=5), "worker never entered send()"
+            # The worker reserved dropped_note=0 and is blocked inside send();
+            # fill the 2-slot queue and overflow the rest while it is busy.
+            for i in range(6):
+                sink.submit({"message": f"q{i}"}, dedup_key=f"q{i}")
+            gate.set()
+            backend.wait_for(3)
+            # "in-flight" reserved dropped_note=0 before sending, so the four
+            # queue-overflow drops must surface on the next delivered alert.
+            _wait_stats(sink, lambda s: s["sent"] == 3)
+            assert backend.sent[1].get("dropped") == 4
+        finally:
+            gate.set()
+            sink.close()
+
 
 class TestLogHandler:
+    @pytest.fixture(autouse=True)
+    def _detach_handlers(self):
+        """Never leave an AlertLogHandler behind on a global logger."""
+        created: list[logging.Logger] = []
+        self._created_loggers = created
+        yield
+        for logger in created:
+            for handler in list(logger.handlers):
+                if isinstance(handler, AlertLogHandler):
+                    logger.removeHandler(handler)
+
     def _logger(self, name: str) -> logging.Logger:
         logger = logging.getLogger(name)
         logger.handlers.clear()
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
+        self._created_loggers.append(logger)
         return logger
 
     def test_error_record_reaches_sink(self):
@@ -272,6 +342,41 @@ class TestLogHandler:
         handler.emit(record)  # must not raise
         sink.close()
 
+    def test_exception_record_delivers_traceback(self):
+        """logger.exception records must alert, not die on formatException."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-exc")
+        logger.addHandler(handler)
+        try:
+            try:
+                raise ValueError("kaput")
+            except ValueError:
+                logger.exception("it broke")
+            backend.wait_for(1)
+            alert = backend.sent[0]
+            assert alert["message"] == "it broke"
+            assert "ValueError" in alert["exception"]
+            assert "kaput" in alert["exception"]
+            assert "ValueError" in format_alert_text(alert)
+        finally:
+            sink.close()
+
+    def test_plain_error_dedup_is_scoped_by_data_identifiers(self):
+        """Same message template on different symbols must not mute each other."""
+        backend = FakeBackend()
+        sink = AlertSink(backend, dedup_seconds=60.0)
+        handler = AlertLogHandler(sink)
+        logger = self._logger("trading.test-alerts-scope")
+        logger.addHandler(handler)
+        try:
+            logger.error("fill rejected", extra={"data": {"symbol": "EURUSD"}})
+            logger.error("fill rejected", extra={"data": {"symbol": "XAUUSD"}})
+            backend.wait_for(2)
+        finally:
+            sink.close()
+
 
 class TestInstall:
     def test_disabled_without_webhook_env(self):
@@ -287,8 +392,8 @@ class TestInstall:
 
         monkeypatch.setattr(
             "requests.post",
-            lambda url, json=None, timeout=None: (
-                sent.append({"url": url, "json": json}) or FakeResponse()
+            lambda url, json=None, timeout=None, params=None: (
+                sent.append({"url": url, "json": json, "params": params}) or FakeResponse()
             ),
         )
         sink = create_sink_from_env(env={"OPS_ALERT_WEBHOOK_URL": "https://discord.example/hook"})
@@ -328,8 +433,51 @@ class TestInstall:
     def test_install_is_idempotent(self):
         backend = FakeBackend()
         first = install_alert_sink(sink=_sink(backend))
-        second = install_alert_sink(sink=_sink(FakeBackend()))
+        # No sink argument: a second candidate must not be constructed (its
+        # worker thread would leak, since the first sink wins).
+        second = install_alert_sink()
         assert first is second
+
+    def test_install_lowers_managed_logger_level_and_close_restores(self):
+        """LOG_LEVEL moves to the output handlers so alert= markers always route."""
+        import shared.logging as shared_logging
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(shared_logging, "LOG_LEVEL", "ERROR")
+        try:
+            from shared.logging import get_logger
+
+            service = get_logger("test-alerts-level")
+            assert service.level == logging.ERROR
+            output_levels = {
+                h.level for h in service.handlers if not isinstance(h, AlertLogHandler)
+            }
+            assert output_levels == {logging.ERROR}
+
+            backend = FakeBackend()
+            sink = install_alert_sink(sink=_sink(backend))
+            assert sink is not None
+            assert service.level == logging.DEBUG
+            # A WARNING record with an alert marker must reach the sink even
+            # though LOG_LEVEL=ERROR keeps it out of the file/console handlers.
+            service.warning("marker below log level", extra={"data": {"alert": "m1"}})
+            backend.wait_for(1)
+            assert backend.sent[0]["alert"] == "m1"
+
+            alerts.close_alert_sink()
+            assert service.level == logging.ERROR
+        finally:
+            monkeypatch.undo()
+            alerts._reset_for_tests()
+
+    def test_close_alert_sink_drains_queued_alerts(self):
+        backend = FakeBackend()
+        sink = install_alert_sink(sink=_sink(backend))
+        assert sink is not None
+        sink.submit({"message": "shutdown error", "level": "ERROR"}, dedup_key="k")
+        alerts.close_alert_sink(timeout=5.0)
+        backend.wait_for(1)
+        assert backend.sent[0]["message"] == "shutdown error"
 
 
 class TestFormatting:
@@ -358,17 +506,20 @@ class TestFormatting:
             def raise_for_status(self):
                 return None
 
-        def fake_post(url, json=None, timeout=None):
+        def fake_post(url, json=None, timeout=None, params=None):
             captured["url"] = url
             captured["json"] = json
             captured["timeout"] = timeout
+            captured["params"] = params
             return FakeResponse()
 
         monkeypatch.setattr("requests.post", fake_post)
         backend = DiscordWebhookBackend("https://discord.example/hook")
         backend.send({"message": "alert body", "level": "ERROR"})
         assert captured["url"] == "https://discord.example/hook"
+        assert captured["params"] == {"wait": "true"}
         assert captured["json"] == {
-            "content": format_alert_text({"message": "alert body", "level": "ERROR"})
+            "content": format_alert_text({"message": "alert body", "level": "ERROR"}),
+            "allowed_mentions": {"parse": []},
         }
         assert captured["timeout"] == alerts.DEFAULT_BACKEND_TIMEOUT_SECONDS

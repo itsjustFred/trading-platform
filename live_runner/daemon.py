@@ -90,7 +90,7 @@ from risk.live import (
 )
 from risk.models import realized_risk_amount, realized_risk_percent
 from scheduler.scheduler import ServiceScheduler
-from shared.alerts import install_alert_sink
+from shared.alerts import SHUTDOWN_FLUSH_SECONDS, close_alert_sink, install_alert_sink
 from shared.constants import normalize_timeframe
 from shared.database import (
     LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
@@ -133,11 +133,6 @@ from shared.trailing import (
 from signal_bots.registry import get_signal_processor
 
 initialize_sentry("live-runner")
-# Ops alert channel (#304): ERROR records and explicit `alert=` records are
-# pushed to OPS_ALERT_WEBHOOK_URL when configured; unset disables it and the
-# daemon behaves exactly as before. Fire-and-forget: it cannot block or raise
-# into the trading paths.
-install_alert_sink()
 logger = get_logger("live-runner")
 
 _ACCOUNT_NOT_AUTHORIZED_LOG = "Account %s not authorized for token, skipping"
@@ -5186,6 +5181,13 @@ async def run_daemon(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
 ) -> None:
+    # Ops alert channel (#304): ERROR records and explicit `alert=` records are
+    # pushed to OPS_ALERT_WEBHOOK_URL when configured; unset disables it and the
+    # daemon behaves exactly as before. Installed here rather than at import so
+    # tools that merely import daemon helpers (--help, smoke scripts, tests)
+    # stay free of the worker thread and webhook side effects. Fire-and-forget:
+    # it cannot block or raise into the trading paths.
+    install_alert_sink()
     logger.info(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},
@@ -5302,6 +5304,10 @@ async def run_daemon(
                 }
             },
         )
+        # Flush queued alerts (bounded): the shutdown/crash ERROR records are
+        # the ones most likely to be sitting in the queue.
+        with contextlib.suppress(Exception):
+            close_alert_sink(timeout=SHUTDOWN_FLUSH_SECONDS)
 
 
 def main() -> None:
