@@ -44,6 +44,15 @@ parent Cleanup 16 record.
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
   treat both spellings as the same event class.
+- Level aliases: `take_profit` and `tp_price` are two spellings of the SAME
+  plain take-profit level (as `stop_loss`/`sl_price` are one stop). Native
+  resolves the pair once: the canonical spelling (`take_profit`, `stop_loss`)
+  wins when a row carries both, the alias order `risk.live.resolve_live_levels`,
+  the validation comparison and the vectorbt indicator lookup already use
+  (#237). One alias pair must never become two levels — both would be named
+  `tp`, share the `tp_pct` fill fraction and, through the last level's
+  remaining-quantity rule, over-allocate the position to take-profit exits.
+  Numbered levels (`tp1`, `tp2`, … with `tpN_pct` fractions) are unaffected.
 - Vectorbt has no bar-loop position model: protective levels are resolved on
   the entry bar and enforced through the intrabar walk (§3). Without intrabar
   data, exits happen on the scheduled signal exit and the levels are recorded
