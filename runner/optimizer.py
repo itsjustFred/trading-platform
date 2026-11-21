@@ -886,6 +886,16 @@ def run_optimization(
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
     oos_daily_observations = int(winner_test_row.get("test_daily_observations") or 0)
+    oos_status = (
+        "available"
+        if oos_daily_observations >= config.min_oos_daily_observations
+        else "insufficient_oos_bars"
+    )
+    if oos_status != "available":
+        # #133: risk-adjusted ratios computed on too few daily observations are
+        # noise, not evidence — withhold them from the headline holdout while
+        # keeping factual fields (trade counts, pnl) for diagnostics.
+        final_test_stats = _withhold_oos_risk_metrics(final_test_stats)
     # Flags the winner's overfitting risk; it never changes the selection or
     # drops the result. An OOS holdout below the daily-observation minimum is
     # itself an overfitting/insufficient-evidence failure.
@@ -953,11 +963,7 @@ def run_optimization(
         "validation_stats": _json_safe(validation_stats),
         "final_test_period": test_period,
         "final_test_stats": _json_safe(final_test_stats),
-        "oos_status": (
-            "available"
-            if oos_daily_observations >= config.min_oos_daily_observations
-            else "insufficient_oos_bars"
-        ),
+        "oos_status": oos_status,
         "oos_daily_observations": oos_daily_observations,
         "min_oos_daily_observations": config.min_oos_daily_observations,
         "three_way": {
@@ -968,6 +974,7 @@ def run_optimization(
                 "validation_metrics": _json_safe(validation_stats),
                 "test_metrics": _json_safe(final_test_stats),
             },
+            "oos_metrics_withheld": oos_status != "available",
             "selection": _selection_payload(
                 selection=selection,
                 validation_rows=validation_rows,
@@ -1570,6 +1577,35 @@ def _selection_payload(
             }
             for rank, row in enumerate(selection["top_set"], start=1)
         ],
+    }
+
+
+#: Risk-adjusted performance ratios that are meaningless on an undersized
+#: out-of-sample holdout (#133). Factual fields (trade counts, pnl, returns
+#: in currency) stay: they describe what happened, not whether it is
+#: statistically meaningful.
+_OOS_RISK_METRIC_KEYS = frozenset(
+    {
+        "sharpe_ratio",
+        "sharpe",
+        "sortino_ratio",
+        "sortino",
+        "calmar_ratio",
+        "calmar",
+        "max_drawdown_pct",
+        "max_drawdown",
+        "psr",
+        "deflated_sharpe_ratio",
+    }
+)
+
+
+def _withhold_oos_risk_metrics(stats: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop risk-adjusted ratios from OOS stats below the daily minimum."""
+    return {
+        key: value
+        for key, value in dict(stats).items()
+        if key not in _OOS_RISK_METRIC_KEYS
     }
 
 
@@ -2252,10 +2288,12 @@ def _run_risk_parity_covariance_optimization(
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
         # This path has no overfitting verdict to carry the failure, so an
-        # undersized OOS holdout withholds its statistics entirely rather
+        # undersized OOS holdout withholds its risk-adjusted ratios rather
         # than leaving them readable as if they were evidence.
-        "test_stats": (
-            _json_safe(test_stats) if oos_status == "available" else {}
+        "test_stats": _json_safe(
+            test_stats
+            if oos_status == "available"
+            else _withhold_oos_risk_metrics(test_stats)
         ),
         "oos_status": oos_status,
         "oos_daily_observations": test_daily_observations,

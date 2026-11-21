@@ -1024,6 +1024,12 @@ def test_insufficient_oos_daily_observations_fail_the_overfitting_verdict(
         "computable": True,
     }
     assert any("daily observations" in reason for reason in overfitting["reasons"])
+    # Risk-adjusted ratios are withheld from the headline holdout; the
+    # factual fields stay for diagnostics.
+    assert "sharpe_ratio" not in payload["final_test_stats"]
+    assert payload["final_test_stats"]["total_pnl"] is not None
+    assert "sharpe_ratio" not in payload["three_way"]["winner"]["test_metrics"]
+    assert payload["three_way"]["oos_metrics_withheld"] is True
 
 
 def test_configurable_oos_minimum_admits_a_smaller_holdout(

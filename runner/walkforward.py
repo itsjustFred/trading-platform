@@ -531,9 +531,27 @@ def run_walkforward(
         )
         fold_oos_sharpe = _metric(test_stats, "sharpe_ratio", "sharpe")
         fold_oos_drawdown = _metric(test_stats, "max_drawdown_pct")
+        stored_oos_stats = test_stats
         if oos_status != "available":
             fold_oos_sharpe = None
             fold_oos_drawdown = None
+            # The raw stats still carry the same risk-adjusted metrics; an
+            # undersized holdout must not leak them through oos_stats either.
+            stored_oos_stats = {
+                key: value
+                for key, value in test_stats.items()
+                if key
+                not in {
+                    "sharpe_ratio",
+                    "sharpe",
+                    "sortino_ratio",
+                    "sortino",
+                    "calmar_ratio",
+                    "calmar",
+                    "max_drawdown_pct",
+                    "max_drawdown",
+                }
+            }
         folds.append(
             {
                 "fold": index,
@@ -542,7 +560,7 @@ def run_walkforward(
                 "oos_sharpe": fold_oos_sharpe,
                 "oos_max_drawdown": fold_oos_drawdown,
                 "is_stats": train_stats,
-                "oos_stats": test_stats,
+                "oos_stats": stored_oos_stats,
                 "oos_equity_curve": oos_curve,
                 "oos_status": oos_status,
                 "oos_daily_observations": oos_daily_observations,

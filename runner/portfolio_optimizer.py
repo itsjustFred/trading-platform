@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 #: Minimum number of distinct DAILY out-of-sample observations before OOS
 #: Sharpe/drawdown statistics are meaningful (#133). Counted as distinct UTC
 #: dates of the aligned OOS timestamps — intraday bars on the same day are one
-#: observation because the metrics resample to daily returns.
+#: observation because risk-adjusted ratios need one sample per trading day,
+#: not one per bar.
 MIN_OOS_DAILY_OBSERVATIONS = 20
 
 

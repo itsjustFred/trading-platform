@@ -1330,4 +1330,7 @@ def test_risk_parity_withholds_test_stats_below_oos_minimum(
     assert payload["oos_status"] == "insufficient_oos_bars"
     assert payload["oos_daily_observations"] == 3
     assert payload["min_oos_daily_observations"] == 20
-    assert payload["test_stats"] == {}
+    # Risk-adjusted ratios are withheld; factual fields remain for diagnostics.
+    assert "sharpe_ratio" not in payload["test_stats"]
+    assert "max_drawdown_pct" not in payload["test_stats"]
+    assert payload["test_stats"]["total_pnl"] is not None
