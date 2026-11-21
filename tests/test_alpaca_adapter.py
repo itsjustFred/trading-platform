@@ -39,6 +39,11 @@ class _FakeOrder:
     status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
     submitted_at: datetime | None = None
+    #: What the broker reports as filled. ``object`` so a test can model a row the
+    #: adapter cannot read (a cancelled partial fill carries a quantity, an order
+    #: that never filled reads as zero, and a broker that cannot be asked says
+    #: something that is not a number).
+    filled_qty: object = 0.0
 
 
 @dataclass
@@ -779,6 +784,75 @@ def test_a_stop_that_fills_during_the_flatten_leaves_no_second_stop() -> None:
     assert client.submitted == []
 
 
+def test_a_restored_stop_is_sized_from_the_live_position() -> None:
+    """The stop is sized from the position, not from the flatten's snapshot.
+
+    The leg can fill while the flatten cancels it, so the live position is then
+    smaller than the one the flatten started from. A stop sized from the old
+    quantity oversells the position it is meant to protect, and when it triggers
+    it sells more than there is - a short opened by the very order that was
+    supposed to prevent one.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+        close_error=RuntimeError("broker refused to close"),
+    )
+    real_cancel = client.cancel_order_by_id
+
+    def _partly_fill_during_the_cancel(order_id: str) -> None:
+        real_cancel(order_id)
+        # The leg executed against the position it protected on its way out, so
+        # the broker now reports a smaller position than the flatten saw.
+        client.positions = [_FakePosition("AAPL", 3.0)]
+
+    client.cancel_order_by_id = _partly_fill_during_the_cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    (restored,) = client.submitted
+    assert float(restored.qty) == 3.0, "the stop was sized from the pre-flatten snapshot"
+    assert str(getattr(restored.side, "value", restored.side)).lower() == "sell"
+
+
+def test_a_restored_stop_takes_the_live_side_of_a_flipped_position() -> None:
+    """The other half: a position that flipped needs a stop on the other side.
+
+    The side the flatten started from is the side of a position the broker no
+    longer reports. Restoring a sell stop onto a short would never trigger on it
+    (and on a long it would be the wrong side of the book), so the restore reads
+    the position it is about to protect.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=10.0, stop_price=190.0
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+        close_error=RuntimeError("broker refused to close"),
+    )
+    real_cancel = client.cancel_order_by_id
+
+    def _flip_during_the_cancel(order_id: str) -> None:
+        real_cancel(order_id)
+        client.positions = [_FakePosition("AAPL", -5.0)]
+
+    client.cancel_order_by_id = _flip_during_the_cancel  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is False
+    (restored,) = client.submitted
+    assert float(restored.qty) == 5.0
+    assert str(getattr(restored.side, "value", restored.side)).lower() == "buy"
+
+
 def test_cancel_orphaned_protections_only_touches_flat_symbols() -> None:
     client = _FakeTradingClient(
         orders=[
@@ -944,6 +1018,35 @@ def test_a_refused_cancel_is_not_excused_for_an_order_that_filled() -> None:
         real_cancel(order_id)
 
     client.cancel_order_by_id = _refuse_a_cancel_that_filled  # type: ignore[method-assign]
+
+    outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
+
+    assert outcome.complete is False
+    assert any("sl-leg" in item for item in outcome.failed)
+
+
+def test_a_refused_cancel_is_not_excused_for_an_order_that_partly_filled() -> None:
+    """A stop that executed cannot be excused by its terminal state.
+
+    A sell stop that partly fills and is then cancelled reads back as ``canceled`` -
+    with the quantity it filled. The terminal state alone would excuse the
+    refusal, the sweep would report itself complete, and the daemon would stamp
+    STOPPED enforced while that fill sits open - on a flat symbol it is a short.
+    So the excusal also needs the order to have filled nothing.
+    """
+    client = _BracketPositionClient(positions=[], oco_siblings=False)
+    real_cancel = client.cancel_order_by_id
+
+    def _refuse_a_cancel_that_partly_filled(order_id: str) -> None:
+        if order_id == "sl-leg":
+            # The leg filled as the cancel was sent: the broker keeps the order,
+            # cancelled, with the quantity it managed to execute.
+            client.history["sl-leg"].status = "canceled"
+            client.history["sl-leg"].filled_qty = 4.0
+            raise RuntimeError("422: order is already filled")
+        real_cancel(order_id)
+
+    client.cancel_order_by_id = _refuse_a_cancel_that_partly_filled  # type: ignore[method-assign]
 
     outcome = asyncio.run(_adapter(client).cancel_orphaned_protections())
 
