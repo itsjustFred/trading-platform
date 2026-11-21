@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+import live_runner.daemon as daemon
 import live_runner.signal_archive as sa
 from live_runner.signal_archive import (
     SignalArchive,
@@ -16,6 +19,9 @@ from live_runner.signal_archive import (
     received_record,
     record_signal_decision,
 )
+from live_runner.signal_sources.discord_source import DiscordSignalSource
+from risk import TradeSignal
+from shared.models import LiveDeploymentConfig, LiveSignal
 
 
 @pytest.fixture()
@@ -25,6 +31,28 @@ def archive(tmp_path, monkeypatch):
     arch = SignalArchive(queue_size=64)
     yield arch
     arch.close(timeout=2.0)
+
+
+@pytest.fixture()
+def archive_env(tmp_path, monkeypatch):
+    """A tmp-DATA_DIR archive installed as the process singleton.
+
+    Production call sites resolve the archive through ``get_signal_archive``;
+    patching the module global keeps every record inside ``tmp_path``.
+    """
+    monkeypatch.setattr(sa._constants, "DATA_DIR", tmp_path)
+    arch = SignalArchive(queue_size=256)
+    monkeypatch.setattr(sa, "_ARCHIVE", arch)
+    yield arch
+    arch.close(timeout=2.0)
+
+
+def _all_records() -> list[dict]:
+    records: list[dict] = []
+    for path in sorted(sa.archive_dir().glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            records.append(json.loads(line))
+    return records
 
 
 def _read_records(arch: SignalArchive) -> list[dict]:
@@ -339,3 +367,320 @@ def test_market_features_empty_and_malformed() -> None:
         {"open": ["x"], "high": ["y"], "low": ["z"], "close": ["w"]}
     )
     assert market_features_from_frame(bad) == {}
+
+
+# -- discord_source integration -------------------------------------------------
+
+
+def _rest_message(
+    content: str,
+    *,
+    author_id: str = "bot-1",
+    message_id: str = "m1",
+    channel_id: str = "channel-1",
+    timestamp: str | None = "2026-11-21T14:30:00+00:00",
+    username: str = "ramjet_bot",
+    is_bot: bool = True,
+) -> dict:
+    return {
+        "id": message_id,
+        "content": content,
+        "timestamp": timestamp,
+        "channel_id": channel_id,
+        "type": 0,
+        "author": {"id": author_id, "username": username, "bot": is_bot},
+    }
+
+
+def _poll(source: DiscordSignalSource, messages: list[dict]) -> None:
+    async def _fetch(channel_id, **_kwargs):
+        return list(messages)
+
+    source._fetch_messages = _fetch
+    asyncio.run(source._poll_once("channel-1"))
+
+
+def _source(**kwargs) -> DiscordSignalSource:
+    options = {
+        "bot_name": "ramjet",
+        "token": "test-token",
+        "channel_ids": {"channel-1"},
+        "timeframe": "1h",
+        "trusted_author_ids": {"bot-1"},
+        "account_id": "acc-1",
+    }
+    options.update(kwargs)
+    return DiscordSignalSource(**options)
+
+
+def test_polled_parsed_signal_is_archived(archive_env: SignalArchive) -> None:
+    source = _source()
+    _poll(
+        source,
+        [
+            _rest_message(
+                "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+                message_id="m-parsed",
+            )
+        ],
+    )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_received"]
+    assert len(records) == 1
+    record = records[0]
+    assert record["discord_message_id"] == "m-parsed"
+    assert record["discord_author_id"] == "bot-1"
+    assert record["author_username"] == "ramjet_bot"
+    assert record["account_id"] == "acc-1"
+    assert record["bot_name"] == "ramjet"
+    assert record["parse_status"] == "parsed"
+    assert record["signal"]["symbol"] == "AAPL"
+    assert record["signal"]["action"] == "buy"
+    assert "Price" not in record["signal"]
+    assert "190.5" in record["content"]
+
+
+def test_polled_refused_signal_is_archived_with_reason(archive_env: SignalArchive) -> None:
+    source = _source()
+    _poll(
+        source,
+        [
+            _rest_message(
+                "Took profit on long AAPL",
+                message_id="m-refused",
+            )
+        ],
+    )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_received"]
+    assert len(records) == 1
+    record = records[0]
+    assert record["discord_message_id"] == "m-refused"
+    assert record["parse_status"] == "rejected"
+    assert record["refusal_reason"] == "non_entry_rejection"
+    assert record["signal"] is None
+
+
+def test_polled_untrusted_author_is_archived_as_rejected(archive_env: SignalArchive) -> None:
+    source = _source()
+    _poll(
+        source,
+        [
+            _rest_message(
+                "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
+                author_id="impostor",
+                message_id="m-impostor",
+            )
+        ],
+    )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_received"]
+    assert len(records) == 1
+    assert records[0]["refusal_reason"] == "untrusted_author"
+    assert records[0]["parse_status"] == "rejected"
+
+
+def test_non_emitting_poll_archives_nothing(archive_env: SignalArchive) -> None:
+    source = _source()
+    _poll(source, [_rest_message("**$AAPL** buy signal\nPrice: $190.50", message_id="m-skip")])
+    archive_env.flush(timeout=5.0)
+    before = len(_all_records())
+    asyncio.run(source._poll_once("channel-1", emit=False))
+    archive_env.flush(timeout=5.0)
+    assert len(_all_records()) == before
+
+
+# -- daemon decision integration -----------------------------------------------
+
+
+def _live_deployment(**overrides) -> LiveDeploymentConfig:
+    options = {
+        "strategy_name": "ramjet-live",
+        "account_id": "acc-1",
+        "symbols": ["EURUSD"],
+        "timeframe": "15m",
+        "signal_source": "discord",
+        "signal_config": {},
+        "settings": {},
+    }
+    options.update(overrides)
+    return LiveDeploymentConfig(**options)
+
+
+def _trade_signal(symbol: str = "AAPL") -> TradeSignal:
+    return TradeSignal(
+        action="buy",
+        symbol=symbol,
+        entry_price=190.5,
+        stop_loss=185.0,
+        take_profit=200.0,
+        timeframe="1h",
+        metadata={
+            "discord_message_id": "m-1",
+            "discord_channel_id": "channel-1",
+            "discord_author_id": "bot-1",
+            "discord_bot_name": "ramjet",
+            "discord_signal_type": "ram_jet_oversold_buy",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def test_dispatch_symbol_gate_refusal_is_archived(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    deployment = _live_deployment()
+    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _a: "")
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter=object(),
+            deployments_for_channel=[deployment],
+            trade_signal=_trade_signal(symbol="AAPL"),
+            accounts_env_values={},
+        )
+    )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
+    assert len(records) == 1
+    assert records[0]["outcome"] == "refused"
+    assert records[0]["reason"] == "symbol_not_covered"
+    assert records[0]["deployment_id"] == str(deployment.id)
+    assert records[0]["discord_message_id"] == "m-1"
+
+
+def test_prepare_stale_signal_records_refusal(
+    archive_env: SignalArchive,
+) -> None:
+    stale = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=190.5,
+        stop_loss=185.0,
+        take_profit=200.0,
+        timeframe="1h",
+        metadata={
+            "discord_message_id": "m-stale",
+            "discord_channel_id": "channel-1",
+            "received_at": stale,
+        },
+    )
+    deployment = _live_deployment()
+    decision = SignalDecisionRecorder(
+        trade_signal=signal, account_id="acc-1", deployment=deployment, archive=archive_env
+    )
+    prepared = asyncio.run(
+        daemon._prepare_discord_signal_for_submission(
+            "acc-1",
+            deployment,
+            signal,
+            signal_timeframe="1h",
+            wait_enabled=False,
+            decision=decision,
+        )
+    )
+    assert prepared is None
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
+    assert len(records) == 1
+    assert records[0]["outcome"] == "refused"
+    assert records[0]["reason"] == "stale_signal"
+
+
+def test_claim_and_submit_success_records_traded(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    deployment = _live_deployment()
+    normalized = _trade_signal()
+    live_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=190.5,
+        timestamp=datetime.now(timezone.utc),
+        metadata=dict(normalized.metadata),
+    )
+    prepared_signal = SimpleNamespace(symbol="AAPL", action="buy")
+
+    async def _prepare_order(_adapter, _deployment, _signal):
+        return prepared_signal, 1.0
+
+    class _Adapter:
+        async def submit_order(self, _signal, qty=None):
+            return "ord-42"
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
+    monkeypatch.setattr(
+        daemon, "claim_live_deployment_submission", lambda *_a, **_k: True
+    )
+    monkeypatch.setattr(
+        daemon, "release_live_deployment_submission", lambda *_a, **_k: True
+    )
+
+    decision = SignalDecisionRecorder(
+        trade_signal=normalized,
+        account_id="acc-1",
+        deployment=deployment,
+        archive=archive_env,
+    )
+    asyncio.run(
+        daemon._prepare_claim_and_submit_signal(
+            "acc-1",
+            _Adapter(),
+            deployment,
+            normalized,
+            live_signal,
+            is_exit=False,
+            decision=decision,
+        )
+    )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
+    assert len(records) == 1
+    assert records[0]["outcome"] == "traded"
+    assert records[0]["broker_order_id"] == "ord-42"
+
+
+def test_claim_and_submit_nothing_to_exit_records_ignored(
+    archive_env: SignalArchive, monkeypatch
+) -> None:
+    deployment = _live_deployment()
+    normalized = _trade_signal()
+    live_signal = LiveSignal(
+        deployment_id=str(deployment.id),
+        symbol="AAPL",
+        action="sell",
+        theoretical_price=190.5,
+        timestamp=datetime.now(timezone.utc),
+        metadata=dict(normalized.metadata),
+    )
+
+    async def _prepare_order(_adapter, _deployment, _signal):
+        raise daemon.NothingToExitError("nothing to close", broker_qty=0.0)
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
+
+    decision = SignalDecisionRecorder(
+        trade_signal=normalized,
+        account_id="acc-1",
+        deployment=deployment,
+        archive=archive_env,
+    )
+    asyncio.run(
+        daemon._prepare_claim_and_submit_signal(
+            "acc-1",
+            object(),
+            deployment,
+            normalized,
+            live_signal,
+            is_exit=True,
+            decision=decision,
+        )
+    )
+    archive_env.flush(timeout=5.0)
+    records = [r for r in _all_records() if r["type"] == "discord_signal_decision"]
+    assert len(records) == 1
+    assert records[0]["outcome"] == "ignored"
+    assert records[0]["reason"] == "nothing_to_exit"
