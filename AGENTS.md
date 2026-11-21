@@ -24,7 +24,7 @@ uv run ruff check <changed files>
 uv run mypy
 ```
 
-`mypy` takes no arguments: the scope comes from `files` in `[tool.mypy]`. Run both before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog), a blocking `ruff check --select <the enabled bug-class families>` (the advisory step cannot catch a new hit there), and mypy (blocking, same `uv run mypy` command and the same pinned version from `uv.lock`).
+`mypy` takes no arguments: the scope comes from `files` in `[tool.mypy]`. Run both before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `signal_bots`, `strategies`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog), a blocking `ruff check --select <the enabled bug-class families>` (the advisory step cannot catch a new hit there), and mypy (blocking, same `uv run mypy` command and the same pinned version from `uv.lock`).
 
 ## Issues
 

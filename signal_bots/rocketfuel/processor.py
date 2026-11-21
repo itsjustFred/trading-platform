@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -92,7 +92,7 @@ class RocketFuelSignalProcessor:
         return frame.drop(columns=["h_l", "h_pc", "l_pc", "tr"])
 
     @staticmethod
-    def _normalize_action(raw_action: Any) -> str:
+    def _normalize_action(raw_action: Any) -> Literal["buy", "sell"]:
         action = str(raw_action or "").strip().lower()
         if action in {"buy", "long"}:
             return "buy"
@@ -119,9 +119,8 @@ class RocketFuelSignalProcessor:
             raise ValueError("Latest ATR value is invalid for RocketFuel SL calculation")
 
         stop_loss: float | None
-        metadata: dict[str, Any] = dict(
-            raw_signal.get("metadata") if isinstance(raw_signal.get("metadata"), dict) else {}
-        )
+        raw_metadata = raw_signal.get("metadata")
+        metadata: dict[str, Any] = dict(raw_metadata if isinstance(raw_metadata, dict) else {})
         if action == "buy":
             stop_loss = entry_price - (atr_value * self.sl_multiplier)
         elif self.variant == "longandshort":
