@@ -150,6 +150,29 @@ Implementation:
 
 ## 4. Sizing
 
+- **Sizing basis (native, vectorbt, pynecore):** the `equity` every sizing
+  rule below denominates is **realized cash** — `initial_capital` plus the net
+  PnL of closed trade legs. The mark-to-market equity that feeds the equity
+  curve is never a sizing input: an open position's paper profit is not
+  spendable and an unrealized drawdown is not a realized loss. Native holds it
+  in `TradeEngine._sizing_equity` (decision record D2,
+  `docs/cleanup-16d1-money-path-semantics.md`); vectorbt accumulates it inline
+  and records it as `trade.meta["risk_math"]["equity_at_entry"]`; pynecore walks
+  the same realized ledger. A partial exit's proceeds enter the basis as soon
+  as the leg closes, less the fee model's cost for the legs that position has
+  already incurred (entry leg on its original quantity, plus each closed exit
+  leg) — never the exit leg its still-open remainder has not taken. The basis
+  is therefore *net realized cash*, not "`initial_capital` until the whole
+  trade closes" and not gross proceeds. MT5 is consistent with this basis but
+  cannot decide it: its EA risks a fixed cash amount and reads no account value
+  at all, and the repo's MT5 sizing code and the vectorbt runner each hold at
+  most one position, so they never size while a position is open.
+  **Documented per-engine divergence:** signal replay sizes on realized cash
+  *plus* the mark-to-market PnL of open positions (decision record D9 / F39,
+  pinned by `tests/test_portfolio_sharpe_annualization.py::TestReplaySizingEquity`)
+  — that engine's entries must react to an open drawdown, and its divergence
+  from the realized-only engines is a recorded decision, not an oversight.
+  Do not "align" one side without revisiting the corresponding decision record.
 - **Risk-based sizing** (`risk_per_trade_pct` set): position quantity is
   derived from the *actual* stop distance,
   `qty = (equity × risk_per_trade_pct) / |entry − stop|`, capped by the

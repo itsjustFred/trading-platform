@@ -179,6 +179,478 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "an unrealized drawdown must not reduce the cash available for sizing"
         )
 
+    # ─── #262: sizing WHILE a position is open ──────────────────────────────
+    # The two tests above only stay green on either basis: their first entry
+    # fills at the next bar's open and the paper PnL of the open position
+    # first appears in equity on the very bar the second entry is sized —
+    # which is *after* that bar's sizing call. The scenarios below put a real
+    # unrealized mark on the open position BEFORE the second entry is sized,
+    # so only the realized-cash basis can pass them.
+
+    @staticmethod
+    def _run_open_position_scenario(
+        mark: float, tmp_path: Path, parameters: dict | None = None
+    ) -> list:
+        """Two entries where the first is still OPEN and marked at ``mark``.
+
+        Bar 0 signals entry 1 (fill = bar 1 open, 101); bar 1 closes at
+        ``mark`` with entry 1 riding, so the bar-2 sizing call sees an open
+        position carrying real paper PnL. No bar trades through the 2%
+        fallback stop, so nothing is ever realized and the second entry is
+        sized while entry 1 is still open.
+        """
+        frame = _linear_frame(6, start=100.0)
+        # Bar 1 is entry 1's fill bar: keep its open (101) as the fill price
+        # but mark the close at ``mark`` so the open position carries paper
+        # PnL when the next bar is sized.
+        frame.loc[1, "high"] = max(mark, 101.0) + 0.5
+        frame.loc[1, "low"] = min(mark, 101.0) - 0.5
+        frame.loc[1, "close"] = mark
+        # Bar 2 signals entry 2 (sized from its close) and bar 3 fills it at
+        # its open — the same price, so creation and fill sizing agree.
+        for bar in (2, 3):
+            frame.loc[bar, "open"] = mark
+            frame.loc[bar, "high"] = mark + 0.5
+            frame.loc[bar, "low"] = mark - 0.5
+            frame.loc[bar, "close"] = mark
+
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)
+
+        engine = TradeEngine(
+            _config(tmp_path, parameters=parameters or {}), symbol="PROBE"
+        )
+        engine.run(frame, strategy)
+        assert len(engine.closed_trades) >= 2, "both entries must have filled"
+        return engine.closed_trades
+
+    def test_open_paper_profit_does_not_grow_next_entry(self, tmp_path: Path):
+        """An OPEN position's paper profit must not compound into the next size.
+
+        Entry 1 fills at 101 for 500 shares and rides to a 105 close, so
+        mark-to-market equity is 102k when entry 2 is sized at 105 on bar 2.
+        Realized cash is still 100k (nothing has closed), so the second entry
+        risks 1% of 100k over the 2% fallback stop (2.1) = 476.19 shares.
+        Mark-to-market sizing would risk 1% of 102k = 485.71 shares.
+        """
+        trades = self._run_open_position_scenario(105.0, tmp_path)
+        assert trades[1].quantity == pytest.approx(1000.0 / 2.1, rel=1e-9), (
+            "an open position's unrealized profit is not spendable: the second "
+            "entry must size from realized cash (100k), not mark-to-market (102k)"
+        )
+
+    def test_open_paper_loss_does_not_shrink_next_entry(self, tmp_path: Path):
+        """An OPEN position's paper loss must not deflate the next size.
+
+        Entry 1 rides down to a 99.5 close (paper −750 on 500 shares) while
+        entry 2 is sized at 99.5 on bar 2. Realized cash stays 100k, so the
+        second entry risks 1% of 100k over the 1.99 fallback stop = 502.51
+        shares; mark-to-market sizing would risk 1% of 99.25k = 498.74.
+        """
+        trades = self._run_open_position_scenario(99.5, tmp_path)
+        assert trades[1].quantity == pytest.approx(1000.0 / 1.99, rel=1e-9), (
+            "an open position's unrealized loss is not a realized loss: the "
+            "second entry must size from realized cash (100k), not 99.25k"
+        )
+
+    def test_recorded_equity_at_entry_is_the_sizing_basis(self, tmp_path: Path):
+        """``equity_at_entry`` (the shared-replay coefficient denominator)
+        must record the realized basis the order was SIZED from, not the
+        mark-to-market reporting equity — otherwise the multi-symbol replay
+        rescales a realized-cash quantity by a mark-to-market denominator."""
+        trades = self._run_open_position_scenario(105.0, tmp_path)
+        for trade in trades:
+            assert trade.meta["equity_at_entry"] == pytest.approx(
+                100_000.0, rel=1e-9
+            ), (
+                "equity_at_entry must be the realized sizing basis (100k); the "
+                "mark-to-market figure (102k with entry 1 riding) is reporting "
+                "equity, not the basis the quantity was computed from"
+            )
+
+    def test_recorded_basis_follows_the_surviving_quantity(self, tmp_path: Path):
+        """``equity_at_entry`` must be the basis the surviving quantity was
+        sized from, not whatever the ledger reads at fill time.
+
+        Entry 2 is a fallback-sized MARKET order with no stop, so D4 lets it
+        keep its creation-time quantity (sized at bar 2's close from realized
+        cash 100k). On bar 3 entry 1 stops out (−1,000 realized) *before*
+        entry 2 fills, so the fill-time ledger reads 99k. Recording that would
+        hand the shared-equity replay a coefficient ``quantity / equity_at_entry``
+        that no longer matches the quantity it is re-scaling.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0],
+                "high": [100.5, 100.5, 100.5, 89.5, 89.5, 89.5],
+                "low": [99.5, 99.5, 99.5, 88.0, 88.5, 88.5],
+                "close": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        # Entry 1 carries a real 10-point stop (hit on bar 3); entry 2 has no
+        # stop at all, so it is sized on the 2% fallback and keeps its
+        # creation-time quantity at fill.
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss})
+
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(100.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over its 10-point stop = 100 shares"
+        )
+        assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 3"
+        second = engine.closed_trades[1]
+        assert second.quantity == pytest.approx(500.0, rel=1e-9), (
+            "entry 2 keeps its creation-time size: 1% of 100k over the 2% "
+            "fallback stop (2.0) = 500 shares"
+        )
+        assert second.meta["equity_at_entry"] == pytest.approx(100_000.0, rel=1e-9), (
+            "the basis must be the one the 500 shares were sized from (100k); "
+            "the fill-time ledger (99k after entry 1's stop) is a different "
+            "number and would corrupt the replay's per-unit coefficient"
+        )
+
+    def test_resized_order_records_its_fill_time_basis(self, tmp_path: Path):
+        """The mirror rule: an order that IS re-sized at fill records the
+        fill-time basis, because that is the ledger its surviving quantity was
+        computed from.
+
+        Entry 2 carries an explicit ``stop_distance`` (5), so its MARKET fill
+        re-sizes it from the fill bar (89) — by which point entry 1 has stopped
+        out on that same bar and the realized basis reads 99k. Its quantity is
+        therefore 1% of 99k over the 5-point stop = 198 shares, and the basis
+        must be 99k (the creation-time 100k would no longer match).
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=7, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0, 89.0],
+                "high": [100.5, 100.5, 100.5, 89.5, 89.5, 89.5, 89.5],
+                "low": [99.5, 99.5, 99.5, 88.0, 88.5, 88.5, 88.5],
+                "close": [100.0, 100.0, 100.0, 89.0, 89.0, 89.0, 89.0],
+                "volume": [1000.0] * 7,
+            }
+        )
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
+        stop_distance = pd.Series(blanks[:2] + [5.0] + blanks[3:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss, "stop_distance": stop_distance})
+
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        second = engine.closed_trades[1]
+        assert second.quantity == pytest.approx(198.0, rel=1e-9), (
+            "the fill-time re-size uses the realized basis in force on the "
+            "fill bar: 1% of 99k over the 5-point stop = 198 shares"
+        )
+        assert second.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+            "a re-sized order records the basis its quantity was computed "
+            "from (99k at fill), not the creation-time figure (100k)"
+        )
+
+    def test_resized_limit_order_records_its_fill_time_basis(self, tmp_path: Path):
+        """The mirror rule for a LIMIT order, which is re-sized at fill too.
+
+        Entry 1 is a MARKET order with a 5-point stop (95) that fills at 100
+        for 200 shares; a LONG LIMIT at 98 (stop 96.5) is created on bar 1
+        while the realized cash is still 100k, and fills on bar 2 — the bar
+        entry 1 stops out on, so the ledger reads 99k by then. The LIMIT is
+        re-sized from its trigger price against that fill-time basis: 1% of
+        99,000 over the 1.5-point stop = 660 shares, so the recorded basis
+        must be 99,000. Leaving the creation-time figure (100k) on the order
+        hands the shared-equity replay a coefficient ``quantity /
+        equity_at_entry`` that no longer matches the quantity it re-scales.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 97.0, 96.0, 96.0, 96.0],
+                "high": [100.5, 100.5, 97.5, 96.5, 96.5, 96.5],
+                "low": [99.5, 99.5, 94.5, 96.0, 96.0, 96.0],
+                "close": [100.0, 100.0, 96.0, 96.0, 96.0, 96.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([True] + [False] * 5, index=frame.index)
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss})
+
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
+        original_fill = engine._fill_pending_orders
+        # The engine's own order factory emits MARKET orders only, so the
+        # LIMIT leg is created here (sized from its trigger price, the
+        # pending-order estimate that the fill-time re-size replaces).
+
+        def create_limit(row: pd.Series, i: int) -> None:
+            from runner.engine import Order, OrderType
+
+            engine.pending_orders.append(
+                Order(
+                    symbol="PROBE",
+                    direction="LONG",
+                    order_type=OrderType.LIMIT,
+                    created_index=i,
+                    created_time=engine._to_iso(row["timestamp"]),
+                    quantity=engine._calculate_position_size(
+                        entry_price=98.0,
+                        stop_loss_price=96.5,
+                        direction="LONG",
+                    ),
+                    limit_price=98.0,
+                    stop_loss=96.5,
+                )
+            )
+
+        def patched_fill(row: pd.Series, i: int) -> None:
+            if i == 1:
+                create_limit(row, i)
+            original_fill(row, i)
+
+        engine._fill_pending_orders = patched_fill  # type: ignore[method-assign]
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "entry 1 and the limit leg"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(200.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over its 5-point stop = 200 shares"
+        )
+        assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 2"
+        limit = engine.closed_trades[1]
+        assert limit.entry_price == pytest.approx(98.0, rel=1e-9), "limit fills at its trigger"
+        assert limit.quantity == pytest.approx(660.0, rel=1e-9), (
+            "the re-size uses the fill-time ledger: 1% of 99,000 over the "
+            "1.5-point stop = 660 shares, where the creation-time 100k would "
+            "have given 666.67"
+        )
+        assert limit.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+            "a re-sized LIMIT order records the fill-time basis (99k after "
+            "entry 1's stop), not the creation-time figure (100k)"
+        )
+
+    def test_aggregate_exposure_denominator_is_realized_cash(self, tmp_path: Path):
+        """The aggregate-exposure fraction must use the realized denominator.
+
+        Two open positions each risk 2% of 100k over a 5-point stop, so 0.04
+        of the 0.05 aggregate budget is already committed — while both ride an
+        8,000 paper profit (mark-to-market equity 108k). Entry 3 is sized on
+        the bar after the pump: with the realized denominator the remainder is
+        0.05 − 0.04 = 0.01 → 1,000 risk over the 5-point stop = 200 shares.
+        With a mark-to-market denominator the committed fraction reads
+        4,000/108,000 = 0.037, leaving 0.013 → 1,400 risk = 280 shares.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=9, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 100.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0],
+                "high": [100.5, 100.5, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0],
+                "low": [99.5, 99.5, 99.5, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0],
+                "close": [100.0, 100.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0],
+                "volume": [1000.0] * 9,
+            }
+        )
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[1] = True
+        entries.iloc[3] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        stop_distance = pd.Series([5.0] * len(frame), index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_distance": stop_distance})
+
+        config = _config(tmp_path, risk_per_trade_pct=0.02)
+        engine = TradeEngine(config, symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 3, "all three entries must have filled"
+        for trade in engine.closed_trades[:2]:
+            assert trade.quantity == pytest.approx(400.0, rel=1e-9), (
+                "each of the first two entries risks 2% of 100k over the "
+                "5-point stop = 400 shares"
+            )
+        assert engine.closed_trades[2].quantity == pytest.approx(200.0, rel=1e-9), (
+            "the third entry must see the aggregate exposure already committed "
+            "against realized cash (0.04), leaving 0.01 risk = 200 shares; the "
+            "mark-to-market figure would leave 0.013 = 280 shares"
+        )
+
+    def test_partial_exit_fees_are_not_spendable_while_owed(self, tmp_path: Path):
+        """A partial exit's gross PnL is realized, but the fee model has only
+        been paid for the legs it has already taken — so the next entry may
+        not size on cash that is still owed to it.
+
+        Entry 1 (500 shares @ 100, fee_rate 0.001) takes half off at 105: the
+        realized leg books 1,250 gross. By the time entry 2 is sized on the
+        next bar the fee model has incurred, and nothing else:
+
+        - the entry leg on the ORIGINAL 500 shares, 0.001 x 100 x 500 = 50,
+        - the exit leg of the 250 shares that closed, 0.001 x 105 x 250
+          = 26.25.
+
+        The exit leg of the 250 still-open shares is a future cost the
+        position has not incurred, so it is NOT held back. Basis = 100,000 +
+        1,250 − 76.25 = 101,173.75, and entry 2 risks 1% of that over the 2%
+        fallback stop (2.1).
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 106.0, 105.0, 105.0, 105.0],
+                "high": [100.5, 100.5, 106.0, 105.5, 105.5, 105.5],
+                "low": [99.5, 99.5, 99.0, 104.5, 104.5, 104.5],
+                "close": [100.0, 100.0, 106.0, 105.0, 105.0, 105.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[3] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        # A 50% take-profit at 105 (plus a second level that is never
+        # reached, so the ladder leaves a remainder open) on entry 1 only.
+        blanks: list[float | None] = [None] * len(frame)
+        tp1 = pd.Series([105.0] + blanks[1:], index=frame.index)
+        tp1_pct = pd.Series([0.5] + blanks[1:], index=frame.index)
+        tp2 = pd.Series([200.0] + blanks[1:], index=frame.index)
+        tp2_pct = pd.Series([0.5] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries,
+        exits,
+        {"tp1": tp1, "tp1_pct": tp1_pct, "tp2": tp2, "tp2_pct": tp2_pct},
+        )
+
+        # ``fee_rate`` takes precedence over the ``fees="zero"`` default that
+        # ``with_zero_fees`` merges in (resolve_fee_model's documented order),
+        # so this run is priced and the owed-fee branch is exercised.
+        config = _config(tmp_path, parameters={"fee_rate": 0.001})
+        engine = TradeEngine(config, symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(500.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over the 2% fallback stop (2.0) = 500 shares"
+        )
+        assert [leg.reason for leg in first.exits] == ["tp1", "end_of_data"], (
+            "the first rung must close half of entry 1 on bar 2, leaving the "
+            "remainder open (the second rung is never reached)"
+        )
+        assert [leg.quantity for leg in first.exits] == pytest.approx([250.0, 250.0]), (
+            "the 50% rung closes 250 of the 500 shares"
+        )
+        second = engine.closed_trades[1]
+        assert second.meta["equity_at_entry"] == pytest.approx(101_173.75, rel=1e-9), (
+            "the sizing basis is realized cash less the fees already incurred: "
+            "100,000 + 1,250 gross − 50 entry − 26.25 exit = 101,173.75"
+        )
+        assert second.quantity == pytest.approx(1011.7375 / 2.1, rel=1e-9), (
+            "entry 2 sizes from 101,173.75, not from the gross 101,250 the "
+            "ledger holds before any fee is charged, and not from 101,147.5 "
+            "which would wrongly hold back the remainder's future exit fee"
+        )
+
+    def test_entry_fee_is_owed_before_the_first_exit(self, tmp_path: Path):
+        """A position with NO exit yet still owes its entry leg, so the next
+        entry may not size on cash the fee model has already been paid.
+
+        Same shape as ``test_open_paper_profit_does_not_grow_next_entry`` but
+        priced (fee_rate 0.001): entry 1 keeps its creation-time size of 500
+        shares (1% of 100k over bar 0's 2% fallback stop) and fills at 101, so
+        its entry leg is 0.001 x 101 x 500 = 50.5. The basis entry 2 is sized
+        from is therefore 100,000 − 50.5 = 99,949.5, and entry 2 risks 1% of
+        that over bar 2's 2% fallback stop (2.1) = 475.8071... shares — where
+        a run that held nothing back would still size from the full 100,000.
+        """
+        trades = self._run_open_position_scenario(
+            105.0, tmp_path, parameters={"fee_rate": 0.001}
+        )
+        entry_fee = 0.001 * 101.0 * 500.0
+        assert trades[0].quantity == pytest.approx(500.0, rel=1e-9)
+        assert trades[1].quantity == pytest.approx(
+            (0.01 * (100_000.0 - entry_fee)) / 2.1, rel=1e-9
+        ), (
+            "an open position's entry leg is already owed: the basis is "
+            f"100,000 − {entry_fee} , not the gross 100,000"
+        )
+        assert trades[1].meta["equity_at_entry"] == pytest.approx(
+            round(100_000.0 - entry_fee, 2), rel=1e-9
+        )
+
+    def test_finalized_fees_are_not_held_back_twice(self, tmp_path: Path):
+        """A closed trade's fee is in the ledger, so it is not held back again.
+
+        Entry 1 (200 shares @ 100, fee_rate 0.001) stops out at 95 on bar 2:
+        the leg books −1,000 gross and finalization backs out the round-trip
+        fee 0.001 x (100 + 95) x 200 = 39. Entry 2 is sized on bar 3, when the
+        only ledger entries are those, so its basis is 100,000 − 1,000 − 39 =
+        98,961 — its entry leg is no longer owed, and holding it back a second
+        time would read 98,941.
+        """
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=6, freq="h", tz="UTC"),
+                "open": [100.0, 100.0, 95.5, 96.0, 96.0, 96.0],
+                "high": [100.5, 100.5, 96.0, 96.5, 96.5, 96.5],
+                "low": [99.5, 99.5, 94.5, 95.5, 95.5, 95.5],
+                "close": [100.0, 100.0, 95.0, 96.0, 96.0, 96.0],
+                "volume": [1000.0] * 6,
+            }
+        )
+        entries = pd.Series([True, False, False, True, False, False], index=frame.index)
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        blanks: list[float | None] = [None] * len(frame)
+        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {"stop_loss": stop_loss})
+
+        config = _config(tmp_path, parameters={"fee_rate": 0.001})
+        engine = TradeEngine(config, symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) == 2, "both entries must have filled"
+        first = engine.closed_trades[0]
+        assert first.quantity == pytest.approx(200.0, rel=1e-9), (
+            "entry 1 risks 1% of 100k over its 5-point stop = 200 shares"
+        )
+        assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 2"
+        assert first.fees == pytest.approx(39.0, rel=1e-9), (
+            "the round-trip fee is 0.001 x (100 + 95) x 200 = 39"
+        )
+        second = engine.closed_trades[1]
+        assert second.meta["equity_at_entry"] == pytest.approx(98_961.0, rel=1e-9), (
+            "the basis is the net realized cash 100,000 − 1,000 − 39; the "
+            "closed trade's entry leg must not be held back a second time "
+            "(which would read 98,941)"
+        )
+        assert second.quantity == pytest.approx(989.61 / 1.92, rel=1e-9), (
+            "entry 2 sizes from 98,961: 1% of it over the 2% fallback stop "
+            "(1.92) = 515.421875 shares"
+        )
+
 
 # ─── F22: max_positions comes from risk policy, not strategy params ─────────
 
