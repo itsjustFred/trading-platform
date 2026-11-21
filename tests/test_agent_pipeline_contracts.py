@@ -1055,6 +1055,15 @@ def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
     assert '"$HEAD_SHA"' in body and ".head.sha" in body, "no head comparison"
     assert "exit 0" in body, "a superseded result does not stop the job"
     assert "not updating the comment" in body, "no reason is logged"
+    # The comparison is made twice, and the second one gates the write: the first ran before the
+    # marker search and the body was assembled, and a synchronize event inside that window still
+    # had a comment describing a diff nobody looks at posted as the current result. What is left
+    # is the window of the write itself, which no API can close - there is no conditional comment
+    # update - so the footer's base...head pair is what keeps that result readable.
+    assert body.count("--jq .head.sha") == 2, "the head is read once, before the write"
+    reread = body.index("moved=$(gh api")
+    written = body.index("-F body=@body.md")
+    assert reread < written, "the write does not happen under the re-read head"
     assert MARKER in body, "the poster carries no marker of its own"
     assert "gh api" in body, "the poster does not use the REST API"
     # A second comment carrying the marker (a duplicate from an interrupted run, or one

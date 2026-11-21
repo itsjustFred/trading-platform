@@ -665,6 +665,18 @@ jobs:
             exit 0
           fi
           marker='<!-- actions-pre-mortem -->'
+          # The head is read again with the body in hand. The guard above ran before the marker
+          # search and before the body was assembled, and a synchronize event landing inside that
+          # window would still have been written over: a comment describing a diff nobody is
+          # looking at any more, presented as the current result. This narrows the window to the
+          # write itself, which no API closes - there is no conditional comment update - and the
+          # comment's footer names the base...head it was computed from, so a result that still
+          # slips through is readable rather than silently current.
+          moved=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$moved" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${moved} while this comment was being posted; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
           { echo "$marker"; cat comment.md; } > body.md
           existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
             --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
