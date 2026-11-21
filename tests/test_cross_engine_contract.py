@@ -699,10 +699,12 @@ class TestExitLevelGapped:
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_gapped_nan")
 
         native = _native_result(frame, strategy_fn)
+        vectorbt = _vectorbt_result(tmp_path, frame, text)
 
-        trade = native.trades[0]
-        assert trade.exits[0].price == pytest.approx(107.0)
-        assert trade.meta.get("exit_level_gapped") is True
+        for result in (native, vectorbt):
+            trade = result.trades[0]
+            assert trade.exits[0].price == pytest.approx(107.0)
+            assert trade.meta.get("exit_level_gapped") is True
 
     def test_gapped_level_via_native_adapter(self, tmp_path: Path):
         # End-to-end through NativeAdapter (OHLCV loaded from data_dir).
