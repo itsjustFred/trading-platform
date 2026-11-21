@@ -812,7 +812,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         try:
             self._trading_client.get_account()
-        except Exception:
+        except Exception:  # except-kind: money-decision
             await self.disconnect()
             raise
         self._connected = True
@@ -827,7 +827,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # must say so rather than promise a pass.
         try:
             await self.reconcile_executions()
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca execution reconciliation failed; fills may be missing until retry",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -856,7 +856,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             order = await asyncio.to_thread(
                 self._trading_client.get_order_by_client_id, signal_id
             )
-        except Exception:
+        except Exception:  # except-kind: money-decision
             # Unknown to this account or not found.
             return False
         broker_filled_qty = _to_float(
@@ -1055,7 +1055,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             usd_fees = await asyncio.to_thread(
                 fetch_account_activities, client, "FEE", after=window_start, until=now
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca commission backfill: reading account activities failed; commissions stay "
                 "unknown until the next pass",
@@ -1137,7 +1137,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 result = stop()
                 if inspect.isawaitable(result):
                     await result
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Failed to stop Alpaca stream cleanly",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -1176,7 +1176,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 trading_client.get_order_by_client_id,
                 canonical_signal_id,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             raise RuntimeError(
                 "Alpaca canonical signal already exists and broker recovery failed; "
                 "refusing possible duplicate submission."
@@ -2000,7 +2000,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             try:
                 await self._cancel_one(client, order_id)
                 cancel_accepted.add(order_id)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 if was_pending_cancel:
                     cancel_accepted.add(order_id)
                     logger.info(
@@ -2024,7 +2024,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # dropped, which a count alone would report as done.
         try:
             remaining = await self._list_open_orders(client)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return ControlOutcome(
                 completed=completed,
                 unidentified=tuple(unidentified),
@@ -2154,7 +2154,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """
         try:
             working = await self._list_open_orders(client)
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
             logger.warning(
                 "Could not re-read orders before restoring a stop; restoring anyway",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
@@ -2183,7 +2183,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 stop_price=stop_price,
             )
             await asyncio.to_thread(client.submit_order, order_data=request)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.critical(
                 "Failed to restore a stop on a position whose close was refused; "
                 "the position is unprotected",
@@ -2266,7 +2266,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
             try:
                 await self._cancel_one(client, order_id)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 return await self._abandon_flatten(
                     client,
                     symbol,
@@ -2282,7 +2282,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # quantity, and the close would then be refused. Confirm by re-read.
         try:
             remaining_orders = await self._list_open_orders(client)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return await self._abandon_flatten(
                 client,
                 symbol,
@@ -2311,7 +2311,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
         try:
             await asyncio.to_thread(client.close_position, symbol)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return await self._abandon_flatten(
                 client,
                 symbol,
@@ -2400,7 +2400,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 continue
             try:
                 await self._cancel_one(client, order_id)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 failed.append(f"{order_id}:{exc}")
                 continue
             completed += 1
@@ -2768,7 +2768,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     }
                 }
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Failed to process trade update",
                 extra={"data": {"account_id": self.account_id, "error": str(exc)}},
@@ -2801,7 +2801,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 await asyncio.to_thread(self._trading_stream.run)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 logger.warning(
                     "Alpaca trade stream disconnected, retrying",
                     extra={
@@ -2828,7 +2828,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             result = stop()
                             if inspect.isawaitable(result):
                                 await result
-                    except Exception:
+                    except Exception:  # except-kind: loop-survival
                         pass
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(backoff_seconds * 2, 30)

@@ -1602,7 +1602,7 @@ class DiscordSignalSource(BaseSignalSource):
                 last_activity=last_activity,
                 respect_operator_intent=True,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Failed to update discord service status",
                 extra={
@@ -2049,7 +2049,7 @@ class DiscordSignalSource(BaseSignalSource):
                     },
                 )
                 continue
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 logger.warning(
                     "Discord cursor priming failed",
                     extra={
@@ -2108,7 +2108,7 @@ class DiscordSignalSource(BaseSignalSource):
                             }
                         },
                     )
-                except Exception as exc:
+                except Exception as exc:  # except-kind: loop-survival
                     logger.warning(
                         "Discord poll iteration failed",
                         extra={
@@ -2162,7 +2162,7 @@ class DiscordSignalSource(BaseSignalSource):
                 },
             )
             raise DiscordAuthenticationError(message) from exc
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Initial discord poll failed; continuing with background loop",
                 extra={

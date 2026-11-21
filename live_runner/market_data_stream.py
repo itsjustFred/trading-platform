@@ -143,7 +143,7 @@ class _StreamWorker:
             try:
                 self.stream.run()
                 backoff = 2.0
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 if not self._running:
                     break
                 if _is_connection_limit_error(exc):
@@ -194,7 +194,7 @@ class _StreamWorker:
         if hasattr(self.stream, "unsubscribe_bars"):
             try:
                 self.stream.unsubscribe_bars()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
         if normalized:
             self._subscribe_symbols(sorted(normalized))
@@ -205,7 +205,7 @@ class _StreamWorker:
         if stream is not None and hasattr(stream, "stop"):
             try:
                 stream.stop()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
 
 
