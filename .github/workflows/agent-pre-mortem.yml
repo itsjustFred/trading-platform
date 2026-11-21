@@ -840,12 +840,24 @@ jobs:
           # publishes no outputs, so the value is derived from the event above; anything short
           # of a confirmed same-repo PR leaves the reporter alone rather than 404ing on a
           # commit this repository cannot read.
+          #
+          # Two things a cancelled `workflow_dispatch` cannot resolve, and this reporter does not
+          # pretend otherwise. Its payload carries no `pull_request` at all, so
+          # `github.event.pull_request.head.repo.full_name` is null and the comparison above is
+          # false rather than a confirmation; and a dispatch that omitted `head_sha` names no
+          # commit, while "Mark running" ran under the resolved one. A dispatch cancelled inside
+          # resolve can therefore leave a `pending` mark this job cannot find: the only way to
+          # find it is reading `pulls/N` by number, which needs a token scope this job does not
+          # hold (it writes one status and nothing else), and widening a cancellation reporter's
+          # scopes for a window of seconds is not a trade worth making. So the mark can strand,
+          # and the log says that - it does not claim a fork ran, and it does not claim this run
+          # marked nothing pending, because both are false in exactly the case that matters.
           if [ "$SAME_REPO" != "true" ]; then
-            echo "::notice::A fork PR was not pre-mortemed, or its repository could not be read; nothing was marked pending."
+            echo "::warning::Could not confirm from the event that this run's PR is in this repository; a pending mark, if this run wrote one, is left pending until a later run of that commit clears it."
             exit 0
           fi
           if [ -z "$HEAD_SHA" ]; then
-            echo "::warning::Resolve wrote no head SHA and the event named none; this run marked nothing pending."
+            echo "::warning::Resolve wrote no head SHA and the event named none; a pending mark, if this run wrote one, is left pending until a later run of that commit clears it."
             exit 0
           fi
           # A cancelled run is the case the identity check exists for: what cancelled it

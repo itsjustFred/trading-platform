@@ -544,6 +544,31 @@ def test_the_pending_mark_is_converted_only_when_this_run_wrote_it(tmp_path) -> 
 
 
 @needs_bash
+def test_a_cancelled_dispatch_is_not_reported_as_a_fork_or_as_nothing_marked(tmp_path) -> None:
+    """A cancelled job publishes no outputs, and a `workflow_dispatch` payload carries no
+    `pull_request`, so the cancellation reporter's ownership fallback resolves to false and its
+    SHA fallback to nothing - while "Mark running" ran under both, having already confirmed
+    same-repo ownership. The mark can therefore strand: finding it means reading `pulls/N` by
+    number, which needs a scope this job does not hold. The reporter says that instead of the
+    opposite, because both of the old messages were false in exactly that case - "a fork PR was
+    not pre-mortemed" (the run was a same-repo dispatch) and "this run marked nothing pending"
+    ("Mark running" had just run). Executed, so the messages are the reporter's own."""
+    step_name = "Report cancelled pre-mortem run"
+    for why, override in (
+        ("no ownership confirmation", {"SAME_REPO": "", "HEAD_SHA": REPORTER_ENV["HEAD_SHA"]}),
+        ("no head SHA", {"SAME_REPO": REPORTER_ENV["SAME_REPO"], "HEAD_SHA": ""}),
+    ):
+        result, calls = _run_reporter("report-cancelled", step_name, tmp_path, [], override)
+        assert result.returncode == 0, f"{why}: reporter failed: {result.stderr}"
+        assert "fork" not in result.stdout, f"{why}: claims a fork PR ran:\n{result.stdout}"
+        assert "marked nothing pending" not in result.stdout, (
+            f"{why}: claims nothing was marked pending:\n{result.stdout}"
+        )
+        assert "left pending" in result.stdout, f"{why}: does not say the mark can strand"
+        assert "state=error" not in calls, f"{why}: wrote a status it cannot place"
+
+
+@needs_bash
 def test_a_reporter_case_is_not_decided_by_a_previous_cases_pages(tmp_path) -> None:
     """The stub serves the status list from `page-N.json` files, and the four reporters are run
     several times per test against the same `tmp_path`. A two-page case leaves `page-2.json`
