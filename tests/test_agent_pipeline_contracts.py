@@ -70,8 +70,18 @@ What is pinned here:
   tree-clean check, the two-level skill selection) stay identical modulo the names each copy
   substitutes - the selection by a test of its own, which is the only way a copy that is not
   strict can fail it;
-- the agent job that reads the checkout holds only `contents: read`, keeps no credentials, and
-  fails the run when HEAD moved or the tree is dirty.
+- the agent job that reads the checkout holds only `contents: read` plus the
+  `statuses: write` its pending mark needs, keeps no credentials, and fails the
+  run when HEAD moved or the tree is dirty;
+- a quota, rate-limit or region refusal is never red (decision of 2026-11-21,
+  issue #296): the `quota-probe` job pings the same model before the agent job
+  installs anything and only a positive quota signature skips the agent - a
+  dead probe fails open so a genuine failure still fails - the mid-run quota
+  path in the agent step reports "not run: quota" instead of failing, the post
+  job comments the skip and warns, and the commit status is `pending` with the
+  reason or absent entirely, never `error` and never a verdict `success`. The
+  probe's classification, the agent step's quota branch and the gating
+  expressions are executed here against stubs, not just read.
 
 The chain this file used to pin (review -> mutation -> pre-mortem, dispatched stage by stage, on
 the branch `test/agent-pipeline-chain`) is abandoned: the three are independent workflows now.
@@ -390,10 +400,11 @@ REPORTER_ENV = {
     "RUN_URL": "https://github.com/itsjustFred/trading-platform/actions/runs/123",
 }
 
-# Every stop-path reporter of the pre-mortem: (job name, step name). The four that turn a
-# `pending` status into an `error`.
+# Every stop-path reporter of the pre-mortem: (job name, step name). The three that turn a
+# `pending` status into an `error`. The resolve job has none: it marks nothing - the pending
+# mark is the agent job's, written only once the quota probe has cleared the run to happen -
+# so a resolve failure can strand no status and needs no reporter.
 REPORTERS = (
-    ("resolve", "Report resolve failure"),
     ("post", "Report failed pre-mortem run"),
     ("post", "Report post failure"),
     ("report-cancelled", "Report cancelled pre-mortem run"),
@@ -516,7 +527,7 @@ T2 = "2026-11-20T11:00:00Z"
 
 @needs_bash
 def test_the_pending_mark_is_converted_only_when_this_run_wrote_it(tmp_path) -> None:
-    """The four stop-path reporters exist to keep the stage from stranding `pending`, and each one
+    """The three stop-path reporters exist to keep the stage from stranding `pending`, and each one
     is the workflow's own shell run against a stub `gh` - a string assertion on `--arg ctx` pinned
     the broken `gh api --arg` for three rounds, because nothing here ever executed a reporter.
     Three behaviours are pinned, each with the failure it prevents:
@@ -797,12 +808,13 @@ _EXPR_TOKEN = re.compile(
       |     (?P<and>&&)
       |     (?P<not>!)(?!=)
       |     (?P<eq>==)
+      |     (?P<ne>!=)
       |     (?P<lparen>\()
       |     (?P<rparen>\))
       |     (?P<comma>,)
       |     (?P<string>'(?:[^']*)'|"[^"]*")
       |     (?P<number>-?\d+)
-      |     (?P<path>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)
+      |     (?P<path>[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*)
       |     (?P<unknown>\S)
     )""",
     re.VERBOSE,
@@ -885,6 +897,9 @@ class _Expr:
         if self._peek() and self._peek()[0] == "eq":
             self._eat("eq")
             return left == self._atom()
+        if self._peek() and self._peek()[0] == "ne":
+            self._eat("ne")
+            return left != self._atom()
         return left
 
     def _atom(self):
@@ -912,9 +927,19 @@ class _Expr:
                     if self._peek() and self._peek()[0] == "comma":
                         self._eat("comma")
                 self._eat("rparen")
-                assert text == "format", f"unknown function {text}()"
-                assert arguments, "format() takes a template"
-                return str(arguments[0]).format(*arguments[1:])
+                if text == "format":
+                    assert arguments, "format() takes a template"
+                    return str(arguments[0]).format(*arguments[1:])
+                # The status-check functions a job `if` may call. The scenarios
+                # below are all non-cancelled runs, so the defaults answer what
+                # GitHub would for them; a test that needs another answer puts it
+                # in the context's "fns" map.
+                assert text in ("cancelled", "success", "failure", "always"), (
+                    f"unknown function {text}()"
+                )
+                assert not arguments, f"{text}() takes no arguments"
+                defaults = {"cancelled": False, "success": True, "failure": False, "always": True}
+                return self.context.get("fns", {}).get(text, defaults[text])
             value = self.context
             for part in text.split("."):
                 # A path the payload does not carry is null, exactly as GitHub resolves it:
@@ -1150,7 +1175,9 @@ def test_the_pre_mortem_skips_drafts_and_forks() -> None:
     resolve = data["jobs"]["resolve"]
     assert "draft" in str(resolve.get("if", "")), "a draft PR is not skipped"
     agent_name, agent = _agent_job(data)
-    assert agent.get("permissions") == {"contents": "read"}, (
+    # The agent job also writes the pending mark, so it holds `statuses: write`
+    # on top of the read scope.
+    assert agent.get("permissions") == {"contents": "read", "statuses": "write"}, (
         f"{agent_name} job permissions are {agent.get('permissions')}"
     )
     assert "same_repo" in str(agent.get("if", "")), "fork PRs are not skipped"
@@ -1163,6 +1190,12 @@ def test_the_pre_mortem_skips_drafts_and_forks() -> None:
             body = _run(step)
             if "statuses/" not in body and "issues/" not in body:
                 continue
+            # The pre-mortem's "Mark running" is the one status write the agent
+            # job owns: it moved here from resolve so a quota-skipped run never
+            # strands a `pending` mark. Its token is step-scoped - the agent step
+            # never sees it - which is what the secrets check below still pins.
+            if step.get("name") == "Mark running" and job_name == agent_name:
+                continue
             assert job_name != agent_name, (
                 f"the agent job posts a status or a comment ({step.get('name')!r})"
             )
@@ -1170,6 +1203,8 @@ def test_the_pre_mortem_skips_drafts_and_forks() -> None:
                 f"{job_name}/{step.get('name')}: posts without the repo token"
             )
     for step in _steps(agent):
+        if step.get("name") == "Mark running":
+            continue
         assert "secrets." not in str(_step_env(agent, step)) + _run(step), (
             f"the agent job receives a secret ({step.get('name')!r})"
         )
@@ -1303,24 +1338,34 @@ def test_context_marker_and_title_belong_to_exactly_one_workflow() -> None:
 
 
 def test_the_pre_mortem_marks_the_analysed_commit_pending_once() -> None:
-    """A push shows the stage as running from the first commit, and the mark goes to the commit
-    being analysed - not, on a manual rerun, to the PR's current head. One write only: two
-    pending marks would race, and a second one in an agent job would hand the agent a token."""
+    """A push shows the stage as running while the agent job works, and the mark goes to the
+    commit being analysed - not, on a manual rerun, to the PR's current head. One write only:
+    two pending marks would race, and a second one in an agent job would hand the agent a
+    token. The mark lives in the agent job, not resolve: a run the quota probe skips never
+    reaches it, so a quota skip leaves no `pending` status behind at all - the "not run:
+    quota" path is genuinely neutral, which is what the decision of 2026-11-21 asks for."""
     data = _load(PREMORTEM)
-    resolve = data["jobs"]["resolve"]
-    mark = _find_step(resolve, r"^Mark running$")
+    agent_name, agent = _agent_job(data)
+    assert agent_name == "premortem", f"the agent job is {agent_name!r}"
+    mark = _find_step(agent, r"^Mark running$")
     body = _run(mark)
     assert "-f state=pending" in body and "$PREMORTEM_CONTEXT" in body, "no pending mark"
-    assert "steps.pr.outputs.head" in str(mark["env"]["HEAD_SHA"]), "the mark is not on the head"
-    assert "same_repo" in str(mark.get("if", "")) and "number" in str(mark.get("if", "")), (
-        "the mark runs for every PR, including forks"
+    assert "statuses/${HEAD_SHA}" in body, "the mark is not on the analysed head"
+    assert "needs.resolve.outputs.head" in str(agent["env"]["HEAD_SHA"]), (
+        "the mark's HEAD_SHA is not the resolved analysed head"
     )
-    assert _all_run_bodies(data).count("state=pending") == 1, "more than one pending write"
+    assert _all_run_bodies(data).count("state=pending") == 2, (
+        "the pending writes are not the mark and the quota reporter's rewrite"
+    )
     # Its description is "Running": there is no result yet, so it names no analysed pair - which
     # is why the header promises the pair on every *terminal* status description and not on this
     # one. What it carries instead is the run computing it, so a reader of a pending status has
     # somewhere to go.
     assert '-f target_url="$RUN_URL"' in body, "the pending mark links no run"
+    # And resolve marks nothing: a quota-skipped run must not strand a pending status.
+    assert "statuses/" not in _job_bodies([data["jobs"]["resolve"]]), (
+        "resolve writes a commit status, so a skipped run can strand a pending mark"
+    )
 
 
 def test_a_superseded_result_does_not_overwrite_a_newer_comment() -> None:
@@ -1412,7 +1457,6 @@ def test_every_error_status_names_the_analysed_commit() -> None:
     readable, and it costs nothing in the description."""
     data = _load(PREMORTEM)
     reporters = (
-        (data["jobs"]["resolve"], r"^Report resolve failure$"),
         (data["jobs"]["post"], r"^Report failed pre-mortem run$"),
         (data["jobs"]["post"], r"^Report post failure$"),
         (data["jobs"]["report-cancelled"], r"^Report cancelled pre-mortem run$"),
@@ -1448,7 +1492,6 @@ def test_the_pending_conversion_is_identity_bearing() -> None:
     can close; the reporters' comments call it best effort rather than claim the invariant."""
     data = _load(PREMORTEM)
     reporters = (
-        (data["jobs"]["resolve"], r"^Report resolve failure$"),
         (data["jobs"]["post"], r"^Report failed pre-mortem run$"),
         (data["jobs"]["post"], r"^Report post failure$"),
         (data["jobs"]["report-cancelled"], r"^Report cancelled pre-mortem run$"),
@@ -1482,29 +1525,29 @@ def test_the_pending_conversion_is_identity_bearing() -> None:
         )
     # The mark has to be attributable in the first place: without the run URL on it, no reporter
     # could tell its own pending status from another run's.
-    mark = _run(_find_step(data["jobs"]["resolve"], r"^Mark running$"))
+    mark = _run(_find_step(data["jobs"]["premortem"], r"^Mark running$"))
     assert '-f target_url="$RUN_URL"' in mark, "the pending mark names no run"
 
 
 def test_every_stop_path_leaves_the_pre_mortem_context_terminal() -> None:
-    """The bookkeeping that keeps the stage from stranding `pending`: a resolve failure, a failed
-    agent run, a failed post step and a cancelled run each write `error` for their own context,
-    and each converts a `pending` status this run wrote itself rather than any still-pending one -
+    """The bookkeeping that keeps the stage from stranding `pending`: a failed agent run, a
+    failed post step and a cancelled run each write `error` for their own context, and each
+    converts a `pending` status this run wrote itself rather than any still-pending one -
     including the reporter of the failed agent run, whose family (a rerun of the same commit
     that ran beside this one through the concurrency group) is exactly the case where a terminal
-    status is already there. Deleting a reporter, or writing a literal context somewhere, would
-    leave a SHA `pending` with no error anywhere - or a typo'd context nothing reads."""
+    status is already there. There is no resolve-failure reporter: resolve marks nothing, so a
+    resolve failure strands no status. Deleting a reporter, or writing a literal context
+    somewhere, would leave a SHA `pending` with no error anywhere - or a typo'd context nothing
+    reads."""
     data = _load(PREMORTEM)
-    resolve, post = data["jobs"]["resolve"], data["jobs"]["post"]
+    post = data["jobs"]["post"]
     # Every reporter of a stopped run only clears a status that is still pending, so a failure of
     # one run cannot overwrite the terminal verdict of another run of the same commit.
     clear_pending_only = (
-        "Report resolve failure",
         "Report failed pre-mortem run",
         "Report post failure",
     )
     for job, pattern in (
-        (resolve, r"^Report resolve failure$"),
         (post, r"^Report failed pre-mortem run$"),
         (post, r"^Report post failure$"),
     ):
@@ -1557,29 +1600,22 @@ def test_a_cancelled_run_leaves_no_pending_stage_status() -> None:
         assert "$PREMORTEM_CONTEXT" in body, f"{name}: reporter writes no context variable"
 
 
-def test_the_resolve_reporter_falls_back_to_the_resolved_head() -> None:
-    """A first-step failure writes no `head`, yet the run may already have marked the analysed
-    commit pending: the reporter then falls back to the commit named by the event, and to the
-    dispatch input, so a stranded `pending` still reaches an `error`. The cancellation reporter
-    needs the same chain for the same reason and is pinned with it here - a cancelled job
-    publishes no outputs, so without the fallback a run cancelled after "Mark running" strands
-    the mark on its SHA with nothing but a warning in a log nobody opens."""
-    reporters = (
-        (_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$"),
-        (_load(PREMORTEM)["jobs"]["report-cancelled"], r"^Report cancelled pre-mortem run$"),
+def test_the_cancelled_reporter_falls_back_to_the_resolved_head() -> None:
+    """A cancelled job publishes no outputs, so without the fallback chain a run cancelled
+    after "Mark running" strands the mark on its SHA with nothing but a warning in a log
+    nobody opens: the reporter falls back to the commit named by the event, and to the
+    dispatch input."""
+    job = _load(PREMORTEM)["jobs"]["report-cancelled"]
+    step = _find_step(job, r"^Report cancelled pre-mortem run$")
+    sha = str(_step_env(job, step).get("HEAD_SHA", ""))
+    assert sha.startswith("${{ needs.resolve.outputs.head"), (
+        f"the cancelled reporter must prefer the resolved head: {sha}"
     )
-    for job, pattern in reporters:
-        step = _find_step(job, pattern)
-        sha = str(_step_env(job, step).get("HEAD_SHA", ""))
-        assert sha.startswith(("${{ needs.resolve.outputs.head", "${{ steps.pr.outputs.head")), (
-            f"{pattern} must prefer the resolved head: {sha}"
-        )
-        assert "github.event.pull_request.head.sha" in sha and re.search(
-            r"inputs\.head_sha\s*\}\}$", sha
-        ), f"{pattern} has no fallback chain to the event's head and the dispatch input: {sha}"
-    resolve_step = _find_step(_load(PREMORTEM)["jobs"]["resolve"], r"^Report resolve failure$")
-    assert resolve_step.get("if") == "failure()", (
-        f"the reporter is skipped on {resolve_step.get('if')!r}"
+    assert "github.event.pull_request.head.sha" in sha and re.search(
+        r"inputs\.head_sha\s*\}\}$", sha
+    ), (
+        "the cancelled reporter has no fallback chain to the event's head and the "
+        f"dispatch input: {sha}"
     )
 
 
@@ -1606,45 +1642,28 @@ def test_the_cancelled_reporter_skips_a_fork_pr() -> None:
     )
 
 
-def test_the_resolve_reporter_skips_a_fork_pr() -> None:
-    """The resolve failure reporter runs on the same fork 404, and for the same reason: a
-    dispatch that refused a fork PR is a failed resolve, and its reporter reads the fork's head
-    commit to find the pending mark that was never written there."""
-    job = _load(PREMORTEM)["jobs"]["resolve"]
-    step = _find_step(job, r"^Report resolve failure$")
-    same_repo = str(_step_env(job, step).get("SAME_REPO", "")).strip()
-    assert "github.event.pull_request.head.repo.full_name == github.repository" in same_repo, (
-        f"the resolve reporter cannot tell a fork PR: {same_repo}"
-    )
-    assert '[ "$SAME_REPO" != "true" ]' in _run(step), (
-        "the resolve reporter reads a fork commit's status and fails on the 404"
-    )
-
-
-def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
-    """The free Zen models cap usage per period, and hitting the cap fails the run. That is an
-    infra failure, not a pre-mortem result: the run must fail (no comment is posted from it),
-    the post job must report the status as `error`, and the log must name the cause, so the
-    remedy - re-run the job - is the one the sibling workflows document."""
+def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
+    """The free Zen models cap usage per period, and an exhausted cap must not read as a
+    pre-mortem result: by the decision of 2026-11-21 (issue #296) a quota, rate-limit or
+    region refusal is reported as "not run: quota" - a warning and a comment - and never as
+    a red check or an `error` status, while a genuine failure still fails. Two paths carry
+    it: the `quota-probe` job pings the model before the agent job installs anything and a
+    positive quota signature skips the agent job (grey), and the agent step's own classifier
+    takes the same path for a cap that only appears mid-run. A transient failure and a
+    misconfiguration still need opposite remedies, so they are not one classifier: "re-run
+    after the quota resets" is the fix for a cap, a rate limit or a region refusal, and a lie
+    for a model or variant that cannot be resolved at all - there the run cannot succeed
+    until PREMORTEM_MODEL / PREMORTEM_VARIANT changes."""
     data = _load(PREMORTEM)
     agent = _agent_job(data)[1]
     body = _run(_find_step(agent, r"^Run pre-mortem agent$"))
-    patterns = re.search(r"grep -qiE '([^']+)'", body)
-    assert patterns, "the agent step does not recognise a usage limit"
-    for known in ("usage limit", "rate.?limit", "quota"):
-        assert known in patterns.group(1), f"{known!r} is not recognised"
-    assert "exit 1" in body, "a usage-limit failure does not fail the run"
-    # A transient failure and a misconfiguration need opposite remedies, so they are not one
-    # classifier: "re-run this job" is the fix for a cap, a rate limit or a region refusal,
-    # and a lie for a model or variant that cannot be resolved at all - there the run cannot
-    # succeed until PREMORTEM_MODEL / PREMORTEM_VARIANT changes, and telling an operator to
-    # re-run sends them into a loop while the stage stays `error` for everyone. So the two
-    # classes are separated, and each message names its own remedy.
     classes = re.findall(r"grep -qiE '([^']+)'", body)
     assert len(classes) >= 2, (
         "the failure classifier is one grep, so it cannot tell a cap from a misconfiguration"
     )
     transient, misconfigured = classes[0], classes[1]
+    for known in ("usage limit", "rate.?limit", "quota"):
+        assert known in transient, f"{known!r} is not recognised as transient"
     for misconfiguration in ("no provider", "model (is )?(not (found|available|supported))"):
         assert misconfiguration in misconfigured, (
             f"{misconfiguration!r} is not classified as a configuration error"
@@ -1656,33 +1675,367 @@ def test_the_free_model_usage_limit_is_an_infra_error_not_a_verdict() -> None:
     for configured_only in ("no provider", "unknown variant"):
         assert configured_only not in transient, (
             f"{configured_only!r} is classified as transient, so a permanent misconfiguration "
-            "would tell the operator to re-run"
+            "would take the quota path"
         )
-    errors = [line for line in body.splitlines() if "::error::" in line]
-    rerun = [line for line in errors if "re-run" in line]
-    assert rerun, "no message states the remedy"
-    assert any("PREMORTEM_MODEL" in line for line in errors), (
-        "a misconfiguration does not name the variable that has to change"
+    # The transient class takes the quota path: a warning that names the remedy, the
+    # "not run: quota" comment body, the `quota` output the post job reads, and a clean
+    # exit - the step does not fail, so the job does not go red.
+    quota_branch = body.split("grep -qiE '" + transient + "'", 1)[1]
+    head = quota_branch.split("elif", 1)[0]
+    assert "::warning::" in head and "not run: quota" in head, (
+        "the transient class does not warn and name the quota skip"
     )
-    assert not any("re-run this job" in line for line in errors if "PREMORTEM_MODEL" in line), (
-        "a misconfiguration is told to re-run, which cannot succeed"
+    assert 'echo "quota=true" >> "$GITHUB_OUTPUT"' in head, (
+        "the agent step does not report the quota skip to the post job"
     )
+    assert "Not run: quota" in head and "comment.md" in head, (
+        "the mid-run quota path writes no 'not run: quota' comment"
+    )
+    assert "exit 0" in head, "the mid-run quota path still fails the step"
     # The reason is only in stderr. A failed run has ended with a bare "exit code 1" and no
     # cause, so a capped model and a broken prompt could not be told apart from the log: the
     # captured output is echoed, bounded so a runaway agent cannot flood the log.
     assert "tail -c" in body and "$out.raw" in body, (
         "the agent's failing output is not echoed, so the run log shows no reason"
     )
+    # A genuine failure still fails: the misconfiguration and the unclassified classes exit 1,
+    # and the post job still reports a failed run as `error`.
+    assert body.count("exit 1") >= 1, "a genuine agent failure does not fail the run"
     post = data["jobs"]["post"]
     report = _find_step(post, r"^Report failed pre-mortem run$")
     assert "state=error" in _run(report), "a failed run is not reported as an error"
     assert "needs.premortem.result == 'failure'" in str(post.get("if", "")), (
         "the post job does not run for a failed agent job"
     )
-    for poster in (r"^Post or update pre-mortem comment$", r"^Set status$"):
-        assert "needs.premortem.result == 'success'" in str(
-            _find_step(post, poster).get("if", "")
-        ), f"{poster} runs on a failed agent job"
+    # The verdict status is not written for a quota skip, and the quota reporter rewrites
+    # this run's own pending mark as `pending` - never `error`, never a verdict `success`.
+    set_status = _find_step(post, r"^Set status$")
+    assert "needs.premortem.outputs.quota != 'true'" in str(set_status.get("if", "")), (
+        "Set status maps an empty quota-path verdict to `error`"
+    )
+    quota_report = _find_step(post, r"^Report quota skip$")
+    quota_body = _run(quota_report)
+    assert "state=pending" in quota_body and "state=error" not in quota_body, (
+        "the quota skip writes a red or terminal status"
+    )
+    assert "Not run: quota" in quota_body, "the quota status does not say why nothing ran"
+    assert '"$owner" = "true"' in quota_body, "the quota reporter rewrites another run's status"
+
+
+def _job_if(data: dict, job_name: str) -> str:
+    """The job's `if` expression, without the `${{ }}` wrapper."""
+    expr = str(data["jobs"][job_name].get("if", ""))
+    match = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip())
+    assert match, f"{job_name}: if is not an expression: {expr!r}"
+    return match.group(1)
+
+
+def _run_context_for(needs: dict) -> dict:
+    """The expression context a job `if` is evaluated against: `needs.<job>.*`."""
+    return {"needs": needs}
+
+
+def test_the_quota_probe_gates_the_agent_job() -> None:
+    """The decision's grey check is a job shape, not a status write: the probe runs after
+    resolve and before the agent job installs anything, and only its positive `available=
+    false` skips the agent - a probe that failed, was skipped or never ran leaves the output
+    empty, which is not 'false', so the agent still runs and a genuine failure still fails.
+    The `if` is executed against the needs contexts, because a string assertion cannot tell
+    a gate that skips on quota from one that also skips on a dead probe."""
+    data = _load(PREMORTEM)
+    jobs = data["jobs"]
+    probe = jobs["quota-probe"]
+    assert probe.get("needs") == "resolve" or probe.get("needs") == ["resolve"], (
+        "the probe does not wait for the PR to be resolved"
+    )
+    assert "same_repo" in str(probe.get("if", "")), (
+        "the probe pings the model for a fork PR or a skipped resolve"
+    )
+    assert probe.get("permissions") == {}, "the probe holds a token scope it does not need"
+    assert not any(str(s.get("uses", "")).startswith("actions/checkout") for s in _steps(probe)), (
+        "the probe checks out the PR it is only meant to price"
+    )
+    assert jobs["premortem"].get("needs") == ["resolve", "quota-probe"] or set(
+        jobs["premortem"].get("needs") or []
+    ) >= {"resolve", "quota-probe"}, "the agent job does not need the probe"
+    agent_if = _job_if(data, "premortem")
+    post_if = _job_if(data, "post")
+
+    def evaluate(expr: str, needs: dict):
+        return _Expr(expr, _run_context_for(needs)).evaluate()
+
+    resolved = {"result": "success", "outputs": {"same_repo": "true", "number": "1"}}
+    scenarios = {
+        "quota available": (
+            agent_if,
+            {
+                "resolve": resolved,
+                "quota-probe": {
+                    "result": "success",
+                    "outputs": {"available": "true"},
+                },
+            },
+            True,
+        ),
+        "quota exhausted": (
+            agent_if,
+            {
+                "resolve": resolved,
+                "quota-probe": {
+                    "result": "success",
+                    "outputs": {"available": "false"},
+                },
+            },
+            False,
+        ),
+        "probe job itself failed": (
+            agent_if,
+            {"resolve": resolved, "quota-probe": {"result": "failure", "outputs": {}}},
+            True,
+        ),
+        "probe skipped with the resolve": (
+            agent_if,
+            {
+                "resolve": {"result": "skipped", "outputs": {}},
+                "quota-probe": {"result": "skipped", "outputs": {}},
+            },
+            False,
+        ),
+        "fork PR": (
+            agent_if,
+            {
+                "resolve": {"result": "success", "outputs": {"same_repo": "false"}},
+                "quota-probe": {"result": "skipped", "outputs": {}},
+            },
+            False,
+        ),
+        "post on a quota skip": (
+            post_if,
+            {
+                "resolve": resolved,
+                "premortem": {"result": "skipped", "outputs": {}},
+                "quota-probe": {"result": "success", "outputs": {"available": "false"}},
+            },
+            True,
+        ),
+        "post on a fork": (
+            post_if,
+            {
+                "resolve": {"result": "success", "outputs": {"same_repo": "false"}},
+                "premortem": {"result": "skipped", "outputs": {}},
+                "quota-probe": {"result": "skipped", "outputs": {}},
+            },
+            False,
+        ),
+        "post on a failed agent job": (
+            post_if,
+            {
+                "resolve": resolved,
+                "premortem": {"result": "failure", "outputs": {}},
+                "quota-probe": {"result": "success", "outputs": {"available": "true"}},
+            },
+            True,
+        ),
+    }
+    for why, (expr, needs, expected) in scenarios.items():
+        assert evaluate(expr, needs) is expected, f"{why}: the gate decided wrong"
+
+
+_STUB_OPENCODE = """#!/usr/bin/env bash
+# A stand-in for the `opencode` the quota probe and the agent step call.
+# $STUB_OPENCODE_MODE selects the reply: ok, quota (a cap signature on stderr,
+# exit 1), other (a non-quota failure, exit 1).
+set -u
+case "${STUB_OPENCODE_MODE:-ok}" in
+  ok) printf 'OK\\n'; exit 0 ;;
+  quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
+  other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
+esac
+"""
+
+
+def _run_probe_step(tmp_path, mode: str):
+    """Execute the probe step's own `run:` body against a stub `opencode`."""
+    job = _load(PREMORTEM)["jobs"]["quota-probe"]
+    step = _find_step(job, r"^Probe model quota$")
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "opencode"
+    stub.write_text(_STUB_OPENCODE, encoding="utf-8")
+    stub.chmod(0o755)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir(exist_ok=True)
+    output = tmp_path / "github-output"
+    output.write_text("", encoding="utf-8")
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
+        "STUB_OPENCODE_MODE": mode,
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_OUTPUT": str(output),
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+    }
+    script = tmp_path / "probe.sh"
+    script.write_text(_run(step), encoding="utf-8")
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    written = output.read_text(encoding="utf-8")
+    return result, written
+
+
+@needs_bash
+def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> None:
+    """The probe's whole contract is its output: `available=false` only when the model's
+    own reply carries a quota signature. Executed against a stub `opencode`, because the
+    classification is a grep over stderr and a string assertion cannot tell a pattern that
+    matches from one that does not. A success and a non-quota failure both fail open - the
+    agent job runs and the genuine failure surfaces there."""
+    result, written = _run_probe_step(tmp_path, "ok")
+    assert result.returncode == 0, f"probe step failed: {result.stderr}"
+    assert "available=true" in written, "a reachable model did not clear the agent job"
+
+    result, written = _run_probe_step(tmp_path, "quota")
+    assert result.returncode == 0, f"probe step failed on a quota reply: {result.stderr}"
+    assert "available=false" in written, "a quota reply did not skip the agent job"
+    assert "::warning::" in result.stdout, "the quota skip does not warn"
+    assert "not run: quota" in result.stdout, "the quota skip does not name itself"
+
+    result, written = _run_probe_step(tmp_path, "other")
+    assert result.returncode == 0, f"probe step failed on a non-quota reply: {result.stderr}"
+    assert "available=true" in written, (
+        "a non-quota probe failure skipped the agent job - a genuine failure would go grey"
+    )
+    assert "::warning::" in result.stdout, "the fail-open path does not say what it did"
+
+
+def _agent_step_env(tmp_path, head: str) -> dict:
+    """The environment the 'Run pre-mortem agent' step reads, with every file it touches."""
+    premortem = tmp_path / "runner-temp" / "premortem"
+    premortem.mkdir(parents=True, exist_ok=True)
+    (premortem / "meta.json").write_text("{}", encoding="utf-8")
+    env = {
+        "RUNNER_TEMP": str(tmp_path / "runner-temp"),
+        "GITHUB_OUTPUT": str(tmp_path / "github-output"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "step-summary"),
+        "PR_NUMBER": "185",
+        "BASE_SHA": "1" * 40,
+        "HEAD_SHA": head,
+        "SKILL_SOURCE": "base branch",
+        "SKILL_PATH": ".agents/skills/actions-pre-mortem/SKILL.md",
+        "MODEL": "opencode/inkling-2-small-free",
+        "VARIANT": "max",
+        "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+        "PREMORTEM_CONTEXT": CONTEXT,
+    }
+    for path in (env["GITHUB_OUTPUT"], env["GITHUB_STEP_SUMMARY"]):
+        Path(path).write_text("", encoding="utf-8")
+    return env
+
+
+def _git(repo: Path, *args: str) -> str:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "probe",
+        "GIT_AUTHOR_EMAIL": "probe@example.invalid",
+        "GIT_COMMITTER_NAME": "probe",
+        "GIT_COMMITTER_EMAIL": "probe@example.invalid",
+    }
+    done = subprocess.run(
+        ["git", *args], cwd=repo, env=env, check=True, capture_output=True, text=True
+    )
+    return done.stdout.strip()
+
+
+@needs_bash
+def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
+    """The probe clears the agent job to run, but the cap can still appear mid-run - the
+    decision covers that too. Executed against a stub `opencode` that fails with a quota
+    signature: the step must write the "not run: quota" comment and the `quota` output and
+    exit 0, so the job stays green-ish and the post job comments the skip. A misconfigured
+    model is the opposite case and must still exit 1."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "--initial-branch=main", ".")
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    agent = _agent_job(_load(PREMORTEM))[1]
+    body = _run(_find_step(agent, r"^Run pre-mortem agent$"))
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "opencode"
+    stub.write_text(_STUB_OPENCODE, encoding="utf-8")
+    stub.chmod(0o755)
+
+    for mode, expect_ok in (("quota", True), ("other", False)):
+        case = tmp_path / mode
+        case.mkdir()
+        env = {**os.environ, **_agent_step_env(case, head)}
+        env["PATH"] = os.pathsep.join([str(bindir), os.environ["PATH"]])
+        env["STUB_OPENCODE_MODE"] = mode
+        script = case / "step.sh"
+        script.write_text(body, encoding="utf-8")
+        result = subprocess.run(
+            [shutil.which("bash") or "bash", str(script)],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if expect_ok:
+            assert result.returncode == 0, (
+                f"{mode}: the quota path failed the step:\n{result.stderr}"
+            )
+            comment = (case / "runner-temp" / "premortem" / "comment.md").read_text(
+                encoding="utf-8"
+            )
+            assert "Not run: quota" in comment, f"{mode}: no 'not run: quota' comment"
+            assert "# Pre-Mortem Action" in comment, f"{mode}: the comment has no title"
+            assert "quota=true" in Path(env["GITHUB_OUTPUT"]).read_text(encoding="utf-8"), (
+                f"{mode}: the post job is not told this was a quota skip"
+            )
+            assert "::warning::" in result.stdout and "::error::" not in result.stdout, (
+                f"{mode}: the quota path does not warn without erroring"
+            )
+        else:
+            assert result.returncode == 1, f"{mode}: a genuine failure did not fail the step"
+            assert "quota=true" not in Path(env["GITHUB_OUTPUT"]).read_text(encoding="utf-8"), (
+                f"{mode}: a non-quota failure took the quota path"
+            )
+
+
+@needs_bash
+def test_the_quota_reporter_rewrites_only_this_runs_pending_mark(tmp_path) -> None:
+    """'Report quota skip' is the mid-run quota path's status write, executed against the
+    stub `gh` like the other reporters: this run's own pending mark is rewritten as
+    `pending` - the commit status API has no neutral state, so pending with the reason is
+    the non-green, non-red answer - and never as `error` or `success`. Another run's mark,
+    or no mark at all (the probe path, where the agent job never started), is left alone."""
+    own_pending = [_status_page([(CONTEXT, "pending", OWN, T2)])]
+    result, calls = _run_reporter("post", "Report quota skip", tmp_path, own_pending)
+    assert result.returncode == 0, f"quota reporter failed: {result.stderr}"
+    assert "state=pending" in calls, "this run's pending mark was not rewritten"
+    assert "state=error" not in calls and "state=success" not in calls, (
+        "the quota skip wrote a red or green status"
+    )
+    assert "Not run: quota" in calls, "the rewritten status does not say why nothing ran"
+    assert f"context={CONTEXT}" in calls, "the rewrite carries no context"
+
+    other_pending = [_status_page([(CONTEXT, "pending", OTHER, T2)])]
+    result, calls = _run_reporter("post", "Report quota skip", tmp_path, other_pending)
+    assert result.returncode == 0, f"quota reporter failed: {result.stderr}"
+    assert "--method" not in calls, "the quota reporter rewrote another run's mark"
+    assert "::notice::" in result.stdout, "the quota reporter is silent about the mark it left"
+
+    result, calls = _run_reporter("post", "Report quota skip", tmp_path, [])
+    assert result.returncode == 0, f"quota reporter failed with no status: {result.stderr}"
+    assert "--method" not in calls, "the quota reporter wrote a status where none exists"
 
 
 def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
@@ -1943,9 +2296,10 @@ def test_the_agent_jobs_hold_no_token_and_verify_the_tree() -> None:
     for name in AGENT_WORKFLOWS:
         _job_name, job = _agent_job(_load(name))
         permissions = job.get("permissions", {})
-        assert permissions == {"contents": "read"}, (
-            f"{name}: agent job permissions are {permissions}"
-        )
+        # The pre-mortem's agent job also writes the pending mark and reads no
+        # credential itself; the siblings' agent jobs write nothing.
+        expected = {"contents": "read"} | ({"statuses": "write"} if name == PREMORTEM else {})
+        assert permissions == expected, f"{name}: agent job permissions are {permissions}"
         checkout = next(
             s for s in _steps(job) if str(s.get("uses", "")).startswith("actions/checkout")
         )
