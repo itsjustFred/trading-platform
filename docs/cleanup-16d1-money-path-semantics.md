@@ -125,8 +125,17 @@ sized — *after* that bar's sizing call). The class therefore also pins the
 scenarios where a position is open and already marked when the next entry is
 sized: `test_open_paper_profit_does_not_grow_next_entry`,
 `test_open_paper_loss_does_not_shrink_next_entry`,
-`test_recorded_equity_at_entry_is_the_sizing_basis` and
-`test_aggregate_exposure_denominator_is_realized_cash`.
+`test_recorded_equity_at_entry_is_the_sizing_basis`,
+`test_recorded_basis_follows_the_surviving_quantity`,
+`test_resized_order_records_its_fill_time_basis`,
+`test_resized_limit_order_records_its_fill_time_basis` and
+`test_aggregate_exposure_denominator_is_realized_cash`. The held-back fee rule
+is pinned by `test_entry_fee_is_owed_before_the_first_exit` (a position with no
+exit yet still owes its entry leg), `test_partial_exit_fees_are_not_spendable_while_owed`
+(only the incurred legs are held back, on hand-computed figures) and
+`test_finalized_fees_are_not_held_back_twice` (a closed trade's fee is already
+in the ledger), with the per-leg additivity contract pinned in
+`tests/test_fees.py`.
 
 ## D3 — Engine risk policy is not strategy-configurable (F22)
 
