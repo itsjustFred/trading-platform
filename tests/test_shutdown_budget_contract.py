@@ -29,6 +29,7 @@ from live_runner.shutdown import (
     CLEANUP_PHASE_COUNT,
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    EXIT_PATH_TIMEOUT_SECONDS,
     WORST_CASE_SHUTDOWN_SECONDS,
     ShutdownCoordinator,
 )
@@ -142,6 +143,23 @@ def test_the_runbook_states_the_budget_the_code_actually_has() -> None:
     assert float(total.group(1)) == WORST_CASE_SHUTDOWN_SECONDS, (
         "the documented worst case must be the computed one"
     )
+    exit_path = re.search(r"at most (\d+(?:\.\d+)?) s \(`EXIT_PATH_TIMEOUT_SECONDS`\)", section)
+    assert exit_path is not None, "the runbook must state the exit path's own deadline"
+    assert float(exit_path.group(1)) == EXIT_PATH_TIMEOUT_SECONDS, (
+        "the documented exit path must be the computed one"
+    )
+
+
+def test_the_exit_path_is_bounded_and_short() -> None:
+    """The tail after ``run_daemon`` returns is bounded, and it is not a phase.
+
+    The drain and the six phases are the deadlines a shutdown needs. The exit
+    path only has to let a cancelled task unwind, so it waits for a bounded
+    grace rather than re-spending a phase's budget on work the phases already
+    abandoned - but it must still have a figure of its own, because that figure
+    is what the operator's window is computed from.
+    """
+    assert 0 < EXIT_PATH_TIMEOUT_SECONDS < DEFAULT_CLEANUP_TIMEOUT_SECONDS
 
 
 def test_the_generated_daemon_unit_outlives_the_worst_case_shutdown() -> None:
@@ -160,6 +178,13 @@ def test_the_generated_daemon_unit_outlives_the_worst_case_shutdown() -> None:
     seconds = float(timeout.group(1))
     assert seconds > WORST_CASE_SHUTDOWN_SECONDS, (
         f"TimeoutStopSec={seconds:g} is inside the {WORST_CASE_SHUTDOWN_SECONDS:g} s worst case"
+    )
+    # The window is the whole shutdown, the bounded exit path included: a daemon
+    # that is SIGKILLed in its tail is killed after it has already done all of
+    # its work, which loses the exit code just the same.
+    assert seconds >= WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_TIMEOUT_SECONDS, (
+        f"TimeoutStopSec={seconds:g} is inside the "
+        f"{WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_TIMEOUT_SECONDS:g} s shutdown window"
     )
     # The reviewed value: the worst case plus 30 s for the exit path itself.
     assert seconds == 180.0

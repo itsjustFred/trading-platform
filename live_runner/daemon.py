@@ -71,7 +71,9 @@ from live_runner.shutdown import (
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     EXIT_CLEANUP_TIMEOUT,
     EXIT_OK,
+    EXIT_PATH_TIMEOUT_SECONDS,
     ShutdownCoordinator,
+    close_the_loop_bounded,
     release_twisted_reactor_threads_bounded,
 )
 from live_runner.signal_sources import (
@@ -2086,7 +2088,9 @@ async def submit_order_with_risk(
     account_balance: float | None = None,
     pip_value: float | None = None,
 ) -> str:
-    """Prepare an order and submit it, for callers with no lease to protect."""
+    """Prepare an order and submit it, for callers with no lease to protect.
+
+    """
     prepared_signal, prepared_qty = await prepare_order_with_risk(
         adapter,
         deployment,
@@ -4881,6 +4885,14 @@ async def _enforce_one_stopped_deployment(
             },
         )
         return False
+    # Narrow the outcome before it is read below. ``cancel_ok`` is a bool, so the
+    # checker cannot see that the branch above returned for every case where
+    # ``cancelled`` is ``None`` (no outcome, a raised cancel or an adapter that
+    # cannot cancel orders); stating it keeps the union resolved by types rather
+    # than by an ignore, and answers the money path the safe way - an outcome
+    # that is not there cannot be stamped as enforced.
+    if cancelled is None:  # pragma: no cover - defensive: cancel_ok returned above
+        return False
     if cancelled.pending_cancel:
         passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
         _PENDING_CANCEL_PASSES[deployment_id] = passes
@@ -5573,7 +5585,9 @@ async def _shutdown_cleanup(
             ),
             return_exceptions=True,
         )
-        for (account_id, adapter), result in zip(adapters, results):
+        # ``strict=True``: the gather returns one result per adapter, so a
+        # mismatch is a bug, not a length to tolerate silently.
+        for (account_id, adapter), result in zip(adapters, results, strict=True):
             if isinstance(result, BaseException):
                 raise RuntimeError(
                     f"adapter disconnect failed for account {account_id} "
@@ -5798,16 +5812,59 @@ async def run_daemon(
 
 
 def main() -> None:
-    exit_code = asyncio.run(run_daemon())
+    """Run the daemon and report its exit code, never past the shutdown budget.
+
+    The loop is run by hand rather than by ``asyncio.run`` because of how
+    ``asyncio.run`` closes a loop whose coroutine has returned: it cancels every
+    task still on the loop and gathers those cancels with no deadline, then joins
+    the loop's default executor. Both are unbounded, and the bounded shutdown
+    feeds both of them: a loop task that ignored the cancels the cleanup already
+    gave up on, and a broker request the drain did not cover (already handed to a
+    ``to_thread`` worker, which no cancel can stop). The exit code that says a
+    broker outcome was left unknown would then arrive only after the unit file's
+    ``TimeoutStopSec``, so systemd reports the SIGKILL it sent itself instead -
+    hence ``close_the_loop_bounded`` in place of that close, and the forced
+    ``os._exit`` below whenever the tail was not clean.
+
+    A crashed daemon still re-raises: the traceback is what an operator acts on,
+    and it gets the same bounded tail before it.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    exit_code = EXIT_OK
+    exit_path_clean = True
+    crashed: BaseException | None = None
+    try:
+        exit_code = loop.run_until_complete(run_daemon())
+        exit_path_clean = loop.run_until_complete(
+            close_the_loop_bounded(EXIT_PATH_TIMEOUT_SECONDS)
+        )
+    except BaseException as exc:
+        # A crashed run leaves exactly the leftovers above, so the tail it gets
+        # is the bounded one; the exception itself is raised again afterwards.
+        crashed = exc
+        with contextlib.suppress(BaseException):
+            exit_path_clean = loop.run_until_complete(
+                close_the_loop_bounded(EXIT_PATH_TIMEOUT_SECONDS)
+            )
+    finally:
+        # The daemon owns this loop for the process lifetime: no other code may
+        # run on a loop the daemon is about to close.
+        asyncio.set_event_loop(None)
+        loop.close()
     # Flush and close log handlers before exiting; the exit code tells systemd
     # whether the shutdown was clean.
     logging.shutdown()
-    if _SHUTDOWN.reactor_release_abandoned:
-        # The reactor release timed out, so the Twisted pool's worker threads -
-        # which are not daemon threads - may still be alive and interpreter
-        # shutdown would block on them. Leave through os._exit instead: the code
-        # still reaches the service manager, where a hang would be SIGKILLed and
-        # the operator would never learn a broker outcome was left unknown.
+    if crashed is not None:
+        raise crashed
+    if _SHUTDOWN.reactor_release_abandoned or not exit_path_clean:
+        # Two reasons the interpreter cannot be trusted to finish: the reactor
+        # release timed out, so the Twisted pool's workers - which are not daemon
+        # threads - may still be alive, and the exit path abandoned a task that
+        # ignored its cancel, so the default executor's join would wait for
+        # whatever that task left running. Leave through os._exit instead: the
+        # code still reaches the service manager, where a hang would be SIGKILLed
+        # and the operator would never learn a broker outcome was left unknown.
         os._exit(exit_code)
     sys.exit(exit_code)
 

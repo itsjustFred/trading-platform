@@ -26,6 +26,12 @@ documents and what the generated systemd unit's stop timeout has to stay above
 (``scripts/setup_services.sh``); ``tests/test_shutdown_budget_contract.py``
 pins the three together so they cannot drift apart.
 
+"A whole shutdown" has to include the exit path - everything the daemon does
+after ``run_daemon`` returned and reported its verdict (see
+:func:`close_the_loop_bounded` and ``live_runner.daemon.main``), because that is
+where the interpreter would otherwise wait, with no bound, for whatever the
+bounded phases already gave up on.
+
 Shutdown NEVER cancels, closes or modifies open orders or positions at the
 broker. Positions belong to the strategy's own exit logic and the operator;
 a restart must find the account exactly as the daemon left it. The only
@@ -77,6 +83,18 @@ CLEANUP_PHASE_COUNT = 6
 WORST_CASE_SHUTDOWN_SECONDS = (
     DEFAULT_DRAIN_TIMEOUT_SECONDS + CLEANUP_PHASE_COUNT * DEFAULT_CLEANUP_TIMEOUT_SECONDS
 )
+
+# How much of the budget the exit path may still spend: the tail that runs after
+# ``run_daemon`` has returned its verdict (``main`` -> ``close_the_loop_bounded``).
+# It is not a phase with work of its own - every deadline a shutdown actually
+# needed already happened inside the drain and the phases - so what this covers
+# is a cancelled task unwinding (its own ``finally``, one more loop iteration),
+# which is cooperative and takes iterations rather than a deadline. Anything
+# still running here was already abandoned by the phase that owned it and has
+# had its outcome logged, so the exit path must not re-spend that phase's budget
+# on it: it stays small, and the worst case plus this figure is still inside the
+# ``TimeoutStopSec`` the generated unit sets.
+EXIT_PATH_TIMEOUT_SECONDS = 2.0
 
 
 def release_twisted_reactor_threads(log: logging.Logger | None = None) -> None:
@@ -160,6 +178,89 @@ async def release_twisted_reactor_threads_bounded(timeout: float) -> None:
         await finished
     if failure:
         raise failure[0]
+
+
+async def close_the_loop_bounded(timeout: float) -> bool:
+    """Cancel what is left on the loop and wait for those cancels, at most ``timeout``.
+
+    ``live_runner.daemon.main`` runs this instead of letting ``asyncio.run`` close
+    the loop, because the close a loop gets once its coroutine has returned is
+    unbounded in exactly the two places the shutdown budget has to cover:
+
+    * every task still on the loop is cancelled and those cancels are gathered
+      with no deadline, so a task that ignores its cancellation holds that gather
+      open forever - after the bounded cleanup has already reported its verdict
+      and abandoned the very same task; and
+    * the loop's default executor is then joined, and a ``to_thread`` call that
+      is already running cannot be cancelled, so an in-flight broker request the
+      drain did not cover holds the join for as long as that request takes. No
+      bound on the cancellation can touch it.
+
+    Either one is a wait past the budget the runbook published and past the unit
+    file's ``TimeoutStopSec``, so the service manager SIGKILLs the daemon after
+    it has already done all of its work, and the operator never learns the exit
+    code that says a broker outcome was left unknown.
+
+    Returns ``True`` only when nothing was left unfinished, so ``main`` knows
+    whether it can let the interpreter finish normally or has to leave through
+    ``os._exit`` to still report the code.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    # ``all_tasks`` returns the loop's unfinished tasks, so nothing that already
+    # finished is cancelled and nothing pending is missed. This task is the one
+    # running the close; it is excluded because cancelling it would cancel the
+    # close itself.
+    pending = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+    for task in pending:
+        task.cancel()
+    clean = True
+    if pending:
+        _, unfinished = await asyncio.wait(pending, timeout=max(0.0, deadline - loop.time()))
+        if unfinished:
+            # A second cancel: the first was ignored, and this is the last thing
+            # the daemon will ever do to them. Their outcome was already logged
+            # by the phase that abandoned them.
+            for task in unfinished:
+                task.cancel()
+            logger.error(
+                "The exit path gave up on task(s) that ignored cancellation and "
+                "is exiting without waiting for them",
+                extra={
+                    "data": {
+                        "abandoned_tasks": sorted(task.get_name() for task in unfinished),
+                        "timeout_seconds": timeout,
+                    }
+                },
+            )
+            clean = False
+    # ``asyncio.run`` closes pending async generators before it closes the loop,
+    # so a suspended one (a submission's ``async with`` unwinding late) is not
+    # left for the interpreter. Same deadline, same verdict: one whose closing
+    # blocks is abandoned and reported rather than waited out.
+    generators = asyncio.ensure_future(loop.shutdown_asyncgens())
+    done, _ = await asyncio.wait({generators}, timeout=max(0.0, deadline - loop.time()))
+    if not done:
+        generators.cancel()
+        logger.error(
+            "The exit path gave up on closing async generators and is exiting "
+            "without waiting for them",
+            extra={"data": {"timeout_seconds": timeout}},
+        )
+        clean = False
+    return clean
+
+
+class SubmissionRefusedError(RuntimeError):
+    """Broker work was attempted after a shutdown was requested.
+
+    Refused rather than sent: work started once the stop flag is set would be
+    sent through the connections the shutdown is tearing down, and it would not
+    be on the in-flight ledger the drain waits for, so its broker outcome could
+    never be reported. Callers of a submission helper that registers itself (see
+    ``live_runner.daemon.submit_order_with_risk``) see this instead of a
+    submission that silently bypasses the ledger.
+    """
 
 
 def force_exit(code: int = FORCED_EXIT_CODE) -> None:

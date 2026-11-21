@@ -46,8 +46,11 @@ from live_runner.shutdown import (
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
     EXIT_CLEANUP_TIMEOUT,
     EXIT_OK,
+    EXIT_PATH_TIMEOUT_SECONDS,
     FORCED_EXIT_CODE,
+    WORST_CASE_SHUTDOWN_SECONDS,
     ShutdownCoordinator,
+    close_the_loop_bounded,
     release_twisted_reactor_threads,
     release_twisted_reactor_threads_bounded,
 )
@@ -1125,6 +1128,140 @@ def test_real_sigterm_to_a_daemon_process_exits_cleanly(tmp_path: Path) -> None:
     assert "Traceback" not in text
 
 
+# ─── the exit path: what is left after run_daemon returns ──────────────────────
+
+
+# A stand-in for the deployment-sync loop that produces exactly the two leftovers
+# the exit path has to survive: a broker request already handed to a worker
+# thread (one the drain does not cover, because it is not on the in-flight
+# ledger) and a loop task that ignores every cancel it is ever given.
+_LEFTOVERS_PROGRAM = """
+import asyncio
+import os
+import sys
+import time
+
+sys.path.insert(0, os.environ["TP_REPO_ROOT"])
+
+import live_runner.daemon as daemon
+
+# Longer than any budget this test could grant it, so a single second spent
+# waiting for it is a wait the budget did not allow.
+_WORKER_SECONDS = 300.0
+_real_run_daemon = daemon.run_daemon
+
+
+async def _wedged_loop(*_args, **_kwargs):
+    # A broker request already sent to the executor. ``asyncio.to_thread``
+    # cannot be recalled once it is running and it is not on the shutdown's
+    # in-flight ledger, so the drain neither waits for it nor cancels it.
+    asyncio.ensure_future(asyncio.to_thread(time.sleep, _WORKER_SECONDS))
+    await asyncio.sleep(0)
+    print("WEDGED", flush=True)
+    while True:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            continue
+
+
+daemon.sync_deployments_loop = _wedged_loop
+
+
+async def _fast_daemon(**kwargs):
+    # The real 150 s worst case, scaled down: what is under test is the exit path
+    # after the last phase, and that is the part that has to hold the budget.
+    kwargs.setdefault("drain_timeout_seconds", 0.2)
+    kwargs.setdefault("cleanup_timeout_seconds", 0.2)
+    return await _real_run_daemon(**kwargs)
+
+
+daemon.run_daemon = _fast_daemon
+print("READY", flush=True)
+daemon.main()
+"""
+
+
+def test_the_exit_path_survives_a_task_that_ignores_every_cancel(
+    tmp_path: Path,
+) -> None:
+    """End to end through ``main``: the budget also holds after ``run_daemon``.
+
+    ``asyncio.run`` closes a finished loop with two unbounded steps: it cancels
+    every task still on the loop and gathers those cancels with no deadline (a
+    loop task that ignores its cancellation holds the gather open forever - the
+    ``cancel_loops`` phase already abandoned one after two cancels), and it then
+    joins the default executor's ``to_thread`` workers, which a broker request
+    the drain could not wait for can hold for as long as that request takes. Both
+    were reachable after a normal, reported shutdown, so the daemon spent them
+    past the budget the runbook published and past the unit's ``TimeoutStopSec``:
+    systemd would report the SIGKILL it sent itself instead of the exit code that
+    says a broker outcome was left unknown.
+
+    The exit code here is ``1`` (the loop cancel phase timed out, because the
+    wedge ignored it), and it has to arrive while the abandoned worker is still
+    running: that is the whole difference between a reported shutdown and a
+    process the service manager kills.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    env = dict(os.environ)
+    env.update(
+        DATA_DIR=str(data_dir),
+        LOG_DIR=str(tmp_path / "logs"),
+        PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+        TP_REPO_ROOT=str(Path(__file__).resolve().parents[1]),
+    )
+    process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", _LEFTOVERS_PROGRAM],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    lines: queue.Queue[str] = queue.Queue()
+    reader = threading.Thread(
+        target=lambda: [lines.put(line) for line in process.stdout],  # type: ignore[union-attr]
+        daemon=True,
+    )
+    reader.start()
+    output: list[str] = []
+    started = time.monotonic()
+    try:
+        deadline = started + 60
+        wedged = False
+        while time.monotonic() < deadline and not wedged:
+            try:
+                line = lines.get(timeout=1)
+            except queue.Empty:
+                assert process.poll() is None, (
+                    "the daemon exited early: " + "".join(output)[-2000:]
+                )
+                continue
+            output.append(line)
+            wedged = "WEDGED" in line
+        assert wedged, "the stand-in loop never started: " + "".join(output)[-2000:]
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=60)
+    finally:
+        if process.poll() is None:  # pragma: no cover - only on a failed test
+            process.kill()
+            process.wait(timeout=30)
+        reader.join(timeout=10)
+    elapsed = time.monotonic() - started
+    output.extend(lines.queue)
+    text = "".join(output)
+    # The whole bounded shutdown, scaled: the drain plus six phases at 0.2 s, with
+    # ample slack for process start-up on a loaded machine. The abandoned worker
+    # alone would take 300 s and the wedged task hangs forever, so only a bounded
+    # exit path can beat this.
+    assert elapsed < 20.0, (
+        f"the exit code did not arrive within the budget after {elapsed:.2f}s"
+    )
+    assert process.returncode == EXIT_CLEANUP_TIMEOUT, text[-2000:]
+
+
 # ─── exit codes ─────────────────────────────────────────────────────────────────
 
 
@@ -1135,11 +1272,10 @@ def test_main_exits_with_the_code_the_daemon_returned(
     """The shutdown verdict has to survive the last mile to the service manager."""
     flushed: list[int] = []
 
-    def _fake_run(coro: Any) -> int:
-        coro.close()
+    async def _fake_run_daemon(**_kwargs: Any) -> int:
         return code
 
-    monkeypatch.setattr(daemon.asyncio, "run", _fake_run)
+    monkeypatch.setattr(daemon, "run_daemon", _fake_run_daemon)
     monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
 
     with pytest.raises(SystemExit) as excinfo:
@@ -1154,10 +1290,11 @@ def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
 ) -> None:
     """A timed-out reactor release must not cost the operator the exit code.
 
-    Twisted's pool workers are non-daemon threads, so ``sys.exit`` would block in
-    interpreter shutdown waiting for the very thread the release gave up on. The
-    service manager would then SIGKILL the daemon at ``TimeoutStopSec`` and the
-    ``1`` that says "a broker outcome needs reconciliation" would be lost.
+    Twisted's pool workers are non-daemon threads, so the exit path's executor
+    join would block in interpreter shutdown waiting for the very thread the
+    release gave up on. The service manager would then SIGKILL the daemon at
+    ``TimeoutStopSec`` and the ``1`` that says "a broker outcome needs
+    reconciliation" would be lost.
     """
     flushed: list[int] = []
     exited: list[int] = []
@@ -1166,8 +1303,7 @@ def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
         def __init__(self, code: int) -> None:
             self.code = code
 
-    def _fake_run(coro: Any) -> int:
-        coro.close()
+    async def _fake_run_daemon(**_kwargs: Any) -> int:
         daemon._SHUTDOWN.note_abandoned_reactor_release()
         return EXIT_CLEANUP_TIMEOUT
 
@@ -1177,7 +1313,7 @@ def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
         exited.append(code)
         raise _Exit(code)
 
-    monkeypatch.setattr(daemon.asyncio, "run", _fake_run)
+    monkeypatch.setattr(daemon, "run_daemon", _fake_run_daemon)
     monkeypatch.setattr(daemon.logging, "shutdown", lambda: flushed.append(1))
     monkeypatch.setattr(daemon.os, "_exit", _exit)
 
@@ -1440,6 +1576,68 @@ def test_a_reactor_release_that_never_returns_cannot_hold_the_shutdown(
     # The pool's workers are non-daemon threads, so an abandoned release can
     # still block interpreter exit; the run records it for main to act on.
     assert coordinator.reactor_release_abandoned is True
+
+
+def test_close_the_loop_gives_up_on_a_task_that_ignores_every_cancel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Closing the loop is bounded too - that is the point of ``main``'s loop.
+
+    ``asyncio.run`` gathers the cancels of whatever is left with no deadline, so a
+    loop task that ignores every cancel keeps the process open forever *after*
+    the bounded cleanup reported and abandoned it. ``close_the_loop_bounded`` is
+    the step ``main`` runs instead, and it must give up on exactly that task at
+    its own deadline rather than waiting it out.
+    """
+    refused: list[int] = []
+
+    async def _wedged() -> None:
+        # A loop stuck in something it cannot be cancelled out of: the cancel is
+        # only delivered when the coroutine resumes, and this one swallows the
+        # first three. The daemon spends its exit-path budget on it below; the
+        # rest is this test tearing the fake down again.
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                refused.append(len(refused) + 1)
+                if len(refused) <= 3:
+                    continue
+                raise
+
+    async def _probe() -> tuple[bool, float, bool]:
+        task = asyncio.create_task(_wedged(), name="wedged")
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        ok = await close_the_loop_bounded(0.1)
+        elapsed = time.monotonic() - started
+        still_running = not task.done()
+        while not task.done():
+            task.cancel()
+            await asyncio.sleep(0.01)
+        return ok, elapsed, still_running
+
+    with caplog.at_level("ERROR"):
+        ok, elapsed, still_running = asyncio.run(_probe())
+
+    assert refused, "the leftover really was cancelled first"
+    assert still_running, "the exit path must give up on it, not wait it out"
+    assert ok is False, "a loop that would not come down is not a clean exit path"
+    assert elapsed < 5.0, f"the exit path must not wait past its budget: {elapsed}"
+
+
+def test_the_exit_path_budget_is_part_of_the_budget_the_unit_file_grants() -> None:
+    """The tail after ``run_daemon`` is bounded, and it is inside the unit window.
+
+    ``TimeoutStopSec`` = worst case + exit path, so the sum is the whole window
+    systemd gives the daemon; if the exit path ever grows past what is left, the
+    daemon is SIGKILLed after it has already done all the work.
+    """
+    assert 0 < EXIT_PATH_TIMEOUT_SECONDS
+    assert (
+        WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_TIMEOUT_SECONDS
+        <= 180.0
+    ), "the exit path must fit inside the unit's TimeoutStopSec"
 
 
 def test_the_exit_codes_are_the_values_the_service_manager_sees() -> None:
