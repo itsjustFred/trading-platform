@@ -1761,6 +1761,7 @@ def test_run_daemon_points_loss_breaker_env_at_accounts_env(monkeypatch, tmp_pat
     monkeypatch.setattr(daemon, "sync_services_loop", _noop_async)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_async)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_async)
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_async)
     monkeypatch.setattr(
         daemon,
         "_start_balance_poller",

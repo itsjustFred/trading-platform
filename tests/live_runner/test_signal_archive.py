@@ -497,6 +497,7 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     monkeypatch.setattr(daemon, "_poll_balances", _noop_loop)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_loop)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_loop)
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_loop)
 
     asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
 
