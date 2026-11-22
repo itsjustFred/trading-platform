@@ -6,7 +6,34 @@ name: Agent Code Review
 # comment and never fails the PR because of its verdict.
 #
 # opencode's free Zen models need no login and no API key, so this workflow
-# holds no secret besides the default GITHUB_TOKEN of the posting job.
+# holds no secret besides the default GITHUB_TOKEN of the posting job. Those
+# models do cap usage, and an exhausted cap must not read as a review result:
+# the `quota-probe` job pings the same model before the agent job installs
+# anything, and a cap, rate limit or region refusal there skips the agent job
+# - a grey check, not a red one - while the post job comments "not run: quota"
+# and warns (decision of 2026-11-21, issue #296). The probe's reply is logged
+# on every path, its quota signature is grepped over stdout and stderr
+# whatever the exit status (opencode has been seen exiting 0 on the cap for
+# this tiny prompt), and `available=true` is only claimed when the reply
+# actually carries the OK token - every other outcome fails open so a genuine
+# failure still fails.
+#
+# The honest limit of the probe: it is a one-word ping, and a cap that is a
+# token budget can still pass it - the ping fits under a ceiling the real run
+# does not. Then the mid-run path below is the usual one: the agent step
+# reports the skip instead of failing and the run's check is green (a job
+# that ran cannot show skipped), with the comment saying "not run: quota".
+# Grey is only reachable on the pre-install skip.
+#
+# A quota error that only appears mid-run takes the same path inside the
+# agent step: the run reports the skip instead of failing. Anything the probe
+# cannot classify as quota still runs the agent job, so a genuine failure - a
+# broken install, a misconfigured model, a crashed agent - still fails the
+# run.
+#
+# A run that failed for a transient reason other than quota (e.g. a provider
+# outage) is restarted with "Re-run jobs" on the run page or
+# `gh run rerun <run-id>`.
 #
 # Trust model:
 # - The review rules (the skill) are read from the base branch, so a PR cannot
@@ -74,10 +101,117 @@ jobs:
           path: meta.json
           retention-days: 1
 
-  review:
+  # Cheap quota probe: one minimal model call on the configured model, before
+  # the agent job installs anything. A positive quota/rate-limit/model-cap/
+  # region-refusal signature - grepped over stdout and stderr, whatever the
+  # exit status, because opencode has been seen exiting 0 on the cap for this
+  # tiny prompt - means the agent job is skipped (grey), and the post job
+  # reports "not run: quota". `available=true` is only claimed when the reply
+  # carries the OK token; any other outcome - including the probe itself
+  # failing - reports available=true so a real failure still fails.
+  quota-probe:
     needs: resolve
-    # Fork PRs get no secrets on pull_request and are not reviewed.
-    if: ${{ needs.resolve.outputs.same_repo == 'true' }}
+    # Fork PRs are not reviewed, so they are not probed either.
+    if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No checkout and no token: the probe needs neither the repository nor a
+    # credential - the free models take no key.
+    permissions: {}
+    outputs:
+      available: ${{ steps.probe.outputs.available }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
+      - name: Install opencode CLI
+        run: |
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
+          opencode --version
+
+      # The probe agent lives in the global config, like the real one, so the
+      # ping exercises the same model resolution the agent run will.
+      - name: Configure quota probe agent
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Read-only model quota probe (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            # The ping needs no tool at all: deny everything, so a misbehaving
+            # model reply cannot make the probe act.
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf -- '---\n'
+            printf 'Reply with the single word OK and nothing else.\n'
+          } > "$conf/agents/quota-probe.md"
+
+      - name: Probe model quota
+        id: probe
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          probe_dir="$RUNNER_TEMP/quota-probe"
+          mkdir -p "$probe_dir"
+          # opencode has been seen exiting 0 on the cap for this tiny prompt,
+          # so the exit status alone cannot clear the model: the quota
+          # signature is grepped over BOTH streams whatever the status, and
+          # `available=true` is only claimed when the reply actually carries
+          # the OK token. Every other outcome - a non-quota failure, a zero
+          # exit with no OK, even a dead probe - fails open: the agent job runs
+          # and the genuine failure surfaces there.
+          status=0
+          raw=$(opencode run --standalone --archived --agent quota-probe \
+            "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
+          printf '%s\n' "$raw" > "$probe_dir/stdout"
+          cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
+          # Always logged, bounded like the agent step's echo: run 44962236033
+          # passed this probe and hit "Free usage limit reached" 26 s later,
+          # and with the output unlogged there was no way to tell a real reach
+          # from a capped one - the success path used to log nothing at all.
+          echo "::group::Quota probe output (last 4000 bytes)"
+          tail -c 4000 "$probe_dir/combined"
+          echo "::endgroup::"
+          # Only a positive quota signature skips the agent job - on either
+          # stream, whatever the exit status. The pattern is the transient
+          # class the agent step below classifies with - a cap, a rate limit,
+          # an exhausted quota or a region refusal - and deliberately not the
+          # misconfiguration class (a model or variant that cannot be resolved
+          # at all): that is a genuine failure, and the agent job reports it.
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stdout" "$probe_dir/stderr"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
+          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Quota probe reached the model; the agent job will run."
+          else
+            # Inconclusive - a non-quota failure, or a zero exit whose reply
+            # carried no OK. Fail open, exactly as before the probe existed.
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::The quota probe was inconclusive (exit ${status}, no OK token, no quota signature); the agent job will run and report the real failure."
+          fi
+
+  review:
+    needs: [resolve, quota-probe]
+    # Fork PRs get no secrets on pull_request and are not reviewed. The probe's
+    # `available` output is the quota gate: only a positive "the model is
+    # capped" skips the agent - a probe that failed, was skipped or never ran
+    # leaves `available` empty, which is not 'false', so the agent job still
+    # runs and a genuine failure still fails. `!cancelled()` keeps the
+    # expression from implying `success()`, which would skip the agent on a
+    # failed probe - the fail-open case above.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.resolve.outputs.same_repo == 'true' && needs.quota-probe.outputs.available != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -107,14 +241,34 @@ jobs:
           opencode --version
 
       # Review rules: the base branch's skill if it has one. Otherwise (only
-      # while the skill is not merged yet) the PR's own copy. Any git failure
-      # other than "no skill at base" stops the job.
+      # while the skill is not merged yet) the PR's own copy. A base commit that
+      # cannot be read aborts the step before the `if`, at the standalone
+      # `git cat-file -e`: that check is the guard, because GitHub's default
+      # shell for a `run:` block is already `bash -e {0}` and fail-fast needs no
+      # help - and inside the `if` condition that follows, a failure is a false
+      # branch, not an abort. `set -euo pipefail` adds `pipefail` and `-u` (an
+      # unset variable now fails the step instead of expanding to nothing) and
+      # states the strictness, so it is not the guard and must not be read as
+      # one.
+      #
+      # The path lookup inside the `if` is a plain assignment rather than a command
+      # in a condition, so `errexit` does apply to it: `git ls-tree` is asked for
+      # the path and the *result* decides the branch, instead of `git cat-file`
+      # being run as the condition with its failure suppressed. The distinction
+      # matters: a suppressed failure inside a condition is only a false branch, so
+      # any `git` error - a missing object, an unreadable repository, a wrong
+      # revision syntax - fell through to the PR's own copy under a prompt that
+      # said the rules came from the base branch. Now only an empty listing
+      # (the base genuinely has no skill at that path) takes that branch, and every
+      # other failure stops the job.
       - name: Select skill revision
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/review"
           skill="$RUNNER_TEMP/review/skill.md"
           git cat-file -e "${BASE_SHA}^{commit}"
-          if git cat-file -e "${BASE_SHA}:${SKILL_PATH}" 2>/dev/null; then
+          listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")
+          if [ -n "$listing" ]; then
             git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
             echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
           elif [ -f "$SKILL_PATH" ]; then
@@ -171,14 +325,87 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/review/comment.md"
-          opencode run --standalone --archived --agent pr-review \
+          # Whose rules ran is the one thing the report itself cannot show, and it is the
+          # fallback's whole point: while the base branch has no skill, the PR's own copy
+          # runs. Name it in the log and in the comment footer (below), so a verdict
+          # produced by a PR's own rules is never indistinguishable from one the base
+          # produced. The pre-mortem copy does the same; a silent SKILL_SOURCE is what
+          # let the fallback grade a PR unnoticed.
+          # The quota path is one body reached from three places: the non-zero-exit
+          # classifier below, and the two zero-exit dead ends (no summary line, no
+          # verdict line) where the cap has been seen arriving on a zero exit -
+          # opencode exiting 0 on "Free usage limit reached" is exactly the run
+          # shape that used to reach "no summary line" and go red, the outcome
+          # the decision of 2026-11-21 forbids.
+          report_quota_skip() {
+            echo "::warning::The review agent could not run - the free model was capped, rate-limited, refused or unavailable (see the group above for the exact reason). That is a transient infra failure, not a review result: not run: quota. Re-run this job after the quota resets."
+            {
+              printf '# Code Review Action\n\n'
+              printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable while the agent ran; no review was produced for this commit.\n\n'
+              printf 'Re-run the job after the quota resets.\n'
+              printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+              printf '\n---\n_Automated review not run: quota (%s skill)_\n' "$(basename "$(dirname "$SKILL_PATH")")"
+            } > "$out"
+            cat "$out" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          echo "::notice::Review rules from: ${SKILL_SOURCE}."
+          # Captured through a variable, never a file the agent can reach, and
+          # stderr to a file so a failed run's reason stays greppable below.
+          if ! raw=$(opencode run --standalone --archived --agent pr-review \
             "Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Review rules loaded from: ${SKILL_SOURCE}." \
-            > "$out.raw"
+            2> "$out.stderr"); then
+            printf '%s\n' "$raw" > "$out.raw"
+            cat "$out.stderr" >> "$out.raw"
+            # The reason the agent failed is only in stderr, and a file no one
+            # reads is not a diagnosis: echo the captured output, bounded so a
+            # runaway agent cannot flood the log, before the classification.
+            echo "::group::Agent stdout and stderr (last 4000 bytes)"
+            tail -c 4000 "$out.raw"
+            echo "::endgroup::"
+            # Two causes share this grep and need opposite remedies, so they are
+            # classified separately. A cap, a rate limit, an exhausted quota or
+            # a region refusal is transient infra, not a review result: by the
+            # decision of 2026-11-21 the run does not go red for it - the step
+            # writes the "not run: quota" comment and exits 0, and the remedy is
+            # to re-run the job once the quota resets. A model or variant that
+            # cannot be resolved at all is not transient: the run cannot succeed
+            # until the repository variable changes. Only the first class takes
+            # the quota path; anything else fails with its own message and the
+            # captured stderr above it.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.stderr"; then
+              report_quota_skip
+            elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
+              echo "::error::The review agent could not resolve its model - REVIEW_MODEL / REVIEW_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes."
+            else
+              echo "::error::The review agent run failed."
+            fi
+            exit 1
+          fi
+          printf '%s\n' "$raw" > "$out.raw"
+          # stderr went to a file for the failure classifier; on success it
+          # would otherwise never reach the log, so it is echoed bounded too.
+          if [ -s "$out.stderr" ]; then
+            echo "::group::Agent stderr (last 4000 bytes)"
+            tail -c 4000 "$out.stderr"
+            echo "::endgroup::"
+          fi
           # opencode prints every assistant message; keep only the final comment,
           # which starts at the last "**Summary:**" line. Drop a closing code
           # fence the model may have wrapped around it.
           start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
           if [ -z "$start" ]; then
+            # opencode has been seen exiting 0 on the cap, with the signature on
+            # stdout: a zero exit is not a clean run, so this dead end is
+            # classified before it fails. The grep covers the raw stream and
+            # stderr both, and runs only here - a real report's own text may
+            # mention "quota", so a produced report is never re-classified.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.raw" "$out.stderr"; then
+              echo "::group::Agent output (last 4000 bytes)"
+              tail -c 4000 "$out.raw"
+              echo "::endgroup::"
+              report_quota_skip
+            fi
             echo "::error::Review output has no summary line; not posting."
             cat "$out.raw"
             exit 1
@@ -187,6 +414,14 @@ jobs:
           # The verdict must be the last non-empty line (a verdict quoted from the
           # diff elsewhere in the output does not count).
           if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
+            # Same zero-exit cap as above: a report that starts but never reaches
+            # a verdict line can still be the quota signature, on either stream.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.raw" "$out.stderr"; then
+              echo "::group::Agent output (last 4000 bytes)"
+              tail -c 4000 "$out.raw"
+              echo "::endgroup::"
+              report_quota_skip
+            fi
             echo "::error::Review output does not end with a verdict line; not posting."
             cat "$out.raw"
             exit 1
@@ -197,11 +432,12 @@ jobs:
             exit 1
           fi
           # Footer: the model, its variant and the skill the review rules came
-          # from (the skill directory's name, not its path), so a reader can
-          # map the verdict to the rules that produced it.
+          # from (the skill directory's name, not its path), plus whose rules
+          # actually ran, so a reader can map the verdict to the rules that
+          # produced it.
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
-          printf '\n\n---\n_Automated review using %s with `%s` skill_\n' \
-            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" >> "$out"
+          printf '\n\n---\n_Automated review using %s with `%s` skill (rules from %s)_\n' \
+            "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}" >> "$out"
           # Title first, so the comment is recognisable among the other bots'.
           { printf '# Code Review Action\n\n'; cat "$out"; } > "$out.titled"
           mv "$out.titled" "$out"
@@ -213,8 +449,14 @@ jobs:
           path: ${{ runner.temp }}/review/comment.md
           retention-days: 14
 
+  # Posts the comment. Runs no repo code. Also runs for the quota skip the
+  # probe produced: the agent job is then `skipped` - the grey check the
+  # decision asks for - and this job is what still tells the PR why.
+  # `!cancelled()` keeps the expression from implying `success()`, so a quota
+  # skip still reaches the comment steps below.
   post:
-    needs: [resolve, review]
+    needs: [resolve, review, quota-probe]
+    if: ${{ !cancelled() && (needs.review.result == 'success' || (needs.resolve.outputs.same_repo == 'true' && needs.quota-probe.outputs.available == 'false')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Verified on PR #178: pull-requests: write is enough for the
@@ -222,13 +464,36 @@ jobs:
     permissions:
       pull-requests: write
     steps:
+      # The probe-skip path has no agent artifact: the agent job never ran, so
+      # the "not run: quota" comment is written here instead. The mid-run quota
+      # path already wrote the same body into the artifact, so this step is the
+      # probe path's alone.
+      - name: Write quota comment
+        if: needs.quota-probe.outputs.available == 'false'
+        env:
+          BASE_SHA: ${{ needs.resolve.outputs.base }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
+        run: |
+          set -euo pipefail
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          {
+            printf '# Code Review Action\n\n'
+            printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable before the agent could start; no review was produced for this commit.\n\n'
+            printf 'Re-run the workflow after the quota resets.\n'
+            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+            printf '\n---\n_Automated review not run: quota (%s skill)_\n' "$skill_name"
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/download-artifact@v4
+        if: needs.review.result == 'success'
         with:
           name: agent-code-review
 
       # One comment per PR, identified by a hidden marker and updated in place.
       # Uses the REST API only.
       - name: Post or update review comment
+        if: needs.review.result == 'success' || needs.quota-probe.outputs.available == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ needs.resolve.outputs.number }}

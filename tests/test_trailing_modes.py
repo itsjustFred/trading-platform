@@ -184,7 +184,7 @@ def test_broker_aware_override_check_rejects_percent_without_broker_support(brok
 
 @pytest.mark.parametrize("mode", ["supertrend_flip", "bogus"])
 def test_broker_aware_override_check_rejects_unsupported_modes_on_alpaca(mode: str) -> None:
-    with pytest.raises(ValueError, match="[Tt]railing"):
+    with pytest.raises(ValueError, match=r"[Tt]railing"):
         validate_live_deployment_trailing_override(
             {"signal_processor_config": {"trailing_mode": mode}},
             context="test",
@@ -367,7 +367,7 @@ _ALPACA_WITHOUT_AMEND = SimpleNamespace(broker_name="alpaca", supports_stop_amen
     ],
 )
 def test_live_signal_with_unexecutable_trailing_is_refused(monkeypatch, trailing_cfg) -> None:
-    with pytest.raises(ValueError, match="[Tt]railing|trailing_sl_config"):
+    with pytest.raises(ValueError, match=r"[Tt]railing|trailing_sl_config"):
         _process(monkeypatch, trailing_cfg)
 
 
@@ -383,7 +383,7 @@ def test_live_percent_signal_is_refused_for_an_adapter_that_cannot_trail(
 def test_live_signal_with_a_mode_no_adapter_executes_is_refused(
     monkeypatch, trailing_cfg
 ) -> None:
-    with pytest.raises(ValueError, match="[Tt]railing"):
+    with pytest.raises(ValueError, match=r"[Tt]railing"):
         _process(monkeypatch, trailing_cfg, _ALPACA_LIKE)
 
 

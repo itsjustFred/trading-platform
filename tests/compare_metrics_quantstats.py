@@ -40,7 +40,10 @@ def equity_to_returns_series(equities: list[float], dates: pd.DatetimeIndex | No
 
 def make_equity_curve_objs(equities: list[float]) -> list[EquityPoint]:
     dates = pd.date_range("2020-01-01", periods=len(equities), freq="B")
-    return [EquityPoint(time=str(d.date()), equity=float(e)) for d, e in zip(dates, equities)]
+    return [
+        EquityPoint(time=str(d.date()), equity=float(e))
+        for d, e in zip(dates, equities, strict=True)
+    ]
 
 
 def make_dummy_trade(pnl: float) -> Trade:

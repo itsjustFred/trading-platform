@@ -129,7 +129,7 @@ def money_digits_from_trader(trader: Any) -> int:
             pass
 
     try:
-        digits = int(raw)
+        digits = int(raw)  # type: ignore[call-overload]  # raw is validated by the surrounding try/except
     except (TypeError, ValueError, OverflowError):
         return _money_digits_fallback("moneyDigits is not an integer", raw)
     if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
@@ -142,13 +142,16 @@ def money_scale(money_digits: int) -> int:
     return 10**money_digits
 
 
-def commission_cost(signed_cash_flow: float) -> float:
+def commission_from_signed_cash_flow(signed_cash_flow: float) -> float:
     """``live_executions.commission`` convention: a charge is a POSITIVE cost.
 
     Net PnL is ``gross - commission`` everywhere (viewer, ``net_pnl``), so every adapter must
-    store what the fill cost as a positive number and a rebate as a negative one. A broker that
-    reports a signed cash flow (cTrader: ``ProtoOADeal.commission`` is negative for a charge)
-    is converted with this helper. ``0`` stays ``0.0`` (never ``-0.0``).
+    store what the fill cost as a positive number. A broker that reports a signed cash flow
+    (cTrader: ``ProtoOADeal.commission`` is negative for a charge) is converted with this
+    helper; ``0`` stays ``0.0`` (never ``-0.0``). This is the ONLY sanctioned way to turn a
+    broker-signed commission into the stored convention - the result still has to pass the
+    ``commission`` write guard (`shared.models.validate_commission_cost`), which refuses a
+    negative value, so a broker rebate (a positive cash flow here) cannot be stored.
 
     Raises ``ValueError`` on a non-finite value: ``0.0`` is a KNOWN zero fee, so garbage must not
     be turned into one. A caller that wants "unknown" handles it before calling (cTrader stores
@@ -311,7 +314,7 @@ class ControlOutcome:
         )
 
 
-def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
+def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric")
     try:

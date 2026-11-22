@@ -101,3 +101,23 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/trailing_stops.py` | 870 | `run_trailing_stops_loop` | loop survival (log and continue) | yes — next tick retries |
 
 Total: 88 broad handlers.
+
+## Handlers added after this table was generated
+
+These broad handlers landed on main while this classification was in review, and are classified by the same rule (a handler that only keeps the loop alive and logs is `loop-survival`; one whose failure changes whether an order/stop/position action happens is `money-decision` and fails closed). Their line numbers move; the marker in the source and `tests/live_runner/test_except_classification.py` are authoritative.
+
+| File | Handler | Kind | Why |
+|---|---|---|---|
+| `alpaca_adapter.py` | venue-calendar resolution fallback (flat staleness age) | loop-survival | falls back to a documented default age |
+| `alpaca_adapter.py` | position re-read before restoring a stop | money-decision | not restoring is the bounded failure |
+| `alpaca_adapter.py` | working-book re-read after a flatten | money-decision | a book nobody could read proves nothing |
+| `alpaca_adapter.py` | `_cancel_already_gone` order read | money-decision | fails closed: an unreadable order is not "gone" |
+| `alpaca_adapter.py` | orphan-sweep verification read | money-decision | recorded as `failed`, retried |
+| `ctrader_adapter.py` | venue-calendar cache write | loop-survival | cache only |
+| `ctrader_adapter.py` | broker-close reconcile of an unreadable deal | money-decision | the deal is skipped, not booked |
+| `daemon.py` | decision record on an escaping exception (re-raised) | loop-survival | observational |
+| `daemon.py` | signal-archive market features | loop-survival | best effort |
+| `daemon.py` | trailing-mode check at deployment load | loop-survival | signal-time gates still refuse |
+| `daemon.py` | submission-lease release in a refusal path | loop-survival | the lease expires on its own |
+| `kill_switch.py` | halt-state read; order-cancel, flatten and protection sweeps | money-decision | entries refused / sweep retried next tick, nothing liquidated on an error |
+| `signal_archive.py`, `signal_sources/discord_source.py` | archive enqueue/serialize/write/record, outcome sink, per-message emission failure | loop-survival | archive is observational; a dropped message trades nothing |

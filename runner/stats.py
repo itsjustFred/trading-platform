@@ -442,9 +442,14 @@ def _equity_curve_in_time_order(equity_curve: list[EquityPoint]) -> list[EquityP
         return list(equity_curve)
     if timestamps.isna().any():
         return list(equity_curve)
+    # One timestamp per equity point by construction (``timestamps`` is read off
+    # ``equity_curve``), so ``strict=True`` turns them getting out of step into an
+    # error instead of silently pairing points with the wrong timestamps.
     return [
         point
-        for _timestamp, point in sorted(zip(timestamps, equity_curve), key=lambda pair: pair[0])
+        for _timestamp, point in sorted(
+            zip(timestamps, equity_curve, strict=True), key=lambda pair: pair[0]
+        )
     ]
 
 
@@ -527,27 +532,6 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
     if raw_returns is None or raw_returns.empty:
         return None
     return raw_returns
-
-
-def _attach_inferred_freq(returns: pd.Series) -> pd.Series:
-    """Attach an inferred frequency when the datetime index is regular."""
-    if not isinstance(returns.index, pd.DatetimeIndex) or len(returns.index) < 3:
-        return returns
-
-    try:
-        freq = pd.infer_freq(returns.index)
-    except ValueError:
-        return returns
-
-    if not freq:
-        return returns
-
-    try:
-        copied = returns.copy()
-        copied.index = pd.DatetimeIndex(copied.index, freq=freq)
-        return copied
-    except ValueError:
-        return returns
 
 
 def _net_trade_pnl(trade: Trade) -> float:
@@ -1000,7 +984,7 @@ def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] |
     if not (math.isfinite(skew) and math.isfinite(kurtosis)):
         return None
     return {
-        "count": int(len(returns)),
+        "count": len(returns),
         "sharpe_per_obs": float(returns.mean()) / std_r,
         "skew": skew,
         "kurtosis": kurtosis,

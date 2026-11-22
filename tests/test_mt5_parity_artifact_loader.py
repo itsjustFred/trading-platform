@@ -6,12 +6,18 @@ import pandas as pd
 import pytest
 
 import scripts.regenerate_mt5_parity_artifacts as regen
+from runner.engine_pkg.trading_engine import _floor_to_lot_grid
 from scripts.regenerate_mt5_parity_artifacts import (
     COMPARISON_CASES,
     _build_trades,
     _load_ohlcv,
     _price_unit_value,
     _round_mt5_lots,
+)
+from shared.strategy_registry import (
+    DEFAULT_STRATEGIES_DIR,
+    iter_strategy_files,
+    load_strategy_meta,
 )
 
 
@@ -348,6 +354,67 @@ def test_bug3b_tick_sizing_matches_mt5_and_clamps():
     assert _round_mt5_lots("EURUSD", 0.001) >= 0.01
     assert _round_mt5_lots("EURUSD", 100000.0) <= 1000.0
     assert _round_mt5_lots("USA500.IDX", 0.2) >= 1.0
+
+
+def test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon():
+    # Pin the documented divergence between the two lot-floor rules of the
+    # parity pair (the generator's docstring cites this test): the generator
+    # keeps MT5's ABSOLUTE `+ 1e-12` in the quotient, while the engine's
+    # shared decimal floor (#278, `shared.lot_grid.floor_qty_to_step`) works
+    # on the exact `repr` decimals with a 1e-6-OF-A-STEP noise band -- so the
+    # engine snaps a size up to the next step whenever its quotient lands
+    # within 1e-6 below an integer, a window MT5's 1e-12 absolute epsilon
+    # only covers for quotients under ~1e-6. The divergence is therefore
+    # NOT limited to ulp-low `k * lot_step` products: any size within
+    # 1e-6 of a step below a grid multiple also splits the two rules.
+
+    # 25602 * 0.01 is the double nearest 256.02, but dividing it back by the
+    # step in float lands an ulp pair below 25602 -- off by ~4e-12, above
+    # the generator's absolute epsilon. The engine's decimal floor reads the
+    # `repr` of the size ('256.02'), so its quotient is exactly 25602.
+    ulp_low = 25602 * 0.01
+    assert ulp_low / 0.01 < 25602
+    assert 25602 - ulp_low / 0.01 > 1e-12
+    assert _round_mt5_lots("EURUSD", ulp_low) == 256.01
+    assert _floor_to_lot_grid(ulp_low, 0.01) == 256.02
+
+    # A real fraction inside the engine's 1e-6-of-a-step band but far above
+    # MT5's absolute epsilon: quotient 2.9999995 sits 5e-7 below the integer
+    # 3 -- the engine's `+ 1e-6` pushes it over and floors UP to 0.03, while
+    # MT5's `+ 1e-12` does not and floors DOWN to 0.02. (0.29999995 / 0.1 in
+    # the issue's step-0.1 terms; EURUSD's step is 0.01.)
+    near_step = 0.029999995
+    assert near_step / 0.01 == pytest.approx(2.9999995)
+    assert _round_mt5_lots("EURUSD", near_step) == pytest.approx(0.02)
+    assert _floor_to_lot_grid(near_step, 0.01) == pytest.approx(0.03)
+
+    # A small quotient inside BOTH epsilons: both rules floor to the same
+    # step, so below the band the divergence is bounded, not random.
+    agree = 3 * 0.01
+    assert agree / 0.01 - 3 <= 1e-12
+    assert _round_mt5_lots("EURUSD", agree) == pytest.approx(0.03)
+    assert _floor_to_lot_grid(agree, 0.01) == pytest.approx(0.03)
+
+
+def test_no_committed_strategy_configures_lot_metadata():
+    # The engine's `lot_step`/`min_lot`/`max_lot` metadata would diverge from
+    # the MT5 reference floor above inside the engine's 1e-6-of-a-step noise
+    # band (`test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon`),
+    # so the goldens only stay stable while no committed strategy configures
+    # it. Pin that exclusion (parsed from STRATEGY_META, never imported).
+    lot_keys = {"lot_step", "min_lot", "max_lot"}
+    configured: dict[str, list[str]] = {}
+
+    for path in iter_strategy_files(DEFAULT_STRATEGIES_DIR):
+        parameters = load_strategy_meta(path, DEFAULT_STRATEGIES_DIR).get("parameters") or {}
+        hits = sorted(lot_keys & set(parameters))
+        if hits:
+            configured[path.name] = hits
+
+    assert not configured, (
+        "committed strategies configure engine lot metadata, which the MT5 "
+        f"golden generator floors by a different rule: {configured}"
+    )
 
 
 def test_bug4_searchsorted_uses_last_known_rate():

@@ -141,7 +141,13 @@ class _StreamWorker:
         backoff = 2.0
         while self._running:
             try:
-                self.stream.run()
+                # A failed reconnect setup leaves no stream (set to None below): the
+                # except path then backs off and retries the setup, as it always did
+                # when `.run()` was called on None.
+                stream = self.stream
+                if stream is None:
+                    raise RuntimeError("market data stream is not set up")
+                stream.run()
                 backoff = 2.0
             except Exception as exc:  # except-kind: loop-survival
                 if not self._running:

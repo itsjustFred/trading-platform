@@ -44,7 +44,8 @@ def _assert_close(actual: Any, expected: Any, path: str) -> None:
     elif isinstance(expected, list):
         assert isinstance(actual, list), f"{path}: not a list"
         assert len(actual) == len(expected), f"{path}: length {len(actual)} != {len(expected)}"
-        for index, (a, e) in enumerate(zip(actual, expected)):
+        # Length equality is asserted above; ``strict`` makes the pairing explicit.
+        for index, (a, e) in enumerate(zip(actual, expected, strict=True)):
             _assert_close(a, e, f"{path}[{index}]")
     else:
         assert actual == expected, f"{path}: {actual!r} != {expected!r}"

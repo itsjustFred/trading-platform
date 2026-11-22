@@ -752,7 +752,11 @@ def test_daemon_refuses_an_unusable_pip_value(pip, match):
         (lambda: _quote(1.25, age=11.0), "quote_stale"),
         (lambda: _quote(1.25, timestamp=None), "quote_time_missing"),
         (lambda: _quote(1.25, age=-5.0), "quote_time_in_future"),
-        (lambda: _quote(1.25, timestamp=datetime(2026, 1, 1)), "quote_time_invalid"),
+        # A naive quote timestamp is the case: a quote with no zone is unusable.
+        (
+            lambda: _quote(1.25, timestamp=datetime(2026, 1, 1)),  # noqa: DTZ001 - naive case
+            "quote_time_invalid",
+        ),
     ],
 )
 def test_daemon_refuses_a_stale_or_untimed_conversion_rate(make_quote, rule):
