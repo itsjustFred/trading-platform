@@ -1613,3 +1613,203 @@ def test_money_digits_fallback_is_logged(caplog) -> None:
     assert any("moneyDigits" in record.getMessage() for record in caplog.records), (
         "the fallback to the default scale was silent"
     )
+
+
+# ─── get_equity: equity must include open-position unrealized P&L (#301) ──────
+#
+# The loss breaker reads ``get_equity`` - a SEPARATE path from ``get_balance``
+# (#267 decision: sizing stays on realized balance, so ``get_balance`` must
+# not start carrying unrealized P&L). ProtoOATrader has no equity field, so
+# equity = balance + net unrealized P&L from
+# ProtoOAGetPositionUnrealizedPnL. Measuring only balance would hide an open
+# losing position until it closes.
+
+
+def _proto_classes():
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+        ProtoOATraderReq,
+        ProtoOATraderRes,
+    )
+    return (
+        ProtoOATraderReq,
+        ProtoOATraderRes,
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+
+def _trader_res(trader_res_cls, *, balance: int, money_digits: int):
+    res = trader_res_cls()
+    res.ctidTraderAccountId = 12345
+    trader = res.trader
+    trader.balance = balance
+    trader.moneyDigits = money_digits
+    return res
+
+
+def _pnl_res(pnl_res_cls, *, money_digits: int, pnl_minor: int):
+    res = pnl_res_cls()
+    res.ctidTraderAccountId = 12345
+    res.moneyDigits = money_digits
+    entry = res.positionUnrealizedPnL.add()
+    entry.positionId = 777
+    entry.grossUnrealizedPnL = pnl_minor
+    entry.netUnrealizedPnL = pnl_minor
+    return res
+
+
+def _wire_balance_and_equity(adapter, trader_res, pnl_res, *, pnl_fails=False):
+    trader_req_cls, trader_res_cls, pnl_req_cls, _pnl_res_cls = _proto_classes()
+    adapter._ProtoOATraderReq = trader_req_cls
+    adapter._ProtoOATraderRes = trader_res_cls
+
+    calls = []
+
+    async def _send(request, **kwargs):
+        calls.append(request)
+        if isinstance(request, pnl_req_cls):
+            if pnl_fails:
+                raise RuntimeError("pnl endpoint down")
+            return pnl_res
+        if isinstance(request, trader_req_cls):
+            return trader_res
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    return calls
+
+
+def _connected_adapter():
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    return adapter
+
+
+def test_get_equity_includes_net_unrealized_pnl():
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    _, trader_res_cls, _, _ = _proto_classes()
+    _wire_balance_and_equity(
+        adapter,
+        _trader_res(trader_res_cls, balance=10_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=2, pnl_minor=-300_000),
+    )
+    equity = asyncio.run(adapter.get_equity())
+    # balance 100_000.00 + (-3_000.00) unrealized = equity 97_000.00
+    assert equity == pytest.approx(97_000.0)
+
+
+def test_get_balance_keeps_realized_balance_semantics():
+    """Sizing reads ``get_balance``: its equity slot must NOT gain unrealized
+    P&L (#267 - sizing stays on realized balance), and it must not even ask
+    the broker for it."""
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    _, trader_res_cls, _, _ = _proto_classes()
+    calls = _wire_balance_and_equity(
+        adapter,
+        _trader_res(trader_res_cls, balance=10_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=2, pnl_minor=-300_000),
+    )
+    balance, equity = asyncio.run(adapter.get_balance())
+    assert balance == pytest.approx(100_000.0)
+    assert equity == pytest.approx(100_000.0)
+    pnl_req_cls = _proto_classes()[2]
+    assert not any(isinstance(call, pnl_req_cls) for call in calls)
+
+
+def test_get_equity_uses_trader_digits_when_pnl_digits_unset():
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    _, trader_res_cls, _, _ = _proto_classes()
+    _wire_balance_and_equity(
+        adapter,
+        _trader_res(trader_res_cls, balance=5_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=0, pnl_minor=-100_000),
+    )
+    equity = asyncio.run(adapter.get_equity())
+    # pnl moneyDigits unset (0) -> falls back to trader digits (2): -1_000.00
+    assert equity == pytest.approx(49_000.0)
+
+
+def test_get_equity_fails_closed_when_pnl_request_fails():
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    _, trader_res_cls, _, _ = _proto_classes()
+    _wire_balance_and_equity(
+        adapter,
+        _trader_res(trader_res_cls, balance=5_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=2, pnl_minor=0),
+        pnl_fails=True,
+    )
+    with pytest.raises(RuntimeError, match="pnl endpoint down"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_sums_net_not_gross_across_multiple_positions():
+    """Two open positions whose gross and net unrealized P&L differ (swap /
+    accrued commission): the breaker must sum ``netUnrealizedPnL`` - the
+    figure equity actually carries - never gross."""
+    adapter = _connected_adapter()
+    trader_req_cls, trader_res_cls, pnl_req_cls, pnl_res_cls = _proto_classes()
+    adapter._ProtoOATraderReq = trader_req_cls
+    adapter._ProtoOATraderRes = trader_res_cls
+
+    pnl_res = pnl_res_cls()
+    pnl_res.ctidTraderAccountId = 12345
+    pnl_res.moneyDigits = 2
+    for position_id, gross, net in ((1, -50_000, -60_000), (2, 20_000, 15_000)):
+        entry = pnl_res.positionUnrealizedPnL.add()
+        entry.positionId = position_id
+        entry.grossUnrealizedPnL = gross
+        entry.netUnrealizedPnL = net
+
+    async def _send(request, **kwargs):
+        if isinstance(request, pnl_req_cls):
+            return pnl_res
+        if isinstance(request, trader_req_cls):
+            return _trader_res(trader_res_cls, balance=10_000_000, money_digits=2)
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    # net: -600.00 + 150.00 = -450.00 -> equity 99_550.00 (gross would be -300.00)
+    assert asyncio.run(adapter.get_equity()) == pytest.approx(99_550.0)
+
+
+def test_get_equity_propagates_ctrader_api_error():
+    """The CTraderApiError branch of the unrealized-PnL fetch: a non-terminal
+    API error propagates so the breaker fails closed, never reads as 0."""
+    adapter = _connected_adapter()
+    trader_req_cls, trader_res_cls, pnl_req_cls, _pnl_res_cls = _proto_classes()
+    adapter._ProtoOATraderReq = trader_req_cls
+    adapter._ProtoOATraderRes = trader_res_cls
+
+    async def _send(request, **kwargs):
+        if isinstance(request, pnl_req_cls):
+            raise CTraderApiError("CH_SERVER_ERROR", "pnl endpoint down")
+        if isinstance(request, trader_req_cls):
+            return _trader_res(trader_res_cls, balance=5_000_000, money_digits=2)
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    with pytest.raises(CTraderApiError):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_trusts_a_trader_equity_field_when_present():
+    """A trader payload that carries its own equity field is used as-is (it is
+    trusted to include unrealized P&L); the P&L endpoint is not consulted."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, equity=5_500_000, moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    assert asyncio.run(adapter.get_equity()) == pytest.approx(55_000.0)
+    balance, equity = asyncio.run(adapter.get_balance())
+    assert (balance, equity) == (pytest.approx(50_000.0), pytest.approx(55_000.0))

@@ -119,7 +119,12 @@ def build_ctrader_deployment_plan(
                 account_id=account.id,
                 symbols=list(row["symbols"]),
                 timeframe=timeframe,
-                status=status if status in {"ACTIVE", "PAUSED", "STOPPED"} else "PAUSED",
+                # Any status the caller did not spell as one of the three the
+                # model accepts is forced to PAUSED rather than trusted (pinned by
+                # test_build_ctrader_deployment_plan_never_activates_an_unknown_status).
+                # mypy does not narrow a `str` by membership in a set of literals,
+                # so the selected branch stays `str` here.
+                status=status if status in {"ACTIVE", "PAUSED", "STOPPED"} else "PAUSED",  # type: ignore[arg-type]
                 signal_source_type="internal",
                 signal_source="internal",
                 signal_config={

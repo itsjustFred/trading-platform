@@ -392,7 +392,7 @@ def export_data():
                                     "dolt",
                                     "sql",
                                     "-q",
-                                    build_ohlcv_select(table_name, symbol),
+                                    build_ohlcv_select(table_name, symbol),  # noqa: B023 - called synchronously by atomic_replace within this iteration
                                     "-r",
                                     "csv",
                                 ],

@@ -39,6 +39,7 @@ from runner.stats import DAILY_RETURN_PERIODS_PER_YEAR
 from .eligibility import EligibilityConfig, EligibilityResult, filter_eligible_sleeves
 from .loader import SleeveReturns
 from .objectives import BASELINE_OBJECTIVES, SUPPORTED_OBJECTIVES, solve_weights
+import itertools
 
 __all__ = [
     "AllocationConfig",
@@ -136,7 +137,7 @@ def curve_metrics(returns: pd.Series) -> dict[str, Any]:
     than a fixed sqrt(252); series too short to measure fall back to
     ``runner.stats.DAILY_RETURN_PERIODS_PER_YEAR``.
     """
-    n = int(len(returns))
+    n = len(returns)
     metrics: dict[str, Any] = {"n_days": n}
     keys = (
         "total_return",
@@ -179,7 +180,7 @@ def _turnover(records: list[RebalanceRecord], columns: list[str]) -> float | Non
     if len(records) < 2:
         return None
     distances = []
-    for previous, current in zip(records[:-1], records[1:], strict=False):
+    for previous, current in itertools.pairwise(records):
         delta = sum(
             abs(current.weights.get(col, 0.0) - previous.weights.get(col, 0.0))
             for col in columns

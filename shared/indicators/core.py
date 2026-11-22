@@ -76,6 +76,22 @@ def _as_float_series(series: pd.Series, name: str) -> pd.Series:
     return out
 
 
+def _positive_int(value: object, name: str) -> int:
+    """Fail closed on non-positive indicator lengths.
+
+    The legacy copies raised (``alpha=1/period``, ``ewm(span=0)`` or
+    ``rolling(0)``); silently clamping to 1 would change stop sizing and
+    band widths, so every public length goes through this guard.
+    """
+    try:
+        result = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if result < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return result
+
+
 def lagged(series: pd.Series, periods: int = 1) -> pd.Series:
     """Shift ``series`` forward by ``periods`` bars (value usable next bar)."""
     return series.shift(periods)
@@ -111,7 +127,7 @@ def true_range(
 
 def sma(series: pd.Series, window: int) -> pd.Series:
     """Simple moving average; NaN until ``window`` observations exist."""
-    window = max(1, int(window))
+    window = _positive_int(window, "window")
     return _as_float_series(series, series.name).rolling(
         window, min_periods=window
     ).mean()
@@ -135,7 +151,7 @@ def _rma_valid(
     ``seed="first"`` seeds the recursion at the first valid value itself and
     emits from that bar — there is no ``length``-bar warm-up for that seed.
     """
-    length = max(1, int(length))
+    length = _positive_int(length, "length")
     out_values = np.full(len(values), np.nan)
     valid, positions = _valid_positions(values)
     if seed == "sma":
@@ -167,7 +183,7 @@ def _rma_valid(
 
 def _sma_valid(values: pd.Series, window: int) -> pd.Series:
     """SMA over the last ``window`` *valid* values (``_mt5_atr`` semantics)."""
-    window = max(1, int(window))
+    window = _positive_int(window, "window")
     out_values = np.full(len(values), np.nan)
     valid, positions = _valid_positions(values)
     if len(valid) < window:
@@ -190,7 +206,7 @@ def _ema_valid(
     pandas ``ewm`` path counts rows instead; the two agree on
     NaN-free input).
     """
-    span = max(1, int(span))
+    span = _positive_int(span, "span")
     alpha = 2.0 / (span + 1)
     valid, positions = _valid_positions(values)
     need = span if min_periods is None else max(0, int(min_periods))
@@ -246,7 +262,7 @@ def rma(
     themselves, so a separate ``min_periods`` would be silently ignored.
     """
     values = _as_float_series(series, series.name)
-    length = max(1, int(length))
+    length = _positive_int(length, "length")
     if seed == "sma" and min_periods is not None:
         raise ValueError("min_periods is not supported for seed='sma'")
     if skipna and min_periods is not None:
@@ -276,7 +292,7 @@ def ema(
     valid-window recursion. ``min_periods`` defaults to ``span``.
     """
     values = _as_float_series(series, series.name)
-    span = max(1, int(span))
+    span = _positive_int(span, "span")
     if seed == "first" and not skipna:
         return values.ewm(
             span=span,
@@ -307,7 +323,7 @@ def atr_from_tr(
     ``skipna=True``).
     """
     values = _as_float_series(true_range, "atr")
-    period = max(1, int(period))
+    period = _positive_int(period, "period")
     if skipna:
         if smoothing == "sma":
             if min_periods is not None:
@@ -363,6 +379,58 @@ def atr(
     )
 
 
+@dataclass(frozen=True)
+class BollingerBands:
+    """Bollinger Bands: ``mid`` is the SMA, ``upper``/``lower`` are
+    ``mid +/- std_mult * std`` with the population-window sample std
+    (pandas ``rolling.std``, ddof=1)."""
+
+    mid: pd.Series
+    upper: pd.Series
+    lower: pd.Series
+
+
+def bbands(
+    close: pd.Series, window: int, *, std_mult: float
+) -> BollingerBands:
+    """Bollinger Bands over ``close``; all three legs are NaN during warm-up."""
+    window = _positive_int(window, "window")
+    values = _as_float_series(close, close.name)
+    mid = sma(values, window)
+    std = values.rolling(window, min_periods=window).std()
+    return BollingerBands(
+        mid=mid,
+        upper=mid + float(std_mult) * std,
+        lower=mid - float(std_mult) * std,
+    )
+
+
+@dataclass(frozen=True)
+class MacdResult:
+    """MACD: ``macd`` is the fast/slow EMA spread, ``signal`` its EMA and
+    ``histogram`` their difference. EMA legs are first-seeded but keep the
+    ADR warm-up: values are NaN until each leg has its span of observations."""
+
+    macd: pd.Series
+    signal: pd.Series
+    histogram: pd.Series
+
+
+def macd(
+    close: pd.Series, fast: int, slow: int, signal: int
+) -> MacdResult:
+    """MACD(fast, slow, signal) with first-seeded EMA legs and NaN warm-up."""
+    values = _as_float_series(close, close.name)
+    fast_span = _positive_int(fast, "fast")
+    slow_span = _positive_int(slow, "slow")
+    signal_span = _positive_int(signal, "signal")
+    line = ema(values, fast_span, seed="first") - ema(
+        values, slow_span, seed="first"
+    )
+    sig = ema(line, signal_span, seed="first")
+    return MacdResult(macd=line, signal=sig, histogram=line - sig)
+
+
 def rsi(
     close: pd.Series,
     period: int,
@@ -387,7 +455,7 @@ def rsi(
       (``runner/strategy_ir/codegen_vectorbt._calc_rsi``).
     """
     values = _as_float_series(close, "rsi")
-    period = max(1, int(period))
+    period = _positive_int(period, "period")
     delta = values.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
@@ -521,6 +589,8 @@ def _supertrend_pine(
     ``pine_supertrend_dema`` rule: a band only ratchets while the
     previous close is beyond the *opposite* band.
     """
+    if first_i < 0:
+        raise ValueError(f"first_i must be >= 0, got {first_i!r}")
     return _numba.call(
         _supertrend_pine_kernel_py,
         _supertrend_pine_kernel_nb,
@@ -543,8 +613,15 @@ def _supertrend_ta_kernel_py(
 
     Reference kernel for :func:`_supertrend_ta`; see its docstring for the
     semantics. Returns ``(trend, upper, lower, first_valid)`` where
-    ``first_valid`` is the first bar index with a usable ATR/src pair, or
-    ``-1`` when there is none (the wrapper maps that to ``None``).
+    ``first_valid`` is the first bar index with a non-NaN ``basic_upper``,
+    or ``-1`` when there is none (the wrapper maps that to ``None``).
+
+    Written with explicit comparisons instead of helper calls so the same
+    source compiles under numba; the NaN behaviour is identical to the
+    scalar helpers it replaces: every comparison against NaN is False, so
+    a NaN basic band can be selected into ``upper``/``lower`` (poisoning
+    that band) and NaN operands in the direction step read bearish and
+    seed the next step.
     """
     n = len(close)
     basic_upper = src + multiplier * atr_values
@@ -555,7 +632,7 @@ def _supertrend_ta_kernel_py(
 
     first_valid = -1
     for i in range(n):
-        if not np.isnan(basic_upper[i]) and not np.isnan(basic_lower[i]):
+        if not np.isnan(basic_upper[i]):
             first_valid = i
             break
     if first_valid < 0:
@@ -567,36 +644,25 @@ def _supertrend_ta_kernel_py(
         1.0 if close[first_valid] >= lower[first_valid] else -1.0
     )
     for i in range(first_valid + 1, n):
-        if np.isnan(basic_upper[i]) or np.isnan(basic_lower[i]):
-            upper[i] = upper[i - 1]
-            lower[i] = lower[i - 1]
+        basic_u = basic_upper[i]
+        basic_l = basic_lower[i]
+        upper_prev = upper[i - 1]
+        lower_prev = lower[i - 1]
+        close_prev = close[i - 1]
+        upper[i] = (
+            basic_u
+            if basic_u < upper_prev or close_prev > upper_prev
+            else upper_prev
+        )
+        lower[i] = (
+            basic_l
+            if basic_l > lower_prev or close_prev < lower_prev
+            else lower_prev
+        )
+        if trend[i - 1] > 0.0:
+            trend[i] = 1.0 if close[i] > lower[i] else -1.0
         else:
-            basic_u = basic_upper[i]
-            basic_l = basic_lower[i]
-            upper_prev = upper[i - 1]
-            lower_prev = lower[i - 1]
-            close_prev = close[i - 1]
-            upper[i] = (
-                basic_u
-                if basic_u < upper_prev or close_prev > upper_prev
-                else upper_prev
-            )
-            lower[i] = (
-                basic_l
-                if basic_l > lower_prev or close_prev < lower_prev
-                else lower_prev
-            )
-        close_i = close[i]
-        lower_i = lower[i]
-        upper_i = upper[i]
-        prev_trend = trend[i - 1]
-        if np.isnan(close_i) or np.isnan(lower_i) or np.isnan(upper_i):
-            new_trend = prev_trend
-        elif prev_trend > 0.0:
-            new_trend = 1.0 if close_i > lower_i else -1.0
-        else:
-            new_trend = 1.0 if close_i >= upper_i else -1.0
-        trend[i] = new_trend
+            trend[i] = 1.0 if close[i] >= upper[i] else -1.0
     return trend, upper, lower, first_valid
 
 
@@ -615,8 +681,9 @@ def _supertrend_ta(
     ``+1``/``-1`` and the caller derives ``ready`` from
     ``first_valid_idx + period``. ``first_valid_idx`` is ``None`` when no
     bar has a usable ATR/src pair, in which case ``ready`` must stay
-    all-False. An interior NaN ATR/src carries the previous bands forward;
-    the direction is still evaluated against those carried bands.
+    all-False. An interior NaN ATR/src is fed through the same ``or``-chain
+    as the deleted RamJet fallback: a NaN basic band can be selected and
+    then poisons that band, because every comparison against NaN is False.
     """
     trend, upper, lower, first_valid = _numba.call(
         _supertrend_ta_kernel_py,
@@ -665,7 +732,8 @@ def supertrend(
       direction compares the close against the *current* band; pre-warm-up
       direction is fail-closed down with ``ready=False``. If no bar has a
       usable ATR/src pair, ``ready`` is all-False; an interior NaN ATR/src
-      carries the previous bands forward.
+      follows the legacy ``or``-chain, so a NaN basic band may be selected
+      and poison that band.
 
     ``atr`` may carry a precomputed ATR series (index-aligned); when
     ``None`` it is computed from ``high``/``low``/``close`` with the
@@ -673,7 +741,7 @@ def supertrend(
     seed. Passing a legacy warm-up (e.g. zero-filled) ATR is how the parity
     presets reproduce their sources bit-for-bit.
     """
-    period = max(1, int(period))
+    period = _positive_int(period, "period")
     multiplier = float(multiplier)
     if atr is None:
         atr_values = atr_from_tr(
@@ -702,11 +770,7 @@ def supertrend(
         if first_valid is None:
             ready_v = np.zeros(n, dtype=bool)
         else:
-            ready_v = (
-                (np.arange(n) >= first_valid + period)
-                & ~np.isnan(upper_v)
-                & ~np.isnan(lower_v)
-            )
+            ready_v = np.arange(n) >= first_valid + period
     else:
         band_condition: Literal["same", "cross"] = "same"
         first_i = 1

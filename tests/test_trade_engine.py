@@ -68,9 +68,9 @@ def _has_coverage(path: Path, *, start: str, end: str) -> bool:
     # Conformance (Cleanup 16-A, F9): the coverage check uses the SHARED
     # contract parser instead of a private re-implementation, so the test's
     # window arithmetic can never drift from the engines'.
-    return lower <= parse_date_bound(start, is_end=False).to_pydatetime() and upper >= parse_date_bound(
-        end, is_end=True
-    ).to_pydatetime()
+    window_start = parse_date_bound(start, is_end=False).to_pydatetime()
+    window_end = parse_date_bound(end, is_end=True).to_pydatetime()
+    return lower <= window_start and upper >= window_end
 
 
 def _synthetic_ohlcv(rows: int = 100) -> pd.DataFrame:
@@ -525,7 +525,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Position
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         engine.positions.append(
             Position(
                 symbol="X",
@@ -546,7 +550,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Order, OrderType
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         engine.pending_orders.append(
             Order(
                 symbol="X",
@@ -565,7 +573,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Order, OrderType
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         first = Order(
             symbol="X",
             direction="LONG",
@@ -593,7 +605,11 @@ class TestIssueC2ExposureMath:
         from runner.engine_pkg.orders import Position
 
         engine = self._engine()
-        engine.equity = 100_000.0
+        # F21 (D2): the aggregate-exposure denominator is the realized
+        # sizing cash, never the mark-to-market reporting equity — both are
+        # set on purpose so the pair only reads as intended.
+        engine._sizing_equity = 100_000.0
+        engine.equity = 1_000_000.0
         engine.positions.append(
             Position(
                 symbol="X",
@@ -625,17 +641,17 @@ def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index
     full-bar MAE as if it were a bug in the clamp.
     """
     records = []
-    for index in range(25):
-        records.append(
-            {
-                "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
-                "open": 100.0,
-                "high": 130.0 if index == 10 else 101.0,
-                "low": 70.0 if index == 10 else 99.0,
-                "close": 100.0,
-                "volume": 1000,
-            }
-        )
+    records.extend(
+        {
+            "timestamp": pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(hours=index),
+            "open": 100.0,
+            "high": 130.0 if index == 10 else 101.0,
+            "low": 70.0 if index == 10 else 99.0,
+            "close": 100.0,
+            "volume": 1000,
+        }
+        for index in range(25)
+    )
     data = pd.DataFrame.from_records(records)
 
     def strategy_fn(df: pd.DataFrame, params: dict):

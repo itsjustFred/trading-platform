@@ -1,5 +1,14 @@
 # Strategy Validation Framework — Scope & Grenzen
 
+> **Historical planning note (Phase 1, 2026-06-24).** Kept for the record. It describes the
+> scoping of the validation framework as it stood then, so several statements no longer match
+> the repository: the branch `kimchi-kimi-continue` it names no longer exists; `runner/engine.py`
+> and `live_runner/` have changed many times since (execution logic is no longer out of
+> bounds); and the external frameworks once listed as later extensions now have engine
+> adapters (`runner/engines/lean_adapter.py`, `runner/engines/pynecore_adapter.py`). Read
+> `docs/validation_architecture.md`, `docs/validation_inventory.md` and
+> `docs/mt5_xlsx_schema.md` for the current state.
+
 **Datum:** 2026-06-24
 **Branch:** `kimchi-kimi-continue`
 **Phase:** 1 — Repository Analysis & Scoping

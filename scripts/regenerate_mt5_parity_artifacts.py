@@ -328,18 +328,22 @@ def _round_mt5_lots(symbol: str, lots: float) -> float:
     The floor keeps MT5's ABSOLUTE epsilon -- `+ 1e-12` added to the QUOTIENT
     (`lots / step`), not a relative tolerance -- because this generator is the
     reference the engine is parity-checked against: it reproduces the EA, it
-    does not improve on it. The engine's
-    `runner.engine_pkg.trading_engine._floor_to_lot_grid` snaps with a
-    RELATIVE 1e-9 band instead (`1e-9 * max(1, |quotient|)`), so the two rules
-    disagree on exactly the sizes whose quotient is MORE than 1e-12 (absolute)
-    off an integer step while still inside the engine's relative band -- the
-    `k * lot_step` ulp case from step counts of a few thousand and up, e.g.
-    `25602 * 0.01` (quotient `25601.999999999996`, ~4e-12 off an integer)
-    comes out `256.01` here and `256.02` in the engine. The divergence is
-    pinned, not incidental: no committed strategy configures the engine's lot
-    metadata (`lot_step`/`min_lot`/`max_lot`) -- asserted by
-    `test_no_committed_strategy_configures_lot_metadata` -- so the committed
-    goldens do not shift, and the boundary itself is pinned by
+    does not improve on it. The engine's lot floor is the shared decimal floor
+    `shared.lot_grid.floor_qty_to_step` (#278, reached through
+    `runner.engine_pkg.trading_engine._floor_to_lot_grid`): exact `repr`
+    decimals with a noise band of 1e-6 OF A STEP added to the quotient, so
+    the engine snaps a size UP to the next step whenever `lots / step` lands
+    within 1e-6 below an integer. MT5's band is the absolute `+ 1e-12` on
+    the same quotient, so the two rules disagree on EVERY size inside that
+    1e-6-of-a-step window -- not only the `k * lot_step` ulp case from step
+    counts of a few thousand and up (`25602 * 0.01`, float quotient
+    `25601.999999999996`, ~4e-12 off an integer, comes out `256.01` here and
+    `256.02` in the engine), but also real fractions like
+    `0.029999995 / 0.01` (quotient 2.9999995): `0.02` here, `0.03` in the
+    engine. The divergence is pinned, not incidental: no committed strategy
+    configures the engine's lot metadata (`lot_step`/`min_lot`/`max_lot`) --
+    asserted by `test_no_committed_strategy_configures_lot_metadata` -- so
+    the committed goldens do not shift, and the boundary itself is pinned by
     `test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon`. The
     first config that wires a `lot_step` must decide which of the two rules
     its goldens pin (or stay on the absolute-epsilon side of the reference).

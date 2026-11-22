@@ -624,7 +624,7 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
         true_range = true_range.fillna(high - low)
         atr = true_range.ewm(span=_ATR_SPAN, adjust=False).mean()
 
-        features["bars"] = int(len(work))
+        features["bars"] = len(work)
         features["close"] = _finite(close.iloc[-1])
         atr_last = _finite(atr.iloc[-1])
         features["atr_14"] = atr_last
@@ -656,9 +656,9 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
             last_vol = float(cum_vol.iloc[-1])
             if last_vol > 0:
                 vwap = float((typical * volume).cumsum().iloc[-1] / last_vol)
-                vwap = _finite(vwap)
-                if vwap:
-                    features["vwap"] = vwap
+                finite_vwap = _finite(vwap)
+                if finite_vwap:
+                    features["vwap"] = finite_vwap
                     features["dist_vwap_pct"] = _finite(
                         (close.iloc[-1] - vwap) / vwap * 100.0
                     )

@@ -98,7 +98,7 @@ class _LookupRecorder(Mapping[str, str]):
         self.looked_up.add(key)
         return self._values[key]
 
-    def get(self, key: str, default: object = None) -> object:
+    def get(self, key: str, default: Any = None) -> Any:
         self.looked_up.add(key)
         return self._values.get(key, default)
 
@@ -719,7 +719,9 @@ def run_live_preflight(
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
     deployment_errors.extend(_promotion_gate_errors(deployments, account_results))
 
-    db_report: dict[str, Any] | None = None
+    # Annotated once, on the config-error path above: this is the other branch
+    # of the same ``db_report``, so annotating it again would shadow the type.
+    db_report = None
     if check_db:
         from live_runner.preflight_db import run_db_preflight
 
