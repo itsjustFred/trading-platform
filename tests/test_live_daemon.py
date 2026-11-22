@@ -1,6 +1,7 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1153,3 +1154,269 @@ def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
     # Gathered: fast completes while slow is still sleeping. Sequential
     # would order slow first (dict order) — or never reach fast at all.
     assert completions and completions[0] == "fast"
+
+
+# ── ACTIVE deployments nothing can trade (#242) ──────────────────────────────
+
+
+def _internal_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
+    return LiveDeploymentConfig(
+        id="22222222-2222-2222-2222-222222222222",
+        strategy_name="internal::ramjet",
+        account_id="acc-1",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status=status,
+        signal_source="internal",
+        signal_source_type="internal",
+        signal_config={},
+    )
+
+
+def test_active_internal_deployment_logs_error_naming_it(monkeypatch) -> None:
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+
+    daemon._warn_untradeable_active_deployments([_internal_deployment()])
+
+    assert len(errors) == 1
+    msg, args, kwargs = errors[0]
+    assert "cannot trade" in msg
+    assert "22222222-2222-2222-2222-222222222222" in str(args)
+    assert "internal" in str(args)
+    data = kwargs["extra"]["data"]
+    assert data["deployment_id"] == "22222222-2222-2222-2222-222222222222"
+    assert data["signal_source"] == "internal"
+    assert "no live strategy runner" in data["untradeable_reason"]
+
+
+def test_active_discord_and_non_active_deployments_are_not_warned(monkeypatch) -> None:
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+
+    daemon._warn_untradeable_active_deployments(
+        [
+            _internal_deployment("PAUSED"),
+            _internal_deployment("STOPPED"),
+            _discord_deployment("ACTIVE"),
+        ]
+    )
+
+    assert errors == []
+
+
+def test_active_unknown_signal_source_is_reported_as_untradeable(monkeypatch) -> None:
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    unknown = _internal_deployment()
+    unknown.signal_source = "webhook"
+
+    daemon._warn_untradeable_active_deployments([unknown])
+
+    assert len(errors) == 1
+    assert "webhook" in str(errors[0][1])
+    # #242 asks for an alert, not a log line. In this daemon the alert is the ERROR
+    # record (Sentry's LoggingIntegration sends event_level=ERROR), so it is tagged.
+    assert errors[0][2]["extra"]["data"]["alert"] == "untradeable_active_deployment"
+
+
+def test_already_warned_reports_a_row_once_then_only_on_change(monkeypatch) -> None:
+    """The suppression the sync loop relies on, pinned at the function itself.
+
+    The loop tests drive it in situ; this is the contract in isolation, so a change
+    to the dedupe key cannot pass the loop tests and break here.
+    """
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    already_warned: dict[str, str] = {}
+    deployment = _internal_deployment()
+
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert len(errors) == 1
+    reported_reason = errors[0][2]["extra"]["data"]["untradeable_reason"]
+    assert already_warned == {str(deployment.id): reported_reason}
+
+    # A different kind of untradeable (repointed to a source with no runner) is a
+    # new condition, not a repeat of the one already reported.
+    deployment.signal_source = "webhook"
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert len(errors) == 2
+    assert "webhook" in str(errors[1][1])
+
+
+def test_already_warned_forgets_a_row_that_is_no_longer_untradeable(monkeypatch) -> None:
+    """Stopping the row (or making it tradeable) must not silence a later repeat."""
+    errors: list[tuple] = []
+    monkeypatch.setattr(
+        daemon,
+        "logger",
+        SimpleNamespace(error=lambda msg, *args, **kwargs: errors.append((msg, args, kwargs))),
+    )
+    already_warned: dict[str, str] = {}
+    deployment = _internal_deployment()
+
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    deployment.status = "STOPPED"
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert already_warned == {}
+
+    deployment.status = "ACTIVE"
+    daemon._warn_untradeable_active_deployments([deployment], already_warned)
+
+    assert len(errors) == 2
+
+
+@dataclass
+class _RecordingLogger:
+    """The logger the daemon uses, keeping every level for an assertion."""
+
+    errors: list[tuple] = field(default_factory=list)
+
+    def error(self, msg, *args, **kwargs) -> None:
+        self.errors.append((msg, args, kwargs))
+
+    def warning(self, msg, *args, **kwargs) -> None:
+        pass
+
+    def info(self, msg, *args, **kwargs) -> None:
+        pass
+
+    def debug(self, msg, *args, **kwargs) -> None:
+        pass
+
+
+def _run_ticks(deployments, ticks: int):
+    """Run the real deployment-sync loop for ``ticks`` ticks, capturing its ERRORs.
+
+    Only the DB read is stubbed (``_load_db_accounts_and_deployments``) and the
+    enforcement ledger it seeds itself from; everything else -- the sync loop, the
+    warning call inside it, the status observation -- is the code that ships. The
+    loop is cancelled out of its sleep once ``ticks`` ticks have run.
+    """
+    recorder = _RecordingLogger()
+    original_load = daemon._load_db_accounts_and_deployments
+    original_sleep = daemon.asyncio.sleep
+    original_logger = daemon.logger
+    original_ledger = daemon.list_stopped_enforced_deployment_ids
+    ticks_run = {"count": 0}
+
+    async def _load_state():
+        return [], deployments
+
+    async def _sleep(_seconds: float) -> None:
+        ticks_run["count"] += 1
+        if ticks_run["count"] >= ticks:
+            raise asyncio.CancelledError
+
+    daemon._load_db_accounts_and_deployments = _load_state
+    daemon.asyncio.sleep = _sleep
+    daemon.logger = recorder
+    daemon.list_stopped_enforced_deployment_ids = lambda: set()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                daemon.sync_deployments_loop(
+                    {},
+                    {},
+                    {},
+                    accounts_env=Path("/nonexistent/accounts.env"),
+                    interval_seconds=0,
+                )
+            )
+    finally:
+        daemon._load_db_accounts_and_deployments = original_load
+        daemon.asyncio.sleep = original_sleep
+        daemon.logger = original_logger
+        daemon.list_stopped_enforced_deployment_ids = original_ledger
+    return recorder.errors
+
+
+def _untradeable_alerts(errors):
+    """Only the #242 alerts, not every ERROR the loop can log."""
+    return [
+        error
+        for error in errors
+        if error[2]["extra"]["data"].get("alert") == "untradeable_active_deployment"
+    ]
+
+
+def test_sync_loop_alerts_an_untradeable_active_deployment() -> None:
+    """#242 blocker: the warning has to be reached from the loop, not only unit-tested.
+
+    The rows the daemon trades come from this loop's DB read, so a helper nothing
+    calls leaves an ACTIVE internal deployment looking live in the log for ever.
+    """
+    deployment = _internal_deployment()
+
+    alerts = _untradeable_alerts(_run_ticks([deployment], ticks=2))
+
+    assert len(alerts) == 1
+    data = alerts[0][2]["extra"]["data"]
+    assert data["deployment_id"] == str(deployment.id)
+    assert data["account_id"] == "acc-1"
+    assert data["signal_source"] == "internal"
+    assert "no live strategy runner" in data["untradeable_reason"]
+
+
+def test_the_same_untradeable_row_is_not_alerted_on_every_tick() -> None:
+    """A loop that polls for days must not repeat a condition that has not changed."""
+    assert len(_untradeable_alerts(_run_ticks([_internal_deployment()], ticks=3))) == 1
+
+
+def test_a_stopped_or_paused_row_is_not_alerted() -> None:
+    assert _untradeable_alerts(_run_ticks([_internal_deployment("PAUSED")], ticks=2)) == []
+    assert _untradeable_alerts(_run_ticks([_internal_deployment("STOPPED")], ticks=2)) == []
+
+
+def test_a_tradeable_row_is_not_alerted() -> None:
+    assert _untradeable_alerts(_run_ticks([_discord_deployment()], ticks=2)) == []
+
+
+def test_activating_a_row_alerts_it_once() -> None:
+    """A row that becomes untradeable is a new condition, not a repeat of an old one."""
+    deployment = _internal_deployment("PAUSED")
+    assert _untradeable_alerts(_run_ticks([deployment], ticks=2)) == []
+
+    deployment.status = "ACTIVE"
+    alerts = _untradeable_alerts(_run_ticks([deployment], ticks=3))
+
+    assert len(alerts) == 1
+    assert alerts[0][2]["extra"]["data"]["signal_source"] == "internal"
+
+
+def test_repointing_a_row_alerts_the_change_and_the_stop() -> None:
+    deployment = _internal_deployment()
+    assert len(_untradeable_alerts(_run_ticks([deployment], ticks=2))) == 1
+
+    # Repointed to the source the daemon runs: the alert stops, and the row stays
+    # quiet afterwards rather than being re-reported a tick later.
+    deployment.signal_source = "discord"
+    deployment.signal_source_type = "discord"
+    assert _untradeable_alerts(_run_ticks([deployment], ticks=2)) == []
+
+    # Moved back to a source with no runner: alerted again, once.
+    deployment.signal_source = "internal"
+    deployment.signal_source_type = "internal"
+    assert len(_untradeable_alerts(_run_ticks([deployment], ticks=2))) == 1

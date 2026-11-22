@@ -113,10 +113,16 @@ def test_viewer_stats_payload_renders_an_unreadable_endpoint_without_nan() -> No
 
     json.dumps(payload, allow_nan=False)
     assert payload["ruined"] is True
-    assert payload["net_profit"] == 0.0
-    assert payload["net_profit_pct"] == 0.0
-    assert payload["max_drawdown_pct"] == 0.0
-    assert payload["total_return"] == 0.0
+    # The producer named every endpoint-derived figure undefined; publishing
+    # them as 0.0 would read an unmeasured run as a measured flat one (#256).
+    for key in (
+        "net_profit",
+        "net_profit_pct",
+        "max_drawdown_pct",
+        "avg_trade_pnl",
+        "total_return",
+    ):
+        assert payload[key] is None, key
 
 
 def test_stats_endpoint_serves_an_unreadable_equity_artifact(
@@ -132,7 +138,8 @@ def test_stats_endpoint_serves_an_unreadable_equity_artifact(
     assert resp.status_code == 200, resp.text
     payload = resp.json()
     assert payload["ruined"] is True
-    assert payload["net_profit"] == 0.0
+    assert payload["net_profit"] is None
+    assert payload["max_drawdown_pct"] is None
 
 
 def test_viewer_stats_payload_survives_unusable_cached_figures() -> None:
@@ -160,8 +167,68 @@ def test_viewer_stats_payload_survives_unusable_cached_figures() -> None:
         )
 
         json.dumps(payload, allow_nan=False)
-        assert payload["net_profit"] == 0.0, value
-        assert payload["max_drawdown_pct"] == 0.0, value
+        assert payload["net_profit"] is None, value
+        assert payload["net_profit_pct"] is None, value
+        assert payload["max_drawdown_pct"] is None, value
+        assert payload["avg_trade_pnl"] is None, value
+        assert payload["total_return"] is None, value
+
+
+def test_viewer_stats_payload_keeps_measured_zeros() -> None:
+    """A stored 0.0 is a measurement; only `undefined_metrics` makes a figure null.
+
+    Legacy artifacts carry no `undefined_metrics` list at all, so every figure
+    they do carry keeps publishing its number - including honest zeroes.
+    """
+    from viewer import core
+
+    payload = core._stats_payload_from_result(
+        _result_with_stats(
+            {
+                "total_pnl": 0.0,
+                "total_return": 0.0,
+                "cagr": 0.0,
+                "max_drawdown_pct": 0.0,
+                "sharpe_ratio": 0.0,
+                "total_trades": 0,
+                "win_rate": 0.0,
+            }
+        )
+    )
+
+    assert payload["net_profit"] == 0.0
+    assert payload["net_profit_pct"] == 0.0
+    assert payload["max_drawdown_pct"] == 0.0
+    assert payload["avg_trade_pnl"] == 0.0
+    assert payload["total_return"] == 0.0
+
+
+def test_viewer_stats_payload_does_not_fall_back_for_a_declared_undefined_return() -> None:
+    """`total_return` named in `undefined_metrics` is null, not the net-figure guess.
+
+    The net/capital fallback exists for artifacts that never recorded the key;
+    substituting it for a metric the producer declared unmeasurable would
+    publish the absence as a computed number - the same lie as a 0.0 default.
+    """
+    from viewer import core
+
+    payload = core._stats_payload_from_result(
+        _result_with_stats(
+            {
+                "total_pnl": 500.0,
+                "total_return": None,
+                "cagr": 0.0,
+                "max_drawdown_pct": -0.1,
+                "sharpe_ratio": 1.0,
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "undefined_metrics": ["total_return"],
+            }
+        )
+    )
+
+    assert payload["net_profit"] == 500.0
+    assert payload["total_return"] is None
 
 
 def test_ruined_backtest_is_never_selected_for_live_deployment() -> None:

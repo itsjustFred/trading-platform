@@ -234,6 +234,12 @@ class SignalReplayAdapter:
     close. If the flip bar is the last bar of the data the position is closed
     like every other open position at the end of the data. See
     :meth:`_check_flip_bar` for the full per-bar ordering.
+
+    Gap fills (#287): inside the ``supertrend_flip`` workflow the stop and the
+    TP1 tranche fill at the bar's OPEN when the bar opens beyond the level
+    (``contract.resolve_protective_exit``); intrabar touches keep the level
+    fill. The non-flip protective path still fills at the level — that path's
+    gap handling lands with #208.
     """
 
     def __init__(
@@ -643,13 +649,15 @@ class SignalReplayAdapter:
 
         1. Open: a flip exit decided at the previous bar's close fills here,
            at the open. Nothing else is evaluated on this bar.
-        2. Intrabar: before TP1, the stop and the TP1 level go through the
-           adapter's shared same-bar policy (``resolve_same_bar_exit``,
-           stop-first when both are touched — the whole position then stops
-           out and TP1 does not happen). After TP1 only the stop is checked.
-           A stop moved to breakeven on the TP1 bar takes effect from the
-           next bar: inside the TP1 bar the order of the touches is unknown,
-           the same rule the ``percent`` trail follows.
+        2. Intrabar: before TP1, the stop and the TP1 level go through
+           ``contract.resolve_protective_exit`` — the gap-at-open check first
+           (#287: a bar opening beyond a level fills at the open), then the
+           adapter's shared same-bar policy (stop-first when both levels are
+           touched — the whole position then stops out and TP1 does not
+           happen). After TP1 only the stop is checked, with the same gap
+           rule. A stop moved to breakeven on the TP1 bar takes effect from
+           the next bar: inside the TP1 bar the order of the touches is
+           unknown, the same rule the ``percent`` trail follows.
         3. Close: the Supertrend of this bar (from bars up to and including
            it) is evaluated once TP1 has happened — from the bar AFTER the
            TP1 bar, never on the TP1 bar's own close: nothing that happens at
@@ -673,24 +681,40 @@ class SignalReplayAdapter:
             )
 
         self._update_excursions(position, bar)
+        bar_open = float(bar["open"])
         high = float(bar["high"])
         low = float(bar["low"])
         stop_price = float(position.stop_loss) if position.stop_loss is not None else None
         if flip.phase == _FLIP_PHASE_BEFORE_TP1:
             return self._check_flip_bar_before_tp1(
-                position, bar_time=bar_time, index=index, high=high, low=low, stop_price=stop_price
-            )
-        if (
-            resolve_same_bar_exit(
-                direction=position.direction,
+                position,
+                bar_time=bar_time,
+                index=index,
+                bar_open=bar_open,
                 high=high,
                 low=low,
                 stop_price=stop_price,
-                take_profit_price=None,
             )
-            == "stop"
-        ):
-            return self._close_flip_at_stop(position, bar_time, index)
+        # #287: the open is the bar's first event — a bar that opens beyond the
+        # stop gapped through it and fills at the open, beating any later
+        # same-bar touch (mirrors ``resolve_protective_exit`` / native
+        # ``_check_stops``). Intrabar touches keep the level fill.
+        stop_event, gapped = contract.resolve_protective_exit(
+            direction=position.direction,
+            bar_open=bar_open,
+            high=high,
+            low=low,
+            stop_price=stop_price,
+            take_profit_price=None,
+        )
+        if stop_event == "stop":
+            assert stop_price is not None  # a hit is only reported for a set level
+            return self._close_flip_at_stop(
+                position,
+                bar_time,
+                index,
+                exit_price=bar_open if gapped else stop_price,
+            )
 
         ready = bool(supertrend["supertrend_ready"])
         if not ready:
@@ -711,6 +735,7 @@ class SignalReplayAdapter:
         *,
         bar_time: pd.Timestamp,
         index: int,
+        bar_open: float,
         high: float,
         low: float,
         stop_price: float | None,
@@ -718,20 +743,58 @@ class SignalReplayAdapter:
         """Intrabar step of a flip position that has not reached TP1 yet."""
         flip = position.flip
         assert flip is not None
-        event = resolve_same_bar_exit(
+        # #287: gap checked first — a bar that opens beyond the stop or TP1
+        # fills at the open; otherwise the shared stop-first same-bar policy.
+        event, gapped = contract.resolve_protective_exit(
             direction=position.direction,
+            bar_open=bar_open,
             high=high,
             low=low,
             stop_price=stop_price,
             take_profit_price=flip.plan.tp1_price,
         )
         if event == "stop":
-            return self._close_flip_at_stop(position, bar_time, index)
+            assert stop_price is not None  # a hit is only reported for a set level
+            return self._close_flip_at_stop(
+                position,
+                bar_time,
+                index,
+                exit_price=bar_open if gapped else stop_price,
+            )
         if event != "tp":
             return None
-        trade = self._take_tp1(position, bar_time, index)
+        tp1_level = float(flip.plan.tp1_price)
+        trade = self._take_tp1(
+            position,
+            bar_time,
+            index,
+            fill_price=bar_open if gapped else tp1_level,
+        )
         if trade is not None:
             return trade
+        # A gap through TP1 makes the open the bar's first event, but the
+        # bar's remaining range is still live for the remainder: live keeps
+        # the remainder's ORIGINAL stop working all bar (the breakeven
+        # amendment only takes effect on the next bar, #176), so a later
+        # same-bar trade through that stop exits the remainder at the stop
+        # level. The fill cannot itself be a gap — the open already sat
+        # beyond TP1, on the stop's safe side. An intrabar (non-gap) TP1
+        # fill needs no check: ``resolve_same_bar_exit`` only returns "tp"
+        # when the stop was not touched.
+        if gapped and stop_price is not None:
+            stopped = (
+                low <= stop_price
+                if position.direction == "LONG"
+                else high >= stop_price
+            )
+            if stopped:
+                return self._close_position(
+                    position,
+                    exit_time=bar_time,
+                    exit_price=float(stop_price),
+                    exit_reason="stop_loss",
+                    exit_bar_index=index,
+                )
         # The TP1 bar after the TP1 fill is dead for the workflow: its close is
         # not read (no activation, no flip) and its range is not checked against
         # the stop moved on it — the next bar's intrabar pass is the first one
@@ -739,10 +802,17 @@ class SignalReplayAdapter:
         return None
 
     def _take_tp1(
-        self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
+        self,
+        position: _OpenPosition,
+        bar_time: pd.Timestamp,
+        index: int,
+        *,
+        fill_price: float,
     ) -> Trade | None:
-        """Exit the whole-share TP1 tranche at the TP1 price; returns a trade
-        if nothing is left.
+        """Exit the whole-share TP1 tranche; returns a trade if nothing is left.
+
+        ``fill_price`` is the TP1 level, or the bar's open when the bar gapped
+        through it (#287).
 
         The tranche is ``quantity * tp1_exit_fraction`` floored to whole shares
         — the original bot's arithmetic (``shared.trailing.tp1_partial_quantity``),
@@ -771,18 +841,18 @@ class SignalReplayAdapter:
             return self._close_position(
                 position,
                 exit_time=bar_time,
-                exit_price=plan.tp1_price,
+                exit_price=fill_price,
                 exit_reason="tp1",
                 exit_bar_index=index,
             )
         if position.direction == "LONG":
-            pnl = (plan.tp1_price - position.entry_price) * exit_quantity
+            pnl = (fill_price - position.entry_price) * exit_quantity
         else:
-            pnl = (position.entry_price - plan.tp1_price) * exit_quantity
+            pnl = (position.entry_price - fill_price) * exit_quantity
         position.partial_exits.append(
             TradeExit(
                 time=_to_iso(bar_time),
-                price=float(plan.tp1_price),
+                price=float(fill_price),
                 quantity=exit_quantity,
                 pnl=float(pnl),
                 reason="tp1",
@@ -799,7 +869,12 @@ class SignalReplayAdapter:
         return None
 
     def _close_flip_at_stop(
-        self, position: _OpenPosition, bar_time: pd.Timestamp, index: int
+        self,
+        position: _OpenPosition,
+        bar_time: pd.Timestamp,
+        index: int,
+        *,
+        exit_price: float,
     ) -> Trade:
         flip = position.flip
         assert flip is not None and position.stop_loss is not None
@@ -811,7 +886,7 @@ class SignalReplayAdapter:
         return self._close_position(
             position,
             exit_time=bar_time,
-            exit_price=float(position.stop_loss),
+            exit_price=exit_price,
             exit_reason="breakeven_stop" if at_breakeven else "stop_loss",
             exit_bar_index=index,
         )
