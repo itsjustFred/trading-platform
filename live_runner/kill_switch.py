@@ -271,7 +271,7 @@ def read_kill_switch_state() -> KillSwitchState:
     """
     try:
         scopes = read_live_kill_switch_scopes()
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # Logged with the exception in the message, not only in ``extra``: the
         # log line is the operator's only clue why every entry was refused.
         logger.error(
@@ -435,7 +435,7 @@ async def _cancel_working_orders(
             extra={"data": {"account_id": account_id, "adapter": type(adapter).__name__}},
         )
         return _SweepStep.UNSUPPORTED
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.error(
             "Failed to cancel the working orders of a halted account; retrying "
             "next tick (%r)",
@@ -507,7 +507,7 @@ async def _flatten_positions(account_id: str, adapter: BaseLiveAdapter) -> _Swee
             extra={"data": {"account_id": account_id, "adapter": type(adapter).__name__}},
         )
         return _SweepStep.UNSUPPORTED
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.error(
             "Failed to flatten the positions of a halted account; retrying next "
             "tick (%r)",
@@ -543,7 +543,7 @@ async def _sweep_orphaned_protections(account_id: str, adapter: BaseLiveAdapter)
             extra={"data": {"account_id": account_id, "adapter": type(adapter).__name__}},
         )
         return _SweepStep.UNSUPPORTED
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.error(
             "Failed to sweep the protections the flatten orphaned; the halted "
             "account is flat but a resting protection could still trigger (%r)",

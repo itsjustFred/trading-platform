@@ -194,7 +194,7 @@ def _connectivity_event_loop(enabled: bool) -> Iterator[asyncio.AbstractEventLoo
     finally:
         try:
             _release_twisted_reactor_threads()
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             logger.warning(
                 "Releasing Twisted reactor threads failed; the process may hang at exit",
                 exc_info=True,
@@ -234,7 +234,7 @@ def _run_broker_connectivity_check(
             balance, equity, positions_count = asyncio.run(_check())
         else:
             balance, equity, positions_count = loop.run_until_complete(_check())
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # Broker error text can quote credential values; redact like every other path.
         errors.append(
             _redact_values(
@@ -655,7 +655,7 @@ def run_live_preflight(
         # not a config-text one; it reaches main()'s crash document with a
         # traceback on stderr, as before.
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # B3: invalid account definitions (e.g. non-routable ctrader ids)
         # report as a failed preflight, never as an unhandled crash. The text is
         # value-free: expanded values can be credentials (#199), and so can a
@@ -756,7 +756,7 @@ def _crash_redaction(accounts_env: Path) -> dict[str, str] | None:
     """
     try:
         env_values, expansion_env = _accounts_env_views(accounts_env)
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return None
     return _redaction_values(env_values=env_values, expansion_env=expansion_env, referenced=None)
 
@@ -838,7 +838,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             check_db=args.check_db,
             db_path=args.db_path,
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # An unhandled failure (e.g. missing or malformed config) must still honour
         # the stdout contract: a failed result document, traceback on stderr. Both
         # the traceback and the document are redacted, so an expanded value that
