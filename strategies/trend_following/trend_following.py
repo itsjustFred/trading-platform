@@ -53,6 +53,7 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
 from shared.strategy_markers import entry_exit_markers
 
 
@@ -70,20 +71,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
 
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_mid = close.ewm(span=mid, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    ema_fast = presets.ema_first_seed(close, fast)
+    ema_mid = presets.ema_first_seed(close, mid)
+    ema_slow = presets.ema_first_seed(close, slow)
 
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
+    atr = presets.atr_qc_wilder(high, low, close, atr_period)
 
     fast_cross_up = (ema_fast > ema_mid) & (ema_fast.shift(1) <= ema_mid.shift(1))
     trend_up = ema_mid > ema_slow

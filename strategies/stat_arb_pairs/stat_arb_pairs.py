@@ -14,6 +14,7 @@ behavior so discovery/portfolio tooling does not route it as pairs trading.
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
 from shared.strategy_markers import entry_exit_markers
 
 STRATEGY_META = {
@@ -71,16 +72,7 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
     zscore = (cum_ret - rolling_mean) / rolling_std
     atr = None
     if use_atr_stop:
-        prev_close = close.shift(1)
-        tr = pd.concat(
-            [
-                high - low,
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        atr = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
+        atr = presets.atr_qc_wilder(high, low, close, atr_period)
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)

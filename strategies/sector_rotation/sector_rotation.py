@@ -56,21 +56,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
 from shared.strategy_markers import entry_exit_markers
-
-
-def _wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    # QuantConnect ATR defaults to Wilder smoothing.
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -92,7 +79,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     fast_momentum = close.pct_change(fast_lookback)
     sma_200 = close.rolling(200).mean()
     short_weakness = close.pct_change(exit_lookback) < weakness_threshold
-    atr = _wilder_atr(high, low, close, atr_period)
+    atr = presets.atr_qc_wilder(high, low, close, atr_period)
 
     entry_cond = (momentum > 0) & (fast_momentum > 0) & (close > sma_200)
 

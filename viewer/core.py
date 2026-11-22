@@ -54,6 +54,8 @@ from shared.constants import (
     OPTIMIZATIONS_DIR,
     normalize_timeframe,
 )
+from shared.indicators import core as indicators
+from shared.indicators import presets as indicator_presets
 from shared.logging import get_logger, redact_text, redact_value
 from shared.models import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
     BacktestResult,
@@ -1692,32 +1694,16 @@ def _indicator_payload(
     }
 
 
-_PANDAS_TA_MISSING_WARNED = False
-
-
 def _compute_indicators(
     df: pd.DataFrame, indicator_list: list[dict], ohlcv_times: list[float]
 ) -> list[dict]:
-    """Compute indicator values from OHLCV DataFrame for given time range."""
-    try:
-        import pandas_ta as ta
-    except ImportError:
-        # Every indicator panel - RSI, ATR, Bollinger, MACD - is produced by this one import, and a
-        # missing `pandas_ta` therefore removes all of them at once while leaving the rest of the chart
-        # intact. That failure is invisible: the panels are simply absent.
-        #
-        # `pandas_ta` is declared in no dependency file, so a fresh install lands here, and the bare
-        # `return []` said nothing about why. Warned once rather than per call, because this runs per
-        # chart request.
-        global _PANDAS_TA_MISSING_WARNED
-        if not _PANDAS_TA_MISSING_WARNED:
-            _PANDAS_TA_MISSING_WARNED = True
-            logger.warning(
-                "pandas_ta is not installed, so no chart indicators can be computed; "
-                "RSI, ATR, Bollinger and MACD panels will be absent rather than wrong"
-            )
-        return []
+    """Compute indicator values from OHLCV DataFrame for given time range.
 
+    All series come from ``shared.indicators`` (issue #317): pandas_ta was
+    declared in no dependency file, so the panels it fed were absent in
+    every supported environment. Warm-up bars stay NaN per the indicator
+    contract — ``_indicator_to_points`` already skips them.
+    """
     results = []
     seen_names: set[str] = set()
     time_set = set(ohlcv_times)
@@ -1727,7 +1713,7 @@ def _compute_indicators(
         period = int(ind.get("period")) if ind.get("period") else None
         try:
             series_payloads = _compute_indicator_series(
-                ta, df, kind, period, time_set
+                df, kind, period, time_set
             )
             for label, data, pane, color, line_style in series_payloads:
                 if data and label not in seen_names:
@@ -1740,93 +1726,99 @@ def _compute_indicators(
 
 
 def _compute_indicator_series(
-    ta: Any,
     df: pd.DataFrame,
     kind: str,
     period: int | None,
     time_set: set[float],
 ) -> list[tuple[str, list[dict], str, str, int]]:
     """Compute one indicator kind; returns (label, points, pane, color, line_style)."""
+    close = df["close"]
     if kind == "SMA":
         p = period or 20
-        vals = ta.sma(df["close"], length=p)
-        if vals is None:
-            return []
+        vals = indicators.sma(close, p)
         return [(f"SMA({p})", _indicator_to_points(df, vals, time_set), "overlay", "#d29922", 0)]
     if kind == "EMA":
         p = period or 12
-        vals = ta.ema(df["close"], length=p)
-        if vals is None:
-            return []
+        vals = indicators.ema(close, p, seed="first", min_periods=p)
         return [(f"EMA({p})", _indicator_to_points(df, vals, time_set), "overlay", "#f97316", 0)]
     if kind == "RSI":
         p = period or 14
-        vals = ta.rsi(df["close"], length=p)
-        if vals is None:
-            return []
+        vals = indicators.rsi(close, p, min_periods=p, flat="mask")
         return [(f"RSI({p})", _indicator_to_points(df, vals, time_set), "panel", "#a78bfa", 0)]
     if kind == "ATR":
         p = period or 14
-        vals = ta.atr(df["high"], df["low"], df["close"], length=p)
-        if vals is None:
-            return []
+        vals = indicator_presets.atr_qc_wilder(df["high"], df["low"], close, p)
         return [(f"ATR({p})", _indicator_to_points(df, vals, time_set), "panel", "#fb923c", 0)]
     if kind == "BB":
-        return _compute_bollinger_series(ta, df, period or 20, time_set)
+        return _compute_bollinger_series(df, period or 20, time_set)
     if kind == "MACD":
-        return _compute_macd_series(ta, df, time_set)
+        return _compute_macd_series(df, time_set)
     if kind == "SUPERTREND":
-        return _compute_supertrend_series(ta, df, time_set)
+        return _compute_supertrend_series(df, time_set)
     return []
 
 
-def _compute_bollinger_series(
-    ta: Any, df: pd.DataFrame, p: int, time_set: set[float]
+def _compute_series_payloads(
+    df: pd.DataFrame,
+    specs: list[tuple[pd.Series, str, str, int]],
+    time_set: set[float],
+    pane: str,
 ) -> list[tuple[str, list[dict], str, str, int]]:
-    bb = ta.bbands(df["close"], length=p, std=2)
-    if bb is None:
-        return []
-    payloads = []
-    for col, label, color in [
-        (f"BBU_{p}_2.0", f"BB Upper ({p})", "#6366f1"),
-        (f"BBM_{p}_2.0", f"BB Mid ({p})", "#94a3b8"),
-        (f"BBL_{p}_2.0", f"BB Lower ({p})", "#6366f1"),
-    ]:
-        if col in bb.columns:
-            data = _indicator_to_points(df, bb[col], time_set)
-            payloads.append(
-                (label, data, "overlay", color, 2 if "Mid" not in label else 0)
-            )
-    return payloads
+    return [
+        (
+            label,
+            _indicator_to_points(df, series, time_set),
+            pane,
+            color,
+            line_style,
+        )
+        for series, label, color, line_style in specs
+    ]
+
+
+def _compute_bollinger_series(
+    df: pd.DataFrame, p: int, time_set: set[float]
+) -> list[tuple[str, list[dict], str, str, int]]:
+    bb = indicators.bbands(df["close"], p, std_mult=2.0)
+    return _compute_series_payloads(
+        df,
+        [
+            (bb.upper, f"BB Upper ({p})", "#6366f1", 2),
+            (bb.mid, f"BB Mid ({p})", "#94a3b8", 0),
+            (bb.lower, f"BB Lower ({p})", "#6366f1", 2),
+        ],
+        time_set,
+        "overlay",
+    )
 
 
 def _compute_macd_series(
-    ta: Any, df: pd.DataFrame, time_set: set[float]
+    df: pd.DataFrame, time_set: set[float]
 ) -> list[tuple[str, list[dict], str, str, int]]:
-    macd = ta.macd(df["close"])
-    if macd is None:
-        return []
-    payloads = []
-    for col, label, color in [
-        ("MACD_12_26_9", "MACD", "#3b82f6"),
-        ("MACDs_12_26_9", "Signal", "#f97316"),
-    ]:
-        if col in macd.columns:
-            data = _indicator_to_points(df, macd[col], time_set)
-            payloads.append((label, data, "panel", color, 0))
-    return payloads
+    result = indicators.macd(df["close"], 12, 26, 9)
+    return _compute_series_payloads(
+        df,
+        [
+            (result.macd, "MACD", "#3b82f6", 0),
+            (result.signal, "Signal", "#f97316", 0),
+        ],
+        time_set,
+        "panel",
+    )
 
 
 def _compute_supertrend_series(
-    ta: Any, df: pd.DataFrame, time_set: set[float]
+    df: pd.DataFrame, time_set: set[float]
 ) -> list[tuple[str, list[dict], str, str, int]]:
-    st = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3.0)
-    if st is None:
-        return []
-    st_col = next((c for c in st.columns if c.startswith("SUPERT_")), None)
-    if not st_col:
-        return []
-    data = _indicator_to_points(df, st[st_col], time_set)
+    result = indicator_presets.supertrend_chart(
+        df["high"], df["low"], df["close"], 7, 3.0
+    )
+    # The overlay line is the active band: support in an uptrend, the
+    # ratcheted resistance in a downtrend — masked to ready bars so the
+    # warm-up never draws a fabricated line.
+    line = result.lower_band.where(result.trend == 1, result.upper_band)
+    line = line.where(result.ready)
+    data = _indicator_to_points(df, line, time_set)
     return [("SuperTrend", data, "overlay", "#22c55e", 0)]
 
 

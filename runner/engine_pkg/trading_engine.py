@@ -42,6 +42,7 @@ from runner.engines.contract import (
     usable_exit_price,
 )
 from runner.fees import resolve_fee_model
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     BacktestResult,
     EquityPoint,
@@ -60,21 +61,21 @@ TRADE_ENGINE_MAX_POSITIONS = 5
 
 
 def _floor_to_lot_grid(size: float, lot_step: float) -> float:
-    """Largest multiple of ``lot_step`` at or below ``size``, up to the snap band (#151).
+    """Largest multiple of ``lot_step`` at or below ``size``, up to the snap band (#151, #278).
 
-    A quotient within a relative 1e-9 of an integer counts as that integer, so
-    float noise (``k * lot_step / lot_step`` can land an ulp below ``k``) never
-    drops a whole step. Unlike a fixed absolute epsilon, the tolerance scales
-    with the quotient, so large step counts are handled too. Idempotent on
-    grid values. Because the band is relative, at a quotient of ~1e9 steps or
-    more it reaches a whole step, so the snap can then return a value a full
-    step above ``size``; it never falls more than the band below ``size``.
+    Delegates to ``shared.lot_grid.floor_qty_to_step`` -- the one lot-grid
+    floor the live exit/entry paths use (#278) -- so a capped backtest size
+    and the live order built from the same quantity cannot disagree by one
+    step at the edge (``0.3`` on a ``0.1`` grid). The snap band is a fixed
+    1e-6 of a step in exact decimal arithmetic, replacing the relative
+    1e-9-of-quotient band this function used to carry; the new band is
+    wider than the old one below ~1000 steps and narrower above, and the
+    decimal product is returned instead of ``k * lot_step`` re-evaluated in
+    float (``0.3``, not ``0.30000000000000004``).
+    The MT5 parity divergence this changes is documented in
+    ``scripts/regenerate_mt5_parity_artifacts._round_mt5_lots``.
     """
-    quotient = size / lot_step
-    nearest = round(quotient)
-    if abs(quotient - nearest) <= 1e-9 * max(1.0, abs(quotient)):
-        return nearest * lot_step
-    return math.floor(quotient) * lot_step
+    return floor_qty_to_step(size, lot_step)
 
 
 def _configured_risk_amount(parameters: dict[str, Any]) -> float:
@@ -98,8 +99,9 @@ def _configured_risk_amount(parameters: dict[str, Any]) -> float:
 def _require_finite(name: str, value: float) -> float:
     """Refuse a non-finite fixed-risk sizing parameter (#151).
 
-    ``inf`` crashes the lot-grid floor (``round(inf)``) or leaks into the
-    order quantity, and ``nan`` defeats every guard on the sizing path
+    ``inf`` is refused outright by the lot-grid floor's decimal finiteness
+    check (and would leak into the order quantity), and ``nan`` defeats
+    every guard on the sizing path
     (``nan`` compares false), so a strategy passing either is a config error,
     not a silent no-op. Mirrors the finite-config rule of the sibling
     validator in ``validation/risk/fixed_risk.py``.
@@ -542,13 +544,15 @@ class TradeEngine:
                 # A size below `min_lot` after the caps is SKIPPED (size 0),
                 # never raised back up: the caps make it unaffordable at the
                 # minimum, and a max_lot below min_lot admits no valid size.
-                # One exception, and only with a grid (`lot_step > 0`): a grid
-                # product can come out of the floor an ulp below `min_lot`
-                # (`3 * 0.3 == 0.8999999999999999 < 0.9`). The broker accepts
-                # that size as `min_lot`, so with the same relative tolerance
-                # the grid floor uses, snap it up to `min_lot` and take the
+                # One exception, and only with a grid (`lot_step > 0`): the
+                # grid floor returns exact decimal products, so `shares` can
+                # only land below `min_lot` inside the snap band when
+                # `min_lot` itself is OFF the grid a hair above a grid
+                # multiple (`min_lot = 0.9000000005` vs floor 0.9). The
+                # broker accepts that size as `min_lot`, so within a small
+                # relative tolerance snap it up to `min_lot` and take the
                 # trade instead of skipping it. Without a grid there is no
-                # such product to be an ulp low: a capped raw ratio within
+                # floored product to sit an ulp low: a capped raw ratio within
                 # the band below `min_lot` is a cap the configured minimum
                 # exceeds, and raising it to `min_lot` would push the size
                 # above the cap that just reduced it -- skip it instead.
