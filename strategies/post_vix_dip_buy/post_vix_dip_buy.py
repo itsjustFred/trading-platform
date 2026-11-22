@@ -70,6 +70,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.strategy_markers import entry_exit_markers
+
 
 def _load_vix_data(start: str = None, end: str = None) -> pd.Series | None:
     from shared.constants import DATA_DIR
@@ -421,35 +423,6 @@ def generate_signals(df: pd.DataFrame, params: dict = None):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

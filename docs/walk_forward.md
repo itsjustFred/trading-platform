@@ -21,12 +21,15 @@ Walk-Forward (WF) Validierung ist ein Stabilitäts-Mechanismus, der eine Strateg
 ## CLI Usage
 
 ```bash
-# Walk-Forward-Analyse für eine Strategie
-python -m runner.cli walkforward --strategy example_sma --train-months 12 --test-months 3
+# Walk-forward analysis for one strategy (--symbols, --start and --end are required)
+python -m runner.cli walkforward --strategy strategies/example_sma/example_sma.py --symbols AAPL --start 2024-01-01 --end 2025-12-31 --train-months 12 --test-months 3
 
 # Mit Symbol-Liste
-python -m runner.cli walkforward --strategy my_strat --symbols EURUSD,GBPUSD,USDJPY --train-months 12 --test-months 3
+python -m runner.cli walkforward --strategy strategies/my_strat/my_strat.py --symbols EURUSD,GBPUSD,USDJPY --start 2024-01-01 --end 2025-12-31 --train-months 12 --test-months 3
 ```
+
+`--strategy` takes a strategy file path; a bare name such as `example_sma` is not
+resolved by the walk-forward path.
 
 ## Parameter
 
@@ -34,7 +37,7 @@ python -m runner.cli walkforward --strategy my_strat --symbols EURUSD,GBPUSD,USD
 |-----------|--------------|---------|
 | `train_months` | Monate für Training | 12 |
 | `test_months` | Monate für Test/OOS | 3 |
-| `step_months` | Schrittweite | 1 (relativ zum Test-Ende) |
+| `step_months` | Schrittweite | Test-Fenster (`test_months`) |
 
 ## Metriken
 
