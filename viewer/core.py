@@ -1361,6 +1361,10 @@ def _quick_stats_and_equity(
                 trades=trade_models,
                 initial_capital=initial_capital,
                 equity_curve=equity_points or None,
+                symbols=[
+                    str(getattr(trade, "symbol", "") or "")
+                    for trade in trade_models
+                ],
             )
         except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Could not compute canonical quick stats: %s", exc)

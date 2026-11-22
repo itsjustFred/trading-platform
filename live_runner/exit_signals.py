@@ -25,8 +25,9 @@ the same rule:
 
 Everything here is pure and keyed on ``signal_intent`` rather than on the order
 side or the deployment status. Dispatch is not: an exit reaches a broker only
-through the ACTIVE-only fan-out (and the pre-submit ACTIVE re-check), so an exit
-on a PAUSED deployment is dropped (known limitation, see docs/signal_bots.md).
+through the status-gated fan-out (and the pre-submit re-check), whose accepted
+statuses are ACTIVE or PAUSED for a close and ACTIVE alone for an entry (#126
+decision: a pause stops opening new positions, not closing what is held).
 """
 from __future__ import annotations
 

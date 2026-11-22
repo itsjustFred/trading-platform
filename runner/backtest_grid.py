@@ -31,6 +31,7 @@ from runner.engines.base import (
     BacktestConfig,
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
+    warn_if_engine_frozen,
 )
 from runner.engines.contract import resolve_intrabar_timeframe
 from runner.grid_identity import (
@@ -222,6 +223,7 @@ def build_cli_command(
 
 def get_engine(name: str):
     """Create an engine adapter without importing runner.cli."""
+    warn_if_engine_frozen(name, stacklevel=2)
     if name == "native":
         from runner.engines.native_adapter import NativeAdapter
 

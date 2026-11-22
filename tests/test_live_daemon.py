@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -639,6 +640,69 @@ def test_connect_active_accounts_runs_concurrently(monkeypatch) -> None:
     assert set(started) == {"slow", "fast"}
 
 
+def test_a_paused_account_still_gets_a_discord_listener_for_its_exits(
+    monkeypatch,
+) -> None:
+    """#126 decision, the layer the signal gates live on top of.
+
+    The account's adapter and its Discord listener were ACTIVE-only, so an account whose
+    deployments were all paused lost both and every exit on it was dropped at the task
+    level - the position a conflict-forced pause must not leave open. An entry is still
+    refused at the signal gates, and the per-account trading task stays off, so nothing
+    trades from here.
+    """
+    account_id = "acc-1"
+    account = LiveAccountConfig(id=account_id, broker="alpaca", name="paused account")
+    deployment = _discord_deployment("PAUSED")
+    active_adapters: dict[str, object] = {}
+    active_discord_tasks: dict[str, asyncio.Task[None]] = {}
+    listener_accounts: list[str] = []
+
+    async def _load_state():
+        return [account], [deployment]
+
+    monkeypatch.setattr(daemon, "_load_db_accounts_and_deployments", _load_state)
+    monkeypatch.setattr(daemon, "_create_adapter_for_account", lambda _a, **_k: None)
+
+    async def _connect_stub(connected_id, *_args, **_kwargs):
+        adapter = _TrackingAdapter()
+        active_adapters[connected_id] = adapter
+        return adapter
+
+    monkeypatch.setattr(daemon, "_ensure_adapter_for_active_account", _connect_stub)
+
+    async def _listener_stub(listener_id, *_args, **_kwargs):
+        listener_accounts.append(listener_id)
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(daemon, "_run_discord_listener_with_retries", _listener_stub)
+
+    async def _stop_after_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            daemon.sync_deployments_loop(
+                active_adapters,
+                {},
+                active_discord_tasks,
+                accounts_env=Path("/nonexistent/accounts.env"),
+                interval_seconds=0,
+            )
+        )
+    started_tasks = list(active_discord_tasks.values())
+    for task in started_tasks:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        asyncio.gather(*started_tasks)
+
+    assert account_id in active_adapters, "a paused account has no adapter to close with"
+    assert account_id in active_discord_tasks
+    assert listener_accounts == [account_id]
+
+
 def test_discord_auth_error_detector_matches_improper_token_message() -> None:
     assert _is_discord_auth_error(RuntimeError("Improper token has been passed"))
 
@@ -877,12 +941,23 @@ class _SignalSubmittingAdapter:
         return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
-def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
+DEPLOYMENT_ID = "11111111-1111-1111-1111-111111111111"
+#: A second deployment on the same channel: the one carrying a config error the other
+#: deployments on the channel must not pay for.
+BROKEN_DEPLOYMENT_ID = "33333333-3333-3333-3333-333333333333"
+
+
+def _discord_deployment(
+    status: str = "ACTIVE",
+    *,
+    deployment_id: str = DEPLOYMENT_ID,
+    symbols: list[str] | None = None,
+) -> LiveDeploymentConfig:
     return LiveDeploymentConfig(
-        id="11111111-1111-1111-1111-111111111111",
+        id=deployment_id,
         strategy_name="discord::ramjet",
         account_id="acc-1",
-        symbols=["AAPL"],
+        symbols=list(symbols) if symbols else ["AAPL"],
         timeframe="1h",
         status=status,
         signal_source="discord",
@@ -892,16 +967,22 @@ def _discord_deployment(status: str = "ACTIVE") -> LiveDeploymentConfig:
     )
 
 
-def test_active_discord_deployments_exclude_paused_and_stopped() -> None:
+def test_dispatchable_discord_deployments_keep_paused_drop_stopped() -> None:
+    """#126 decision: a PAUSED deployment still answers an exit message.
+
+    The listener's channel fan-out has to carry it for that to be possible: dropping
+    PAUSED here would drop every exit on it, leaving the position open until its stop -
+    which is precisely the exposure a conflict-forced pause cannot explain.
+    """
     deployments = [
         _discord_deployment("ACTIVE"),
         _discord_deployment("PAUSED"),
         _discord_deployment("STOPPED"),
     ]
 
-    active = daemon._active_discord_deployments_for_account("acc-1", deployments)
+    dispatchable = daemon._dispatchable_discord_deployments_for_account("acc-1", deployments)
 
-    assert [deployment.status for deployment in active] == ["ACTIVE"]
+    assert [deployment.status for deployment in dispatchable] == ["ACTIVE", "PAUSED"]
 
 
 def _trade_signal() -> object:
@@ -923,6 +1004,26 @@ def _trade_signal() -> object:
     )
 
 
+def _exit_signal() -> object:
+    """A parsed exit/close message (#121): the production exit shape, not a fake one."""
+    from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
+    from risk import TradeSignal
+
+    return TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+        metadata={
+            "discord_channel_id": "channel-1",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            **exit_intent_metadata(FULL_EXIT),
+        },
+    )
+
+
 def test_paused_deployment_snapshot_is_rejected_at_dispatch(monkeypatch) -> None:
     """A stale snapshot must not trade: PAUSE is checked against the DB at dispatch."""
     adapter = _SignalSubmittingAdapter()
@@ -935,8 +1036,8 @@ def test_paused_deployment_snapshot_is_rejected_at_dispatch(monkeypatch) -> None
     consulted: list[str] = []
     monkeypatch.setattr(
         daemon,
-        "_deployment_is_currently_active",
-        lambda deployment: consulted.append(str(deployment.id)) or False,
+        "_deployment_can_dispatch",
+        lambda deployment, **_kwargs: consulted.append(str(deployment.id)) or False,
     )
 
     async def _no_wait(_signal, _timeframe):
@@ -1053,8 +1154,9 @@ def test_deployment_with_unknown_status_is_not_traded(monkeypatch) -> None:
     """Deny-by-default: a status outside ACTIVE/PAUSED/STOPPED must not trade.
 
     Pins that _normalize_deployment_status's UNKNOWN fallback keeps
-    _deployment_is_currently_active fail-closed when a new status value
-    appears upstream before live_runner learns about it.
+    _deployment_can_dispatch fail-closed when a new status value
+    appears upstream before live_runner learns about it - for an entry and
+    for an exit alike.
     """
     adapter = _SignalSubmittingAdapter()
     deployment = _discord_deployment("ACTIVE")
@@ -1111,6 +1213,330 @@ def test_deployment_paused_during_candle_close_wait_is_not_traded(monkeypatch) -
     )
 
     assert adapter.submitted == []
+
+
+def _patch_dispatch_scaffolding(monkeypatch, claims) -> None:
+    """Stub what a dispatch touches outside the status gates under test."""
+    monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait_signal)
+
+    def _claim(deployment_id, token, **kwargs):
+        claims.append(
+            {
+                "deployment_id": deployment_id,
+                "allow_paused": bool(kwargs.get("allow_paused")),
+            }
+        )
+        return True
+
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", _claim)
+    monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *a, **k: True)
+
+
+async def _no_wait_signal(_signal, _timeframe):
+    return None
+
+
+class _ExitSubmittingAdapter(_SignalSubmittingAdapter):
+    """An adapter that reports one open position, so an exit has something to close."""
+
+    async def get_positions(self):
+        return [{"symbol": "AAPL", "qty": 10.0}]
+
+
+def test_paused_deployment_rejects_an_entry(monkeypatch) -> None:
+    """#126: the pause is an entry gate. A PAUSE in the DB blocks a new position."""
+    adapter = _SignalSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+    monkeypatch.setattr(
+        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("PAUSED")
+    )
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [_discord_deployment("ACTIVE")],
+            _trade_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+    assert claims == []
+
+
+def test_paused_deployment_executes_an_exit_only_signal(monkeypatch, isolated_db) -> None:
+    """#126 decision: PAUSED blocks entries and still dispatches a close.
+
+    The exit reaches the broker through the normal path (sizing, claim, adapter), and
+    the claim is taken with the widened status gate - the one atomic fact that keeps an
+    operator's PAUSE racing an exit from opening something.
+    """
+    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
+    adapter = _ExitSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+    monkeypatch.setattr(
+        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("PAUSED")
+    )
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [_discord_deployment("PAUSED")],
+            _exit_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    submitted = adapter.submitted[0]
+    assert submitted.action == "sell"
+    assert submitted.metadata["qty"] == pytest.approx(10.0)
+    assert claims == [
+        {"deployment_id": DEPLOYMENT_ID, "allow_paused": True}
+    ]
+
+
+def test_a_paused_deployment_closes_a_plain_sell_that_cannot_be_a_short(
+    monkeypatch,
+) -> None:
+    """#126 review: the exit classification is per deployment, not per message.
+
+    A plain SELL is a full exit on a deployment that cannot short and a short entry on
+    one that can, and which of the two is decided by `_trade_signal_to_live_signal` -
+    after the dispatch gates. Gate it from the raw message instead and the close on the
+    can't-short deployment is dropped as an entry, leaving the position open.
+    """
+    deployment = _discord_deployment("PAUSED")
+    deployment.settings = {"allow_short": False}
+
+    assert daemon._signal_is_exit("sell", {}, deployment) is True
+    entry_deployment = _discord_deployment("PAUSED")
+    entry_deployment.settings = {"allow_short": True}
+    assert daemon._signal_is_exit("sell", {}, entry_deployment) is False
+    # A parsed exit instruction is reduce-only whatever the deployment allows (#121).
+    parsed = _exit_signal().metadata
+    assert daemon._signal_is_exit("sell", dict(parsed), entry_deployment) is True
+    assert daemon._signal_is_exit("buy", dict(parsed), deployment) is True
+
+
+def _plain_sell_signal() -> object:
+    """A bare SELL message: an exit on a deployment that cannot short, an entry on one that can."""
+    from risk import TradeSignal
+
+    return TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=200.0,
+        stop_loss=195.0,
+        take_profit=210.0,
+        timeframe="1h",
+        metadata={
+            "discord_channel_id": "channel-1",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def test_a_bad_allow_short_never_reaches_the_dispatch_gate(monkeypatch) -> None:
+    """The classification reads a strict boolean: one it cannot parse skips the signal.
+
+    The dispatch half has to carry a *sell*: a buy never asks the deployment what it
+    allows shorting, so a buy would pass this gate whether or not the config error is
+    handled.
+    """
+    deployment = _discord_deployment("ACTIVE")
+    deployment.settings = {"allow_short": "eanbled"}
+
+    with pytest.raises(ValueError, match="Invalid boolean value for allow_short"):
+        daemon._signal_is_exit("sell", {}, deployment)
+
+    adapter = _SignalSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [deployment],
+            _plain_sell_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+    assert claims == []
+
+
+def test_an_unparseable_allow_short_costs_only_the_deployment_that_carries_it(
+    monkeypatch, isolated_db
+) -> None:
+    """One deployment's unreadable config must not take the channel down with it.
+
+    The classification reads `allow_short` per deployment, and an `except ValueError`
+    that *returned* aborted the fan-out for every deployment on the channel: a valid
+    deployment's close - the one signal the exit widening exists for - was dropped by a
+    typo on a deployment that is not even on this signal's symbol.
+    """
+    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
+    adapter = _ExitSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+    monkeypatch.setattr(
+        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("ACTIVE")
+    )
+
+    broken = _discord_deployment(
+        "ACTIVE", deployment_id=BROKEN_DEPLOYMENT_ID, symbols=["TSLA"]
+    )
+    broken.settings = {"allow_short": "eanbled"}
+    valid = _discord_deployment("ACTIVE")
+    valid.settings = {"allow_short": False}
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [broken, valid],
+            _plain_sell_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    assert adapter.submitted[0].symbol == "AAPL"
+    # A plain SELL on a deployment that cannot short is a close, so the claim is the
+    # widened exit one - the same call that keeps a PAUSED deployment able to close.
+    assert claims == [{"deployment_id": DEPLOYMENT_ID, "allow_paused": True}]
+
+
+def test_an_unparseable_allow_short_on_the_same_channel_skips_only_that_deployment(
+    monkeypatch, isolated_db
+) -> None:
+    """Same channel, same symbol: the deployment with the bad config is the only loss."""
+    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
+    adapter = _ExitSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+    monkeypatch.setattr(
+        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("ACTIVE")
+    )
+
+    broken = _discord_deployment("ACTIVE", deployment_id=BROKEN_DEPLOYMENT_ID)
+    broken.settings = {"allow_short": "eanbled"}
+    valid = _discord_deployment("ACTIVE")
+    valid.settings = {"allow_short": False}
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [broken, valid],
+            _plain_sell_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    assert claims == [{"deployment_id": DEPLOYMENT_ID, "allow_paused": True}]
+
+
+def test_an_unparseable_wait_boolean_skips_only_that_deployment(
+    monkeypatch, isolated_db
+) -> None:
+    """The wait-boolean refusal has the same shape, on the same fan-out (#311 review).
+
+    Its comment already said "skip the deployment, not ... other deployments", and it
+    returned: a typo'd `wait_candle_close` on one deployment took the whole channel's
+    signal with it.
+    """
+    asyncio.run(asyncio.to_thread(_seed_exit_ledger, isolated_db))
+    adapter = _ExitSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+    monkeypatch.setattr(
+        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("ACTIVE")
+    )
+
+    broken = _discord_deployment("ACTIVE", deployment_id=BROKEN_DEPLOYMENT_ID)
+    broken.signal_config["wait_candle_close"] = "sooon"
+    valid = _discord_deployment("ACTIVE")
+    valid.settings = {"allow_short": False}
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [broken, valid],
+            _plain_sell_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    assert claims == [{"deployment_id": DEPLOYMENT_ID, "allow_paused": True}]
+
+
+def test_stopped_deployment_does_not_dispatch_an_exit(monkeypatch) -> None:
+    """STOPPED stays out: its exposure is closed by the cancel/flatten sweeps."""
+    adapter = _ExitSubmittingAdapter()
+    claims: list[dict[str, object]] = []
+    _patch_dispatch_scaffolding(monkeypatch, claims)
+    monkeypatch.setattr(
+        daemon, "get_live_deployment", lambda _deployment_id: _discord_deployment("STOPPED")
+    )
+
+    asyncio.run(
+        daemon._dispatch_discord_trade_signal(
+            "acc-1",
+            adapter,
+            [_discord_deployment("STOPPED")],
+            _exit_signal(),
+            accounts_env_values={},
+        )
+    )
+
+    assert adapter.submitted == []
+    assert claims == []
+
+
+def _seed_exit_ledger(isolated_db) -> None:
+    """Give the fixture deployment a net filled position, so an exit has a size."""
+    database = isolated_db[0]
+    from shared.database import save_live_execution, save_live_signal
+    from shared.models import LiveExecution, LiveSignal
+    from tests.conftest import seed_live_deployments
+
+    # The fixture deployment and its account have to exist as rows: the ledger is read
+    # by account id, and `live_signals.deployment_id` carries a foreign key.
+    seed_live_deployments(database, [DEPLOYMENT_ID], account_id="acc-1")
+    signal_id = "22222222-2222-2222-2222-222222222222"
+    save_live_signal(
+        LiveSignal(
+            id=signal_id,
+            deployment_id=DEPLOYMENT_ID,
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=200.0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"broker_order_id": "BRK-1"},
+        )
+    )
+    save_live_execution(
+        LiveExecution(
+            signal_id=signal_id,
+            broker_order_id="BRK-1",
+            filled_qty=10.0,
+            actual_price=200.0,
+            # A known zero, not unknown: the ledger reads the fill, not the fee.
+            commission=0.0,
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
 
 
 def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
