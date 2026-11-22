@@ -323,7 +323,7 @@ class TestPeriodValidation:
         ],
     )
     def test_non_positive_periods_raise(self, call):
-        with pytest.raises(ValueError, match="positive|>= 1|period|span|window|length"):
+        with pytest.raises(ValueError, match=r"positive|>= 1|period|span|window|length"):
             call()
 
     def test_atr_from_tr_rejects_non_positive_period(self):
