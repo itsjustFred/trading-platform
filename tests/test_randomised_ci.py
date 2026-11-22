@@ -4,14 +4,17 @@ Two properties keep the tripwire honest:
 
 * ``pytest-randomly`` must stay in the dev extra, or the weekly workflow syncs
   an environment without the plugin and every run is a silent no-op;
-* the ``ci`` workflow must keep disabling the plugin, or PR runs start
-  shuffling and an order-dependent failure lands on an unrelated PR instead of
-  on the weekly run that exists to catch it.
+* ``pytest.ini`` must keep the plugin disabled by default, or local runs, PR
+  runs, and agent workflows start shuffling and an order-dependent failure
+  lands on an unrelated PR instead of on the weekly run that exists to catch
+  it. The weekly workflow is the only place allowed to pass ``-p randomly``.
 """
 
 from __future__ import annotations
 
+import configparser
 import re
+import shlex
 import tomllib
 from pathlib import Path
 
@@ -19,6 +22,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
+RANDOMISED_WORKFLOW = "randomised-tests.yml"
 
 
 def _workflow(name: str) -> dict:
@@ -40,6 +44,21 @@ def _run_commands(workflow: dict) -> list[str]:
     return commands
 
 
+def _pytest_addopts_tokens() -> list[str]:
+    parser = configparser.ConfigParser()
+    parser.read(ROOT / "pytest.ini", encoding="utf-8")
+    return shlex.split(parser["pytest"].get("addopts", ""))
+
+
+def _disables_randomly(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens):
+        if token == "-pno:randomly":
+            return True
+        if token == "-p" and index + 1 < len(tokens) and tokens[index + 1] == "no:randomly":
+            return True
+    return False
+
+
 def test_pytest_randomly_is_a_dev_dependency() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dev = pyproject["project"]["optional-dependencies"]["dev"]
@@ -50,8 +69,16 @@ def test_pytest_randomly_is_a_dev_dependency() -> None:
     )
 
 
+def test_declared_order_is_default_for_pytest() -> None:
+    assert _disables_randomly(_pytest_addopts_tokens()), (
+        "pytest.ini addopts must pass -p no:randomly: random order belongs to "
+        "the weekly workflow only, and the plugin must stay installed but off "
+        "for local/CI/agent runs"
+    )
+
+
 def test_weekly_randomised_workflow_shuffles_and_replays_seeds() -> None:
-    workflow = _workflow("randomised-tests.yml")
+    workflow = _workflow(RANDOMISED_WORKFLOW)
     triggers = _on_block(workflow)
     assert "schedule" in triggers, "the randomised run must be scheduled, not PR-gated"
     assert "workflow_dispatch" in triggers, (
@@ -65,40 +92,40 @@ def test_weekly_randomised_workflow_shuffles_and_replays_seeds() -> None:
     for command in pytest_runs:
         assert "-p randomly" in command or "--randomly-seed" in command, command
         assert "-p no:randomly" not in command, command
-        # A replay seed must reach pytest as an argument, not only via env.
-        assert "--randomly-seed" in command or 'extra+=(--randomly-seed=' in command, (
+        # A replay seed must reach pytest through the extra array, not only env.
+        assert 'extra+=(--randomly-seed=' in command, (
             f"seed replay path missing from: {command}"
         )
+        assert '"${extra[@]}"' in command, f"seed arguments are not passed to pytest: {command}"
 
 
-def test_ci_workflow_keeps_declared_order() -> None:
-    workflow = _workflow("ci.yml")
-    python_jobs = [
-        job
-        for job in workflow["jobs"].values()
-        if "PYTEST_ADDOPTS" in (job.get("env") or {})
-        or any("pytest" in (s.get("run") or "") for s in job.get("steps") or [])
-    ]
-    assert python_jobs, "ci.yml must still run pytest somewhere"
-    for job in python_jobs:
-        env = job.get("env") or {}
-        addopts = env.get("PYTEST_ADDOPTS", "")
-        commands = [
-            " ".join((s.get("run") or "").split())
-            for s in job.get("steps") or []
-            if "pytest" in (s.get("run") or "")
-        ]
-        disabled = "-p no:randomly" in addopts or any(
-            "-p no:randomly" in c for c in commands
-        )
-        assert disabled, (
-            "ci.yml pytest runs must pass -p no:randomly (directly or via "
-            "PYTEST_ADDOPTS): random order belongs to the weekly workflow only"
-        )
+def test_only_the_weekly_workflow_enables_randomly() -> None:
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        workflow = _workflow(path.name)
+        commands = _run_commands(workflow)
+        for job in workflow.get("jobs", {}).values():
+            addopts = str((job.get("env") or {}).get("PYTEST_ADDOPTS") or "")
+            if path.name != RANDOMISED_WORKFLOW:
+                assert "-p randomly" not in addopts, (
+                    f"{path.name} re-enables pytest-randomly through PYTEST_ADDOPTS"
+                )
+                assert "--randomly-seed" not in addopts, path.name
+        for command in commands:
+            if "pytest" not in command or path.name == RANDOMISED_WORKFLOW:
+                continue
+            assert "-p randomly" not in command, (
+                f"{path.name} must not enable pytest-randomly: {command}"
+            )
+            assert "--randomly-seed" not in command, (
+                f"{path.name} must not pass a pytest-randomly seed: {command}"
+            )
+            assert "PYTEST_RANDOMLY_SEED" not in command, (
+                f"{path.name} must not set a pytest-randomly seed: {command}"
+            )
 
 
 def test_seed_reproduction_is_documented() -> None:
     """The workflow header is the runbook; pin the command shape it promises."""
-    text = (WORKFLOWS / "randomised-tests.yml").read_text(encoding="utf-8")
+    text = (WORKFLOWS / RANDOMISED_WORKFLOW).read_text(encoding="utf-8")
     assert "--randomly-seed" in text
     assert re.search(r"Using --randomly-seed", text)

@@ -1,12 +1,14 @@
 name: randomised-tests
 
-# Weekly randomised-order test run (#293). Nothing else shuffles test order:
-# the `ci` workflow passes `-p no:randomly` so PR and main runs stay in the
-# declared order and a failure there is reproducible from the checkout alone.
-# This job is the tripwire for order-dependent tests - module/class/function
-# order, plus the global random/np.random/faker seeds pytest-randomly resets
-# per test - run once a week instead of on every push, because a random-order
-# failure is only actionable when it is isolated in its own run.
+# Weekly randomised-order test run (#293). pytest.ini keeps `-p no:randomly`
+# in addopts, so every pytest run stays in declared order and reproducible
+# from the checkout alone unless it explicitly passes `-p randomly` (as this
+# job does). This job is the tripwire for order-dependent tests -
+# module/class/function order, plus the global random/np.random/faker seeds
+# pytest-randomly resets per test - run once a week instead of on every push,
+# because a random-order failure is only actionable when it is isolated in its
+# own run. It runs single-process; an xdist run distributes tests differently
+# for the same seed, so replay exactly what failed here.
 #
 # Reproducing a failure: the pytest header prints `Using --randomly-seed=N`.
 # Re-run the same command with that seed, e.g.
