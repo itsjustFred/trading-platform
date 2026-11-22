@@ -25,18 +25,19 @@ the same rule:
 
 Everything here is pure and keyed on ``signal_intent`` rather than on the order
 side or the deployment status. Dispatch is not: an exit reaches a broker only
-through the ACTIVE-only fan-out (and the pre-submit ACTIVE re-check), so an exit
-on a PAUSED deployment is dropped (known limitation, see docs/signal_bots.md).
+through the status-gated fan-out (and the pre-submit re-check), whose accepted
+statuses are ACTIVE or PAUSED for a close and ACTIVE alone for an entry (#126
+decision: a pause stops opening new positions, not closing what is held).
 """
 from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 
 from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 
 logger = get_logger("live-runner")
 
@@ -116,31 +117,11 @@ class ExitBelowStepError(ValueError):
         self.qty_step = float(qty_step)
 
 
-#: Float noise allowance when flooring to a step, as a fraction of one step. A
-#: ledger sum of 2.9999999999999996 is a whole 3, not 2 plus dust; anything this
-#: close to the next step is below every broker's quantity resolution.
-_STEP_NOISE = Decimal("1e-6")
-
-
-def round_exit_qty_down(qty: float, step: float) -> float:
-    """``qty`` rounded DOWN to a whole number of ``step`` (#121 review).
-
-    An exit must never close more than the deployment's own quantity or the
-    fraction it was asked for, so it is floored, never rounded to nearest.
-    Computed in decimal so a step like 1e-9 is exact. Returns 0.0 when less than
-    one step remains; raises ``ValueError`` for an unusable step.
-    """
-    try:
-        step_value = Decimal(repr(float(step)))
-        qty_value = Decimal(repr(float(qty)))
-    except (TypeError, ValueError, InvalidOperation) as exc:
-        raise ValueError(f"Unusable exit quantity {qty!r} or step {step!r}") from exc
-    if not step_value.is_finite() or step_value <= 0:
-        raise ValueError(f"Exit quantity step must be finite and positive, got {step!r}")
-    if not qty_value.is_finite() or qty_value < 0:
-        raise ValueError(f"Exit quantity must be finite and non-negative, got {qty!r}")
-    steps = math.floor(qty_value / step_value + _STEP_NOISE)
-    return float(Decimal(steps) * step_value)
+# Deprecated alias for the pre-#278 name. Open PRs (#329, #369, #350, #367)
+# still import ``round_exit_qty_down`` from this module; main is not
+# branch-protected, so deleting it would break them silently on merge.
+# Remove this alias in a follow-up once those PRs have landed and migrated.
+round_exit_qty_down = floor_qty_to_step
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +224,10 @@ def _broker_quantity(positions: Iterable[Mapping[str, object]], symbol: str) -> 
             continue
         raw = position.get("qty")
         try:
+            # Untrusted broker JSON: the qty is whatever the adapter stored (str,
+            # int, float or garbage), so `float()` is the parse and its TypeError/
+            # ValueError is what turns an unreadable position into the domain
+            # error below - not a type error to suppress away.
             quantity = float(raw)  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
             raise ValueError(
@@ -272,7 +257,9 @@ def _apply_fraction(own_qty: float, fraction: float) -> float:
     raw = own_qty * fraction
     if abs(own_qty - round(own_qty)) <= _WHOLE_UNIT_TOLERANCE:
         # A whole-unit position stays whole: round DOWN, so a partial can never
-        # close more than it was asked to.
+        # close more than it was asked to. Deliberately NOT the shared
+        # lot-grid floor (#278): its 1e-6-of-a-step band could round a real
+        # fraction up past the requested close; this nudge stays at 1e-9.
         return float(math.floor(raw + _WHOLE_UNIT_TOLERANCE))
     return raw
 

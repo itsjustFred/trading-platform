@@ -53,7 +53,7 @@ def _columns(backtest_id: str) -> dict[str, float]:
             select(*(getattr(database.BacktestRecord, name) for name in COLUMNS))
             .where(database.BacktestRecord.id == backtest_id)
         ).first()
-    return dict(zip(COLUMNS, row))
+    return dict(zip(COLUMNS, row, strict=True))
 
 
 def test_the_four_columns_are_actually_mapped() -> None:
@@ -161,6 +161,16 @@ def test_an_unparsable_value_is_treated_as_undefined(isolated_db: tuple) -> None
     _save("junk-1", {"sharpe_ratio": 0.8})
     _save("junk-1", {"sharpe_ratio": "n/a"})
     assert _columns("junk-1")["sharpe_ratio"] == 0.8, _columns("junk-1")
+
+
+def test_an_out_of_range_integer_stat_is_treated_as_undefined(isolated_db: tuple) -> None:
+    """``json.loads`` yields an arbitrary-precision int, and ``float(10**400)`` raises
+    ``OverflowError`` - not ``ValueError`` - so the corrupt value must fail closed the same
+    way NaN and infinity do: carry the stored column forward, never crash the save (#256).
+    """
+    _save("overflow-1", {"sharpe_ratio": -0.9})
+    _save("overflow-1", {"sharpe_ratio": 10**400})
+    assert _columns("overflow-1")["sharpe_ratio"] == -0.9, _columns("overflow-1")
 
 
 def test_resolve_defined_stat_distinguishes_the_three_routes_to_no_number() -> None:

@@ -769,6 +769,56 @@ def test_c2_safe_a_capped_out_deal_is_healed_by_reconciliation_not_doubled(datab
     assert sorted(row[0] for row in _rows(database)) == ["ctrader:deal:1001", "ctrader:deal:1002"]
 
 
+def _commissions(database) -> list[float | None]:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{database.DB_PATH}?mode=ro", uri=True)
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT commission FROM live_executions ORDER BY rowid"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def test_c2_a_ctrader_rebate_fill_is_stored_with_unknown_commission(database, caplog) -> None:
+    """#285: a rebate must not drop the fill. ``_deal_commission`` maps the negative
+    converted cost to NULL ("fee unknown") and logs ERROR; both the stream path
+    (``_persist_execution_event``) and reconciliation (``_persist_recovered_deals``)
+    persist the row instead of raising on every retry."""
+    signal = _seed_ctrader_signal(database, ENTRY_ORDER)
+    adapter = _ctrader_adapter()
+
+    stream = _stream_event(
+        signal_id=signal,
+        order_id=ENTRY_ORDER,
+        deal_id=1001,
+        volume=300_000,
+        cumulative=300_000,
+        execution_type=2,
+    )
+    stream.deal.commission = 350  # +3.50 cash flow at moneyDigits=2: a rebate
+    stream.deal.moneyDigits = 2
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(adapter._persist_execution_event(stream))
+
+    recovered = _recovered_deal(1002, ENTRY_ORDER, 300_000)
+    recovered.commission = 350
+    recovered.moneyDigits = 2
+    with caplog.at_level(logging.ERROR):
+        assert _reconcile(adapter, signal, ENTRY_ORDER, [recovered], 600_000) == 1
+        # A second reconciliation pass re-reads the same rebate deal: the row is a
+        # duplicate (nothing new stored) and the ERROR is not repeated per pass.
+        assert _reconcile(adapter, signal, ENTRY_ORDER, [recovered], 600_000) == 0
+
+    assert _commissions(database) == [None, None]
+    assert database.get_live_signal_filled_qty(signal) == pytest.approx(600.0)
+    assert sum("rebate" in r.message for r in caplog.records) == 2
+
+
 def test_c2_a_dedupe_key_owned_by_another_signal_is_never_amended(database, caplog) -> None:
     """A repeated key under a DIFFERENT signal is not a redelivery and must not be amended.
 

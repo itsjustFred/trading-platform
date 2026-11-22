@@ -445,11 +445,11 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         return None
 
     original_wait = daemon.wait_for_candle_close
-    original_active = daemon._deployment_is_currently_active
+    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
     daemon.wait_for_candle_close = _no_wait
-    daemon._deployment_is_currently_active = lambda _deployment: True
+    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda *_a, **_k: True
     try:
@@ -465,7 +465,7 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         )
     finally:
         daemon.wait_for_candle_close = original_wait
-        daemon._deployment_is_currently_active = original_active
+        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
 
@@ -1321,19 +1321,19 @@ def test_nothing_to_exit_on_a_flat_book_stays_info(monkeypatch, caplog) -> None:
         (0.125, 1.0, 0.0),
     ],
 )
-def test_round_exit_qty_down_to_step(qty, step, expected) -> None:
-    from live_runner.exit_signals import round_exit_qty_down
+def test_floor_qty_to_step_to_step(qty, step, expected) -> None:
+    from shared.lot_grid import floor_qty_to_step
 
-    assert round_exit_qty_down(qty, step) == pytest.approx(expected, abs=1e-15)
-    assert round_exit_qty_down(qty, step) <= qty + 1e-12
+    assert floor_qty_to_step(qty, step) == pytest.approx(expected, abs=1e-15)
+    assert floor_qty_to_step(qty, step) <= qty + 1e-12
 
 
 @pytest.mark.parametrize("step", [0.0, -1.0, float("nan"), float("inf")])
-def test_round_exit_qty_down_refuses_an_unusable_step(step) -> None:
-    from live_runner.exit_signals import round_exit_qty_down
+def test_floor_qty_to_step_refuses_an_unusable_step(step) -> None:
+    from shared.lot_grid import floor_qty_to_step
 
     with pytest.raises(ValueError):
-        round_exit_qty_down(1.0, step)
+        floor_qty_to_step(1.0, step)
 
 
 class _SteppedAdapter(_Adapter):
@@ -1662,7 +1662,7 @@ def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(
         return None
 
     monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
     monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *_a, **_k: True)
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *_a, **_k: True)
 

@@ -20,7 +20,7 @@ from live_runner.alpaca_adapter import (
     _default_alpaca_credentials,
 )
 from live_runner.base_adapter import money_digits_from_trader, money_scale
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import load_accounts_env_values, resolve_accounts_env_path
 from shared.logging import get_logger
 from shared.models import LiveAccount
 
@@ -240,15 +240,15 @@ def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
     with, so is_demo can never contradict the actual trading mode.
     """
     indexed: list[dict[str, Any]] = []
-    for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env)):
-        indexed.append(
-            {
-                "key": str(block.get("source_index", "")),
-                "api_key": str(block["api_key"]),
-                "secret_key": str(block["secret_key"]),
-                "paper": bool(block["paper"]),
-            }
-        )
+    indexed.extend(
+        {
+            "key": str(block.get("source_index", "")),
+            "api_key": str(block["api_key"]),
+            "secret_key": str(block["secret_key"]),
+            "paper": bool(block["paper"]),
+        }
+        for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env))
+    )
 
     if indexed:
         return indexed
@@ -383,9 +383,7 @@ def _ctrader_message_name_sources(message: Any) -> list[Any]:
         if isinstance(nested, (str, bytes, bytearray)):
             continue
         try:
-            for item in nested:
-                if item is not None:
-                    sources.append(item)
+            sources.extend(item for item in nested if item is not None)
         except TypeError:
             sources.append(nested)
     return sources
@@ -492,11 +490,11 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
             )
             if isinstance(payload, dict):
                 return payload
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
     if not hasattr(message, "ListFields"):
         return {}
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {}  # type: ignore[no-redef]  # same name intentionally reused for the fallback payload
     for descriptor, value in message.ListFields():
         field_name = str(descriptor.name)
         if descriptor.label == descriptor.LABEL_REPEATED:
@@ -724,7 +722,7 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
             },
         )
         raise _CtraderStreamError(str(exc)) from exc
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         logger.debug(
             "Optional cTrader account detail request failed",
             extra={
@@ -853,7 +851,7 @@ def _build_ctrader_live_account(
         _load_ctrader_trader_details(ctx, account_id)
     except _CtraderStreamError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         error_text = repr(exc)
         if _handle_ctrader_trader_error(error_text, host, account_id) == "skip":
             return None
@@ -918,7 +916,7 @@ async def discover_ctrader_accounts(
                 app_secret=app_secret,
                 access_token=access_token,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             error_text = repr(exc)
             if _is_expected_ctrader_host_route_error(error_text):
                 logger.info(
@@ -951,11 +949,13 @@ async def discover_ctrader_accounts(
 
 
 async def discover_configured_accounts(
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
 ) -> list[LiveAccount]:
     # File-first precedence: .accounts.env wins over the process environment.
     # Discovery also must not mutate os.environ (no load_dotenv side effects).
-    env = load_accounts_env_values(accounts_env)
+    env = load_accounts_env_values(
+        resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
+    )
 
     discovered_accounts: dict[tuple[str, str], LiveAccount] = {}
 
@@ -980,7 +980,7 @@ async def discover_configured_accounts(
                     }
                 },
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping cTrader account discovery because of runtime error",
                 extra={"data": {"error": repr(exc)}},
@@ -993,7 +993,7 @@ async def discover_configured_accounts(
                 credentials["secret_key"],
                 bool(credentials["paper"]),
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping Alpaca account discovery for credential block",
                 extra={

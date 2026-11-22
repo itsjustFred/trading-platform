@@ -51,7 +51,7 @@ backtest engine does, so exhaustion surfaces as a refusal, not a silent
 drop.
 
 Any failure to verify (no quote, a stale or missing quote time, no pip value,
-unreadable balance, missing stop, invalid cap config) refuses the order.
+unreadable equity, missing stop, invalid cap config) refuses the order.
 
 Whether an order is an exit is decided by the daemon's own classification
 (:func:`live_runner.exit_signals.is_exit_order`), never by a payload marker:
@@ -75,7 +75,7 @@ import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Mapping, NoReturn
+from typing import TYPE_CHECKING, Any, Mapping, NoReturn, overload
 
 from live_runner.base_adapter import (
     BaseLiveAdapter,
@@ -149,7 +149,7 @@ def _cap_number(raw: object, *, key: str) -> float:
     if raw is None or isinstance(raw, bool):
         raise ValueError(f"{key} must be a number, got {raw!r}")
     try:
-        value = float(raw)
+        value = float(raw)  # type: ignore[arg-type]  # raw is a parsed JSON scalar
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{key} must be a number, got {raw!r}") from exc
     if not math.isfinite(value):
@@ -182,7 +182,8 @@ def _parse_cap_overrides(
         unknown = sorted(
             key
             for key in raw
-            if str(key).startswith("pre_submit") and key not in _CAP_KEYS + (_SYMBOL_CAPS_KEY,)
+            if str(key).startswith("pre_submit")
+            and key not in (*_CAP_KEYS, _SYMBOL_CAPS_KEY)
         )
         if unknown:
             raise ValueError(f"{context} has unknown cap keys: {unknown}")
@@ -267,6 +268,10 @@ def pre_submit_cap_settings(
                 )
                 break
 
+    @overload
+    def _resolve(key: str, default: float) -> float: ...
+    @overload
+    def _resolve(key: str, default: float | None) -> float | None: ...
     def _resolve(key: str, default: float | None) -> float | None:
         value = overrides.get(key, base.get(key))
         if value is None:
@@ -326,7 +331,7 @@ async def _record_cap_audit(
             succeeded=succeeded,
             detail=dict(data),
         )
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
         logger.error(
             "Could not write the pre-submit cap audit record; the decision stands",
             extra={"data": {"error": repr(exc)}},
@@ -345,7 +350,7 @@ async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | N
     """
     try:
         value = await adapter.get_max_leverage(symbol)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.debug(
             "Max leverage lookup raised; treating it as unknown (1x)",
             extra={"data": {"symbol": symbol, "error": repr(exc)}},
@@ -376,7 +381,7 @@ async def _safe_used_margin(adapter: BaseLiveAdapter) -> float | None:
         if not callable(method):
             return None
         value = await method()
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.debug(
             "Used-margin lookup raised; treating it as unknown (refuse)",
             extra={"data": {"error": repr(exc)}},
@@ -431,19 +436,25 @@ async def _verify_broker_facts(
     """
     quote_task = asyncio.create_task(adapter.get_quote(signal.symbol))
     pip_task = asyncio.create_task(adapter.get_pip_value(signal.symbol))
-    balance_task = asyncio.create_task(adapter.get_balance())
+    # Equity — not the balance tuple's equity slot — is what the caps judge:
+    # on cTrader that slot is realized balance by design (#267, sizing stays
+    # on it), while ``get_equity`` is the mark-to-market figure (#301) the
+    # free-margin ceiling needs (#302/#359). On adapters whose balance tuple
+    # already carries true equity the default ``get_equity`` returns the same
+    # value.
+    equity_task = asyncio.create_task(adapter.get_equity())
     leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
     margin_task = asyncio.create_task(_safe_used_margin(adapter))
     try:
-        quote, pip_value, (_balance, equity), max_leverage, used_margin = (
+        quote, pip_value, equity, max_leverage, used_margin = (
             await asyncio.wait_for(
                 asyncio.gather(
-                    quote_task, pip_task, balance_task, leverage_task, margin_task
+                    quote_task, pip_task, equity_task, leverage_task, margin_task
                 ),
                 timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
             )
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # gather propagates the first failure but leaves the sibling reads
         # running; cancel them so a hung broker call cannot outlive the
         # refusal (wait_for already cancelled them on a timeout). The
@@ -451,18 +462,18 @@ async def _verify_broker_facts(
         for task in (
             quote_task,
             pip_task,
-            balance_task,
+            equity_task,
             leverage_task,
             margin_task,
         ):
             task.cancel()
         await asyncio.gather(
-            quote_task, pip_task, balance_task, leverage_task, margin_task,
+            quote_task, pip_task, equity_task, leverage_task, margin_task,
             return_exceptions=True,
         )
         await fail(
             "broker_facts_unavailable",
-            "could not fetch the live quote, pip value and balance needed to "
+            "could not fetch the live quote, pip value and equity needed to "
             f"verify the caps ({type(exc).__name__}: {exc})",
         )
 

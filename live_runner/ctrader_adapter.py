@@ -24,28 +24,37 @@ from live_runner.base_adapter import (
     LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
-    commission_cost,
+    commission_from_signed_cash_flow,
     is_unbounded_tp,
     money_digits_from_trader,
     money_scale,
     order_not_submitted,
     validate_live_quote_prices,
 )
-from live_runner.credential_env import resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
+from live_runner.exit_signals import ExitBelowStepError
+from shared import venue_calendar
+from shared.constants import DATA_DIR
 from shared.database import (
+    BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
+    broker_close_signal_id,
     find_live_signal_id_by_broker_order_id,
+    flag_live_ledger_reconciliation,
+    get_live_signal_account_id,
     get_live_signal_broker_order_id,
     get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     get_live_signal_timestamp,
     list_live_signal_ids_for_reconciliation,
+    live_execution_dedupe_key_exists,
+    record_live_broker_side_close_fill,
     save_live_execution,
     save_live_execution_up_to_cumulative,
     save_live_signal,
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -181,6 +190,17 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
+#: pending broker reconciliation instead of letting it sleep out the 30 s
+#: ``queue.get`` timeout. Never a real execution payload.
+_EXECUTION_RECONCILE_WAKE = object()
+
+#: How far back the deal-list pass looks for broker-side position closes the
+#: stream never saw (#144). Bounded on purpose: an older unattributed close is
+#: surfaced by the ledger-mismatch alert and periodic broker reconciliation,
+#: not silently booked from a stale snapshot.
+BROKER_CLOSE_RECONCILE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
+BROKER_CLOSE_RECONCILE_MAX_ROWS = 1000
 
 
 def _power_of_ten_exponent(value: int) -> int:
@@ -415,34 +435,6 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
-def _unrealized_pnl_money_digits(res: Any) -> int:
-    """Decimal places for the unrealized-PnL response's money fields, or raise.
-
-    Unlike ``money_digits_from_trader`` — which falls back to the default
-    scale for monitoring paths — an absent or unusable count here is
-    fail-closed: guessing 2 decimals could mis-scale the unrealized PnL by
-    orders of magnitude and silently overstate equity.
-    """
-    raw = getattr(res, "moneyDigits", None)
-    has_field = getattr(res, "HasField", None)
-    if has_field is not None:
-        try:
-            present = bool(has_field("moneyDigits"))
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("unrealized-PnL moneyDigits is unreadable") from exc
-        if not present:
-            raise RuntimeError("unrealized-PnL response carried no moneyDigits")
-    elif raw is None:
-        raise RuntimeError("unrealized-PnL response carried no moneyDigits")
-    try:
-        digits = int(raw)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError("unrealized-PnL moneyDigits is not an integer") from exc
-    if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
-        raise RuntimeError(f"unrealized-PnL moneyDigits is out of range ({raw!r})")
-    return digits
-
-
 def _fallback_field(fallback: SymbolScale | None, name: str, default: Any = None) -> Any:
     return getattr(fallback, name) if fallback is not None else default
 
@@ -490,9 +482,12 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
     # Floor, never round: rounding to nearest can size up by half a volume unit
-    # and put the loss at the stop above the risk budget. The relative nudge
-    # only absorbs binary float error (0.29 * 100 == 28.999999999999996).
-    volume = math.floor(qty_value * float(volume_per_qty) * (1.0 + 1e-12))
+    # and put the loss at the stop above the risk budget. The shared lot-grid
+    # floor's decimal noise band absorbs binary float error
+    # (0.29 * 100 == 28.999999999999996) and can return a value up to 1e-6 of
+    # a unit above a real fraction that close to the next unit -- below every
+    # broker's volume resolution -- #278.
+    volume = int(floor_qty_to_step(qty_value * float(volume_per_qty), 1.0))
     if volume <= 0:
         raise ValueError(
             f"qty {qty_value!r} is below one broker volume unit at "
@@ -509,6 +504,9 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
     ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
     lands on that grid, so it is rounded DOWN: rounding up would exceed the
     risk budget. A result below the broker minimum is refused by the caller.
+    Both operands are integers, so ``//`` is already the exact floor -- there
+    is no float dust for the shared lot-grid floor (#278) to absorb, and
+    routing ints through it could only add error.
     """
     step = int(step_volume)
     if step <= 1:
@@ -559,18 +557,28 @@ def _deal_id_or_none(deal: Any | None) -> int | None:
     return deal_id if deal_id > 0 else None
 
 
-def _deal_commission(deal: Any | None) -> float:
-    """A deal's commission in account currency, as a positive cost.
+def _deal_commission(
+    deal: Any | None, *, rebate_logged: set[int] | None = None
+) -> float | None:
+    """A deal's commission in account currency, as a positive cost — or ``None``.
 
     cTrader reports a charge as a NEGATIVE ``commission`` (a signed cash flow). It is stored as a
     positive cost, the ``live_executions.commission`` convention shared with Alpaca (see
-    ``base_adapter.commission_cost``).
+    ``base_adapter.commission_from_signed_cash_flow``).
 
     ``ProtoOADeal.commission`` is an ``int64`` in minor units: it is scaled by the deal's own
     ``moneyDigits`` exactly like ``ProtoOATrader.balance`` is by the trader's. Storing the raw
     integer records a 2-digit-account commission of 3.50 as 350. A deal that carries no
     commission (an unset int64 reads as ``0``) is ``0.0`` without consulting ``moneyDigits``, so
     only a real charge can trigger the "digits missing" fallback warning.
+
+    A positive broker cash flow is a REBATE: the converted cost is negative, which the
+    ``commission`` write guard refuses. Refusing the ``LiveExecution`` would drop the whole
+    fill — the stream caller retains the event for reconciliation forever and the row never
+    reaches ``live_executions``, the lost-fill the persist path exists to prevent — so the
+    rebate is stored as ``None`` ("fee unknown"; readers already treat it as net-PnL
+    incomplete) and logged at ERROR with the deal id and the raw value. How a rebate should
+    be represented is an open maintainer decision (#285); until then the fill is kept.
     """
     if deal is None:
         return 0.0
@@ -578,7 +586,25 @@ def _deal_commission(deal: Any | None) -> float:
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
     if not raw or not math.isfinite(raw):
         return 0.0
-    return commission_cost(raw / money_scale(money_digits_from_trader(deal)))
+    cost = commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
+    if cost < 0:
+        deal_id = _deal_id_or_none(deal)
+        # ERROR once per deal id per adapter: reconciliation re-reads the same deals on
+        # every pass, and each ERROR is a Sentry event — the anomaly is logged loudly
+        # once, not once per pass.
+        if rebate_logged is None or deal_id is None or deal_id not in rebate_logged:
+            logger.error(
+                "cTrader deal %s reported a rebate: commission=%r converts to cost=%r, which "
+                "the write guard refuses; storing commission=NULL so the fill is kept and "
+                "net PnL stays flagged incomplete (#285)",
+                deal_id,
+                raw,
+                cost,
+            )
+            if rebate_logged is not None and deal_id is not None:
+                rebate_logged.add(deal_id)
+        return None
+    return cost
 
 
 _NOT_AUTHORIZED_MARKER = "not authorized"
@@ -597,7 +623,7 @@ def _twisted_deferred_timeout_class() -> type[BaseException] | None:
     """
     try:
         from twisted.internet import defer
-    except Exception:  # pragma: no cover - Twisted is absent
+    except Exception:  # pragma: no cover - Twisted is absent  # except-kind: loop-survival
         return None
     return getattr(defer, "TimeoutError", None)
 
@@ -642,7 +668,7 @@ def _reason_to_text(reason: Any) -> str:
     if hasattr(reason, "getErrorMessage"):
         try:
             return str(reason.getErrorMessage())
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             return str(reason)
     return str(reason)
 
@@ -698,7 +724,12 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                # `msvcrt` is a Windows-only stdlib module (typeshed gates it on
+                # `sys_platform == "win32"`), so mypy on the Linux CI runner cannot
+                # see its members at all: `attr-defined` is about the platform, not
+                # about a runtime value. The `os.name == "nt"` guard is what makes
+                # this branch reachable only where the module exists.
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
                 break
             except OSError:
                 time.sleep(0.05)
@@ -706,7 +737,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # Windows-only module, see the lock call above
         return
 
     import fcntl
@@ -779,7 +810,18 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             pass
         _ASYNCIO_REACTOR_VALIDATED = True
 
-    from twisted.internet import reactor
+    from twisted.internet import reactor as _reactor
+
+    # `twisted.internet.reactor` is a *module* at import time and the installed
+    # reactor *instance* at run time: `installReactor()` rebinds
+    # sys.modules["twisted.internet.reactor"] to the instance, which is why
+    # `__class__.__module__` names the reactor class below. The static type is
+    # therefore the module, so `running`/`startRunning` are genuinely not on it.
+    # Take it as Any instead of two `# type: ignore[attr-defined]` comments:
+    # those are unused whenever Twisted's own (partial) types are absent, and
+    # `warn_unused_ignores` turns an unused ignore into a failure - so the same
+    # source would type-check in CI and fail in a dev-extra-only checkout.
+    reactor: Any = _reactor
 
     reactor_module = reactor.__class__.__module__
     if "asyncioreactor" not in reactor_module:
@@ -819,8 +861,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self.app_secret = app_secret or resolve_env_value(env_values, "CTRADER_APP_SECRET")
         self.access_token = access_token or resolve_env_value(env_values, "CTRADER_ACCESS_TOKEN")
         self.refresh_token = refresh_token or resolve_env_value(env_values, "CTRADER_REFRESH_TOKEN")
-        self.accounts_env_path = (
-            Path(accounts_env_path) if accounts_env_path else DEFAULT_ACCOUNTS_ENV
+        self.accounts_env_path = resolve_accounts_env_path(
+            accounts_env_path or None, default=DEFAULT_ACCOUNTS_ENV
         )
         raw_account_id = str(account_id or account_config_id).strip()
         self.ctid_trader_account_id = int(raw_account_id) if raw_account_id else 0
@@ -863,7 +905,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._connected_event = asyncio.Event()
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts: dict[int, int] = {}
+        self._rebate_logged_deal_ids: set[int] = set()
         self._unresolved_execution_events: deque[Any] = deque()
+        # Deal ids already flagged ledger_reconciliation_required this process.
+        # The reconcile pass re-reads the same 7-day window on every connect and
+        # every pending retry; without this each unattributable deal would write
+        # a new audit row and a new ERROR alert per pass, drowning the next real
+        # flag in repeats. Deliberately NOT cleared on disconnect: a reconnect
+        # is exactly when the pass re-runs.
+        self._flagged_broker_close_deals: set[int] = set()
         self._reconciliation_required = False
         self._reconciliation_retry_at = 0.0
         self._connected = False
@@ -923,6 +973,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderListRes: Any = None
         self._ProtoOAOrderListByPositionIdReq: Any = None
         self._ProtoOAOrderListByPositionIdRes: Any = None
+        self._ProtoOADealListReq: Any = None
+        self._ProtoOADealListRes: Any = None
         self._ProtoOAReconcileReq: Any = None
         self._ProtoOAReconcileRes: Any = None
         self._ProtoOARefreshTokenReq: Any = None
@@ -963,6 +1015,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAApplicationAuthRes,
                 ProtoOACancelOrderReq,
                 ProtoOAClosePositionReq,
+                ProtoOADealListReq,
+                ProtoOADealListRes,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
                 ProtoOAGetDynamicLeverageByIDReq,
@@ -1032,6 +1086,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
+        self._ProtoOADealListReq = ProtoOADealListReq
+        self._ProtoOADealListRes = ProtoOADealListRes
         self._ProtoOAReconcileReq = ProtoOAReconcileReq
         self._ProtoOAReconcileRes = ProtoOAReconcileRes
         self._ProtoOARefreshTokenReq = ProtoOARefreshTokenReq
@@ -1126,7 +1182,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         "CTRADER_REFRESH_TOKEN": refresh_token,
                     },
                 )
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.warning(
                     "cTrader tokens refreshed but could not be persisted",
                     extra={
@@ -1217,7 +1273,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         try:
             payload = self._Protobuf.extract(message)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
+            if payload_type == self._execution_payload_type:
+                self._reconciliation_required = True
+                self._reconciliation_retry_at = 0.0
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
             return
 
@@ -1230,6 +1291,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._execution_queue.put_nowait(payload)
             except asyncio.QueueFull:
                 self._reconciliation_required = True
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
                 logger.warning(
                     "cTrader execution queue is full; broker reconciliation required"
                 )
@@ -1342,7 +1405,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         raise RuntimeError(
                             "Unexpected account auth response after refresh: "
                             f"{type(account_auth_res).__name__}"
-                        )
+                        ) from exc
                     self._authenticated = True
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
@@ -1507,8 +1570,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_name_to_id = symbol_name_to_id
         self._symbol_assets = symbol_assets
         # #80: broker-API symbol properties (digits/lotSize/minVolume) are the
-        # source of truth for per-symbol scales. Best-effort: the light list
-        # above stays authoritative for ids when the detail fetch fails.
+        # source of truth for per-symbol scales. Required: a failed or
+        # unexpected detail fetch aborts authentication rather than letting
+        # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
 
@@ -1542,21 +1606,29 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             detail_res = await self._send_request_with_refresh_retry(
                 detail_req, timeout_seconds=15
             )
-        except Exception:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
-                "cTrader symbol-props fetch failed; using fallback scales",
-                extra={"data": {"account_id": self.ctid_trader_account_id}},
+                "cTrader symbol-props fetch failed; refusing fallback scales",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": str(exc),
+                    }
+                },
             )
-            return
+            raise
         if not isinstance(detail_res, ProtoOASymbolByIdRes):
-            return
+            raise RuntimeError(
+                f"Unexpected symbol-props response: {type(detail_res).__name__}; "
+                "refusing to authenticate with fallback scales."
+            )
         # Archived entries first so live properties always win on collision.
         for detail in list(getattr(detail_res, "archivedSymbol", [])) + list(detail_res.symbol):
             try:
                 sid = int(detail.symbolId)
             except (TypeError, ValueError):
                 continue
-            name = id_to_name.get(sid)
+            name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
             # #240: the symbol's dynamic-leverage id rides on the same detail
@@ -1576,6 +1648,42 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
             if scale is not None:
                 self._symbol_props[name] = scale
+            self._persist_symbol_venue_calendar(detail, name)
+
+    def _persist_symbol_venue_calendar(self, detail: Any, name: str) -> None:
+        """Cache ProtoOASymbol schedule/timezone/holidays as a venue calendar.
+
+        The same ProtoOASymbolById response already carries the broker's
+        session schedule; persisting it lets coverage gates and live checks
+        share one authoritative calendar (#133). Best-effort per symbol.
+        """
+        try:
+            schedule = list(getattr(detail, "schedule", []) or [])
+            holidays = list(getattr(detail, "holiday", []) or [])
+            if not schedule and not holidays:
+                return
+            timezone_name = str(getattr(detail, "scheduleTimeZone", "") or "")
+            if not timezone_name.strip():
+                # Schedule seconds are relative to the broker zone; caching
+                # them as UTC would misplace every session boundary, so an
+                # absent timezone means no cache — the venue stays unresolved
+                # and coverage fails closed.
+                return
+            payload = venue_calendar.ctrader_schedule_payload(
+                symbol=name,
+                schedule=schedule,
+                schedule_timezone=timezone_name,
+                holidays=holidays,
+            )
+            venue_calendar.save_cached_calendar(
+                data_dir=DATA_DIR, source="ctrader", symbol=name, payload=payload
+            )
+        except Exception:  # except-kind: loop-survival
+            logger.warning(
+                "cTrader venue-calendar cache write failed for %s",
+                name,
+                exc_info=True,
+            )
 
     def _extract_order_id_from_payload(self, payload: Any) -> int | None:
         if isinstance(payload, self._ProtoOAExecutionEvent):
@@ -1601,7 +1709,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         when less than one step remains.
         """
         step_qty = float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
-        floored_qty = round_exit_qty_down(qty, step_qty)
+        floored_qty = floor_qty_to_step(qty, step_qty)
         if floored_qty <= 0.0:
             raise ExitBelowStepError(
                 f"cTrader exit for {symbol} ignored: the requested qty {qty:g} is below "
@@ -1609,8 +1717,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 requested_qty=qty,
                 qty_step=step_qty,
             )
-        # A whole number of steps: round() only removes float noise here.
-        return int(round(floored_qty * float(scale.volume_per_qty)))
+        # A whole number of steps: round() on a float returns an int, and this
+        # only removes float noise.
+        return round(floored_qty * float(scale.volume_per_qty))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``."""
@@ -1723,7 +1832,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 except CTraderAuthTerminalError as exc:
                     self._handle_terminal_auth_failure(exc)
                     raise
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     await self._retry_or_raise_connect_failure(
                         exc, attempt, max_attempts, base_delay
                     )
@@ -1749,7 +1858,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.reconcile_executions()
         except CTraderAuthTerminalError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._reconciliation_required = True
             self._reconciliation_retry_at = 0.0
             logger.warning(
@@ -1832,7 +1941,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await asyncio.sleep(delay)
             return
         self._log_connect_failure(exc, error_text, message)
-        raise
+        raise exc
 
     def _log_connect_failure(
         self, exc: Exception, error_text: str, message: str
@@ -1931,11 +2040,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
                     stop()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
         try:
             self._connected_event.clear()
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
 
     async def _recover_broker_order_id(
@@ -2057,6 +2166,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 broker_order_id=broker_order_id,
                 details_res=details_res,
             )
+        # #144: broker-side position closes have no signal of ours, so the
+        # per-signal pass above can never see them; the account deal list can.
+        recovered += await self._reconcile_broker_side_closes()
         return recovered
 
     def _parse_signal_uuid(self, signal_id: str) -> UUID | None:
@@ -2241,7 +2353,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             actual_price=self._resolve_execution_price(order=order, deal=deal),
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(
+                deal,
+                # ``getattr``: tests build partial adapters via ``__new__`` without
+                # ``__init__``; a missing set only means the ERROR is not deduped.
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=broker_order_id,
             dedupe_key=f"ctrader:deal:{deal_id}",
@@ -2574,7 +2691,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ),
         )
 
-    async def _resolve_symbol_id(self, symbol: str) -> int | None:
+    async def _resolve_symbol_id(self, symbol: str) -> int:
+        """Resolve a symbol to its broker id, raising when it is unknown.
+
+        The return is declared ``int``, never ``int | None``: both lookup
+        misses raise, so a ``None`` return would be unrepresentable.
+        """
         symbol_id = self._symbol_name_to_id.get(symbol.upper())
         if symbol_id is None:
             await self._authenticate()
@@ -2600,7 +2722,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             raise ValueError("cTrader close position id must be positive integer.")
         volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = int(round(volume_value))
+        broker_volume = round(volume_value)
         if broker_volume <= 0:
             raise ValueError("cTrader close volume must be a positive integer.")
         request = self._ProtoOAClosePositionReq()
@@ -2780,7 +2902,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.symbolId.append(int(symbol_id))
         try:
             await self._send_request_with_refresh_retry(request, timeout_seconds=10)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "cTrader spot unsubscribe failed",
                 extra={
@@ -2946,7 +3068,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._asset_names = {
                     int(asset.assetId): str(asset.name) for asset in response.asset
                 }
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "cTrader asset list unavailable; pip value record keeps asset ids",
                 extra={"data": {"account_id": self.ctid_trader_account_id, "error": str(exc)}},
@@ -3102,7 +3224,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
             candidates = [cents for cents in (tier_cents, account_cents) if cents is not None]
             return min(candidates) / 100.0 if candidates else None
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "cTrader max leverage lookup failed; treating it as unknown (1x)",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
@@ -3122,7 +3244,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         try:
             trader = await self._fetch_trader()
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "cTrader trader leverage lookup failed; using the symbol tiers only",
                 extra={"data": {"error": repr(exc)}},
@@ -3154,61 +3276,67 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
         return trader_res.trader
 
-    async def get_balance(self) -> tuple[float, float]:
-        trader = await self._fetch_trader()
-        money_digits = money_digits_from_trader(trader)
-        scale = money_scale(money_digits)
-        balance = _to_float(getattr(trader, "balance", 0)) / scale
-        if hasattr(trader, "equity"):
-            equity = _to_float(getattr(trader, "equity", balance)) / scale
-        else:
-            # #359/#347: MT5-style equity is mark-to-market — realized balance
-            # plus the broker-reported unrealized PnL. ``ProtoOATrader`` has no
-            # equity field, and realized balance alone overstates free margin
-            # while positions are losing (the unsafe direction the caps
-            # refuse), so an unreadable PnL figure fails the whole read closed.
-            equity = balance + await self._unrealized_pnl_total()
-        return balance, equity
+    async def _fetch_position_unrealized_pnl(self, fallback_money_digits: int) -> float:
+        """Summed net unrealized P&L of all open positions, in account currency.
 
-    async def _unrealized_pnl_total(self) -> float:
-        """Σ ``netUnrealizedPnL`` across the account's positions, account ccy.
-
-        ``ProtoOAGetPositionUnrealizedPnLReq`` returns one entry per position
-        with the broker-computed unrealized figure; ``netUnrealizedPnL``
-        (gross + swap + commission) is the conservative leg — it can only sit
-        below ``grossUnrealizedPnL``. Raises on any unreadable figure: an
-        understated loss would overstate equity and free margin.
+        ``ProtoOAGetPositionUnrealizedPnLRes`` reports one entry per open
+        position with ``grossUnrealizedPnL``/``netUnrealizedPnL`` in money
+        digits; the net figure (after accrued swap/commission) is what the
+        account's equity actually carries. The response carries its own
+        ``moneyDigits``; the trader's digits are the fallback when it is unset.
+        Any failure raises - the caller treats unreadable equity as unreadable,
+        never as "no unrealized loss".
         """
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOAGetPositionUnrealizedPnLReq,
+            ProtoOAGetPositionUnrealizedPnLRes,
+        )
+
         self._raise_if_terminal_auth_failed()
         if not self._connected or not self._authenticated:
             await self.connect()
+
         self._raise_if_terminal_auth_failed()
-        if (
-            self._ProtoOAGetPositionUnrealizedPnLReq is None
-            or self._ProtoOAGetPositionUnrealizedPnLRes is None
-        ):
-            raise RuntimeError("cTrader unrealized-PnL proto types are not loaded")
-        req = self._ProtoOAGetPositionUnrealizedPnLReq()
-        req.ctidTraderAccountId = self.ctid_trader_account_id
+        request = ProtoOAGetPositionUnrealizedPnLReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
         try:
-            res = await self._send_request_with_refresh_retry(req, timeout_seconds=15)
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=15
+            )
         except CTraderApiError as exc:
             self._raise_terminal_auth_from_api_error(exc)
             raise
-        if not isinstance(res, self._ProtoOAGetPositionUnrealizedPnLRes):
+        if not isinstance(response, ProtoOAGetPositionUnrealizedPnLRes):
             raise RuntimeError(
-                f"Unexpected unrealized-PnL response: {type(res).__name__}"
+                f"Unexpected unrealized PnL response: {type(response).__name__}"
             )
-        scale = money_scale(_unrealized_pnl_money_digits(res))
+        digits = int(getattr(response, "moneyDigits", 0) or 0)
+        if digits <= 0:
+            digits = int(fallback_money_digits or 0)
+        scale = money_scale(digits)
         total = 0.0
-        for entry in getattr(res, "positionUnrealizedPnL", []) or []:
-            net = _optional_float(getattr(entry, "netUnrealizedPnL", None))
+        for position_pnl in response.positionUnrealizedPnL:
+            # Fail closed per entry (#302): an unreadable or non-finite
+            # netUnrealizedPnL read as 0.0 would understate a losing position
+            # and overstate equity - the unsafe direction for both the loss
+            # breaker and the pre-submit caps' free-margin ceiling.
+            net = _optional_float(getattr(position_pnl, "netUnrealizedPnL", None))
             if net is None or not math.isfinite(net):
                 raise RuntimeError(
                     "unrealized-PnL entry carried an unreadable netUnrealizedPnL"
                 )
             total += net / scale
         return total
+
+    async def get_balance(self) -> tuple[float, float]:
+        trader = await self._fetch_trader()
+        money_digits = money_digits_from_trader(trader)
+        scale = money_scale(money_digits)
+        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        equity = balance
+        if hasattr(trader, "equity"):
+            equity = _to_float(getattr(trader, "equity", balance)) / scale
+        return balance, equity
 
     async def get_used_margin(self) -> float | None:
         """Margin held against open positions, summed in account currency (#359).
@@ -3243,12 +3371,34 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     return None
                 total += used / money_scale(digits_int)
             return total
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "cTrader used-margin lookup failed; treating it as unknown",
                 extra={"data": {"error": repr(exc)}},
             )
             return None
+
+    async def get_equity(self) -> float:
+        """Account equity including unrealized P&L, for the loss breaker (#301).
+
+        Deliberately a separate path from :meth:`get_balance`: the #267
+        maintainer decision keeps position sizing on realized balance, so
+        ``get_balance`` must not start carrying unrealized P&L. The loss
+        breaker (#301) and the pre-submit caps' free-margin ceiling (#302,
+        #359) read this. ``ProtoOATrader`` has no equity field, so equity
+        is balance plus the summed net unrealized P&L of open positions -
+        reporting balance here would hide an open losing position until it
+        closes. Any failure raises: unreadable equity is never "no loss".
+        """
+        trader = await self._fetch_trader()
+        money_digits = money_digits_from_trader(trader)
+        scale = money_scale(money_digits)
+        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        if hasattr(trader, "equity"):
+            # A trader payload that carries its own equity field is trusted to
+            # include unrealized P&L already (ProtoOATrader does not).
+            return _to_float(getattr(trader, "equity", balance)) / scale
+        return balance + await self._fetch_position_unrealized_pnl(money_digits)
 
     @property
     def supports_cancel_orders(self) -> bool:
@@ -3721,7 +3871,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id,
+                    # mypy's `to_thread` signature demands a callable returning
+                    # non-Optional (`Callable[[str, str], str]`) and rejects this
+                    # one's `str | None` result; the lookup genuinely returns
+                    # None for an unknown order and the `or ""` below handles
+                    # it. The arguments themselves are both str.
+                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]
                     self.account_config_id,
                     str(order_id),
                 )
@@ -3732,6 +3887,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             client_order_id, order_id=order_id, execution_type=execution_type
         )
         if signal_id is None:
+            # #144: a broker-side position close (SL/TP, flatten, manual) names
+            # no signal of ours, but its deal still resolves to the position's
+            # opening order and through it to the parent signal's ledger. Only
+            # an unambiguous chain is booked; anything else is flagged for
+            # reconciliation, never guessed into a ledger.
+            if await self._try_record_position_close(
+                order=order, deal=deal, order_id=order_id, execution_type=execution_type
+            ):
+                return
             raise ValueError(
                 "cTrader fill could not be mapped to a persisted live signal; "
                 "retaining the event for reconciliation."
@@ -3779,7 +3943,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             # `actual_price` treats a non-answer as a price.
             actual_price_observed=self._execution_price_presence(order=order, deal=deal),
             filled_qty=filled_qty,
-            commission=_deal_commission(deal),
+            commission=_deal_commission(
+                deal,
+                rebate_logged=getattr(self, "_rebate_logged_deal_ids", None),
+            ),
             timestamp=_to_datetime_from_ms(timestamp_ms),
             broker_order_id=str(order_id or ""),
             dedupe_key=self._build_dedupe_key(
@@ -3840,6 +4007,644 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 }
             },
         )
+
+    # ─── broker-side position closes (#144) ────────────────────────────────────────────────
+
+    @staticmethod
+    def _has_proto_field(payload: Any, name: str) -> bool:
+        """``HasField`` when the payload is a real protobuf, attribute presence otherwise."""
+        has_field = getattr(payload, "HasField", None)
+        if callable(has_field):
+            try:
+                return bool(has_field(name))
+            except (TypeError, ValueError):
+                return False
+        return getattr(payload, name, None) is not None
+
+    @staticmethod
+    def _event_is_position_close(order: Any | None, deal: Any | None) -> bool:
+        """Whether this execution event reduces an existing position.
+
+        ``closePositionDetail`` is set on a deal that closed position volume -
+        an SL/TP trigger, a flatten, a manual close, and this platform's own
+        ``ClosePositionReq`` exits all carry it. ``closingOrder`` on the order
+        is the same fact from the order side. Our own exits never reach this
+        check: their order id resolves to the persisted exit signal first.
+        """
+        if deal is not None and CTraderLiveAdapter._has_proto_field(
+            deal, "closePositionDetail"
+        ):
+            return True
+        return order is not None and bool(getattr(order, "closingOrder", False))
+
+    def _position_id_from_payload(self, order: Any | None, deal: Any | None) -> int | None:
+        """The position a close deal/order belongs to, deal first."""
+        for payload in (deal, order):
+            if payload is None:
+                continue
+            position_id = self._positive_int(getattr(payload, "positionId", 0))
+            if position_id is not None:
+                return position_id
+        return None
+
+    async def _fetch_position_orders(self, position_id: int) -> Any | None:
+        """Every order the broker ties to one position, opening and closing."""
+        if (
+            self._ProtoOAOrderListByPositionIdReq is None
+            or self._ProtoOAOrderListByPositionIdRes is None
+        ):
+            return None
+        request = self._ProtoOAOrderListByPositionIdReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.positionId = int(position_id)
+        response = await self._send_request_with_refresh_retry(request, timeout_seconds=15)
+        if not isinstance(response, self._ProtoOAOrderListByPositionIdRes):
+            logger.warning(
+                "Unexpected order-list-by-position response during broker-close attribution",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "position_id": position_id,
+                        "response_type": type(response).__name__,
+                    }
+                },
+            )
+            return None
+        return response
+
+    async def _signal_id_for_position_order(self, order: Any) -> str | None:
+        """The persisted signal one position order belongs to, or ``None``.
+
+        The opening order carries our ``clientOrderId`` (the signal id) or, after
+        a restart where the in-memory maps are empty, an order id the database
+        can resolve. A ``clientOrderId`` only counts when it names a signal on
+        THIS account: it is a bare UUID, and booking a close against another
+        account's deployment would corrupt that ledger.
+        """
+        client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+        candidate = ""
+        if client_order_id:
+            try:
+                candidate = str(UUID(client_order_id))
+            except (ValueError, AttributeError, TypeError):
+                candidate = ""
+            if candidate:
+                account_id = await asyncio.to_thread(
+                    get_live_signal_account_id, candidate
+                )
+                if account_id is None or str(account_id) != str(
+                    self.account_config_id
+                ):
+                    candidate = ""
+        if not candidate:
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            if order_id is not None:
+                resolved = self._order_id_to_signal_id.get(order_id)
+                if resolved is None:
+                    resolved = await asyncio.to_thread(
+                        find_live_signal_id_by_broker_order_id,
+                        self.account_config_id,
+                        str(order_id),
+                    )
+                candidate = str(resolved) if resolved else ""
+        if not candidate:
+            return None
+        # An exit signal is itself a close, never the position's opener: if the
+        # broker did not flag its order ``closingOrder`` it must still not be
+        # booked as the parent, or the close would reduce the wrong ledger side.
+        metadata = await asyncio.to_thread(get_live_signal_metadata, candidate)
+        if metadata and (
+            str(metadata.get("signal_intent") or "") == "exit"
+            or bool(metadata.get("exit_only"))
+            or str(metadata.get("risk_sizing_mode") or "")
+            == EXIT_ONLY_RISK_SIZING_MODE
+        ):
+            return None
+        return candidate
+
+    async def _resolve_position_parent_signal(
+        self, position_id: int
+    ) -> tuple[str | None, str]:
+        """``(parent_signal_id, cause)`` for the position's opening order(s).
+
+        Exactly one distinct persisted signal may open the position for the
+        close to be attributable. Zero (a manual position, or orders this
+        platform never submitted) and several (a netted book several
+        deployments share) are both refusals - the caller flags the ledger
+        rather than guessing which shares the close took.
+
+        Known limitation, kept deliberately fail-closed: several opening
+        orders that all resolve to signals of ONE deployment on ONE side are
+        still flagged ``ambiguous_parent``. The ledger is per deployment, so
+        attribution would be exact there - but whether a scaled-in position's
+        close belongs to that deployment alone is a maintainer decision
+        (#277), and until it lands the flag is the honest answer.
+        """
+        orders = await self._fetch_position_orders(position_id)
+        if orders is None:
+            return None, "position_orders_unreadable"
+        candidates: set[str] = set()
+        for order in getattr(orders, "order", []) or []:
+            if bool(getattr(order, "closingOrder", False)):
+                continue
+            signal_id = await self._signal_id_for_position_order(order)
+            if signal_id:
+                candidates.add(signal_id)
+        if len(candidates) == 1:
+            return next(iter(candidates)), "ok"
+        if not candidates:
+            return None, "no_opening_order"
+        return None, "ambiguous_parent"
+
+    @staticmethod
+    def _broker_close_dedupe_key(deal: Any | None) -> str | None:
+        """The one dedupe derivation every path shares for one deal.
+
+        ``dealId`` is unique per fill by construction, and it is the SAME key
+        ``_build_dedupe_key`` derives for the normal fill path: a deal that
+        reaches both paths - booked as a broker-side close, then resolved to a
+        signal once the exit's broker order id is persisted - must collide on
+        one key, or the ledger is reduced twice. A close deal without a dealId
+        cannot be told from its own redelivery, so it is refused rather than
+        keyed on something that could count it twice.
+        """
+        deal_id = _deal_id_or_none(deal)
+        if deal_id is None:
+            return None
+        return f"ctrader:deal:{deal_id}"
+
+    def _close_side_from_payload(self, order: Any | None, deal: Any | None) -> str | None:
+        """``buy``/``sell`` of the closing deal, for the insert's side cross-check."""
+        trade_side = None
+        for payload in (deal, order):
+            if payload is None:
+                continue
+            value = getattr(payload, "tradeSide", None)
+            if value:
+                trade_side = value
+                break
+        if trade_side is None or self._ProtoOATradeSide is None:
+            return None
+        try:
+            side_value = int(trade_side)
+        except (TypeError, ValueError):
+            return None
+        if side_value == int(self._ProtoOATradeSide.BUY):
+            return "buy"
+        if side_value == int(self._ProtoOATradeSide.SELL):
+            return "sell"
+        return None
+
+    def _fill_symbol_name(
+        self, *, order_id: int | None, order: Any | None, deal: Any | None
+    ) -> str | None:
+        """The upper symbol name a close fill trades, or ``None`` when unreadable.
+
+        Same precedence as the normal fill path - deal ``symbolId``, then the
+        order's, then the submit-time order map - but non-raising: the caller
+        flags the ledger instead of dropping the event silently.
+        """
+        for payload in (deal, order):
+            if payload is None:
+                continue
+            symbol_id = int(getattr(payload, "symbolId", 0) or 0)
+            if symbol_id:
+                try:
+                    return self._symbol_name_for_id(symbol_id)
+                except ValueError:
+                    return None
+        if order_id is not None:
+            return self._order_id_to_symbol.get(int(order_id))
+        return None
+
+    async def _persist_position_close_fill(
+        self,
+        *,
+        parent_signal_id: str,
+        order: Any | None,
+        deal: Any | None,
+        order_id: int | None,
+        dedupe_key: str,
+    ) -> tuple[float, str | None]:
+        """Book one broker-side close against the parent's ledger (#144).
+
+        Returns ``(persisted_qty, failure_cause)``. ``failure_cause`` is ``None``
+        both when quantity was persisted and when the fill was already recorded
+        (a redelivery or a slice reconciliation booked first) - the caller only
+        flags on a real ``failure_cause``. The closing order's cumulative
+        executed volume caps the booking per broker order inside the insert,
+        exactly like the Alpaca leg path; the deal's own ``filledVolume`` is the
+        slice this fill contributes.
+        """
+        filled_volume = self._resolve_filled_volume(order=order, deal=deal)
+        if filled_volume <= 0:
+            return 0.0, "unusable_volume"
+        symbol = self._fill_symbol_name(order_id=order_id, order=order, deal=deal)
+        if symbol is None:
+            return 0.0, "unusable_symbol"
+        scale = self._scale_for(symbol)
+        filled_qty = _broker_volume_to_qty(filled_volume, scale.volume_per_qty)
+        timestamp_ms = self._resolve_execution_timestamp_ms(order=order, deal=deal)
+        if timestamp_ms <= 0:
+            # The ledger is ordered by fill time; an invented epoch stamp could
+            # not be corrected later, so the fill is refused and flagged.
+            return 0.0, "unusable_timestamp"
+        cumulative_volume = self._resolve_order_cumulative_volume(order)
+        cumulative_qty = (
+            _broker_volume_to_qty(cumulative_volume, scale.volume_per_qty)
+            if cumulative_volume > 0
+            else None
+        )
+        persisted_qty = await asyncio.to_thread(
+            record_live_broker_side_close_fill,
+            parent_signal_id=parent_signal_id,
+            close_reason=BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE,
+            filled_qty=filled_qty,
+            actual_price=self._resolve_execution_price(order=order, deal=deal),
+            actual_price_observed=self._execution_price_presence(order=order, deal=deal),
+            commission=_deal_commission(deal),
+            timestamp=_to_datetime_from_ms(timestamp_ms),
+            broker_order_id=str(order_id or ""),
+            dedupe_key=dedupe_key,
+            broker_fill_id=_deal_id_or_none(deal),
+            close_side=self._close_side_from_payload(order, deal),
+            cumulative_filled_qty=cumulative_qty,
+        )
+        if persisted_qty > 0.0:
+            return persisted_qty, None
+        if await asyncio.to_thread(live_execution_dedupe_key_exists, dedupe_key):
+            # A redelivery, or a slice the reconcile pass already booked: the
+            # fill is handled, just not by this call.
+            return 0.0, None
+        return 0.0, "record_refused"
+
+    def _flag_ledger_reconciliation(
+        self, symbol: str, cause: str, detail: Mapping[str, Any]
+    ) -> None:
+        """Surface an unattributable close: durable audit flag + ERROR alert.
+
+        The fill is NOT guessed into a ledger (the #144 maintainer decision for
+        flatten/manual closes). The audit row is what an operator and the
+        periodic broker reconciliation (#330) can act on; the ERROR record is
+        the alert channel.
+
+        One flag per deal per process: the reconcile pass and the stream's
+        retain-for-reconciliation retries see the same unattributable deal
+        again and again, and each repeat would otherwise add another audit row
+        and another ERROR alert. A deal with no id cannot be deduplicated and
+        is flagged every time.
+        """
+        deal_id = detail.get("deal_id")
+        if isinstance(deal_id, int) and deal_id > 0:
+            if deal_id in self._flagged_broker_close_deals:
+                logger.info(
+                    "cTrader broker-side close already flagged for reconciliation; "
+                    "not flagging the same deal again",
+                    extra={
+                        "data": {
+                            "account_id": self.account_config_id,
+                            "symbol": symbol,
+                            "cause": cause,
+                            "deal_id": deal_id,
+                        }
+                    },
+                )
+                return
+            self._flagged_broker_close_deals.add(deal_id)
+        flag_live_ledger_reconciliation(
+            account_id=self.account_config_id,
+            symbol=symbol,
+            cause=cause,
+            detail=dict(detail),
+        )
+        logger.error(
+            "ALERT: cTrader broker-side position close could not be attributed "
+            "to one deployment; the account ledger needs reconciliation",
+            extra={
+                "data": {
+                    "alert": "ledger_reconciliation_required",
+                    "account_id": self.account_config_id,
+                    "symbol": symbol,
+                    "cause": cause,
+                    **dict(detail),
+                }
+            },
+        )
+
+    async def _try_record_position_close(
+        self,
+        *,
+        order: Any | None,
+        deal: Any | None,
+        order_id: int | None,
+        execution_type: int,
+    ) -> bool:
+        """Book an unmapped position-close fill, or flag why it cannot be.
+
+        ``True`` means the event is handled (booked or already recorded) and may
+        be acknowledged; ``False`` leaves the caller's retain-for-reconciliation
+        path in charge.
+        """
+        if not self._event_is_position_close(order, deal):
+            return False
+        position_id = self._position_id_from_payload(order, deal)
+        symbol = (
+            self._fill_symbol_name(order_id=order_id, order=order, deal=deal) or ""
+        )
+        base_detail: dict[str, Any] = {
+            "order_id": str(order_id or ""),
+            "deal_id": _deal_id_or_none(deal),
+            "execution_type": execution_type,
+        }
+        if position_id is None:
+            self._flag_ledger_reconciliation(symbol, "no_position_id", base_detail)
+            return False
+        parent_signal_id, cause = await self._resolve_position_parent_signal(position_id)
+        if parent_signal_id is None:
+            self._flag_ledger_reconciliation(
+                symbol, cause, {**base_detail, "position_id": position_id}
+            )
+            return False
+        dedupe_key = self._broker_close_dedupe_key(deal)
+        if dedupe_key is None:
+            self._flag_ledger_reconciliation(
+                symbol,
+                "unusable_fill",
+                {**base_detail, "position_id": position_id, "missing": "deal_id"},
+            )
+            return False
+        persisted_qty, failure = await self._persist_position_close_fill(
+            parent_signal_id=parent_signal_id,
+            order=order,
+            deal=deal,
+            order_id=order_id,
+            dedupe_key=dedupe_key,
+        )
+        if failure is not None:
+            self._flag_ledger_reconciliation(
+                symbol,
+                failure,
+                {
+                    **base_detail,
+                    "position_id": position_id,
+                    "parent_signal_id": parent_signal_id,
+                },
+            )
+            return False
+        logger.info(
+            (
+                "Persisted cTrader broker-side position close fill"
+                if persisted_qty > 0.0
+                else "Skipped cTrader broker-side position close fill "
+                "(already recorded)"
+            ),
+            extra={
+                "data": {
+                    "account_id": self.account_config_id,
+                    "parent_signal_id": parent_signal_id,
+                    "close_signal_id": broker_close_signal_id(parent_signal_id),
+                    "position_id": position_id,
+                    "order_id": str(order_id or ""),
+                    "deal_id": _deal_id_or_none(deal),
+                    "filled_qty": persisted_qty,
+                }
+            },
+        )
+        return True
+
+    async def _fetch_order_details(self, order_id: int) -> Any | None:
+        """One order's details for the reconcile pass's cumulative cap."""
+        if (
+            self._ProtoOAOrderDetailsReq is None
+            or self._ProtoOAOrderDetailsRes is None
+        ):
+            return None
+        request = self._ProtoOAOrderDetailsReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.orderId = int(order_id)
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            logger.info(
+                "cTrader order-details fetch failed during broker-close reconcile",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "order_id": order_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return None
+        if not isinstance(response, self._ProtoOAOrderDetailsRes):
+            return None
+        order = getattr(response, "order", None)
+        if isinstance(order, (list, tuple)):
+            order = order[0] if order else None
+        return order
+
+    async def _reconcile_position_close_deal(
+        self,
+        deal: Any,
+        *,
+        parent_cache: dict[int, tuple[str | None, str]],
+        order_cache: dict[int, Any | None],
+        own_order_cache: dict[int, bool],
+    ) -> int:
+        """Book one deal-list close the stream missed, or flag it (#144)."""
+        if not self._event_is_position_close(None, deal):
+            return 0
+        deal_status = int(getattr(deal, "dealStatus", 0) or 0)
+        if deal_status not in {
+            self._ProtoOADealStatus.FILLED,
+            self._ProtoOADealStatus.PARTIALLY_FILLED,
+        }:
+            return 0
+        position_id = self._position_id_from_payload(None, deal)
+        if position_id is None:
+            return 0
+        if self._resolve_filled_volume(order=None, deal=deal) <= 0:
+            return 0
+        deal_id = _deal_id_or_none(deal)
+        if deal_id is None:
+            return 0
+        order_id = self._positive_int(getattr(deal, "orderId", 0))
+        if order_id is not None:
+            # A deal our own order made is the per-signal reconcile's job, not
+            # this pass's: booking it here too would close the ledger twice.
+            if order_id not in own_order_cache:
+                own_order_cache[order_id] = bool(
+                    self._order_id_to_signal_id.get(order_id)
+                ) or bool(
+                    await asyncio.to_thread(
+                        find_live_signal_id_by_broker_order_id,
+                        self.account_config_id,
+                        str(order_id),
+                    )
+                )
+            if own_order_cache[order_id]:
+                return 0
+        if position_id not in parent_cache:
+            parent_cache[position_id] = await self._resolve_position_parent_signal(
+                position_id
+            )
+        parent_signal_id, cause = parent_cache[position_id]
+        symbol = ""
+        if parent_signal_id is None:
+            symbol = (
+                self._fill_symbol_name(order_id=order_id, order=None, deal=deal) or ""
+            )
+            self._flag_ledger_reconciliation(
+                symbol,
+                cause,
+                {
+                    "position_id": position_id,
+                    "deal_id": deal_id,
+                    "order_id": str(order_id or ""),
+                    "source": "reconcile",
+                },
+            )
+            return 0
+        order = None
+        if order_id is not None:
+            if order_id not in order_cache:
+                order_cache[order_id] = await self._fetch_order_details(order_id)
+            order = order_cache[order_id]
+        dedupe_key = self._broker_close_dedupe_key(deal)
+        if dedupe_key is None:
+            return 0
+        persisted_qty, failure = await self._persist_position_close_fill(
+            parent_signal_id=parent_signal_id,
+            order=order,
+            deal=deal,
+            order_id=order_id,
+            dedupe_key=dedupe_key,
+        )
+        if failure is not None:
+            symbol = (
+                self._fill_symbol_name(order_id=order_id, order=order, deal=deal) or ""
+            )
+            self._flag_ledger_reconciliation(
+                symbol,
+                failure,
+                {
+                    "position_id": position_id,
+                    "deal_id": deal_id,
+                    "order_id": str(order_id or ""),
+                    "parent_signal_id": parent_signal_id,
+                    "source": "reconcile",
+                },
+            )
+            return 0
+        if persisted_qty > 0.0:
+            logger.info(
+                "Reconciled missed cTrader broker-side position close fill",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "parent_signal_id": parent_signal_id,
+                        "close_signal_id": broker_close_signal_id(parent_signal_id),
+                        "position_id": position_id,
+                        "order_id": str(order_id or ""),
+                        "deal_id": deal_id,
+                        "filled_qty": persisted_qty,
+                    }
+                },
+            )
+            return 1
+        return 0
+
+    async def _reconcile_broker_side_closes(self) -> int:
+        """Backfill position closes the stream never delivered (#144).
+
+        The per-signal pass above only re-reads orders this platform submitted;
+        a broker-side close has no signal, so it is invisible there. The account
+        deal list is the only place it shows up. Bounded to a recent window and
+        a row cap: anything older or unattributable is flagged for the periodic
+        broker reconciliation rather than booked from stale state.
+        """
+        if (
+            self._ProtoOADealListReq is None
+            or self._ProtoOADealListRes is None
+            or self._ProtoOADealStatus is None
+        ):
+            return 0
+        now_ms = int(time.time() * 1000)
+        request = self._ProtoOADealListReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.fromTimestamp = now_ms - BROKER_CLOSE_RECONCILE_LOOKBACK_MS
+        request.toTimestamp = now_ms
+        request.maxRows = BROKER_CLOSE_RECONCILE_MAX_ROWS
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=20
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            logger.info(
+                "cTrader deal-list fetch failed during broker-close reconcile",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "error": str(exc),
+                    }
+                },
+            )
+            return 0
+        if not isinstance(response, self._ProtoOADealListRes):
+            logger.warning(
+                "Unexpected deal-list response during broker-close reconcile",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "response_type": type(response).__name__,
+                    }
+                },
+            )
+            return 0
+        if getattr(response, "hasMore", False):
+            # maxRows truncated the window: older closes in it are silently
+            # missed, so the truncation has to be loud rather than discovered
+            # as a ledger gap weeks later.
+            logger.warning(
+                "cTrader deal list reports hasMore during broker-close reconcile; "
+                "closes older than the returned rows are not reconciled this pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "max_rows": BROKER_CLOSE_RECONCILE_MAX_ROWS,
+                    }
+                },
+            )
+        recovered = 0
+        parent_cache: dict[int, tuple[str | None, str]] = {}
+        order_cache: dict[int, Any | None] = {}
+        own_order_cache: dict[int, bool] = {}
+        for deal in getattr(response, "deal", []) or []:
+            try:
+                recovered += await self._reconcile_position_close_deal(
+                    deal,
+                    parent_cache=parent_cache,
+                    order_cache=order_cache,
+                    own_order_cache=own_order_cache,
+                )
+            except CTraderApiError:
+                raise
+            except Exception as exc:  # except-kind: money-decision
+                logger.warning(
+                    "cTrader broker-close reconcile skipped an unreadable deal",
+                    extra={
+                        "data": {
+                            "account_id": self.account_config_id,
+                            "deal_id": _deal_id_or_none(deal),
+                            "error": str(exc),
+                        }
+                    },
+                )
+        return recovered
 
     def _extract_order_and_client_ids(
         self, order: Any | None, deal: Any | None
@@ -4085,6 +4890,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 await self._run_pending_reconciliation(backoff_seconds)
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
+                if event is _EXECUTION_RECONCILE_WAKE:
+                    continue
                 await self._persist_execution_event(event)
                 self._ack_execution_event(event)
                 backoff_seconds = 2
@@ -4101,7 +4908,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     ) from exc
                 self._log_listener_terminal_auth_failure(exc)
                 return
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 if event is not None and not self._requeue_execution_event(event):
                     raise RuntimeError(
                         "cTrader execution event exhausted its retry budget; "
@@ -4131,7 +4938,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.reconcile_executions()
         except CTraderAuthTerminalError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._reconciliation_retry_at = time.monotonic() + backoff_seconds
             logger.warning(
                 "cTrader overflow reconciliation failed; queue processing continues",

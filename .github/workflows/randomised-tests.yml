@@ -1,0 +1,76 @@
+name: randomised-tests
+
+# Weekly randomised-order test run (#293). pytest.ini keeps `-p no:randomly`
+# in addopts, so every pytest run stays in declared order and reproducible
+# from the checkout alone unless it explicitly passes `-p randomly` (as this
+# job does). This job is the tripwire for order-dependent tests -
+# module/class/function order, plus the global random/np.random/faker seeds
+# pytest-randomly resets per test - run once a week instead of on every push,
+# because a random-order failure is only actionable when it is isolated in its
+# own run. It runs single-process; an xdist run distributes tests differently
+# for the same seed, so replay exactly what failed here.
+#
+# Reproducing a failure: the pytest header prints `Using --randomly-seed=N`.
+# Re-run the same command with that seed, e.g.
+#   uv sync --frozen --all-extras
+#   uv run --no-sync --no-build pytest -q -p no:cacheprovider -p randomly \
+#       --randomly-seed=N -m "not slow" --ignore=tests/strategies
+# (`PYTEST_RANDOMLY_SEED=N` works too.) Dispatch this workflow with the `seed`
+# input to replay a seed without touching the checkout; the seed fixes both the
+# collection order and every per-test random seed, so the replay is exact.
+#
+# Scope: ubuntu only. The matrix in `ci` already covers windows-latest for the
+# deterministic run; order dependence is a property of the suite, not the OS.
+#
+# A red run notifies the last committer of this file (GitHub's scheduled-
+# workflow behaviour). Triage it like a `ci` failure: reproduce with the
+# printed seed and file an issue for a real order-dependent test - #381 is
+# the first catch.
+
+on:
+  schedule:
+    # Mondays 04:41 UTC - off-peak, away from the hour when cron fleets fire.
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "pytest-randomly seed to replay (the N in 'Using --randomly-seed=N')"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  REPRO_SEED: ${{ inputs.seed }}
+
+jobs:
+  pytest-randomly:
+    name: pytest-randomly
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: "python -m pip install --only-binary=:all: uv==0.10.4"
+      - name: Validate lockfile
+        run: uv lock --check
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-extras --no-install-project --no-build
+      - name: Tests (random order)
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ -n "$REPRO_SEED" ]; then extra+=(--randomly-seed="$REPRO_SEED"); fi
+          uv run --no-sync --no-build pytest -q -p no:cacheprovider -p randomly \
+            -m "not slow" --ignore=tests/strategies "${extra[@]}"
+      - name: Strategy tests (random order)
+        run: |
+          set -euo pipefail
+          extra=()
+          if [ -n "$REPRO_SEED" ]; then extra+=(--randomly-seed="$REPRO_SEED"); fi
+          uv run --no-sync --no-build pytest -q -p no:cacheprovider -p randomly \
+            tests/strategies "${extra[@]}"
