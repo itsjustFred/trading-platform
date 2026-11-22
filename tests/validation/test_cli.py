@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -54,7 +55,7 @@ def _make_reference(**overrides: Any) -> ValidationReference:
     return ValidationReference(**defaults)
 
 
-def _invoke_cli(args: list[str]) -> subprocess.CompletedProcess:
+def _invoke_cli_subprocess(args: list[str]) -> subprocess.CompletedProcess:
     cmd = [sys.executable, "-m", "validation.cli"] + args
     return subprocess.run(
         cmd,
@@ -62,6 +63,13 @@ def _invoke_cli(args: list[str]) -> subprocess.CompletedProcess:
         text=True,
         cwd=Path(__file__).resolve().parents[2],
     )
+
+
+def _invoke_cli(args: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
+    """Run validation.cli.main in-process; return (exit_code, stdout)."""
+    rc = validation_cli.main(list(args))
+    captured = capsys.readouterr()
+    return rc, captured.out
 
 
 @pytest.fixture
@@ -82,7 +90,9 @@ def tmp_platform_json(tmp_path: Path) -> Path:
 
 class TestCliHelp:
     def test_cli_help(self):
-        result = _invoke_cli(["--help"])
+        # One subprocess smoke test: exercises the real `python -m
+        # validation.cli` entrypoint end to end.
+        result = _invoke_cli_subprocess(["--help"])
         assert result.returncode == 0
         assert "usage:" in result.stdout.lower()
         assert "--reference" in result.stdout
@@ -141,15 +151,20 @@ class TestCliAutoImporterFallback:
 
 
 class TestCliJsonOutput:
-    def test_cli_json_output(self, tmp_reference_json: Path, tmp_platform_json: Path):
-        result = _invoke_cli([
+    def test_cli_json_output(
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        rc, out = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--readiness-golden", str(tmp_reference_json),
             "--format", "json",
-        ])
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
+        ], capsys)
+        assert rc == 0
+        data = json.loads(out)
         assert data["strategy_name"] == "test_strategy"
         assert data["passed"] is True
         assert data["trade_passed"] is True
@@ -157,58 +172,72 @@ class TestCliJsonOutput:
 
 
 class TestCliMarkdownOutput:
-    def test_cli_markdown_output(self, tmp_reference_json: Path, tmp_platform_json: Path):
-        result = _invoke_cli([
+    def test_cli_markdown_output(
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        rc, out = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--readiness-golden", str(tmp_reference_json),
             "--format", "markdown",
-        ])
-        assert result.returncode == 0
-        assert "# Validation Report: test_strategy" in result.stdout
+        ], capsys)
+        assert rc == 0
+        assert "# Validation Report: test_strategy" in out
         assert (
-            "Overall Passed**:** Yes" in result.stdout
-            or "Overall Passed**: Yes" in result.stdout
+            "Overall Passed**:** Yes" in out
+            or "Overall Passed**: Yes" in out
         )
 
 
 class TestCliMissingTradeExitCode1:
-    def test_cli_missing_trade_exit_code_1(self, tmp_reference_json: Path, tmp_path: Path):
+    def test_cli_missing_trade_exit_code_1(
+        self,
+        tmp_reference_json: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
         platform = _make_reference(trades=[], allow_empty=True)
         platform_path = tmp_path / "platform_empty.json"
         platform_path.write_text(platform.model_dump_json(indent=2), encoding="utf-8")
 
-        result = _invoke_cli([
+        rc, out = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(platform_path),
             "--format", "json",
-        ])
-        assert result.returncode == 1
-        data = json.loads(result.stdout)
+        ], capsys)
+        assert rc == 1
+        data = json.loads(out)
         assert data["passed"] is False
         assert data["trade_summary"]["missing"] == 1
 
 
 class TestCliOutputToFile:
     def test_cli_output_to_file(
-        self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ):
         out_path = tmp_path / "report.json"
-        result = _invoke_cli([
+        rc, _ = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--readiness-golden", str(tmp_reference_json),
             "--format", "json",
             "--output", str(out_path),
-        ])
-        assert result.returncode == 0
+        ], capsys)
+        assert rc == 0
         assert out_path.exists()
         data = json.loads(out_path.read_text(encoding="utf-8"))
         assert data["passed"] is True
 
 
 class TestCliAutoImporterXLSX:
-    def test_cli_auto_importer_xlsx(self, tmp_path: Path):
+    def test_cli_auto_importer_xlsx(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         pytest.importorskip("openpyxl")
         from openpyxl import Workbook
 
@@ -244,14 +273,14 @@ class TestCliAutoImporterXLSX:
         wb.save(ref_path)
 
         # Use the same file as both reference and platform
-        result = _invoke_cli([
+        rc, out = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(ref_path),
             "--format", "json",
             "--importer", "auto",
-        ])
-        assert result.returncode == 1
-        data = json.loads(result.stdout)
+        ], capsys)
+        assert rc == 1
+        data = json.loads(out)
         assert data["strategy_name"] == "TestStrategy"
         assert data["passed"] is False
         assert data["equity_evidence_status"] == "missing"
@@ -260,50 +289,60 @@ class TestCliAutoImporterXLSX:
 
 class TestCliExitCode0OnPerfectMatch:
     def test_cli_exit_code_0_on_perfect_match(
-        self, tmp_reference_json: Path, tmp_platform_json: Path
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        capsys: pytest.CaptureFixture[str],
     ):
-        result = _invoke_cli([
+        rc, _ = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--readiness-golden", str(tmp_reference_json),
             "--format", "json",
-        ])
-        assert result.returncode == 0
+        ], capsys)
+        assert rc == 0
 
     def test_cli_runs_readiness_without_golden_and_fails_closed(
-        self, tmp_reference_json: Path, tmp_platform_json: Path
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        result = _invoke_cli([
+        rc, out = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--format", "json",
-        ])
+        ], capsys)
 
-        assert result.returncode == 1
-        data = json.loads(result.stdout)
+        assert rc == 1
+        data = json.loads(out)
         assert data["readiness"] is not None
         assert data["readiness"]["level"] == "NOT_READY"
         assert data["readiness"]["passed"] is False
 
     def test_cli_runs_readiness_when_golden_is_supplied(
-        self, tmp_reference_json: Path, tmp_platform_json: Path, tmp_path: Path
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
     ):
         golden_path = tmp_path / "golden.json"
         golden_path.write_text(tmp_reference_json.read_text(encoding="utf-8"), encoding="utf-8")
-        result = _invoke_cli([
+        rc, out = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--readiness-golden", str(golden_path),
             "--format", "json",
-        ])
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
+        ], capsys)
+        assert rc == 0
+        data = json.loads(out)
         assert data["readiness"]["level"] == "READY"
         assert data["readiness"]["passed"] is True
 
 
 class TestCliTimeToleranceArgument:
-    def test_cli_time_tolerance_argument(self, tmp_path: Path):
+    def test_cli_time_tolerance_argument(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         ref = _make_reference(
             trades=[_make_sample_trade(entry_time="2024-01-01T10:00:00Z")]
         )
@@ -316,49 +355,56 @@ class TestCliTimeToleranceArgument:
         platform_path.write_text(platform.model_dump_json(indent=2), encoding="utf-8")
 
         # Without tolerance, times differ by 5s -> mismatch
-        result_no_tol = _invoke_cli([
+        rc_no_tol, _ = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
             "--format", "json",
             "--time-tolerance", "0",
-        ])
-        assert result_no_tol.returncode == 1
+        ], capsys)
+        assert rc_no_tol == 1
 
         # With 10s tolerance, should match
-        result_with_tol = _invoke_cli([
+        rc_with_tol, out = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
             "--readiness-golden", str(ref_path),
             "--format", "json",
             "--time-tolerance", "10",
-        ])
-        assert result_with_tol.returncode == 0
-        data = json.loads(result_with_tol.stdout)
+        ], capsys)
+        assert rc_with_tol == 0
+        data = json.loads(out)
         assert data["passed"] is True
 
 
 class TestCliInvalidReferencePathExitCode2:
-    def test_cli_invalid_reference_path_exit_code_2(self, tmp_path: Path):
+    def test_cli_invalid_reference_path_exit_code_2(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ):
         bad_ref = tmp_path / "nonexistent.json"
         platform = _make_reference()
         platform_path = tmp_path / "platform.json"
         platform_path.write_text(platform.model_dump_json(indent=2), encoding="utf-8")
 
-        result = _invoke_cli([
-            "--reference", str(bad_ref),
-            "--platform", str(platform_path),
-            "--format", "json",
-        ])
-        assert result.returncode == 2
+        with caplog.at_level(logging.ERROR, logger="validation.cli"):
+            rc, _ = _invoke_cli([
+                "--reference", str(bad_ref),
+                "--platform", str(platform_path),
+                "--format", "json",
+            ], capsys)
+        assert rc == 2
+        message = " ".join(record.getMessage() for record in caplog.records)
         assert (
-            "not found" in result.stderr.lower()
-            or "failed to load reference" in result.stderr.lower()
-            or "no such file or directory" in result.stderr.lower()
+            "not found" in message.lower()
+            or "failed to load reference" in message.lower()
+            or "no such file or directory" in message.lower()
         )
 
 
 class TestCliStatsToleranceArgument:
-    def test_cli_stats_tolerance_argument(self, tmp_path: Path):
+    def test_cli_stats_tolerance_argument(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         ref_trade = _make_sample_trade()
         ref_trade.exits[0].pnl = 100.0
         ref = _make_reference(trades=[ref_trade])
@@ -372,34 +418,36 @@ class TestCliStatsToleranceArgument:
         platform_path.write_text(platform.model_dump_json(indent=2), encoding="utf-8")
 
         # With strict stats tolerance (0.001), different PnL should fail
-        result_strict = _invoke_cli([
+        rc_strict, out_strict = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
             "--format", "json",
             "--stats-tolerance", "0.001",
             "--pnl-absolute-tolerance", "0.01",
-        ])
-        assert result_strict.returncode == 1
-        data_strict = json.loads(result_strict.stdout)
+        ], capsys)
+        assert rc_strict == 1
+        data_strict = json.loads(out_strict)
         assert data_strict["stat_passed"] is False
 
         # With both tolerances loosened, should pass. The stat gate requires
         # every computed tolerance to hold (DV-B35), so the absolute band is
         # widened here as well; loosening only the relative band must not be
         # enough on its own.
-        result_loose = _invoke_cli([
+        rc_loose, out_loose = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
             "--readiness-golden", str(ref_path),
             "--format", "json",
             "--stats-tolerance", "1.0",
             "--pnl-absolute-tolerance", "1000.0",
-        ])
-        assert result_loose.returncode == 0
-        data_loose = json.loads(result_loose.stdout)
+        ], capsys)
+        assert rc_loose == 0
+        data_loose = json.loads(out_loose)
         assert data_loose["stat_passed"] is True
 
-    def test_loose_relative_tolerance_alone_does_not_pass(self, tmp_path: Path):
+    def test_loose_relative_tolerance_alone_does_not_pass(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
         """DV-B35: the abs tolerance must not be bypassed by a loose rel band."""
         ref_trade = _make_sample_trade()
         ref_trade.exits[0].pnl = 100.0
@@ -413,20 +461,20 @@ class TestCliStatsToleranceArgument:
         ref_path.write_text(ref.model_dump_json(indent=2), encoding="utf-8")
         platform_path.write_text(platform.model_dump_json(indent=2), encoding="utf-8")
 
-        result = _invoke_cli([
+        rc, out = _invoke_cli([
             "--reference", str(ref_path),
             "--platform", str(platform_path),
             "--format", "json",
             "--stats-tolerance", "1.0",
             "--pnl-absolute-tolerance", "0.01",
-        ])
-        assert result.returncode == 1
-        data = json.loads(result.stdout)
+        ], capsys)
+        assert rc == 1
+        data = json.loads(out)
         assert data["stat_passed"] is False
 
 
 class TestCliHtmlImporter:
-    def test_cli_html_importer(self, tmp_path: Path):
+    def test_cli_html_importer(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         pytest.importorskip("bs4")
         html_content = """<!DOCTYPE html>
 <html>
@@ -468,26 +516,31 @@ class TestCliHtmlImporter:
         html_path = tmp_path / "report.html"
         html_path.write_text(html_content, encoding="utf-8")
 
-        result = _invoke_cli([
+        rc, out = _invoke_cli([
             "--reference", str(html_path),
             "--platform", str(html_path),
             "--format", "json",
             "--importer", "mt5_html",
-        ])
-        assert result.returncode == 1
-        data = json.loads(result.stdout)
+        ], capsys)
+        assert rc == 1
+        data = json.loads(out)
         assert data["strategy_name"] == "HtmlStrategy"
         assert data["passed"] is False
         assert data["equity_evidence_status"] == "missing"
 
 
 class TestCliStdinStdoutBehavior:
-    def test_cli_default_output_is_stdout(self, tmp_reference_json: Path, tmp_platform_json: Path):
-        result = _invoke_cli([
+    def test_cli_default_output_is_stdout(
+        self,
+        tmp_reference_json: Path,
+        tmp_platform_json: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        rc, out = _invoke_cli([
             "--reference", str(tmp_reference_json),
             "--platform", str(tmp_platform_json),
             "--readiness-golden", str(tmp_reference_json),
-        ])
-        assert result.returncode == 0
+        ], capsys)
+        assert rc == 0
         # Default format is markdown, so verify markdown output on stdout
-        assert "# Validation Report" in result.stdout
+        assert "# Validation Report" in out

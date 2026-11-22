@@ -219,25 +219,61 @@ Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
 akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
 Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
 
+## Kill Switch (#300)
+
+Vor jedem Entry verweigert `prepare_order_with_risk()` den Order, wenn der Account
+gehalten ist (`live_runner.kill_switch.refuse_entry_while_halted`). Die Prüfung steht
+**nach** dem Exit-Zweig, blockiert also nie das Schließen einer Position, und
+**vor** jedem Broker-Zugriff: ein gehaltener Account kostet keinen Round-Trip.
+
+Der Zustand liegt in `live_kill_switch` (eine Zeile pro Scope: `global` plus eine pro
+Live-Account) und wird bei jedem Entry und auf jedem Tick neu gelesen - kein
+Prozess-Cache, sonst würde ein Neustart den Halt aufheben. Der strengste Modus gewinnt
+(`entries` < `orders` < `flatten`); ein Account-Scope kann einen globalen Halt nie
+aufweichen.
+
+Fail closed heißt hier bewusst die billige Seite: ein unlesbarer Zustand oder ein nicht
+interpretierbarer Modus verwirft Entries und rührt den Broker nicht. Ein leerer Read ist
+nicht von "nichts ist gehalten" zu unterscheiden - die eine Antwort, die ein Kill Switch
+nie zufällig produzieren darf.
+
+Setzen, lift und lesen: `scripts/live_kill_switch.py` (CLI) und
+`/api/live/kill-switch` (Viewer); Betriebsdetails in `docs/live-deploy-runbook.md`.
+
 ## Commission-Vorzeichen (#184 Finding 14)
 
-`live_executions.commission` ist bei **allen** Brokern ein **positiver Kostenwert**
-(Gebühr = positiv, Rebate = negativ, bekannt-null = `0.0`; ein Rebate kann nur der
-cTrader-Pfad speichern, `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative Werte ab). Net-PnL ist überall
+`live_executions.commission` ist bei **allen** Brokern ein **nicht-negativer Kostenwert**
+(Gebühr = positiv, bekannt-null = `0.0`; #285). Net-PnL ist überall
 `gross - commission` (Viewer, `net_pnl`, Alpaca-CFEE-Backfill aus #143).
 Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
 als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
-`base_adapter.commission_cost` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
+`base_adapter.commission_from_signed_cash_flow` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
 backfillt CFEE als positive Kosten.
+Seit #285 ist der Wert schreibseitig abgesichert: `LiveExecution.commission` validiert
+über `shared.models.validate_commission_cost` (`mode="before"`; `bool` und numerische
+Strings werden ebenfalls abgelehnt) und wirft `ValidationError` bei negativem oder
+nicht-endlichem Wert; an der Persistierungsschwelle prüft
+`LiveExecutionModel.from_live_execution` erneut und wirft `ValueError`. Abgesichert ist
+nur dieser Funnel - ein direktes `LiveExecutionModel(...)` oder `session.add` validiert
+nicht. `commission_from_signed_cash_flow` ist die einzige zulässige Umrechnung der
+Vorzeichen-Konvention; ihr negatives Ergebnis (d. h. ein cTrader-Rebate) wird vom Adapter
+als `commission=NULL` („Gebühr unbekannt") plus ERROR-Log gespeichert, damit der Fill
+nicht verloren geht - die eigentliche Rebate-Darstellung ist eine offene
+Maintainer-Entscheidung. `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative
+Werte ebenfalls ab. Der Lese-Pfad (`LiveExecutionModel.to_live_execution`) baut ein
+`LiveExecution` und validiert damit erneut; er hat aktuell keine Produktions-Aufrufer -
+die Net-PnL-Reader konsumieren die rohen `live_executions`-Zeilen direkt.
 Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) trugen das rohe negative
 Vorzeichen; `init_db` wandelt sie einmalig per Migration
 (`_migrate_ctrader_commission_to_cost`, `abs` des gespeicherten Werts) in einen positiven
 Kostenwert um. Nur Konten mit Broker `ctrader` sind betroffen, NULL (unbekannt) und `0.0`
 bleiben. Die Migration ist in `schema_data_migrations` vermerkt und läuft genau einmal:
-ein erneutes `abs` würde einen vom korrigierten Adapter gespeicherten Rebate (negativ)
-in eine Gebühr verwandeln. Ein vor der Änderung gespeicherter cTrader-Rebate (roh positiv)
+seit #285 kann ohnehin kein negativer Wert mehr geschrieben werden, aber ein erneutes
+`abs` würde einen bereits konvertierten Wert unnötig anfassen. Ein vor der Änderung
+gespeicherter cTrader-Rebate (roh positiv)
 ist von einer neuen Gebühr nicht unterscheidbar und bleibt positiv.
-`commission_cost` lehnt nicht-endliche Werte mit `ValueError` ab (kein stilles `0.0`).
+`commission_from_signed_cash_flow` lehnt nicht-endliche Werte mit `ValueError` ab
+(kein stilles `0.0`).
 Deploy-Hinweis: Daemon vor dem ersten Start des neuen Builds stoppen (siehe
 `docs/live-deploy-runbook.md`); ein alter Build, der nach dem Migrationsvermerk noch eine
 rohe negative Gebühr schreibt, wird nicht mehr umgewandelt.
