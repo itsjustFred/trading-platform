@@ -696,8 +696,20 @@ def test_a_network_violation_names_the_test_that_attempted_it(
     assert request.node.nodeid in violation
 
 
+def _consume_stub_hits(edge: str, nodeid: str) -> list[str]:
+    """Remove and return the stub hits a test deliberately triggered.
+
+    The session-end warning exists to expose *accidental* leaks; a test that
+    exercises the blocked edge on purpose must not leave its own hit behind.
+    """
+    hits = suite_conftest._DUKASCOPY_STUB_HITS
+    mine = [hit for hit in hits if edge in hit and nodeid in hit]
+    hits[:] = [hit for hit in hits if hit not in mine]
+    return mine
+
+
 def test_jforex_classpath_resolution_cannot_reach_the_jnlp_endpoint(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, request
 ) -> None:
     """The autouse stub turns an accidental JNLP bootstrap into a test failure (#381).
 
@@ -717,8 +729,11 @@ def test_jforex_classpath_resolution_cannot_reach_the_jnlp_endpoint(
     with pytest.raises(RuntimeError, match="must not fetch JForex SDK jars"):
         jforex_dl._resolve_jforex_classpath_details()
 
+    (hit,) = _consume_stub_hits("jforex_dl.urlopen", request.node.nodeid)
+    assert request.node.nodeid in hit
 
-def test_dukascopy_native_fetch_is_blocked_in_tests() -> None:
+
+def test_dukascopy_native_fetch_is_blocked_in_tests(request) -> None:
     """``_fetch_one`` is the single aiohttp edge to ``datafeed.dukascopy.com``."""
     import asyncio
 
@@ -730,6 +745,9 @@ def test_dukascopy_native_fetch_is_blocked_in_tests() -> None:
                 None, None, "https://datafeed.dukascopy.com/datafeed/x", None
             )
         )
+
+    (hit,) = _consume_stub_hits("dukascopy_native._fetch_one", request.node.nodeid)
+    assert request.node.nodeid in hit
 
 
 def test_every_daemon_discovery_call_names_the_resolved_accounts_env() -> None:
