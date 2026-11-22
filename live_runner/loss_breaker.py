@@ -368,7 +368,7 @@ def _latch_and_alert(
     )
     try:
         transitioned = latch_live_loss_breaker_breach(scope, kind, detail, now)
-    except Exception:
+    except Exception:  # except-kind: money-decision
         # The latch write failed; the in-memory evaluation below still refuses
         # this entry, and the next observation retries the latch.
         logger.exception(
@@ -510,7 +510,7 @@ def _gate_scope(
         )
     except LossBreakerBreachError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # Fail closed: a breaker state that cannot be read is never "all
         # clear". The cheap failure is refusing entries; exits never reach
         # this function.
@@ -616,7 +616,7 @@ async def _untrusted_fill_refs(account_id: str) -> list[dict[str, Any]]:
     """The untrusted fills behind an ``unpriced_fills`` failure, for the alert."""
     try:
         return await asyncio.to_thread(list_untrusted_fill_references, account_id)
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         logger.exception(
             "Could not list untrusted fill references for the P&L alert",
             extra={"data": {"account_id": account_id}},
@@ -635,7 +635,7 @@ async def _pip_value_for_symbol(
     try:
         pip_value = await adapter.get_pip_value(symbol)
         value = float(pip_value.value)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.warning(
             "Deployment P&L is unmeasurable: no pip value for %s (%r)",
             symbol,
@@ -703,7 +703,7 @@ async def account_deployment_trading_pnls(
             )
             return None
         flows = await asyncio.to_thread(get_account_deployment_trading_flows, account_id)
-    except Exception:
+    except Exception:  # except-kind: money-decision
         logger.exception(
             "Deployment trading flows are unreadable; deployment loss breaker "
             "scopes cannot be measured",
@@ -744,7 +744,7 @@ async def account_deployment_trading_pnls(
             bid, ask = validate_live_quote_prices(
                 quote, symbol=symbol, label="Loss breaker deployment P&L mark"
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Deployment P&L is unmeasurable: no usable quote for %s (%r)",
                 symbol,
@@ -1020,7 +1020,7 @@ def observe_account_loss_breaker_equity(
                         }
                     },
                 )
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         logger.exception(
             "Loss breaker observation failed; entries still fail closed at the gate",
             extra={"data": {"account_id": account_id, "scope": account_scope}},

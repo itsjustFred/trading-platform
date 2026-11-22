@@ -189,6 +189,11 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
+#: pending broker reconciliation instead of letting it sleep out the 30 s
+#: ``queue.get`` timeout. Never a real execution payload.
+_EXECUTION_RECONCILE_WAKE = object()
+
 #: How far back the deal-list pass looks for broker-side position closes the
 #: stream never saw (#144). Bounded on purpose: an older unattributed close is
 #: surfaced by the ledger-mismatch alert and periodic broker reconciliation,
@@ -617,7 +622,7 @@ def _twisted_deferred_timeout_class() -> type[BaseException] | None:
     """
     try:
         from twisted.internet import defer
-    except Exception:  # pragma: no cover - Twisted is absent
+    except Exception:  # pragma: no cover - Twisted is absent  # except-kind: loop-survival
         return None
     return getattr(defer, "TimeoutError", None)
 
@@ -662,7 +667,7 @@ def _reason_to_text(reason: Any) -> str:
     if hasattr(reason, "getErrorMessage"):
         try:
             return str(reason.getErrorMessage())
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             return str(reason)
     return str(reason)
 
@@ -1161,7 +1166,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         "CTRADER_REFRESH_TOKEN": refresh_token,
                     },
                 )
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.warning(
                     "cTrader tokens refreshed but could not be persisted",
                     extra={
@@ -1252,7 +1257,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return
         try:
             payload = self._Protobuf.extract(message)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
+            if payload_type == self._execution_payload_type:
+                self._reconciliation_required = True
+                self._reconciliation_retry_at = 0.0
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
             logger.warning("Could not decode cTrader payload", extra={"data": {"error": str(exc)}})
             return
 
@@ -1265,6 +1275,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._execution_queue.put_nowait(payload)
             except asyncio.QueueFull:
                 self._reconciliation_required = True
+                with contextlib.suppress(asyncio.QueueFull):
+                    self._execution_queue.put_nowait(_EXECUTION_RECONCILE_WAKE)
                 logger.warning(
                     "cTrader execution queue is full; broker reconciliation required"
                 )
@@ -1542,8 +1554,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_name_to_id = symbol_name_to_id
         self._symbol_assets = symbol_assets
         # #80: broker-API symbol properties (digits/lotSize/minVolume) are the
-        # source of truth for per-symbol scales. Best-effort: the light list
-        # above stays authoritative for ids when the detail fetch fails.
+        # source of truth for per-symbol scales. Required: a failed or
+        # unexpected detail fetch aborts authentication rather than letting
+        # _scale_for fall back to static scales that can misstate size.
         await self._load_symbol_props_into_cache(symbol_name_to_id)
         self._authenticated = True
 
@@ -1575,14 +1588,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             detail_res = await self._send_request_with_refresh_retry(
                 detail_req, timeout_seconds=15
             )
-        except Exception:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
-                "cTrader symbol-props fetch failed; using fallback scales",
-                extra={"data": {"account_id": self.ctid_trader_account_id}},
+                "cTrader symbol-props fetch failed; refusing fallback scales",
+                extra={
+                    "data": {
+                        "account_id": self.ctid_trader_account_id,
+                        "error": str(exc),
+                    }
+                },
             )
-            return
+            raise
         if not isinstance(detail_res, ProtoOASymbolByIdRes):
-            return
+            raise RuntimeError(
+                f"Unexpected symbol-props response: {type(detail_res).__name__}; "
+                "refusing to authenticate with fallback scales."
+            )
         # Archived entries first so live properties always win on collision.
         for detail in list(getattr(detail_res, "archivedSymbol", [])) + list(detail_res.symbol):
             try:
@@ -1632,7 +1653,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             venue_calendar.save_cached_calendar(
                 data_dir=DATA_DIR, source="ctrader", symbol=name, payload=payload
             )
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             logger.warning(
                 "cTrader venue-calendar cache write failed for %s",
                 name,
@@ -1786,7 +1807,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 except CTraderAuthTerminalError as exc:
                     self._handle_terminal_auth_failure(exc)
                     raise
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     await self._retry_or_raise_connect_failure(
                         exc, attempt, max_attempts, base_delay
                     )
@@ -1812,7 +1833,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.reconcile_executions()
         except CTraderAuthTerminalError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._reconciliation_required = True
             self._reconciliation_retry_at = 0.0
             logger.warning(
@@ -1994,11 +2015,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 stop = getattr(client, "stopService", None)
                 if stop is not None:
                     stop()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
         try:
             self._connected_event.clear()
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
 
     async def _recover_broker_order_id(
@@ -2855,7 +2876,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         request.symbolId.append(int(symbol_id))
         try:
             await self._send_request_with_refresh_retry(request, timeout_seconds=10)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "cTrader spot unsubscribe failed",
                 extra={
@@ -3021,7 +3042,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 self._asset_names = {
                     int(asset.assetId): str(asset.name) for asset in response.asset
                 }
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "cTrader asset list unavailable; pip value record keeps asset ids",
                 extra={"data": {"account_id": self.ctid_trader_account_id, "error": str(exc)}},
@@ -4428,7 +4449,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 )
             except CTraderApiError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 logger.warning(
                     "cTrader broker-close reconcile skipped an unreadable deal",
                     extra={
@@ -4685,6 +4706,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 await self._run_pending_reconciliation(backoff_seconds)
 
                 event = await asyncio.wait_for(self._execution_queue.get(), timeout=30)
+                if event is _EXECUTION_RECONCILE_WAKE:
+                    continue
                 await self._persist_execution_event(event)
                 self._ack_execution_event(event)
                 backoff_seconds = 2
@@ -4701,7 +4724,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     ) from exc
                 self._log_listener_terminal_auth_failure(exc)
                 return
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 if event is not None and not self._requeue_execution_event(event):
                     raise RuntimeError(
                         "cTrader execution event exhausted its retry budget; "
@@ -4731,7 +4754,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await self.reconcile_executions()
         except CTraderAuthTerminalError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._reconciliation_retry_at = time.monotonic() + backoff_seconds
             logger.warning(
                 "cTrader overflow reconciliation failed; queue processing continues",
