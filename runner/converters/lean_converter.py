@@ -182,7 +182,16 @@ def _build_trades(data: dict) -> list[Trade]:
             ]
             trade = Trade(
                 id=len(trades) + 1,
-                symbol=ticker,
+                # B023: `_close_leg` (defined in the ticker loop) reads the loop
+                # variable. Safe because the closure runs *synchronously* inside
+                # the iteration that defined it - the exit-pairing loop below
+                # calls `_close_leg` before the ticker loop advances - so
+                # `ticker` cannot have moved on. Making `_close_leg` outlive the
+                # iteration (a task, a callback, a stored partial) would break
+                # that and must bind `ticker` as an argument instead. The
+                # `trade_exits` comprehension above is unrelated to this
+                # warning, whatever an earlier reason here implied.
+                symbol=ticker,  # noqa: B023
                 direction=open_direction,
                 entry_time=entry_dt,
                 entry_price=round(entry_price, 6),

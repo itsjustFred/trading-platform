@@ -747,12 +747,12 @@ def _describe_golden_change(
         f"  fields removed: {len(removed)}",
         f"  fields changed: {len(changed)}",
     ]
-    for key in added[:MAX_REPORTED_PATHS]:
-        lines.append(f"    + {key} = {new_flat[key]!r}")
-    for key in removed[:MAX_REPORTED_PATHS]:
-        lines.append(f"    - {key} = {old_flat[key]!r}")
-    for key in changed[:MAX_REPORTED_PATHS]:
-        lines.append(f"    ~ {key}: {old_flat[key]!r} -> {new_flat[key]!r}")
+    lines.extend(f"    + {key} = {new_flat[key]!r}" for key in added[:MAX_REPORTED_PATHS])
+    lines.extend(f"    - {key} = {old_flat[key]!r}" for key in removed[:MAX_REPORTED_PATHS])
+    lines.extend(
+        f"    ~ {key}: {old_flat[key]!r} -> {new_flat[key]!r}"
+        for key in changed[:MAX_REPORTED_PATHS]
+    )
     if len(changed) > MAX_REPORTED_PATHS:
         lines.append(f"    ... {len(changed) - MAX_REPORTED_PATHS} further changed fields")
 
@@ -911,7 +911,7 @@ def _assert_oracle_series(
     assert result.stats["daily_return_count"] == len(ORACLE_DAYS) == 10
     assert [row["date"] for row in result.stats["daily_returns"]] == ORACLE_DAYS
     for row, (_day, expected_return, expected_close) in zip(
-        result.stats["daily_returns"], expected
+        result.stats["daily_returns"], expected, strict=True
     ):
         assert row["return"] == pytest.approx(expected_return, rel=1e-12, abs=1e-15)
         assert row["equity"] == expected_close
@@ -973,7 +973,7 @@ def test_oracle_calendar_path_agrees_with_the_engine_curve_path(scenario: str) -
     assert "engine_curve_reconciliation" not in calendar.meta.data
     _assert_oracle_series(calendar, window_trades)
     for engine_row, calendar_row in zip(
-        engine.stats["daily_returns"], calendar.stats["daily_returns"]
+        engine.stats["daily_returns"], calendar.stats["daily_returns"], strict=True
     ):
         assert engine_row["date"] == calendar_row["date"]
         assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-15)

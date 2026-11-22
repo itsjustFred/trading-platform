@@ -31,7 +31,7 @@ from live_runner.base_adapter import (
     validate_live_quote_prices,
 )
 from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.exit_signals import ExitBelowStepError
 from shared import venue_calendar
 from shared.constants import DATA_DIR
 from shared.database import (
@@ -53,6 +53,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -476,9 +477,12 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
     # Floor, never round: rounding to nearest can size up by half a volume unit
-    # and put the loss at the stop above the risk budget. The relative nudge
-    # only absorbs binary float error (0.29 * 100 == 28.999999999999996).
-    volume = math.floor(qty_value * float(volume_per_qty) * (1.0 + 1e-12))
+    # and put the loss at the stop above the risk budget. The shared lot-grid
+    # floor's decimal noise band absorbs binary float error
+    # (0.29 * 100 == 28.999999999999996) and can return a value up to 1e-6 of
+    # a unit above a real fraction that close to the next unit -- below every
+    # broker's volume resolution -- #278.
+    volume = int(floor_qty_to_step(qty_value * float(volume_per_qty), 1.0))
     if volume <= 0:
         raise ValueError(
             f"qty {qty_value!r} is below one broker volume unit at "
@@ -495,6 +499,9 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
     ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
     lands on that grid, so it is rounded DOWN: rounding up would exceed the
     risk budget. A result below the broker minimum is refused by the caller.
+    Both operands are integers, so ``//`` is already the exact floor -- there
+    is no float dust for the shared lot-grid floor (#278) to absorb, and
+    routing ints through it could only add error.
     """
     step = int(step_volume)
     if step <= 1:
@@ -712,7 +719,12 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
         while True:
             handle.seek(0)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                # `msvcrt` is a Windows-only stdlib module (typeshed gates it on
+                # `sys_platform == "win32"`), so mypy on the Linux CI runner cannot
+                # see its members at all: `attr-defined` is about the platform, not
+                # about a runtime value. The `os.name == "nt"` guard is what makes
+                # this branch reachable only where the module exists.
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
                 break
             except OSError:
                 time.sleep(0.05)
@@ -720,7 +732,7 @@ def _exclusive_file_lock(handle: Any) -> Iterator[None]:
             yield
         finally:
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]  # Windows-only module, see the lock call above
         return
 
     import fcntl
@@ -793,7 +805,18 @@ def _ensure_asyncio_twisted_reactor(loop: asyncio.AbstractEventLoop) -> None:
             pass
         _ASYNCIO_REACTOR_VALIDATED = True
 
-    from twisted.internet import reactor
+    from twisted.internet import reactor as _reactor
+
+    # `twisted.internet.reactor` is a *module* at import time and the installed
+    # reactor *instance* at run time: `installReactor()` rebinds
+    # sys.modules["twisted.internet.reactor"] to the instance, which is why
+    # `__class__.__module__` names the reactor class below. The static type is
+    # therefore the module, so `running`/`startRunning` are genuinely not on it.
+    # Take it as Any instead of two `# type: ignore[attr-defined]` comments:
+    # those are unused whenever Twisted's own (partial) types are absent, and
+    # `warn_unused_ignores` turns an unused ignore into a failure - so the same
+    # source would type-check in CI and fail in a dev-extra-only checkout.
+    reactor: Any = _reactor
 
     reactor_module = reactor.__class__.__module__
     if "asyncioreactor" not in reactor_module:
@@ -1355,7 +1378,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                         raise RuntimeError(
                             "Unexpected account auth response after refresh: "
                             f"{type(account_auth_res).__name__}"
-                        )
+                        ) from exc
                     self._authenticated = True
                 return await self._send_request_with_refresh_retry(
                     request, timeout_seconds=timeout_seconds, _depth=_depth + 1
@@ -1567,7 +1590,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 sid = int(detail.symbolId)
             except (TypeError, ValueError):
                 continue
-            name = id_to_name.get(sid)
+            name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
@@ -1641,7 +1664,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         when less than one step remains.
         """
         step_qty = float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
-        floored_qty = round_exit_qty_down(qty, step_qty)
+        floored_qty = floor_qty_to_step(qty, step_qty)
         if floored_qty <= 0.0:
             raise ExitBelowStepError(
                 f"cTrader exit for {symbol} ignored: the requested qty {qty:g} is below "
@@ -1649,8 +1672,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 requested_qty=qty,
                 qty_step=step_qty,
             )
-        # A whole number of steps: round() only removes float noise here.
-        return int(round(floored_qty * float(scale.volume_per_qty)))
+        # A whole number of steps: round() on a float returns an int, and this
+        # only removes float noise.
+        return round(floored_qty * float(scale.volume_per_qty))
 
     def _resolve_order_volume(self, signal: LiveSignal) -> int:
         """Resolve broker volume from the binding risk-engine ``qty``."""
@@ -1872,7 +1896,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             await asyncio.sleep(delay)
             return
         self._log_connect_failure(exc, error_text, message)
-        raise
+        raise exc
 
     def _log_connect_failure(
         self, exc: Exception, error_text: str, message: str
@@ -2621,7 +2645,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             ),
         )
 
-    async def _resolve_symbol_id(self, symbol: str) -> int | None:
+    async def _resolve_symbol_id(self, symbol: str) -> int:
+        """Resolve a symbol to its broker id, raising when it is unknown.
+
+        The return is declared ``int``, never ``int | None``: both lookup
+        misses raise, so a ``None`` return would be unrepresentable.
+        """
         symbol_id = self._symbol_name_to_id.get(symbol.upper())
         if symbol_id is None:
             await self._authenticate()
@@ -2647,7 +2676,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             raise ValueError("cTrader close position id must be positive integer.")
         volume_value = coerce_positive_live_qty(volume, field_name="cTrader close volume")
-        broker_volume = int(round(volume_value))
+        broker_volume = round(volume_value)
         if broker_volume <= 0:
             raise ValueError("cTrader close volume must be a positive integer.")
         request = self._ProtoOAClosePositionReq()
@@ -3093,6 +3122,49 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
         return trader_res.trader
 
+    async def _fetch_position_unrealized_pnl(self, fallback_money_digits: int) -> float:
+        """Summed net unrealized P&L of all open positions, in account currency.
+
+        ``ProtoOAGetPositionUnrealizedPnLRes`` reports one entry per open
+        position with ``grossUnrealizedPnL``/``netUnrealizedPnL`` in money
+        digits; the net figure (after accrued swap/commission) is what the
+        account's equity actually carries. The response carries its own
+        ``moneyDigits``; the trader's digits are the fallback when it is unset.
+        Any failure raises - the caller treats unreadable equity as unreadable,
+        never as "no unrealized loss".
+        """
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOAGetPositionUnrealizedPnLReq,
+            ProtoOAGetPositionUnrealizedPnLRes,
+        )
+
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+
+        self._raise_if_terminal_auth_failed()
+        request = ProtoOAGetPositionUnrealizedPnLReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(response, ProtoOAGetPositionUnrealizedPnLRes):
+            raise RuntimeError(
+                f"Unexpected unrealized PnL response: {type(response).__name__}"
+            )
+        digits = int(getattr(response, "moneyDigits", 0) or 0)
+        if digits <= 0:
+            digits = int(fallback_money_digits or 0)
+        scale = money_scale(digits)
+        total = 0.0
+        for position_pnl in response.positionUnrealizedPnL:
+            total += _to_float(getattr(position_pnl, "netUnrealizedPnL", 0))
+        return total / scale
+
     async def get_balance(self) -> tuple[float, float]:
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
@@ -3104,6 +3176,27 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if raw_equity is not None:
                 equity = raw_equity / scale
         return balance, equity
+
+    async def get_equity(self) -> float:
+        """Account equity including unrealized P&L, for the loss breaker (#301).
+
+        Deliberately a separate path from :meth:`get_balance`: the #267
+        maintainer decision keeps position sizing on realized balance, so
+        ``get_balance`` must not start carrying unrealized P&L. Only the
+        breaker reads this. ``ProtoOATrader`` has no equity field, so equity
+        is balance plus the summed net unrealized P&L of open positions -
+        reporting balance here would hide an open losing position until it
+        closes. Any failure raises: unreadable equity is never "no loss".
+        """
+        trader = await self._fetch_trader()
+        money_digits = money_digits_from_trader(trader)
+        scale = money_scale(money_digits)
+        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        if hasattr(trader, "equity"):
+            # A trader payload that carries its own equity field is trusted to
+            # include unrealized P&L already (ProtoOATrader does not).
+            return _to_float(getattr(trader, "equity", balance)) / scale
+        return balance + await self._fetch_position_unrealized_pnl(money_digits)
 
     @property
     def supports_cancel_orders(self) -> bool:
@@ -3584,7 +3677,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         if not client_order_id and order_id is not None:
             client_order_id = (
                 await asyncio.to_thread(
-                    find_live_signal_id_by_broker_order_id,
+                    # mypy's `to_thread` signature demands a callable returning
+                    # non-Optional (`Callable[[str, str], str]`) and rejects this
+                    # one's `str | None` result; the lookup genuinely returns
+                    # None for an unknown order and the `or ""` below handles
+                    # it. The arguments themselves are both str.
+                    find_live_signal_id_by_broker_order_id,  # type: ignore[arg-type]
                     self.account_config_id,
                     str(order_id),
                 )

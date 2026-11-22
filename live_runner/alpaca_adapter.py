@@ -35,7 +35,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.exit_signals import ExitBelowStepError
 from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared import venue_calendar
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
@@ -61,6 +61,7 @@ from shared.database import (
 )
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_DERIVED,
@@ -179,9 +180,12 @@ def _floor_to_whole_shares(qty: float) -> float:
 
     A bracket/OTO entry with a fractional qty is rejected ("fractional orders
     must have order_class=simple", HTTP 422). Floor, never round up: rounding
-    up would exceed the risk-sized quantity.
+    up would exceed the risk-sized quantity. The shared lot-grid floor's
+    decimal noise band (1e-6 of a step) can return a value a hair ABOVE a
+    real fraction that close to the next whole share -- at most 1e-6 of a
+    share, below Alpaca's quantity resolution (#278).
     """
-    return float(math.floor(float(qty) + 1e-9))
+    return floor_qty_to_step(qty, 1.0)
 
 
 def _normalize_broker_order_id(value: Any) -> str | None:
@@ -1117,6 +1121,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         id was persisted falls back to the client-id fetch, and an alpaca-py without the
         nested filter degrades to the flat ``get_order_by_id``.
         """
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError("Alpaca adapter is not connected; cannot fetch the parent order")
         stored_order_id = await asyncio.to_thread(get_live_signal_broker_order_id, signal_id)
         if stored_order_id:
             try:
@@ -1126,11 +1133,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # still carries the parent's own fill. `ImportError`, not
                 # `ModuleNotFoundError`: a missing NAME inside an importable
                 # module raises the former, and the fallback must still fire.
-                GetOrderByIdRequest = None  # type: ignore[assignment]
+                GetOrderByIdRequest = None  # type: ignore[assignment,misc]
             if GetOrderByIdRequest is not None:
                 try:
                     return await asyncio.to_thread(
-                        self._trading_client.get_order_by_id,
+                        trading_client.get_order_by_id,
                         stored_order_id,
                         GetOrderByIdRequest(nested=True),
                     )
@@ -1139,11 +1146,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     # flat order instead.
                     pass
             return await asyncio.to_thread(
-                self._trading_client.get_order_by_id, stored_order_id
+                trading_client.get_order_by_id, stored_order_id
             )
-        return await asyncio.to_thread(
-            self._trading_client.get_order_by_client_id, signal_id
-        )
+        return await asyncio.to_thread(trading_client.get_order_by_client_id, signal_id)
 
     def _parent_signal_id_for_broker_order(self, broker_order_id: str | None) -> str | None:
         """The signal whose bracket leg this broker order id names, or ``None``."""
@@ -1164,7 +1169,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if _order_status(leg) not in {"filled", "partially_filled"}:
             return False
         # Absent reads as nothing filled; a present but unreadable quantity raises
-        # MoneyParseError (#280), which the reconciliation pass skips per signal.
+        # MoneyParseError (#280), which the reconciliation pass skips per signal;
+        # the parent fill booked earlier in the same call is kept.
         parsed_leg_qty = parse_optional(_order_attr(leg, "filled_qty", None))
         leg_cumulative_qty = 0.0 if parsed_leg_qty is None else parsed_leg_qty
         if leg_cumulative_qty <= 0.0:
@@ -1685,6 +1691,18 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     )
                 return float(stop_loss), float("nan")
             return float("nan"), float("nan")
+        # `missing` handled every None above: it either raised or returned, so
+        # both are prices here. Re-stated as a check rather than a suppression:
+        # mypy cannot correlate the `missing` scan with the loop below or with
+        # the return, and an explicit refusal keeps the invariant visible (and
+        # fails closed with a message instead of a TypeError) if the control
+        # flow above is ever reordered.
+        if stop_loss is None or take_profit is None:
+            raise ValueError(
+                "Refusing to submit Alpaca order with a missing level "
+                f"(signal_id={signal.id}, symbol={signal.symbol}); "
+                "opening an unbounded position is not allowed."
+            )
         for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
             if math.isnan(value) or math.isinf(value) or value <= 0:
                 raise ValueError(
@@ -1915,7 +1933,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         than asked. Raises :class:`ExitBelowStepError` below one step.
         """
         step = self.exit_qty_step(symbol)
-        floored = round_exit_qty_down(qty, step)
+        floored = floor_qty_to_step(qty, step)
         if floored <= 0.0:
             raise ExitBelowStepError(
                 f"Alpaca exit for {symbol} ignored: the requested qty {qty:g} is below "
@@ -2019,7 +2037,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)
+        # Re-read after the await: `connect()` is what establishes the client, and
+        # mypy drops member narrowing across it, so without this a failed connect
+        # would raise AttributeError instead of saying the adapter is not ready.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
         balance = parse_money(getattr(account, "cash", None))
         equity = parse_optional(getattr(account, "equity", None))
         return balance, balance if equity is None else equity
@@ -2044,7 +2070,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
         if not self._connected or self._trading_client is None:
             await self.connect()
-        account = await asyncio.to_thread(self._trading_client.get_account)
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before requesting the account"
+            )
+        account = await asyncio.to_thread(trading_client.get_account)
         currency = str(getattr(account, "currency", "") or "").strip().upper()
         if currency != "USD":
             raise ValueError(
@@ -2074,6 +2105,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         differently from the one that was validated.
         """
         from alpaca.common.enums import Sort
+        from alpaca.data.enums import Adjustment, DataFeed
         from alpaca.data.requests import StockBarsRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -2089,15 +2121,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(
                 "Alpaca adapter must be connected before requesting market data"
             )
+        # Bound after the guard and used by the closures below: mypy does not
+        # carry a member narrowing into a nested function, so reaching through
+        # `self` there would need a suppression (and would read the attribute
+        # twice, which a concurrent disconnect could turn into None).
+        historical_client = self._historical_data_client
 
         def _fetch_crypto(slack_multiplier: float) -> pd.DataFrame:
             from alpaca.data.historical import CryptoHistoricalDataClient
             from alpaca.data.requests import CryptoBarsRequest
 
-            if self._crypto_data_client is None:
-                self._crypto_data_client = CryptoHistoricalDataClient(
+            crypto_client = self._crypto_data_client
+            if crypto_client is None:
+                crypto_client = CryptoHistoricalDataClient(
                     self.api_key, self.secret_key
                 )
+                self._crypto_data_client = crypto_client
             request = CryptoBarsRequest(
                 symbol_or_symbols=[normalized_symbol],
                 timeframe=resolved_timeframe,
@@ -2107,7 +2146,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 limit=1000,
                 sort=Sort.DESC,
             )
-            return self._crypto_data_client.get_crypto_bars(request).df
+            # `get_crypto_bars` is declared `BarSet | RawData`: the RawData
+            # branch only happens when the client was built with
+            # `use_raw_data=True`, which this adapter never does (see the
+            # construction above), so the answer is the BarSet and `.df` is on
+            # it. Stated because mypy cannot see that construction flag.
+            return crypto_client.get_crypto_bars(request).df  # type: ignore[union-attr]
 
         def _fetch(slack_multiplier: float) -> pd.DataFrame:
             if is_crypto:
@@ -2119,14 +2163,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     timeframe, bounded_limit, slack_multiplier=slack_multiplier
                 ),
                 limit=1000,
-                adjustment="raw",
-                feed="iex",
+                # alpaca-py's own enum members, not the wire strings: the
+                # request model declares these fields as `Adjustment`/`DataFeed`,
+                # so a misspelled or deleted member is a type error instead of a
+                # runtime validation failure buried in a broker call. Both are
+                # `str` enums, so the serialised request is byte-identical.
+                adjustment=Adjustment.RAW,
+                feed=DataFeed.IEX,
                 # Newest first. The response is capped at `limit`, so an
                 # ascending request over a widened window would return the
                 # oldest bars in it. Sorted back to ascending below.
                 sort=Sort.DESC,
             )
-            return self._historical_data_client.get_stock_bars(request).df
+            return historical_client.get_stock_bars(request).df
 
         frame = await asyncio.to_thread(_fetch, 1.0)
         if frame is not None and len(frame.index) < bounded_limit:
@@ -2254,6 +2303,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         or non-numeric side raises instead of returning an invented price; the
         daemon additionally rejects zero, non-finite and crossed quotes.
         """
+        from alpaca.data.enums import DataFeed
         from alpaca.data.requests import StockLatestQuoteRequest
 
         normalized_symbol = str(symbol or "").strip().upper()
@@ -2261,7 +2311,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise ValueError("symbol is required for an Alpaca quote")
         if not self._connected or self._historical_data_client is None:
             raise RuntimeError("Alpaca adapter must be connected before requesting a quote")
-        request = StockLatestQuoteRequest(symbol_or_symbols=[normalized_symbol], feed="iex")
+        request = StockLatestQuoteRequest(
+            symbol_or_symbols=[normalized_symbol],
+            # The alpaca-py `DataFeed` member, not the wire string, for the same
+            # reason as `get_market_data` above; `DataFeed` is a `str` enum, so
+            # the request this sends is unchanged.
+            feed=DataFeed.IEX,
+        )
         response = await asyncio.to_thread(
             self._historical_data_client.get_stock_latest_quote, request
         )
@@ -2541,7 +2597,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return ControlOutcome(
                 completed=completed,
                 unidentified=tuple(unidentified),
-                failed=tuple(failed) + (f"verify:{exc}",),
+                failed=(*failed, f"verify:{exc}"),
             )
         # Alpaca keeps listing a cancel it accepted as ``pending_cancel`` until the
         # cancel settles, so that status on an id this sweep cancelled without error
@@ -2556,13 +2612,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         def accepted_pending_cancel(order_id: str | None, order: Any) -> bool:
             return order_id in cancel_accepted and _order_status(order) == "pending_cancel"
 
+        # `_control_order_id` returns ``str | None``, so the None case is filtered
+        # in the comprehension (as in `pending_cancel` below) instead of being
+        # discarded from the finished set, which the checker cannot model.
         still_working = {
             order_id
             for order in remaining
-            if (order_id := _control_order_id(_order_attr(order, "id"))) not in protected
+            if (order_id := _control_order_id(_order_attr(order, "id"))) is not None
+            and order_id not in protected
             and not accepted_pending_cancel(order_id, order)
         }
-        still_working.discard(None)
         failed.extend(sorted(still_working))
         pending_cancel = sorted(
             {
@@ -3055,7 +3114,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # sit on would fall back to the account-wide re-read on exactly the
             # ordinary bracket sweep. So only an unresolved symbol, which names no
             # bound at all, widens the scope.
-            verify_symbols = {symbol for symbol in cancelled_symbols.values() if symbol}
+            verify_symbols: set[str] | None = {
+                symbol for symbol in cancelled_symbols.values() if symbol
+            }
             if any(not symbol for symbol in cancelled_symbols.values()):
                 verify_symbols = None
             try:
@@ -3185,7 +3246,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 collected[row_key or f"row-{len(collected)}"] = order
             if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
                 return self._parents_with_resting_legs(collected.values())
-            until = _page_back_cursor(result)
+            until = _page_back_cursor(list(result))
             if until is None:
                 raise RuntimeError(
                     "Alpaca's order rows carry no submitted timestamp, so the next page "
@@ -3426,7 +3487,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """Return open positions with pricing and unrealized PnL."""
         if not self._connected or self._trading_client is None:
             await self.connect()
-        rows = await asyncio.to_thread(self._trading_client.get_all_positions)
+        # Re-read after the await, for the same reason as `get_balance`: a
+        # `connect()` that left the client unset must raise, not AttributeError.
+        trading_client = self._trading_client
+        if trading_client is None:
+            raise RuntimeError(
+                "Alpaca adapter must be connected before listing positions"
+            )
+        rows = await asyncio.to_thread(trading_client.get_all_positions)
         payload: list[dict[str, Any]] = []
         for row in rows:
             raw_qty = getattr(row, "qty", None)
@@ -3840,7 +3908,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 # alternative in alpaca-py). The thread is released when run
                 # returns/raises; on error the stream is stopped below before
                 # discard so a healthy stream never leaks a thread per retry.
-                await asyncio.to_thread(self._trading_stream.run)
+                # Bound above in the `is None` branch and re-assigned on
+                # reconnect, so mypy still sees `Any | None` here even though the
+                # `is None` check just established it.
+                await asyncio.to_thread(self._trading_stream.run)  # type: ignore[union-attr]
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

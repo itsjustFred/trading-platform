@@ -397,7 +397,7 @@ def test_cancel_open_orders_reports_an_uncancelled_pending_cancel_order() -> Non
     def get_orders(filter=None):  # noqa: A002 - mirrors alpaca-py
         reads["n"] += 1
         result = original_get(filter)
-        return result + [stranger] if reads["n"] > 1 else result
+        return [*result, stranger] if reads["n"] > 1 else result
 
     client.get_orders = get_orders  # type: ignore[method-assign]
 
@@ -2295,3 +2295,29 @@ def test_reconcile_raises_on_an_unreadable_filled_qty() -> None:
 
     with pytest.raises(ValueError, match="unreadable money value"):
         asyncio.run(adapter._reconcile_signal_fill("00000000-0000-0000-0000-000000000001"))
+
+
+def test_order_filled_qty_reads_an_unreadable_quantity_as_unknown() -> None:
+    """``None`` means "unknown", not zero: the refuse-cancel excusal must not
+    read a quantity nobody could parse as "nothing filled" (#280)."""
+    from live_runner.alpaca_adapter import _order_filled_qty
+
+    assert _order_filled_qty(SimpleNamespace(filled_qty="junk")) is None
+    assert _order_filled_qty(SimpleNamespace(filled_qty=float("nan"))) is None
+    assert _order_filled_qty(SimpleNamespace()) is None
+    assert _order_filled_qty(SimpleNamespace(filled_qty=2.5)) == 2.5
+
+
+def test_a_refused_cancel_is_not_excused_by_an_unreadable_filled_qty() -> None:
+    """A ``canceled`` order whose ``filled_qty`` cannot be read proves nothing:
+    it may have executed, so the refusal stands (#280)."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "entry-1", "AAPL", "buy", status="canceled", filled_qty="junk"
+            )
+        ]
+    )
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._cancel_already_gone(client, "entry-1")) is False

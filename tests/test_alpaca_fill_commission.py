@@ -25,13 +25,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from shared.models import (
     PRICE_ABSENT,
@@ -53,7 +54,7 @@ OTHER_DEPLOYMENT = "dep-alpaca-124-b"
 
 @pytest.fixture
 def db(isolated_db):
-    database, engine, _data_dir = isolated_db
+    database, _engine, _data_dir = isolated_db
     database.init_db()
     with database.get_session() as session:
         session.add(database.LiveAccountModel(id=ACCOUNT, broker="alpaca", name=ACCOUNT))
@@ -675,7 +676,7 @@ def test_legacy_not_null_commission_column_is_migrated_to_nullable(isolated_db_n
         "ix_live_executions_timestamp",
         "ix_live_executions_broker_order_id",
     } <= index_names
-    with pytest.raises(Exception):
+    with pytest.raises(IntegrityError):
         with engine.begin() as connection:
             connection.execute(
                 text(
@@ -2361,6 +2362,54 @@ def test_plan_refuses_a_zero_quantity_local_order_without_aborting_the_pass():
     assert plan.commissions == {}
 
 
+def test_group_problem_refuses_a_broken_pair_that_carries_no_reason():
+    """A broken pair must never read as clean: a reason-less entry fails closed.
+
+    ``broken_pairs`` is ``dict[str, str]`` and production only ever stores a
+    reason, but the consumer (``plan_commission_backfill``) skips a pair only on
+    a non-None problem, so a stored ``None`` would have sent the broken pair on
+    to the allocator with no fills and left its commissions unbackfilled instead
+    of reported. Pin the fail-closed branch so that state cannot come back.
+    """
+    from live_runner.alpaca_fees import _FeeIndex, _group_problem, _Inputs
+
+    inputs = _Inputs(
+        fills_by_order={},
+        fills_by_pair={},
+        rows_by_order={},
+        fees=_FeeIndex(),
+        broken_pairs={"BTC/USD": None},
+    )
+
+    problem, fills = _group_problem(inputs, "BTC/USD", date.fromisoformat(TRADE_DAY))
+
+    assert problem is not None and "BTC/USD" in problem
+    assert fills == []
+
+
+def test_group_problem_reports_a_stored_broken_pair_reason():
+    """A pair taken out of play with a reason returns that reason, no fills.
+
+    The membership test is the whole guard: without it a broken pair would fall
+    through to the fill checks and the allocator, with its commissions either
+    mis-allocated or silently skipped.
+    """
+    from live_runner.alpaca_fees import _FeeIndex, _group_problem, _Inputs
+
+    inputs = _Inputs(
+        fills_by_order={},
+        fills_by_pair={},
+        rows_by_order={},
+        fees=_FeeIndex(),
+        broken_pairs={"BTC/USD": "an unreadable FILL activity"},
+    )
+
+    problem, fills = _group_problem(inputs, "BTC/USD", date.fromisoformat(TRADE_DAY))
+
+    assert problem == "an unreadable FILL activity"
+    assert fills == []
+
+
 # ── a fill is never stored with an invented time (audit of #135) ────────────────────────────────
 
 ORDER_FILLED_AT = datetime(2026, 11, 3, 15, 5, tzinfo=timezone.utc)
@@ -2542,7 +2591,7 @@ def test_reconcile_refusal_names_the_connect_that_retries_it(db, live_runner_log
 
 @pytest.mark.parametrize(
     "date_only",
-    ["2026-11-03", "20261103", "2026-11-03T", "2026-W45", datetime(2026, 11, 3).date()],
+    ["2026-11-03", "20261103", "2026-11-03T", "2026-W45", date(2026, 11, 3)],
 )
 def test_a_date_without_a_time_of_day_is_not_a_fill_timestamp(date_only):
     from live_runner.alpaca_adapter import _broker_fill_timestamp

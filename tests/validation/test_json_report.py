@@ -184,6 +184,42 @@ class TestRiskEvidenceGate:
         assert data["passed"] is False
         assert data["risk_evidence_status"] == "failed"
 
+    def test_failed_risk_field_is_a_warning_delta(self) -> None:
+        """A failing risk field is emitted at severity=warning, never info.
+
+        The gate still reports the risk evidence as failed, so an info-level
+        delta under-reports the mismatch in the structured and markdown report:
+        consumers counting warnings miss a risk field that did not match.
+        """
+        from validation.comparison.comparison import FieldComparisonResult
+        from validation.risk.comparison import RiskComparisonReport, RiskComparisonResult
+
+        reference = make_reference([make_trade()])
+        result = RiskComparisonResult(
+            field_results={
+                "position_size": FieldComparisonResult(
+                    field="position_size",
+                    expected=1.0,
+                    actual=2.0,
+                    tolerance=0.01,
+                    passed=False,
+                    message="position size differs",
+                )
+            },
+            passed=False,
+        )
+        risk = RiskComparisonReport(trade_results=[result], passed=False)
+
+        data = json.loads(
+            json_report.generate_json_report(reference, reference, risk_delta_report=risk)
+        )
+
+        deltas = {delta["field"]: delta for delta in data["risk_deltas"]}
+        assert deltas["risk_position_size"]["passed"] is False
+        assert deltas["risk_position_size"]["severity"] == "warning"
+        assert data["risk_passed"] is False
+        assert data["risk_evidence_status"] == "failed"
+
 
 class TestStatDeltaDefaults:
     def test_infinite_match_explanation_names_the_sign(self) -> None:

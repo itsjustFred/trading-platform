@@ -168,7 +168,12 @@ def test_iter_alpaca_credentials_share_adapter_block_semantics():
     blocks = _alpaca_credential_blocks(env, indexes)
 
     by_key = {block["key"]: block for block in discovered}
-    by_adapter_key = {f"ACC{index}": block for index, block in zip(indexes, blocks)}
+    # `strict=True` is the point of this test: the two lists must stay
+    # index-aligned, and a block that fails to build would otherwise shift
+    # every later adapter key onto the wrong credentials.
+    by_adapter_key = {
+        f"ACC{index}": block for index, block in zip(indexes, blocks, strict=True)
+    }
 
     assert by_key["ACC1"]["paper"] is False
     assert by_adapter_key["ACC1"]["paper"] is False
@@ -447,7 +452,17 @@ def test_the_adapter_balance_uses_the_same_resolution():
     response = adapter._ProtoOATraderRes()
     response.trader = trader
 
-    async def _send_response(_request, **_kwargs):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    async def _send_response(request, **_kwargs):
+        # get_balance keeps realized-balance semantics (#267): it no longer
+        # asks for open-position unrealized P&L - that is get_equity's job.
+        # The branch stays so the mock also serves a get_equity call.
+        if isinstance(request, ProtoOAGetPositionUnrealizedPnLReq):
+            return ProtoOAGetPositionUnrealizedPnLRes()
         return response
 
     adapter._send_request = _send_response

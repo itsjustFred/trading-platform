@@ -912,7 +912,7 @@ def _moments_curve(daily_equities: list[float]) -> list:
     days = pd.date_range("2024-01-01", periods=len(daily_equities), freq="D", tz="UTC")
     return [
         EquityPoint(time=day.isoformat(), equity=value)
-        for day, value in zip(days, daily_equities)
+        for day, value in zip(days, daily_equities, strict=True)
     ]
 
 

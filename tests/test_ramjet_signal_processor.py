@@ -140,6 +140,15 @@ def test_trailing_percent_boundaries_rejected(trailing_percent):
         )
 
 
+@pytest.mark.parametrize("key", ["atr_period", "supertrend_period"])
+@pytest.mark.parametrize("value", [0, -1, 0.5])
+def test_non_positive_indicator_periods_rejected(key, value):
+    """A non-positive period must fail at config time, not clamp to 1 and
+    size a live stop from a one-bar ATR."""
+    with pytest.raises(ValueError, match=key):
+        RamJetSignalProcessor({"ram_jet": {key: value}})
+
+
 def test_process_signal_rejects_non_buy_actions():
     processor = RamJetSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}})
     with pytest.raises(ValueError, match="BUY/LONG"):
@@ -161,65 +170,33 @@ def test_processor_loads_default_ramjet_config_file():
     assert processor.default_timeframe == "5m"
 
 
-class _FakeSupertrendTA:
-    """Stands in for the ``pandas_ta`` accessor with a deterministic frame."""
+def test_supertrend_marks_warmup_not_ready_on_short_frame():
+    """A frame shorter than the Supertrend warm-up must not read as ready.
 
-    def __init__(self, directions: list[int], period: int, multiplier: float):
-        self._directions = directions
-        self._period = period
-        self._multiplier = multiplier
-
-    def supertrend(self, length=None, multiplier=None, **_kwargs):
-        return pd.DataFrame(
-            {
-                f"SUPERTd_{self._period}_{float(self._multiplier)}": self._directions,
-            }
-        )
-
-
-def test_pandas_ta_supertrend_marks_warmup_not_ready(monkeypatch):
-    """The pandas_ta branch must carry the same warm-up marker as the fallback.
-
-    Old behaviour: the pandas_ta branch only set ``supertrend``, so
-    process_signal fell into its ``else True`` and reported the warm-up bar as
-    ready with whatever direction the library emitted for it — the marker was
-    the fallback's secret, not the contract's (CodeRabbit batch review).
+    The single shared implementation (issue #317 P1, replacing both the
+    pandas_ta branch and the hand-written fallback) emits ``supertrend``
+    for every bar but ``supertrend_ready`` only after ``period`` bars of
+    history — ``process_signal`` must report the warm-up bar as not ready
+    even though a direction column exists.
     """
     period = 100
     rows = 40
-    # The library reports green on every bar, but the frame is shorter than
-    # the requested warm-up — exactly the short live fetch the golden test
-    # pins for the fallback path.
-    directions = [1] * rows
-    # pandas_ta registers the ``ta`` accessor on import; it is absent when the
-    # library is not installed, hence raising=False.
-    monkeypatch.setattr(
-        pd.DataFrame,
-        "ta",
-        property(lambda self: _FakeSupertrendTA(directions, period, 3.0)),
-        raising=False,
-    )
-
     processor = RamJetSignalProcessor(
         {"ram_jet": {"supertrend_period": period, "candle_timeframe": "5Min"}}
     )
-    signal = processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows))
+    signal = processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows)
+    )
 
     assert signal.metadata["supertrend_ready"] is False
-    assert signal.metadata["supertrend_green_at_entry"] is True
 
-    # Once the warm-up is over the same library output counts as ready.
-    warmed_directions = [1] * rows
-    monkeypatch.setattr(
-        pd.DataFrame,
-        "ta",
-        property(lambda self: _FakeSupertrendTA(warmed_directions, 10, 3.0)),
-        raising=False,
-    )
+    # Once the warm-up is over the same computation counts as ready.
     warmed_processor = RamJetSignalProcessor(
         {"ram_jet": {"supertrend_period": 10, "candle_timeframe": "5Min"}}
     )
-    warmed = warmed_processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows))
+    warmed = warmed_processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows)
+    )
     assert warmed.metadata["supertrend_ready"] is True
 
 
