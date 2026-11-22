@@ -52,8 +52,9 @@ def archive_env(tmp_path, monkeypatch):
 def _all_records() -> list[dict]:
     records: list[dict] = []
     for path in sorted(sa.archive_dir().glob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            records.append(json.loads(line))
+        records.extend(
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+        )
     return records
 
 
@@ -61,8 +62,9 @@ def _read_records(arch: SignalArchive) -> list[dict]:
     assert arch.flush(timeout=5.0)
     records: list[dict] = []
     for path in sorted(sa.archive_dir().glob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            records.append(json.loads(line))
+        records.extend(
+            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+        )
     return records
 
 

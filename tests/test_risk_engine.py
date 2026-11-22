@@ -334,6 +334,83 @@ def test_calculate_position_size_zero_distance_wrong_side_returns_rejection():
     assert sized.decision.risk_distance is None
 
 
+def test_wrong_side_stop_reports_the_absolute_risk_distance():
+    """A rejected wrong-side stop still reports the distance, as an absolute.
+
+    The rejection is sized from ``abs(entry - stop)``: a buy at 100 with a stop
+    at 105 is 5.0 away, not -105.0, so the diagnostic a reviewer reads against a
+    rejected order names the real separation rather than a signed difference.
+    """
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=105.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+
+    sized = RiskEngine().calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "bad_stop_direction"
+    assert sized.decision.risk_distance == pytest.approx(5.0)
+
+
+def test_a_non_finite_entry_price_is_refused_at_the_model():
+    """The signal model refuses a non-finite entry at construction.
+
+    Together with the engine's stop re-validation below, this is what makes the
+    wrong-side branch's ``math.isfinite`` guard defence in depth: neither price
+    can be non-finite once sizing starts, so no reachable outcome depends on it.
+    """
+    with pytest.raises(ValueError, match="entry_price must be finite"):
+        TradeSignal(
+            action="buy",
+            symbol="AAPL",
+            entry_price=math.inf,
+            stop_loss=105.0,
+            take_profit=110.0,
+            timeframe="1h",
+            metadata={"current_positions": 0, "enforce_stop_direction": True},
+        )
+
+
+def test_a_non_finite_stop_is_refused_before_the_distance_is_computed():
+    """A stop the fallback path rewrote to a non-finite value never gets sized.
+
+    The engine assigns ``signal.stop_loss`` itself when resolving a fallback, so
+    pin that it re-validates the price before the wrong-side distance maths
+    rather than reporting an ``inf`` risk distance.
+    """
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=105.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+    signal.stop_loss = math.inf
+
+    with pytest.raises(ValueError, match="stop_loss must be finite"):
+        RiskEngine().calculate_position_size(
+            signal=signal,
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+        )
+
+
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
     engine = RiskEngine(
         RiskConfig(
@@ -585,7 +662,7 @@ class TestIssueC1FallbackGuards:
 
     @pytest.mark.parametrize("bad_atr", [float("nan"), float("inf"), -1.5, 0.0, "nonsense"])
     def test_non_finite_atr_rejected(self, bad_atr) -> None:
-        with pytest.raises(ValueError, match="[Aa][Tt][Rr]"):
+        with pytest.raises(ValueError, match=r"[Aa][Tt][Rr]"):
             self._engine().calculate_position_size(
                 signal=self._signal(atr=bad_atr),
                 account_balance=10000.0,

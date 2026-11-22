@@ -141,7 +141,7 @@ class SignalArchive:
                     extra={"data": {"dropped_total": self.dropped}},
                 )
             return
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive  # except-kind: loop-survival
             self.enqueue_errors += 1
             logger.warning(
                 "Signal archive could not enqueue a record",
@@ -212,7 +212,7 @@ class SignalArchive:
         for record in records:
             try:
                 line = json.dumps(record, default=str, separators=(",", ":"))
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 self.write_errors += 1
                 logger.warning(
                     "Signal archive could not serialize a record",
@@ -247,7 +247,7 @@ class SignalArchive:
                 finally:
                     os.close(fd)
                 self.written += len(lines)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 self.write_errors += len(lines)
                 logger.warning(
                     "Signal archive could not write records",
@@ -491,7 +491,7 @@ class SignalDecisionRecorder:
             features = dict(self._features)
         try:
             self._archive.record(self._build_record(outcome, reason, detail, features, extra))
-        except Exception as exc:  # pragma: no cover - record() is already total
+        except Exception as exc:  # pragma: no cover - record() is already total  # except-kind: loop-survival
             logger.warning(
                 "Signal archive decision record failed",
                 extra={"data": {"error": str(exc)}},
@@ -624,7 +624,7 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
         true_range = true_range.fillna(high - low)
         atr = true_range.ewm(span=_ATR_SPAN, adjust=False).mean()
 
-        features["bars"] = int(len(work))
+        features["bars"] = len(work)
         features["close"] = _finite(close.iloc[-1])
         atr_last = _finite(atr.iloc[-1])
         features["atr_14"] = atr_last
@@ -656,9 +656,9 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
             last_vol = float(cum_vol.iloc[-1])
             if last_vol > 0:
                 vwap = float((typical * volume).cumsum().iloc[-1] / last_vol)
-                vwap = _finite(vwap)
-                if vwap:
-                    features["vwap"] = vwap
+                finite_vwap = _finite(vwap)
+                if finite_vwap:
+                    features["vwap"] = finite_vwap
                     features["dist_vwap_pct"] = _finite(
                         (close.iloc[-1] - vwap) / vwap * 100.0
                     )
@@ -677,7 +677,7 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
                 features["last_bar_time"] = last_label.isoformat()
             else:
                 features["last_bar_time"] = str(last_label)
-    except Exception as exc:  # pragma: no cover - defensive; features are best-effort
+    except Exception as exc:  # pragma: no cover - defensive; features are best-effort  # except-kind: loop-survival
         logger.debug(
             "Market feature computation failed",
             extra={"data": {"error": str(exc)}},

@@ -259,6 +259,25 @@ def supertrend_ramjet(
     )
 
 
+def supertrend_chart(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 7,
+    multiplier: float = 3.0,
+) -> SupertrendResult:
+    """Viewer overlay Supertrend (was ``pandas_ta.ta.supertrend(7, 3)``).
+
+    Same ``"ta"`` band recursion and Wilder-RMA ATR as
+    :func:`supertrend_ramjet` — pandas_ta was never importable in a
+    supported environment, so there is no library output to preserve; the
+    chart plots the active band (``lower_band`` in an uptrend,
+    ``upper_band`` otherwise) masked to ``ready`` bars. Its outputs are the
+    RamJet semantics, including the legacy NaN-band ``or``-chain.
+    """
+    return supertrend_ramjet(high, low, close, period, multiplier)
+
+
 def supertrend_custom_swings(
     high: pd.Series,
     low: pd.Series,
@@ -377,6 +396,7 @@ PRESETS: dict[str, Callable] = {
     "rsi_wilder_masked": rsi_wilder_masked,
     "rsi_wilder_fill50": rsi_wilder_fill50,
     "supertrend_ramjet": supertrend_ramjet,
+    "supertrend_chart": supertrend_chart,
     "supertrend_custom_swings": supertrend_custom_swings,
     "supertrend_pine_dema": supertrend_pine_dema,
     "supertrend_pine_superosc": supertrend_pine_superosc,

@@ -602,7 +602,7 @@ def test_a_loopback_connect_is_allowed_through_to_the_os(monkeypatch) -> None:
 
 def test_a_remote_name_lookup_is_refused(monkeypatch) -> None:
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
-    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match="api.alpaca.markets"):
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"api\.alpaca\.markets"):
         socket.getaddrinfo("api.alpaca.markets", 443)
     assert suite_conftest.network_violations() == ("name lookup 'api.alpaca.markets'",)
 
@@ -611,7 +611,7 @@ def test_a_remote_connect_is_refused(monkeypatch) -> None:
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
     probe = socket.socket()
     try:
-        with pytest.raises(suite_conftest.SuiteHermeticityViolation, match="35.221.23.121"):
+        with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"35\.221\.23\.121"):
             probe.connect(("35.221.23.121", 443))
     finally:
         probe.close()

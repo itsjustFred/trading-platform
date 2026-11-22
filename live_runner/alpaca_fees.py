@@ -299,12 +299,21 @@ class _Inputs:
     fills_by_pair: dict[str, list[BrokerFill]]
     rows_by_order: dict[str, list[dict[str, Any]]]
     fees: _FeeIndex
+    # The value carries the per-pair message: ``_group_problem`` returns it
+    # alongside the (empty) fill list. Every entry is the reason the pair was
+    # taken out of play, so a pair is only "clean" by being absent here.
     broken_pairs: dict[str, str]
 
 
 def _group_problem(inputs: _Inputs, pair: str, day: date) -> tuple[str | None, list[BrokerFill]]:
     if pair in inputs.broken_pairs:
-        return inputs.broken_pairs[pair], []
+        # Fail closed: a stored ``None`` would read as "no problem" further down
+        # (the caller only skips a pair on a non-None problem), so an entry that
+        # carries no reason still refuses the pair rather than backfilling it.
+        reason = inputs.broken_pairs[pair] or (
+            f"the pair {pair} is broken without a recorded reason"
+        )
+        return reason, []
     group_fills = [fill for fill in inputs.fills_by_pair.get(pair, []) if day in fill.days]
     for fill in group_fills:
         if len(fill.days) > 1:
@@ -466,9 +475,9 @@ def plan_commission_backfill(
     for pair, day in sorted(groups):
         if not fee_day_is_posted(day, now):
             continue
-        problem, group_fills = _group_problem(inputs, pair, day)
-        if problem is not None:
-            plans.append(GroupPlan(pair, day, {}, problem))
+        group_problem, group_fills = _group_problem(inputs, pair, day)
+        if group_problem is not None:
+            plans.append(GroupPlan(pair, day, {}, group_problem))
             continue
         try:
             plans.append(_allocate(inputs, pair, day, group_fills))

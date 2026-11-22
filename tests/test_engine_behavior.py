@@ -301,7 +301,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         # stop at all, so it is sized on the 2% fallback and keeps its
         # creation-time quantity at fill.
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
+        stop_loss = pd.Series([90.0, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
@@ -351,8 +351,8 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries.iloc[2] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
-        stop_distance = pd.Series(blanks[:2] + [5.0] + blanks[3:], index=frame.index)
+        stop_loss = pd.Series([90.0, *blanks[1:]], index=frame.index)
+        stop_distance = pd.Series([*blanks[:2], 5.0, *blanks[3:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss, "stop_distance": stop_distance})
 
@@ -396,7 +396,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries = pd.Series([True] + [False] * 5, index=frame.index)
         exits = pd.Series([False] * len(frame), index=frame.index)
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        stop_loss = pd.Series([95.0, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
@@ -533,10 +533,10 @@ class TestSizingEquityExcludesUnrealizedPnl:
         # A 50% take-profit at 105 (plus a second level that is never
         # reached, so the ladder leaves a remainder open) on entry 1 only.
         blanks: list[float | None] = [None] * len(frame)
-        tp1 = pd.Series([105.0] + blanks[1:], index=frame.index)
-        tp1_pct = pd.Series([0.5] + blanks[1:], index=frame.index)
-        tp2 = pd.Series([200.0] + blanks[1:], index=frame.index)
-        tp2_pct = pd.Series([0.5] + blanks[1:], index=frame.index)
+        tp1 = pd.Series([105.0, *blanks[1:]], index=frame.index)
+        tp1_pct = pd.Series([0.5, *blanks[1:]], index=frame.index)
+        tp2 = pd.Series([200.0, *blanks[1:]], index=frame.index)
+        tp2_pct = pd.Series([0.5, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries,
         exits,
@@ -623,7 +623,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries = pd.Series([True, False, False, True, False, False], index=frame.index)
         exits = pd.Series([False] * len(frame), index=frame.index)
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        stop_loss = pd.Series([95.0, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
@@ -732,7 +732,7 @@ class TestOrderTypeSizingSemantics:
         return engine, frame
 
     def test_limit_order_is_resized_to_trigger_price_at_fill(self):
-        engine, frame = self._limit_order_engine(limit_price=100.5)
+        engine, _frame = self._limit_order_engine(limit_price=100.5)
         assert engine.closed_trades, "limit order must fill"
         trade = engine.closed_trades[0]
         # C1: explicit risk sizing (1% of 100k = 1000 risk, 2% fallback stop
