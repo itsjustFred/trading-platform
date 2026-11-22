@@ -1734,6 +1734,100 @@ def test_get_max_leverage_without_proto_types_returns_none() -> None:
     assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
 
 
+def _stub_trader(adapter: CTraderLiveAdapter, trader: object) -> None:
+    """Pin ``_fetch_trader`` so no broker call is needed for the account leg."""
+
+    async def _fake_fetch_trader():
+        if isinstance(trader, Exception):
+            raise trader
+        return trader
+
+    adapter._fetch_trader = _fake_fetch_trader
+
+
+def test_get_max_leverage_clamps_the_tier_to_the_account_leverage() -> None:
+    """The account's own ``leverageInCents`` bounds the symbol tiers.
+
+    Spotware's example computes the effective leverage as
+    ``min(trader.leverageInCents, tier.leverage) / 100``: an account set to
+    1:50 on a symbol whose leverage group offers 1:500 is capped at 50, not
+    500. Returning the tier alone would hand the caps a ceiling the broker
+    will not margin.
+    """
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=5000, maxLeverage=0))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(50000, 20000, 10000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(50.0)
+
+
+def test_get_max_leverage_honours_max_leverage_when_set() -> None:
+    """``ProtoOATrader.maxLeverage`` is the account's own ceiling; when it is
+    the tighter of the readable account fields it wins the min."""
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=50000, maxLeverage=20000))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(50000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(200.0)
+
+
+def test_get_max_leverage_uses_whichever_side_is_readable() -> None:
+    """Tier known + account unreadable -> tier; account known + no leverageId
+    -> the account leverage; neither -> None (the caller's 1x)."""
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, RuntimeError("trader request failed"))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(50000, 20000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(500.0)
+
+    # No leverageId: the tier leg is unreadable, the account leg still answers.
+    adapter2 = _leverage_adapter()
+    _stub_trader(adapter2, SimpleNamespace(leverageInCents=3000, maxLeverage=0))
+
+    async def _fake_send2(request, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no leverageId means no tier request")
+
+    adapter2._send_request_with_refresh_retry = _fake_send2
+    assert asyncio.run(adapter2.get_max_leverage("EURUSD")) == pytest.approx(30.0)
+
+    # Neither side readable -> None.
+    adapter3 = _leverage_adapter()
+    _stub_trader(adapter3, RuntimeError("trader request failed"))
+
+    async def _fake_send3(request, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no leverageId means no tier request")
+
+    adapter3._send_request_with_refresh_retry = _fake_send3
+    assert asyncio.run(adapter3.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_ignores_unset_or_garbage_trader_fields() -> None:
+    """Unset (0) or non-numeric trader leverage fields are not a ceiling."""
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=0, maxLeverage="not-a-number"))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(20000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(200.0)
+
+
 def _symbol_by_id_response(leverage_id: int | None, symbol_id: int = 123):
     from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolByIdRes
 

@@ -2993,62 +2993,112 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     async def get_max_leverage(self, symbol: str) -> float | None:
         """The broker's maximum leverage for this account and ``symbol`` (#240).
 
-        ``ProtoOASymbol.leverageId`` — captured with the symbol props — resolves
-        through ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
-        ascending by volume. ``ProtoOADynamicLeverageTier.leverage`` is in the
-        same cents convention as ``ProtoOATrader.leverageInCents`` (1:200 is
-        ``20000``): Spotware's own Open API example divides the field by 100
-        before display, so the plain ratio is ``value / 100``.
+        Two broker-granted ceilings bound the answer and the tighter one wins:
 
-        Leverage shrinks as position volume grows across the tiers, so the
-        maximum sits in the first tier — an upper bound: a larger order is
-        margined at a lower tier, which the broker still enforces. The answer
-        is per account (the request carries ``ctidTraderAccountId``) and per
-        asset.
+        * the symbol's dynamic-leverage tiers — ``ProtoOASymbol.leverageId``,
+          captured with the symbol props, resolves through
+          ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
+          ascending by volume. ``ProtoOADynamicLeverageTier.leverage`` is in
+          the cents convention (1:200 is ``20000``): Spotware's own Open API
+          example divides the field by 100 before display, so the plain ratio
+          is ``value / 100``. Leverage shrinks as position volume grows, so
+          the maximum sits in the first tier — an upper bound: a larger order
+          is margined at a lower tier, which the broker still enforces;
+        * the account's own leverage — ``ProtoOATrader.leverageInCents`` is
+          the leverage the account actually trades at, and ``maxLeverage``,
+          when set, is the broker's ceiling for changing it. Spotware's
+          example computes the effective leverage as
+          ``min(trader.leverageInCents, tier.leverage) / 100``, so an account
+          set to 1:50 on a symbol offering 1:500 is capped at 50 — the tier
+          alone would overstate what the broker will margin. Both fields are
+          uint32 in the same cents family as ``leverageInCents`` (it is the
+          value ``maxLeverage`` validates against); if that convention ever
+          differed, reading it as cents is the fail-closed direction.
 
-        Returns ``None`` — never a guess — when the symbol has no leverage id,
-        the proto classes are unavailable, the response is unusable, or the
-        broker call fails; callers must treat ``None`` as 1x.
+        Either side may be unreadable (no ``leverageId``, missing proto
+        types, a failed broker call); the readable side alone still answers,
+        and ``None`` — never a guess — is returned when neither is, so callers
+        treat ``None`` as 1x.
         """
         try:
             self._raise_if_terminal_auth_failed()
             if not self._connected or not self._authenticated:
                 await self.connect()
             self._raise_if_terminal_auth_failed()
+
+            account_cents = await self._account_leverage_cents()
+
+            tier_cents: float | None = None
             if (
-                self._ProtoOAGetDynamicLeverageByIDReq is None
-                or self._ProtoOAGetDynamicLeverageByIDRes is None
+                self._ProtoOAGetDynamicLeverageByIDReq is not None
+                and self._ProtoOAGetDynamicLeverageByIDRes is not None
             ):
-                return None
-            leverage_id = self._symbol_leverage_ids.get(str(symbol or "").strip().upper())
-            if leverage_id is None:
-                return None
-            request = self._ProtoOAGetDynamicLeverageByIDReq()
-            request.ctidTraderAccountId = self.ctid_trader_account_id
-            request.leverageId = int(leverage_id)
-            response = await self._send_request_with_refresh_retry(
-                request, timeout_seconds=10
-            )
-            if not isinstance(response, self._ProtoOAGetDynamicLeverageByIDRes):
-                return None
-            leverage_msg = getattr(response, "leverage", None)
-            tiers = getattr(leverage_msg, "tiers", None) if leverage_msg is not None else None
-            values = [
-                value
-                for tier in tiers or []
-                if (value := _optional_float(getattr(tier, "leverage", None))) is not None
-                and math.isfinite(value)
-                and value > 0
-            ]
-            # Tier leverage is in cents (1:200 -> 20000), like
-            # ProtoOATrader.leverageInCents; callers want the plain ratio.
-            return max(values) / 100.0 if values else None
+                leverage_id = self._symbol_leverage_ids.get(
+                    str(symbol or "").strip().upper()
+                )
+                if leverage_id is not None:
+                    request = self._ProtoOAGetDynamicLeverageByIDReq()
+                    request.ctidTraderAccountId = self.ctid_trader_account_id
+                    request.leverageId = int(leverage_id)
+                    response = await self._send_request_with_refresh_retry(
+                        request, timeout_seconds=10
+                    )
+                    if isinstance(
+                        response, self._ProtoOAGetDynamicLeverageByIDRes
+                    ):
+                        leverage_msg = getattr(response, "leverage", None)
+                        tiers = (
+                            getattr(leverage_msg, "tiers", None)
+                            if leverage_msg is not None
+                            else None
+                        )
+                        values = [
+                            value
+                            for tier in tiers or []
+                            if (value := _optional_float(getattr(tier, "leverage", None)))
+                            is not None
+                            and math.isfinite(value)
+                            and value > 0
+                        ]
+                        if values:
+                            tier_cents = max(values)
+
+            candidates = [cents for cents in (tier_cents, account_cents) if cents is not None]
+            return min(candidates) / 100.0 if candidates else None
         except Exception as exc:
             logger.warning(
                 "cTrader max leverage lookup failed; treating it as unknown (1x)",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
             )
             return None
+
+    async def _account_leverage_cents(self) -> float | None:
+        """The account's own leverage ceiling in cents, or ``None``.
+
+        Reads ``ProtoOATrader.leverageInCents`` (the leverage the account
+        trades at) and ``maxLeverage`` (the broker's ceiling for changing it,
+        when set); the tighter readable value is the account-side bound the
+        symbol tiers are clamped against. An unreadable trader record or
+        unset/nonpositive fields degrade to ``None`` — the tier leg may still
+        answer on its own.
+        """
+        try:
+            trader = await self._fetch_trader()
+        except Exception as exc:
+            logger.warning(
+                "cTrader trader leverage lookup failed; using the symbol tiers only",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+        values = [
+            value
+            for value in (
+                _optional_float(getattr(trader, "leverageInCents", None)),
+                _optional_float(getattr(trader, "maxLeverage", None)),
+            )
+            if value is not None and math.isfinite(value) and value > 0
+        ]
+        return min(values) if values else None
 
     async def _fetch_trader(self) -> Any:
         """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""
