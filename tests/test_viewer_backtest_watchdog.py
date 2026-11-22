@@ -260,6 +260,22 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
 
     monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
 
+    terminal = threading.Event()
+    real_mark_task_finished = viewer_app_module._LEGACY_MARK_TASK_FINISHED
+
+    def mark_task_finished(task_id, **kwargs):
+        try:
+            return real_mark_task_finished(task_id, **kwargs)
+        finally:
+            if str(kwargs.get("status") or "").lower() in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                terminal.set()
+
+    monkeypatch.setattr(viewer_app_module, "_LEGACY_MARK_TASK_FINISHED", mark_task_finished)
+
     response = viewer_client.post(
         "/api/backtests/run",
         json={
@@ -272,12 +288,7 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
     assert response.status_code == 202
     task_id = response.json()["task_id"]
 
-    for _ in range(200):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
+    assert terminal.wait(timeout=10), "backtest task did not reach a terminal state"
     task = viewer_app_module.DATA_TASKS[task_id]
     assert task["status"] == "failed"
     error_text = str(task.get("error") or "")

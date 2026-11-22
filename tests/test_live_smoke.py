@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts import live_smoke
 from scripts.live_smoke import (
     SmokeCheck,
     SmokeReport,
@@ -16,6 +17,44 @@ from scripts.live_smoke import (
     main,
     run_smoke,
 )
+
+
+def test_alpaca_crypto_roundtrip_awaits_every_account_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three-iteration crypto roundtrip must await each iteration.
+
+    A PERF401 rewrite once put the ``await`` inside the generator expression
+    handed to ``list.extend``: the genexp became an async generator, so
+    ``extend`` raised ``TypeError: 'async_generator' object is not iterable``
+    and the crypto roundtrip never ran on any of the three accounts.
+    """
+    seen: list[int] = []
+
+    async def _fake_iteration(
+        env: dict[str, str],
+        *,
+        index: int,
+        symbol: str,
+        notional: float,
+        timeout_seconds: int,
+    ) -> SmokeCheck:
+        seen.append(index)
+        return SmokeCheck(name=f"crypto-acc{index}", ok=True, details={"index": index})
+
+    monkeypatch.setattr(live_smoke, "_run_alpaca_crypto_iteration", _fake_iteration)
+
+    checks = asyncio.run(
+        live_smoke._alpaca_crypto_roundtrip(
+            {},
+            symbol="BTC/USD",
+            notional=25.0,
+            timeout_seconds=5,
+        )
+    )
+
+    assert seen == [1, 2, 3]
+    assert [check.name for check in checks] == ["crypto-acc1", "crypto-acc2", "crypto-acc3"]
 
 
 def test_position_qty_for_symbol_matches_crypto_slash_alias() -> None:

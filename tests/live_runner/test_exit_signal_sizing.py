@@ -1318,19 +1318,19 @@ def test_nothing_to_exit_on_a_flat_book_stays_info(monkeypatch, caplog) -> None:
         (0.125, 1.0, 0.0),
     ],
 )
-def test_round_exit_qty_down_to_step(qty, step, expected) -> None:
-    from live_runner.exit_signals import round_exit_qty_down
+def test_floor_qty_to_step_to_step(qty, step, expected) -> None:
+    from shared.lot_grid import floor_qty_to_step
 
-    assert round_exit_qty_down(qty, step) == pytest.approx(expected, abs=1e-15)
-    assert round_exit_qty_down(qty, step) <= qty + 1e-12
+    assert floor_qty_to_step(qty, step) == pytest.approx(expected, abs=1e-15)
+    assert floor_qty_to_step(qty, step) <= qty + 1e-12
 
 
 @pytest.mark.parametrize("step", [0.0, -1.0, float("nan"), float("inf")])
-def test_round_exit_qty_down_refuses_an_unusable_step(step) -> None:
-    from live_runner.exit_signals import round_exit_qty_down
+def test_floor_qty_to_step_refuses_an_unusable_step(step) -> None:
+    from shared.lot_grid import floor_qty_to_step
 
     with pytest.raises(ValueError):
-        round_exit_qty_down(1.0, step)
+        floor_qty_to_step(1.0, step)
 
 
 class _SteppedAdapter(_Adapter):

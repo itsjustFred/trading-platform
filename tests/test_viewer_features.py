@@ -32,6 +32,16 @@ from shared.models import (
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _wait_for_viewer_task(viewer_app_module, task_id: str, *, timeout: float = 5.0):
+    """Join the task's worker thread instead of polling ``DATA_TASKS``."""
+    task = viewer_app_module.DATA_TASKS[task_id]
+    thread = task.get("thread")
+    assert isinstance(thread, threading.Thread), f"task {task_id} has no worker thread"
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), f"task {task_id} worker did not finish"
+    return viewer_app_module.DATA_TASKS[task_id]
+
+
 def test_get_dukascopy_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
@@ -1825,27 +1835,61 @@ def test_coalesced_cleanup_state_updates_are_serialized(tmp_path, monkeypatch):
         real_write(state)
 
     monkeypatch.setattr(viewer_app_module, "_write_coalesced_cleanup_state", blocking_write)
+
+    # Spy on the state lock itself: ``second_attempted`` must fire when the
+    # second thread *attempts* the acquire — proving it was actually blocked
+    # on the lock while the first writer held it, not merely scheduled late.
+    real_lock = viewer_app_module._COALESCED_CLEANUP_STATE_LOCK
+    second_attempted = threading.Event()
+
+    class _AcquireSpyLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "second-writer":
+                second_attempted.set()
+            return real_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            real_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.release()
+            return False
+
+    monkeypatch.setattr(
+        viewer_app_module, "_COALESCED_CLEANUP_STATE_LOCK", _AcquireSpyLock()
+    )
+
     first = threading.Thread(
         target=viewer_app_module._update_coalesced_cleanup_state,
         args=("cleanup-0001",),
         kwargs={"attempts": 1, "exhausted": False},
+        name="first-writer",
     )
-    second = threading.Thread(
-        target=viewer_app_module._update_coalesced_cleanup_state,
-        args=("cleanup-0002",),
-        kwargs={"attempts": 1, "exhausted": False},
-    )
+
+    def run_second():
+        viewer_app_module._update_coalesced_cleanup_state(
+            "cleanup-0002", attempts=1, exhausted=False
+        )
+
+    second = threading.Thread(target=run_second, name="second-writer")
     first.start()
     assert first_write_started.wait(timeout=2)
     second.start()
-    time.sleep(0.05)
+    assert second_attempted.wait(timeout=2)
     assert len(write_calls) == 1
     release_first_write.set()
     first.join(timeout=2)
     second.join(timeout=2)
+    assert not first.is_alive() and not second.is_alive()
 
     state = viewer_app_module._load_coalesced_cleanup_state()
     assert set(state) == {"cleanup-0001", "cleanup-0002"}
+    assert set(write_calls[0]) == {"cleanup-0001"}
+    assert set(write_calls[1]) == {"cleanup-0001", "cleanup-0002"}
 
 
 def test_coalesced_cleanup_failure_persists_retryable_marker(
@@ -3024,13 +3068,7 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
         total_items=1,
     )
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.1)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["status"] == "completed"
     assert Path(task["log_file"]).parent == tmp_path / "logs" / "tasks"
     assert task["pause_event"].is_set() is False
@@ -3044,10 +3082,6 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
-    thread = task.get("thread")
-    if isinstance(thread, threading.Thread):
-        thread.join(timeout=5)
-        assert not thread.is_alive()
 
 
 def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
@@ -3105,13 +3139,7 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     assert run_payload["task_id"] == run_payload["job_id"]
     job_id = run_payload["job_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[job_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[job_id]
+    task = _wait_for_viewer_task(viewer_app_module, job_id)
     assert task["status"] == "completed"
     assert task["kind"] == "optimization"
     assert task["optimization_id"] == "opt_base-demo_20260311_100000"
@@ -3223,13 +3251,7 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["kind"] == "backtest"
     assert task["status"] == "completed"
     assert task["progress"] == 100.0
@@ -3370,13 +3392,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["kind"] == "backtest"
     assert task["status"] == "completed"
     assert task["result"]["backtest_id"] == "signal-replay-unit"

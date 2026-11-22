@@ -163,13 +163,17 @@ def _solve_dense(
         big_m = float(len(costs) + 1)
 
     matrix = np.full((ref_count, act_count), big_m, dtype=float)
-    for (ref_pos, act_pos, _cost), cost in zip(feasible, costs):
+    # ``costs`` is read off ``feasible`` one entry per pair, so the two are the
+    # same length by construction: ``strict=True`` turns them getting out of
+    # step into an error instead of filling the matrix with shifted costs.
+    for (ref_pos, act_pos, _cost), cost in zip(feasible, costs, strict=True):
         matrix[ref_pos, act_pos] = cost
 
     rows, cols = linear_sum_assignment(matrix)
     allowed = {(ref_pos, act_pos) for ref_pos, act_pos, _cost in feasible}
     assigned: dict[int, int] = {}
-    for row, col in zip(rows, cols):
+    # ``linear_sum_assignment`` returns one row and one col per assigned pair.
+    for row, col in zip(rows, cols, strict=True):
         ref_pos, act_pos = int(row), int(col)
         # The solver had to fill the unmatched rows/columns with the sentinel.
         if (ref_pos, act_pos) in allowed:

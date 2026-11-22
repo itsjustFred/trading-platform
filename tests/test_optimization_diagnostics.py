@@ -125,9 +125,11 @@ def test_walk_forward_produces_ordered_non_overlapping_test_folds():
     test_starts = [pd.Timestamp(fold["test"]["start"]) for fold in folds]
     test_ends = [pd.Timestamp(fold["test"]["end"]) for fold in folds]
     assert test_starts == sorted(test_starts), "folds must be chronological"
-    for start, end in zip(test_starts, test_ends):
+    for start, end in zip(test_starts, test_ends, strict=True):
         assert end > start
-    for earlier, later in zip(test_ends, test_starts[1:]):
+    # Adjacent folds: the last `test_end` has no successor to compare against, so
+    # it is dropped explicitly rather than silently by `zip`'s truncation.
+    for earlier, later in zip(test_ends[:-1], test_starts[1:], strict=True):
         assert later >= earlier, "test windows must not overlap"
     # Every fold's train window precedes its own test window.
     for fold in folds:
@@ -721,7 +723,7 @@ def test_subperiods_are_the_walk_forward_test_windows():
     subperiods = subperiods_from_walk_forward(folds)
 
     assert [subperiod["label"] for subperiod in subperiods] == ["fold_0", "fold_1", "fold_2"]
-    for subperiod, fold in zip(subperiods, folds):
+    for subperiod, fold in zip(subperiods, folds, strict=True):
         assert subperiod["start"] == fold["test"]["start"]
         assert subperiod["end"] == fold["test"]["end"]
         assert subperiod["fold"] == fold["fold"]
@@ -1240,7 +1242,7 @@ def test_three_way_split_rejects_empty_segments():
             embargo_pct=0.5,
         )
     # Fractions don't sum to 1
-    with pytest.raises(ValueError, match="sum to 1.0"):
+    with pytest.raises(ValueError, match=r"sum to 1\.0"):
         three_way_split(
             "2024-01-01T00:00:00+00:00",
             "2024-01-11T00:00:00+00:00",
