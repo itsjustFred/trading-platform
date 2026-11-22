@@ -68,7 +68,7 @@ class TestSupertrendPineKernelParity:
         actual = core._supertrend_pine_kernel_nb(
             src, close, atr, multiplier, cross, first_i
         )
-        for a, e in zip(actual, expected):
+        for a, e in zip(actual, expected, strict=True):
             _assert_bit_identical(a, e)
 
     def test_constant_series(self):
@@ -84,7 +84,7 @@ class TestSupertrendPineKernelParity:
                 actual = core._supertrend_pine_kernel_nb(
                     src, close, atr, 2.0, cross, first_i
                 )
-                for a, e in zip(actual, expected):
+                for a, e in zip(actual, expected, strict=True):
                     _assert_bit_identical(a, e)
 
     @pytest.mark.parametrize("rule", ["pine", "pine_dema", "pine_superosc"])
@@ -129,7 +129,7 @@ class TestSupertrendTaKernelParity:
         src, close, atr = _ohlc_arrays(n, seed, nan_frac=nan_frac)
         expected = core._supertrend_ta_kernel_py(src, close, atr, 3.0)
         actual = core._supertrend_ta_kernel_nb(src, close, atr, 3.0)
-        for a, e in zip(actual[:3], expected[:3]):
+        for a, e in zip(actual[:3], expected[:3], strict=True):
             _assert_bit_identical(a, e)
         assert actual[3] == expected[3]
 
@@ -140,7 +140,7 @@ class TestSupertrendTaKernelParity:
         atr = np.full(n, np.nan)
         expected = core._supertrend_ta_kernel_py(src, close, atr, 2.0)
         actual = core._supertrend_ta_kernel_nb(src, close, atr, 2.0)
-        for a, e in zip(actual[:3], expected[:3]):
+        for a, e in zip(actual[:3], expected[:3], strict=True):
             _assert_bit_identical(a, e)
         assert actual[3] == expected[3] == -1
         result = core._supertrend_ta(src, close, atr, 2.0)
@@ -153,7 +153,7 @@ class TestSupertrendTaKernelParity:
         atr = np.full(n, 0.0)
         expected = core._supertrend_ta_kernel_py(src, close, atr, 2.0)
         actual = core._supertrend_ta_kernel_nb(src, close, atr, 2.0)
-        for a, e in zip(actual[:3], expected[:3]):
+        for a, e in zip(actual[:3], expected[:3], strict=True):
             _assert_bit_identical(a, e)
         assert actual[3] == expected[3]
 
@@ -275,7 +275,7 @@ class TestDispatch:
         assert calls == {"py": 1, "nb": 0}
 
     @pytest.mark.skipif(
-        core._supertrend_pine_kernel_nb is None, reason="numba unavailable"
+        _numba._load_njit() is None, reason="numba unavailable"
     )
     def test_numba_kernel_used_by_default(self, monkeypatch):
         calls = {"nb": 0}
@@ -292,9 +292,16 @@ class TestDispatch:
                               band_condition="cross", first_i=1)
         assert calls["nb"] == 1
 
-    def test_numba_failure_falls_back_to_python(self, monkeypatch):
+    def test_numba_compile_error_falls_back_and_marks_failed(
+        self, monkeypatch
+    ):
+        """A NumbaError (typing/compile failure) recurs on every input, so
+        the kernel is marked failed for the process after one fallback."""
+        numba_errors = pytest.importorskip("numba.core.errors")
+        assert _numba._load_njit() is not None
+
         def nb_broken(*args):
-            raise RuntimeError("simulated numba failure")
+            raise numba_errors.NumbaError("simulated compile failure")
 
         monkeypatch.delenv("TP_DISABLE_NUMBA", raising=False)
         monkeypatch.setattr(
@@ -303,10 +310,76 @@ class TestDispatch:
         _numba._failed.discard("_custom_swings_tr_kernel_py")
         high, low, close = _cs_inputs(50, 33, 0.0)
         tr = presets._custom_swings_tr_kernel_py(high, low, close)
-        # Direct dispatch check: broken nb -> py result, kernel marked failed.
         out = _numba.call(
             presets._custom_swings_tr_kernel_py, nb_broken, high, low, close
         )
         _assert_bit_identical(out, tr)
         assert "_custom_swings_tr_kernel_py" in _numba._failed
         _numba._failed.discard("_custom_swings_tr_kernel_py")
+
+    def test_input_error_on_both_paths_is_not_marked_failed(
+        self, monkeypatch
+    ):
+        """A failure the Python kernel reproduces is an input error: it is
+        re-raised and must NOT disable numba for later valid calls."""
+
+        def nb_broken(*args):
+            raise ZeroDivisionError("simulated input error")
+
+        def py_broken(*args):
+            raise ZeroDivisionError("simulated input error")
+
+        monkeypatch.delenv("TP_DISABLE_NUMBA", raising=False)
+        _numba._failed.discard("py_broken")
+        with pytest.raises(ZeroDivisionError):
+            _numba.call(py_broken, nb_broken, 1)
+        assert "py_broken" not in _numba._failed
+
+    def test_non_numba_nb_failure_falls_back_without_disabling(
+        self, monkeypatch
+    ):
+        """A non-NumbaError nb failure on input the Python kernel accepts
+        falls back for that call but does not disable the kernel."""
+
+        def nb_broken(*args):
+            raise RuntimeError("simulated numba runtime failure")
+
+        monkeypatch.delenv("TP_DISABLE_NUMBA", raising=False)
+        _numba._failed.discard("_custom_swings_tr_kernel_py")
+        high, low, close = _cs_inputs(50, 34, 0.0)
+        tr = presets._custom_swings_tr_kernel_py(high, low, close)
+        out = _numba.call(
+            presets._custom_swings_tr_kernel_py, nb_broken, high, low, close
+        )
+        _assert_bit_identical(out, tr)
+        assert "_custom_swings_tr_kernel_py" not in _numba._failed
+
+    def test_numba_unavailable_falls_back_to_python(self, monkeypatch):
+        def nb_unavailable(*args):
+            raise _numba._NumbaUnavailable("simulated")
+
+        monkeypatch.delenv("TP_DISABLE_NUMBA", raising=False)
+        _numba._failed.discard("_custom_swings_tr_kernel_py")
+        high, low, close = _cs_inputs(50, 35, 0.0)
+        tr = presets._custom_swings_tr_kernel_py(high, low, close)
+        out = _numba.call(
+            presets._custom_swings_tr_kernel_py,
+            nb_unavailable,
+            high,
+            low,
+            close,
+        )
+        _assert_bit_identical(out, tr)
+        assert "_custom_swings_tr_kernel_py" not in _numba._failed
+
+    def test_non_positive_period_rejected_before_dispatch(self):
+        """``period=0`` must fail as a clean ValueError before either kernel
+        runs — previously it surfaced as a ZeroDivisionError inside the
+        recursion and permanently disabled the numba path."""
+        high, low, close = _cs_inputs(50, 36, 0.0)
+        _numba._failed.discard("_custom_swings_atr_kernel_py")
+        _numba._failed.discard("_custom_swings_tr_kernel_py")
+        with pytest.raises(ValueError, match="positive integer"):
+            presets._custom_swings_atr(high, low, close, 0)
+        assert "_custom_swings_atr_kernel_py" not in _numba._failed
+        assert "_custom_swings_tr_kernel_py" not in _numba._failed

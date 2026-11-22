@@ -9,8 +9,24 @@ implementation remains the reference and is used whenever
 
 - numba cannot be imported (logged once at DEBUG), or
 - ``TP_DISABLE_NUMBA=1`` is set in the environment, or
-- the compiled kernel raises (compile or runtime failure; the kernel is
-  marked failed and the Python path takes over, logged once at DEBUG).
+- the compiled kernel raises a numba typing/compile error
+  (``numba.core.errors.NumbaError``; the kernel is marked failed for the
+  rest of the process and the Python path takes over, logged at WARNING).
+
+Both the ``import numba`` (~0.5 s) and the per-signature compilation
+(0.1-0.8 s, paid once per kernel thanks to ``cache=True``) are deferred to
+the first kernel call: :func:`compile_kernel` only wraps the Python
+function in a lazy thunk, so importing ``shared.indicators`` stays cheap
+for the viewer, signal bots and tests that never touch the hot loops. The
+first *use* of a kernel — typically the first bar a live signal bot
+processes — pays the one-time compile cost; numba's cache lives in the
+``__pycache__`` directory next to the kernel's source file (or under
+``NUMBA_CACHE_DIR`` when that is set), so a warm checkout does not recompile.
+
+A numba failure that the Python kernel reproduces is an input error, not
+a numba defect: it is re-raised without disabling the kernel. Only
+``NumbaError`` subclasses mark a kernel failed, so one bad call can never
+silently downgrade every later call to the ~100-600x slower Python path.
 
 Parity between the two paths is pinned bit-for-bit by
 ``tests/indicators/test_numba_parity.py``.
@@ -28,17 +44,19 @@ _DISABLE_ENV = "TP_DISABLE_NUMBA"
 
 _checked = False
 _njit: Callable[..., Any] | None = None
+_numba_errors: tuple[type[BaseException], ...] = ()
 _failed: set[str] = set()
 
 
 def _load_njit() -> Callable[..., Any] | None:
     """Import numba once and return ``numba.njit``; None when unavailable."""
-    global _checked, _njit
+    global _checked, _njit, _numba_errors
     if _checked:
         return _njit
     _checked = True
     try:
         import numba
+        import numba.core.errors
     except Exception:
         _log.debug(
             "numba is not importable; indicator kernels use the Python path",
@@ -46,28 +64,61 @@ def _load_njit() -> Callable[..., Any] | None:
         )
         return None
     _njit = numba.njit
+    _numba_errors = (numba.core.errors.NumbaError,)
     return _njit
 
 
-def compile_kernel(py_kernel: Callable) -> Callable | None:
-    """Return ``njit(cache=True, fastmath=False)(py_kernel)`` or None.
+class _NumbaUnavailable(Exception):
+    """numba is not importable or the kernel could not be njit-wrapped."""
 
-    ``njit`` wraps lazily, so this only fails when numba itself rejects the
-    decoration; actual compilation errors surface on first call and are
-    handled by :func:`call`.
+
+class _LazyKernel:
+    """``njit(cache=True, fastmath=False)`` wrapper deferred to first call.
+
+    Keeps ``import numba`` and the one-time compilation off the
+    ``shared.indicators`` import path; see the module docstring.
     """
-    njit = _load_njit()
-    if njit is None:
-        return None
-    try:
-        return njit(cache=True, fastmath=False)(py_kernel)
-    except Exception:
-        _log.debug(
-            "numba could not wrap %s; using the Python kernel",
-            py_kernel.__name__,
-            exc_info=True,
-        )
-        return None
+
+    __slots__ = ("_compiled", "_wrap_failed", "py_kernel")
+
+    def __init__(self, py_kernel: Callable) -> None:
+        self.py_kernel = py_kernel
+        self._compiled: Callable | None = None
+        self._wrap_failed = False
+
+    def _get(self) -> Callable:
+        if self._compiled is None and not self._wrap_failed:
+            njit = _load_njit()
+            if njit is None:
+                self._wrap_failed = True
+            else:
+                try:
+                    self._compiled = njit(cache=True, fastmath=False)(
+                        self.py_kernel
+                    )
+                except Exception:
+                    self._wrap_failed = True
+                    _log.debug(
+                        "numba could not wrap %s; using the Python kernel",
+                        self.py_kernel.__name__,
+                        exc_info=True,
+                    )
+        if self._compiled is None:
+            raise _NumbaUnavailable(self.py_kernel.__name__)
+        return self._compiled
+
+    def __call__(self, *args: Any) -> Any:
+        return self._get()(*args)
+
+
+def compile_kernel(py_kernel: Callable) -> Callable:
+    """Return a lazy ``njit(cache=True, fastmath=False)`` dispatcher.
+
+    The returned callable compiles ``py_kernel`` on first invocation (or
+    raises :class:`_NumbaUnavailable`, which :func:`call` turns into the
+    Python path). Nothing here imports numba, so module import stays cheap.
+    """
+    return _LazyKernel(py_kernel)
 
 
 def _disabled() -> bool:
@@ -83,17 +134,38 @@ def call(
 
     ``TP_DISABLE_NUMBA`` is read on every call so tests and operators can
     flip it without re-importing the module.
+
+    When the numba path raises, the Python kernel runs once as the
+    arbiter: if it raises too, the failure is an input error and is
+    re-raised with the kernel left enabled. Only a
+    ``numba.core.errors.NumbaError`` (typing/compile failure, which would
+    recur on every input) marks the kernel failed for the process.
     """
     name = getattr(py_kernel, "__name__", repr(py_kernel))
     if nb_kernel is None or _disabled() or name in _failed:
         return py_kernel(*args)
     try:
         return nb_kernel(*args)
-    except Exception:
-        _failed.add(name)
-        _log.debug(
-            "numba kernel for %s failed; falling back to the Python kernel",
-            name,
-            exc_info=True,
-        )
+    except _NumbaUnavailable:
         return py_kernel(*args)
+    except Exception as exc:
+        try:
+            result = py_kernel(*args)
+        except Exception:
+            raise
+        if isinstance(exc, _numba_errors):
+            _failed.add(name)
+            _log.warning(
+                "numba kernel for %s failed to compile; falling back to "
+                "the Python kernel for the rest of the process",
+                name,
+                exc_info=True,
+            )
+        else:
+            _log.warning(
+                "numba kernel for %s raised %s; using the Python result",
+                name,
+                type(exc).__name__,
+                exc_info=True,
+            )
+        return result

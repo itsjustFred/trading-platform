@@ -42,6 +42,7 @@ from . import _numba
 from .core import (
     SupertrendResult,
     TrFirstBar,
+    _positive_int,
     atr,
     atr_from_tr,
     ema,
@@ -273,6 +274,10 @@ def _custom_swings_atr(
     The two loops run as numba-compiled kernels when available (see
     :mod:`shared.indicators._numba`); outputs are bit-identical either way.
     """
+    # Guard before dispatch: the kernels index ``tr``/``atr_values`` with
+    # ``period`` and a non-positive length must fail here, not as a
+    # ZeroDivisionError inside the recursion (or a numba typing error).
+    period = _positive_int(period, "period")
     high_v = high.to_numpy()
     low_v = low.to_numpy()
     close_v = close.to_numpy()

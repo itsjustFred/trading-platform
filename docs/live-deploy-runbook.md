@@ -633,6 +633,20 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+## Indicator Kernel Warm-up (#378)
+
+The shared indicator hot loops (`shared/indicators/`) run as `numba.njit`
+compiled kernels. Importing `shared.indicators` stays cheap — numba is
+imported lazily — but the **first call of each kernel in a process pays a
+one-time compile of roughly 0.1–0.8 s** (four kernels: the two Supertrend
+recursions and the two `custom_swings` ATR loops). For a live signal bot
+that is the first bar it evaluates; for a backtest it is inside the first
+strategy evaluation and is amortised over the run. Compiled kernels are
+cached in the `__pycache__` directory next to `shared/indicators/` (or
+under `NUMBA_CACHE_DIR` when set), so a warm checkout does not recompile
+after the first process. Set `TP_DISABLE_NUMBA=1` to force the pure
+Python/NumPy path everywhere (parity is pinned bit-for-bit either way).
+
 ## Loss Circuit Breaker (#301)
 
 Every live account and every deployment carries a persisted loss breaker
