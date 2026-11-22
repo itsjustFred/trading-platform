@@ -31,7 +31,7 @@ from live_runner.base_adapter import (
     validate_live_quote_prices,
 )
 from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.exit_signals import ExitBelowStepError
 from shared import venue_calendar
 from shared.constants import DATA_DIR
 from shared.database import (
@@ -53,6 +53,7 @@ from shared.database import (
     set_live_signal_broker_order_id,
 )
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_OBSERVED,
@@ -475,9 +476,12 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
     if not math.isfinite(float(volume_per_qty)) or float(volume_per_qty) <= 0:
         raise ValueError("volume_per_qty must be finite and positive")
     # Floor, never round: rounding to nearest can size up by half a volume unit
-    # and put the loss at the stop above the risk budget. The relative nudge
-    # only absorbs binary float error (0.29 * 100 == 28.999999999999996).
-    volume = math.floor(qty_value * float(volume_per_qty) * (1.0 + 1e-12))
+    # and put the loss at the stop above the risk budget. The shared lot-grid
+    # floor's decimal noise band absorbs binary float error
+    # (0.29 * 100 == 28.999999999999996) and can return a value up to 1e-6 of
+    # a unit above a real fraction that close to the next unit -- below every
+    # broker's volume resolution -- #278.
+    volume = int(floor_qty_to_step(qty_value * float(volume_per_qty), 1.0))
     if volume <= 0:
         raise ValueError(
             f"qty {qty_value!r} is below one broker volume unit at "
@@ -494,6 +498,9 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
     ``stepVolume`` (``TRADING_BAD_VOLUME``). A risk-sized volume almost never
     lands on that grid, so it is rounded DOWN: rounding up would exceed the
     risk budget. A result below the broker minimum is refused by the caller.
+    Both operands are integers, so ``//`` is already the exact floor -- there
+    is no float dust for the shared lot-grid floor (#278) to absorb, and
+    routing ints through it could only add error.
     """
     step = int(step_volume)
     if step <= 1:
@@ -1640,7 +1647,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         when less than one step remains.
         """
         step_qty = float(max(int(scale.step_volume), 1)) / float(scale.volume_per_qty)
-        floored_qty = round_exit_qty_down(qty, step_qty)
+        floored_qty = floor_qty_to_step(qty, step_qty)
         if floored_qty <= 0.0:
             raise ExitBelowStepError(
                 f"cTrader exit for {symbol} ignored: the requested qty {qty:g} is below "

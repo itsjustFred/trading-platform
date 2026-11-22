@@ -57,7 +57,7 @@ recovery and fill reconciliation, which today assume one broker order per signal
 
 **Replay semantics to mirror live (decided 2026-11-16, `#176`)**
 
-Two rules the replay implements today; a live implementation must copy them exactly, or paper
+Three rules the replay implements today; a live implementation must copy them exactly, or paper
 results stop predicting live behaviour:
 
 - *TP1 tranche in whole shares, floored.* The tranche is
@@ -73,6 +73,18 @@ results stop predicting live behaviour:
   breakeven stop only takes effect from the next bar. Nothing that happens at or inside the
   TP1 bar after the TP1 fill may move or trigger the trailing stop — live that means the
   amendment waits for the first bar that closes after the TP1 fill.
+- *A bar that opens beyond a protective level fills at the open.* The pre-TP1 stop, the
+  post-TP1 stop (initial or breakeven) and the TP1 tranche all follow the gap rule (#287):
+  the open is the bar's first event, so a bar opening past a level fills at `bar_open` —
+  never the skipped level — and beats any later same-bar touch of the other level
+  (`contract.resolve_protective_exit` checks the gap before the stop-first same-bar policy).
+  One qualification inside the flip workflow: a bar that gaps through TP1 fills the
+  *tranche* at the open, but the remainder's pre-TP1 stop is still working for the rest of
+  that bar — the OTO stop sits at the initial level and the breakeven amendment only takes
+  effect on the next bar — so a later same-bar trade through it stops the remainder at the
+  stop level. Live that means the open-versus-level check must run before the bar's range
+  is evaluated, and an entry fill must never be checked against a level on its own fill bar
+  (the replay never evaluates the entry bar).
 
 **Where an unsupported mode is rejected**
 

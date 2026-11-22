@@ -35,7 +35,7 @@ from live_runner.base_adapter import (
     order_not_submitted,
 )
 from live_runner.credential_env import parse_bool_env, resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.exit_signals import ExitBelowStepError
 from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared import venue_calendar
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
@@ -61,6 +61,7 @@ from shared.database import (
 )
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     PRICE_ABSENT,
     PRICE_DERIVED,
@@ -178,9 +179,12 @@ def _floor_to_whole_shares(qty: float) -> float:
 
     A bracket/OTO entry with a fractional qty is rejected ("fractional orders
     must have order_class=simple", HTTP 422). Floor, never round up: rounding
-    up would exceed the risk-sized quantity.
+    up would exceed the risk-sized quantity. The shared lot-grid floor's
+    decimal noise band (1e-6 of a step) can return a value a hair ABOVE a
+    real fraction that close to the next whole share -- at most 1e-6 of a
+    share, below Alpaca's quantity resolution (#278).
     """
-    return float(math.floor(float(qty) + 1e-9))
+    return floor_qty_to_step(qty, 1.0)
 
 
 def _normalize_broker_order_id(value: Any) -> str | None:
@@ -1817,7 +1821,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         than asked. Raises :class:`ExitBelowStepError` below one step.
         """
         step = self.exit_qty_step(symbol)
-        floored = round_exit_qty_down(qty, step)
+        floored = floor_qty_to_step(qty, step)
         if floored <= 0.0:
             raise ExitBelowStepError(
                 f"Alpaca exit for {symbol} ignored: the requested qty {qty:g} is below "

@@ -56,19 +56,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
-
-def _wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    # QuantConnect ATR defaults to Wilder smoothing.
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+from shared.indicators import presets
+from shared.strategy_markers import entry_exit_markers
 
 
 def generate_signals(df: pd.DataFrame, params: dict):
@@ -95,7 +84,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     vol_adj_mom = composite / vol.replace(0, np.nan)
     rolling_max = close.rolling(252, min_periods=1).max()
     drawdown = (close - rolling_max) / rolling_max
-    atr = _wilder_atr(high, low, close, atr_period)
+    atr = presets.atr_qc_wilder(high, low, close, atr_period)
 
     entry_cond = (composite > 0) & (vol_adj_mom > 0)
 
@@ -162,35 +151,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings
