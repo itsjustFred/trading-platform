@@ -233,3 +233,162 @@ def test_pending_exit_reprotections_skip_non_exit_only_signals(
     assert pending[0]["marker"] == marker
     assert pending[0]["symbol"] == "AAPL"
     assert pending[0]["broker_order_id"] == ""
+
+
+
+def _marker_signal_row(
+    signal_id: str,
+    symbol: str,
+    timestamp: datetime,
+    *,
+    deployment_id: str = "dep-1",
+):
+    from shared.database import LiveSignalModel
+
+    return LiveSignalModel(
+        id=signal_id,
+        deployment_id=deployment_id,
+        symbol=symbol,
+        action="sell",
+        theoretical_price=200.0,
+        timestamp=timestamp,
+        metadata_json={
+            "risk_sizing_mode": "exit_only",
+            "signal_intent": "exit",
+            "exit_reprotection": {"side": "sell", "stop_price": 190.0},
+        },
+    )
+
+
+def test_pending_exit_reprotections_returns_newest_per_symbol(
+    isolated_db_sandbox,
+) -> None:
+    """#350 review: 60 markers on one symbol must not starve another symbol.
+
+    The recovery page used to be the newest 50 marker rows globally, then
+    newest-per-symbol in Python - so a symbol with many partial exits pushed
+    every other symbol's crash-recovery marker off the page and those
+    remainders were never restored. Selection is now newest-per-symbol in SQL.
+    """
+    from tests.conftest import seed_live_deployments
+
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+    seed_live_deployments(database, ["dep-1"], account_id="acct-1")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with database.get_session() as session:
+        for index in range(60):
+            session.add(
+                _marker_signal_row(
+                    f"sig-aapl-{index}",
+                    "AAPL",
+                    base + timedelta(minutes=index),
+                )
+            )
+        session.add(
+            _marker_signal_row(
+                "sig-msft", "MSFT", base - timedelta(days=1)
+            )
+        )
+        session.commit()
+
+    pending = database.list_pending_exit_reprotections("acct-1")
+
+    assert {row["signal_id"] for row in pending} == {"sig-aapl-59", "sig-msft"}
+    by_symbol = {row["symbol"]: row for row in pending}
+    assert by_symbol["AAPL"]["signal_id"] == "sig-aapl-59"
+    assert by_symbol["MSFT"]["signal_id"] == "sig-msft"
+
+
+def test_clear_superseded_exit_reprotection_markers(
+    isolated_db_sandbox,
+) -> None:
+    """Once a symbol's newest marker resolves, its older markers are spent."""
+    from tests.conftest import seed_live_deployments
+
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+    seed_live_deployments(database, ["dep-1"], account_id="acct-1")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with database.get_session() as session:
+        for index in range(3):
+            session.add(
+                _marker_signal_row(
+                    f"sig-aapl-{index}",
+                    "AAPL",
+                    base + timedelta(minutes=index),
+                )
+            )
+        session.add(
+            _marker_signal_row("sig-msft", "MSFT", base)
+        )
+        session.commit()
+
+    cleared = database.clear_superseded_exit_reprotection_markers(
+        "acct-1", "AAPL", keep_signal_id="sig-aapl-2"
+    )
+
+    assert cleared == 2
+    pending = database.list_pending_exit_reprotections("acct-1")
+    assert {row["signal_id"] for row in pending} == {"sig-aapl-2", "sig-msft"}
+
+
+def test_earliest_live_signal_timestamp_bounds_order_scans(
+    isolated_db_sandbox,
+) -> None:
+    """The ``after`` lower bound for ``status=all`` scans comes from the ledger."""
+    from tests.conftest import seed_live_deployments
+
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+    seed_live_deployments(database, ["dep-1"], account_id="acct-1")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with database.get_session() as session:
+        session.add(
+            database.LiveSignalModel(
+                id="sig-old",
+                deployment_id="dep-1",
+                symbol="AAPL",
+                action="buy",
+                theoretical_price=200.0,
+                timestamp=base,
+                metadata_json={},
+            )
+        )
+        session.add(
+            database.LiveSignalModel(
+                id="sig-new",
+                deployment_id="dep-1",
+                symbol="MSFT",
+                action="buy",
+                theoretical_price=100.0,
+                timestamp=base + timedelta(days=10),
+                metadata_json={},
+            )
+        )
+        session.commit()
+
+    assert database.earliest_live_signal_timestamp("acct-1", {"AAPL"}) == base
+    assert (
+        database.earliest_live_signal_timestamp("acct-1", {"MSFT"})
+        == base + timedelta(days=10)
+    )
+    assert database.earliest_live_signal_timestamp("acct-1", {"TSLA"}) is None
+    assert database.earliest_live_signal_timestamp("acct-1", set()) is None
+
+
+def test_adapter_state_roundtrip(isolated_db_sandbox) -> None:
+    """The reconcile watermark persists across adapter instances."""
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+
+    assert database.get_live_adapter_state("acct-1", "wm") is None
+    database.set_live_adapter_state("acct-1", "wm", {"after": "2026-01-01T00:00:00+00:00"})
+    assert database.get_live_adapter_state("acct-1", "wm") == {
+        "after": "2026-01-01T00:00:00+00:00"
+    }
+    database.set_live_adapter_state("acct-1", "wm", {"after": "2026-02-01T00:00:00+00:00"})
+    assert database.get_live_adapter_state("acct-1", "wm") == {
+        "after": "2026-02-01T00:00:00+00:00"
+    }
+    assert database.get_live_adapter_state("acct-2", "wm") is None

@@ -790,6 +790,72 @@ class LiveAccountModel(SQLModel, table=True):
         )
 
 
+class LiveAdapterStateModel(SQLModel, table=True):
+    """Small persisted key/value store for adapter runtime state.
+
+    Adapters need a durable place for pass-to-pass bookkeeping that is not a
+    signal, an execution or an account attribute - e.g. the Alpaca
+    re-protect reconciliation watermark (#350 review). ``id`` is
+    ``"{account_id}|{key}"`` so one account can hold several keys.
+    """
+
+    __tablename__ = "live_adapter_state"
+
+    id: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    key: str = Field(index=True)
+    value_json: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column("value", JSON, nullable=False),
+    )
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+
+def _adapter_state_id(account_id: str, key: str) -> str:
+    return f"{account_id}|{key}"
+
+
+def get_live_adapter_state(account_id: str, key: str) -> dict[str, Any] | None:
+    """The persisted value for ``(account_id, key)``, or ``None`` when unset."""
+    normalized_account_id = str(account_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_account_id or not normalized_key:
+        return None
+    init_db()
+    state_id = _adapter_state_id(normalized_account_id, normalized_key)
+    with get_session() as session:
+        record = session.get(LiveAdapterStateModel, state_id)
+    if record is None or not isinstance(record.value_json, dict):
+        return None
+    return dict(record.value_json)
+
+
+def set_live_adapter_state(
+    account_id: str, key: str, value: Mapping[str, Any]
+) -> None:
+    """Persist ``value`` for ``(account_id, key)``, replacing any earlier one."""
+    normalized_account_id = str(account_id or "").strip()
+    normalized_key = str(key or "").strip()
+    if not normalized_account_id or not normalized_key:
+        raise ValueError("adapter state requires an account id and a key")
+    init_db()
+    state_id = _adapter_state_id(normalized_account_id, normalized_key)
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveAdapterStateModel, state_id)
+        if record is None:
+            record = LiveAdapterStateModel(
+                id=state_id,
+                account_id=normalized_account_id,
+                key=normalized_key,
+            )
+            session.add(record)
+        record.value_json = dict(value)
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+
+
 class LiveControlAuditModel(SQLModel, table=True):
     """Durable record of every state-changing live control.
 
@@ -3825,18 +3891,19 @@ def _list_unfilled_exit_orders(
     return pending
 
 
-def list_pending_exit_reprotections(
-    account_id: str, *, limit: int = 50
-) -> list[dict[str, Any]]:
-    """Exit-only signals of an account carrying an ``exit_reprotection`` marker.
+def _exit_reprotection_qualifying_statement(
+    account_id: str,
+    *,
+    symbol: str | None = None,
+    exclude_signal_id: str | None = None,
+):
+    """SELECT of qualifying ``exit_reprotection`` marker rows (shared filters).
 
-    The marker is written by the Alpaca adapter when an exit had to release
-    bracket protection before submitting (#145): if the process died between
-    the release and the re-place, the remainder may be unprotected and the
-    marker records the levels to restore. Rows are newest first; each carries
-    ``signal_id``, ``symbol``, ``deployment_id``, ``timestamp`` and ``marker``
-    (the recorded dict). Only signals that are themselves exit-only qualify -
-    a forged marker on an entry signal is inert.
+    A row qualifies when it is an exit-only, exit-intent signal of the account
+    whose metadata carries an ``exit_reprotection`` object - the same rules the
+    Python post-filter applies, expressed in SQL so per-symbol newest-row
+    selection and superseded-marker clearing cannot be starved by a page of
+    newer markers on one symbol (#350 review).
     """
     # Lazy: keeps shared/ free of an import-time dependency on live_runner.
     from live_runner.base_adapter import (
@@ -3845,23 +3912,94 @@ def list_pending_exit_reprotections(
     )
     from live_runner.exit_signals import SIGNAL_INTENT_EXIT, SIGNAL_INTENT_KEY
 
-    normalized_account_id = str(account_id or "").strip()
-    if not normalized_account_id:
-        return []
-    init_db()
-    marker_present = func.json_extract(
-        LiveSignalModel.metadata_json, f"$.{EXIT_REPROTECTION_METADATA_KEY}"
-    ).is_not(None)
+    marker_path = f"$.{EXIT_REPROTECTION_METADATA_KEY}"
     statement = (
         select(LiveSignalModel)
         .join(
             LiveDeploymentModel,
             LiveDeploymentModel.id == LiveSignalModel.deployment_id,
         )
-        .where(LiveDeploymentModel.account_id == normalized_account_id)
-        .where(marker_present)
+        .where(LiveDeploymentModel.account_id == account_id)
+        .where(
+            func.json_extract(
+                LiveSignalModel.metadata_json, marker_path
+            ).is_not(None)
+        )
+        .where(
+            func.json_type(LiveSignalModel.metadata_json, marker_path) == "object"
+        )
+        .where(
+            func.json_extract(
+                LiveSignalModel.metadata_json, "$.risk_sizing_mode"
+            )
+            == EXIT_ONLY_RISK_SIZING_MODE
+        )
+        .where(
+            func.json_extract(
+                LiveSignalModel.metadata_json, f"$.{SIGNAL_INTENT_KEY}"
+            )
+            == SIGNAL_INTENT_EXIT
+        )
+    )
+    if symbol is not None:
+        statement = statement.where(
+            func.upper(func.trim(LiveSignalModel.symbol)) == symbol.strip().upper()
+        )
+    if exclude_signal_id is not None:
+        statement = statement.where(LiveSignalModel.id != exclude_signal_id)
+    return statement
+
+
+def list_pending_exit_reprotections(
+    account_id: str, *, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Newest ``exit_reprotection`` marker per symbol for an account.
+
+    The marker is written by the Alpaca adapter when an exit had to release
+    bracket protection before submitting (#145): if the process died between
+    the release and the re-place, the remainder may be unprotected and the
+    marker records the levels to restore. Only signals that are themselves
+    exit-only qualify - a forged marker on an entry signal is inert.
+
+    Selection is newest-per-symbol in SQL (``ROW_NUMBER`` over
+    ``timestamp DESC, id DESC``), not a global page: a symbol with many
+    partial exits can no longer push every other symbol's crash-recovery
+    marker off the result (#350 review). Each row carries ``signal_id``,
+    ``symbol``, ``deployment_id``, ``timestamp``, ``broker_order_id`` and
+    ``marker`` (the recorded dict), newest first.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import EXIT_REPROTECTION_METADATA_KEY
+
+    init_db()
+    qualifying = _exit_reprotection_qualifying_statement(normalized_account_id).subquery()
+    ranked = (
+        select(
+            qualifying.c.id.label("row_id"),
+            func.row_number()
+            .over(
+                partition_by=func.upper(func.trim(qualifying.c.symbol)),
+                order_by=[
+                    qualifying.c.timestamp.desc(),
+                    qualifying.c.id.desc(),
+                ],
+            )
+            .label("symbol_rank"),
+        )
+        .select_from(qualifying)
+        .subquery()
+    )
+    statement = (
+        select(LiveSignalModel)
+        .where(
+            LiveSignalModel.id.in_(
+                select(ranked.c.row_id).where(ranked.c.symbol_rank == 1)
+            )
+        )
         .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
-        .limit(max(int(limit), 1))
     )
     with get_session() as session:
         rows = session.exec(statement).all()
@@ -3870,13 +4008,6 @@ def list_pending_exit_reprotections(
         metadata = dict(row.metadata_json or {})
         recorded = metadata.get(EXIT_REPROTECTION_METADATA_KEY)
         if not isinstance(recorded, dict):
-            continue
-        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
-            continue
-        # Every persisted exit is stamped ``signal_intent == "exit"`` by
-        # ``prepare_exit_intent_order``; requiring it keeps a marker smuggled
-        # onto a non-exit row from ever consuming this page (#350 review).
-        if str(metadata.get(SIGNAL_INTENT_KEY) or "") != SIGNAL_INTENT_EXIT:
             continue
         pending.append(
             {
@@ -3888,7 +4019,81 @@ def list_pending_exit_reprotections(
                 "marker": dict(recorded),
             }
         )
+    if limit is not None:
+        pending = pending[: max(int(limit), 1)]
     return pending
+
+
+def clear_superseded_exit_reprotection_markers(
+    account_id: str, symbol: str, *, keep_signal_id: str
+) -> int:
+    """Clear ``exit_reprotection`` markers on a symbol's older exit rows.
+
+    ``list_pending_exit_reprotections`` replays only the newest marker per
+    symbol, so markers an older exit left behind are never replayed; once the
+    newest marker for the symbol is resolved they are spent weight that would
+    otherwise linger forever (#350 review). Returns the number cleared.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_keep = str(keep_signal_id or "").strip()
+    if not normalized_account_id or not normalized_symbol or not normalized_keep:
+        return 0
+    init_db()
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import EXIT_REPROTECTION_METADATA_KEY
+
+    statement = _exit_reprotection_qualifying_statement(
+        normalized_account_id,
+        symbol=normalized_symbol,
+        exclude_signal_id=normalized_keep,
+    )
+    with get_session() as session:
+        rows = session.exec(statement).all()
+        signal_ids = [str(row.id) for row in rows]
+    cleared = 0
+    for signal_id in signal_ids:
+        if clear_live_signal_metadata_key(signal_id, EXIT_REPROTECTION_METADATA_KEY):
+            cleared += 1
+    return cleared
+
+
+def earliest_live_signal_timestamp(
+    account_id: str, symbols: set[str] | list[str] | tuple[str, ...]
+) -> datetime | None:
+    """Earliest signal timestamp for ``symbols`` on ``account_id``.
+
+    Used as the ``after`` lower bound for ``status=all`` order scans: every
+    order the scan could still need was submitted at or after the first
+    signal that could have produced it, so history older than that cannot
+    hold a relevant order (#350 review). ``None`` when the account has no
+    signals for those symbols (the caller then scans unbounded, still under
+    the page cap).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbols = {
+        str(symbol or "").strip().upper() for symbol in (symbols or ())
+    }
+    normalized_symbols.discard("")
+    if not normalized_account_id or not normalized_symbols:
+        return None
+    init_db()
+    statement = (
+        select(func.min(LiveSignalModel.timestamp))
+        .join(
+            LiveDeploymentModel,
+            LiveDeploymentModel.id == LiveSignalModel.deployment_id,
+        )
+        .where(LiveDeploymentModel.account_id == normalized_account_id)
+        .where(
+            func.upper(func.trim(LiveSignalModel.symbol)).in_(normalized_symbols)
+        )
+    )
+    with get_session() as session:
+        earliest = session.exec(statement).one()
+    if earliest is not None and earliest.tzinfo is None:
+        earliest = earliest.replace(tzinfo=timezone.utc)
+    return earliest
 
 
 def clear_live_signal_metadata_key(signal_id: str, key: str) -> bool:

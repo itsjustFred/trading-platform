@@ -46,8 +46,11 @@ from shared.database import (
     apply_live_execution_commissions,
     broker_close_signal_id,
     clear_live_signal_metadata_key,
+    clear_superseded_exit_reprotection_markers,
+    earliest_live_signal_timestamp,
     find_latest_filled_live_entry_signals,
     flag_live_ledger_reconciliation,
+    get_live_adapter_state,
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
     get_live_signal_filled_qty_for_broker_order,
@@ -61,6 +64,7 @@ from shared.database import (
     save_live_execution,
     save_live_execution_up_to_cumulative,
     save_live_signal,
+    set_live_adapter_state,
     set_live_signal_broker_order_id,
 )
 from shared.fill_keys import canonical_utc_timestamp
@@ -86,6 +90,12 @@ _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
 #: total orders scanned so a pathological account fails closed instead of
 #: looping forever (25 pages = 12,500 orders).
 _ALPACA_ORDER_LOOKUP_MAX_PAGES = 25
+#: Safety margin subtracted from ledger-derived ``after`` bounds so broker
+#: clock skew or a slow signal-to-submit path can never exclude the very
+#: order the bound was computed from (#350 review).
+_ORDER_SCAN_AFTER_MARGIN = timedelta(minutes=5)
+#: ``live_adapter_state`` key holding the re-protect reconcile ``after`` bound.
+_REPROTECT_RECONCILE_STATE_KEY = "alpaca_reprotect_reconcile_after"
 
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
@@ -1041,6 +1051,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # Broker order ids of re-protect fills already flagged
         # ``ledger_reconciliation_required`` this process (dedupe, like cTrader's).
         self._flagged_reprotect_order_ids: set[str] = set()
+        # Exit re-protection watchdog driven by the trade stream (#350 review):
+        # a terminal update on an exit order re-checks its persisted marker
+        # without waiting for a reconnect. The lock serializes replays so two
+        # terminal updates cannot place protection twice; ``_seen`` dedupes
+        # per (signal, order) for the process lifetime.
+        self._reprotect_watchdog_lock = asyncio.Lock()
+        self._reprotect_watchdog_seen: set[str] = set()
+        self._reprotect_watchdog_tasks: set[asyncio.Task[None]] = set()
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -1630,18 +1648,43 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
             return 0
-        # ``status=all`` is paged backwards through every page of history:
-        # re-protect orders can be arbitrarily old, and a single newest-first
-        # page would silently drop the fills of any beyond it (#350 review).
-        # The pass raises rather than truncate, so the connect wrapper logs
-        # and the next connect retries.
-        result = await self._list_orders_status_all(client)
+        # ``status=all`` is paged backwards from a persisted watermark: only
+        # orders submitted after the earliest still-working ``-reprotect``
+        # order seen last pass (or the last pass itself when none worked)
+        # can still produce fills this pass needs. Terminal orders were
+        # reconciled when they went terminal, and a working order's own
+        # ``submitted_at`` bounds every fill it can still report - so older
+        # history cannot hold an unbooked fill. Without the bound a
+        # minute-bar account passes the 12,500-order page cap within weeks
+        # and every connect's reconcile raises (#350 review). The cap stays
+        # the fail-closed backstop; a failed pass never moves the watermark.
+        pass_started = datetime.now(timezone.utc)
+        after = await self._reprotect_reconcile_after()
+        result = await self._list_orders_status_all(client, after=after)
+        oldest_working: datetime | None = None
         recovered = 0
         for order in result:
             client_order_id = _order_attr(order, "client_order_id")
             coid_text = str(client_order_id or "")
             if _REPROTECT_CLIENT_ORDER_MARKER not in coid_text:
                 continue
+            submitted_candidates = [
+                _order_attr(item, "submitted_at")
+                for item in [order, *_order_legs(order)]
+            ]
+            statuses = [
+                _order_status(item) for item in [order, *_order_legs(order)]
+            ]
+            if any(status not in _TERMINAL_ORDER_STATUSES for status in statuses):
+                working_times = [
+                    value
+                    for value in submitted_candidates
+                    if isinstance(value, datetime)
+                ]
+                if working_times:
+                    candidate = min(working_times)
+                    if oldest_working is None or candidate < oldest_working:
+                        oldest_working = candidate
             entry_signal_id = await self._verified_reprotect_entry(
                 _reprotect_entry_candidate(coid_text)
             )
@@ -1680,7 +1723,65 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     self._bracket_leg_order_id_to_signal_id[leg_key] = entry_signal_id
                 if await self._reconcile_bracket_leg_fill(entry_signal_id, item):
                     recovered += 1
+        await self._persist_reprotect_reconcile_watermark(
+            oldest_working=oldest_working, pass_started=pass_started
+        )
         return recovered
+
+    async def _reprotect_reconcile_after(self) -> datetime | None:
+        """The persisted ``after`` bound for the re-protect reconcile scan."""
+        try:
+            state = await asyncio.to_thread(
+                get_live_adapter_state,
+                self.account_id,
+                _REPROTECT_RECONCILE_STATE_KEY,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Alpaca re-protect reconcile watermark unreadable; scanning "
+                "unbounded this pass: %r",
+                exc,
+            )
+            return None
+        raw = state.get("after") if isinstance(state, dict) else None
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    async def _persist_reprotect_reconcile_watermark(
+        self, *, oldest_working: datetime | None, pass_started: datetime
+    ) -> None:
+        """Advance the reconcile ``after`` bound after a complete pass.
+
+        The bound is the earliest ``submitted_at`` among ``-reprotect``
+        orders still working (they alone can report fills later), or the
+        pass start when none worked. Minus the shared margin so a same-second
+        submission or broker clock skew cannot fall below the bound.
+        Best-effort: a failed write only means the next pass rescans more.
+        """
+        bound = oldest_working if oldest_working is not None else pass_started
+        if bound.tzinfo is None:
+            bound = bound.replace(tzinfo=timezone.utc)
+        bound = bound - _ORDER_SCAN_AFTER_MARGIN
+        try:
+            await asyncio.to_thread(
+                set_live_adapter_state,
+                self.account_id,
+                _REPROTECT_RECONCILE_STATE_KEY,
+                {"after": bound.isoformat()},
+            )
+        except Exception as exc:
+            logger.debug(
+                "Alpaca re-protect reconcile watermark could not be persisted "
+                "(%r); the next pass rescans from the older bound",
+                exc,
+            )
 
     async def backfill_commissions(self, *, now: datetime | None = None) -> int:
         """Price this account's still-unknown crypto commissions from posted ``CFEE`` activities.
@@ -3088,20 +3189,79 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     f"Alpaca exit order for {symbol} was {status} on submission "
                     f"(signal_id={signal_id})."
                 )
-            await self._place_exit_protection(
+            placed = await self._place_exit_protection(
                 client,
                 plan,
                 qty=plan["reprotect_qty"],
                 signal_id=signal_id,
                 reason="partial exit",
             )
-            # The marker is deliberately NOT cleared here even when the
-            # re-place succeeded: it now doubles as the under-fill watchdog.
-            # If the exit order later expires or fills short, the replayed
-            # marker is the only record that the uncovered shares need
-            # protection; ``_recover_exit_reprotection`` clears it once the
-            # exit order is terminal and coverage is verified (#350 review).
+            # The marker is deliberately NOT cleared here just because the
+            # re-place succeeded: it doubles as the under-fill watchdog. But
+            # when the exit order is already proven terminal AND filled for
+            # the full requested quantity there is nothing left to watch -
+            # clear it now instead of leaving it for the next connect or
+            # stream update (#350 review). Otherwise it stays: if the exit
+            # later expires or fills short, the replayed marker is the only
+            # record that the uncovered shares need protection, and
+            # ``_recover_exit_reprotection`` clears it once the exit order is
+            # terminal and coverage is verified. A FAILED re-place keeps the
+            # marker too - the remainder is unprotected and only the replay
+            # can restore it.
+            if placed:
+                await self._maybe_clear_exit_marker_on_full_fill(
+                    client, order, plan, signal_id=signal_id
+                )
             return order
+
+    async def _maybe_clear_exit_marker_on_full_fill(
+        self,
+        client: Any,
+        order: Any,
+        plan: Mapping[str, Any],
+        *,
+        signal_id: str,
+    ) -> None:
+        """Spend the ``exit_reprotection`` marker when nothing is left to watch.
+
+        Only a *proven* outcome clears: the exit order re-read by id must be
+        terminal and its ``filled_qty`` must cover the requested exit
+        quantity. A still-working order, a short fill, an unknown status or a
+        failed re-read all keep the marker - the connect replay and the
+        stream watchdog remain the backstops (#350 review).
+        """
+        order_id = _control_order_id(_order_attr(order, "id"))
+        get_order = getattr(client, "get_order_by_id", None)
+        if order_id is None or not callable(get_order):
+            return
+        try:
+            fresh = await asyncio.to_thread(get_order, order_id)
+        except Exception as exc:
+            logger.debug(
+                "Alpaca exit order %s could not be re-read after re-protect; "
+                "the marker stays pending: %r",
+                order_id,
+                exc,
+            )
+            return
+        if _order_status(fresh) not in _TERMINAL_ORDER_STATUSES:
+            return
+        exit_qty = plan.get("exit_qty")
+        if (
+            not isinstance(exit_qty, (int, float))
+            or not math.isfinite(float(exit_qty))
+        ):
+            return
+        filled_qty = _to_float(_order_attr(fresh, "filled_qty", None), default=0.0)
+        if filled_qty + self.position_qty_tolerance(str(plan.get("symbol") or "")) < float(
+            exit_qty
+        ):
+            return
+        await _clear_exit_reprotection_marker(
+            signal_id,
+            str(plan.get("symbol") or "?"),
+            "exit order terminal and fully filled",
+        )
 
     async def _recover_exit_reprotection(self, row: Mapping[str, Any]) -> None:
         """Replay one persisted ``exit_reprotection`` marker, if still needed."""
@@ -3500,6 +3660,38 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         }
                     },
                 )
+                continue
+            # Only the newest marker per symbol is ever replayed, so once it
+            # resolves (its marker is gone from the persisted metadata) the
+            # symbol's older markers are spent weight that would otherwise
+            # linger forever - and, before the SQL per-symbol selection, could
+            # pile up ahead of other symbols' markers (#350 review).
+            signal_id = str(row.get("signal_id") or "")
+            try:
+                metadata = await asyncio.to_thread(
+                    get_live_signal_metadata, signal_id
+                )
+            except Exception:
+                metadata = None
+            if (
+                signal_id
+                and isinstance(metadata, dict)
+                and EXIT_REPROTECTION_METADATA_KEY not in metadata
+            ):
+                try:
+                    await asyncio.to_thread(
+                        clear_superseded_exit_reprotection_markers,
+                        self.account_id,
+                        symbol,
+                        keep_signal_id=signal_id,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Alpaca superseded exit re-protection markers for %s "
+                        "could not be cleared: %r",
+                        symbol,
+                        exc,
+                    )
 
     async def submit_order(self, signal: LiveSignal, *, qty: float | None = None) -> str:
         # Everything up to and including the request build is provably before
@@ -4540,7 +4732,21 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         get_orders = getattr(client, "get_orders", None)
         if not symbols or not callable(get_orders):
             return []
-        result = await self._list_orders_status_all(client, symbols=symbols)
+        # Only orders submitted after the symbols' first signal can still be
+        # relevant: the held legs belong to entry brackets of positions that
+        # are open now, and every entry was signalled first. The bound keeps a
+        # long-lived account from walking its whole order history on every
+        # exit; the page cap remains the fail-closed backstop (#350 review).
+        after = await asyncio.to_thread(
+            earliest_live_signal_timestamp, self.account_id, symbols
+        )
+        if after is not None:
+            # Margin for clock skew and the signal-to-submit delay: the bound
+            # must stay at or before the entry order's own ``submitted_at``.
+            after = after - _ORDER_SCAN_AFTER_MARGIN
+        result = await self._list_orders_status_all(
+            client, symbols=symbols, after=after
+        )
         return [
             order
             for order in result
@@ -4549,19 +4755,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
 
     async def _list_orders_status_all(
-        self, client: Any, *, symbols: set[str] | None = None
+        self,
+        client: Any,
+        *,
+        symbols: set[str] | None = None,
+        after: datetime | None = None,
     ) -> list[Any]:
         """Every ``status=all`` order, paged backwards with ``until``.
 
         ``get_orders`` returns at most ``limit`` orders per call and offers no
         page token, so history longer than one page is walked back explicitly:
-        each full page moves ``until`` to its oldest ``submitted_at`` and ids
-        already seen are skipped (``until`` is inclusive, so a page boundary
-        can repeat orders). A page that cannot advance - a missing timestamp,
-        or a full page of already-seen ids - raises, as does exceeding
-        ``_ALPACA_ORDER_LOOKUP_MAX_PAGES``: a silently truncated ``status=all``
-        listing is the #174/#350 failure mode - a held stop leg or a
-        ``-reprotect`` order read as absent.
+        each full page moves ``until`` to its oldest ``submitted_at`` plus one
+        microsecond and ids already seen are skipped (``until`` is inclusive,
+        so a page boundary can repeat orders; the +1µs keeps an order whose
+        ``submitted_at`` equals the boundary from being skipped outright if
+        Alpaca ever treats the bound as exclusive - the dedupe absorbs the
+        overlap either way). A page that cannot advance - a missing
+        timestamp, or a full page of already-seen ids - raises, as does
+        exceeding ``_ALPACA_ORDER_LOOKUP_MAX_PAGES``: a silently truncated
+        ``status=all`` listing is the #174/#350 failure mode - a held stop
+        leg or a ``-reprotect`` order read as absent. ``after`` is an
+        optional lower bound (orders submitted at/after it) so callers that
+        only need recent history do not walk the whole account (#350 review).
         """
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
@@ -4580,6 +4795,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 nested=True,
                 limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
                 until=until,
+                after=after,
                 direction=Sort.DESC,
             )
             result = await asyncio.to_thread(get_orders, filter=request)
@@ -4615,7 +4831,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     f"{len(collected)} orders; refusing to treat the list "
                     "as complete"
                 )
-            until = oldest
+            # ``until`` is inclusive: step one microsecond past the page's
+            # oldest timestamp so a boundary order can never fall into the
+            # gap between pages; the ``seen`` dedupe absorbs the repeat.
+            until = (
+                oldest + timedelta(microseconds=1)
+                if isinstance(oldest, datetime)
+                else oldest
+            )
         raise RuntimeError(
             f"Alpaca order history exceeds {_ALPACA_ORDER_LOOKUP_MAX_PAGES} "
             f"pages ({len(collected)} orders); refusing to treat the list "
@@ -4921,8 +5144,111 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         persisted = await asyncio.to_thread(save_live_execution, execution)
         return execution.filled_qty if persisted else 0.0
 
+    async def _maybe_watchdog_exit_reprotection(self, data: Any) -> None:
+        """Re-check a pending ``exit_reprotection`` marker on a terminal update.
+
+        The marker's under-fill watchdog used to run only at ``connect``: a
+        DAY exit that expired - or filled short - while the daemon kept
+        running left the uncovered shares unprotected until the next
+        reconnect, potentially days (#350 review). Any trade update that
+        reports the exit order terminal now replays its marker immediately;
+        the replay is the same ``_recover_exit_reprotection`` the connect
+        path uses, serialized on ``_reprotect_watchdog_lock`` and deduped
+        per (signal, order) for the process lifetime.
+        """
+        order = getattr(data, "order", None)
+        if order is None:
+            return
+        status = _order_status(order)
+        if status not in _TERMINAL_ORDER_STATUSES:
+            return
+        client_order_id = getattr(order, "client_order_id", "")
+        try:
+            signal_uuid = UUID(str(client_order_id))
+        except (TypeError, ValueError, AttributeError):
+            return
+        try:
+            metadata = await asyncio.to_thread(
+                get_live_signal_metadata, str(signal_uuid)
+            )
+        except Exception as exc:
+            logger.debug(
+                "Alpaca exit re-protection watchdog could not read signal "
+                "%s metadata: %r",
+                signal_uuid,
+                exc,
+            )
+            return
+        if not isinstance(metadata, dict):
+            return
+        marker = metadata.get(EXIT_REPROTECTION_METADATA_KEY)
+        if not isinstance(marker, dict):
+            return
+        if (
+            str(metadata.get("risk_sizing_mode") or "")
+            != EXIT_ONLY_RISK_SIZING_MODE
+        ):
+            return
+        broker_order_id = _control_order_id(_order_attr(order, "id")) or ""
+        dedupe_key = f"{signal_uuid}:{broker_order_id}"
+        if dedupe_key in self._reprotect_watchdog_seen:
+            return
+        self._reprotect_watchdog_seen.add(dedupe_key)
+        symbol = _order_symbol(order)
+        if status != "filled":
+            logger.error(
+                "ALERT: Alpaca exit order for %s reached terminal status %r "
+                "while its re-protection marker is pending; re-checking "
+                "protection coverage now instead of waiting for a reconnect",
+                symbol or "?",
+                status,
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "signal_id": str(signal_uuid),
+                        "symbol": symbol,
+                        "broker_order_id": broker_order_id,
+                        "status": status,
+                    }
+                },
+            )
+        row = {
+            "signal_id": str(signal_uuid),
+            "symbol": symbol,
+            "broker_order_id": broker_order_id,
+            "marker": dict(marker),
+        }
+        task = asyncio.create_task(
+            self._run_exit_reprotection_recheck(row), name="alpaca-reprotect-watchdog"
+        )
+        self._reprotect_watchdog_tasks.add(task)
+        task.add_done_callback(self._reprotect_watchdog_tasks.discard)
+
+    async def _run_exit_reprotection_recheck(self, row: Mapping[str, Any]) -> None:
+        """Serialized, best-effort marker replay for the stream watchdog."""
+        async with self._reprotect_watchdog_lock:
+            try:
+                await self._recover_exit_reprotection(row)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.critical(
+                    "Alpaca exit re-protection watchdog replay failed for %s; "
+                    "the remainder may be unprotected until the next connect",
+                    row.get("symbol"),
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": row.get("signal_id"),
+                            "symbol": row.get("symbol"),
+                            "error": repr(exc),
+                        }
+                    },
+                )
+
     async def _on_trade_update(self, data: Any) -> None:
         try:
+            await self._maybe_watchdog_exit_reprotection(data)
             fill = self._trade_update_fill_order(data)
             if fill is None:
                 return

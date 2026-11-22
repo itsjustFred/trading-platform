@@ -244,7 +244,10 @@ Orders selbst bleiben simple Market/Limit-CloseOrders; eine **partielle** Exit-o
 jedoch gibt vorher den reservierten Bracket-/OCO-Schutz der Position frei und platziert
 für den Restbestand ein neues OCO zum ursprünglichen SL/TP (bzw. aktuellen Trailing-Level)
 neu (#145/#350) - ein persistierter `exit_reprotection`-Marker sichert die Wiederherstellung
-nach einem Crash, und Recovery füllt fehlende Stücke nach, sobald die Exit-Order terminal ist.
+nach einem Crash, und Recovery füllt fehlende Stücke nach, sobald die Exit-Order terminal ist:
+der Watchdog läuft bei `connect()` und zusätzlich bei jedem terminalen Trade-Update der
+Exit-Order auf dem Stream (das Marker wird auch direkt nach dem Re-Place geräumt, wenn die
+Exit-Order bereits vollständig gefüllt ist).
 
 Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
 Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,

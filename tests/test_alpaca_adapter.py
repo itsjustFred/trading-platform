@@ -34,6 +34,8 @@ class _FakeOrder:
     status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
     submitted_at: datetime | None = None
+    filled_qty: float | None = None
+    client_order_id: str = ""
 
 
 @dataclass
@@ -302,6 +304,7 @@ class _FakeTradingClient:
                 order_type="market",
                 qty=qty,
                 status="filled",
+                filled_qty=qty,
             )
             self.orders.append(order)
             self._fill_market_order(order_data)
@@ -1282,11 +1285,12 @@ def test_partial_exit_reprotects_remainder_at_original_levels(
     assert float(oco[0].take_profit.limit_price) == 210.0
     assert float(oco[0].stop_loss.stop_price) == 190.0
     assert _side_text(oco[0]) == "sell"
-    # The persisted signal carried the recovery marker. It is NOT cleared at
-    # submit any more: it doubles as the under-fill watchdog until a connect
-    # replay proves the exit order terminal and the coverage complete.
+    # The persisted signal carried the recovery marker. The market exit is
+    # already proven terminal and fully filled when the re-place returns, so
+    # the watchdog marker is spent immediately rather than left for the next
+    # connect or stream update (#350 review).
     assert captured and "exit_reprotection" in (captured[0].metadata or {})
-    assert cleared == []
+    assert len(cleared) == 1
 
 
 def test_partial_exit_reprotects_at_current_trailing_level(monkeypatch) -> None:
@@ -2489,3 +2493,313 @@ def test_a_full_exit_over_ambiguous_levels_restores_each_recorded_candidate(
     assert sorted(float(order.qty) for order in oco) == [5.0, 5.0]
     assert sorted(float(order.stop_loss.stop_price) for order in oco) == [185.0, 190.0]
     assert sorted(float(order.take_profit.limit_price) for order in oco) == [210.0, 215.0]
+
+
+# ─── #350 review round 3: marker lifecycle, stream watchdog, scan bounds ────
+
+
+def test_stream_expired_exit_tops_up_without_a_reconnect(monkeypatch) -> None:
+    """A DAY exit that expires while the daemon runs must not strand shares.
+
+    The under-fill watchdog used to run only at ``connect``: an exit order
+    going working -> ``expired`` with ``filled_qty < qty`` left the uncovered
+    shares naked until the next reconnect - potentially days. A terminal
+    trade update now replays the marker immediately (#350 review).
+    """
+    exit_order = _FakeOrder(
+        id="exit-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        qty=4.0,
+        status="expired",
+        filled_qty=1.0,
+    )
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0), exit_order],
+        # The expired exit's 1.0 fill already left the position: 10 - 1 = 9.
+        positions=[_FakePosition("AAPL", 9.0)],
+    )
+    adapter = _adapter(client)
+    signal_id = str(uuid4())
+    marker = {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": "entry-1",
+    }
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda sid: {
+            "risk_sizing_mode": "exit_only",
+            "signal_intent": "exit",
+            "exit_reprotection": marker,
+        }
+        if str(sid) == signal_id
+        else {},
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+    update = SimpleNamespace(
+        event="expired",
+        order=SimpleNamespace(
+            id="exit-1",
+            client_order_id=signal_id,
+            status="expired",
+            symbol="AAPL",
+            filled_qty=1.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=1.0,
+    )
+
+    async def _run() -> None:
+        await adapter._on_trade_update(update)
+        if adapter._reprotect_watchdog_tasks:
+            await asyncio.gather(*adapter._reprotect_watchdog_tasks)
+
+    asyncio.run(_run())
+
+    # 10 held - 6 covered - 1 filled by the expired exit = 3 naked -> top-up.
+    top_ups = [
+        order
+        for order in client.submitted
+        if _class_text(order) == "oco" and float(order.qty) == 3.0
+    ]
+    assert len(top_ups) == 1
+    assert cleared == [signal_id]
+
+    # A redelivered terminal update for the same order does not replay again.
+    client.submitted.clear()
+    cleared.clear()
+
+    async def _run_again() -> None:
+        await adapter._on_trade_update(update)
+        if adapter._reprotect_watchdog_tasks:
+            await asyncio.gather(*adapter._reprotect_watchdog_tasks)
+
+    asyncio.run(_run_again())
+    assert client.submitted == []
+
+
+def test_stream_filled_exit_with_full_coverage_clears_the_marker(
+    monkeypatch,
+) -> None:
+    """A filled exit whose remainder is already protected spends the marker."""
+    exit_order = _FakeOrder(
+        id="exit-2",
+        symbol="AAPL",
+        side="sell",
+        order_type="market",
+        qty=4.0,
+        status="filled",
+        filled_qty=4.0,
+    )
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0), exit_order],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    signal_id = str(uuid4())
+    marker = {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": "entry-1",
+    }
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda sid: {
+            "risk_sizing_mode": "exit_only",
+            "signal_intent": "exit",
+            "exit_reprotection": marker,
+        }
+        if str(sid) == signal_id
+        else {},
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+    update = SimpleNamespace(
+        event="new",
+        order=SimpleNamespace(
+            id="exit-2",
+            client_order_id=signal_id,
+            status="filled",
+            symbol="AAPL",
+            filled_qty=4.0,
+        ),
+        timestamp=datetime.now(timezone.utc),
+        qty=4.0,
+    )
+
+    async def _run() -> None:
+        await adapter._on_trade_update(update)
+        if adapter._reprotect_watchdog_tasks:
+            await asyncio.gather(*adapter._reprotect_watchdog_tasks)
+
+    asyncio.run(_run())
+
+    assert client.submitted == []
+    assert cleared == [signal_id]
+
+
+def test_list_orders_status_all_pages_until_plus_one_microsecond() -> None:
+    """``until`` steps one microsecond past the page's oldest ``submitted_at``.
+
+    ``until`` is inclusive, so the +1µs can only *widen* the next page by the
+    boundary timestamp; the id dedupe absorbs the repeat and no order can
+    fall into a gap between pages (#350 nit).
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    orders = [
+        _FakeOrder(
+            id=f"ord-{index}",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            status="canceled",
+            qty=1.0,
+            submitted_at=base + timedelta(seconds=1000 - index),
+        )
+        for index in range(501)
+    ]
+    client = _FakeTradingClient(orders=orders)
+    adapter = _adapter(client)
+    filters: list[object] = []
+    original = client.get_orders
+
+    def _record(filter=None):  # noqa: A002 - mirrors alpaca-py
+        filters.append(filter)
+        return original(filter)
+
+    client.get_orders = _record  # type: ignore[method-assign]
+
+    collected = asyncio.run(adapter._list_orders_status_all(client))
+
+    assert len(collected) == 501
+    assert len({getattr(order, "id") for order in collected}) == 501
+    assert len(filters) == 2
+    page1_oldest = orders[499].submitted_at
+    assert filters[1].until == page1_oldest + timedelta(microseconds=1)
+
+
+def test_held_leg_lookup_bounds_the_scan_at_the_ledger(monkeypatch) -> None:
+    """The ``status=all`` held-leg scan passes the ledger ``after`` bound."""
+    bound = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        alpaca_module,
+        "earliest_live_signal_timestamp",
+        lambda account_id, symbols: bound,
+    )
+    client = _FakeTradingClient(orders=_filled_bracket())
+    adapter = _adapter(client)
+    adapter.account_id = "acct-bound"
+
+    asyncio.run(adapter._list_filled_parents_with_held_legs(client, {"AAPL"}))
+
+    assert client.last_order_filter.after == bound - timedelta(minutes=5)
+
+
+def test_reconcile_reprotect_orders_uses_and_advances_the_watermark(
+    monkeypatch,
+) -> None:
+    """The account-wide reprotect scan is bounded by a persisted watermark.
+
+    Without it a minute-bar account passes the 12,500-order page cap within
+    weeks and every connect's reconcile raises - the #277 defect returns.
+    The bound is the earliest still-working ``-reprotect`` order's
+    ``submitted_at`` (minus the shared margin), or the pass start when none
+    worked; a failed pass never moves it (#350 review).
+    """
+    store: dict[str, dict] = {}
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_adapter_state",
+        lambda account_id, key: store.get(f"{account_id}|{key}"),
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "set_live_adapter_state",
+        lambda account_id, key, value: store.__setitem__(
+            f"{account_id}|{key}", dict(value)
+        ),
+    )
+    monkeypatch.setattr(
+        alpaca_module, "get_live_signal_metadata", lambda _sid: {}
+    )
+    working_at = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    reprotect = _FakeOrder(
+        id=str(uuid4()),
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        qty=6.0,
+        stop_price=190.0,
+        status="new",
+        submitted_at=working_at,
+        client_order_id=f"{uuid4()}-reprotect-{uuid4()}",
+    )
+    client = _FakeTradingClient(orders=[reprotect])
+    adapter = _adapter(client)
+    adapter.account_id = "acct-wm"
+    seen_after: list[object] = []
+    original = client.get_orders
+
+    def _record(filter=None):  # noqa: A002 - mirrors alpaca-py
+        seen_after.append(getattr(filter, "after", None))
+        return original(filter)
+
+    client.get_orders = _record  # type: ignore[method-assign]
+
+    asyncio.run(adapter._reconcile_reprotect_orders())
+
+    # First pass: no watermark -> unbounded; the working order bounds it.
+    assert seen_after == [None]
+    expected = (working_at - timedelta(minutes=5)).isoformat()
+    assert store["acct-wm|alpaca_reprotect_reconcile_after"]["after"] == expected
+
+    asyncio.run(adapter._reconcile_reprotect_orders())
+
+    # Second pass: the persisted bound reaches the broker as ``after``.
+    assert seen_after[1] == datetime.fromisoformat(expected)
+
+
+def test_recover_exit_reprotections_clears_superseded_markers(monkeypatch) -> None:
+    """Once a symbol's newest marker resolves, its older markers are spent."""
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0)],
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+                signal_id="sig-new",
+            )
+        ],
+    )
+    _patch_marker_clears(monkeypatch)
+    superseded: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "get_live_signal_metadata",
+        lambda _sid: {},  # marker gone -> the newest row resolved
+    )
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_superseded_exit_reprotection_markers",
+        lambda account_id, symbol, *, keep_signal_id: superseded.append(
+            (account_id, symbol, keep_signal_id)
+        )
+        or 2,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert superseded == [(adapter.account_id, "AAPL", "sig-new")]
