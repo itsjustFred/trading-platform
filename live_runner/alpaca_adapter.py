@@ -2411,10 +2411,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         (#174). Both are needed: missing one leaves quantity reserved and the
         exit rejected, or protection uncancelled and later orphaned.
         """
-        orders = await self._list_open_orders(client, nested=True)
-        orders.extend(
-            await self._list_filled_parents_with_held_legs(client, {symbol})
+        orders = await self._listed_working_orders(client, {symbol})
+        return self._exit_protection_candidates_from_orders(
+            orders, symbol=symbol, side=side
         )
+
+    def _exit_protection_candidates_from_orders(
+        self, orders: list[Any], *, symbol: str, side: str
+    ) -> list[dict[str, Any]]:
+        """``_exit_protection_candidates`` over an already-fetched listing.
+
+        Lets a caller reconcile candidates and the working book against one
+        snapshot of the order book instead of two listings taken at
+        different moments (#367 review).
+        """
         found: dict[str, dict[str, Any]] = {}
         for order in orders:
             self._collect_exit_protection(
@@ -2595,41 +2605,33 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         entry = found.get(symbol)
         return str(entry.get("signal_id")) if entry else None
 
-    async def _working_ids_for_symbol(self, client: Any, symbol: str) -> set[str]:
-        """Ids of every working order and leg on ``symbol`` (post-cancel re-read).
+    async def _listed_working_orders(
+        self, client: Any, symbols: set[str]
+    ) -> list[Any]:
+        """Both working-order listings as one snapshot, for ``symbols``.
 
-        Both listings are needed: the ``status=open`` page sees top-level orders
-        and OCO legs, the ``status=all`` page of filled parents sees a held
-        bracket stop leg that no open listing returns (#174).
+        The ``status=open`` page sees top-level orders and OCO legs; the
+        ``status=all`` page of filled parents sees a held bracket stop leg
+        that no open listing returns (#174). Callers that reconcile the
+        position against the book share this one listing pair so the two
+        views cannot come from different moments (#367 review).
         """
         orders = await self._list_open_orders(client, nested=True)
         orders.extend(
-            await self._list_filled_parents_with_held_legs(client, {symbol})
+            await self._list_filled_parents_with_held_legs(client, symbols)
         )
-        ids: set[str] = set()
-        for order in orders:
-            for item in (order, *_order_legs(order)):
-                order_id = _control_order_id(_order_attr(item, "id"))
-                if order_id is not None:
-                    ids.add(order_id)
-        return ids
+        return orders
 
-    async def _working_items_for_symbol(self, client: Any, symbol: str) -> list[Any]:
-        """Every working order and leg on ``symbol``, as objects not ids.
+    @staticmethod
+    def _iter_working_items(
+        orders: list[Any], symbol: str
+    ) -> Iterator[tuple[Any, Any]]:
+        """``(parent, item)`` for every working order and leg on ``symbol``.
 
-        The same two listings ``_working_ids_for_symbol`` reconciles - the
-        ``status=open`` page (top-level orders, OCO legs) and the
-        ``status=all`` page of filled parents (a held bracket stop leg) -
-        kept as order objects so a caller can weigh side and class before
-        trusting a position read (#362). Terminal orders and items naming
-        another symbol are excluded; a leg with no symbol of its own counts
-        under its parent's.
+        Terminal orders and items naming another symbol are excluded; a leg
+        with no symbol of its own counts under its parent's. The parent is
+        yielded alongside so callers can weigh its class and client order id.
         """
-        orders = await self._list_open_orders(client, nested=True)
-        orders.extend(
-            await self._list_filled_parents_with_held_legs(client, {symbol})
-        )
-        items: list[Any] = []
         for order in orders:
             for item in (order, *_order_legs(order)):
                 item_symbol = _order_symbol(item) or _order_symbol(order)
@@ -2637,8 +2639,23 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     continue
                 if _order_status(item) in _TERMINAL_ORDER_STATUSES:
                     continue
-                items.append(item)
-        return items
+                yield order, item
+
+    async def _working_ids_for_symbol(self, client: Any, symbol: str) -> set[str]:
+        """Ids of every working order and leg on ``symbol`` (post-cancel re-read).
+
+        Both listings are needed: the ``status=open`` page sees top-level orders
+        and OCO legs, the ``status=all`` page of filled parents sees a held
+        bracket stop leg that no open listing returns (#174).
+        """
+        orders = await self._listed_working_orders(client, {symbol})
+        ids: set[str] = set()
+        for order in orders:
+            for item in (order, *_order_legs(order)):
+                order_id = _control_order_id(_order_attr(item, "id"))
+                if order_id is not None:
+                    ids.add(order_id)
+        return ids
 
     def _load_exit_order_types(self) -> tuple[Any, Any, Any, Any, Any]:
         try:
@@ -3259,11 +3276,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         read: a fill landing between the exit's fill and the marker clear -
         a working entry adding shares, another exit still working - can
         leave a position the spent marker was the only record for. The
-        marker is cleared only when the broker position still matches the
-        planned remainder AND no working order outside the just-placed
-        protection can still move it. Anything unreadable or unexpected
-        keeps the marker: the connect replay and the stream watchdog
-        re-verify later, which is the safe direction.
+        marker is cleared only when every working order on the symbol is
+        reducing-side protection the plan accounts for AND the broker
+        position - re-read after the book listings - still matches the
+        planned remainder with that protection actually covering it.
+        Anything unreadable or unexpected keeps the marker: the connect
+        replay and the stream watchdog re-verify later, which is the safe
+        direction.
         """
         symbol = str(plan.get("symbol") or "")
         side = str(plan.get("side") or "")
@@ -3279,6 +3298,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if expected_qty is None or expected_qty < 0:
             return False
         tolerance = self.position_qty_tolerance(symbol)
+        # The book is reconciled FIRST and the position re-read LAST (#367
+        # review): reading the position before the listings left a window in
+        # which a working entry could fill, leave the book, and still match
+        # the stale plan. With the listings ahead of the position read, a
+        # fill landing anywhere in the check is reflected in ``current``;
+        # only a fill after that last read remains, which no client-side
+        # ordering can close without broker-side atomicity.
+        orders = await self._listed_working_orders(client, {symbol})
+        candidates = self._exit_protection_candidates_from_orders(
+            orders, symbol=symbol, side=side
+        )
+        protected_ids = {
+            str(order_id)
+            for candidate in candidates
+            for order_id in (candidate.get("cancel_ids") or ())
+            if str(order_id or "")
+        }
+        for _parent, item in self._iter_working_items(orders, symbol):
+            item_id = _control_order_id(_order_attr(item, "id"))
+            if item_id is None or item_id not in protected_ids:
+                return False
         current = await self._symbol_position_qty(symbol)
         if _is_flat(expected_qty):
             # A full exit leaves nothing: any position still open - or one
@@ -3292,16 +3332,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return False
             if abs(abs(current) - expected_qty) > tolerance:
                 return False
-        candidates = await self._exit_protection_candidates(client, symbol, side)
-        protected_ids = {
-            str(order_id)
-            for candidate in candidates
-            for order_id in (candidate.get("cancel_ids") or ())
-            if str(order_id or "")
-        }
-        for item in await self._working_items_for_symbol(client, symbol):
-            item_id = _control_order_id(_order_attr(item, "id"))
-            if item_id is None or item_id not in protected_ids:
+            # The remainder must actually be protected before the marker is
+            # spent (#367 review): ``_place_exit_protection`` returns True on
+            # submit without re-reading the book, so an OCO the broker
+            # accepted and then dropped would leave the remainder naked with
+            # its only record already spent. Candidates cover the remainder
+            # when the largest reservation reaches it - OCO parents and
+            # their legs reserve the same shares, so quantities are never
+            # summed; a split protection under-covers and keeps the marker,
+            # which the next replay re-verifies.
+            covered = max(
+                (
+                    qty
+                    for candidate in candidates
+                    if isinstance((qty := candidate.get("qty")), (int, float))
+                    and math.isfinite(float(qty))
+                ),
+                default=0.0,
+            )
+            if covered + tolerance < expected_qty:
                 return False
         return True
 
@@ -3328,7 +3377,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         try:
             fresh = await asyncio.to_thread(get_order, order_id)
         except Exception as exc:
-            logger.debug(
+            logger.info(
                 "Alpaca exit order %s could not be re-read after re-protect; "
                 "the marker stays pending: %r",
                 order_id,
@@ -3356,7 +3405,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         try:
             settled = await self._exit_marker_clear_is_safe(client, plan)
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Alpaca exit marker clear check failed for %s; the marker "
                 "stays pending: %r",
                 plan.get("symbol"),
@@ -3364,7 +3413,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return
         if not settled:
-            logger.debug(
+            logger.info(
                 "Alpaca exit marker for %s stays pending: the position or "
                 "the working book changed since the exit filled",
                 plan.get("symbol"),
@@ -3374,6 +3423,60 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             signal_id,
             str(plan.get("symbol") or "?"),
             "exit order terminal and fully filled",
+        )
+
+    async def _working_item_is_markers_own(
+        self,
+        parent: Any,
+        item: Any,
+        *,
+        row: Mapping[str, Any],
+        marker: Mapping[str, Any],
+    ) -> bool:
+        """Whether a working ``(parent, item)`` pair belongs to this marker.
+
+        Marker-owned means: the exit order behind the marker (``broker_order_id``)
+        or one of its legs, an order id the marker recorded as protection, or
+        an order attributed to the marker's ``entry_signal_id`` - directly by
+        client order id, through the verified ``-reprotect`` attribution, or
+        through the learned bracket-leg map. Anything else is another signal's
+        order and must not keep this marker pending (#367 review).
+        """
+        item_id = _control_order_id(_order_attr(item, "id"))
+        parent_id = _control_order_id(_order_attr(parent, "id"))
+        exit_id = str(row.get("broker_order_id") or "").strip()
+        if exit_id and exit_id in {item_id, parent_id}:
+            return True
+        recorded_ids: set[str] = set()
+        for recorded in marker.get("protection") or []:
+            if not isinstance(recorded, Mapping):
+                continue
+            recorded_ids.add(str(recorded.get("order_id") or ""))
+            recorded_ids.update(
+                str(order_id) for order_id in (recorded.get("cancel_ids") or ())
+            )
+        recorded_ids.discard("")
+        if item_id in recorded_ids or parent_id in recorded_ids:
+            return True
+        entry_id = str(marker.get("entry_signal_id") or "").strip()
+        if not entry_id:
+            return False
+        for order_obj in (item, parent):
+            client_order_id = str(
+                _order_attr(order_obj, "client_order_id") or ""
+            ).strip()
+            if client_order_id == entry_id:
+                return True
+            candidate = _reprotect_entry_candidate(client_order_id)
+            if (
+                candidate is not None
+                and await self._verified_reprotect_entry(candidate) == entry_id
+            ):
+                return True
+        return any(
+            self._bracket_leg_order_id_to_signal_id.get(order_key) == entry_id
+            for order_key in (item_id, parent_id)
+            if order_key is not None
         )
 
     async def _recover_exit_reprotection(self, row: Mapping[str, Any]) -> None:
@@ -3393,25 +3496,44 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return
         client = self._trading_client
+        # The book is listed BEFORE the position is read (#367 review): a
+        # fill landing between a position-first read and the listing would
+        # leave the book quiet and the position stale-flat, spending the
+        # marker over a position that just reopened. Reading the position
+        # last reflects every fill up to that moment; only a fill after it
+        # remains, which no client-side ordering can close.
+        orders: list[Any] = []
+        if client is not None:
+            orders = await self._listed_working_orders(client, {symbol})
         position_qty = await self._symbol_position_qty(symbol)
         if position_qty is None:
             # Flat: the exit completed and nothing is left to protect - but
             # the position read and the marker clear are not atomic (#362):
-            # a fill landing in between (a working entry, a leg, another
-            # exit) can reopen the position with its marker already spent.
-            # Reconcile the book first: the marker is only cleared when no
-            # working order on the symbol can still move the position; with
-            # a flat book every working order counts, protection included -
-            # a reduce-side order that fires on a flat book opens the
-            # opposite position. Otherwise the marker stays pending and the
-            # next replay re-evaluates.
+            # a fill landing in between can reopen the position with its
+            # marker already spent. Only orders that belong to THIS marker
+            # keep it pending (#367 review): its exit order and legs, the
+            # protection it recorded, and orders attributed to its entry
+            # signal (including re-placed ``-reprotect`` protection). An
+            # unrelated order working on the symbol - a new signal's entry -
+            # must not keep a stale marker alive: when it fills, the new
+            # position belongs to its own signal, and this marker replaying
+            # later could otherwise re-place the OLD stop/TP on it. With a
+            # flat book of marker-owned orders every one counts, protection
+            # included - a reduce-side order that fires on a flat book opens
+            # the opposite position.
             if client is None:
                 raise RuntimeError("Alpaca trading client is unavailable")
-            moving = await self._working_items_for_symbol(client, symbol)
+            moving = [
+                (parent, item)
+                for parent, item in self._iter_working_items(orders, symbol)
+                if await self._working_item_is_markers_own(
+                    parent, item, row=row, marker=marker
+                )
+            ]
             if moving:
                 logger.info(
                     "Alpaca exit re-protection marker for %s reads flat but "
-                    "%d order(s) still work on the symbol; keeping the "
+                    "%d of its own order(s) still work; keeping the "
                     "marker - a fill landing before the clear could reopen "
                     "the position",
                     symbol,
