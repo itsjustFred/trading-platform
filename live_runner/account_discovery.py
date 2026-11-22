@@ -20,7 +20,7 @@ from live_runner.alpaca_adapter import (
     _default_alpaca_credentials,
 )
 from live_runner.base_adapter import money_digits_from_trader, money_scale
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import load_accounts_env_values, resolve_accounts_env_path
 from shared.logging import get_logger
 from shared.models import LiveAccount
 
@@ -951,11 +951,13 @@ async def discover_ctrader_accounts(
 
 
 async def discover_configured_accounts(
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
 ) -> list[LiveAccount]:
     # File-first precedence: .accounts.env wins over the process environment.
     # Discovery also must not mutate os.environ (no load_dotenv side effects).
-    env = load_accounts_env_values(accounts_env)
+    env = load_accounts_env_values(
+        resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
+    )
 
     discovered_accounts: dict[tuple[str, str], LiveAccount] = {}
 

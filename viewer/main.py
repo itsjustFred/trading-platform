@@ -17,7 +17,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -79,6 +79,11 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.kill_switch import (
+    KillSwitchMode,
+    kill_switch_payload,
+    read_kill_switch_state,
+)
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
@@ -91,9 +96,11 @@ from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
 from shared.database import (
+    BROKER_CLOSE_SIGNAL_SOURCE,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
+    clear_live_kill_switch,
     create_live_deployment,
     create_service,
     delete_background_task_record,
@@ -105,6 +112,7 @@ from shared.database import (
     get_latest_live_balances,
     get_live_account,
     get_live_deployment,
+    get_live_kill_switch_state,
     get_service,
     init_db,
     list_background_task_records,
@@ -133,6 +141,7 @@ from shared.database import (
     normalize_task_status,
     record_live_control_audit,
     save_result_to_sqlite,
+    set_live_kill_switch,
     update_live_deployment_account,
     update_live_deployment_status,
     update_service_status,
@@ -1638,46 +1647,10 @@ class PortfoliosDeduplicateRequest(SQLModel):
     ids: list[str] = PydanticField(default_factory=list)
 
 
-_SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-
-def _safe_asset_id(raw_id: object) -> str:
-    """Normalize a client-supplied asset id for file-backed operations.
-
-    Returns an empty string for ids that are blank or that could participate
-    in a path traversal (path separators, ``..`` segments). Ids are only ever
-    joined onto a fixed directory below, and the join is containment-checked
-    again by :func:`_contained_asset_path`.
-    """
-    normalized = str(raw_id or "").strip()
-    if not normalized:
-        return ""
-    if normalized in {".", ".."}:
-        return ""
-    if not _SAFE_ASSET_ID_RE.match(normalized):
-        return ""
-    return normalized
-
-
-def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | None:
-    """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
-
-    The resolved candidate must be contained in the resolved base directory,
-    otherwise ``None`` is returned so the caller never builds an unlink path
-    from raw input. See :func:`_contained_client_data_file` for the
-    client-path variant of the same containment contract.
-    """
-    normalized = _safe_asset_id(asset_id)
-    if not normalized:
-        return None
-    base = base_dir.resolve()
-    raw_candidate = base_dir / f"{normalized}{suffix}"
-    if raw_candidate.is_symlink():
-        return None
-    candidate = raw_candidate.resolve()
-    if candidate.parent != base:
-        return None
-    return candidate
+# The id→path containment contract lives in ONE place (viewer.core, #230);
+# these aliases keep the historical viewer.main names for routes and tests.
+_safe_asset_id = legacy_viewer._safe_asset_id
+_contained_asset_path = legacy_viewer._contained_asset_path
 
 
 def _contained_client_data_file(
@@ -1916,12 +1889,14 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
     if result is not None:
         return result
 
-    path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
+    # Containment, not a bare join: the id is a route parameter, and an
+    # unresolved `..`/absolute form must never read outside BACKTESTS_DIR (#230).
+    path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if path is None or not path.exists():
         return None
 
     try:
-        fallback_result = BacktestResult.load(str(path))
+        fallback_result = BacktestResult.load(path, root=BACKTESTS_DIR)
         save_result_to_sqlite(fallback_result)
         return fallback_result
     except Exception as exc:
@@ -9777,7 +9752,11 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
 
     result.meta.notes = updated_name
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
+    # The write side of the same id→path join the loader contains (#230): a
+    # stored row loaded by id must never be written outside BACKTESTS_DIR.
+    output_path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if output_path is None:
+        raise HTTPException(status_code=400, detail="Invalid backtest id")
     try:
         result.save(output_path)
         save_result_to_sqlite(result)
@@ -12756,6 +12735,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
 
     trades: list[dict[str, Any]] = []
     for row in rows:
+        # #144: a broker-side close is a ledger row for a fill the broker made, not a
+        # trade of ours: it has no theoretical price, so any P&L or slippage computed
+        # from it would be fabricated (a stop at 95 would read as a -950 loss on 10
+        # shares). The realized-PnL stats path prices it from actual prices instead.
+        if str(row.get("source") or "") == BROKER_CLOSE_SIGNAL_SOURCE:
+            continue
         signal_metadata = row.get("signal_metadata")
         metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
@@ -12816,7 +12801,16 @@ async def _live_signals_payload(account_id: str, *, limit: int = 200) -> dict[st
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
         execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
         raw_source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
-        source = "discord" if raw_source.startswith("discord") else "internal"
+        if raw_source.startswith("discord"):
+            source = "discord"
+        elif raw_source == "broker_close":
+            # A close the broker made (#144): not an entry of ours, so it gets
+            # its own label rather than reading as an internal signal. Its
+            # theoretical_price is 0.0 by construction - the marker price is the
+            # fill's actual_price, which the row already carries.
+            source = "broker_close"
+        else:
+            source = "internal"
         status = _signal_status_from_row(row)
         waiting_seconds = (
             _waiting_countdown(signal_metadata, signal_unix)
@@ -13372,7 +13366,8 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         )
 
     # Promotion gate (#165), before the dry-run return on purpose: a plan that
-    # could not be deployed must not be presented as deployable.
+    # could not be deployed must not be presented as deployable. Its verdict does
+    # not depend on the status, so the pause below is free to change it afterwards.
     demo_flags: dict[str, bool | None] = {}
     for deployment in plan:
         if deployment.account_id not in demo_flags:
@@ -13381,11 +13376,16 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
             )
         _require_promotion_gate(deployment, demo_flag=demo_flags[deployment.account_id])
 
+    # #261, and before the dry-run return on purpose as well: a preview showing
+    # ACTIVE rows would advertise a deploy the account cannot have.
+    plan, paused_as_real_money = _pause_non_demo_deployments(plan, demo_flags)
+
     if payload.dry_run:
         return {
             "status": "planned",
             "dry_run": True,
             "deployments": [_serialize_live_deployment_payload(item) for item in plan],
+            "paused_as_real_money": paused_as_real_money,
         }
 
     created: list[dict[str, Any]] = []
@@ -13399,18 +13399,82 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         "status": "created",
         "dry_run": False,
         "deployments": created,
+        "paused_as_real_money": paused_as_real_money,
     }
+
+
+#: Why a top-N deployment was created PAUSED instead of ACTIVE (#261). Two texts
+#: because they ask different things of the operator: a broker-reported live
+#: account is a decision to accept, an unanswered question is a check to make.
+_PAUSE_REASON_LIVE = "the broker reports this account as live (non-demo)"
+_PAUSE_REASON_UNKNOWN = "the broker could not assert that this account is demo"
+
+
+def _pause_non_demo_deployments(
+    plan: Sequence[LiveDeploymentConfig],
+    demo_flags: Mapping[str, bool | None],
+) -> tuple[list[LiveDeploymentConfig], list[dict[str, Any]]]:
+    """Create the non-demo rows of a top-N plan PAUSED instead of ACTIVE (#261).
+
+    A bulk deploy is a one-shot action: it arms what it creates without the fresh
+    broker re-verification the single-deployment activate path performs, so
+    `activate` used to be the only route that could put an armed deployment on an
+    account the broker does not report as demo. Only the daemon's demo-only block
+    then stood between those rows and real money, and a single safeguard must not
+    be what protects a live account. A maintainer activates the rows by hand
+    instead, through the status endpoint, which re-verifies the account first.
+
+    The account classification is the shared one: :func:`is_real_money` over the
+    broker-reported flag, the same verdict the daemon's demo-only guard reaches
+    for its adapter. An account the broker did not assert as demo - including one
+    it could not answer for - is real money here too, so it fails closed. Demo
+    accounts keep the ACTIVE status they were given, and a row that was requested
+    PAUSED is never touched.
+
+    Returns the plan as it will be created, and one entry per deployment paused
+    here naming it and the reason, for the response and the log below.
+    """
+    deployments: list[LiveDeploymentConfig] = []
+    paused: list[dict[str, Any]] = []
+    labels: list[str] = []
+    for deployment in plan:
+        demo_flag = demo_flags.get(deployment.account_id)
+        if deployment.status == "ACTIVE" and is_real_money(demo_flag):
+            reason = _PAUSE_REASON_LIVE if demo_flag is False else _PAUSE_REASON_UNKNOWN
+            strategy_name = deployment.strategy_name
+            account_id = str(deployment.account_id)
+            paused.append(
+                {
+                    "strategy_name": strategy_name,
+                    "account_id": account_id,
+                    "reason": reason,
+                }
+            )
+            labels.append(f"'{strategy_name}' on account '{account_id}' ({reason})")
+            deployment = deployment.model_copy(update={"status": "PAUSED"})
+        deployments.append(deployment)
+    if paused:
+        logger.warning(
+            "cTrader top-N deploy created %d deployment(s) PAUSED instead of "
+            "ACTIVE, because a non-demo account is never armed by a bulk deploy "
+            "(#261): %s. Activate them by hand once reviewed.",
+            len(paused),
+            "; ".join(labels),
+            extra={"data": {"paused": paused}},
+        )
+    return deployments, paused
 
 
 async def _broker_reported_demo_flag(account_id: str) -> bool | None:
     """What broker discovery says about ``account_id``: demo, not demo, or unknown.
 
     The promotion gate's real-money verdict for deployment create and the
-    cTrader top-N deploy (#165). It asks broker discovery directly, bypassing the
-    30 s discovery cache, so a broker that reclassifies the account is seen at
-    once, as activation's re-verification sees it. It never reads the stored
-    account row. ``None`` means discovery failed, did not return the account, or
-    did not assert the flag; the gate treats that as real money.
+    cTrader top-N deploy (#165), and the account classification that decides
+    whether that deploy may arm its rows (#261). It asks broker discovery
+    directly, bypassing the 30 s discovery cache, so a broker that reclassifies
+    the account is seen at once, as activation's re-verification sees it. It never
+    reads the stored account row. ``None`` means discovery failed, did not return
+    the account, or did not assert the flag; the gate treats that as real money.
     """
     try:
         discovered = await asyncio.to_thread(
@@ -13930,6 +13994,368 @@ async def update_live_deployment_status_endpoint(
                 },
             )
     return payload
+
+
+# ── Kill switch (#300) ───────────────────────────────────────────────────────
+#
+# The viewer's half of the operator halt. What it writes is the same row the CLI
+# writes and the daemon reads before every entry and on every tick, so a halt
+# from the dashboard holds across a restart exactly like one from a shell.
+
+
+class LiveKillSwitchHaltRequest(BaseModel):
+    """Halt one scope. ``scope`` is 'global' or a live account id."""
+
+    scope: str
+    #: One of the modes `live_runner.kill_switch` defines. Validated here rather
+    #: than left to the database, so a typo is a 400 the UI can show instead of a
+    #: refusal from a layer the caller cannot see.
+    mode: str
+    reason: str = ""
+    #: Required only for the modes that move money: `orders` cancels working
+    #: orders and `flatten` closes positions. A plain `entries` halt refuses new
+    #: entries and can cost nothing, so it must stay one click in an incident -
+    #: a confirmation gate on the emergency control would be the wrong trade.
+    confirmed_scope: str | None = None
+
+
+class LiveKillSwitchResumeRequest(BaseModel):
+    """Lift the halt on one scope. Confirmed, because it re-enables trading."""
+
+    scope: str
+    confirmed_scope: str | None = None
+
+
+async def _require_kill_switch_confirmation(
+    *,
+    action: str,
+    scope: str,
+    confirmed_scope: str | None,
+    request: Request | None,
+    why: str,
+) -> None:
+    """Refuse a money-moving kill-switch control that was not confirmed.
+
+    The scope is echoed back, for the same reason the deployment confirmation
+    echoes the deployment id: naming the scope proves the operator confirmed
+    *this* account, which is the mistake that happens when several accounts are
+    stacked in a list. 428 rather than 400, so a caller can tell "you did not
+    confirm this" from "your payload was malformed".
+    """
+    if confirmed_scope is None:
+        await _audit_live_control(
+            action=action,
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no confirmation supplied"},
+        )
+        raise HTTPException(
+            status_code=428,
+            detail=f"'{action}' {why} Send confirmed_scope='{scope}'.",
+        )
+    if str(confirmed_scope).strip() != scope:
+        await _audit_live_control(
+            action=action,
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "confirmation named a different scope",
+                "confirmed_scope": str(confirmed_scope),
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Confirmation does not match this scope (confirmed "
+                f"'{confirmed_scope}', requested '{scope}')."
+            ),
+        )
+
+
+async def _kill_switch_details(state: Any) -> list[dict[str, Any]]:
+    """Every halted scope with the history its row carries, for the payload.
+
+    The mode is the one the state read already captured, so the payload's two
+    views cannot describe two different observations of a halt someone escalated
+    in between. A history read that fails is marked as such rather than allowed to
+    fail the whole response: the state above it is the answer the caller asked
+    for, and "history unavailable" is distinguishable from "no history".
+    """
+    details: list[dict[str, Any]] = []
+    for scope in state.halted_scopes():
+        mode = state.halts[scope].value
+        try:
+            record = await asyncio.to_thread(get_live_kill_switch_state, scope)
+        except Exception as exc:
+            logger.warning(
+                "Could not read the halt history for scope %s",
+                scope,
+                extra={"data": {"scope": scope, "error": repr(exc)}},
+            )
+            details.append(
+                {
+                    "scope": scope,
+                    "mode": mode,
+                    "halted_at": None,
+                    "halted_by": "unknown",
+                    "reason": "",
+                    "history_available": False,
+                }
+            )
+            continue
+        details.append(
+            {
+                "scope": scope,
+                "mode": mode,
+                "halted_at": record.halted_at if record is not None else None,
+                "halted_by": record.halted_by if record is not None else "unknown",
+                "reason": record.reason if record is not None else "",
+                "history_available": True,
+            }
+        )
+    return details
+
+
+async def _live_kill_switch_state_payload(state: Any = None) -> dict[str, Any]:
+    """The halt state as the daemon enforces it, plus each scope's history.
+
+    An already-read ``state`` is reused so a caller can answer from the same
+    observation it just acted on rather than racing a second read.
+    """
+    resolved = (
+        state
+        if state is not None
+        else await asyncio.to_thread(read_kill_switch_state)
+    )
+    return {
+        **kill_switch_payload(resolved),
+        "halt_details": await _kill_switch_details(resolved),
+    }
+
+
+@app.get("/api/live/kill-switch")
+async def get_live_kill_switch() -> dict[str, Any]:
+    """The halt state. Read-only: it touches no trading state."""
+    _log_live_endpoint_request("/api/live/kill-switch")
+    return await _live_kill_switch_state_payload()
+
+
+@app.post(
+    "/api/live/kill-switch/halt",
+    responses={
+        400: {"description": "Unknown scope, or a mode this build cannot interpret"},
+        428: {"description": "A money-moving mode was not confirmed"},
+        409: {"description": "The confirmation named a different scope"},
+    },
+)
+async def halt_live_kill_switch(
+    payload: LiveKillSwitchHaltRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Halt one scope. The daemon enforces it on its next tick.
+
+    The scope must name a real account: the database refuses one that does not,
+    because a halt that covers nothing while the dashboard reads it as armed is
+    worse than no halt at all. That refusal is a 400 and it is audited.
+    """
+    scope = str(payload.scope or "").strip()
+    mode = str(payload.mode or "").strip().lower()
+    _log_live_endpoint_request("/api/live/kill-switch/halt", scope=scope, mode=mode)
+    if KillSwitchMode.parse(mode) is None:
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": "unknown mode", "mode": mode},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown kill switch mode '{payload.mode}'; expected one of "
+                f"{', '.join(item.value for item in KillSwitchMode)}"
+            ),
+        )
+    if mode != KillSwitchMode.ENTRIES.value:
+        await _require_kill_switch_confirmation(
+            action="kill_switch.halt",
+            scope=scope,
+            confirmed_scope=payload.confirmed_scope,
+            request=request,
+            why=(
+                f"in '{mode}' mode cancels working orders"
+                + (
+                    " and closes positions"
+                    if mode == KillSwitchMode.FLATTEN.value
+                    else ""
+                )
+                + ", so it must be confirmed."
+            ),
+        )
+    try:
+        halted = await asyncio.to_thread(
+            set_live_kill_switch,
+            scope,
+            mode,
+            actor=_live_control_actor(request),
+            reason=str(payload.reason or ""),
+        )
+    except ValueError as exc:
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": str(exc), "mode": mode},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    except Exception as exc:
+        # A database failure is not a client error, but the attempt still
+        # belongs in the audit trail: an operator asking "did anyone try to
+        # halt this" must not get silence because the write 500'd. The original
+        # failure is logged first so an audit problem can never be the
+        # exception the caller sees instead of it.
+        logger.exception("Kill switch halt write failed")
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": f"{type(exc).__name__}: {exc}", "mode": mode},
+        )
+        raise
+    await _audit_live_control(
+        action="kill_switch.halt",
+        target_type="live_kill_switch",
+        target_id=halted.scope,
+        request=request,
+        succeeded=True,
+        detail={"mode": halted.mode, "reason": halted.reason},
+    )
+    logger.warning(
+        "Kill switch halt written by the viewer",
+        extra={
+            "data": {
+                "scope": halted.scope,
+                "mode": halted.mode,
+                "actor": _live_control_actor(request),
+                "reason": halted.reason,
+            }
+        },
+    )
+    return {
+        "halted": True,
+        "scope": halted.scope,
+        "mode": halted.mode,
+        "halted_at": halted.halted_at,
+        "halted_by": halted.halted_by,
+        "reason": halted.reason,
+        # Read back rather than echoed: what the daemon enforces is the combined
+        # state (a global halt covers this account too), and a caller that
+        # echoed its own write would report a weaker halt than the one in force.
+        "state": await _live_kill_switch_state_payload(),
+    }
+
+
+@app.post(
+    "/api/live/kill-switch/resume",
+    responses={
+        428: {"description": "The resume was not confirmed"},
+        409: {"description": "The confirmation named a different scope"},
+    },
+)
+async def resume_live_kill_switch(
+    payload: LiveKillSwitchResumeRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Lift the halt on one scope, so the daemon may trade it again.
+
+    Idempotent: resuming a scope that is not halted reports ``lifted: false``
+    rather than failing, because the state the caller wants is the state that
+    results. Confirmed anyway - it is the action that re-enables trading.
+    """
+    scope = str(payload.scope or "").strip()
+    _log_live_endpoint_request("/api/live/kill-switch/resume", scope=scope)
+    await _require_kill_switch_confirmation(
+        action="kill_switch.resume",
+        scope=scope,
+        confirmed_scope=payload.confirmed_scope,
+        request=request,
+        why="re-enables trading on this scope, so it must be confirmed.",
+    )
+    try:
+        lifted = await asyncio.to_thread(
+            clear_live_kill_switch, scope, actor=_live_control_actor(request)
+        )
+    except ValueError as exc:
+        # An empty or mis-cased scope is a client error, not a server one, and
+        # the refusal is the event worth recording.
+        await _audit_live_control(
+            action="kill_switch.resume",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    except Exception as exc:
+        # Same rule as the halt route: a failed write is still an attempt, and
+        # the audit trail is where an operator looks for it. The original
+        # failure is logged first so an audit problem can never be the
+        # exception the caller sees instead of it.
+        logger.exception("Kill switch resume write failed")
+        await _audit_live_control(
+            action="kill_switch.resume",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": f"{type(exc).__name__}: {exc}"},
+        )
+        raise
+    await _audit_live_control(
+        action="kill_switch.resume",
+        target_type="live_kill_switch",
+        target_id=scope,
+        request=request,
+        succeeded=lifted,
+        detail={"lifted": lifted},
+    )
+    if not lifted:
+        logger.info(
+            "Kill switch resume found no halt in force",
+            extra={"data": {"scope": scope}},
+        )
+    else:
+        logger.warning(
+            "Kill switch halt lifted by the viewer",
+            extra={
+                "data": {
+                    "scope": scope,
+                    "actor": _live_control_actor(request),
+                }
+            },
+        )
+    # ``halted`` answers "is this scope still covered by a halt", not "was this
+    # scope's own row lifted": a global halt still covers the account after its
+    # own halt is resumed, and reporting ``halted: false`` there would tell the
+    # operator trading may resume when it may not. Read once, after the clear,
+    # so the answer and the embedded state describe the same observation.
+    state = await asyncio.to_thread(read_kill_switch_state)
+    return {
+        "halted": state.mode_for_account(scope) is not None,
+        "lifted": lifted,
+        "scope": scope,
+        "state": await _live_kill_switch_state_payload(state),
+    }
 
 
 @app.put("/api/live/deployments/{deployment_id}/account")
