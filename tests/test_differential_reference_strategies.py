@@ -608,22 +608,6 @@ def check_native(tmp_path: Path, case: Case) -> None:
     assert_final_equity(result, ref, case.ref_cfg(), NATIVE_TOL, f"native/{case.name}")
 
 
-def check_vectorbt_known_wrong_side_deviation(tmp_path: Path, case: Case) -> None:
-    """Pin the documented vectorbt wrong-side sizing-stop defect to its signature:
-    the trade is opened and sized on ``abs(entry - stop)`` instead of being skipped."""
-    _guard_scenario(case)
-    ref = case.reference(vectorbt=True, skip_wrong_side_stop=False)
-    result = run_vbt(tmp_path, case.frame, case.strategy, case.params, **dict(case.cfg_kwargs))
-    assert_trades_match(
-        _engine_trades(result),
-        ref,
-        VBT_TOL,
-        check_reason=False,
-        label=f"vectorbt-known-deviation/{case.name}",
-    )
-    assert len(ref) > len(case.reference(vectorbt=True)), "scenario no longer exercises the defect"
-
-
 def check_vectorbt(tmp_path: Path, case: Case) -> None:
     _guard_scenario(case)
     ref = case.reference(vectorbt=True)
@@ -1017,31 +1001,17 @@ RSI_FALLBACK_SCENARIOS = {
         "rsi/fallback_stop_gap_up", _rsi_gap_fill(0.0), stop_pct=0.0
     ),
 }
-VBT_WRONG_SIDE_SIZING_STOP = (
-    "vectorbt only applies its inverted-stop guard to the PROTECTIVE stop series "
-    "(runner/engines/vectorbt_adapter.py ~L539-565); a sizing-only stop on the wrong "
-    "side of the fill (LONG sizing stop >= fill after a gap down) is not rejected, the "
-    "trade is opened and sized on abs(entry - stop). The native engine skips it "
-    "(trading_engine.py ~L574-591) as the documented A-C2 guard intends."
-)
-RSI_XFAIL_VBT = {
-    "gap_below_sizing_stop_skips_trade": pytest.mark.xfail(
-        strict=True, raises=AssertionError, reason=VBT_WRONG_SIDE_SIZING_STOP
-    )
-}
-
-
 @pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS))
 def test_rsi_time_exit_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, RSI_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, RSI_XFAIL_VBT))
+@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS))
 def test_rsi_time_exit_vectorbt_matches_reference(tmp_path, scenario):
     check_vectorbt(tmp_path, RSI_SCENARIOS[scenario]())
 
 
-@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS, {**RSI_XFAIL_VBT}))
+@pytest.mark.parametrize("scenario", _make_params(RSI_SCENARIOS))
 def test_rsi_time_exit_native_and_vectorbt_agree(tmp_path, scenario):
     check_engines_agree(tmp_path, RSI_SCENARIOS[scenario]())
 
@@ -1052,11 +1022,6 @@ def test_rsi_time_exit_native_and_vectorbt_agree(tmp_path, scenario):
 )
 def test_rsi_fallback_stop_native_matches_reference(tmp_path, scenario):
     check_native(tmp_path, RSI_FALLBACK_SCENARIOS[scenario]())
-
-
-@pytest.mark.parametrize("scenario", sorted(RSI_XFAIL_VBT))
-def test_rsi_vectorbt_known_wrong_side_deviation(tmp_path, scenario):
-    check_vectorbt_known_wrong_side_deviation(tmp_path, RSI_SCENARIOS[scenario]())
 
 
 @pytest.mark.parametrize("scenario", _make_params(RSI_FALLBACK_SCENARIOS))
@@ -1117,9 +1082,11 @@ def _assert_finite_or_loud(run) -> None:
         result = run()
     except (ValueError, RuntimeError) as exc:
         # Failing closed is acceptable, but only with the engines' documented refusal of an
-        # unpriced fill. Any other failure (path drift, refactor, dependency) is re-raised
-        # as itself, so it is not absorbed by the expected-failure mark on the native case.
-        if "must be finite" not in str(exc):
+        # unpriced fill; any other failure (path drift, refactor, dependency) is re-raised
+        # as itself. native: "... fill price nan is not finite and > 0 (unpriced bar)";
+        # vectorbt: "entry_price must be finite and > 0".
+        message = str(exc)
+        if "must be finite" not in message and "(unpriced bar)" not in message:
             raise
         return
     for t in result.trades:
