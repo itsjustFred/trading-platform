@@ -536,10 +536,12 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
 _STUB_OPENCODE = """#!/usr/bin/env bash
 # A stand-in for the `opencode` the quota probe and the agent step call.
 # $STUB_OPENCODE_MODE selects the reply: ok, verdict (a parseable report),
-# quota (a cap signature on stderr, exit 1), quota-out / quota-err (the same
-# signature on a ZERO exit - the shape run 44962245768 showed the probe
-# cannot currently see), no-ok (a zero exit whose reply carries no OK token),
-# other (a non-quota failure, exit 1).
+# quota (a cap signature on stderr, exit 1), quota-out / quota-err / quota-zero
+# (the same signature on a ZERO exit - the shape run 44962245768 showed the
+# probe cannot currently see), quota-verdict (a started report that never
+# reaches a verdict, cap signature on stdout, exit 0), garbage (a zero exit
+# with no signature and no report), no-ok (a zero exit whose reply carries no
+# OK token), other (a non-quota failure, exit 1).
 set -u
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
@@ -547,6 +549,12 @@ case "${STUB_OPENCODE_MODE:-ok}" in
   quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
   quota-out) printf 'Free usage limit reached for this model\\n'; exit 0 ;;
   quota-err) printf 'Free usage limit reached for this model\\n' >&2; exit 0 ;;
+  quota-zero) printf 'Free usage limit reached for this model\\n'; exit 0 ;;
+  quota-verdict)
+    printf '**Summary:** the agent started.\\nFree usage limit reached for this model\\n'
+    exit 0
+    ;;
+  garbage) printf 'The agent said something unrelated.\\n'; exit 0 ;;
   no-ok) printf 'Here is the answer you asked for.\\n'; exit 0 ;;
   other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
 esac
@@ -694,7 +702,23 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         agent = _load(name)["jobs"][agent_name]
         step = _find_step(agent, rf"^{re.escape(step_name)}$")
         body = _run(step)
-        for mode in ("quota", "other", "verdict"):
+        # The two zero-exit dead ends (no summary line, no verdict line)
+        # classify the quota signature over the raw stream and stderr before
+        # they fail - the cap has been seen arriving on a zero exit.
+        transient = (
+            "usage limit|rate.?limit|quota|insufficient credits|limit reached|"
+            "not available in your country|service unavailable|overloaded"
+        )
+        dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
+        assert body.count(dead_end_grep) == 2, (
+            f"{name}: the two zero-exit dead ends do not both classify the "
+            "quota signature"
+        )
+        # The cap has been seen arriving on a ZERO exit: with no report at all
+        # (quota-zero), or with a report that never reaches a verdict
+        # (quota-verdict), the step must still take the quota path. A zero exit
+        # with no signature (garbage) is still a failure.
+        for mode in ("quota", "quota-zero", "quota-verdict", "verdict", "garbage", "other"):
             case = tmp_path / f"{stage}-{mode}"
             case.mkdir(parents=True, exist_ok=True)
             runner_temp = case / "runner-temp"
@@ -727,7 +751,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
                 text=True,
             )
             comment = runner_temp / stage / "comment.md"
-            if mode == "quota":
+            if mode in ("quota", "quota-zero", "quota-verdict"):
                 assert result.returncode == 0, (
                     f"{name}: the quota path failed the step:\n{result.stderr}"
                 )
@@ -764,7 +788,9 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
                     encoding="utf-8"
                 ), f"{name}: the verdict path wrote no comment"
             else:
-                assert result.returncode == 1, f"{name}: a non-quota failure did not fail the step"
+                assert result.returncode == 1, (
+                    f"{name} ({mode}): a non-quota failure did not fail the step"
+                )
                 assert not comment.is_file() or "Not run: quota" not in (
                     comment.read_text(encoding="utf-8") if comment.is_file() else ""
                 ), f"{name}: a genuine failure took the quota path"
