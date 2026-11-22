@@ -48,13 +48,17 @@ sourced `.accounts.env` / a systemd `EnvironmentFile`.
   only select "the whole live daemon", not one module inside it.
 - `OPS_ALERT_IGNORE` (unset = nothing ignored) — comma-separated denylist of fnmatch patterns
   (e.g. `poll failed for *`, `*heartbeat*`) matched against the message template and the rendered
-  message. A match drops the record even when it is a `data.alert` marker or `CRITICAL`, so this is
-  the explicit "this one routine error is noise" switch. Use it to mute a single noisy ERROR
-  without touching call sites; prefer it over a broad `OPS_ALERT_EVENTS` allowlist.
+  message. Matching is `fnmatchcase`: case-sensitive, and a pattern cannot itself contain a comma
+  (the comma separates entries). A match drops the record even when it is a `data.alert` marker or
+  `CRITICAL`, so this is the explicit "this one routine error is noise" switch — a broad pattern
+  such as `*failed*` can silently mute the known emergency markers, which is why setting it logs a
+  startup warning. Use it to mute a single noisy ERROR without touching call sites; prefer it over
+  a broad `OPS_ALERT_EVENTS` allowlist.
 
-The effective filter (min level, allowlist, denylist) is logged once at startup on the `alerts`
-logger, and setting `OPS_ALERT_EVENTS` additionally logs a warning — a filter that matches nothing
-would otherwise leave the channel silently dead.
+The effective filter (min level, allowlist, denylist) is logged once at startup on the
+`trading.alerts` logger, and setting `OPS_ALERT_EVENTS` or `OPS_ALERT_IGNORE` additionally logs a
+warning — a filter that matches nothing, or a denylist wide enough to mute the emergency markers,
+would otherwise leave the channel silently dead or silently mute.
 
 What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
 any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
@@ -64,8 +68,10 @@ file/console output — then filtered by `OPS_ALERT_IGNORE` and, for routine err
 
 Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
 webhook drops and counts alerts; it can never block or raise into a trading path. A failed send
-(e.g. a Discord 429 or 5xx) is counted and logged on the `alerts` logger, not retried — a single
+(e.g. a Discord 429 or 5xx) is counted and logged on the `trading.alerts` logger, not retried — a single
 lost alert is accepted for v1 rather than risking a retry storm against a struggling webhook.
+The sink's own logger (`trading.alerts`) never pages, so a failing webhook cannot feed alerts
+back into the channel.
 Payloads are
 redacted with the same rules as the JSON log formatter before they leave the process. Only the
 live daemon installs the sink today; other entry points are unaffected.

@@ -526,6 +526,57 @@ class TestFiltering:
             logger.removeHandler(handler)
             sink.close()
 
+    def test_ignore_denylist_matches_template_and_rendered_separately(self):
+        """Each denylist arm is load-bearing: ``"poll failed for %s"`` can
+        only match the message *template* (the rendered text has the argument
+        substituted), and ``"*EURUSD*"`` can only match the *rendered*
+        message. Dropping either ``fnmatchcase`` call must fail here."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink,
+            ignored_patterns=frozenset({"poll failed for %s", "*EURUSD*"}),
+        )
+        logger = logging.getLogger("trading.test-alerts-ignore-arms")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            # Template arm only: rendered is "poll failed for GBPUSD", which
+            # matches neither pattern.
+            logger.error("poll failed for %s", "GBPUSD")
+            # Rendered arm only: the template "quote stale for %s" matches
+            # neither pattern; the rendered text contains EURUSD.
+            logger.error("quote stale for %s", "EURUSD")
+            logger.error("real failure")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["message"] for a in backend.sent] == ["real failure"]
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
+    def test_the_alerts_logger_itself_never_pages(self):
+        """``trading.alerts`` carries this module's own operational warnings
+        (backend send failed, the install-time filter lines). With a lowered
+        ``OPS_ALERT_MIN_LEVEL`` they would otherwise re-enter the sink - and
+        a failing webhook would enqueue a new alert on every failure, since
+        dedup state is committed only on a successful send."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(sink, min_level=logging.WARNING)
+        logger = logging.getLogger("trading.alerts")
+        logger.addHandler(handler)
+        try:
+            logger.warning("ops alert backend send failed: RuntimeError")
+            time.sleep(0.3)
+            assert backend.sent == []
+            assert sink.stats()["sent"] == 0
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
     def test_allowlist_uses_logger_hierarchy_prefix(self):
         """An allowlist entry for a parent logger covers its children, matching
         logging's dotted-name hierarchy."""
@@ -611,10 +662,24 @@ class TestFiltering:
         finally:
             alerts._reset_for_tests()
 
-    def test_install_logs_the_effective_filter(self, caplog):
-        """A misconfigured filter must be visible in the log, not silent."""
+    def test_install_logs_the_effective_filter(self):
+        """A misconfigured filter must be visible in the log, not silent. The
+        lines go through ``trading.alerts`` - the logger ``get_logger`` gives
+        the file and console handlers - so the assertion attaches a capture
+        handler to that real logger. caplog on the root would pass even when
+        the records are dropped in production, which is exactly the defect
+        this pins: a bare ``alerts`` logger has no handlers at all."""
         backend = FakeBackend()
-        with caplog.at_level(logging.INFO, logger="alerts"):
+        ops_logger = logging.getLogger("trading.alerts")
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        capture = _Capture()
+        ops_logger.addHandler(capture)
+        try:
             sink = install_alert_sink(
                 sink=_sink(backend),
                 env={
@@ -624,14 +689,18 @@ class TestFiltering:
                 },
             )
             assert sink is not None
-        messages = [r.getMessage() for r in caplog.records]
+        finally:
+            ops_logger.removeHandler(capture)
+            alerts._reset_for_tests()
+        messages = [r.getMessage() for r in records]
         assert any("min_level" in m and "CRITICAL" in m for m in messages)
         assert any("trading.live-runner" in m for m in messages)
         assert any("flap*" in m for m in messages)
-        # The allowlist being set is itself warned about: it can mute the
-        # whole channel, so it must not install silently.
-        assert any(r.levelno >= logging.WARNING for r in caplog.records)
-        alerts._reset_for_tests()
+        # The allowlist and the denylist being set are themselves warned
+        # about: either can mute the whole channel, so neither may install
+        # silently.
+        assert any(r.levelno >= logging.WARNING for r in records)
+        assert any("denylist" in m for m in messages)
 
     def test_invalid_min_level_falls_back_to_error(self):
         assert alerts._parse_min_level("bogus") == logging.ERROR

@@ -72,6 +72,8 @@ DEFAULT_MIN_LEVEL = logging.ERROR
 EVENTS_ENV = "OPS_ALERT_EVENTS"
 #: Comma-separated denylist of fnmatch patterns matched against the message
 #: template and the rendered message. Mutes even markers and CRITICAL.
+#: ``fnmatchcase`` is case-sensitive and a pattern cannot contain a comma
+#: (the comma is the entry separator).
 IGNORE_ENV = "OPS_ALERT_IGNORE"
 #: Bound on queued alerts; a full queue drops and counts.
 DEFAULT_QUEUE_SIZE = 256
@@ -85,10 +87,24 @@ _DEDUP_STORE_PRUNE_AT = 1024
 #: Flush budget for queued alerts during daemon shutdown.
 SHUTDOWN_FLUSH_SECONDS = 2.0
 
-_logger = logging.getLogger("alerts")
 #: ``logging.Handler`` has no ``formatException`` (that lives on
 #: ``logging.Formatter``); exception-bearing records must render through one.
 _EXC_FORMATTER = logging.Formatter()
+
+
+def _ops_logger() -> logging.Logger:
+    """The ops logger: ``trading.alerts`` via ``shared.logging.get_logger``.
+
+    A bare ``alerts`` logger has no handlers, so its records were dropped
+    (warnings reaching stderr only through ``lastResort``, unformatted and
+    outside the log file): the effective-filter line at install and the
+    backend-failure warning never reached the log. ``get_logger`` gives it
+    the file and console handlers. Resolved lazily so ``import
+    shared.alerts`` keeps no import-time side effects.
+    """
+    from shared.logging import get_logger
+
+    return get_logger("alerts")
 
 
 class AlertBackend(Protocol):
@@ -251,7 +267,7 @@ class AlertSink:
             with self._lock:
                 self._failed += 1
             status = getattr(getattr(exc, "response", None), "status_code", None)
-            _logger.warning(
+            _ops_logger().warning(
                 "ops alert backend send failed: %s%s",
                 type(exc).__name__,
                 f" HTTP {status}" if status is not None else "",
@@ -431,6 +447,13 @@ class AlertLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # This module's own logger must never page: with a lowered
+            # OPS_ALERT_MIN_LEVEL its records (the backend-failure warning
+            # above, the install-time filter lines) would re-enter the sink,
+            # and a failing webhook would enqueue a new alert on every
+            # failure - dedup state is only committed on a successful send.
+            if record.name == "trading.alerts":
+                return
             data = getattr(record, "data", None)
             alert_name = (
                 str(data.get("alert")) if isinstance(data, Mapping) and data.get("alert") else None
@@ -520,19 +543,26 @@ def install_alert_sink(
         ignored_patterns=ignored_patterns,
     )
     # The filter decides what pages; a misconfiguration (e.g. an allowlist
-    # matching nothing) must be visible in the log, not a silently dead
+    # matching nothing, or a denylist wide enough to mute the known markers)
+    # must be visible in the log, not a silently dead or silently mute
     # channel. Logged once per install.
-    _logger.info(
+    _ops_logger().info(
         "ops alert filter: min_level=%s allowed_events=%s ignored=%s",
         logging.getLevelName(min_level),
         sorted(allowed_events) if allowed_events else None,
         sorted(ignored_patterns) if ignored_patterns else None,
     )
     if allowed_events is not None:
-        _logger.warning(
+        _ops_logger().warning(
             "ops alert allowlist %s is set: only matching event classes page "
             "(data.alert markers and CRITICAL records always page)",
             sorted(allowed_events),
+        )
+    if ignored_patterns is not None:
+        _ops_logger().warning(
+            "ops alert denylist %s is set: matching records are muted even "
+            "when they are data.alert markers or CRITICAL",
+            sorted(ignored_patterns),
         )
     _ALERT_HANDLER.setFormatter(logging.Formatter("%(message)s"))
     # Loggers created through shared.logging.get_logger keep LOG_LEVEL on their
