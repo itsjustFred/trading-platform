@@ -529,27 +529,6 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
     return raw_returns
 
 
-def _attach_inferred_freq(returns: pd.Series) -> pd.Series:
-    """Attach an inferred frequency when the datetime index is regular."""
-    if not isinstance(returns.index, pd.DatetimeIndex) or len(returns.index) < 3:
-        return returns
-
-    try:
-        freq = pd.infer_freq(returns.index)
-    except ValueError:
-        return returns
-
-    if not freq:
-        return returns
-
-    try:
-        copied = returns.copy()
-        copied.index = pd.DatetimeIndex(copied.index, freq=freq)
-        return copied
-    except ValueError:
-        return returns
-
-
 def _net_trade_pnl(trade: Trade) -> float:
     """Net realized PnL for one trade (#84: never silently gross)."""
     if trade.net_pnl is not None:

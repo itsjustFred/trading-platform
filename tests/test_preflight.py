@@ -27,6 +27,9 @@ class TestPreflightValidator:
                 account_id="acc1",
                 symbols=["AAPL"],
                 timeframe="1h",
+                # The default status is ACTIVE, which without a Discord signal
+                # source is untradeable (#242), so a valid fixture must say so.
+                status="PAUSED",
             )
         ]
         errors, warnings = _validate_deployments(accounts, deployments)
@@ -218,6 +221,53 @@ class TestPreflightResultSerialization:
         assert len(jsonable["accounts"]) == 1
         assert jsonable["accounts"][0]["broker"] == "alpaca"
         assert jsonable["accounts"][0]["warnings"] == ["test warning"]
+
+
+# ── ACTIVE deployments no runner can trade (#242) ────────────────────────────
+
+
+def test_active_non_discord_deployment_warns_it_will_never_trade():
+    deployments = [
+        LiveDeploymentConfig(
+            strategy_name="internal_strat",
+            account_id="acc1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="ACTIVE",
+            signal_source="internal",
+            signal_source_type="internal",
+        )
+    ]
+
+    errors, warnings = _validate_deployments(
+        [LiveAccountConfig(id="acc1", broker="alpaca")], deployments
+    )
+
+    assert errors == []
+    assert len(warnings) == 1
+    assert "internal_strat" in warnings[0]
+    assert "no live strategy runner" in warnings[0]
+
+
+def test_non_active_non_discord_deployment_does_not_warn():
+    deployments = [
+        LiveDeploymentConfig(
+            strategy_name="paused_strat",
+            account_id="acc1",
+            symbols=["AAPL"],
+            timeframe="1h",
+            status="PAUSED",
+            signal_source="internal",
+            signal_source_type="internal",
+        )
+    ]
+
+    errors, warnings = _validate_deployments(
+        [LiveAccountConfig(id="acc1", broker="alpaca")], deployments
+    )
+
+    assert errors == []
+    assert warnings == []
 
 
 if __name__ == "__main__":
