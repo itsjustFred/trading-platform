@@ -30,7 +30,17 @@ from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
-from runner.engines.contract import flag_missing_intrabar, resolve_same_bar_exit
+from runner.engines.contract import (
+    EXIT_LEVEL_GAPPED,
+    EXIT_LEVEL_UNREACHABLE,
+    EXIT_ORDER_TYPE_LEVEL,
+    exit_level_disposition,
+    exit_order_type_is_present,
+    flag_missing_intrabar,
+    normalize_exit_order_type,
+    resolve_same_bar_exit,
+    usable_exit_price,
+)
 from runner.fees import resolve_fee_model
 from shared.lot_grid import floor_qty_to_step
 from shared.models import (
@@ -178,8 +188,25 @@ class TradeEngine:
         self._indicator_series: list[IndicatorSeries] = []
         self._execution_model = ExecutionModelSettings.from_config(config)
         self._realized_pnl = 0.0
+        # Sizing capital (Cleanup 16-D1, F21 / decision record D2; #262):
+        # position sizing draws on REALIZED CASH only — ``initial_capital``
+        # plus the net PnL of closed trades. The mark-to-market
+        # ``self.equity`` stays the *reporting* equity (it feeds the equity
+        # curve) and must never reach a sizing decision: an open position's
+        # paper profit is not spendable, and an unrealized drawdown is not a
+        # realized loss. The basis is decided by D2; the references are
+        # consistent with it but cannot distinguish the two, because none of
+        # them ever sizes while a position is open — MT5 risks a fixed cash
+        # amount and reads no account value at all (the repo's MT5 sizing
+        # fallback starts at the capital and is credited only when a trade
+        # closes), and the vectorbt runner holds one position at a time
+        # (``in_trade``) with no partial exit, so it credits ``equity`` with
+        # ``pnl - fees`` only at the close and never sizes against an open
+        # mark. Realized cash equals mark-to-market there.
+        self._sizing_equity = float(config.initial_capital)
         self._trade_counter = 0
         self._signals_frame: pd.DataFrame | None = None
+        self._warned_exit_order_keys: set[str] = set()
         self._intrabar = self._prepare_intrabar(intrabar_data)
         self._progress_callback = progress_callback
         self._progress_start = float(progress_start)
@@ -319,10 +346,53 @@ class TradeEngine:
             return "LONG"
         return normalize_direction_value(row["direction"])
 
+    def _refresh_sizing_equity(self) -> None:
+        """Recompute the spendable sizing cash from the realized ledger.
+
+        ``_close_partial`` books exit legs gross and ``_finalize_position``
+        backs the whole round-trip fee out only when the last leg closes, so a
+        position's realized cash is not fully spendable until it is finalized.
+        What is held back is exactly the cost the fee model has ALREADY
+        incurred for every still-open position, and nothing it has not:
+
+        - the ENTRY leg on the position's original quantity (plus the
+          per-trade surcharge, owed from the moment the position was
+          opened) — which is why a position with no exit yet holds its entry
+          fee back too, and
+        - the EXIT fee of every leg that has already closed, priced at that
+          leg's own fill price.
+
+        The exit leg of the still-open remainder is a FUTURE cost and is
+        deliberately not held back: sizing may not be reduced by a fee the
+        position has not incurred (and may never incur at that price). At
+        finalization the ledger charges ``fee_for_trade``, which is exactly
+        the entry leg plus every exit leg, so the held-back estimate and the
+        charged figure meet there.
+        """
+        owed = 0.0
+        fee_model = None
+        for position in self.positions:
+            # A finalized position's fees are already in ``_realized_pnl``;
+            # an open one (with or without exits) still owes its entry leg.
+            if position.remaining_qty <= 1e-9:
+                continue
+            if fee_model is None:
+                fee_model = resolve_fee_model(self.config.parameters)
+            owed += fee_model.entry_fee(
+                float(position.entry_price), float(position.quantity)
+            )
+            for item in position.exits:
+                owed += fee_model.exit_fee(
+                    float(item.price or 0.0), float(item.quantity or 0.0)
+                )
+        self._sizing_equity = self.config.initial_capital + self._realized_pnl - owed
+
     def _current_risk_exposure(
         self, reference_price: float, exclude_order: Order | None = None
     ) -> float:
-        if self.equity <= 0:
+        # F21 (D2): the aggregate-risk denominator is the same realized cash
+        # the sizing call uses — never the mark-to-market reporting equity.
+        if self._sizing_equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
@@ -336,7 +406,9 @@ class TradeEngine:
                     "Cannot compute exposure for a stopless open position"
                 )
             risk_distance = abs(float(position.entry_price) - float(stop_loss))
-            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(self.equity)
+            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(
+                self._sizing_equity
+            )
 
         for order in self.pending_orders:
             if exclude_order is not None and order is exclude_order:
@@ -364,7 +436,9 @@ class TradeEngine:
                     "Cannot compute exposure for a stopless pending order"
                 )
             risk_distance = abs(float(reference_price) - float(stop_loss))
-            risk_exposure += (risk_distance * float(order.quantity)) / float(self.equity)
+            risk_exposure += (risk_distance * float(order.quantity)) / float(
+                self._sizing_equity
+            )
 
         return max(0.0, risk_exposure)
 
@@ -454,10 +528,10 @@ class TradeEngine:
                     shares = min(shares, max_lot_grid)
                 uncapped_shares = shares
                 if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self.equity * position_notional_limit
+                    max_value = self._sizing_equity * position_notional_limit
                     shares = min(shares, max_value / entry_price)
                 elif self._max_position_exposure_pct is not None:
-                    max_value = self.equity * self._max_position_exposure_pct
+                    max_value = self._sizing_equity * self._max_position_exposure_pct
                     shares = min(shares, max_value / entry_price)
                 # Issue #151: the leverage/exposure cap is a raw
                 # equity/price ratio, so it can leave a size off the
@@ -537,7 +611,10 @@ class TradeEngine:
             )
             sized_order = self._risk_engine.calculate_position_size(
                 signal=signal,
-                account_balance=float(self.equity),
+                # F21 (D2): realized cash, NOT the mark-to-market
+                # ``self.equity`` — an open position's paper PnL must not
+                # change the size of the next entry.
+                account_balance=float(self._sizing_equity),
                 pip_value=1.0,
                 current_exposure=self._current_risk_exposure(
                     float(entry_price), exclude_order=exclude_order
@@ -554,7 +631,9 @@ class TradeEngine:
                 "Set risk_per_trade_pct or fixed_risk_amount explicitly."
             )
 
-        max_value = self.equity * position_notional_limit
+        # F21 (D2): the notional/leverage cap is denominated in the same
+        # realized sizing cash as the risk target.
+        max_value = self._sizing_equity * position_notional_limit
         shares = min(shares, max_value / entry_price)
         return max(shares, 0.0)
 
@@ -656,12 +735,18 @@ class TradeEngine:
         order._sizing_only_stop = stop_loss is None and sizing_only_stop is not None
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
         # proportional), so the shared-equity replay must not re-scale this
-        # order's quantity — it still tracks exposure and credits PnL. The
+        # order's quantity - it still tracks exposure and credits PnL. The
         # flag is derived through the same gate the sizing branch uses (see
         # `_equity_proportional_for_stop`), including the #170
         # `fixed_risk_amount: 0.0`-is-off read. Transient marker: not an
         # `Order` dataclass field.
         order._equity_proportional = self._equity_proportional_for_stop(size_from_stop)
+        # F21 (D2): the realized-cash basis this quantity was computed from. It
+        # travels with the order because the quantity that survives to the fill
+        # is not always recomputed there - a MARKET order whose only stop is the
+        # sizing fallback keeps its creation-time estimate (D4), so re-reading
+        # the ledger at fill time could record a basis the quantity never saw.
+        order._sizing_equity = float(self._sizing_equity)
         self.pending_orders.append(order)
 
     def _open_position(self, order: Order, fill_price: float, fill_time: str, i: int) -> None:
@@ -670,7 +755,17 @@ class TradeEngine:
         # running portfolio equity (position size is linear in equity, so the
         # per-unit coefficient quantity/equity_at_entry replays exactly).
         position_meta = dict(getattr(order, "meta", None) or {})
-        position_meta["equity_at_entry"] = round(float(self.equity), 2)
+        # The basis is the equity the order was SIZED from (realized cash,
+        # F21/D2), not the mark-to-market reporting equity: the multi-symbol
+        # replay recovers the per-unit coefficient quantity / equity_at_entry
+        # from it, and ``replay_shared_equity`` accumulates realized PnL only.
+        # It is the basis of the quantity that actually survived to this fill —
+        # the fill-time ledger when the order was re-sized at fill, the
+        # creation-time one when a fallback-sized MARKET order kept its
+        # creation-time quantity (D4).
+        position_meta["equity_at_entry"] = round(
+            float(getattr(order, "_sizing_equity", self._sizing_equity)), 2
+        )
         sizing_stop = getattr(order, "_sizing_stop_loss", None)
         if sizing_stop is not None:
             position_meta["sizing_stop_loss"] = float(sizing_stop)
@@ -694,6 +789,10 @@ class TradeEngine:
                 meta=position_meta,
             )
         )
+        # F21 (D2): the position's entry leg is owed from this fill, so the
+        # spendable cash drops now — a run with no exit yet must still hold it
+        # back from the next entry.
+        self._refresh_sizing_equity()
 
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
         if not self.pending_orders:
@@ -719,30 +818,40 @@ class TradeEngine:
                 else:
                     fill_price = bar_open
             elif order.order_type == OrderType.LIMIT:
+                # #288: like MARKET, a pending order may never fill on its
+                # creation bar — the signal is computed from that bar's
+                # close, so spending its range would be lookahead.
                 if order.direction == "LONG" and order.limit_price is not None:
-                    filled = bar_low <= order.limit_price
+                    filled = i > order.created_index and bar_low <= order.limit_price
                     fill_price = order.limit_price
                 elif order.direction == "SHORT" and order.limit_price is not None:
-                    filled = bar_high >= order.limit_price
+                    filled = i > order.created_index and bar_high >= order.limit_price
                     fill_price = order.limit_price
             elif order.order_type == OrderType.STOP:
                 if order.direction == "LONG" and order.stop_price is not None:
-                    filled = bar_high >= order.stop_price
+                    filled = i > order.created_index and bar_high >= order.stop_price
                     fill_price = order.stop_price
                 elif order.direction == "SHORT" and order.stop_price is not None:
-                    filled = bar_low <= order.stop_price
+                    filled = i > order.created_index and bar_low <= order.stop_price
                     fill_price = order.stop_price
             elif order.order_type == OrderType.STOP_LIMIT:
-                trigger = False
+                # The trigger is evaluated per bar, not latched: trigger and
+                # limit must both be reached on the same bar. Whether #339
+                # needs a latched trigger is tracked in #371.
+                trigger = i > order.created_index
                 if order.direction == "LONG" and order.stop_price is not None:
-                    trigger = bar_high >= order.stop_price
+                    trigger = trigger and bar_high >= order.stop_price
                     filled = (
-                        trigger and order.limit_price is not None and bar_low <= order.limit_price
+                        trigger
+                        and order.limit_price is not None
+                        and bar_low <= order.limit_price
                     )
                 elif order.direction == "SHORT" and order.stop_price is not None:
-                    trigger = bar_low <= order.stop_price
+                    trigger = trigger and bar_low <= order.stop_price
                     filled = (
-                        trigger and order.limit_price is not None and bar_high >= order.limit_price
+                        trigger
+                        and order.limit_price is not None
+                        and bar_high >= order.limit_price
                     )
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
@@ -793,6 +902,9 @@ class TradeEngine:
                         stop_distance=order.stop_distance,
                         exclude_order=order,
                     )
+                    # F21 (D2): the quantity was just recomputed from the
+                    # fill-time ledger, so that is now the basis to record.
+                    order._sizing_equity = float(self._sizing_equity)
                     if order.quantity <= 0:
                         continue
                     order._equity_proportional = self._equity_proportional_for_stop(order.stop_loss)
@@ -840,6 +952,10 @@ class TradeEngine:
                             stop_distance=order.stop_distance,
                             exclude_order=order,
                         )
+                        # F21 (D2): same as the LIMIT/STOP re-size above — the
+                        # surviving quantity is the fill-time one, so the
+                        # fill-time basis is the one to record.
+                        order._sizing_equity = float(self._sizing_equity)
                         if order.quantity <= 0:
                             continue
                         # A-M4 (D5)/#170: the fill-time re-size can select a
@@ -915,7 +1031,12 @@ class TradeEngine:
             )
         )
         position.remaining_qty -= qty
+        # #84: exit legs accumulate gross; ``_finalize_position`` backs the
+        # fees out, so this running realized figure is net (F21/D2).
         self._realized_pnl += pnl
+        # F21 (D2): cash becomes spendable the moment it is realized, net of
+        # the round-trip fees the still-open position will owe.
+        self._refresh_sizing_equity()
 
     def _finalize_position(self, position: Position, exit_index: int) -> None:
         if position.remaining_qty > 1e-9:
@@ -943,6 +1064,10 @@ class TradeEngine:
         # #84: exit legs accumulated gross into _realized_pnl — back the
         # costs out here so the equity path is net.
         self._realized_pnl -= fees
+        # F21 (D2): the spendable sizing cash follows the NET realized figure
+        # (the fee model is part of the realized path), so it is refreshed
+        # here as well as at every partial close.
+        self._refresh_sizing_equity()
         take_profit = None
         if position.take_profit_levels:
             first_level = position.take_profit_levels[0]
@@ -995,9 +1120,49 @@ class TradeEngine:
         )
         self.closed_trades.append(trade)
 
-    def _close_position(self, row: pd.Series, i: int, reason: str) -> None:
+    def _warn_exit_order_once(self, key: str, message: str, *args: Any) -> None:
+        if key in self._warned_exit_order_keys:
+            return
+        self._warned_exit_order_keys.add(key)
+        logger.warning(message, *args)
+
+    def _close_position(
+        self,
+        row: pd.Series,
+        i: int,
+        reason: str,
+        *,
+        exit_order_type: Any = None,
+        exit_price: Any = None,
+    ) -> None:
         if not self.positions:
             return
+
+        # Explicit exit order type (#243): "level" fills the signal exit at the
+        # strategy's exit_price instead of the convention price; "market" and
+        # an unspecified value keep the legacy market fill (native never read
+        # exit_price before this contract existed).
+        order_type = normalize_exit_order_type(exit_order_type)
+        if order_type is None and exit_order_type_is_present(exit_order_type):
+            self._warn_exit_order_once(
+                "exit_order_type_invalid",
+                "%s: unrecognized exit_order_type value %r; expected 'market' "
+                "or 'level'. Falling back to the market fill.",
+                self.symbol,
+                exit_order_type,
+            )
+        level_exit_price: float | None = None
+        level_missing_price = False
+        if order_type == EXIT_ORDER_TYPE_LEVEL:
+            level_exit_price = usable_exit_price(exit_price)
+            if level_exit_price is None:
+                level_missing_price = True
+                self._warn_exit_order_once(
+                    "exit_level_missing_price",
+                    "%s: exit_order_type='level' but no usable exit_price on "
+                    "the exit bar; falling back to the market fill.",
+                    self.symbol,
+                )
 
         # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close
         # for signal exits — the exit fills at the trigger bar's close by
@@ -1015,12 +1180,90 @@ class TradeEngine:
         base_exit = float(row["open"]) if fill_at_open else float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
+        ask_high, ask_low = self._ask_bar(row)
 
         for position in self.positions:
-            exit_price = base_exit + (spread if position.direction == "SHORT" else 0.0)
+            position_level = level_exit_price
+            level_unreachable = False
+            level_gapped = False
+            if position_level is not None:
+                # A-H4/A-L5: a SHORT exit buys the ask, so reachability is
+                # judged on the ask range when ask-side data is enabled —
+                # the same side _check_stops and _update_equity use.
+                bar_high = row.get("high")
+                bar_low = row.get("low")
+                if position.direction != "LONG":
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                disposition = exit_level_disposition(
+                    direction=position.direction,
+                    level=position_level,
+                    high=bar_high,
+                    low=bar_low,
+                )
+                if disposition == EXIT_LEVEL_UNREACHABLE:
+                    # A level the exit bar never traded through could not
+                    # have filled — fall back to the market fill rather
+                    # than book a fantasy price.
+                    position_level = None
+                    level_unreachable = True
+                    self._warn_exit_order_once(
+                        "exit_level_unreachable",
+                        "%s: exit_order_type='level' price %.6f is outside the "
+                        "exit bar's traded range; falling back to the market fill.",
+                        self.symbol,
+                        level_exit_price,
+                    )
+                elif disposition == EXIT_LEVEL_GAPPED:
+                    # The level sat beyond the bar on the marketable side:
+                    # the resting order was marketable at the open, so it
+                    # fills at the bar's open (gap-through-level), never at
+                    # the level itself.
+                    position_level = None
+                    level_gapped = True
+                    self._warn_exit_order_once(
+                        "exit_level_gapped",
+                        "%s: exit_order_type='level' price %.6f gapped the "
+                        "exit bar's open; filling at the open instead of the "
+                        "level.",
+                        self.symbol,
+                        level_exit_price,
+                    )
+            if position_level is not None:
+                # A level fill trades at the level itself — no spread, like
+                # the stop/TP legs.
+                fill_price = position_level
+            elif level_gapped:
+                # Gap-through-level: marketable at the open. A SHORT buy
+                # lifts the ask (open + spread); a LONG sell hits the bid.
+                open_value = row.get("open")
+                gap_base = (
+                    float(open_value)
+                    if open_value is not None and pd.notna(open_value)
+                    else float(row["close"])
+                )
+                fill_price = gap_base + (
+                    self._bar_spread(row)
+                    if position.direction != "LONG"
+                    else 0.0
+                )
+            else:
+                fill_price = base_exit + (
+                    spread if position.direction == "SHORT" else 0.0
+                )
+            if level_missing_price:
+                position.meta["exit_level_missing_price"] = True
+            if level_unreachable:
+                position.meta["exit_level_unreachable"] = True
+            if level_gapped:
+                position.meta["exit_level_gapped"] = True
+            if order_type is not None:
+                position.meta["exit_order_type"] = order_type
             self._close_partial(
                 position,
-                price=exit_price,
+                price=fill_price,
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,
@@ -1406,6 +1649,12 @@ class TradeEngine:
             position.mae = min(position.mae, low_pnl)
 
         self.equity = self.config.initial_capital + self._realized_pnl + unrealized
+        # NOTE (Cleanup 16-D1, F21 / decision record D2): ``self.equity`` is the
+        # mark-to-market REPORTING equity (it feeds the equity curve); it
+        # deliberately does NOT feed position sizing. Sizing draws on
+        # ``self._sizing_equity`` (realized cash only), so an unrealized
+        # drawdown cannot deflate new sizes and unrealized profit cannot
+        # compound into them either.
         self.equity_curve.append(
             EquityPoint(time=self._to_iso(row["timestamp"]), equity=round(float(self.equity), 2))
         )
@@ -1552,7 +1801,13 @@ class TradeEngine:
                 self._create_order(merged_row, i, direction)
 
             if bool(exits.iloc[i]):
-                self._close_position(row, i, reason="signal")
+                self._close_position(
+                    row,
+                    i,
+                    reason="signal",
+                    exit_order_type=merged_row.get("exit_order_type"),
+                    exit_price=merged_row.get("exit_price"),
+                )
 
             self._update_equity(row, i)
 

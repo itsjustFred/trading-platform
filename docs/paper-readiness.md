@@ -122,7 +122,9 @@ The paper-trading evidence needs:
 - a run on a paper/demo account (Alpaca paper or cTrader demo) of at least
   **60 days** that has ended (default, configurable),
 - at least **30 trades** (default, configurable),
-- a report file, whose SHA256 is recorded in the promotion ledger.
+- a report file, whose path and SHA256 are recorded in the promotion ledger and
+  re-hashed every time the promotion is checked (editing or deleting the report
+  makes the code `experimental` again).
 
 The other two are an out-of-sample result with a passed overfitting verdict
 (test segment ≥ 180 days and ≥ 50 trades) and cross-engine or reference parity

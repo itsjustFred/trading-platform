@@ -28,6 +28,10 @@ from runner.optimization_diagnostics import (
     train_validation_degradation,
     walk_forward_train_validation_folds,
 )
+from runner.portfolio_optimizer import (
+    MIN_OOS_DAILY_OBSERVATIONS,
+    daily_observation_count,
+)
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
 from runner.stats import compute_stats_for_result, daily_returns_moments
 from runner.universe_provenance import (
@@ -316,6 +320,11 @@ class OptimizationConfig(BaseModel):
     # This is an overfitting / selection-luck hint, not a judgement of
     # strategy quality: a low Sharpe can still be a useful portfolio component.
     min_deflated_sharpe: float = Field(default=0.90, gt=0.0, le=1.0)
+    # Minimum distinct DAILY observations in the OOS holdout before its
+    # statistics are trusted (#133). Intraday bars on the same day count once.
+    min_oos_daily_observations: int = Field(
+        default=MIN_OOS_DAILY_OBSERVATIONS, ge=1
+    )
 
     @field_validator("base_backtest_id", "target_metric")
     @classmethod
@@ -876,13 +885,27 @@ def run_optimization(
         )
     final_test_stats = dict(winner_test_row["test_stats"])
     validation_stats = dict(winner_row["validation_stats"])
+    oos_daily_observations = int(winner_test_row.get("test_daily_observations") or 0)
+    oos_status = (
+        "available"
+        if oos_daily_observations >= config.min_oos_daily_observations
+        else "insufficient_oos_bars"
+    )
+    if oos_status != "available":
+        # #133: risk-adjusted ratios computed on too few daily observations are
+        # noise, not evidence — withhold them from the headline holdout while
+        # keeping factual fields (trade counts, pnl) for diagnostics.
+        final_test_stats = _withhold_oos_risk_metrics(final_test_stats)
     # Flags the winner's overfitting risk; it never changes the selection or
-    # drops the result.
+    # drops the result. An OOS holdout below the daily-observation minimum is
+    # itself an overfitting/insufficient-evidence failure.
     overfitting = _overfitting_payload(
         winner_row=winner_row,
         train_stats=best_train_stats,
         selectable_rows=selectable_rows,
         config=config,
+        oos_daily_observations=oos_daily_observations,
+        min_oos_daily_observations=config.min_oos_daily_observations,
     )
 
     now = datetime.now(timezone.utc)
@@ -940,7 +963,9 @@ def run_optimization(
         "validation_stats": _json_safe(validation_stats),
         "final_test_period": test_period,
         "final_test_stats": _json_safe(final_test_stats),
-        "oos_status": "available",
+        "oos_status": oos_status,
+        "oos_daily_observations": oos_daily_observations,
+        "min_oos_daily_observations": config.min_oos_daily_observations,
         "three_way": {
             "segments": split.as_dict(),
             "winner": {
@@ -949,6 +974,7 @@ def run_optimization(
                 "validation_metrics": _json_safe(validation_stats),
                 "test_metrics": _json_safe(final_test_stats),
             },
+            "oos_metrics_withheld": oos_status != "available",
             "selection": _selection_payload(
                 selection=selection,
                 validation_rows=validation_rows,
@@ -1384,6 +1410,7 @@ def _evaluate_top_set_on_test(
             "test_metric_value": None,
             "test_stats": {},
             "test_failure_reason": None,
+            "test_daily_observations": 0,
         }
         # Same isolation as the validation pass: one candidate whose holdout
         # run fails is recorded, and the rest of the top set still reports.
@@ -1400,6 +1427,9 @@ def _evaluate_top_set_on_test(
             )
             stats = _canonical_stats(result)
             metric_value = _metric_value(stats, config.target_metric)
+            row["test_daily_observations"] = daily_observation_count(
+                point.time for point in result.equity_curve
+            )
         except (ValueError, RuntimeError, KeyError) as exc:
             row["test_failure_reason"] = f"{type(exc).__name__}: {exc}"
             rows.append(row)
@@ -1550,12 +1580,43 @@ def _selection_payload(
     }
 
 
+#: Risk-adjusted performance ratios that are meaningless on an undersized
+#: out-of-sample holdout (#133). Factual fields (trade counts, pnl, returns
+#: in currency) stay: they describe what happened, not whether it is
+#: statistically meaningful.
+_OOS_RISK_METRIC_KEYS = frozenset(
+    {
+        "sharpe_ratio",
+        "sharpe",
+        "sortino_ratio",
+        "sortino",
+        "calmar_ratio",
+        "calmar",
+        "max_drawdown_pct",
+        "max_drawdown",
+        "psr",
+        "deflated_sharpe_ratio",
+    }
+)
+
+
+def _withhold_oos_risk_metrics(stats: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop risk-adjusted ratios from OOS stats below the daily minimum."""
+    return {
+        key: value
+        for key, value in dict(stats).items()
+        if key not in _OOS_RISK_METRIC_KEYS
+    }
+
+
 def _overfitting_payload(
     *,
     winner_row: Mapping[str, Any],
     train_stats: Mapping[str, Any],
     selectable_rows: Sequence[Mapping[str, Any]],
     config: OptimizationConfig,
+    oos_daily_observations: int | None = None,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> dict[str, Any]:
     """The winner's train->validation degradation and deflated Sharpe (#164).
 
@@ -1605,8 +1666,32 @@ def _overfitting_payload(
         max_degradation=config.max_train_validation_degradation,
         min_deflated_sharpe=config.min_deflated_sharpe,
     )
+    checks = dict(verdict.get("checks") or {})
+    reasons = list(verdict.get("reasons") or [])
+    passed = bool(verdict.get("passed"))
+    if (
+        oos_daily_observations is not None
+        and oos_daily_observations < min_oos_daily_observations
+    ):
+        # #133: too few distinct daily OOS observations means the holdout
+        # cannot support a promotion decision; the verdict must say so rather
+        # than leaving oos_status as a label the gate never reads.
+        checks["oos_daily_observations"] = {
+            "value": int(oos_daily_observations),
+            "threshold": int(min_oos_daily_observations),
+            "passed": False,
+            "computable": True,
+        }
+        reasons.append(
+            f"out-of-sample holdout has {int(oos_daily_observations)} daily "
+            f"observations, below the required {int(min_oos_daily_observations)}"
+        )
+        passed = False
     return {
         **verdict,
+        "passed": passed,
+        "checks": checks,
+        "reasons": reasons,
         "degradation": _safe_float_or_none(degradation),
         "deflated_sharpe": _safe_float_or_none(deflated),
         "metric": TARGET_METRIC_ALIASES.get(config.target_metric, config.target_metric),
@@ -2152,6 +2237,14 @@ def _run_risk_parity_covariance_optimization(
         strategy_path,
     )
     test_stats = _canonical_stats(test_result)
+    test_daily_observations = daily_observation_count(
+        point.time for point in test_result.equity_curve
+    )
+    oos_status = (
+        "available"
+        if test_daily_observations >= config.min_oos_daily_observations
+        else "insufficient_oos_bars"
+    )
 
     now = datetime.now(timezone.utc)
     optimization_id = (
@@ -2194,8 +2287,17 @@ def _run_risk_parity_covariance_optimization(
             "diversification_ratio": selection["best_diversification_ratio"],
             "avg_abs_correlation": selection["best_avg_abs_correlation"],
         },
-        "test_stats": _json_safe(test_stats),
-        "oos_status": "available",
+        # This path has no overfitting verdict to carry the failure, so an
+        # undersized OOS holdout withholds its risk-adjusted ratios rather
+        # than leaving them readable as if they were evidence.
+        "test_stats": _json_safe(
+            test_stats
+            if oos_status == "available"
+            else _withhold_oos_risk_metrics(test_stats)
+        ),
+        "oos_status": oos_status,
+        "oos_daily_observations": test_daily_observations,
+        "min_oos_daily_observations": config.min_oos_daily_observations,
         "risk_parity": _json_safe(selection),
         "top_trials": [],
     }
