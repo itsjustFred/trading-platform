@@ -17,7 +17,8 @@ Data sources, in precedence order:
   ``<root>/ohlcv``, a temporary wrapper directory with an ``ohlcv`` symlink
   is created (the adapters resolve ``<data_dir>/ohlcv``).
 - otherwise: deterministic synthetic OHLCV is generated under
-  ``--synthetic-dir`` (default ``$DATA_DIR/engine-migration-gate/synthetic``).
+  ``--synthetic-dir``; when that flag is absent a temporary directory is
+  used so tooling runs never drop synthetic data into ``$DATA_DIR``.
 
 Run from the repo root::
 
@@ -75,7 +76,7 @@ from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import merge_canonical_stats
 from scripts._safe_path import under_root
 from shared.atomic_io import write_text_atomically
-from shared.constants import DATA_DIR, normalize_timeframe
+from shared.constants import normalize_timeframe
 from shared.models import StrategyType
 from shared.strategy_registry import (
     detect_strategy_type,
@@ -205,6 +206,9 @@ def _resolve_data_root(
             return DataResolution(data_root=root.parent, mode=TEST_OHLCV_DIR_ENV)
         # The adapters hardcode ``<data_dir>/ohlcv``; bridge with a symlink so
         # the env var keeps its conftest meaning (the OHLCV content root).
+        # ``resolve()`` first: a relative env value would leave a dangling
+        # symlink inside the temp wrapper.
+        root = root.resolve()
         wrapper = tempfile.TemporaryDirectory(prefix="engine_gate_ohlcv_")
         link = Path(wrapper.name) / "ohlcv"
         try:
@@ -223,12 +227,16 @@ def _resolve_data_root(
             cleanup=wrapper,
         )
 
-    target = (
-        Path(synthetic_dir).expanduser()
-        if synthetic_dir is not None
-        else Path(DATA_DIR) / "engine-migration-gate" / "synthetic"
+    if synthetic_dir is not None:
+        return DataResolution(
+            data_root=Path(synthetic_dir).expanduser(), mode="synthetic"
+        )
+    # Default: a throwaway directory. Writing synthetic OHLCV under the
+    # default $DATA_DIR would drop test fixtures next to real market data.
+    wrapper = tempfile.TemporaryDirectory(prefix="engine_gate_synth_")
+    return DataResolution(
+        data_root=Path(wrapper.name), mode="synthetic", cleanup=wrapper
     )
-    return DataResolution(data_root=target, mode="synthetic")
 
 
 def _write_synthetic_ohlcv(
@@ -240,6 +248,7 @@ def _write_synthetic_ohlcv(
 ) -> int:
     """Write deterministic synthetic OHLCV for ``symbols``; returns bar count."""
     freq_map = {
+        "s1": "s",
         "1m": "min",
         "5m": "5min",
         "15m": "15min",
@@ -247,14 +256,22 @@ def _write_synthetic_ohlcv(
         "1h": "h",
         "4h": "4h",
         "1d": "D",
+        "1w": "W",
     }
-    freq = freq_map.get(timeframe, "h")
+    freq = freq_map.get(timeframe)
+    if freq is None:
+        raise ValueError(
+            f"no synthetic bar frequency for timeframe {timeframe!r}; "
+            f"supported: {sorted(freq_map)}"
+        )
     timestamps = pd.date_range(start, end, freq=freq, tz="UTC")
     bars = 0
     for index, symbol in enumerate(symbols):
         rng = np.random.default_rng(seed=20261121 + index)
         returns = rng.normal(0.0004, 0.012, size=len(timestamps))
-        close = 100.0 * np.exp(np.cumsum(returns))
+        # Clip the cumulative log-return: fine timeframes (s1) over long
+        # windows would otherwise overflow np.exp into non-finite prices.
+        close = 100.0 * np.exp(np.clip(np.cumsum(returns), -50.0, 50.0))
         open_ = np.concatenate([[100.0], close[:-1]])
         spread = np.abs(rng.normal(0.0, 0.15, size=len(timestamps)))
         frame = pd.DataFrame(
@@ -343,19 +360,30 @@ def _norm_time(value: Any) -> str:
         return str(value)
 
 
-def _trade_signature(trade: Any) -> tuple:
-    """Stable comparable signature for one trade (floats rounded to 9dp)."""
+#: Signature precision = the coarsest precision either engine stores. The
+#: vectorbt adapter persists prices at 6dp, quantities at 4dp and money at
+#: 2dp (``vectorbt_adapter.py`` Trade construction) while native stores
+#: unrounded values; comparing at the stored precision keeps pure
+#: representation rounding from reading as a trade difference while any
+#: real fill/size/PnL divergence still diffs.
+_SIG_PRICE_DP = 6
+_SIG_QTY_DP = 4
+_SIG_MONEY_DP = 2
 
-    def rnd(value: Any) -> Any:
+
+def _trade_signature(trade: Any) -> tuple:
+    """Stable comparable signature for one trade at stored precision."""
+
+    def rnd(value: Any, digits: int) -> Any:
         number = _f(value)
-        return round(number, 9) if number is not None else value
+        return round(number, digits) if number is not None else value
 
     exits = tuple(
         (
             _norm_time(exit_.time),
-            rnd(exit_.price),
-            rnd(exit_.quantity),
-            rnd(exit_.pnl),
+            rnd(exit_.price, _SIG_PRICE_DP),
+            rnd(exit_.quantity, _SIG_QTY_DP),
+            rnd(exit_.pnl, _SIG_MONEY_DP),
             exit_.reason,
         )
         for exit_ in trade.exits
@@ -364,12 +392,12 @@ def _trade_signature(trade: Any) -> tuple:
         trade.symbol,
         trade.direction,
         _norm_time(trade.entry_time),
-        rnd(trade.entry_price),
-        rnd(trade.quantity),
+        rnd(trade.entry_price, _SIG_PRICE_DP),
+        rnd(trade.quantity, _SIG_QTY_DP),
         exits,
-        rnd(trade.pnl),
-        rnd(trade.fees),
-        rnd(trade.net_pnl),
+        rnd(trade.pnl, _SIG_MONEY_DP),
+        rnd(trade.fees, _SIG_MONEY_DP),
+        rnd(trade.net_pnl, _SIG_MONEY_DP),
         trade.exit_reason,
     )
 
@@ -467,6 +495,60 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _skip_reason(entry: Any, gate: GateConfig) -> str | None:
+    """Why a registry entry cannot join the native/vectorbt comparison."""
+    if (
+        detect_strategy_type(entry.file_path, gate.strategies_dir).value
+        == StrategyType.SIGNAL_PROCESSOR.value
+    ):
+        return "signal_processor strategies are not engine backtests"
+    # Strategies declaring an engine outside {native, vectorbt} (pynecore,
+    # lean) cannot run on either side of this comparison. Skipping avoids
+    # executing their modules at all — importing a pynecore strategy
+    # rewrites its generated .toml/context files as a side effect.
+    if entry.engine not in {"native", "vectorbt"}:
+        return (
+            f"declared engine {entry.engine!r} is outside the "
+            "native/vectorbt comparison"
+        )
+    return None
+
+
+def _compare_engines(
+    record: dict[str, Any], gate: GateConfig, entry: Any
+) -> dict[str, Any]:
+    """Run both adapters for one strategy and attach the diff verdict."""
+    config = _backtest_config(gate, entry.slug)
+    outcomes: dict[str, dict[str, Any]] = {}
+    results: dict[str, Any] = {}
+    for engine_name in ("native", "vectorbt"):
+        outcome = _run_engine(engine_name, config, entry.file_path)
+        outcomes[engine_name] = {
+            key: value for key, value in outcome.items() if key != "_result"
+        }
+        if "_result" in outcome:
+            results[engine_name] = outcome["_result"]
+
+    record["native"] = outcomes["native"]
+    record["vectorbt"] = outcomes["vectorbt"]
+
+    if "native" in results and "vectorbt" in results:
+        trade_diff = _diff_trades(results["native"], results["vectorbt"])
+        stats_diff = _diff_stats(results["native"], results["vectorbt"])
+        if trade_diff["trades_identical"] and stats_diff["stats_identical"]:
+            status = "identical"
+        elif not trade_diff["trades_identical"]:
+            status = "trades_differ"
+        else:
+            status = "stats_differ"
+        record["diff"] = {**trade_diff, **stats_diff, "status": status}
+        record["status"] = status
+    else:
+        record["status"] = "engine_error"
+        record["diff"] = None
+    return record
+
+
 def run_gate(gate: GateConfig) -> dict[str, Any]:
     """Run the gate and return the report dict (also written by ``main``)."""
     if not gate.symbols:
@@ -484,68 +566,19 @@ def run_gate(gate: GateConfig) -> dict[str, Any]:
         record: dict[str, Any] = {
             "slug": entry.slug,
             "file": entry.relative_file,
-            "declared_engine": entry.engine,
+            # ``entry.engine`` is the EFFECTIVE engine (undeclared strategies
+            # default to vectorbt), not a declared preference.
+            "engine": entry.engine,
             "strategy_type": detect_strategy_type(
                 entry.file_path, gate.strategies_dir
             ).value,
         }
-        if record["strategy_type"] == StrategyType.SIGNAL_PROCESSOR.value:
+        reason = _skip_reason(entry, gate)
+        if reason is not None:
             record["status"] = "skipped"
-            record["reason"] = "signal_processor strategies are not engine backtests"
-            strategies.append(record)
-            print(
-                f"[{index}/{total}] {entry.slug}: skipped",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-
-        # Strategies declaring an engine outside {native, vectorbt} (pynecore,
-        # lean) cannot run on either side of this comparison. Skipping avoids
-        # executing their modules at all — importing a pynecore strategy
-        # rewrites its generated .toml/context files as a side effect.
-        if entry.engine not in {"native", "vectorbt"}:
-            record["status"] = "skipped"
-            record["reason"] = (
-                f"declared engine {entry.engine!r} is outside the "
-                "native/vectorbt comparison"
-            )
-            strategies.append(record)
-            print(
-                f"[{index}/{total}] {entry.slug}: skipped",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-
-        config = _backtest_config(gate, entry.slug)
-        outcomes: dict[str, dict[str, Any]] = {}
-        results: dict[str, Any] = {}
-        for engine_name in ("native", "vectorbt"):
-            outcome = _run_engine(engine_name, config, entry.file_path)
-            outcomes[engine_name] = {
-                key: value for key, value in outcome.items() if key != "_result"
-            }
-            if "_result" in outcome:
-                results[engine_name] = outcome["_result"]
-
-        record["native"] = outcomes["native"]
-        record["vectorbt"] = outcomes["vectorbt"]
-
-        if "native" in results and "vectorbt" in results:
-            trade_diff = _diff_trades(results["native"], results["vectorbt"])
-            stats_diff = _diff_stats(results["native"], results["vectorbt"])
-            if trade_diff["trades_identical"] and stats_diff["stats_identical"]:
-                status = "identical"
-            elif not trade_diff["trades_identical"]:
-                status = "trades_differ"
-            else:
-                status = "stats_differ"
-            record["diff"] = {**trade_diff, **stats_diff, "status": status}
-            record["status"] = status
+            record["reason"] = reason
         else:
-            record["status"] = "engine_error"
-            record["diff"] = None
+            record = _compare_engines(record, gate, entry)
         strategies.append(record)
         print(
             f"[{index}/{total}] {entry.slug}: {record['status']}",
@@ -600,6 +633,70 @@ def _parse_params(raw: str) -> dict[str, Any]:
     return parsed
 
 
+def _resolve_symbols_and_window(
+    args: argparse.Namespace,
+    resolution: DataResolution,
+    ohlcv_root: Path,
+    timeframe: str,
+) -> tuple[list[str], str, str]:
+    """Pick symbols and the start/end window for one gate run."""
+    symbols = _csv_list(args.symbols)
+    if not symbols:
+        if resolution.mode == "synthetic":
+            symbols = ["SYNTH_A", "SYNTH_B"]
+        else:
+            symbols = _probe_symbols(ohlcv_root, timeframe, args.max_symbols)
+            if not symbols:
+                raise SystemExit(
+                    f"no symbols with {timeframe}.parquet under {ohlcv_root}; "
+                    "pass --symbols or --data-dir"
+                )
+
+    start, end = args.start, args.end
+    if resolution.mode == "synthetic":
+        start = start or "2024-01-01"
+        end = end or "2024-06-30"
+        bars = _write_synthetic_ohlcv(
+            resolution.data_root, symbols, timeframe, start, end
+        )
+        print(f"synthetic data: {len(symbols)} symbol(s), ~{bars} bars each")
+    elif not start or not end:
+        window = _detect_window(ohlcv_root, symbols, timeframe)
+        if window is None:
+            raise SystemExit(
+                f"could not detect a common {timeframe} window for {symbols} "
+                f"under {ohlcv_root}; pass --start/--end"
+            )
+        start = start or window[0]
+        end = end or window[1]
+    return symbols, start, end
+
+
+def _build_gate(
+    args: argparse.Namespace, resolution: DataResolution, ohlcv_root: Path
+) -> GateConfig:
+    """Assemble the GateConfig from parsed CLI args and resolved data."""
+    timeframe = normalize_timeframe(args.timeframe) or DEFAULT_TIMEFRAME
+    symbols, start, end = _resolve_symbols_and_window(
+        args, resolution, ohlcv_root, timeframe
+    )
+    parameters = {**DEFAULT_PARAMETERS, **_parse_params(args.params)}
+    return GateConfig(
+        data_dir=str(resolution.data_root),
+        symbols=symbols,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        capital=args.capital,
+        risk_pct=args.risk_pct,
+        modeling_resolution=args.modeling_resolution,
+        parameters=parameters,
+        strategies_dir=args.strategies_dir,
+        only=tuple(_csv_list(args.only)),
+        max_symbols=args.max_symbols,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -642,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Where synthetic OHLCV is written when no real data source is "
-        "configured (default: $DATA_DIR/engine-migration-gate/synthetic)",
+        "configured (default: a throwaway temporary directory)",
     )
     parser.add_argument(
         "--output",
@@ -652,57 +749,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    timeframe = normalize_timeframe(args.timeframe) or DEFAULT_TIMEFRAME
     resolution = _resolve_data_root(
         args.data_dir, synthetic_dir=args.synthetic_dir
     )
     ohlcv_root = _ohlcv_root(resolution.data_root)
-
-    symbols = _csv_list(args.symbols)
-    if not symbols:
-        if resolution.mode == "synthetic":
-            symbols = ["SYNTH_A", "SYNTH_B"]
-        else:
-            symbols = _probe_symbols(ohlcv_root, timeframe, args.max_symbols)
-            if not symbols:
-                raise SystemExit(
-                    f"no symbols with {timeframe}.parquet under {ohlcv_root}; "
-                    "pass --symbols or --data-dir"
-                )
-
-    start, end = args.start, args.end
-    if resolution.mode == "synthetic":
-        start = start or "2024-01-01"
-        end = end or "2024-06-30"
-        bars = _write_synthetic_ohlcv(
-            resolution.data_root, symbols, timeframe, start, end
-        )
-        print(f"synthetic data: {len(symbols)} symbol(s), ~{bars} bars each")
-    elif not start or not end:
-        window = _detect_window(ohlcv_root, symbols, timeframe)
-        if window is None:
-            raise SystemExit(
-                f"could not detect a common {timeframe} window for {symbols} "
-                f"under {ohlcv_root}; pass --start/--end"
-            )
-        start = start or window[0]
-        end = end or window[1]
-
-    parameters = {**DEFAULT_PARAMETERS, **_parse_params(args.params)}
-    gate = GateConfig(
-        data_dir=str(resolution.data_root),
-        symbols=symbols,
-        timeframe=timeframe,
-        start=start,
-        end=end,
-        capital=args.capital,
-        risk_pct=args.risk_pct,
-        modeling_resolution=args.modeling_resolution,
-        parameters=parameters,
-        strategies_dir=args.strategies_dir,
-        only=tuple(_csv_list(args.only)),
-        max_symbols=args.max_symbols,
-    )
+    gate = _build_gate(args, resolution, ohlcv_root)
 
     try:
         report = run_gate(gate)

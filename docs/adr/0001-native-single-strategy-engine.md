@@ -17,8 +17,9 @@ signal-replay product:
   **no `import vectorbt`** — it is a second hand-written Python bar loop with
   its own fill, stop and sizing code, kept in step with native through
   "mirrors native" comments and `tests/test_vectorbt_native_parity.py`.
-  Strategy-registry default; the only engine the optimizer, walk-forward,
-  matrix and grid paths accept.
+  Strategy-registry default; the optimizer requires it for base backtests
+  while walk-forward, matrix and grid merely default to it (they still
+  accept `--engine native` or any adapter).
 - **pynecore** (`pynecore_adapter.py`, 1422 LOC): runs the external `pyne` CLI
   for two demo strategies (`pynecore_orb`, `pynecore_sma_crossover`).
 - **LEAN** (`lean_adapter.py`, 185 LOC): a subprocess into an external

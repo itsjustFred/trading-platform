@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from scripts import engine_migration_gate as gate
@@ -89,6 +91,8 @@ class TestRunGate:
         }
 
         sma = by_slug[SMA_STRATEGY]
+        # ``engine`` is the EFFECTIVE engine (undeclared → vectorbt default).
+        assert sma["engine"] == "vectorbt"
         assert sma["native"]["status"] == "ok"
         assert sma["vectorbt"]["status"] == "ok"
         assert sma["native"]["trade_count"] > 0
@@ -189,3 +193,183 @@ class TestDiffHelpers:
         assert not gate._numbers_close(None, 0.0)
         assert gate._numbers_close(1.0000000001, 1.0)
         assert not gate._numbers_close(1.1, 1.0)
+
+
+def _trade(**overrides) -> SimpleNamespace:
+    base = {
+        "symbol": "GSYN",
+        "direction": "long",
+        "entry_time": "2024-01-10T10:00:00+00:00",
+        "entry_price": 100.0,
+        "quantity": 10.0,
+        "exits": [
+            SimpleNamespace(
+                time="2024-01-11T10:00:00+00:00",
+                price=101.0,
+                quantity=10.0,
+                pnl=10.0,
+                reason="signal",
+            )
+        ],
+        "pnl": 10.0,
+        "fees": 0.5,
+        "net_pnl": 9.5,
+        "exit_reason": "signal",
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class TestTradeSignaturePrecision:
+    """The gate must not call representation rounding a trade difference.
+
+    The vectorbt adapter persists prices at 6dp, quantities at 4dp and money
+    at 2dp while native stores unrounded floats; signatures compare at that
+    stored precision so equivalent fills still report ``identical``.
+    """
+
+    def test_stored_precision_rounding_still_reports_identical(self):
+        native_trade = _trade(
+            entry_price=100.1234567891,
+            quantity=3.1415926535,
+            pnl=12.345678,
+            fees=0.123456,
+            net_pnl=12.222222,
+            exits=[
+                SimpleNamespace(
+                    time="2024-01-11T10:00:00+00:00",
+                    price=101.987654321,
+                    quantity=3.1415926535,
+                    pnl=12.345678,
+                    reason="signal",
+                )
+            ],
+        )
+        vectorbt_trade = _trade(
+            entry_price=100.123457,
+            quantity=3.1416,
+            pnl=12.35,
+            fees=0.12,
+            net_pnl=12.22,
+            exits=[
+                SimpleNamespace(
+                    time="2024-01-11T10:00:00+00:00",
+                    price=101.987654,
+                    quantity=3.1416,
+                    pnl=12.35,
+                    reason="signal",
+                )
+            ],
+        )
+        diff = gate._diff_trades(
+            SimpleNamespace(trades=[native_trade]),
+            SimpleNamespace(trades=[vectorbt_trade]),
+        )
+        assert diff["trades_identical"] is True
+        assert diff["only_in_native_count"] == 0
+        assert diff["only_in_vectorbt_count"] == 0
+
+    def test_real_fill_difference_still_diffs(self):
+        native_trade = _trade(quantity=3.1416)
+        vectorbt_trade = _trade(quantity=3.1417)
+        diff = gate._diff_trades(
+            SimpleNamespace(trades=[native_trade]),
+            SimpleNamespace(trades=[vectorbt_trade]),
+        )
+        assert diff["trades_identical"] is False
+        assert diff["only_in_native_count"] == 1
+        assert diff["only_in_vectorbt_count"] == 1
+
+    def test_trade_count_difference_still_diffs(self):
+        diff = gate._diff_trades(
+            SimpleNamespace(trades=[_trade()]),
+            SimpleNamespace(trades=[_trade(), _trade(entry_time="2024-02-01T10:00:00+00:00")]),
+        )
+        assert diff["trades_identical"] is False
+        assert diff["trade_count"]["delta"] == 1
+
+
+class TestDiffStats:
+    def test_matching_stats_report_identical(self):
+        native = SimpleNamespace(
+            stats={"sharpe": 1.0, "total_return": 0.05, "extras": {"a": 1}}
+        )
+        vectorbt = SimpleNamespace(
+            stats={
+                "sharpe": 1.0,
+                "total_return": 0.0500000001,
+                "extras": {"b": 2},
+            }
+        )
+        diff = gate._diff_stats(native, vectorbt)
+        assert diff["stats_identical"] is True
+        assert diff["stats_diffs"] == {}
+
+    def test_real_stat_difference_is_reported(self):
+        native = SimpleNamespace(stats={"sharpe": 1.0, "total_return": 0.05})
+        vectorbt = SimpleNamespace(stats={"sharpe": 1.0, "total_return": 0.08})
+        diff = gate._diff_stats(native, vectorbt)
+        assert diff["stats_identical"] is False
+        assert diff["stats_diffs"]["total_return"] == {
+            "native": 0.05,
+            "vectorbt": 0.08,
+        }
+
+
+class TestDetectWindow:
+    def _write_shard(self, root: Path, symbol: str, start: str, end: str) -> None:
+        folder = root / "ohlcv" / symbol
+        folder.mkdir(parents=True, exist_ok=True)
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range(start, end, freq="h", tz="UTC"),
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 1.0,
+            }
+        )
+        frame.to_parquet(folder / "1h.parquet", index=False)
+
+    def test_window_is_the_intersection_not_the_union(self, tmp_path):
+        self._write_shard(tmp_path, "AAA", "2024-01-01", "2024-06-30")
+        self._write_shard(tmp_path, "BBB", "2024-03-01", "2024-09-30")
+        window = gate._detect_window(tmp_path / "ohlcv", ["AAA", "BBB"], "1h")
+        assert window == ("2024-03-01", "2024-06-30")
+
+    def test_missing_symbol_returns_none(self, tmp_path):
+        self._write_shard(tmp_path, "AAA", "2024-01-01", "2024-06-30")
+        assert gate._detect_window(tmp_path / "ohlcv", ["AAA", "MISSING"], "1h") is None
+
+
+class TestSyntheticOhlcv:
+    def test_unmapped_timeframe_refuses_instead_of_guessing(self, tmp_path):
+        with pytest.raises(ValueError, match="tick"):
+            gate._write_synthetic_ohlcv(
+                tmp_path, ["X"], "tick", "2024-01-01", "2024-01-02"
+            )
+
+    @pytest.mark.parametrize(
+        "timeframe,start,end",
+        [("s1", "2024-01-01", "2024-01-02"), ("1w", "2024-01-01", "2024-02-01")],
+    )
+    def test_supported_timeframes_write_bars(self, tmp_path, timeframe, start, end):
+        bars = gate._write_synthetic_ohlcv(tmp_path, ["X"], timeframe, start, end)
+        assert bars > 0
+        assert list(tmp_path.rglob(f"{timeframe}.parquet"))
+
+
+class TestSyntheticDataResolution:
+    def test_default_synthetic_dir_is_a_throwaway_tempdir(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(gate.TEST_OHLCV_DIR_ENV, raising=False)
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+        resolution = gate._resolve_data_root("")
+        try:
+            assert resolution.mode == "synthetic"
+            assert resolution.cleanup is not None
+            # Must not write fixture data next to real market data.
+            assert not str(resolution.data_root).startswith(str(tmp_path / "data"))
+        finally:
+            if resolution.cleanup is not None:
+                resolution.cleanup.cleanup()

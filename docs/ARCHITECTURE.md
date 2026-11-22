@@ -103,9 +103,10 @@ Execution and conversion layer.
   - any change to the file after approval invalidates the approval
   - REST surface: `GET /api/strategies/{file}/approval` and `POST /api/strategies/{file}/approve`
 - `runner/engines/`
-  - `vectorbt_adapter.py`: fast vectorized backtests (per-symbol processing in
+  - `vectorbt_adapter.py`: bar-loop adapter kept in parity with native via
+    `tests/test_vectorbt_native_parity.py` (per-symbol processing in
     `_process_symbol`, per-trade sizing in `_size_trade`; drawing and
-    indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`)
+    indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`); FROZEN per #318 — no `vectorbt` import, no vectorization
   - `pynecore_adapter.py`: Pine-style strategies through PyneCore
   - `lean_adapter.py`: QuantConnect LEAN result ingestion / execution bridge
 - Sizing semantics: `max_position_exposure_pct` (position-size), `risk_per_trade_pct`

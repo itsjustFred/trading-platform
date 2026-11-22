@@ -86,3 +86,32 @@ class TestEngineSelectionWarnings:
         assert not [
             w for w in caught if issubclass(w.category, DeprecationWarning)
         ]
+
+    def test_optimizer_vectorbt_backtest_path_warns(self, monkeypatch):
+        """``optimizer._run_vectorbt_backtest`` is the optimizer's engine path."""
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        import runner.optimizer as optimizer
+
+        class _FakeAdapter:
+            def run(self, config, strategy_path):
+                return SimpleNamespace(stats={}, trades=[])
+
+        monkeypatch.setattr(optimizer, "ensure_backtest_data", lambda **kwargs: [])
+        monkeypatch.setattr(optimizer, "VectorbtAdapter", _FakeAdapter)
+        monkeypatch.setattr(
+            optimizer, "compute_stats_for_result", lambda result: {}
+        )
+
+        config = BacktestConfig(
+            strategy_name="x",
+            symbols=["SYM"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+        )
+        caught = _warnings_for(
+            optimizer._run_vectorbt_backtest, config, Path("s.py")
+        )
+        assert any("frozen" in str(w.message) for w in caught)

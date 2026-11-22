@@ -71,7 +71,7 @@ ENGINES = ("native", "vectorbt")
 def _numeric_meta_parameters(strategy_path: Path) -> dict[str, float]:
     """Numeric STRATEGY_META.parameters defaults, for grid derivation."""
     meta = load_strategy_meta(strategy_path, strategy_path.parent)
-    params = meta.get("parameters", {}) if isinstance(meta, dict) else {}
+    params = meta.get("parameters", {})
     if not isinstance(params, dict):
         return {}
     return {
@@ -141,6 +141,98 @@ def _make_config(
     )
 
 
+def _config_for_cell(
+    args: argparse.Namespace,
+    *,
+    strategy_path: Path,
+    symbols: list[str],
+    timeframe: str,
+    start: str,
+    end: str,
+    data_dir: str,
+    parameters: dict[str, Any],
+) -> BacktestConfig:
+    return _make_config(
+        strategy_path=strategy_path,
+        symbols=symbols,
+        timeframe=timeframe,
+        start=start,
+        end=end,
+        capital=args.capital,
+        risk_pct=args.risk_pct,
+        modeling_resolution=args.modeling_resolution,
+        data_dir=data_dir,
+        parameters=parameters,
+    )
+
+
+def _timed_cells(
+    args: argparse.Namespace,
+    adapters: dict[str, Any],
+    cells: list[dict[str, Any]],
+    base_parameters: dict[str, Any],
+    *,
+    strategy_path: Path,
+    symbols: list[str],
+    timeframe: str,
+    start: str,
+    end: str,
+    data_dir: str,
+) -> list[dict[str, Any]]:
+    """Time every (repeat, cell, engine) combination; returns run rows."""
+    rows: list[dict[str, Any]] = []
+    for repeat in range(args.repeats):
+        for cell_index, cell_params in enumerate(cells):
+            config = _config_for_cell(
+                args,
+                strategy_path=strategy_path,
+                symbols=symbols,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                data_dir=data_dir,
+                parameters={**base_parameters, **cell_params},
+            )
+            for engine_name in ENGINES:
+                rows.append(
+                    {
+                        "repeat": repeat,
+                        "cell": cell_index,
+                        "params": cell_params,
+                        "engine": engine_name,
+                        **_time_run(adapters[engine_name], config, strategy_path),
+                    }
+                )
+    return rows
+
+
+def _summarize_cells(
+    rows: list[dict[str, Any]], warmup: dict[str, Any]
+) -> dict[str, Any]:
+    """Per-engine totals plus the vectorbt/native total-time ratio."""
+    summary: dict[str, Any] = {"warmup": warmup, "cells_per_engine": {}}
+    for engine_name in ENGINES:
+        engine_rows = [r for r in rows if r["engine"] == engine_name]
+        ok = [r for r in engine_rows if r["status"] == "ok"]
+        seconds = [r["seconds"] for r in ok]
+        summary["cells_per_engine"][engine_name] = {
+            "runs": len(engine_rows),
+            "errors": len(engine_rows) - len(ok),
+            "total_seconds": round(sum(seconds), 4),
+            "mean_cell_seconds": round(sum(seconds) / len(seconds), 4)
+            if seconds
+            else None,
+            "trades_total": sum(r.get("trade_count", 0) for r in ok),
+        }
+    native_total = summary["cells_per_engine"]["native"]["total_seconds"]
+    vectorbt_total = summary["cells_per_engine"]["vectorbt"]["total_seconds"]
+    if native_total and vectorbt_total:
+        summary["vectorbt_over_native_total_seconds"] = round(
+            vectorbt_total / native_total, 4
+        )
+    return summary
+
+
 def _time_run(adapter: Any, config: BacktestConfig, strategy_path: Path) -> dict[str, Any]:
     started = time.perf_counter()
     try:
@@ -168,34 +260,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     resolution = gate._resolve_data_root(args.data_dir, synthetic_dir=args.synthetic_dir)
     try:
         ohlcv_root = gate._ohlcv_root(resolution.data_root)
-        symbols = gate._csv_list(args.symbols)
-        if not symbols:
-            if resolution.mode == "synthetic":
-                symbols = ["SYNTH_A", "SYNTH_B"]
-            else:
-                symbols = gate._probe_symbols(ohlcv_root, timeframe, args.max_symbols)
-                if not symbols:
-                    raise SystemExit(
-                        f"no symbols with {timeframe}.parquet under {ohlcv_root}; "
-                        "pass --symbols or --data-dir"
-                    )
-
-        start, end = args.start, args.end
-        if resolution.mode == "synthetic":
-            start = start or "2024-01-01"
-            end = end or "2024-06-30"
-            gate._write_synthetic_ohlcv(
-                resolution.data_root, symbols, timeframe, start, end
-            )
-        elif not start or not end:
-            window = gate._detect_window(ohlcv_root, symbols, timeframe)
-            if window is None:
-                raise SystemExit(
-                    f"could not detect a common {timeframe} window for {symbols} "
-                    f"under {ohlcv_root}; pass --start/--end"
-                )
-            start = start or window[0]
-            end = end or window[1]
+        symbols, start, end = gate._resolve_symbols_and_window(
+            args, resolution, ohlcv_root, timeframe
+        )
 
         base_parameters = {
             **gate.DEFAULT_PARAMETERS,
@@ -206,19 +273,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             raise SystemExit("--param-grid produced no cells")
 
         adapters = {"native": NativeAdapter(), "vectorbt": VectorbtAdapter()}
-        rows: list[dict[str, Any]] = []
 
         # Unmeasured warmup per engine so first-call imports/JIT do not skew
         # the timed cells (still reported, marked warmup).
-        warmup_config = _make_config(
+        warmup_config = _config_for_cell(
+            args,
             strategy_path=strategy_path,
             symbols=symbols,
             timeframe=timeframe,
             start=start,
             end=end,
-            capital=args.capital,
-            risk_pct=args.risk_pct,
-            modeling_resolution=args.modeling_resolution,
             data_dir=str(resolution.data_root),
             parameters={**base_parameters, **(cells[0] if cells else {})},
         )
@@ -228,56 +292,23 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 adapters[engine_name], warmup_config, strategy_path
             )
 
-        for repeat in range(args.repeats):
-            for cell_index, cell_params in enumerate(cells):
-                config = _make_config(
-                    strategy_path=strategy_path,
-                    symbols=symbols,
-                    timeframe=timeframe,
-                    start=start,
-                    end=end,
-                    capital=args.capital,
-                    risk_pct=args.risk_pct,
-                    modeling_resolution=args.modeling_resolution,
-                    data_dir=str(resolution.data_root),
-                    parameters={**base_parameters, **cell_params},
-                )
-                for engine_name in ENGINES:
-                    rows.append(
-                        {
-                            "repeat": repeat,
-                            "cell": cell_index,
-                            "params": cell_params,
-                            "engine": engine_name,
-                            **_time_run(
-                                adapters[engine_name], config, strategy_path
-                            ),
-                        }
-                    )
+        rows = _timed_cells(
+            args,
+            adapters,
+            cells,
+            base_parameters,
+            strategy_path=strategy_path,
+            symbols=symbols,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            data_dir=str(resolution.data_root),
+        )
     finally:
         if resolution.cleanup is not None:
             resolution.cleanup.cleanup()
 
-    summary: dict[str, Any] = {"warmup": warmup, "cells_per_engine": {}}
-    for engine_name in ENGINES:
-        engine_rows = [r for r in rows if r["engine"] == engine_name]
-        ok = [r for r in engine_rows if r["status"] == "ok"]
-        seconds = [r["seconds"] for r in ok]
-        summary["cells_per_engine"][engine_name] = {
-            "runs": len(engine_rows),
-            "errors": len(engine_rows) - len(ok),
-            "total_seconds": round(sum(seconds), 4),
-            "mean_cell_seconds": round(sum(seconds) / len(seconds), 4)
-            if seconds
-            else None,
-            "trades_total": sum(r.get("trade_count", 0) for r in ok),
-        }
-    native_total = summary["cells_per_engine"]["native"]["total_seconds"]
-    vectorbt_total = summary["cells_per_engine"]["vectorbt"]["total_seconds"]
-    if native_total and vectorbt_total:
-        summary["vectorbt_over_native_total_seconds"] = round(
-            vectorbt_total / native_total, 4
-        )
+    summary = _summarize_cells(rows, warmup)
 
     return gate._jsonable(
         {
