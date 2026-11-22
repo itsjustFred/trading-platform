@@ -16,12 +16,17 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
 from live_runner.alpaca_fees import (
+    ACTIVITY_WINDOW_OVERLAP,
+    CFEE_LOOKBACK_MARGIN,
     COMMISSION_BACKFILL_LOOKBACK,
-    candidate_fee_days,
-    day_start_utc,
-    fee_day_is_posted,
+    CRYPTO_FILL_SCAN_UNKNOWN,
+    cfee_created_at,
+    earliest_crypto_fill_at,
+    fee_fill_window_start,
     fetch_account_activities,
+    has_earlier_account_activity,
     plan_commission_backfill,
+    select_activity_window,
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
@@ -105,6 +110,9 @@ _GONE_WITHOUT_EXECUTING = frozenset({"canceled", "expired", "rejected"})
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
 _ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
+
+#: ``AlpacaLiveAdapter._earliest_crypto_fill_at`` before its one-time FILL-history scan ran.
+_CRYPTO_FILL_SCAN_PENDING = object()
 
 _EXTENDED_HOURS_BRACKET_MESSAGE = (
     "Extended-hours entry with mandatory SL/TP is not supported: "
@@ -945,6 +953,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # and at once in `amend_protective_stop`, because a trailed stop's replacement is
         # a NEW leg order id that would otherwise stay unattributable until the next pass.
         self._bracket_leg_order_id_to_signal_id: dict[str, str] = {}
+        # The earliest crypto fill is fixed history once found: the FILL-history scan behind
+        # ``backfill_commissions`` runs once and later passes answer from this cache
+        # instead of re-paging up to ``MAX_ACTIVITY_PAGES`` requests every pass. Only a found
+        # datetime (or CRYPTO_FILL_SCAN_UNKNOWN, which fails closed either way) is cached -
+        # ``None`` ("no crypto fill up to the scan's ``until``") is not, because fills posted
+        # after the scan can still predate ``fill_start`` on a later pass.
+        self._earliest_crypto_fill_at: Any = _CRYPTO_FILL_SCAN_PENDING
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -1337,13 +1352,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     async def backfill_commissions(self, *, now: datetime | None = None) -> int:
         """Price this account's still-unknown crypto commissions from posted ``CFEE`` activities.
 
-        Crypto fees are posted end of day, so fills are stored with a NULL commission and this pass
-        - run periodically by the daemon - fills them in once their trade date has been posted
-        (``CFEE_POSTING_DELAY``) and while they are inside ``COMMISSION_BACKFILL_LOOKBACK``. It
-        reads ``FILL``, ``CFEE`` and ``FEE`` activities over REST (alpaca-py has no activities
-        method), allocates each (pair, trade date)'s fee as documented in `live_runner.alpaca_fees`,
-        and
-        writes a group's commissions all or nothing. Every group that cannot be priced honestly
+        Crypto fees are posted in batches some time after the fills, so fills are stored with a
+        NULL commission and this pass - run periodically by the daemon - fills them in once the
+        batch covering them exists and while they are inside
+        ``COMMISSION_BACKFILL_LOOKBACK``. It reads ``CFEE`` activities first (``CFEE.date`` is the
+        posting date, not the trade date), works out which ``FILL`` window the relevant batches
+        cover, then reads ``FILL`` and ``FEE`` activities over REST (alpaca-py has no activities
+        method), allocates each (pair, batch)'s fee as documented in `live_runner.alpaca_fees`,
+        and writes a group's priced side all or nothing. Every group that cannot be priced honestly
         keeps NULL and is logged; nothing is ever written as ``0.0``.
 
         Returns the number of executions whose commission was set. Never raises for broker data or
@@ -1368,14 +1384,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     f"not a crypto pair (symbol {row['symbol']!r} classifies as {kind}); no CFEE "
                     "applies and nothing else prices it"
                 )
-            elif not all(
-                fee_day_is_posted(day, now) for day in candidate_fee_days(row["timestamp"])
-            ):
-                reason = "its trade date's CFEE is not posted yet; retried on a later pass"
+                skipped.setdefault(reason, []).append(str(row["execution_id"]))
             else:
                 candidates.append(row)
-                continue
-            skipped.setdefault(reason, []).append(str(row["execution_id"]))
         for reason, execution_ids in skipped.items():
             logger.info(
                 "Alpaca commission backfill: skipping %s execution(s) with unknown commission: "
@@ -1388,18 +1399,118 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not candidates:
             return 0
 
-        days = {day for row in candidates for day in candidate_fee_days(row["timestamp"])}
-        window_start = day_start_utc(min(days)) - timedelta(days=1)
-        fill_window_end = min(day_start_utc(max(days)) + timedelta(days=2), now)
+        candidate_times = []
+        for row in candidates:
+            timestamp = row.get("timestamp")
+            if timestamp is None:
+                timestamp = now - COMMISSION_BACKFILL_LOOKBACK
+            elif timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            candidate_times.append(timestamp)
+
+        # CFEE first: its batches decide which fills can be priced at all, and how far back the
+        # FILL listing must reach to cover every relevant batch window. CFEE/FEE filter by New
+        # York calendar day (#149), so the listing is widened by a day on both sides and
+        # re-filtered here on the real timestamps.
+        cfee_after = min(candidate_times) - CFEE_LOOKBACK_MARGIN
         try:
+            raw_cfees = await asyncio.to_thread(
+                fetch_account_activities,
+                client,
+                "CFEE",
+                after=cfee_after - ACTIVITY_WINDOW_OVERLAP,
+                until=now + ACTIVITY_WINDOW_OVERLAP,
+            )
+            cfees = select_activity_window(
+                raw_cfees, after=cfee_after, until=now, field="created_at"
+            )
+            fill_start = fee_fill_window_start(candidate_times, cfees)
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "Alpaca commission backfill: reading CFEE activities failed; commissions stay "
+                "unknown until the next pass",
+                extra={"data": {"account_id": self.account_id, "error": str(exc)}},
+            )
+            return 0
+        if fill_start is None:
+            logger.info(
+                "Alpaca commission backfill: no posted CFEE batch can cover %s execution(s); "
+                "their fee batch is not posted yet - retried on a later pass: %s",
+                len(candidates),
+                ", ".join(str(row["execution_id"]) for row in candidates),
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "execution_ids": [str(row["execution_id"]) for row in candidates],
+                    }
+                },
+            )
+            return 0
+
+        # Does an earlier CFEE batch exist before the first fetched one? If so its coverage
+        # window is truncated and it must fail closed when relevant. With no predecessor it is
+        # the account's first batch ever - then it is complete only if no *crypto* fills exist
+        # before the FILL fetch bound either (equity fills cannot sit in a crypto CFEE batch's
+        # coverage, so they must not open the window). The CFEE probe is a single request; the
+        # crypto-fill scan pages FILL ascending for the account's earliest crypto fill. A found
+        # instant never changes, so it is cached; an unfinished scan is cached as
+        # CRYPTO_FILL_SCAN_UNKNOWN and fails closed on every later pass exactly as re-scanning
+        # would; a ``None`` ("no crypto fill up to the scan's ``until``") is deliberately NOT
+        # cached - a fill posted after the scan can still predate ``fill_start`` later, so the
+        # next pass rescans. ``None`` with crypto candidates present is an anomaly, so the
+        # rescan is rare.
+        first_batch_open = False
+        try:
+            if cfees:
+                first_cfee_at = min(cfee_created_at(raw) for raw in cfees)
+                first_batch_open = await asyncio.to_thread(
+                    has_earlier_account_activity,
+                    client,
+                    "CFEE",
+                    before=first_cfee_at,
+                    field="created_at",
+                )
+            if not first_batch_open:
+                earliest = self._earliest_crypto_fill_at
+                if earliest is _CRYPTO_FILL_SCAN_PENDING:
+                    earliest = await asyncio.to_thread(
+                        earliest_crypto_fill_at,
+                        client,
+                        until=now + ACTIVITY_WINDOW_OVERLAP,
+                    )
+                    if earliest is not None:
+                        self._earliest_crypto_fill_at = earliest
+                if earliest is None:
+                    # Candidates are crypto-only (filtered above), so a completed scan that
+                    # found no crypto fill at all while crypto executions await a commission
+                    # means the broker account or symbol mapping is likely wrong. ``None`` is
+                    # deliberately not cached, so every pass re-pages the history until a fill
+                    # appears - warn so the anomaly is visible instead of silent request spend.
+                    logger.warning(
+                        "Alpaca commission backfill: the FILL-history scan found no crypto "
+                        "fills, yet %s crypto execution(s) await a commission; each pass "
+                        "rescans the history - check the account and symbol mapping",
+                        len(candidates),
+                        extra={"data": {"account_id": self.account_id}},
+                    )
+                # ``<=``: the FILL listing is ``(fill_start, now]``, exclusive of the bound,
+                # so a crypto fill exactly at ``fill_start`` is never fetched - it opens the
+                # window like any earlier one.
+                first_batch_open = earliest is CRYPTO_FILL_SCAN_UNKNOWN or (
+                    earliest is not None and earliest <= fill_start
+                )
             fills = await asyncio.to_thread(
-                fetch_account_activities, client, "FILL", after=window_start, until=fill_window_end
+                fetch_account_activities, client, "FILL", after=fill_start, until=now
             )
-            cfees = await asyncio.to_thread(
-                fetch_account_activities, client, "CFEE", after=window_start, until=now
+            raw_fees = await asyncio.to_thread(
+                fetch_account_activities,
+                client,
+                "FEE",
+                after=cfee_after - ACTIVITY_WINDOW_OVERLAP,
+                until=now + ACTIVITY_WINDOW_OVERLAP,
             )
-            usd_fees = await asyncio.to_thread(
-                fetch_account_activities, client, "FEE", after=window_start, until=now
+            usd_fees = select_activity_window(
+                raw_fees, after=cfee_after, until=now, field="created_at"
             )
         except Exception as exc:  # except-kind: money-decision
             logger.warning(
@@ -1421,13 +1532,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         local_rows = await asyncio.to_thread(
             list_live_executions_for_broker_orders, self.account_id, order_ids
         )
-        plans, unplaced = plan_commission_backfill(
+        plans, unplaced, pending = plan_commission_backfill(
             candidates=candidates,
             fill_activities=fills,
             cfee_activities=cfees,
             fee_activities=usd_fees,
             local_rows=local_rows,
             now=now,
+            first_batch_open=first_batch_open,
         )
         for message in unplaced:
             logger.warning(
@@ -1436,29 +1548,45 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 message,
                 extra={"data": {"account_id": self.account_id}},
             )
+        for message in pending:
+            logger.info(
+                "Alpaca commission backfill: %s",
+                message,
+                extra={"data": {"account_id": self.account_id}},
+            )
         updated = 0
         for plan in plans:
+            if plan.commissions:
+                applied = await asyncio.to_thread(
+                    apply_live_execution_commissions, self.account_id, plan.commissions
+                )
+                updated += applied
+                logger.info(
+                    "Alpaca commission backfill: priced %s execution(s) of %s on %s from CFEE",
+                    applied,
+                    plan.pair,
+                    plan.end.isoformat(),
+                    extra={
+                        "data": {"account_id": self.account_id, "commissions": plan.commissions}
+                    },
+                )
             if plan.problem is not None:
                 logger.warning(
-                    "Alpaca commission backfill: leaving the CFEE of %s on %s unallocated, "
-                    "commissions stay unknown: %s",
+                    "Alpaca commission backfill: leaving part of the CFEE of %s on %s "
+                    "unallocated, those commissions stay unknown: %s",
                     plan.pair,
-                    plan.day.isoformat(),
+                    plan.end.isoformat(),
                     plan.problem,
                     extra={"data": {"account_id": self.account_id}},
                 )
-                continue
-            applied = await asyncio.to_thread(
-                apply_live_execution_commissions, self.account_id, plan.commissions
-            )
-            updated += applied
-            logger.info(
-                "Alpaca commission backfill: priced %s execution(s) of %s on %s from CFEE",
-                applied,
-                plan.pair,
-                plan.day.isoformat(),
-                extra={"data": {"account_id": self.account_id, "commissions": plan.commissions}},
-            )
+            for warning in plan.warnings:
+                logger.warning(
+                    "Alpaca commission backfill: %s on %s posted %s",
+                    warning,
+                    plan.pair,
+                    plan.end.isoformat(),
+                    extra={"data": {"account_id": self.account_id}},
+                )
         return updated
 
     async def disconnect(self) -> None:

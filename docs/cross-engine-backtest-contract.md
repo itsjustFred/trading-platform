@@ -1,5 +1,13 @@
 # Cross-Engine Backtest Contract
 
+> **Freeze notice (#318, 2026-11-21).** Per
+> `docs/adr/0001-native-single-strategy-engine.md`, `native` is the single
+> strategy engine going forward. `vectorbt`, `pynecore` and the LEAN *run*
+> path are frozen (bug fixes only, no new features) and scheduled for
+> removal; LEAN becomes import-only. This contract will shrink to native +
+> signal replay once they are gone. Selecting a frozen engine emits a
+> `DeprecationWarning`.
+
 Status: contract for the backtest engine adapters (`runner/engines/`), shared
 primitives in `runner/engines/contract.py`, conformance tests in
 `tests/test_engine_contract.py`.
@@ -428,6 +436,27 @@ specific stats (pynecore strategy stats) are merged **on top of** the
 canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
 but never remove or overwrite them — a same-named engine key loses the
 collision, so consumers always read the canonical value.
+
+**Sharpe/Sortino convention (#229).** The equity curve is resampled to one
+observation per calendar day (the production `attach_daily_equity` shape
+fills every day, flat days included), then the calendar-filled rows —
+weekend/holiday days the venue was closed, whose forward-filled equity can
+only produce a zero return — are dropped before the ratio is computed.
+Trading days come from the venue calendar resolved from the run's symbols,
+source and asset-class metadata (`shared.venue_calendar`); a symbol whose
+venue cannot be resolved falls back to the Monday–Friday grid. The ratio is
+annualised at 252 for equities/FX/CFDs and 365 for an all-crypto (24/7)
+book, published as `equity_return_periods_per_year`. Cross-platform parity
+(the MT5 audit matrix in `validation/statistics/cross_platform.py`) applies
+this identical formula to realized-exit equity curves rebuilt from BOTH
+trade lists — initial capital plus cumulative net PnL booked at each
+position's last exit, calendar-filled to the production daily shape —
+rather than comparing against MT5's printed
+Sharpe-Ratio, which uses MT5's own convention; the printed value is kept
+as `sharpe_ratio_reported`, and the platform artifact's mark-to-market
+Sharpe is kept as `sharpe_ratio_mtm`. Because both sides now run the same
+formula on the same curve shape, identical trade lists give identical
+parity Sharpes; the trade list remains the primary parity evidence.
 
 ## 7. `total_bars`
 

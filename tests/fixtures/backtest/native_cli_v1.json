@@ -153,6 +153,7 @@
     ],
     "duplicate_equity_timestamps": 0,
     "equity_return_frequency": "daily",
+    "equity_return_periods_per_year": 252.0,
     "losers": 2,
     "max_consecutive_losses": 2,
     "max_consecutive_wins": 1,

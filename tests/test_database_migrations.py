@@ -165,7 +165,9 @@ def signal_parent(isolated_db):
     seed_live_deployments(database, ["dep-1"])
 
 
-def _make_live_signal(*, discord_message_id=None, broker_order_id=None, **extra) -> LiveSignal:
+def _make_live_signal(
+    *, discord_message_id=None, broker_order_id=None, deployment_id="dep-1", **extra
+) -> LiveSignal:
     metadata: dict = {}
     if discord_message_id is not None:
         metadata["discord_message_id"] = discord_message_id
@@ -174,7 +176,7 @@ def _make_live_signal(*, discord_message_id=None, broker_order_id=None, **extra)
     metadata.update(extra)
     return LiveSignal(
         id=uuid4(),
-        deployment_id="dep-1",
+        deployment_id=deployment_id,
         symbol="AAPL",
         action="buy",
         theoretical_price=100.0,
@@ -347,6 +349,208 @@ def test_conflicting_broker_order_id_is_persisted_and_reported(
             "conflicting_broker_order_ids": ["BRK-BBB"],
         }
     ]
+
+
+#: Deployment ids used by the broker-order-conflict halt tests. Real UUIDs, because
+#: `LiveDeploymentModel.to_live_deployment` rehydrates a pydantic `LiveDeploymentConfig`
+#: and a synthetic "dep-1" id cannot round-trip through it.
+CONFLICT_DEPLOYMENT = "11111111-1111-1111-1111-111111111111"
+OTHER_DEPLOYMENT = "22222222-2222-2222-2222-222222222222"
+
+
+def _haltable_deployments(database, deployment_ids) -> None:
+    """Seed deployments as ACTIVE, so a conflict can actually halt them.
+
+    ``seed_live_deployments`` writes PAUSED by default; a test of the halt needs the
+    starting state the production conflict arrives in.
+    """
+    seed_live_deployments(database, deployment_ids)
+    from shared.database import update_live_deployment_status
+
+    for deployment_id in deployment_ids:
+        update_live_deployment_status(deployment_id, "ACTIVE")
+
+
+def _deployment_status(database, deployment_id: str) -> str:
+    with database.get_session() as session:
+        row = session.get(database.LiveDeploymentModel, deployment_id)
+        assert row is not None
+        return str(row.status)
+
+
+def test_conflicting_broker_order_id_halts_the_affected_deployment(
+    isolated_db, caplog
+) -> None:
+    """Issue #126 decision: the conflict fails closed - the deployment is paused.
+
+    The other deployments on the account are left alone: a halt is narrow, or one broker
+    order id nobody can explain would stop the whole account trading.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    _haltable_deployments(database, [CONFLICT_DEPLOYMENT, OTHER_DEPLOYMENT])
+    from shared.database import list_live_signal_broker_order_conflicts
+
+    save_live_signal(
+        _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-halt", broker_order_id="BRK-AAA"
+    )
+    )
+    assert _deployment_status(database, CONFLICT_DEPLOYMENT) == "ACTIVE"
+    with caplog.at_level("ERROR"):
+        save_live_signal(
+            _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-halt", broker_order_id="BRK-BBB")
+        )
+
+    assert _deployment_status(database, CONFLICT_DEPLOYMENT) == "PAUSED"
+    assert _deployment_status(database, OTHER_DEPLOYMENT) == "ACTIVE"
+    conflicts = list_live_signal_broker_order_conflicts()
+    assert [row["conflicting_broker_order_ids"] for row in conflicts] == [["BRK-BBB"]]
+    alert = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(alert) == 1
+    assert "BRK-BBB" in alert[0].getMessage()
+    assert "halted" in alert[0].getMessage()
+    # The StructuredData the logging integration and Sentry read, not just the text.
+    assert alert[0].data["alert"] == "live_broker_order_id_conflict"
+    assert alert[0].data["deployment_halt"] == "PAUSED"
+
+
+def test_conflicting_broker_order_id_keeps_a_stopped_deployment_stopped(
+    isolated_db, caplog
+) -> None:
+    """STOPPED is the stronger intent: a conflict must never downgrade it to PAUSED.
+
+    Downgrading would clear `stopped_enforced_at` and re-open the claim gate on a
+    deployment whose cancel-and-flatten sweep already ran.
+    """
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    _haltable_deployments(database, [CONFLICT_DEPLOYMENT])
+    from shared.database import (
+        mark_live_deployment_stopped_enforced,
+        update_live_deployment_status,
+    )
+
+    update_live_deployment_status(CONFLICT_DEPLOYMENT, "STOPPED")
+    assert mark_live_deployment_stopped_enforced(CONFLICT_DEPLOYMENT) is True
+
+    with caplog.at_level("ERROR"):
+        save_live_signal(
+            _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-stop", broker_order_id="BRK-AAA")
+        )
+        save_live_signal(
+            _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-stop", broker_order_id="BRK-BBB")
+        )
+
+    assert _deployment_status(database, CONFLICT_DEPLOYMENT) == "STOPPED"
+    with database.get_session() as session:
+        row = session.get(database.LiveDeploymentModel, CONFLICT_DEPLOYMENT)
+        assert row.stopped_enforced_at is not None
+    assert [
+        r.data["deployment_halt"] for r in caplog.records if r.levelno == logging.ERROR
+    ] == ["already-halted"]
+
+
+def test_redelivered_conflict_keeps_the_deployment_paused_and_reports_no_new_halt(
+    isolated_db, caplog
+) -> None:
+    """A redelivery conflicts again on every save: no fresh halt is claimed, none lost."""
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    _haltable_deployments(database, [CONFLICT_DEPLOYMENT])
+
+    save_live_signal(
+        _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-again", broker_order_id="BRK-AAA")
+    )
+    with caplog.at_level("ERROR"):
+        for _ in range(2):
+            save_live_signal(
+                _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-again", broker_order_id="BRK-BBB")
+            )
+
+    assert _deployment_status(database, CONFLICT_DEPLOYMENT) == "PAUSED"
+    halts = [r.data["deployment_halt"] for r in caplog.records if r.levelno == logging.ERROR]
+    assert halts == ["PAUSED", "already-halted"]
+
+
+def test_no_conflict_never_halts_a_deployment(isolated_db, caplog) -> None:
+    """The backfill and the identical-redelivery paths must not pause anything."""
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    _haltable_deployments(database, [CONFLICT_DEPLOYMENT])
+
+    save_live_signal(
+        _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-clean-1", broker_order_id=None
+    )
+    )
+    save_live_signal(
+        _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-clean-1", broker_order_id="BRK-1")
+    )
+    save_live_signal(
+        _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-clean-1", broker_order_id="BRK-1")
+    )
+    save_live_signal(
+        _make_live_signal(
+        deployment_id=CONFLICT_DEPLOYMENT,
+        discord_message_id="ord-clean-2", broker_order_id="BRK-1")
+    )
+
+    assert _deployment_status(database, CONFLICT_DEPLOYMENT) == "ACTIVE"
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_deployments_with_broker_order_conflicts_groups_by_deployment(isolated_db) -> None:
+    """One query answers "which deployments are halted for a conflict and why"."""
+    database, _engine, _data_dir, _backtests_dir = isolated_db
+    _haltable_deployments(database, [CONFLICT_DEPLOYMENT, OTHER_DEPLOYMENT])
+    from shared.database import deployments_with_broker_order_conflicts
+
+    save_live_signal(
+        _make_live_signal(
+            deployment_id=CONFLICT_DEPLOYMENT,
+            discord_message_id="ord-grp-1",
+            broker_order_id="BRK-AAA",
+        )
+    )
+    save_live_signal(
+        _make_live_signal(
+            deployment_id=CONFLICT_DEPLOYMENT,
+            discord_message_id="ord-grp-1",
+            broker_order_id="BRK-BBB",
+        )
+    )
+    save_live_signal(
+        _make_live_signal(
+            deployment_id=OTHER_DEPLOYMENT,
+            discord_message_id="ord-grp-2",
+            broker_order_id="BRK-CCC",
+        )
+    )
+    save_live_signal(
+        _make_live_signal(
+            deployment_id=OTHER_DEPLOYMENT,
+            discord_message_id="ord-grp-2",
+            broker_order_id="BRK-DDD",
+        )
+    )
+
+    grouped = deployments_with_broker_order_conflicts()
+    assert set(grouped) == {CONFLICT_DEPLOYMENT, OTHER_DEPLOYMENT}
+    assert grouped[CONFLICT_DEPLOYMENT][0]["conflicting_broker_order_ids"] == ["BRK-BBB"]
+    assert grouped[OTHER_DEPLOYMENT][0]["conflicting_broker_order_ids"] == ["BRK-DDD"]
 
 
 def test_matching_or_missing_broker_order_id_records_no_conflict(

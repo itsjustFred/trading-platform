@@ -278,7 +278,9 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   eine ganze Einheit → strikt 1e-9 + `WARNING`),
   oder übersteigt die eigene Menge die Broker-Position, wird der gedeckelte Exit
   **trotzdem abgeschickt** und ein Alert ausgelöst: `ERROR`-Log mit
-  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event), allen
+  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event; mit
+  `OPS_ALERT_WEBHOOK_URL` konfiguriert geht der Alert zusätzlich an den
+  Ops-Alert-Channel, siehe `docs/live-deploy-runbook.md`), allen
   Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`), `broker_qty`
   und `own_ledger_qty`. Grund der Abweichung sind meist Broker-seitige
   Schließungen (SL/TP-Legs, cTrader-SL/TP, Flatten, manuelles Schließen), die
@@ -333,11 +335,22 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
-- **Bekannte Einschränkung: Exits auf `PAUSED`-Deployments (#126).** Ein Exit
-  wird wie jede Order nur für `ACTIVE`-Deployments zugestellt (Fan-out und
-  Re-Check vor dem Absenden). Auf einem `PAUSED`-Deployment wird „Exit AAPL"
-  verworfen (INFO-Log), die Position bleibt offen. Das Gate ist in #121
-  unverändert; Exits trotz `PAUSED` anzunehmen ist offen (#126).
+- **`PAUSED` nimmt Exits an, aber keine Entries (#126).** Die Status-Gates
+  (Fan-out, Re-Check vor dem Absenden und der atomare Submission-Claim) lassen
+  für einen Exit `ACTIVE` **oder** `PAUSED` zu, für einen Entry nur `ACTIVE`;
+  unterschieden wird je Deployment aus dem rohen Signal: der geparste Intent
+  (`live_runner.exit_signals.is_exit_order`) **oder** ein plain `SELL`/`SHORT` auf
+  einem Deployment, das nicht shorten darf - dieselbe Regel, die
+  `live_runner.daemon._trade_signal_to_live_signal` anwendet, nur vor den Gates
+  statt danach. `STOPPED` bleibt ausgeschlossen
+  (STOP macht seine Position über die Cancel/Flatten-Sweeps dicht). Das gilt für
+  jedes Pause, auch ein manuelles. Hintergrund: „stop opening new positions"
+  (die `PAUSED`-Zeile des "Operator safety controls"-Kommentars in
+  `live_runner/base_adapter.py`) darf eine Position, die das Ledger kennt, nicht
+  unbewacht bis zum Stop offen lassen - genau das wäre bei einem Pause durch
+  einen widersprüchlichen `broker_order_id` der Fall (Konflikt-Halt, siehe
+  `docs/live-deploy-runbook.md`). Trailing bleibt dabei unberührt: nur
+  `ACTIVE`-Deployments werden getrailt.
 - **Ein Exit nach dem anderen (pro Account und Symbol):** Ein früherer Exit
   **desselben Deployments** für dasselbe Symbol, der beim Broker noch arbeitet
   (nicht voll gefüllt und in den offenen Orders des Brokers, per Broker- oder
