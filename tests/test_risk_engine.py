@@ -119,6 +119,141 @@ def test_calculate_position_size_normal_case():
     assert sized.decision.metadata["stop_source"] == "signal"
 
 
+def _override_signal(**metadata) -> TradeSignal:
+    return TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=98.0,
+        take_profit=None,
+        timeframe="1h",
+        metadata=metadata,
+    )
+
+
+def test_calculate_position_size_risk_amount_override_sizes_absolute_dollars():
+    """#279: the override IS the per-trade risk — max_risk_per_trade does not
+    apply, and the quantity derives from the declared amount, not the pct."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+    )
+
+    # 500 / |100 - 98| = 250 units; the 1% pct target would have been 50.
+    assert sized.position_size == pytest.approx(250.0)
+    assert sized.risk_amount == pytest.approx(500.0)
+    assert sized.risk_percent == pytest.approx(0.005)
+    assert sized.decision.accepted is True
+
+
+def test_calculate_position_size_risk_amount_override_clamps_to_exposure_budget():
+    """The aggregate ceiling still binds: the override is clamped to the
+    remaining exposure budget, like the pct path clamps risk_percent."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        # 4% already used → only 1% (1,000) of risk budget remains.
+        current_exposure=0.04,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=5_000.0,
+    )
+
+    assert sized.risk_amount == pytest.approx(1_000.0)
+    assert sized.position_size == pytest.approx(500.0)
+
+
+def test_calculate_position_size_risk_amount_override_rejects_at_exposure_limit():
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.05,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "max_total_exposure"
+
+
+def test_calculate_position_size_risk_amount_override_respects_max_positions():
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=2)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(current_positions=2),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision.rejection_reason == "max_positions"
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf])
+def test_calculate_position_size_risk_amount_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="risk_amount_override"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            risk_amount_override=value,
+        )
+
+
+def test_calculate_position_size_stop_distance_override_replaces_derived_distance():
+    """#279: the strategy's explicit stop distance (e.g. ATR-based) sizes the
+    position instead of |entry - stop_loss| — the MT5-parity protocol."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        stop_distance_override=5.0,
+    )
+
+    # |100 - 98| = 2 would give 250; the 5.0 override distance gives 100.
+    assert sized.position_size == pytest.approx(100.0)
+    assert sized.decision.risk_distance == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf])
+def test_calculate_position_size_stop_distance_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="stop_distance_override"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            risk_amount_override=500.0,
+            stop_distance_override=value,
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

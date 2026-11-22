@@ -182,6 +182,8 @@ class RiskEngine:
         allow_fallback_stop: bool | None = None,
         reject_missing_stop: bool | None = None,
         max_notional_per_trade: float | None = None,
+        risk_amount_override: float | None = None,
+        stop_distance_override: float | None = None,
     ) -> SizedOrder:
         """Size one signal against the configured risk limits.
 
@@ -199,6 +201,19 @@ class RiskEngine:
           engines whose leverage policy is independent of the risk config.
           ``math.inf`` means explicitly uncapped (recorded as ``"uncapped"``
           in the decision metadata).
+        - ``risk_amount_override``: optional absolute per-trade risk in
+          account currency (e.g. the native engine's ``fixed_risk_amount``
+          MT5-alignment protocol, #279). It replaces the
+          ``balance * max_risk_per_trade`` target — the declared amount IS
+          the per-trade risk, so ``max_risk_per_trade`` does not apply — but
+          the aggregate ``max_total_exposure`` ceiling still binds: the
+          override is clamped to the remaining exposure budget, exactly like
+          the pct path clamps ``risk_percent``.
+        - ``stop_distance_override``: optional explicit risk distance per
+          unit (the strategy's stop distance, e.g. ATR-based) used instead of
+          ``|entry_price - stop_loss|``. ``max_positions``,
+          ``max_total_exposure`` rejection and every input validation apply
+          identically on both paths.
 
         The returned ``SizedOrder.position_size`` is in account-currency units
         of the traded symbol (shares/lots); it is the only quantity in that
@@ -265,7 +280,22 @@ class RiskEngine:
             )
 
         remaining_exposure = max(0.0, self.config.max_total_exposure - exposure)
-        risk_percent = min(self.config.max_risk_per_trade, remaining_exposure)
+        override_amount: float | None = None
+        if risk_amount_override is None:
+            risk_percent = min(self.config.max_risk_per_trade, remaining_exposure)
+        else:
+            override_amount = self._finite_number(
+                risk_amount_override, "risk_amount_override"
+            )
+            if override_amount <= 0:
+                raise ValueError("risk_amount_override must be > 0")
+            # The override is the declared absolute per-trade risk;
+            # ``max_risk_per_trade`` deliberately does not apply — the
+            # override IS the per-trade risk declaration. The aggregate
+            # exposure ceiling still binds: the amount is clamped to the
+            # remaining exposure budget, exactly like the pct path clamps
+            # ``risk_percent`` to ``remaining_exposure``.
+            risk_percent = min(override_amount / balance, remaining_exposure)
         if risk_percent <= 0:
             return self._sized_order(
                 signal=signal,
@@ -367,11 +397,26 @@ class RiskEngine:
                 ),
             )
 
-        risk_distance = abs(signal.entry_price - stop_loss)
+        if stop_distance_override is not None:
+            override_distance = self._finite_number(
+                stop_distance_override, "stop_distance_override"
+            )
+            if override_distance <= 0:
+                raise ValueError("stop_distance_override must be > 0")
+            risk_distance = override_distance
+        else:
+            risk_distance = abs(signal.entry_price - stop_loss)
         if risk_distance <= 0 or not math.isfinite(risk_distance):
             raise ValueError("entry_price and stop_loss must differ for risk sizing")
 
-        risk_amount = balance * risk_percent
+        # For the override path keep the declared dollars exact — routing
+        # through ``balance * (override / balance)`` would add float dust to
+        # quantities the MT5-parity protocol pins exactly.
+        risk_amount = (
+            min(override_amount, remaining_exposure * balance)
+            if override_amount is not None
+            else balance * risk_percent
+        )
         raw_size = risk_amount / (risk_distance * pip)
         position_size = max(0.0, raw_size)
         max_notional = balance * notional_limit

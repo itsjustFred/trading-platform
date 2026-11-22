@@ -432,6 +432,24 @@ class TradeEngine:
         if fixed_risk_amount is None:
             fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
 
+        pending_positions = sum(
+            order is not exclude_order for order in self.pending_orders
+        )
+        signal = TradeSignal(
+            action="buy" if str(direction).upper() == "LONG" else "sell",
+            symbol=self.symbol,
+            entry_price=float(entry_price),
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            timeframe=self.config.timeframe,
+            metadata={
+                # C2: pending orders count toward max_positions — a
+                # pending order is committed intent, not free capacity.
+                "current_positions": len(self.positions) + pending_positions,
+                "pending_positions": pending_positions,
+            },
+        )
+
         if fixed_risk_amount is not None and stop_loss_price is not None:
             risk_amount = float(fixed_risk_amount)
             # MT5 parity: when the strategy provides an explicit stop distance
@@ -440,7 +458,8 @@ class TradeEngine:
             # deriving it from |entry - stop|. The derived form inherits
             # fill-price noise (bid/ask, next-open gaps) that MT5 lots never
             # see. Falls back to the derived form when no distance is given.
-            if stop_distance is not None and stop_distance > 0:
+            has_stop_distance = stop_distance is not None and stop_distance > 0
+            if has_stop_distance:
                 risk_distance = float(stop_distance)
             else:
                 risk_distance = abs(float(entry_price) - float(stop_loss_price))
@@ -449,7 +468,41 @@ class TradeEngine:
                 tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
                 min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
                 max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
-                shares = (risk_amount / risk_distance) * (tick_size / tick_value)
+                # #279: the fixed-risk branch used to return before the risk
+                # engine, skipping max_positions, the aggregate exposure
+                # ceiling and input validation. It now sizes through
+                # ``calculate_position_size`` via ``risk_amount_override``;
+                # ``pip_value = tick_value / tick_size`` is the engine's unit
+                # contract (account-currency P&L of one size unit per 1.0
+                # price move) and reproduces the legacy
+                # ``(risk / distance) * (tick_size / tick_value)`` exactly.
+                sized_order = self._risk_engine.calculate_position_size(
+                    signal=signal,
+                    # F21 (D2): realized cash, same basis as the pct path.
+                    account_balance=float(self._sizing_equity),
+                    pip_value=tick_value / tick_size,
+                    current_exposure=self._current_risk_exposure(
+                        float(entry_price), exclude_order=exclude_order
+                    ),
+                    # The per-position notional ceiling stays in
+                    # ``_apply_notional_caps`` below: the engine's notional
+                    # unit (qty * price * pip — true contract notional for
+                    # lot-denominated symbols) differs from the native cap's
+                    # qty * price convention, so an engine-level ceiling here
+                    # would silently tighten MT5-parity sizing. ``inf`` is
+                    # the documented uncapped value.
+                    max_notional_per_trade=math.inf,
+                    risk_amount_override=risk_amount,
+                    stop_distance_override=(
+                        float(stop_distance) if has_stop_distance else None
+                    ),
+                )
+                shares = float(sized_order.position_size)
+                if shares <= 0:
+                    # Engine rejection (max_positions / max_total_exposure)
+                    # or a non-positive size — the same zero the leverage
+                    # clamp produces; callers log the skip.
+                    return 0.0
                 if lot_step > 0:
                     shares = math.floor((shares / lot_step) + 1e-12) * lot_step
                 if min_lot > 0:
@@ -468,24 +521,7 @@ class TradeEngine:
                     ),
                 )
 
-        pending_positions = sum(
-            order is not exclude_order for order in self.pending_orders
-        )
         if self._risk_enabled:
-            signal = TradeSignal(
-                action="buy" if str(direction).upper() == "LONG" else "sell",
-                symbol=self.symbol,
-                entry_price=float(entry_price),
-                stop_loss=stop_loss_price,
-                take_profit=take_profit_price,
-                timeframe=self.config.timeframe,
-                metadata={
-                    # C2: pending orders count toward max_positions — a
-                    # pending order is committed intent, not free capacity.
-                    "current_positions": len(self.positions) + pending_positions,
-                    "pending_positions": pending_positions,
-                },
-            )
             sized_order = self._risk_engine.calculate_position_size(
                 signal=signal,
                 # F21 (D2): realized cash, NOT the mark-to-market

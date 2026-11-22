@@ -197,8 +197,12 @@ Implementation:
   broker maximum means 1x.
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
-  the result is still capped by `max_leverage` (free margin, #347) unless
-  `cap_fixed_risk_by_leverage = false`.
+  since #279 the branch sizes through `RiskEngine.calculate_position_size`
+  (`risk_amount_override`), so `max_positions`, the aggregate
+  `max_total_exposure` ceiling and the engine's input validation apply —
+  the declared amount is the per-trade risk and is clamped to the remaining
+  exposure budget. The result is still capped by `max_leverage` (free
+  margin, #347) unless `cap_fixed_risk_by_leverage = false`.
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop

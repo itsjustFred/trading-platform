@@ -1125,6 +1125,164 @@ class TestFreeMarginLeverageCap:
 # ─── F22: max_positions comes from risk policy, not strategy params ─────────
 
 
+class TestFixedRiskViaRiskEngine:
+    """#279: ``fixed_risk_amount`` sizing must go through
+    ``RiskEngine.calculate_position_size`` (via ``risk_amount_override``) so
+    ``max_positions``, the aggregate ``max_total_exposure`` ceiling and the
+    engine's input validation apply — the fixed-risk branch used to return
+    before the risk engine and skip all three. Quantities must stay identical
+    where the caps never bound (the MT5-parity sizing protocol)."""
+
+    @staticmethod
+    def _engine(tmp_path: Path, *, parameters: dict | None = None, **overrides):
+        engine = TradeEngine(
+            _config(tmp_path, parameters=parameters or {}, **overrides),
+            symbol="PROBE",
+        )
+        engine._refresh_sizing_equity()
+        return engine
+
+    @staticmethod
+    def _open_position(
+        engine: TradeEngine,
+        *,
+        entry_price: float = 100.0,
+        qty: float = 100.0,
+        stop_loss: float | None = None,
+    ) -> None:
+        engine.positions.append(
+            Position(
+                symbol="PROBE",
+                direction="LONG",
+                entry_index=0,
+                entry_time="2024-01-01T00:00:00+00:00",
+                entry_price=entry_price,
+                order_type="market",
+                quantity=qty,
+                remaining_qty=qty,
+                stop_loss=stop_loss if stop_loss is not None else entry_price * 0.98,
+            )
+        )
+        engine._refresh_sizing_equity()
+
+    @staticmethod
+    def _fixed_params(**extra) -> dict:
+        params = {"fixed_risk_amount": 500.0, "tick_value": 1.0, "tick_size": 1.0}
+        params.update(extra)
+        return params
+
+    def test_fixed_risk_respects_max_positions(self, tmp_path: Path):
+        """Five open positions fill TRADE_ENGINE_MAX_POSITIONS: the fixed-risk
+        branch must not size a sixth order — today it bypasses the engine and
+        does."""
+        engine = self._engine(tmp_path, parameters=self._fixed_params(), max_leverage=100.0)
+        for _ in range(5):
+            self._open_position(engine)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
+    def test_fixed_risk_pending_orders_count_toward_max_positions(
+        self, tmp_path: Path
+    ):
+        """C2 parity with the pct path: pending orders are committed intent,
+        so 4 positions + 1 pending order already fills the limit."""
+        from runner.engine import Order, OrderType
+
+        engine = self._engine(tmp_path, parameters=self._fixed_params(), max_leverage=100.0)
+        for _ in range(4):
+            self._open_position(engine)
+        engine.pending_orders.append(
+            Order(
+                symbol="PROBE",
+                direction="LONG",
+                order_type=OrderType.MARKET,
+                created_index=0,
+                created_time="2024-01-01T00:00:00+00:00",
+                quantity=10.0,
+                stop_loss=99.0,
+            )
+        )
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
+    def test_fixed_risk_rejects_when_aggregate_exposure_is_spent(
+        self, tmp_path: Path
+    ):
+        """max_total_exposure (5% of realized cash) was invisible to the
+        fixed-risk branch: two positions already carrying 12% aggregate risk
+        must reject the next entry, not size it."""
+        engine = self._engine(tmp_path, parameters=self._fixed_params(), max_leverage=100.0)
+        # Each position risks |100 - 98| * 3000 = 6,000 → 0.06 of 100k; two
+        # of them are 0.12 > 0.05. High leverage keeps the margin cap out of
+        # the way so only the exposure ceiling can produce the zero.
+        self._open_position(engine, qty=3000.0, stop_loss=98.0)
+        self._open_position(engine, qty=3000.0, stop_loss=98.0)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
+    def test_fixed_risk_clamps_to_remaining_exposure_budget(
+        self, tmp_path: Path
+    ):
+        """The aggregate ceiling clamps like the pct path does: with 1% of
+        exposure already used, only 4% of balance remains as risk budget, so
+        a $5,000 fixed risk sizes as $4,000 — 4,000 shares at a 1.0 distance,
+        not the 5,000 the override alone would give."""
+        engine = self._engine(
+            tmp_path,
+            parameters=self._fixed_params(fixed_risk_amount=5000.0),
+            max_leverage=100.0,
+        )
+        # |100 - 99.5| * 2000 = 1,000 risk → 0.01 exposure; remaining = 0.04.
+        self._open_position(engine, qty=2000.0, stop_loss=99.5)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(4_000.0)
+
+    def test_fixed_risk_validates_sizing_equity(self, tmp_path: Path):
+        """Engine input validation now applies: a non-positive realized-cash
+        basis must raise instead of sizing against it."""
+        engine = self._engine(tmp_path, parameters=self._fixed_params(), max_leverage=100.0)
+        engine._sizing_equity = -1.0
+        with pytest.raises(ValueError, match="account_balance"):
+            engine._calculate_position_size(
+                entry_price=100.0,
+                stop_loss_price=99.0,
+                direction="LONG",
+            )
+
+    def test_fixed_risk_still_sizes_without_risk_pct(self, tmp_path: Path):
+        """Regression guard: fixed_risk_amount is the sizing protocol for
+        MT5-parity runs whose configs never set risk_per_trade_pct — routing
+        through the engine must not make the pct config a prerequisite."""
+        engine = self._engine(
+            tmp_path,
+            parameters=self._fixed_params(),
+            risk_per_trade_pct=0.0,
+            max_leverage=100.0,
+        )
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(500.0)
+
+
 class TestMaxPositionsPolicy:
     def test_strategy_param_max_positions_is_ignored(self):
         """Strategy `parameters` must not silently set engine risk policy."""

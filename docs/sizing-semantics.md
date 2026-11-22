@@ -75,6 +75,13 @@ documented here.
     same bar are each judged against the full free margin, so with
     pyramiding they can jointly exceed it — the same convention MT5 applies
     to pending orders.
+  `fixed_risk_amount` (the MT5-alignment sizing protocol) routes through the
+  same `RiskEngine.calculate_position_size` via `risk_amount_override`:
+  `max_positions` (pending orders included), the aggregate
+  `max_total_exposure` ceiling — which clamps the declared amount to the
+  remaining exposure budget — and input validation all apply; the
+  per-position notional cap and the free-margin leverage clamp are
+  unchanged.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.
