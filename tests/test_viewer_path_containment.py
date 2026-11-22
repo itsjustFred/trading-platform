@@ -384,6 +384,7 @@ def test_signal_replay_accepts_csv_inside_data_dir(
             "filepath": str(csv_path),
             "start_date": "2026-02-23",
             "end_date": "2026-02-24",
+            "fees_zero": True,
         },
     )
 

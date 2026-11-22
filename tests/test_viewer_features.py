@@ -3361,6 +3361,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             "end_date": "2024-01-02",
             "timeframe": "1h",
             "auto_download": False,
+            "fees_zero": True,
         },
     )
 
@@ -3387,6 +3388,9 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert replay_query_args["source"] == "discord"
     assert replay_query_args["limit"] == 20000
     assert adapter_init_kwargs["signal_processor_name"] == "ramjet"
+    # #361: the declared fee params reach the adapter — before the fix the
+    # adapter got none and run() died on the #84 fail-closed fee check.
+    assert adapter_init_kwargs["fee_params"] == {"fees": "zero"}
 
 
 def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeypatch, tmp_path):
@@ -3421,6 +3425,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
             "start_date": "2026-02-23",
             "end_date": "2026-02-24",
             "auto_download": True,
+            "fees_zero": True,
         },
     )
 
@@ -3432,6 +3437,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
     assert forwarded.timeframe == "1m"
     assert forwarded.signal_processor == "ramjet"
     assert forwarded.signal_source is None
+    assert forwarded.fees_zero is True
     assert len(forwarded.signals) == 2
     assert str(forwarded.signals[0].source).startswith("csv:")
 
@@ -3466,14 +3472,103 @@ def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client,
             "signal_processor": "ramjet",
             "start_date": "2026-02-23",
             "end_date": "2026-02-23",
+            "fees_zero": True,
         },
     )
 
     assert response.status_code == 202
     forwarded = captured["payload"]
     assert forwarded is not None
+    assert forwarded.fees_zero is True
     assert len(forwarded.signals) == 1
     assert forwarded.signals[0].symbol == "AAPL"
+
+
+def test_backtest_run_signals_requires_an_explicit_fee_declaration(viewer_client):
+    """#361/#84: without fee fields the request is a 400 at the boundary —
+    before the fix the task was accepted and died in the worker on the
+    adapter's fail-closed ``resolve_fee_model`` check."""
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "fee" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_signals_rejects_conflicting_fee_flags(viewer_client):
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fees_zero": True,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflict" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_from_signals_requires_an_explicit_fee_declaration(viewer_client):
+    """The discord-history branch forwards to run-signals, so the same
+    fail-closed fee check applies before any signal gathering."""
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "fee" in str(response.json()["detail"]).lower()
+
+
+def test_signal_replay_fee_params_map_cli_style_flags():
+    import viewer.main as viewer_app_module
+
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.001,
+        fee_flat_per_trade=2.0,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.001,
+        "fee_flat_per_trade": 2.0,
+    }
+
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.001,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.001
+    }
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
