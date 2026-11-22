@@ -99,7 +99,7 @@ def enforce_broker_order_conflict_halts() -> list[dict[str, Any]]:
     ).items():
         try:
             paused_now = pause_live_deployment_for_order_conflict(deployment_id)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             # The halt is the safety property. Failing to write it must be loud and
             # must not stop the remaining deployments from being re-halted.
             logger.error(

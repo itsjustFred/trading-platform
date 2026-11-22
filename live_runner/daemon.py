@@ -4601,7 +4601,7 @@ async def sync_services_loop(
             halted = await asyncio.to_thread(enforce_broker_order_conflict_halts)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             # The halt is the safety property. Failing to write it must be loud, and it
             # must not stop this loop from going on to keep the services in sync.
             logger.error(
