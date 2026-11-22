@@ -375,6 +375,20 @@ class BaseLiveAdapter(ABC):
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""
 
+    async def get_equity(self) -> float:
+        """Account equity including unrealized P&L, for the loss breaker (#301).
+
+        Defaults to ``get_balance()[1]``: adapters whose balance tuple already
+        carries true equity (Alpaca's ``account.equity``) need no override.
+        Adapters whose ``get_balance`` equity slot is really balance (cTrader,
+        per the #267 decision that sizing stays on realized balance) override
+        this so ONLY the breaker sees equity-with-unrealized-P&L. Sizing must
+        keep reading ``get_balance`` - this method exists so the breaker never
+        changes what sizing sees.
+        """
+        _, equity = await self.get_balance()
+        return float(equity)
+
     async def get_quote(self, symbol: str) -> LiveQuote:
         """Return the current broker bid/ask for ``symbol``.
 

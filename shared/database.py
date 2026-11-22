@@ -23,6 +23,8 @@ from sqlalchemy import (
     String,
     TextClause,
     UniqueConstraint,
+    and_,
+    case,
     delete,
     event,
     func,
@@ -51,6 +53,7 @@ from shared.models import (
     LiveBalanceRecord,
     LiveDeploymentConfig,
     LiveExecution,
+    LiveLossBreakerRecord,
     LiveSignal,
     Service,
     ServiceStatus,
@@ -769,6 +772,55 @@ class LiveBalanceModel(SQLModel, table=True):
             timestamp=self.timestamp,
             balance=self.balance,
             equity=self.equity,
+        )
+
+
+class LiveLossBreakerStateModel(SQLModel, table=True):
+    """One loss circuit-breaker row per scope (#301); see LiveLossBreakerRecord."""
+
+    __tablename__ = "live_loss_breaker_state"
+
+    scope: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    utc_day: str
+    day_start_equity: float
+    peak_equity: float
+    daily_breached: bool = Field(default=False)
+    drawdown_breached: bool = Field(default=False)
+    last_equity: float | None = Field(default=None)
+    last_observed_at: datetime | None = Field(default=None)
+    breach_detail_json: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+    @classmethod
+    def from_record(cls, record: LiveLossBreakerRecord) -> "LiveLossBreakerStateModel":
+        return cls(
+            scope=record.scope,
+            account_id=record.account_id,
+            utc_day=record.utc_day,
+            day_start_equity=record.day_start_equity,
+            peak_equity=record.peak_equity,
+            daily_breached=record.daily_breached,
+            drawdown_breached=record.drawdown_breached,
+            last_equity=record.last_equity,
+            last_observed_at=record.last_observed_at,
+            breach_detail_json=record.breach_detail,
+        )
+
+    def to_record(self) -> LiveLossBreakerRecord:
+        return LiveLossBreakerRecord(
+            scope=self.scope,
+            account_id=self.account_id,
+            utc_day=self.utc_day,
+            day_start_equity=self.day_start_equity,
+            peak_equity=self.peak_equity,
+            daily_breached=bool(self.daily_breached),
+            drawdown_breached=bool(self.drawdown_breached),
+            last_equity=self.last_equity,
+            last_observed_at=self.last_observed_at,
+            breach_detail=self.breach_detail_json,
         )
 
 
@@ -4664,6 +4716,7 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.loss_breaker import deployment_loss_breaker_limits
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -4671,6 +4724,9 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Loss breaker settings (#301) get the same treatment: a malformed
+    # threshold would otherwise refuse every entry at dispatch.
+    deployment_loss_breaker_limits(deployment)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
@@ -5619,6 +5675,504 @@ def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRec
         if record is not None:
             latest[account_id] = record
     return latest
+
+
+# ─── Loss circuit breaker (#301) ─────────────────────────────────────────────
+#
+# One row per scope in ``live_loss_breaker_state``. The observe/latch/reset
+# helpers are deliberately dumb storage: threshold evaluation lives in
+# ``live_runner.loss_breaker`` so this layer never decides whether trading is
+# allowed. ``observe`` is the only writer of the equity series; its
+# read-modify-write runs under a per-scope ``threading.Lock`` so the balance
+# poll and an entry check observing the same scope from different worker
+# threads cannot lose each other's update (a lost ``peak_equity`` update would
+# understate drawdown; two first observations at once would raise
+# ``IntegrityError`` on the primary key).
+
+_OBSERVE_LOCKS_GUARD = threading.Lock()
+_OBSERVE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _loss_breaker_observe_lock(scope: str) -> threading.Lock:
+    with _OBSERVE_LOCKS_GUARD:
+        lock = _OBSERVE_LOCKS.get(scope)
+        if lock is None:
+            lock = threading.Lock()
+            _OBSERVE_LOCKS[scope] = lock
+        return lock
+
+
+def _loss_breaker_utc_day(observed_at: datetime) -> str:
+    """The UTC calendar day ``observed_at`` falls on, as ``YYYY-MM-DD``."""
+    if observed_at.tzinfo is None:
+        aware = observed_at.replace(tzinfo=timezone.utc)
+    else:
+        aware = observed_at
+    return aware.astimezone(timezone.utc).date().isoformat()
+
+
+def get_live_loss_breaker_state(scope: str) -> LiveLossBreakerRecord | None:
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        return None
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+    return row.to_record() if row is not None else None
+
+
+def list_live_loss_breaker_states(
+    account_id: str | None = None,
+) -> list[LiveLossBreakerRecord]:
+    init_db()
+    with get_session() as session:
+        statement = select(LiveLossBreakerStateModel).order_by(
+            LiveLossBreakerStateModel.scope.asc()
+        )
+        if account_id is not None:
+            statement = statement.where(
+                LiveLossBreakerStateModel.account_id == str(account_id)
+            )
+        rows = session.exec(statement).all()
+    return [row.to_record() for row in rows]
+
+
+def observe_live_loss_breaker(
+    scope: str,
+    account_id: str,
+    equity: float,
+    observed_at: datetime,
+) -> LiveLossBreakerRecord:
+    """Record one equity observation for ``scope`` and return the new state.
+
+    First observation of a UTC day re-bases ``day_start_equity`` to the last
+    equity observed before the boundary (the closest available estimate of
+    start-of-day equity - it also captures an overnight gap a fresh baseline
+    would hide) and clears the daily latch; with no earlier observation the
+    current equity is the baseline. ``peak_equity`` only ever rises here - it
+    is re-based solely by ``reset_live_loss_breaker_drawdown``. Breach flags
+    are not evaluated here; ``latch_live_loss_breaker_breach`` owns them.
+
+    A scope's first-ever observation always seeds ``day_start_equity`` and
+    ``peak_equity`` from THAT observation - never from another scope's
+    baseline. A deployment scope observes a synthetic equity
+    (``account_equity - other deployments' P&L``) on a different basis than
+    the account scope, so inheriting the account row's baseline would trip a
+    brand-new deployment instantly (or hide its first-day losses).
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_scope or not normalized_account:
+        raise ValueError("observe_live_loss_breaker requires a scope and an account_id")
+    equity_value = float(equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    observed_naive = _naive_utc(observed_at)
+    utc_day = _loss_breaker_utc_day(observed_at)
+
+    init_db()
+    with _loss_breaker_observe_lock(normalized_scope):
+        with get_session() as session:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            if row is None:
+                row = LiveLossBreakerStateModel(
+                    scope=normalized_scope,
+                    account_id=normalized_account,
+                    utc_day=utc_day,
+                    day_start_equity=equity_value,
+                    peak_equity=equity_value,
+                    daily_breached=False,
+                    drawdown_breached=False,
+                    last_equity=equity_value,
+                    last_observed_at=observed_naive,
+                    breach_detail_json=None,
+                    updated_at=observed_naive,
+                )
+                session.add(row)
+            else:
+                if row.utc_day != utc_day:
+                    # UTC day boundary: the daily breaker resets automatically.
+                    # The new day's baseline is the equity last seen before the
+                    # boundary, not this observation - a gap across midnight is a
+                    # loss of the new day, not its starting capital.
+                    row.utc_day = utc_day
+                    row.day_start_equity = (
+                        float(row.last_equity)
+                        if row.last_equity is not None
+                        else equity_value
+                    )
+                    row.daily_breached = False
+                row.peak_equity = max(float(row.peak_equity), equity_value)
+                row.last_equity = equity_value
+                row.last_observed_at = observed_naive
+                row.updated_at = observed_naive
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
+
+
+def latch_live_loss_breaker_breach(
+    scope: str,
+    kind: str,
+    detail: dict[str, Any],
+    latched_at: datetime,
+) -> bool:
+    """Set the ``daily``/``drawdown`` latch on ``scope``; True when it transitions.
+
+    The return value is what the caller alerts on: a scope already latched for
+    that kind reports False so a standing breach alerts once per episode, not
+    once per observation.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("latch_live_loss_breaker_breach requires a scope")
+    if kind not in {"daily", "drawdown"}:
+        raise ValueError(f"unknown loss breaker breach kind {kind!r}")
+    latched_naive = _naive_utc(latched_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            raise KeyError(f"no loss breaker state for scope {normalized_scope!r}")
+        flag = "daily_breached" if kind == "daily" else "drawdown_breached"
+        already = bool(getattr(row, flag))
+        setattr(row, flag, True)
+        row.breach_detail_json = dict(detail)
+        row.updated_at = latched_naive
+        session.add(row)
+        session.commit()
+        return not already
+
+
+def reset_live_loss_breaker_drawdown(
+    scope: str,
+    equity: float,
+    reset_at: datetime,
+) -> LiveLossBreakerRecord | None:
+    """Operator reset of the drawdown breaker: clear the latch, re-base the peak.
+
+    ``peak_equity`` is set to the current equity, not kept: the drawdown
+    breaker measures from the peak, so a reset that kept the old high-water
+    mark would re-trip on the very next observation. Returns ``None`` when the
+    scope has no state row.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("reset_live_loss_breaker_drawdown requires a scope")
+    equity_value = float(equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    reset_naive = _naive_utc(reset_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            return None
+        row.drawdown_breached = False
+        row.peak_equity = equity_value
+        row.last_equity = equity_value
+        row.last_observed_at = reset_naive
+        row.updated_at = reset_naive
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.to_record()
+
+
+# ─── Deployment trading flows (loss breaker, #301) ────────────────────────────
+#
+# The deployment loss-breaker scope cannot read a "deployment equity" from the
+# broker: positions on a netted account belong to the account, not to a
+# deployment. What the platform does have is the persisted fill ledger - every
+# execution knows its deployment, symbol, side, quantity, price and commission.
+# From it a deployment's trading P&L (realized AND unrealized, in account
+# currency once marked with the current quote and pip value) is computable:
+#
+#     pnl = pip_value * (cash + net_qty * price_now) - commission
+#
+# where ``cash`` is net cash paid (negative) or received (positive) in
+# qty x price units and ``net_qty`` the signed open quantity. This section only
+# aggregates the ledger; marking to market and the breaker math live in
+# ``live_runner.loss_breaker``.
+
+#: ``actual_price_observed`` verdicts a fill's price may be trusted for P&L.
+#: ``derived`` is the reconcile remainder's estimate - the best available and
+#: excluding it would make every deployment that ever needed a reconcile
+#: unmeasurable. ``sent_bad``/``absent``/``derived_unavailable`` and a
+#: non-positive price are not a price. A NULL verdict is a row written before
+#: the column existed; its ``actual_price`` was still recorded, so it counts
+#: when positive.
+_TRUSTED_FILL_PRICE_OBSERVED = ("observed", "derived")
+
+
+def get_account_deployment_trading_flows(
+    account_id: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Per-deployment, per-symbol trading flows for one account's breaker scopes.
+
+    Returns ``{deployment_id: {symbol: flow}}`` where ``flow`` holds:
+
+    * ``net_qty`` - signed filled quantity (buy ``+``, sell ``-``);
+    * ``cash`` - ``-sum(sign * qty * actual_price)`` in qty x price units:
+      net cash paid (negative) or received (positive);
+    * ``commission`` - summed per-fill commission in account currency.
+      KNOWN APPROXIMATION: a NULL commission is summed as 0. Alpaca crypto
+      fees stay NULL until the CFEE backfill lands (about two days), so a
+      crypto deployment's P&L is overstated by those fees until then.
+      Failing closed instead would stop crypto deployments for days after
+      each fill, so the runbook documents this as accepted;
+    * ``unpriced_fills`` - fills whose ``actual_price`` cannot be trusted
+      (see ``_TRUSTED_FILL_PRICE_OBSERVED``). Any non-zero count means the
+      deployment's P&L cannot be computed exactly and the caller must fail
+      closed rather than mark to market on a partial ledger.
+
+    Every deployment on the account is covered whatever its status - a stopped
+    deployment's ledger still describes positions at the broker. Deployments
+    without fills are absent (their P&L is 0). Fails closed on a stored action
+    other than buy/sell, like the quantity ledger.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        raise ValueError("An account id is required for deployment trading flows")
+    trusted = or_(
+        LiveExecutionModel.actual_price_observed.is_(None),
+        LiveExecutionModel.actual_price_observed.in_(_TRUSTED_FILL_PRICE_OBSERVED),
+    )
+    priced = and_(
+        LiveExecutionModel.actual_price > 0,
+        trusted,
+    )
+    unpriced = ~priced
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                func.sum(LiveExecutionModel.filled_qty),
+                func.sum(LiveExecutionModel.filled_qty * LiveExecutionModel.actual_price),
+                func.sum(func.coalesce(LiveExecutionModel.commission, 0.0)),
+                func.sum(case((unpriced, 1), else_=0)),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account)
+            .group_by(
+                LiveSignalModel.deployment_id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+            )
+        ).all()
+    flows: dict[str, dict[str, dict[str, Any]]] = {}
+    for deployment_id, symbol, action, qty, qty_price, commission, unpriced_count in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(qty or 0.0)
+        qty_at_price = float(qty_price or 0.0)
+        if normalized_action == "buy":
+            sign = 1.0
+        elif normalized_action == "sell":
+            sign = -1.0
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({symbol}) has no known position sign; the deployment loss "
+                "breaker cannot compute its P&L."
+            )
+        dep = flows.setdefault(str(deployment_id), {})
+        flow = dep.setdefault(
+            str(symbol),
+            {"net_qty": 0.0, "cash": 0.0, "commission": 0.0, "unpriced_fills": 0},
+        )
+        flow["net_qty"] += sign * quantity
+        flow["cash"] += -sign * qty_at_price
+        flow["commission"] += float(commission or 0.0)
+        flow["unpriced_fills"] += int(unpriced_count or 0)
+    return flows
+
+
+#: ``live_control_audit.action`` written when a broker-side close could not be
+#: attributed to one deployment's ledger (#144; the writer lands with #277).
+#: The loss breaker treats any such row on the account as "the fill ledger may
+#: be incomplete" and fails deployment scopes closed - a stale ledger P&L
+#: would otherwise move every OTHER deployment's synthetic equity.
+LEDGER_RECONCILIATION_AUDIT_ACTION = "ledger_reconciliation_required"
+
+#: ``live_control_audit.action`` written by the operator resolution path
+#: (``scripts.live_loss_breaker resolve-ledger-flag``): an operator has
+#: reconciled the flagged ``account:symbol`` by hand. A flag counts as
+#: UNRESOLVED only while it is newer than the latest resolution for the same
+#: ``account:symbol`` - audit rows are append-only, so "resolved" can never
+#: delete the flag, only supersede it.
+LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION = "ledger_reconciliation_resolved"
+
+
+def _ledger_flag_account_like(account_id: str) -> str:
+    """The LIKE pattern matching ``<account_id>:*`` audit target ids.
+
+    The trailing colon keeps ``acc-1`` from matching ``acc-10:SYM``.
+    """
+    escaped_account = (
+        str(account_id).replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"{escaped_account}:%"
+
+
+def _latest_audit_timestamps_by_target(
+    session: Session, action: str, like_pattern: str
+) -> dict[str, Any]:
+    """``{target_id: max(created_at)}`` for one audit action on an account."""
+    rows = session.exec(
+        select(
+            LiveControlAuditModel.target_id,
+            func.max(LiveControlAuditModel.created_at),
+        )
+        .where(LiveControlAuditModel.action == action)
+        .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        .group_by(LiveControlAuditModel.target_id)
+    ).all()
+    return {str(target_id): created_at for target_id, created_at in rows}
+
+
+def list_unresolved_ledger_reconciliation_flags(account_id: str) -> list[str]:
+    """The ``<account_id>:<SYMBOL>`` targets with an UNRESOLVED flag.
+
+    ``flag_live_ledger_reconciliation`` (#277) writes one audit row per
+    ``account:symbol`` whose broker position the persisted fill ledger cannot
+    explain. A flag is unresolved while it is newer than the latest
+    ``ledger_reconciliation_resolved`` row for the SAME target: the operator
+    resolution command writes those, and a NEW flag after a resolution flags
+    the target again. ``target_id`` is ``<account_id>:<SYMBOL>``; the LIKE
+    pattern's trailing colon keeps ``acc-1`` from matching ``acc-10:SYM``.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    like_pattern = _ledger_flag_account_like(normalized_account)
+    init_db()
+    with get_session() as session:
+        flagged = _latest_audit_timestamps_by_target(
+            session, LEDGER_RECONCILIATION_AUDIT_ACTION, like_pattern
+        )
+        if not flagged:
+            return []
+        resolved = _latest_audit_timestamps_by_target(
+            session, LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION, like_pattern
+        )
+    return sorted(
+        target_id
+        for target_id, flagged_at in flagged.items()
+        if target_id not in resolved
+        or flagged_at is None
+        or resolved[target_id] is None
+        or flagged_at > resolved[target_id]
+    )
+
+
+def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
+    """Whether ``account_id`` has any UNRESOLVED ledger-reconciliation flag.
+
+    See :func:`list_unresolved_ledger_reconciliation_flags`: ANY unresolved
+    row means the ledger may be missing fills and deployment P&L derived from
+    it is not trustworthy.
+    """
+    return bool(list_unresolved_ledger_reconciliation_flags(account_id))
+
+
+def resolve_ledger_reconciliation_flag(
+    *,
+    account_id: str,
+    symbol: str,
+    actor: str = "operator",
+    note: str = "",
+) -> dict[str, Any]:
+    """Record the operator resolution of one ``account:symbol`` flag.
+
+    Writes a ``ledger_reconciliation_resolved`` audit row against the same
+    ``account:symbol`` target the flag used, so the flag stops counting as
+    unresolved (it is newer-than-resolution that keeps it live - see
+    :func:`list_unresolved_ledger_reconciliation_flags`). The flag row itself
+    is never touched: the audit trail stays append-only. Never raises - the
+    audit writer logs and returns its payload either way.
+    """
+    normalized_account = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account or not normalized_symbol:
+        raise ValueError("resolve_ledger_reconciliation_flag requires account and symbol")
+    return record_live_control_audit(
+        action=LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION,
+        target_type="account_symbol",
+        target_id=f"{normalized_account}:{normalized_symbol}",
+        actor=actor,
+        detail={
+            "account_id": normalized_account,
+            "symbol": normalized_symbol,
+            "note": str(note or ""),
+        },
+    )
+
+
+def list_untrusted_fill_references(
+    account_id: str, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Identities of the account's fills whose price cannot be trusted.
+
+    The counterpart of ``unpriced_fills`` in
+    :func:`get_account_deployment_trading_flows` for alerting: the aggregate
+    only counts them, this names them so an operator can find and repair the
+    rows. Same trust rule (``_TRUSTED_FILL_PRICE_OBSERVED`` + positive price).
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    trusted = or_(
+        LiveExecutionModel.actual_price_observed.is_(None),
+        LiveExecutionModel.actual_price_observed.in_(_TRUSTED_FILL_PRICE_OBSERVED),
+    )
+    priced = and_(
+        LiveExecutionModel.actual_price > 0,
+        trusted,
+    )
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveExecutionModel.id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                LiveExecutionModel.filled_qty,
+                LiveExecutionModel.actual_price,
+                LiveExecutionModel.actual_price_observed,
+                LiveExecutionModel.broker_order_id,
+                LiveExecutionModel.timestamp,
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account)
+            .where(~priced)
+            .order_by(LiveExecutionModel.timestamp.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+    return [
+        {
+            "execution_id": str(row[1]),
+            "deployment_id": str(row[0]),
+            "symbol": str(row[2]),
+            "action": str(row[3] or ""),
+            "filled_qty": float(row[4] or 0.0),
+            "actual_price": float(row[5] or 0.0),
+            "actual_price_observed": row[6],
+            "broker_order_id": str(row[7] or ""),
+            "timestamp": row[8].isoformat() if row[8] else None,
+        }
+        for row in rows
+    ]
 
 
 def list_live_signal_executions_for_deployments(

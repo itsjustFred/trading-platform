@@ -121,3 +121,7 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | submission-lease release in a refusal path | loop-survival | the lease expires on its own |
 | `kill_switch.py` | halt-state read; order-cancel, flatten and protection sweeps | money-decision | entries refused / sweep retried next tick, nothing liquidated on an error |
 | `signal_archive.py`, `signal_sources/discord_source.py` | archive enqueue/serialize/write/record, outcome sink, per-message emission failure | loop-survival | archive is observational; a dropped message trades nothing |
+| `daemon.py` | loss-breaker equity read in the balance poll | loop-survival | observation skipped, the entry gate still fails closed |
+| `daemon.py` | account equity read in the loss-breaker entry gate | money-decision | raises `LossBreakerBreachError`, entry refused |
+| `loss_breaker.py` | breach-latch write, state read, deployment pip-value/quote/flows reads | money-decision | unmeasurable loss = entries refused |
+| `loss_breaker.py` | untrusted-fill listing for the alert, observation wrapper | loop-survival | alert/observation only |

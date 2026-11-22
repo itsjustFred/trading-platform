@@ -297,6 +297,7 @@ _ACCOUNTS_ENV_DEFINERS: tuple[tuple[str, str], ...] = (
     ("scripts.live_smoke", "DEFAULT_ACCOUNTS_ENV"),
     ("scripts.verify_ctrader_order", "ACCOUNTS_ENV"),
     ("live_runner.test_signal_trigger", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.loss_breaker", "_ACCOUNTS_ENV"),
 )
 # These import the name from a module above, and the value they bind lands in function default
 # arguments, which are frozen at import time. They are therefore imported *after* the definers
@@ -864,3 +865,77 @@ def _restore_console_log_streams():
         for handler in logger.handlers:
             if getattr(handler, "_trading_console", False) and id(handler) not in restored:
                 handler.stream = real_stream
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loss_breaker_state():
+    """Give every test a clean ``live_loss_breaker_state``.
+
+    The loss breaker (#301) latches on purpose: a daily latch holds until the
+    UTC rollover and a drawdown latch until an operator reset, so one test's
+    tripped breaker would refuse every later entry on the same account scope
+    inside the worker's shared database. Tests that exercise the breaker set
+    up and assert its state inside a single test, so clearing before each one
+    is isolation, not a weakened assertion. Deletes through the same engine
+    ``get_session`` uses; ``init_db`` runs first so the tables exist, and a
+    cleanup failure fails the test rather than silently leaking breaker
+    state into the next one.
+    """
+    from sqlalchemy import text
+
+    import live_runner.loss_breaker as loss_breaker
+    import shared.database as database
+
+    # init_db first: the deletes below must hit real tables, and a failure
+    # here is an isolation failure worth surfacing, not swallowing.
+    database.init_db()
+    with database.get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM live_loss_breaker_state"))
+        # ``ledger_reconciliation_*`` audit rows also latch breaker behaviour
+        # (deployment P&L fails closed) and, unlike the state table, nothing
+        # else clears them between tests.
+        conn.execute(
+            text(
+                "DELETE FROM live_control_audit "
+                "WHERE action IN "
+                "('ledger_reconciliation_required', 'ledger_reconciliation_resolved')"
+            )
+        )
+    # Process-local breaker caches must not leak between tests either: a
+    # latched unmeasurable-P&L alert or a cached pip value would silently
+    # change a later test's behaviour.
+    loss_breaker._PNL_UNMEASURABLE_ALERTED.clear()
+    loss_breaker._PIP_VALUE_CACHE.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loss_breaker_accounts_env():
+    """Keep the loss breaker's ``.accounts.env`` at the session sandbox path.
+
+    The path itself is redirected for the whole session through
+    ``ACCOUNTS_ENV_MODULES`` (``live_runner.loss_breaker._ACCOUNTS_ENV``), which
+    resolves to a file that does not exist; this fixture only guarantees no test
+    inherits a ``set_accounts_env_file`` override from an earlier one.
+
+    ``refuse_entry_if_loss_breaker_tripped`` and the balance-poll observation
+    resolve ``LOSS_BREAKER_*`` thresholds file-first through the repo's
+    ``.accounts.env`` when no ``env_values`` mapping is passed. Without this
+    isolation every daemon test that reaches ``prepare_order_with_risk`` would
+    parse the live credentials file, and a ``LOSS_BREAKER_*`` typo there would
+    fail unrelated tests - the same reason ``DATA_DIR`` is isolated above.
+    Process-env ``LOSS_BREAKER_*`` variables still apply on top, matching
+    production precedence.
+
+    Uses its own ``MonkeyPatch`` rather than the ``monkeypatch`` fixture, for
+    the same reason as ``_no_jforex_jvm_prewarm`` above: an autouse fixture
+    that requested it would instantiate it before every test's other fixtures
+    and delay its undo until after them.
+    """
+    import live_runner.loss_breaker as loss_breaker
+
+    with pytest.MonkeyPatch.context() as patch:
+        # ``run_daemon`` may point the breaker at a configured accounts file;
+        # tests must never inherit that override from an earlier test.
+        patch.setattr(loss_breaker, "_ACCOUNTS_ENV_OVERRIDE", None)
+        yield
