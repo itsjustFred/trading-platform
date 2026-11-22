@@ -115,9 +115,11 @@ def _apply_fill_parity(
       column is configured AND the entry bar is locatable — otherwise the
       engine price stands (default off = unchanged behavior).
     - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
-      follow ``signal_exit_fill``: "close" (default) fills at the exit bar's
-      close, "open" at its open; SHORT open-exits pay the spread (ask).
-      Level exits keep the engine price (stop-market fills at the level).
+      follow ``signal_exit_fill``: "close" fills at the exit bar's close,
+      "open" and "next_open" at its open (the ledger leg is stamped on
+      Pine's fill bar, so next_open prices that bar's open); SHORT
+      open-exits pay the spread (ask). Level exits keep the engine price
+      (stop-market fills at the level).
     - Touched legs get their pnl recomputed from the new prices so
       trade.pnl stays consistent ahead of risk sizing.
 
@@ -129,7 +131,14 @@ def _apply_fill_parity(
     """
     if not trades or df is None or df.empty or "timestamp" not in df.columns:
         return
-    fill_at_open = str(getattr(config, "signal_exit_fill", "close") or "close").lower() == "open"
+    # "next_open" prices the leg bar's open: PyneCore stamps the ledger leg
+    # on the fill bar itself, so the next bar's open IS that bar's open. The
+    # adapter maps next_open to "close" before this runs (frozen engine), so
+    # production never passes it; handling it here keeps the helper total
+    # over the documented enum.
+    fill_at_open = str(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    ).lower() in {"open", "next_open"}
     timestamp_series = df["timestamp"]
     for trade in trades:
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
