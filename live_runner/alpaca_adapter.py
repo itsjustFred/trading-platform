@@ -949,9 +949,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # and at once in `amend_protective_stop`, because a trailed stop's replacement is
         # a NEW leg order id that would otherwise stay unattributable until the next pass.
         self._bracket_leg_order_id_to_signal_id: dict[str, str] = {}
-        # The earliest crypto fill is fixed history: the FILL-history scan behind
+        # The earliest crypto fill is fixed history once found: the FILL-history scan behind
         # ``backfill_commissions`` runs once and later passes answer from this cache
-        # instead of re-paging up to ``MAX_ACTIVITY_PAGES`` requests every pass.
+        # instead of re-paging up to ``MAX_ACTIVITY_PAGES`` requests every pass. Only a found
+        # datetime (or CRYPTO_FILL_SCAN_UNKNOWN, which fails closed either way) is cached -
+        # ``None`` ("no crypto fill up to the scan's ``until``") is not, because fills posted
+        # after the scan can still predate ``fill_start`` on a later pass.
         self._earliest_crypto_fill_at: Any = _CRYPTO_FILL_SCAN_PENDING
 
         if not self.api_key or not self.secret_key:
@@ -1444,10 +1447,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # the account's first batch ever - then it is complete only if no *crypto* fills exist
         # before the FILL fetch bound either (equity fills cannot sit in a crypto CFEE batch's
         # coverage, so they must not open the window). The CFEE probe is a single request; the
-        # crypto-fill scan pages FILL ascending for the account's earliest crypto fill - once
-        # per adapter, since that instant never changes - and an unfinished scan is cached as
-        # CRYPTO_FILL_SCAN_UNKNOWN, which fails closed on every later pass exactly as
-        # re-scanning would.
+        # crypto-fill scan pages FILL ascending for the account's earliest crypto fill. A found
+        # instant never changes, so it is cached; an unfinished scan is cached as
+        # CRYPTO_FILL_SCAN_UNKNOWN and fails closed on every later pass exactly as re-scanning
+        # would; a ``None`` ("no crypto fill up to the scan's ``until``") is deliberately NOT
+        # cached - a fill posted after the scan can still predate ``fill_start`` later, so the
+        # next pass rescans. ``None`` with crypto candidates present is an anomaly, so the
+        # rescan is rare.
         first_batch_open = False
         try:
             if cfees:
@@ -1460,15 +1466,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     field="created_at",
                 )
             if not first_batch_open:
-                if self._earliest_crypto_fill_at is _CRYPTO_FILL_SCAN_PENDING:
-                    self._earliest_crypto_fill_at = await asyncio.to_thread(
+                earliest = self._earliest_crypto_fill_at
+                if earliest is _CRYPTO_FILL_SCAN_PENDING:
+                    earliest = await asyncio.to_thread(
                         earliest_crypto_fill_at,
                         client,
                         until=now + ACTIVITY_WINDOW_OVERLAP,
                     )
-                earliest = self._earliest_crypto_fill_at
+                    if earliest is not None:
+                        self._earliest_crypto_fill_at = earliest
+                # ``<=``: the FILL listing is ``(fill_start, now]``, exclusive of the bound,
+                # so a crypto fill exactly at ``fill_start`` is never fetched - it opens the
+                # window like any earlier one.
                 first_batch_open = earliest is CRYPTO_FILL_SCAN_UNKNOWN or (
-                    earliest is not None and earliest < fill_start
+                    earliest is not None and earliest <= fill_start
                 )
             fills = await asyncio.to_thread(
                 fetch_account_activities, client, "FILL", after=fill_start, until=now
@@ -1548,6 +1559,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     plan.pair,
                     plan.end.isoformat(),
                     plan.problem,
+                    extra={"data": {"account_id": self.account_id}},
+                )
+            for warning in plan.warnings:
+                logger.warning(
+                    "Alpaca commission backfill: %s on %s posted %s",
+                    warning,
+                    plan.pair,
+                    plan.end.isoformat(),
                     extra={"data": {"account_id": self.account_id}},
                 )
         return updated

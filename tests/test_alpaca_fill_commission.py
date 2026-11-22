@@ -1674,10 +1674,109 @@ def test_backfill_crypto_fill_scan_runs_once_and_is_memoized(db):
     assert asyncio.run(adapter.backfill_commissions(now=NOW)) == 0
     assert _commission(db, signal) == [None]
     assert len(probe_calls()) == 3, "251 fills page three times for the one-time scan"
+    from live_runner.alpaca_fees import ACTIVITY_WINDOW_OVERLAP, activity_timestamp
+
+    expected_until = activity_timestamp(NOW + ACTIVITY_WINDOW_OVERLAP)
+    assert all(
+        params.get("until") == expected_until for _path, params in probe_calls()
+    ), "the scan must cover fills up to now + the day-granular listing overlap"
 
     assert asyncio.run(adapter.backfill_commissions(now=NOW)) == 0
     assert len(probe_calls()) == 3, "the memoized scan must not re-page the history"
     assert _commission(db, signal) == [None]
+
+
+def test_backfill_rescans_the_crypto_fill_probe_when_it_found_none(db):
+    """``None`` is not fixed history: a crypto fill that only reaches FILL history after
+    the first scan must reopen the first batch's window on a later pass - a cached
+    ``None`` would answer "no earlier fill" forever and price a truncated batch."""
+    signal, order_id = _crypto_fill(db, label="late-posted-fill")
+    client = FakeActivitiesClient(fills=[], cfees=[_cfee(qty="-0.00125")])
+    adapter = _adapter(client=client)
+
+    def probe_calls() -> list[tuple[str, dict[str, Any]]]:
+        return [
+            call
+            for call in client.calls
+            if call[0].endswith("/FILL")
+            and call[1].get("after") == "1970-01-01T00:00:00Z"
+        ]
+
+    assert asyncio.run(adapter.backfill_commissions(now=NOW)) == 0
+    assert _commission(db, signal) == [None]
+    assert len(probe_calls()) == 1, "the scan ran and found no crypto fill"
+
+    # The order's own fill and an older crypto fill only reach FILL history now.
+    client.items["FILL"] = [
+        _fill_activity(
+            order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT
+        ),
+        _fill_activity(
+            order_id=_order_id("older-crypto"),
+            side="buy",
+            qty="0.1",
+            price="3000",
+            at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            symbol="ETH/USD",
+        ),
+    ]
+
+    assert asyncio.run(adapter.backfill_commissions(now=NOW)) == 0
+    assert len(probe_calls()) == 2, "a cached None must not suppress the rescan"
+    assert _commission(db, signal) == [None], (
+        "the late-appearing earlier crypto fill opens the first batch's window"
+    )
+
+
+def test_backfill_treats_a_crypto_fill_exactly_at_the_fetch_bound_as_earlier(db):
+    """``FILL`` is fetched ``(fill_start, now]`` - exclusive of the bound - so a crypto
+    fill exactly at ``fill_start`` is never fetched; it must open the first batch's
+    window (fail closed) like any earlier one."""
+    from live_runner.alpaca_fees import FILL_WINDOW_SKEW
+
+    signal, order_id = _crypto_fill(db, label="boundary-fill")
+    boundary = FILL_AT - FILL_WINDOW_SKEW  # == fill_start for a single posted batch
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(
+                order_id=_order_id("boundary-crypto"),
+                side="buy",
+                qty="0.1",
+                price="3000",
+                at=boundary,
+                symbol="ETH/USD",
+            ),
+            _fill_activity(
+                order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT
+            ),
+        ],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 0
+    assert _commission(db, signal) == [None]
+
+
+def test_backfill_warns_that_usd_fees_are_matched_by_count_only(db, live_runner_logs):
+    """Maintainer decision: the count-only USD residual is accepted *with a warning* -
+    a delayed posting that swapped batches could still spread a plausible but
+    misattributed total, so every USD-priced side logs it."""
+    signal, order_id = _crypto_fill(db, action="sell", label="warn-sell")
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(
+                order_id=order_id, side="sell", qty="0.5", price="60000", at=FILL_AT
+            )
+        ],
+        cfees=[_usd_pool_cfee("-75.0", "2026-11-04T05:00:00Z")],
+    )
+
+    assert _backfill(client) == 1
+    assert _commission(db, signal) == [pytest.approx(75.0)]
+    assert any(
+        "count only" in record.getMessage() and "misattribute" in record.getMessage()
+        for record in live_runner_logs.records
+    ), "pricing USD fees by entry count must warn about the accepted residual"
 
 
 # ── has_earlier_crypto_fill / earliest_crypto_fill_at: fail-closed branches pinned ──────────
@@ -1822,6 +1921,36 @@ def test_crypto_fill_probe_answers_false_on_an_empty_history():
 
     assert has_earlier_crypto_fill(client, before=PROBE_BEFORE) is False
     assert len(client.calls) == 1
+
+
+def test_crypto_fill_probe_returns_the_earliest_after_a_full_page_then_an_empty_one():
+    """A history whose length is an exact page multiple ends on an empty page: the
+    minimum found on the full page is still the answer, not ``None``."""
+    from live_runner.alpaca_fees import earliest_crypto_fill_at
+
+    crypto = PROBE_BEFORE - timedelta(days=2)
+    page1 = [
+        _probe_fill("BTC/USD", crypto, item_id="id-1"),
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=1), item_id="id-2"),
+    ]
+    client = _ProbeClient([page1, []])
+
+    assert earliest_crypto_fill_at(client, until=NOW, page_size=2) == crypto
+    assert len(client.calls) == 2
+
+
+def test_crypto_fill_probe_returns_none_after_a_full_equity_page_then_an_empty_one():
+    """Same exact-multiple history with no crypto fill at all completes as ``None``."""
+    from live_runner.alpaca_fees import earliest_crypto_fill_at
+
+    page1 = [
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=2), item_id="id-1"),
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=1), item_id="id-2"),
+    ]
+    client = _ProbeClient([page1, []])
+
+    assert earliest_crypto_fill_at(client, until=NOW, page_size=2) is None
+    assert len(client.calls) == 2
 
 
 def test_earliest_crypto_fill_at_returns_the_minimum_across_pages():

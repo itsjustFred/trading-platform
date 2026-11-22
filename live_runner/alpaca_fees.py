@@ -229,9 +229,11 @@ def earliest_crypto_fill_at(
     ``CRYPTO_FILL_SCAN_UNKNOWN`` means it could not prove the earliest - a missing symbol,
     an unreadable crypto timestamp, pagination that stalls, or ``MAX_ACTIVITY_PAGES``
     reached - so the caller must fail closed. Bounded by ``MAX_ACTIVITY_PAGES`` requests;
-    the answer is fixed history, so a caller that asks on every pass should memoize it
-    (the trading path shares Alpaca's ~200 requests/minute budget, and the daemon's
-    ``wait_for`` cannot stop a ``to_thread`` scan).
+    a found datetime never changes and ``CRYPTO_FILL_SCAN_UNKNOWN`` fails closed either
+    way, so a caller that asks on every pass should memoize those - but ``None`` is not
+    fixed history (a fill posted after the scan can still predate the caller's bound
+    later) and must be rescanned (the trading path shares Alpaca's ~200 requests/minute
+    budget, and the daemon's ``wait_for`` cannot stop a ``to_thread`` scan).
     """
     earliest: datetime | None = None
     token: str | None = None
@@ -587,13 +589,16 @@ class GroupPlan:
 
     ``problem`` describes what could not be priced; ``commissions`` may still be non-empty -
     the asset and USD sides are priced independently, so an unattributable USD pool does not
-    block a pair's asset fees.
+    block a pair's asset fees. ``warnings`` notes residual risks the maintainer accepted
+    (the USD side is matched by entry count only, so a delayed posting that swapped batches
+    could still misattribute a plausible total).
     """
 
     pair: str
     end: datetime
     commissions: dict[str, float]
     problem: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 def _close(left: float, right: float) -> bool:
@@ -733,6 +738,7 @@ def _allocate(
             )
 
     problems: list[str] = []
+    warnings: list[str] = []
     usd_by_order: dict[str, Decimal] = defaultdict(Decimal)
     if buys:
         if asset_fee <= 0:
@@ -775,6 +781,11 @@ def _allocate(
         else:
             for fill in sells:
                 usd_by_order[fill.order_id] += usd_fee * fill.received / received_sell
+            warnings.append(
+                f"the USD CFEE {usd_fee} was matched to the {len(sells)} sell fill(s) by "
+                "entry count only; a delayed posting that swapped batches could still "
+                "misattribute it"
+            )
     elif batch.pair_usd.get(pair, Decimal(0)) > 0:
         problems.append(
             "a USD CFEE naming the pair is posted but the pair has no sells in the batch window"
@@ -796,7 +807,11 @@ def _allocate(
             share = float(row["filled_qty"]) / order_qty
             commissions[row["execution_id"]] = float(order_usd) * share
     return GroupPlan(
-        pair, end, commissions, "; ".join(problems) if problems else None
+        pair,
+        end,
+        commissions,
+        "; ".join(problems) if problems else None,
+        tuple(warnings),
     )
 
 
