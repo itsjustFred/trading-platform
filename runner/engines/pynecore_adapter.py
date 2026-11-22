@@ -437,6 +437,7 @@ class PyneCoreAdapter(EngineAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                check=False,
                 capture_output=True,
                 text=True,
                 cwd=str(tmpdir_path),

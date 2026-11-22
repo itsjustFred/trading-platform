@@ -15,5 +15,5 @@ def generate_signals(df: pd.DataFrame, params: dict):
     entries = ((fast > slow) & (fast.shift(1) <= slow.shift(1))).fillna(False)
     exits = ((fast < slow) & (fast.shift(1) >= slow.shift(1))).fillna(False)
     indicators_dict = {"fast_sma": fast, "slow_sma": slow}
-    drawings = []
+    drawings: list[dict] = []
     return entries, exits, indicators_dict, drawings

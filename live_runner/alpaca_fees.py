@@ -617,6 +617,9 @@ class _Inputs:
     fills_by_pair: dict[str, list[BrokerFill]]
     rows_by_order: dict[str, list[dict[str, Any]]]
     fees: _FeeBatches
+    # The value carries the per-pair message: ``_group_problem`` returns it
+    # alongside the (empty) fill list. Every entry is the reason the pair was
+    # taken out of play, so a pair is only "clean" by being absent here.
     broken_pairs: dict[str, str]
     sell_pairs: dict[int, set[str]]
 
@@ -629,7 +632,13 @@ def _group_problem(
     group_fills: list[BrokerFill],
 ) -> tuple[str | None, list[BrokerFill]]:
     if pair in inputs.broken_pairs:
-        return inputs.broken_pairs[pair], []
+        # Fail closed: a stored ``None`` would read as "no problem" further down
+        # (the caller only skips a pair on a non-None problem), so an entry that
+        # carries no reason still refuses the pair rather than backfilling it.
+        reason = inputs.broken_pairs[pair] or (
+            f"the pair {pair} is broken without a recorded reason"
+        )
+        return reason, []
 
     def in_window(fill: BrokerFill) -> bool:
         return fill.at <= batch.end and (window_start is None or fill.at > window_start)

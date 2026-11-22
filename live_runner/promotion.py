@@ -210,12 +210,12 @@ def repository_import_closure(start: Path, *, repo_root: Path | None = None) -> 
                     if dotted not in resolved_names:
                         module = _module_file(dotted, root)
                         resolved_names[dotted] = module.resolve() if module else None
-                    resolved = resolved_names[dotted]
-                    if resolved is None or resolved in seen:
+                    resolved_module = resolved_names[dotted]
+                    if resolved_module is None or resolved_module in seen:
                         continue
-                    seen.add(resolved)
-                    todo.append(resolved)
-                    found[_repository_key(resolved, root)] = _sha256_of(resolved)
+                    seen.add(resolved_module)
+                    todo.append(resolved_module)
+                    found[_repository_key(resolved_module, root)] = _sha256_of(resolved_module)
     return dict(sorted(found.items()))
 
 
@@ -289,7 +289,7 @@ def strategy_target(
         )
     try:
         meta = load_strategy_meta(path, root)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         raise PromotionTargetError(f"STRATEGY_META of '{name}' is unreadable: {exc}") from exc
     defaults = meta.get("parameters", {}) if isinstance(meta, Mapping) else None
     if not meta or not isinstance(defaults, Mapping):

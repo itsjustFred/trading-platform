@@ -47,6 +47,25 @@ jobs:
       - name: Lint (advisory)
         continue-on-error: true
         run: uv run --no-sync --no-build ruff check .
+      - name: Lint (bug-class families, blocking)
+        if: runner.os == 'Linux'
+        # `ruff check .` above is advisory because main carries an E501 backlog,
+        # so it can never fail on the families this change drove to zero: a new
+        # B/DTZ/PERF/... hit would land inside a green build. This step selects
+        # exactly the families pyproject.toml enabled and pins them at zero.
+        # Keep the list in sync with [tool.ruff.lint].select; the
+        # `tests/test_lint_family_ratchet.py` test asserts the two agree.
+        run: >-
+          uv run --no-sync --no-build ruff check --select
+          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307 .
+      - name: Type check (mypy)
+        if: runner.os == 'Linux'
+        # mypy is a dev dependency (`uv sync` installs it) and pinned there to
+        # 2.4.1, so this is the same interpreter the developer gets from
+        # `uv sync --frozen --extra dev && uv run mypy` (AGENTS.md): no --with
+        # overlay, no second copy of the type-checker, and a version bump is one
+        # lock change.
+        run: uv run --no-sync --no-build mypy
       - name: Tests
         if: runner.os == 'Linux'
         run: >-

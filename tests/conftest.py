@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import importlib
 import ipaddress
 import os
@@ -296,6 +297,7 @@ _ACCOUNTS_ENV_DEFINERS: tuple[tuple[str, str], ...] = (
     ("scripts.live_smoke", "DEFAULT_ACCOUNTS_ENV"),
     ("scripts.verify_ctrader_order", "ACCOUNTS_ENV"),
     ("live_runner.test_signal_trigger", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.loss_breaker", "_ACCOUNTS_ENV"),
 )
 # These import the name from a module above, and the value they bind lands in function default
 # arguments, which are frozen at import time. They are therefore imported *after* the definers
@@ -370,8 +372,9 @@ def _watched_repo_dirs_changed() -> list[str]:
         return []
     changes: list[str] = []
     for root, before in _REPO_TREES_BEFORE.items():
-        for change in diff_snapshots(before, snapshot_tree(Path(root))):
-            changes.append(f"{root}: {change}")
+        changes.extend(
+            f"{root}: {change}" for change in diff_snapshots(before, snapshot_tree(Path(root)))
+        )
     return changes
 
 
@@ -674,6 +677,101 @@ def seed_live_deployments(
         session.commit()
 
 
+@contextlib.contextmanager
+def _viewer_state_lock(lock, name: str):
+    """Acquire a viewer state lock with a timeout so a leaked thread holding
+    it fails the test loudly instead of hanging the whole suite."""
+    if not lock.acquire(timeout=5):
+        raise RuntimeError(
+            f"viewer state reset timed out acquiring {name}: a thread leaked "
+            "by an earlier test still holds the lock"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
+    """Clear viewer module state that must not cross test boundaries.
+
+    The viewer keeps process-global caches for strategies, live accounts,
+    backtest/portfolio metadata, data views and task hydration. Several of
+    those caches are not keyed by the monkeypatched ``DATA_DIR`` /
+    ``STRATEGIES_DIR`` a test is using, so a payload built against one
+    fixture's tmp tree can otherwise be served to the next test for the
+    cache TTL (this is the #236 strategy-list leak).
+    """
+    module = viewer_main_module or sys.modules.get("viewer.main")
+    # ``viewer.core`` is the legacy module ``viewer.main`` wraps; a session
+    # that imported only ``viewer.core`` still needs its OHLCV cache reset.
+    legacy_module = (
+        getattr(module, "legacy_viewer", None)
+        if module is not None
+        else sys.modules.get("viewer.core")
+    )
+    if module is None and legacy_module is None:
+        return
+    if module is not None:
+        with _viewer_state_lock(module._STRATEGIES_CACHE_LOCK, "_STRATEGIES_CACHE_LOCK"):
+            module._STRATEGIES_CACHE["payload"] = []
+            module._STRATEGIES_CACHE["expires_at"] = 0.0
+        with _viewer_state_lock(module._LIVE_ACCOUNTS_CACHE_LOCK, "_LIVE_ACCOUNTS_CACHE_LOCK"):
+            module._LIVE_ACCOUNTS_CACHE["expires_at"] = 0.0
+            module._LIVE_ACCOUNTS_CACHE["payload"] = []
+            module._LIVE_ACCOUNTS_CACHE["provider_marker"] = None
+        with _viewer_state_lock(module._BACKTEST_META_CACHE_LOCK, "_BACKTEST_META_CACHE_LOCK"):
+            module._BACKTEST_META_CACHE.clear()
+            module._BACKTEST_META_CACHE_SOURCE_MTIME_NS = 0
+        with _viewer_state_lock(
+            module._BACKTEST_EQUITY_PREVIEW_CACHE_LOCK,
+            "_BACKTEST_EQUITY_PREVIEW_CACHE_LOCK",
+        ):
+            module._BACKTEST_EQUITY_PREVIEW_CACHE.clear()
+        with _viewer_state_lock(module._PORTFOLIO_META_CACHE_LOCK, "_PORTFOLIO_META_CACHE_LOCK"):
+            module._PORTFOLIO_META_CACHE.clear()
+            module._PORTFOLIO_META_CACHE_WARMED = False
+        with _viewer_state_lock(module._TASK_CACHE_HYDRATION_LOCK, "_TASK_CACHE_HYDRATION_LOCK"):
+            module._TASK_CACHE_HYDRATED = False
+        with _viewer_state_lock(module._DATA_VIEWS_CACHE_LOCK, "_DATA_VIEWS_CACHE_LOCK"):
+            module._invalidate_data_views_cache()
+            module._DATA_VIEWS_PREWARM_DONE = False
+        with _viewer_state_lock(
+            module._COALESCED_CLEANUP_STATE_LOCK, "_COALESCED_CLEANUP_STATE_LOCK"
+        ):
+            module._COALESCED_CLEANUP_PENDING.clear()
+            module._COALESCED_CLEANUP_ORDER.clear()
+            module._COALESCED_CLEANUP_ATTEMPTS.clear()
+            module._COALESCED_CLEANUP_EXHAUSTED.clear()
+    if legacy_module is not None:
+        # DATA_TASKS lives in viewer.core (viewer.main re-exports it), so it
+        # is cleared here to cover sessions that never import viewer.main.
+        with _viewer_state_lock(legacy_module.DATA_TASKS_LOCK, "DATA_TASKS_LOCK"):
+            legacy_module.DATA_TASKS.clear()
+        with _viewer_state_lock(legacy_module._OHLCV_DF_CACHE_LOCK, "_OHLCV_DF_CACHE_LOCK"):
+            legacy_module._OHLCV_DF_CACHE.clear()
+    from data_tools import cache_manager
+
+    cache_manager.invalidate_cache()
+
+
+@pytest.fixture(autouse=True)
+def _viewer_runtime_state_reset():
+    """Keep viewer caches/task state isolated between tests."""
+    _reset_viewer_runtime_state()
+    yield
+    _reset_viewer_runtime_state()
+
+
+@pytest.fixture(scope="session")
+def viewer_app():
+    """The shared viewer FastAPI app, with caches reset before first use."""
+    import viewer.main as viewer_main_module
+
+    _reset_viewer_runtime_state(viewer_main_module)
+    return viewer_main_module.app
+
+
 @lru_cache(maxsize=None)
 def _playwright_browser_launchable(browser_name: str) -> tuple[bool, str]:
     from playwright.sync_api import sync_playwright
@@ -691,7 +789,7 @@ def _playwright_browser_launchable(browser_name: str) -> tuple[bool, str]:
 
 
 @pytest.fixture
-def viewer_client(monkeypatch, tmp_path):
+def viewer_client(monkeypatch, tmp_path, viewer_app):
     """Shared viewer TestClient with DATA_DIR-scoped storage paths."""
     from fastapi.testclient import TestClient as _TestClient
 
@@ -715,12 +813,8 @@ def viewer_client(monkeypatch, tmp_path):
         "migrate_json_to_sqlite",
         lambda: {"migrated": 0, "failed": 0, "total": 0},
     )
-    viewer_app_module.DATA_TASKS.clear()
-    viewer_app_module._COALESCED_CLEANUP_PENDING.clear()
-    viewer_app_module._COALESCED_CLEANUP_ORDER.clear()
-    viewer_app_module._COALESCED_CLEANUP_ATTEMPTS.clear()
-    viewer_app_module._COALESCED_CLEANUP_EXHAUSTED.clear()
-    return _TestClient(viewer_app_module.app)
+    _reset_viewer_runtime_state(viewer_app_module)
+    return _TestClient(viewer_app)
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
@@ -771,3 +865,77 @@ def _restore_console_log_streams():
         for handler in logger.handlers:
             if getattr(handler, "_trading_console", False) and id(handler) not in restored:
                 handler.stream = real_stream
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loss_breaker_state():
+    """Give every test a clean ``live_loss_breaker_state``.
+
+    The loss breaker (#301) latches on purpose: a daily latch holds until the
+    UTC rollover and a drawdown latch until an operator reset, so one test's
+    tripped breaker would refuse every later entry on the same account scope
+    inside the worker's shared database. Tests that exercise the breaker set
+    up and assert its state inside a single test, so clearing before each one
+    is isolation, not a weakened assertion. Deletes through the same engine
+    ``get_session`` uses; ``init_db`` runs first so the tables exist, and a
+    cleanup failure fails the test rather than silently leaking breaker
+    state into the next one.
+    """
+    from sqlalchemy import text
+
+    import live_runner.loss_breaker as loss_breaker
+    import shared.database as database
+
+    # init_db first: the deletes below must hit real tables, and a failure
+    # here is an isolation failure worth surfacing, not swallowing.
+    database.init_db()
+    with database.get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM live_loss_breaker_state"))
+        # ``ledger_reconciliation_*`` audit rows also latch breaker behaviour
+        # (deployment P&L fails closed) and, unlike the state table, nothing
+        # else clears them between tests.
+        conn.execute(
+            text(
+                "DELETE FROM live_control_audit "
+                "WHERE action IN "
+                "('ledger_reconciliation_required', 'ledger_reconciliation_resolved')"
+            )
+        )
+    # Process-local breaker caches must not leak between tests either: a
+    # latched unmeasurable-P&L alert or a cached pip value would silently
+    # change a later test's behaviour.
+    loss_breaker._PNL_UNMEASURABLE_ALERTED.clear()
+    loss_breaker._PIP_VALUE_CACHE.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loss_breaker_accounts_env():
+    """Keep the loss breaker's ``.accounts.env`` at the session sandbox path.
+
+    The path itself is redirected for the whole session through
+    ``ACCOUNTS_ENV_MODULES`` (``live_runner.loss_breaker._ACCOUNTS_ENV``), which
+    resolves to a file that does not exist; this fixture only guarantees no test
+    inherits a ``set_accounts_env_file`` override from an earlier one.
+
+    ``refuse_entry_if_loss_breaker_tripped`` and the balance-poll observation
+    resolve ``LOSS_BREAKER_*`` thresholds file-first through the repo's
+    ``.accounts.env`` when no ``env_values`` mapping is passed. Without this
+    isolation every daemon test that reaches ``prepare_order_with_risk`` would
+    parse the live credentials file, and a ``LOSS_BREAKER_*`` typo there would
+    fail unrelated tests - the same reason ``DATA_DIR`` is isolated above.
+    Process-env ``LOSS_BREAKER_*`` variables still apply on top, matching
+    production precedence.
+
+    Uses its own ``MonkeyPatch`` rather than the ``monkeypatch`` fixture, for
+    the same reason as ``_no_jforex_jvm_prewarm`` above: an autouse fixture
+    that requested it would instantiate it before every test's other fixtures
+    and delay its undo until after them.
+    """
+    import live_runner.loss_breaker as loss_breaker
+
+    with pytest.MonkeyPatch.context() as patch:
+        # ``run_daemon`` may point the breaker at a configured accounts file;
+        # tests must never inherit that override from an earlier test.
+        patch.setattr(loss_breaker, "_ACCOUNTS_ENV_OVERRIDE", None)
+        yield

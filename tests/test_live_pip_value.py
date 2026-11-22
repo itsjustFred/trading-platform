@@ -126,12 +126,18 @@ class _CTrader:
         async def get_balance() -> tuple[float, float]:
             return balance, balance
 
+        async def get_equity() -> float:
+            # The breaker reads the separate equity path (#267); this fixture
+            # has no unrealized-P&L book, so equity == realized balance.
+            return balance
+
         async def get_positions() -> list[dict[str, Any]]:
             return []
 
         adapter.get_quote = get_quote
         adapter._send_request_with_refresh_retry = send
         adapter.get_balance = get_balance
+        adapter.get_equity = get_equity
         adapter.get_positions = get_positions
 
 
@@ -752,7 +758,11 @@ def test_daemon_refuses_an_unusable_pip_value(pip, match):
         (lambda: _quote(1.25, age=11.0), "quote_stale"),
         (lambda: _quote(1.25, timestamp=None), "quote_time_missing"),
         (lambda: _quote(1.25, age=-5.0), "quote_time_in_future"),
-        (lambda: _quote(1.25, timestamp=datetime(2026, 1, 1)), "quote_time_invalid"),
+        # A naive quote timestamp is the case: a quote with no zone is unusable.
+        (
+            lambda: _quote(1.25, timestamp=datetime(2026, 1, 1)),  # noqa: DTZ001 - naive case
+            "quote_time_invalid",
+        ),
     ],
 )
 def test_daemon_refuses_a_stale_or_untimed_conversion_rate(make_quote, rule):

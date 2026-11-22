@@ -2438,36 +2438,36 @@ def _top_trials_payload(
         reverse=(direction != "minimize"),
     )
     payload: list[dict[str, Any]] = []
-    for trial in ordered_trials[:limit]:
-        payload.append(
-            {
-                "number": trial.number,
-                "state": trial.state.name,
-                "value": _safe_float_or_none(trial.value),
-                "params": _json_safe(dict(trial.params)),
-                "effective_parameters": _json_safe(
-                    dict(trial.user_attrs.get("effective_parameters") or {})
-                ),
-                "symbols": _json_safe(list(trial.user_attrs.get("symbols") or [])),
-                "trade_count": int(trial.user_attrs.get("trade_count", 0) or 0),
-                "penalty_applied": bool(trial.user_attrs.get("penalty_applied", False)),
-                "raw_metric_value": _safe_float_or_none(
-                    trial.user_attrs.get("raw_metric_value")
-                ),
-                "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
-                # #164: the trial's out-of-search result, recorded when it was
-                # validated. None for trials the validation pass could not score.
-                "validation_score": _safe_float_or_none(
-                    trial.user_attrs.get(VALIDATION_SCORE_ATTR)
-                ),
-                "validation_metric_value": _safe_float_or_none(
-                    trial.user_attrs.get(VALIDATION_METRIC_ATTR)
-                ),
-                "validation_stats": _json_safe(
-                    dict(trial.user_attrs.get(VALIDATION_STATS_ATTR) or {})
-                ),
-            }
-        )
+    payload.extend(
+        {
+            "number": trial.number,
+            "state": trial.state.name,
+            "value": _safe_float_or_none(trial.value),
+            "params": _json_safe(dict(trial.params)),
+            "effective_parameters": _json_safe(
+                dict(trial.user_attrs.get("effective_parameters") or {})
+            ),
+            "symbols": _json_safe(list(trial.user_attrs.get("symbols") or [])),
+            "trade_count": int(trial.user_attrs.get("trade_count", 0) or 0),
+            "penalty_applied": bool(trial.user_attrs.get("penalty_applied", False)),
+            "raw_metric_value": _safe_float_or_none(
+                trial.user_attrs.get("raw_metric_value")
+            ),
+            "train_stats": _json_safe(dict(trial.user_attrs.get("train_stats") or {})),
+            # #164: the trial's out-of-search result, recorded when it was
+            # validated. None for trials the validation pass could not score.
+            "validation_score": _safe_float_or_none(
+                trial.user_attrs.get(VALIDATION_SCORE_ATTR)
+            ),
+            "validation_metric_value": _safe_float_or_none(
+                trial.user_attrs.get(VALIDATION_METRIC_ATTR)
+            ),
+            "validation_stats": _json_safe(
+                dict(trial.user_attrs.get(VALIDATION_STATS_ATTR) or {})
+            ),
+        }
+        for trial in ordered_trials[:limit]
+    )
     return payload
 
 
