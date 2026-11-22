@@ -9,6 +9,7 @@ import yaml
 
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
+from shared.indicators import presets
 from shared.trailing import (
     KNOWN_TRAILING_MODES,
     TRAILING_MODE_NONE,
@@ -71,6 +72,12 @@ class RamJetSignalProcessor:
         self.tp1_exit_percent = float(self.config.get("tp1_exit_percent", 0.50))
         self.supertrend_period = int(self.config.get("supertrend_period", 10))
         self.supertrend_multiplier = float(self.config.get("supertrend_multiplier", 3.0))
+        for key, value in (
+            ("atr_period", self.atr_period),
+            ("supertrend_period", self.supertrend_period),
+        ):
+            if value <= 0:
+                raise ValueError(f"ramjet config '{key}' must be a positive integer")
         # #150: the trailing mode is a bot/deployment setting, never hard-coded.
         # Fail closed on unknown modes here (bot-config validation); modes the
         # executing path cannot run are rejected later, per path.
@@ -131,112 +138,27 @@ class RamJetSignalProcessor:
 
     @staticmethod
     def _calculate_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
+        # EMA-span "ATR" is a named parity preset (issue #317): the live
+        # bots' stop distance is an EMA of TR, not a Wilder/RMA ATR.
         frame = df.copy()
-        frame["h_l"] = frame["high"] - frame["low"]
-        frame["h_pc"] = (frame["high"] - frame["close"].shift(1)).abs()
-        frame["l_pc"] = (frame["low"] - frame["close"].shift(1)).abs()
-        frame["tr"] = frame[["h_l", "h_pc", "l_pc"]].max(axis=1)
-        frame["atr"] = frame["tr"].ewm(span=period, adjust=False).mean()
-        frame = frame.drop(columns=["h_l", "h_pc", "l_pc", "tr"])
+        frame["atr"] = presets.atr_ema_span(
+            frame["high"], frame["low"], frame["close"], period
+        )
         return frame
 
     @staticmethod
     def _calculate_supertrend(df: pd.DataFrame, period: int, multiplier: float) -> pd.DataFrame:
+        # Single implementation (#317 P1): the shared preset reproduces the
+        # former hand-written fallback bit-for-bit, including the fail-closed
+        # warm-up and the NaN-bearish direction rule. pandas_ta was declared
+        # in no dependency file, so the library branch could never run in a
+        # supported environment and is gone.
         frame = df.copy()
-        st_dir_found = False
-
-        if hasattr(frame, "ta"):
-            st = frame.ta.supertrend(length=period, multiplier=multiplier)
-            if isinstance(st, pd.DataFrame):
-                st_dir_col = f"SUPERTd_{period}_{float(multiplier)}"
-                if st_dir_col not in st.columns:
-                    for column in st.columns:
-                        if str(column).startswith("SUPERTd"):
-                            st_dir_col = str(column)
-                            break
-                if st_dir_col in st.columns:
-                    frame["supertrend"] = st[st_dir_col] == 1
-                    # Same warm-up contract as the fallback below: pandas_ta
-                    # emits a direction for every bar, including the early ones
-                    # whose ATR is still converging, and process_signal reads
-                    # supertrend_ready as ready when the column is missing —
-                    # so the marker must be set here too, or the warm-up bar
-                    # would be reported as a genuine direction.
-                    frame["supertrend_ready"] = np.arange(len(frame)) >= int(period)
-                    st_dir_found = True
-
-        if not st_dir_found:
-            hl2 = (frame["high"] + frame["low"]) / 2
-
-            frame["h_l_st"] = frame["high"] - frame["low"]
-            frame["h_pc_st"] = (frame["high"] - frame["close"].shift(1)).abs()
-            frame["l_pc_st"] = (frame["low"] - frame["close"].shift(1)).abs()
-            frame["tr_st"] = frame[["h_l_st", "h_pc_st", "l_pc_st"]].max(axis=1)
-            # First bar has no previous close: seed its TR with high - low so
-            # the ATR recursion starts from a real range, not 0.
-            frame["tr_st"] = frame["tr_st"].fillna(frame["h_l_st"])
-            frame["atr_st"] = frame["tr_st"].ewm(alpha=1 / period, adjust=False).mean()
-
-            basic_upper = (hl2 + (multiplier * frame["atr_st"])).to_numpy()
-            basic_lower = (hl2 - (multiplier * frame["atr_st"])).to_numpy()
-            close = frame["close"].to_numpy()
-
-            n_rows = len(frame)
-            final_upper = np.full(n_rows, np.nan)
-            final_lower = np.full(n_rows, np.nan)
-            # Fail-closed seeding (Cleanup #35): before the ATR has enough
-            # data the Supertrend direction is unknown and is reported as
-            # bearish/False. The old code seeded an all-True array, so early
-            # bars compared close against uninitialized zero bands and
-            # reported a green Supertrend derived from nothing.
-            supertrend = np.zeros(n_rows, dtype=bool)
-
-            first_valid_idx = 0
-            for i in range(n_rows):
-                if not np.isnan(basic_upper[i]):
-                    first_valid_idx = i
-                    break
-
-            if n_rows > first_valid_idx:
-                final_upper[first_valid_idx] = basic_upper[first_valid_idx]
-                final_lower[first_valid_idx] = basic_lower[first_valid_idx]
-                supertrend[first_valid_idx] = bool(
-                    close[first_valid_idx] >= final_lower[first_valid_idx]
-                )
-
-            for i in range(first_valid_idx + 1, n_rows):
-                if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
-                    final_upper[i] = basic_upper[i]
-                else:
-                    final_upper[i] = final_upper[i - 1]
-
-                if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
-                    final_lower[i] = basic_lower[i]
-                else:
-                    final_lower[i] = final_lower[i - 1]
-
-                prev_st = supertrend[i - 1]
-                if prev_st:
-                    supertrend[i] = close[i] > final_lower[i]
-                else:
-                    supertrend[i] = close[i] >= final_upper[i]
-
-            frame["supertrend"] = supertrend
-            # Warm-up marker (Pre-mortem strategies #3, PR #61): with the
-            # fail-closed zero seed, "not yet computable" and "bearish" are
-            # indistinguishable in the bool column. supertrend_ready is False
-            # until the recursion has period bars of history after the first
-            # computable bar; consumers (e.g. the trailing-stop flip workflow)
-            # must not treat pre-warmup values as a genuine direction.
-            warmup_bars = max(int(period), 1)
-            frame["supertrend_ready"] = (
-                np.arange(n_rows) >= first_valid_idx + warmup_bars
-            )
-            frame = frame.drop(
-                columns=["h_l_st", "h_pc_st", "l_pc_st", "tr_st", "atr_st"],
-                errors="ignore",
-            )
-
+        result = presets.supertrend_ramjet(
+            frame["high"], frame["low"], frame["close"], period, multiplier
+        )
+        frame["supertrend"] = result.trend == 1
+        frame["supertrend_ready"] = result.ready
         return frame
 
     @staticmethod
@@ -304,10 +226,9 @@ class RamJetSignalProcessor:
         # False while the frame is shorter than the Supertrend warm-up: in that
         # regime supertrend=False means "unknown", not "bearish", so consumers
         # of supertrend_green_at_entry / the trailing flip workflow must not
-        # read a direction into it. Both Supertrend paths above set the marker
-        # (the pandas_ta branch for the library's own warm-up, the fallback for
-        # the fail-closed zero seed), so a missing column is unexpected and
-        # stays fail-closed instead of silently reporting ready.
+        # read a direction into it. _calculate_supertrend always sets the
+        # marker, so a missing column is unexpected and stays fail-closed
+        # instead of silently reporting ready.
         supertrend_ready = (
             bool(frame["supertrend_ready"].iloc[-1])
             if "supertrend_ready" in frame.columns

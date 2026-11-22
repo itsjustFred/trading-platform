@@ -41,6 +41,7 @@ class SignalProcessor(Protocol):
 
 SignalProcessorFactory = Callable[[dict[str, Any]], SignalProcessor]
 
+_T = TypeVar("_T")
 
 _ROOT = Path(__file__).resolve().parent
 CONFIG_FILENAME = "config.yaml"
@@ -69,9 +70,9 @@ _ProcessorT = TypeVar("_ProcessorT")
 
 def _build_from_config(
     config_path: Path,
-    factory: Callable[[dict[str, Any]], _ProcessorT],
+    factory: Callable[[dict[str, Any]], _T],
     config: dict[str, Any],
-) -> _ProcessorT:
+) -> _T:
     """Merge the bot's own config file with caller overrides and build it.
 
     `config` is caller-controlled data used as *values* only; it never selects
@@ -152,9 +153,9 @@ def get_signal_processor_module_path(name: str) -> Path:
 
 def _build_from_bot_dir(
     bot_dir: str,
-    factory: Callable[[dict[str, Any]], _ProcessorT],
+    factory: Callable[[dict[str, Any]], _T],
     config: dict[str, Any],
-) -> _ProcessorT:
+) -> _T:
     return _build_from_config(_bot_config_path(bot_dir), factory, config)
 
 
