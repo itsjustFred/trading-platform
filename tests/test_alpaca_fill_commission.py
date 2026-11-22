@@ -1245,10 +1245,16 @@ def test_backfill_follows_pagination(db):
 
     assert _backfill(client) == 1
     assert _commission(db, signal) == [pytest.approx(75.0)]
-    fill_calls = [params for path, params in client.calls if path.endswith("/FILL")]
-    assert len(fill_calls) >= 2
+    # The early-fill probe also pages FILL from the epoch; the listing is the call windowed
+    # on ``fill_start`` (its ``after`` is not the epoch probe bound).
+    listing = [
+        params
+        for path, params in client.calls
+        if path.endswith("/FILL") and params.get("after") != "1970-01-01T00:00:00Z"
+    ]
+    assert len(listing) >= 2
     first_page = sorted(foreign, key=lambda item: item["id"])[:100]
-    paged = [params for params in fill_calls if params.get("page_token")]
+    paged = [params for params in listing if params.get("page_token")]
     assert len(paged) == 1
     assert paged[0]["page_token"] == first_page[-1]["id"]
 
@@ -1533,6 +1539,29 @@ def test_backfill_fails_closed_when_fills_predate_the_fetch_window(db):
     assert _commission(db, signal) == [None]
 
 
+def test_backfill_prices_the_first_crypto_batch_despite_older_equity_fills(db):
+    """Equity fills before the fetch window are not crypto fills: they cannot open the first
+    CFEE batch's coverage window, so the account's first crypto batch still prices (#346)."""
+    signal, order_id = _crypto_fill(db, label="equity-history")
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(
+                order_id=_order_id("aapl-old"),
+                side="buy",
+                qty="10",
+                price="150",
+                at=FILL_AT - timedelta(days=10),
+                symbol="AAPL",
+            ),
+            _fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT),
+        ],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 1
+    assert _commission(db, signal) == [pytest.approx(0.00125 * 60000.0)]
+
+
 def test_backfill_survives_a_broker_error(db, live_runner_logs):
     signal, _order = _crypto_fill(db, label="error")
 
@@ -1603,8 +1632,13 @@ def test_backfill_cfee_predecessor_probe_is_a_single_request_with_long_history(d
     assert len(probes) == 1, "the predecessor probe is one request, not a paginated scan"
 
 
-def test_backfill_early_fill_probe_is_a_single_request_with_long_history(db):
-    """Same bound for the "fills before the fetch window" probe when no CFEE predecessor."""
+def test_backfill_early_fill_probe_stops_at_the_first_crypto_fill(db):
+    """The "crypto fills before the fetch window" probe must not paginate the whole history.
+
+    With 250 early crypto fills a paginating probe would make many calls before answering;
+    it stops at the first crypto fill on the first page instead. The CFEE predecessor probe
+    remains a single request.
+    """
     signal, order_id = _crypto_fill(db, label="deep-fills")
     early_fills = [
         _fill_activity(
@@ -1627,12 +1661,9 @@ def test_backfill_early_fill_probe_is_a_single_request_with_long_history(db):
 
     assert _backfill(client) == 0
     assert _commission(db, signal) == [None]
-    probes = [
-        params
-        for path, params in client.calls
-        if path.endswith("/FILL") and int(params.get("page_size")) == 1
-    ]
-    assert len(probes) == 1, "the early-fill probe is one request, not a paginated scan"
+    fill_calls = [call for call in client.calls if call[0].endswith("/FILL")]
+    # One probe page (the first page already holds crypto fills) plus the main listing.
+    assert len(fill_calls) == 2, "the early-fill probe stops at the first crypto fill"
 
 
 def test_backfill_leaves_a_still_posting_batch_pending_until_it_settles(db):

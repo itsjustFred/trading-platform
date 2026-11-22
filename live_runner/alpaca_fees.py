@@ -199,6 +199,56 @@ def has_earlier_account_activity(
     return _parse_activity_time(page[0].get(field)) < before
 
 
+def has_earlier_crypto_fill(
+    client: Any,
+    *,
+    before: datetime,
+    page_size: int = ACTIVITY_PAGE_SIZE,
+) -> bool:
+    """Whether any crypto ``FILL`` activity has ``transaction_time`` strictly before ``before``.
+
+    The first fetched ``CFEE`` batch's coverage window is open-ended, so an unfetched *crypto*
+    fill inside it would make the batch's fee totals cover fills the per-fill consistency check
+    never sees. Equity fills are irrelevant - the planner ignores them - so this pages ``FILL``
+    ascending and classifies each item's symbol instead of trusting the single oldest-activity
+    probe. A missing or unreadable symbol/timestamp cannot rule a crypto fill out and answers
+    True, as does hitting ``MAX_ACTIVITY_PAGES``: an unfinished scan fails closed.
+    """
+    token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(MAX_ACTIVITY_PAGES):
+        params: dict[str, Any] = {
+            "after": activity_timestamp(ACTIVITY_EPOCH),
+            "until": activity_timestamp(before + ACTIVITY_WINDOW_OVERLAP),
+            "direction": "asc",
+            "page_size": page_size,
+        }
+        if token is not None:
+            params["page_token"] = token
+        page = _activity_page(client, "FILL", params)
+        if not page:
+            return False
+        for raw in page:
+            symbol_text = str(raw.get("symbol") or "").strip()
+            if not symbol_text:
+                return True
+            if split_crypto_pair(symbol_text) is None:
+                continue
+            try:
+                moment = _parse_activity_time(raw.get("transaction_time"))
+            except ValueError:
+                return True
+            if moment < before:
+                return True
+        if len(page) < page_size:
+            return False
+        token = str(page[-1].get("id") or "").strip()
+        if not token or token in seen_tokens:
+            return True
+        seen_tokens.add(token)
+    return True
+
+
 def select_activity_window(
     items: list[dict[str, Any]],
     *,
@@ -268,19 +318,6 @@ def cfee_created_at(raw: dict[str, Any]) -> datetime:
         raise ValueError(
             f"CFEE entry has no usable created_at ({raw.get('created_at')!r})"
         ) from exc
-
-
-def _batch_end_times(moments: list[datetime]) -> list[datetime]:
-    """Cluster posting instants: the latest ``created_at`` of each batch, ascending."""
-    ends: list[datetime] = []
-    previous: datetime | None = None
-    for moment in sorted(moments):
-        if previous is not None and moment - previous <= CFEE_BATCH_GAP:
-            ends[-1] = moment
-        else:
-            ends.append(moment)
-        previous = moment
-    return ends
 
 
 @dataclass(frozen=True)
@@ -465,8 +502,15 @@ def fee_fill_window_start(
     ``timestamps`` are the candidates' execution times (naive values are read as UTC). Returns
     ``None`` when no posted batch can cover any candidate yet - every candidate is simply retried
     on a later pass. Raises ValueError when a ``CFEE`` activity has no usable ``created_at``.
+
+    The batch ends come from ``build_fee_batches`` itself, so the ``FILL`` fetch bound can never
+    drift from the windows the planner later prices. ``cfee_activities`` may include a batch the
+    settle guard later drops as still posting; that only widens the fetch, never narrows it.
     """
-    ends = _batch_end_times([cfee_created_at(raw) for raw in cfee_activities])
+    batches = build_fee_batches(cfee_activities, [])
+    if batches.broken is not None:
+        raise ValueError(batches.broken)
+    ends = [batch.end for batch in batches.batches]
     if not ends:
         return None
     moments = [

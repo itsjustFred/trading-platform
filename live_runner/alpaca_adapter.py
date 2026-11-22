@@ -23,6 +23,7 @@ from live_runner.alpaca_fees import (
     fee_fill_window_start,
     fetch_account_activities,
     has_earlier_account_activity,
+    has_earlier_crypto_fill,
     plan_commission_backfill,
     select_activity_window,
 )
@@ -1091,9 +1092,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
         # Does an earlier CFEE batch exist before the first fetched one? If so its coverage
         # window is truncated and it must fail closed when relevant. With no predecessor it is
-        # the account's first batch ever - then it is complete only if no fills exist before
-        # the FILL fetch bound either. Both probes are single requests: the account's oldest
-        # activity inside the window decides existence, so a long history cannot stall the pass.
+        # the account's first batch ever - then it is complete only if no *crypto* fills exist
+        # before the FILL fetch bound either (equity fills cannot sit in a crypto CFEE batch's
+        # coverage, so they must not open the window). The CFEE probe is a single request; the
+        # crypto-fill probe pages FILL ascending and stops at the first crypto fill, bounded by
+        # the activity page cap - an unfinished scan answers "open", which fails closed.
         first_batch_open = False
         try:
             if cfees:
@@ -1107,11 +1110,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
             if not first_batch_open:
                 first_batch_open = await asyncio.to_thread(
-                    has_earlier_account_activity,
+                    has_earlier_crypto_fill,
                     client,
-                    "FILL",
                     before=fill_start,
-                    field="transaction_time",
                 )
             fills = await asyncio.to_thread(
                 fetch_account_activities, client, "FILL", after=fill_start, until=now
