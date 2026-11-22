@@ -590,7 +590,7 @@ async def account_deployment_trading_pnls(
         symbol
         for dep in flows.values()
         for symbol, flow in dep.items()
-        if flow["net_qty"] != 0.0
+        if flow["net_qty"]
     }
     for symbol in symbols:
         if symbol not in open_symbols:
@@ -630,7 +630,7 @@ async def account_deployment_trading_pnls(
                 )
                 return None
             mark = 0.0
-            if flow["net_qty"] != 0.0:
+            if flow["net_qty"]:
                 bid, ask = marks[symbol]
                 mark = bid if flow["net_qty"] > 0 else ask
             total += (
