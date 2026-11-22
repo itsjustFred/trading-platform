@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -114,6 +115,31 @@ class SuiteHermeticityViolation(RuntimeError):
 _REPO_SECRET_OPENS: list[str] = []
 _NETWORK_VIOLATIONS: list[str] = []
 
+# The node id of the test currently in its setup/call/teardown window, or ``None``
+# for collection, session hooks and work a leaked thread does between tests. The
+# audit hook runs on whichever thread made the socket call, so a violation is
+# attributed to the test *running* on this thread only implicitly: a background
+# thread spawned by a test fires while some other test (or no test) is current.
+# The thread name is recorded alongside so a leaked worker stands out.
+_CURRENT_TEST_NODEID: str | None = None
+
+# Hits on the Dukascopy network-edge stubs (``_no_dukascopy_sdk_network``).
+# Recorded, not failed: the stub already turned what would have been a
+# hermeticity violation into an ordinary downloader error, and the session
+# report naming the test that triggered it is what makes the leak findable.
+_DUKASCOPY_STUB_HITS: list[str] = []
+
+
+def dukascopy_stub_hits() -> tuple[str, ...]:
+    """Every blocked Dukascopy/JForex network-edge call this session saw."""
+    return tuple(_DUKASCOPY_STUB_HITS)
+
+
+def _test_phase_label() -> str:
+    if _CURRENT_TEST_NODEID is None:
+        return "no test running"
+    return f"test {_CURRENT_TEST_NODEID}"
+
 
 def repo_secret_opens() -> tuple[str, ...]:
     """Every attempt this session made to open the checkout's real ``.accounts.env`` / ``.env``.
@@ -197,7 +223,10 @@ def _is_local_host(host: object) -> bool:
 def _refuse_remote_host(host: object, action: str) -> None:
     if _is_local_host(host):
         return
-    _NETWORK_VIOLATIONS.append(f"{action} {host!r}")
+    _NETWORK_VIOLATIONS.append(
+        f"{action} {host!r} during {_test_phase_label()} "
+        f"(thread {threading.current_thread().name})"
+    )
     raise SuiteHermeticityViolation(
         f"the suite refused a {action} to {host!r}: tests must not reach the network. "
         "Point them at a fixture, a stub transport or localhost."
@@ -429,6 +458,9 @@ def _accounts_env_readers() -> list[str]:
 # A worker's own ``session.exitstatus`` is ignored by xdist, so without this handoff a swallowed
 # violation on a worker would fail nothing.
 _WORKER_VIOLATIONS: list[str] = []
+# Same handoff for the Dukascopy stub hits: warnings, not failures, but a
+# worker's stderr is not reliably shown, so the controller prints them.
+_WORKER_STUB_HITS: list[str] = []
 
 
 def _hermeticity_failure_messages(session: pytest.Session) -> list[str]:
@@ -510,15 +542,30 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
     ``config.workeroutput`` and :func:`pytest_testnodedown` collects them there.
     """
     failures = _hermeticity_failure_messages(session)
+    stub_hits = dukascopy_stub_hits()
     if hasattr(session.config, "workerinput"):
         workeroutput = getattr(session.config, "workeroutput", None)
         if isinstance(workeroutput, dict):
             workeroutput["tp_violations"] = failures
+            workeroutput["tp_stub_hits"] = list(stub_hits)
         for message in failures:
             print(message, file=sys.stderr)
         return
     for message in dict.fromkeys((*failures, *_WORKER_VIOLATIONS)):
         _fail_session(session, message)
+    all_stub_hits = list(dict.fromkeys((*stub_hits, *_WORKER_STUB_HITS)))
+    if all_stub_hits:
+        shown = "\n  ".join(all_stub_hits[:25])
+        more = f"\n  ... and {len(all_stub_hits) - 25} more" if len(all_stub_hits) > 25 else ""
+        print(
+            "\n\nWARNING: the Dukascopy/JForex network-edge stubs blocked "
+            f"{len(all_stub_hits)} call(s) that would have reached the network:\n"
+            f"  {shown}{more}\n"
+            "Each became an ordinary downloader error instead of a hermeticity "
+            "violation. A test reached a real download path: give it a fixture, "
+            "a stub transport or localhost, or an explicit patch of the fetch edge.",
+            file=sys.stderr,
+        )
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -534,6 +581,9 @@ def pytest_testnodedown(node: object, error: object) -> None:
         reported = workeroutput.get("tp_violations")
         if isinstance(reported, list):
             _WORKER_VIOLATIONS.extend(str(item) for item in reported)
+        stub_hits = workeroutput.get("tp_stub_hits")
+        if isinstance(stub_hits, list):
+            _WORKER_STUB_HITS.extend(str(item) for item in stub_hits)
 
 
 def _requested_browser_name(item: pytest.Item) -> str:
@@ -623,6 +673,50 @@ def _no_jforex_jvm_prewarm():
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(jforex_dl, "prewarm_jvm", lambda: None)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_dukascopy_sdk_network():
+    """Keep tests off the two Dukascopy network edges: the JNLP/JAR bootstrap
+    and the native ``.bi5`` datafeed fetch.
+
+    Viewer download tasks run on background threads that can outlive the
+    per-test monkeypatch window (and the JVM prewarm patch above only covers
+    ``prewarm_jvm``), so under a randomized order an accidental real fetch
+    fires while an unrelated test - or no test - is current. The audit hook
+    still refuses the socket, but the session then fails on a violation no
+    single test owns. Stubbing the edges themselves turns that leak into an
+    ordinary task failure inside the downloader, which its callers already
+    handle. Tests that exercise the fetchers patch the same attributes
+    themselves; a test-local ``monkeypatch.setattr`` wins for the duration of
+    the test and this fixture's undo restores the real callable afterwards.
+    """
+    from data_tools.downloaders import dukascopy_native, jforex_dl
+
+    def _blocked_urlopen(*args, **kwargs):
+        _DUKASCOPY_STUB_HITS.append(
+            f"jforex_dl.urlopen during {_test_phase_label()} "
+            f"(thread {threading.current_thread().name})"
+        )
+        raise RuntimeError(
+            "the suite must not fetch JForex SDK jars over the network; "
+            "patch jforex_dl.urlopen or seed JFOREX_CLASSPATH/JFOREX_JARS"
+        )
+
+    async def _blocked_fetch_one(*args, **kwargs):
+        _DUKASCOPY_STUB_HITS.append(
+            f"dukascopy_native._fetch_one during {_test_phase_label()} "
+            f"(thread {threading.current_thread().name})"
+        )
+        raise RuntimeError(
+            "the suite must not fetch Dukascopy .bi5 files over the network; "
+            "patch dukascopy_native._fetch_one or download_bi5_files"
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(jforex_dl, "urlopen", _blocked_urlopen)
+        patch.setattr(dukascopy_native, "_fetch_one", _blocked_fetch_one)
         yield
 
 
@@ -817,7 +911,10 @@ def viewer_client(monkeypatch, tmp_path, viewer_app):
     return _TestClient(viewer_app)
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    global _CURRENT_TEST_NODEID
+    _CURRENT_TEST_NODEID = item.nodeid
     if item.get_closest_marker("e2e") is None:
         return
 
@@ -829,6 +926,19 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "Playwright browser binaries not installed. "
             "Run: python -m playwright install firefox"
         )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """Clear the attributed node id once the test's fixtures have torn down.
+
+    ``trylast`` keeps the id set while fixture finalizers run, so a network
+    attempt inside a ``yield`` fixture's teardown still names its test. A
+    violation recorded after this point belongs to no test - the signature of
+    a background thread a test leaked.
+    """
+    global _CURRENT_TEST_NODEID
+    _CURRENT_TEST_NODEID = None
 
 
 @pytest.fixture(autouse=True)
