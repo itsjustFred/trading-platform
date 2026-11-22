@@ -50,6 +50,14 @@ class TestResolveSlippageModel:
         model = resolve_slippage_model({}, asset_class="forex")
         assert isinstance(model, BarSpreadSlippage)
 
+    def test_volatility_cfd_defaults_to_bar_spread(self) -> None:
+        """Dukascopy ships VOLIDXUSD/DOLLARIDXUSD as ``asset_class:
+        'volatility'`` bid/ask CFDs — same class family as energy/commodity,
+        so auto must map them, not refuse (fail-closed stays for truly
+        unmapped classes like 'options')."""
+        model = resolve_slippage_model({}, asset_class="volatility")
+        assert isinstance(model, BarSpreadSlippage)
+
     def test_explicit_none_is_parity_opt_out(self) -> None:
         for spelling in ("none", "zero", "off", "parity"):
             model = resolve_slippage_model({"slippage": spelling}, asset_class="equities")
@@ -115,7 +123,7 @@ class TestResolveSlippageModel:
 
     def test_spread_without_class_or_bps_is_rejected(self) -> None:
         """``slippage='spread'`` may not fall back to a hard-coded 5bps."""
-        with pytest.raises(ValueError, match="slippage_bps|slippage_default_bps"):
+        with pytest.raises(ValueError, match=r"slippage_bps|slippage_default_bps"):
             resolve_slippage_model({"slippage": "spread"}, asset_class="")
         # ... but an explicit fallback or a classified asset class is fine.
         model = resolve_slippage_model(
@@ -539,6 +547,48 @@ class TestNativeEngineFillPriceSlippage:
         # SHORT entry sells: 100.0 * 0.99 = 99.0; exit buys: 100.5 * 1.01.
         assert trade.entry_price == pytest.approx(99.0)
         assert trade.exits[0].price == pytest.approx(100.5 * 1.01)
+
+    def test_short_level_exit_gapped_at_open_slips_once(self) -> None:
+        """#354 review SHORT mirror: a ``level`` exit whose level sits beyond
+        the whole exit bar is marketable at the open — the fill base is the
+        bar OPEN and slippage applies exactly once on top (buy side, up)."""
+        from runner.engine import TradeEngine
+
+        frame = _engine_frame()
+        # Exit bar (index 20): the whole bar trades below the level exit
+        # price, so the resting buy is marketable at the open.
+        frame.loc[20, ["open", "high", "low", "close"]] = [104.0, 104.5, 103.5, 104.2]
+
+        def short_level_strategy(df, params):
+            n = len(df)
+            entries = pd.Series([i == 10 for i in range(n)], index=df.index)
+            exits = pd.Series([i == 20 for i in range(n)], index=df.index)
+            indicators = {
+                "direction": pd.Series("SHORT", index=df.index),
+                "stop_loss": pd.Series([150.0] * n, index=df.index),
+                "take_profit": pd.Series([50.0] * n, index=df.index),
+                "exit_order_type": pd.Series(["level"] * n, index=df.index),
+                "exit_price": pd.Series([105.0] * n, index=df.index),
+            }
+            return entries, exits, indicators, []
+
+        engine = TradeEngine(
+            _engine_config({"slippage_bps": 10.0}),  # 0.1%
+            symbol="TEST",
+        )
+        result = engine.run(frame, short_level_strategy)
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+
+        leg = trade.exits[0]
+        assert leg.reason == "signal"
+        # Gap base = bar open 104.0 (no ask columns -> no bar spread);
+        # SHORT buy slips UP once: 104 * 1.001.
+        assert leg.price == pytest.approx(104.0 * 1.001)
+        assert leg.pnl == pytest.approx(
+            (trade.entry_price - leg.price) * leg.quantity
+        )
+        assert trade.meta["exit_level_gapped"] is True
 
 
 class TestNativeAdapterMetadata:
@@ -1070,6 +1120,82 @@ class TestReplayFlipSlippage:
         assert flip_leg.reason == "supertrend_flip"
         # Fill at the flip+1 bar OPEN (104.0), slipped once: 104 * 0.99.
         assert flip_leg.price == pytest.approx(104.0 * 0.99)
+
+    # ── gap-at-open × slippage composition (#354 review) ─────────────────
+    #
+    # #364 made protective exits gap-fill at the bar's OPEN; #130 slips the
+    # fill price once. The two must compose exactly once on every gap leg:
+    # exit.price == gap_base * (1 -/+ bps). These pin that a later edit
+    # cannot slip the base twice, skip the slip on a gap path, or slip the
+    # pre-gap level instead of the open. The workflow is long-only, so the
+    # SHORT mirror lives in TestNativeEngineFillPriceSlippage (the native
+    # ``level`` exit's gap-at-open fill).
+
+    _GAP_BPS = 10.0
+
+    def _gap_adapter(self):
+        return self._adapter(slippage_params={"slippage_bps": self._GAP_BPS})
+
+    def test_gap_through_stop_slips_the_gap_open_once(self, monkeypatch) -> None:
+        flat = (102.0, 102.5, 101.5, 102.0)
+        gap_stop_bar = (94.0, 94.5, 93.0, 94.2)
+        frame = self._frame([self._ENTRY_BAR, flat, gap_stop_bar, flat])
+        self._stub_supertrend(monkeypatch, "gggg")
+        trade = self._run(frame, self._gap_adapter()).trades[0]
+
+        leg = trade.exits[0]
+        assert leg.reason == "stop_loss"
+        # LONG sells lower: base is the gap OPEN (94), not the 95 level.
+        assert leg.price == pytest.approx(94.0 * (1 - self._GAP_BPS / 1e4))
+        assert leg.pnl == pytest.approx(
+            (leg.price - trade.entry_price) * leg.quantity
+        )
+
+    def test_gap_through_tp1_slips_the_gap_open_once(self, monkeypatch) -> None:
+        flat = (102.0, 102.5, 101.5, 102.0)
+        gap_tp1_bar = (111.0, 112.0, 110.5, 111.5)
+        frame = self._frame([self._ENTRY_BAR, gap_tp1_bar, flat, flat])
+        self._stub_supertrend(monkeypatch, "rrrr")
+        trade = self._run(frame, self._gap_adapter()).trades[0]
+
+        tp1_leg = trade.exits[0]
+        assert tp1_leg.reason == "tp1"
+        assert tp1_leg.price == pytest.approx(111.0 * (1 - self._GAP_BPS / 1e4))
+        assert tp1_leg.pnl == pytest.approx(
+            (tp1_leg.price - trade.entry_price) * tp1_leg.quantity
+        )
+
+    def test_gap_through_breakeven_stop_slips_the_gap_open_once(
+        self, monkeypatch
+    ) -> None:
+        flat = (102.0, 102.5, 101.5, 102.0)
+        gap_bar = (99.0, 99.5, 98.0, 98.5)
+        frame = self._frame([self._ENTRY_BAR, self._TP1_BAR, flat, gap_bar, flat])
+        self._stub_supertrend(monkeypatch, "rrrrr")
+        trade = self._run(frame, self._gap_adapter()).trades[0]
+
+        remainder = trade.exits[1]
+        assert remainder.reason == "breakeven_stop"
+        assert remainder.price == pytest.approx(99.0 * (1 - self._GAP_BPS / 1e4))
+        assert remainder.pnl == pytest.approx(
+            (remainder.price - trade.entry_price) * remainder.quantity
+        )
+
+    def test_gap_tp1_then_level_stop_each_slip_once(self, monkeypatch) -> None:
+        """The TP1 tranche gap-fills at the open; the remainder's pre-TP1
+        stop still working that bar fills AT THE LEVEL (95) — and each leg
+        is slipped exactly once."""
+        flat = (102.0, 102.5, 101.5, 102.0)
+        gap_tp1_then_stop = (111.0, 112.0, 94.0, 105.0)
+        frame = self._frame([self._ENTRY_BAR, gap_tp1_then_stop, flat, flat])
+        self._stub_supertrend(monkeypatch, "rrrr")
+        trade = self._run(frame, self._gap_adapter()).trades[0]
+
+        tp1_leg, remainder = trade.exits
+        assert tp1_leg.reason == "tp1"
+        assert tp1_leg.price == pytest.approx(111.0 * (1 - self._GAP_BPS / 1e4))
+        assert remainder.reason == "stop_loss"
+        assert remainder.price == pytest.approx(95.0 * (1 - self._GAP_BPS / 1e4))
 
 
 class TestSignalReplayEngineAssetClass:

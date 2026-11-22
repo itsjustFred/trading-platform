@@ -92,6 +92,9 @@ FX_SPREAD_ASSET_CLASSES = frozenset(
         "energies",
         "commodity",
         "commodities",
+        # Dukascopy volatility-index CFDs (VOLIDXUSD/DOLLARIDXUSD) are
+        # bid/ask instruments of the same class family.
+        "volatility",
     }
 )
 
@@ -111,6 +114,7 @@ DEFAULT_SLIPPAGE_BPS: dict[str, float] = {
     "energies": 3.0,
     "commodity": 3.0,
     "commodities": 3.0,
+    "volatility": 3.0,
     # Stocks/ETFs: half-spread plus small impact allowance.
     "equity": 5.0,
     "equities": 5.0,
