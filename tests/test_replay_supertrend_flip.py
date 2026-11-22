@@ -677,8 +677,8 @@ def test_a_split_walk_keeps_the_pending_flip_exit(monkeypatch) -> None:
             ),
         ],
     ).trades
-    aapl_alone = [trade for trade in alone if trade.symbol == "AAPL"][0]
-    aapl_split = [trade for trade in split if trade.symbol == "AAPL"][0]
+    aapl_alone = next(trade for trade in alone if trade.symbol == "AAPL")
+    aapl_split = next(trade for trade in split if trade.symbol == "AAPL")
     assert [leg.to_dict() for leg in aapl_split.exits] == [
         leg.to_dict() for leg in aapl_alone.exits
     ]

@@ -223,6 +223,10 @@ def _broker_quantity(positions: Iterable[Mapping[str, object]], symbol: str) -> 
             continue
         raw = position.get("qty")
         try:
+            # Untrusted broker JSON: the qty is whatever the adapter stored (str,
+            # int, float or garbage), so `float()` is the parse and its TypeError/
+            # ValueError is what turns an unreadable position into the domain
+            # error below - not a type error to suppress away.
             quantity = float(raw)  # type: ignore[arg-type]
         except (TypeError, ValueError) as exc:
             raise ValueError(

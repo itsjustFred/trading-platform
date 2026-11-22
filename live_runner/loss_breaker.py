@@ -178,7 +178,8 @@ def _strict_fraction(value: object, *, field_name: str) -> float:
     if value is None or isinstance(value, bool):
         raise ValueError(f"{field_name} must be a number in (0, 1], got {value!r}")
     try:
-        parsed = float(value)
+        # `value` is untyped config input: a TypeError/ValueError here is the refusal below.
+        parsed = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{field_name} must be a number in (0, 1], got {value!r}") from exc
     if not math.isfinite(parsed) or not 0.0 < parsed <= 1.0:

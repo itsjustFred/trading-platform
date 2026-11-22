@@ -199,7 +199,7 @@ def test_compute_supertrend_series_uses_active_band_and_ready_mask():
     assert data == core._indicator_to_points(df, expected_line, time_set)
 
     ready_times = {
-        ts.timestamp() for ts, ready in zip(df["timestamp"], result.ready) if ready
+        ts.timestamp() for ts, ready in zip(df["timestamp"], result.ready, strict=False) if ready
     }
     assert data
     assert all(point["time"] in ready_times for point in data)

@@ -171,18 +171,18 @@ def test_matrix_csv_loader_builds_sleeves_and_metadata(tmp_path):
             }
         )
     # A second sleeve on the same calendar.
-    for day in days:
-        rows.append(
-            {
-                "strategy": "rsi",
-                "symbol": "XAUUSD",
-                "timeframe": "4h",
-                "run_id": "grid_rsi_xauusd_4h",
-                "time": day.isoformat(),
-                "equity": 50000,
-                "daily_return": -0.0005,
-            }
-        )
+    rows.extend(
+        {
+            "strategy": "rsi",
+            "symbol": "XAUUSD",
+            "timeframe": "4h",
+            "run_id": "grid_rsi_xauusd_4h",
+            "time": day.isoformat(),
+            "equity": 50000,
+            "daily_return": -0.0005,
+        }
+        for day in days
+    )
     with csv_path.open("w", newline="", encoding="utf-8") as fh:
         import csv as csv_mod
 
@@ -400,7 +400,7 @@ def test_inverse_vol_gives_zero_weight_to_flat_or_short_sleeve():
     ids = list(window.columns)
     w = solve_weights("inverse_vol", ids, window[ids], min_window_observations=30)
     assert w is not None
-    weights = dict(zip(ids, w))
+    weights = dict(zip(ids, w, strict=False))
     assert weights["flat|X|1d"] == 0.0
     assert weights["short|X|1d"] == 0.0
     assert weights["ok|X|1d"] == pytest.approx(1.0)
@@ -429,7 +429,7 @@ def test_harness_produces_chained_oos_curves_and_always_shows_baselines():
     # inverse_vol must appear even though only equal_weight was requested.
     assert set(result.returns) == {"equal_weight", "inverse_vol"}
     assert set(result.equity) == {"equal_weight", "inverse_vol"}
-    for name, curve in result.equity.items():
+    for curve in result.equity.values():
         assert curve.iloc[0] == pytest.approx(1.0)
         assert len(curve) > 100
         # Business-day index only.
@@ -698,7 +698,7 @@ def test_weights_for_objective_solver_failure_falls_back_to_equal_weight():
         ["a|X|1d", "b|X|1d"],
         window,
         {"a|X|1d": 0.0, "b|X|1d": 0.0, "gone|X|1d": 1.0},
-        columns + ["gone|X|1d"],
+        [*columns, "gone|X|1d"],
         cfg,
     )
     assert weights2["a|X|1d"] == pytest.approx(0.5)
@@ -784,7 +784,7 @@ def test_estimation_window_is_bounded_to_lookback_days():
         min_window_observations=cfg.min_window_observations,
     )
     assert expected is not None
-    expected_map = dict(zip(["sma|EURUSD|1h", "rsi|XAUUSD|4h"], expected))
+    expected_map = dict(zip(["sma|EURUSD|1h", "rsi|XAUUSD|4h"], expected, strict=False))
     for sleeve, w in expected_map.items():
         assert last.weights[sleeve] == pytest.approx(w, abs=1e-12)
     # Sanity: sleeve A's calm recent regime earns it the larger weight.
@@ -808,7 +808,7 @@ def test_matrix_sleeve_without_daily_return_recovers_return_from_equity(tmp_path
             ],
         )
         writer.writeheader()
-        for day, equity in zip(days, equities):
+        for day, equity in zip(days, equities, strict=False):
             writer.writerow(
                 {
                     "strategy": "sma", "symbol": "EURUSD", "timeframe": "1h",
@@ -1526,5 +1526,5 @@ def test_walkforward_fold_without_trade_stats_is_unknown_not_zero(tmp_path):
 def test_walkforward_loader_malformed_json_names_the_file(tmp_path):
     bad = tmp_path / "wf_broken.json"
     bad.write_text("{not json", encoding="utf-8")
-    with pytest.raises(ValueError, match="wf_broken.json"):
+    with pytest.raises(ValueError, match=r"wf_broken\.json"):
         load_sleeve_returns(walkforward_paths=[bad])

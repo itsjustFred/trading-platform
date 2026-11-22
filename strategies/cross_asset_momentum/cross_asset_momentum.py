@@ -77,7 +77,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
     composite = pd.Series(0.0, index=df.index)
-    for lookback, weight in zip(lookbacks, weights):
+    for lookback, weight in zip(lookbacks, weights, strict=False):
         composite += close.pct_change(lookback).fillna(0) * weight
 
     vol = close.pct_change().rolling(vol_window).std() * np.sqrt(252)

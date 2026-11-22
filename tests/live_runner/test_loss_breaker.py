@@ -1346,7 +1346,7 @@ def test_prepare_order_refuses_losing_deployment_at_dispatch():
             )
         assert excinfo.value.scope == deployment_loss_breaker_scope(a_id)
         # dep B's V = 100k - 0 + 25k = 125k -> +25%: allowed.
-        prepared, qty = asyncio.run(
+        _prepared, qty = asyncio.run(
             daemon.prepare_order_with_risk(adapter, dep_b, _entry_signal(dep_b))
         )
         assert qty > 0
@@ -1712,7 +1712,7 @@ def test_prepare_order_skips_equity_read_when_breakers_disabled(monkeypatch):
 
     monkeypatch.setenv("LOSS_BREAKER_ENABLED", "false")
     adapter = _NoEquityAdapter(equity=100_000.0)
-    prepared, qty = asyncio.run(
+    _prepared, qty = asyncio.run(
         daemon.prepare_order_with_risk(adapter, dep, _entry_signal(dep))
     )
     assert qty > 0

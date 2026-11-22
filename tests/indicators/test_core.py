@@ -323,7 +323,7 @@ class TestPeriodValidation:
         ],
     )
     def test_non_positive_periods_raise(self, call):
-        with pytest.raises(ValueError, match="positive|>= 1|period|span|window|length"):
+        with pytest.raises(ValueError, match=r"positive|>= 1|period|span|window|length"):
             call()
 
     def test_atr_from_tr_rejects_non_positive_period(self):
@@ -585,7 +585,7 @@ class TestNoLookahead:
         high, low, close = _property_frames()[frame_kind]
         for smoothing, seed, skipna, min_periods in _ATR_CASES:
             _assert_no_lookahead(
-                lambda h, lo, c: atr(
+                lambda h, lo, c, smoothing=smoothing, seed=seed, min_periods=min_periods, skipna=skipna: atr(
                     h, lo, c, 14,
                     smoothing=smoothing, seed=seed, first_bar="hl",
                     min_periods=min_periods, skipna=skipna,

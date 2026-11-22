@@ -770,7 +770,7 @@ def test_a_ledger_that_matches_the_broker_again_raises_no_alert(database, caplog
 
     exit_adapter = _ExitAdapter([{"symbol": "AAPL", "qty": 10.0}])
     with caplog.at_level(logging.ERROR):
-        prepared, qty = _prepare_exit(exit_adapter, DEP_OTHER)
+        _prepared, qty = _prepare_exit(exit_adapter, DEP_OTHER)
 
     assert qty == pytest.approx(10.0)
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]

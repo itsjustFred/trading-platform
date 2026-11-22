@@ -1661,7 +1661,7 @@ def _pnl_res(pnl_res_cls, *, money_digits: int, pnl_minor: int):
 
 
 def _wire_balance_and_equity(adapter, trader_res, pnl_res, *, pnl_fails=False):
-    trader_req_cls, trader_res_cls, pnl_req_cls, pnl_res_cls = _proto_classes()
+    trader_req_cls, trader_res_cls, pnl_req_cls, _pnl_res_cls = _proto_classes()
     adapter._ProtoOATraderReq = trader_req_cls
     adapter._ProtoOATraderRes = trader_res_cls
 
@@ -1747,7 +1747,7 @@ def test_get_equity_fails_closed_when_pnl_request_fails():
         _pnl_res(pnl_res_cls, money_digits=2, pnl_minor=0),
         pnl_fails=True,
     )
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="pnl endpoint down"):
         asyncio.run(adapter.get_equity())
 
 
@@ -1785,7 +1785,7 @@ def test_get_equity_propagates_ctrader_api_error():
     """The CTraderApiError branch of the unrealized-PnL fetch: a non-terminal
     API error propagates so the breaker fails closed, never reads as 0."""
     adapter = _connected_adapter()
-    trader_req_cls, trader_res_cls, pnl_req_cls, pnl_res_cls = _proto_classes()
+    trader_req_cls, trader_res_cls, pnl_req_cls, _pnl_res_cls = _proto_classes()
     adapter._ProtoOATraderReq = trader_req_cls
     adapter._ProtoOATraderRes = trader_res_cls
 

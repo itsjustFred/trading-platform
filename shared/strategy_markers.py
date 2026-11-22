@@ -72,13 +72,16 @@ def signal_markers(
             times = pd.to_datetime(
                 df.loc[mask[mask].index, "timestamp"], utc=True, errors="coerce"
             ).dropna()
-            for t in times.iloc[:limit]:
-                drawings.append(_marker(position, t, shape, color, text))
+            drawings.extend(
+                _marker(position, t, shape, color, text) for t in times.iloc[:limit]
+            )
         return drawings
     ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     for mask, position, shape, color, text, limit in groups:
-        for t in ts.loc[mask].dropna().iloc[:limit]:
-            drawings.append(_marker(position, t, shape, color, text))
+        drawings.extend(
+            _marker(position, t, shape, color, text)
+            for t in ts.loc[mask].dropna().iloc[:limit]
+        )
     return drawings
 
 
