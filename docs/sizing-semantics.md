@@ -19,7 +19,8 @@ positions to market for sizing (decision record D9).
 
 All exposure fractions are validated as finite values in the inclusive range
 `0 < value <= 1`. `max_leverage` is a separate multiple of equity and is not a
-fraction-valued exposure field.
+fraction-valued exposure field: it is the broker maximum leverage for the
+account/asset, and an unset value means an unknown maximum → 1x (#347).
 
 | Name | Layer | Meaning (Decision Record, verbatim) |
 |---|---|---|
@@ -49,9 +50,15 @@ documented here.
   when unset (equities 100%, other 20%). `risk_per_trade_pct` sizes from the
   stop distance; the position is filled up to the cap, never beyond.
 - **native (`TradeEngine`)**: the flag caps one position's notional at
-  `equity × max_position_exposure_pct`; the aggregate `RiskConfig.max_total_exposure`
+  realized cash `× max_position_exposure_pct`; the aggregate `RiskConfig.max_total_exposure`
   remains the risk engine default (`0.05`). `max_leverage` is an independent
   ceiling, so an omitted position cap preserves the native leverage behavior.
+  Since #347 the leverage check is MT5-style: the order's margin
+  (notional / `max_leverage`) must fit **free margin** — mark-to-market
+  equity minus the margin already used by open positions — and an order that
+  would need more leverage than the broker maximum is clamped down (floored
+  to `lot_step` when it binds) instead of refused. The exposure cap itself
+  stays on realized cash.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.

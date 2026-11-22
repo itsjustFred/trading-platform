@@ -182,9 +182,16 @@ Implementation:
   vectorbt records the decision in `trade.meta["risk_math"]`
   (`sizing_mode`, `risk_target_usd`, `stop_distance`, `required_notional`,
   `final_notional`, `capped_by_max_position`, `capped_by_max_leverage`).
+  **Leverage-cap basis divergence (#347):** vectorbt/pynecore hold at most
+  one position, so their free margin always equals equity and their
+  `equity × max_leverage` cap already *is* the MT5 rule. The native engine
+  sizes against **free margin** — mark-to-market equity minus the margin
+  open positions already use — and clamps the quantity (floored to
+  `lot_step` when the leverage cap binds) instead of refusing; an unknown
+  broker maximum means 1x.
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
-  the result is still capped by `max_leverage` unless
+  the result is still capped by `max_leverage` (free margin, #347) unless
   `cap_fixed_risk_by_leverage = false`.
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.

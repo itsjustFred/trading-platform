@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 from typing import Any, Callable
 
 import pandas as pd
@@ -332,6 +333,79 @@ class TradeEngine:
 
         return max(0.0, risk_exposure)
 
+    def _free_margin(self, mark_price: float) -> float:
+        """MT5-style free margin: equity − used margin, marked at ``mark_price``.
+
+        ``equity`` is mark-to-market — deliberately NOT the realized-cash
+        sizing basis: D2 governs what may be *risked*, while the margin
+        check governs what the broker would *accept* (#347, decisions on
+        #267/#240/#329). The balance leg is ``_sizing_equity`` — realized
+        cash net of every fee already incurred, including the entry leg of
+        still-open positions, which is what MT5 has already charged — plus
+        the floating PnL at ``mark_price``. Used margin is each open
+        position's notional at the same mark divided by the
+        account/asset maximum leverage (``_max_leverage`` — 1x when the
+        broker maximum is unknown); pending orders hold no margin, as on
+        MT5.
+        """
+        if not math.isfinite(mark_price) or mark_price <= 0:
+            return 0.0
+        leverage = self._max_leverage
+        equity = float(self._sizing_equity)
+        used_margin = 0.0
+        for position in self.positions:
+            qty = float(position.remaining_qty or 0.0)
+            if qty <= 1e-9:
+                continue
+            entry = float(position.entry_price)
+            if position.direction == "LONG":
+                equity += (mark_price - entry) * qty
+            else:
+                equity += (entry - mark_price) * qty
+            used_margin += qty * mark_price / leverage
+        return equity - used_margin
+
+    def _free_margin_quantity_cap(self, entry_price: float) -> float:
+        """Largest quantity the free-margin leverage rule affords (unfloored).
+
+        A broker accepts an order whose margin (notional / max leverage)
+        fits in free margin, i.e. ``notional <= free_margin * max_leverage``.
+        """
+        free_margin = self._free_margin(entry_price)
+        if free_margin <= 0:
+            return 0.0
+        return free_margin * self._max_leverage / entry_price
+
+    def _apply_notional_caps(
+        self,
+        shares: float,
+        *,
+        entry_price: float,
+        exposure_limit: float | None,
+        lot_step: float,
+        cap_by_leverage: bool = True,
+    ) -> float:
+        """Apply the two notional ceilings to a sized quantity (#347).
+
+        The per-position exposure cap stays a sizing rule on realized cash
+        (D2). The leverage/margin check is MT5-style free margin: when it is
+        the binding constraint the quantity is clamped down and floored to
+        ``lot_step`` — never refused. ``cap_by_leverage=False`` is the
+        fixed-risk ``cap_fixed_risk_by_leverage=false`` opt-out.
+        """
+        exposure_qty_cap = (
+            self._sizing_equity * exposure_limit / float(entry_price)
+            if exposure_limit is not None
+            else math.inf
+        )
+        shares = min(shares, exposure_qty_cap)
+        if cap_by_leverage:
+            leverage_cap = self._free_margin_quantity_cap(float(entry_price))
+            if lot_step > 0 and leverage_cap < shares:
+                leverage_cap = math.floor(leverage_cap / lot_step + 1e-12) * lot_step
+            shares = min(shares, leverage_cap)
+        return max(shares, 0.0)
+
     def _calculate_position_size(
         self,
         *,
@@ -342,12 +416,14 @@ class TradeEngine:
         stop_distance: float | None = None,
         exclude_order: Order | None = None,
     ) -> float:
-        max_leverage = self._max_leverage
-        position_notional_limit = (
-            max_leverage
-            if self._max_position_exposure_pct is None
-            else min(self._max_position_exposure_pct, max_leverage)
-        )
+        # #347: two different denominators now. The per-position exposure cap
+        # stays a sizing rule on realized cash (D2); the leverage/margin
+        # check is MT5-style and judges the order against FREE MARGIN
+        # (equity − used margin), clamping to the broker maximum instead of
+        # refusing. ``self._max_leverage`` is the broker maximum for the
+        # account/asset; unknown → 1x.
+        exposure_limit = self._max_position_exposure_pct
+        lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
         fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
         if fixed_risk_amount is None:
             fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
@@ -367,7 +443,6 @@ class TradeEngine:
             if risk_amount > 0 and risk_distance > 0:
                 tick_value = float(self.config.parameters.get("tick_value", 1.0) or 1.0)
                 tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
-                lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
                 min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
                 max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
                 shares = (risk_amount / risk_distance) * (tick_size / tick_value)
@@ -377,13 +452,17 @@ class TradeEngine:
                     shares = max(shares, min_lot)
                 if max_lot > 0:
                     shares = min(shares, max_lot)
-                if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self._sizing_equity * position_notional_limit
-                    shares = min(shares, max_value / entry_price)
-                elif self._max_position_exposure_pct is not None:
-                    max_value = self._sizing_equity * self._max_position_exposure_pct
-                    shares = min(shares, max_value / entry_price)
-                return max(shares, 0.0)
+                return self._apply_notional_caps(
+                    shares,
+                    entry_price=float(entry_price),
+                    exposure_limit=exposure_limit,
+                    lot_step=lot_step,
+                    cap_by_leverage=bool(
+                        self.config.parameters.get(
+                            "cap_fixed_risk_by_leverage", True
+                        )
+                    ),
+                )
 
         pending_positions = sum(
             order is not exclude_order for order in self.pending_orders
@@ -413,7 +492,16 @@ class TradeEngine:
                 current_exposure=self._current_risk_exposure(
                     float(entry_price), exclude_order=exclude_order
                 ),
-                max_notional_per_trade=position_notional_limit,
+                # #347: only the realized-cash exposure cap goes into the
+                # risk engine; the leverage/margin ceiling is applied
+                # afterwards on free margin. With no exposure cap there is
+                # no engine-level ceiling — float_info.max stands in for
+                # "uncapped" (the post-cap is the real leverage bound).
+                max_notional_per_trade=(
+                    exposure_limit
+                    if exposure_limit is not None
+                    else sys.float_info.max
+                ),
             )
             shares = float(sized_order.position_size)
         else:
@@ -425,11 +513,14 @@ class TradeEngine:
                 "Set risk_per_trade_pct or fixed_risk_amount explicitly."
             )
 
-        # F21 (D2): the notional/leverage cap is denominated in the same
-        # realized sizing cash as the risk target.
-        max_value = self._sizing_equity * position_notional_limit
-        shares = min(shares, max_value / entry_price)
-        return max(shares, 0.0)
+        # F21 (D2): the per-position notional cap stays denominated in
+        # realized sizing cash; #347: the leverage/margin cap is free margin.
+        return self._apply_notional_caps(
+            shares,
+            entry_price=float(entry_price),
+            exposure_limit=exposure_limit,
+            lot_step=lot_step,
+        )
 
     @staticmethod
     def _to_iso(value: Any) -> str:

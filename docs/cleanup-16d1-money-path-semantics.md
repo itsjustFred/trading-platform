@@ -33,9 +33,9 @@ compounded into the next entry's quantity, and paper drawdown shrank it.
 equity for the curve. Sizing is therefore indifferent to open-trade
 fluctuations: unrealized profit is not spendable, and unrealized loss does not
 shrink new positions. Every sizing input reads that one basis — the risk
-engine's `account_balance`, the notional/leverage caps
-(`_sizing_equity × position_notional_limit`, and the
-`max_position_exposure_pct` arm), the aggregate-exposure denominator
+engine's `account_balance`, the notional/exposure caps
+(`_sizing_equity × max_position_exposure_pct`), the aggregate-exposure
+denominator
 (`_current_risk_exposure`) and `equity_at_entry`, the recorded basis the
 multi-symbol shared-equity replay (`replay_shared_equity`) divides the
 quantity by — that replay accumulates realized PnL only, so a mark-to-market
@@ -117,6 +117,20 @@ compound into entries that the ledger had not received.
 protocol is **deliberately untouched** here — it is a deliberate MT5-alignment
 interface (see `docs/mt5-backtest-alignment-plan.md`), documented rather than
 removed; only the equity base it reads was wrong and is fixed.
+
+**Leverage/margin check moved to free margin (#347):** the maintainer
+decisions on #267/#240/#329 resolved the open question this branch left —
+the leverage cap is no longer denominated in realized cash. It is now
+MT5-style: an order's margin (notional / `max_leverage`, the broker maximum
+for the account/asset; unknown → 1x) must fit **free margin** =
+mark-to-market equity − margin already used by open positions, marked at
+the sizing price. An order that would need more leverage than the broker
+maximum is clamped down (floored to `lot_step` when the leverage cap binds)
+instead of refused, matching the live pre-submit caps (#329). The
+mark-to-market equity here is the *margin-check* input only — the sizing
+target, the exposure cap and the aggregate-exposure denominator all stay on
+realized cash. Pinned by
+`tests/test_engine_behavior.py::TestFreeMarginLeverageCap`.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl`.
 The two original scenarios are basis-blind (the first entry fills at the next
