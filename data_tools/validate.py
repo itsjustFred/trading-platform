@@ -115,7 +115,7 @@ def _parse_session_clock(value: object) -> int | None:
     return int(parsed.hour * 60 + parsed.minute)
 
 
-def _session_window(value: object) -> tuple[int, int] | None | _MalformedSession:
+def _session_window(value: object) -> tuple[int, int] | _MalformedSession | None:
     """Resolve a session to `(start_minutes, end_minutes)`.
 
     Returns `None` when **no** session was configured, `MALFORMED_SESSION` when one was configured
@@ -192,8 +192,8 @@ def _observed_session_window(
         + int(step_minutes)
         for points in by_day.values()
     ]
-    start_minutes = int(round(float(sorted(starts)[len(starts) // 2])))
-    end_minutes = int(round(float(sorted(ends)[len(ends) // 2])))
+    start_minutes = round(float(sorted(starts)[len(starts) // 2]))
+    end_minutes = round(float(sorted(ends)[len(ends) // 2]))
     if end_minutes <= start_minutes or end_minutes - start_minutes < step_minutes * 2:
         return None
     return start_minutes, end_minutes

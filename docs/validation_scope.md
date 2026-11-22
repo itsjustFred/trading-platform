@@ -1,5 +1,14 @@
 # Strategy Validation Framework — Scope & Grenzen
 
+> **Historical planning note (Phase 1, 2026-06-24).** Kept for the record. It describes the
+> scoping of the validation framework as it stood then, so several statements no longer match
+> the repository: the branch `kimchi-kimi-continue` it names no longer exists; `runner/engine.py`
+> and `live_runner/` have changed many times since (execution logic is no longer out of
+> bounds); and the external frameworks once listed as later extensions now have engine
+> adapters (`runner/engines/lean_adapter.py`, `runner/engines/pynecore_adapter.py`). Read
+> `docs/validation_architecture.md`, `docs/validation_inventory.md` and
+> `docs/mt5_xlsx_schema.md` for the current state.
+
 **Datum:** 2026-06-24
 **Branch:** `kimchi-kimi-continue`
 **Phase:** 1 — Repository Analysis & Scoping
@@ -42,7 +51,7 @@
 2. XLSX-Reports enthalten mindestens Orders- und Trades/Deals-Tabellen mit den benötigten Spalten.
 3. Interne `BacktestResult`-Objekte können aus dem Vergleichs-Runner oder einer Datei geladen werden.
 4. Zeitzonen werden soweit möglich normalisiert (ISO 8601 UTC); bei fehlender Zeitzoneninfo wird Broker-Serverzeit angenommen.
-5. Commission/Swap sind in MT5-Reports optional oder 0 (Demo); sie werden in `raw_metadata` abgelegt, blockieren den Import aber nicht.
+5. Commission/Swap sind in MT5-Reports optional oder 0 (Demo); die rohen MT5-Werte (mit Vorzeichen) liegen pro Trade in `Trade.meta.commission` / `Trade.meta.swap`, die normalisierten Kosten in `Trade.fees` (positiv = Kosten, negativ = Netto-Swap-Gutschrift). `raw_metadata` trägt die report-level Metadaten (Kopf-Block, `position_fills`-Evidence) und blockiert den Import nicht. Siehe Regel 5 in `docs/mt5_xlsx_schema.md`.
 
 ---
 

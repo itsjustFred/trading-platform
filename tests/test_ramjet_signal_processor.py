@@ -64,10 +64,89 @@ def test_process_signal_ports_ramjet_sl_tp_and_trailing_config():
     assert signal.metadata["signal_price"] == pytest.approx(111.25)
 
     trailing = signal.metadata["trailing_sl_config"]
+    # #150 (decided behaviour change): the mode is a config setting with a
+    # deliberate default of 'none' (initial stop only) until #167/#168 land.
+    # The old hard-coded 'supertrend_flip' asked for a workflow no path runs.
+    assert trailing == {"mode": "none"}
+    # No workflow fields that would promise trailing the paths do not run.
+    assert "breakeven_after_tp1" not in trailing
+    assert "activation_phase" not in trailing
+    assert "exit_phase" not in trailing
+    # TP1/supertrend context metadata stays: computed facts, not workflow claims.
+    assert signal.metadata["tp1_price"] == pytest.approx(signal.take_profit)
+    assert "supertrend_green_at_entry" in signal.metadata
+    assert "supertrend_ready" in signal.metadata
+
+
+def test_process_signal_selects_trailing_mode_via_config():
+    """#150: the trailing mode comes from config, not from hard-coding."""
+    processor = RamJetSignalProcessor(
+        {"ram_jet": {"trailing_mode": "percent", "trailing_percent": 0.02}}
+    )
+    signal = processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data()
+    )
+    assert signal.metadata["trailing_sl_config"] == {
+        "mode": "percent",
+        "percent": 0.02,
+    }
+
+
+def test_process_signal_emits_supertrend_flip_config_for_known_mode():
+    """#150: supertrend_flip is known, so the processor builds and emits its
+    workflow description; executing paths reject the signal (#168 enables it
+    by extending the support sets)."""
+    processor = RamJetSignalProcessor({"ram_jet": {"trailing_mode": "supertrend_flip"}})
+    signal = processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data()
+    )
+    trailing = signal.metadata["trailing_sl_config"]
     assert trailing["mode"] == "supertrend_flip"
     assert trailing["breakeven_after_tp1"] is True
     assert trailing["activation_phase"] == "wait_for_first_green_after_tp1"
     assert trailing["exit_phase"] == "exit_on_first_red_after_activation"
+
+
+def test_unknown_trailing_mode_rejected_at_config_time():
+    with pytest.raises(ValueError, match="Unknown trailing stop mode"):
+        RamJetSignalProcessor({"ram_jet": {"trailing_mode": "martingale_trail"}})
+
+
+def test_percent_trailing_mode_requires_trailing_percent():
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor({"ram_jet": {"trailing_mode": "percent"}})
+
+
+def test_trailing_percent_rejected_for_other_modes():
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor(
+            {"ram_jet": {"trailing_mode": "none", "trailing_percent": 0.02}}
+        )
+
+
+def test_trailing_percent_out_of_range_rejected():
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor(
+            {"ram_jet": {"trailing_mode": "percent", "trailing_percent": 1.5}}
+        )
+
+
+@pytest.mark.parametrize("trailing_percent", [0.0, 1.0, -0.01, float("nan")])
+def test_trailing_percent_boundaries_rejected(trailing_percent):
+    """Survivor: the open interval (0, 1) must exclude both endpoints and NaN."""
+    with pytest.raises(ValueError, match="trailing_percent"):
+        RamJetSignalProcessor(
+            {"ram_jet": {"trailing_mode": "percent", "trailing_percent": trailing_percent}}
+        )
+
+
+@pytest.mark.parametrize("key", ["atr_period", "supertrend_period"])
+@pytest.mark.parametrize("value", [0, -1, 0.5])
+def test_non_positive_indicator_periods_rejected(key, value):
+    """A non-positive period must fail at config time, not clamp to 1 and
+    size a live stop from a one-bar ATR."""
+    with pytest.raises(ValueError, match=key):
+        RamJetSignalProcessor({"ram_jet": {key: value}})
 
 
 def test_process_signal_rejects_non_buy_actions():
@@ -91,65 +170,33 @@ def test_processor_loads_default_ramjet_config_file():
     assert processor.default_timeframe == "5m"
 
 
-class _FakeSupertrendTA:
-    """Stands in for the ``pandas_ta`` accessor with a deterministic frame."""
+def test_supertrend_marks_warmup_not_ready_on_short_frame():
+    """A frame shorter than the Supertrend warm-up must not read as ready.
 
-    def __init__(self, directions: list[int], period: int, multiplier: float):
-        self._directions = directions
-        self._period = period
-        self._multiplier = multiplier
-
-    def supertrend(self, length=None, multiplier=None, **_kwargs):
-        return pd.DataFrame(
-            {
-                f"SUPERTd_{self._period}_{float(self._multiplier)}": self._directions,
-            }
-        )
-
-
-def test_pandas_ta_supertrend_marks_warmup_not_ready(monkeypatch):
-    """The pandas_ta branch must carry the same warm-up marker as the fallback.
-
-    Old behaviour: the pandas_ta branch only set ``supertrend``, so
-    process_signal fell into its ``else True`` and reported the warm-up bar as
-    ready with whatever direction the library emitted for it — the marker was
-    the fallback's secret, not the contract's (CodeRabbit batch review).
+    The single shared implementation (issue #317 P1, replacing both the
+    pandas_ta branch and the hand-written fallback) emits ``supertrend``
+    for every bar but ``supertrend_ready`` only after ``period`` bars of
+    history — ``process_signal`` must report the warm-up bar as not ready
+    even though a direction column exists.
     """
     period = 100
     rows = 40
-    # The library reports green on every bar, but the frame is shorter than
-    # the requested warm-up — exactly the short live fetch the golden test
-    # pins for the fallback path.
-    directions = [1] * rows
-    # pandas_ta registers the ``ta`` accessor on import; it is absent when the
-    # library is not installed, hence raising=False.
-    monkeypatch.setattr(
-        pd.DataFrame,
-        "ta",
-        property(lambda self: _FakeSupertrendTA(directions, period, 3.0)),
-        raising=False,
-    )
-
     processor = RamJetSignalProcessor(
         {"ram_jet": {"supertrend_period": period, "candle_timeframe": "5Min"}}
     )
-    signal = processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows))
+    signal = processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows)
+    )
 
     assert signal.metadata["supertrend_ready"] is False
-    assert signal.metadata["supertrend_green_at_entry"] is True
 
-    # Once the warm-up is over the same library output counts as ready.
-    warmed_directions = [1] * rows
-    monkeypatch.setattr(
-        pd.DataFrame,
-        "ta",
-        property(lambda self: _FakeSupertrendTA(warmed_directions, 10, 3.0)),
-        raising=False,
-    )
+    # Once the warm-up is over the same computation counts as ready.
     warmed_processor = RamJetSignalProcessor(
         {"ram_jet": {"supertrend_period": 10, "candle_timeframe": "5Min"}}
     )
-    warmed = warmed_processor.process_signal({"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows))
+    warmed = warmed_processor.process_signal(
+        {"symbol": "AAPL", "action": "BUY"}, _sample_market_data(rows)
+    )
     assert warmed.metadata["supertrend_ready"] is True
 
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from scripts.regenerate_qc_risk_parity_artifact import _load_local_prices
 from scripts.run_risk_parity_backtest import TICKERS
@@ -63,3 +64,49 @@ def test_regenerate_offline_accepts_history_start_kwarg(tmp_path: Path):
     )
     assert output.exists()
     assert backtest.meta.id == "rp_offline"
+
+
+def test_regenerate_passes_the_parity_statistics_flags(monkeypatch, tmp_path: Path):
+    """The checked-in reference note says its stats use LEAN conventions with rf=0.025.
+
+    ``run_backtest`` defaults to ``lean_statistics=False, risk_free_rate=0.0``, so the
+    regeneration must pass both explicitly or the pinned Sharpe (0.350569) is not reproduced.
+    """
+    import scripts.regenerate_qc_risk_parity_artifact as regen
+
+    empty = pd.DataFrame()
+    seen: dict[str, object] = {}
+
+    def fake_run_backtest(**kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop after run")
+
+    monkeypatch.setattr(regen, "_load_local_prices", lambda *args: (empty, empty))
+    monkeypatch.setattr(regen.risk_parity, "run_backtest", fake_run_backtest)
+    with pytest.raises(RuntimeError, match="stop after run"):
+        regen.regenerate(
+            data_dir=tmp_path, source=Path("x"), output=tmp_path / "o.json",
+            start="2016-01-01", end="2016-06-30",
+        )
+    assert seen["lean_statistics"] is True
+    assert seen["risk_free_rate"] == 0.025
+
+
+def test_regenerate_loads_prices_from_margined_history_start(monkeypatch, tmp_path: Path):
+    """Offline regeneration must keep the 200-day covariance margin (A-M6)."""
+    import scripts.regenerate_qc_risk_parity_artifact as regen
+    from scripts.run_risk_parity_backtest import price_history_start
+
+    seen: list[str] = []
+
+    def stop(data_dir, source, start, end):
+        seen.append(start)
+        raise RuntimeError("stop after load")
+
+    monkeypatch.setattr(regen, "_load_local_prices", stop)
+    with pytest.raises(RuntimeError, match="stop after load"):
+        regen.regenerate(
+            data_dir=tmp_path, source=Path("x"), output=tmp_path / "o.json",
+            start="2016-01-01", end="2016-06-30",
+        )
+    assert seen == [price_history_start("2016-01-01", "2015-08-04")] == ["2015-01-16"]

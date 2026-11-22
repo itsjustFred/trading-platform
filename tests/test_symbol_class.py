@@ -274,3 +274,15 @@ def test_get_market_data_rejects_unclassifiable_symbol() -> None:
     adapter._historical_data_client = _Stock()
     with pytest.raises(UnclassifiableSymbolError):
         asyncio.run(adapter.get_market_data("FOOBARUSD", timeframe="1h", limit=1))
+
+
+@pytest.mark.parametrize(
+    "symbol", ["BTC-USD", "ETH-USDT", "SOL-USDC", "ETH-BTC", "BTC/USD", "BTCUSD"]
+)
+def test_every_market_data_crypto_spelling_is_crypto_for_the_order_path(symbol):
+    """Routing reads ``classify_symbol``; the bracket refusal and CFEE backfill read
+    ``classify_alpaca_symbol``. A spelling routed as crypto must never be ``unknown`` there."""
+    from shared.alpaca_symbols import classify_alpaca_symbol
+
+    assert classify_symbol(symbol) == "crypto"
+    assert classify_alpaca_symbol(symbol) == "crypto"

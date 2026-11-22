@@ -294,6 +294,8 @@ export interface OptimizationRunRequest {
   target_metric: "sharpe" | "net_profit" | "calmar" | "cagr" | "win_rate";
   n_trials: number;
   train_split_pct: number;
+  validation_split_pct?: number;
+  test_split_pct?: number;
   parameter_ranges: Record<string, OptimizationParameterRange>;
   optimization_mode?:
     | "parameter"
@@ -313,6 +315,88 @@ export interface OptimizationPeriod {
   end: string;
 }
 
+// Three-way split types (issue #164)
+export interface ThreeWaySplitSegments {
+  train: OptimizationPeriod;
+  validation: OptimizationPeriod;
+  test: OptimizationPeriod;
+  embargo_train_val: OptimizationPeriod;
+  embargo_val_test: OptimizationPeriod;
+}
+
+export interface ThreeWayWinnerMetrics {
+  trial_number: number;
+  train_metrics: OptimizationStatMap;
+  validation_metrics: OptimizationStatMap;
+  test_metrics: OptimizationStatMap;
+}
+
+export interface ThreeWaySelection {
+  winner_trial_number: number;
+  score_source: string;
+  target_metric: string;
+  study_direction: string;
+  top_fraction: number;
+  top_set_size: number;
+  n_selectable_trials: number;
+  n_unselectable_trials: number;
+  tie_break: string;
+  ranked_top_set: Array<{
+    rank: number;
+    trial_number: number;
+    validation_score: number;
+    validation_metric_value: number;
+    params: Record<string, StrategyParameterValue>;
+    is_winner: boolean;
+  }>;
+}
+
+export interface ThreeWayTestDistribution {
+  count: number;
+  share_profitable: number;
+  median_target_metric: number;
+  target_metric: string;
+  spearman_validation_to_test: number;
+  ranked_by_test: Array<Record<string, unknown>>;
+  note: string;
+}
+
+export interface ThreeWayOverfittingCheck {
+  value: number | null;
+  threshold: number;
+  passed: boolean;
+  computable: boolean;
+}
+
+export interface ThreeWayOverfitting {
+  passed: boolean;
+  checks: {
+    degradation: ThreeWayOverfittingCheck;
+    deflated_sharpe: ThreeWayOverfittingCheck;
+  };
+  thresholds: {
+    max_train_validation_degradation: number;
+    min_deflated_sharpe: number;
+  };
+  reasons: string[];
+  degradation: number | null;
+  deflated_sharpe: number | null;
+  metric: string;
+  train_metric_value: number;
+  validation_metric_value: number;
+  n_selectable_trials: number;
+  var_sharpe_per_obs: number;
+  note: string;
+}
+
+export interface ThreeWayPayload {
+  segments: ThreeWaySplitSegments;
+  winner: ThreeWayWinnerMetrics;
+  selection: ThreeWaySelection;
+  test_distribution: ThreeWayTestDistribution;
+  overfitting: ThreeWayOverfitting;
+}
+
 export interface OptimizationTrial {
   number: number;
   state: string;
@@ -330,6 +414,7 @@ export type OptimizationStatValue = number | string | boolean | null;
 export type OptimizationStatMap = Record<string, OptimizationStatValue>;
 export type OptimizationOosStatus =
   | "available"
+  | "insufficient_oos_bars"
   | "insufficient_overlap"
   | "no_oos_requested"
   | "unavailable";
@@ -364,6 +449,14 @@ export interface OptimizationSummary {
   train_stats: OptimizationStatMap;
   test_stats: OptimizationStatMap;
   oos_status?: OptimizationOosStatus | null;
+  // Three-way split keys (issue #164)
+  validation_split_pct?: number;
+  test_split_pct?: number;
+  validation_period?: OptimizationPeriod;
+  validation_stats?: OptimizationStatMap;
+  final_test_period?: OptimizationPeriod;
+  final_test_stats?: OptimizationStatMap;
+  three_way?: ThreeWayPayload;
 }
 
 export interface OptimizationDetail {
@@ -400,22 +493,33 @@ export interface OptimizationDetail {
   test_stats: OptimizationStatMap;
   oos_status?: OptimizationOosStatus | null;
   top_trials: OptimizationTrial[];
+  // Three-way split keys (issue #164)
+  validation_split_pct?: number;
+  test_split_pct?: number;
+  validation_period?: OptimizationPeriod;
+  validation_stats?: OptimizationStatMap;
+  final_test_period?: OptimizationPeriod;
+  final_test_stats?: OptimizationStatMap;
+  three_way?: ThreeWayPayload;
 }
 
 export interface BacktestStats {
-  net_profit: number;
-  net_profit_pct: number;
+  // null when the producer could not measure the figure (named in the stats'
+  // undefined_metrics); the card renders an em dash instead of a measured 0.
+  net_profit: number | null;
+  net_profit_pct: number | null;
   // null when the return series was too short to compute the metric; the card
   // renders an em dash instead of grading it.
   cagr: number | null;
   sharpe: number | null;
   sortino: number | null;
-  max_drawdown_pct: number;
+  max_drawdown_pct: number | null;
   max_drawdown_duration: string;
   win_rate: number;
   profit_factor: number;
   total_trades: number;
-  avg_trade_pnl: number;
+  avg_trade_pnl: number | null;
+  total_return: number | null;
   avg_win: number;
   avg_loss: number;
   best_trade: number;
@@ -842,12 +946,12 @@ export interface BacktestMetadataItem {
   strategy_name: string;
   symbols: string[];
   timeframe: string;
-  total_return: number;
+  total_return: number | null;
   sharpe_ratio: number | null;
   psr: number | null;
   p_value: number | null;
   cagr: number | null;
-  max_drawdown: number;
+  max_drawdown: number | null;
   trade_count: number;
   win_rate: number | null;
   start_date: string;
@@ -1065,7 +1169,7 @@ export interface MaintenanceDeleteItem {
   error?: string;
   journal_pending?: boolean;
   /** Set on `skipped` items of a two-phase bulk delete: why the confirmed id
-   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `not_found`). */
+   * was not deleted (e.g. `no_longer_empty`, `now_kept_entry`, `no_longer_duplicate`, `not_found`, `recheck_failed`). */
   reason?: string;
 }
 

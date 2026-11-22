@@ -147,3 +147,32 @@ test("sortableMetric treats an unmeasured win rate as unmeasured, not as -1", as
   assert.equal(sortableMetric(item({ p_value: null }), "p_value"), null);
   assert.equal(sortableMetric(item({ sharpe_ratio: null }), "sharpe_ratio"), null);
 });
+
+test("a row with unmeasured return and drawdown is never ranked as a measured 0", async () => {
+  const { listMetricsFor, sortableMetric, compareMeasuredLast } = await import(
+    "../src/lib/backtestListMetrics.ts"
+  );
+
+  const ruined = item({ id: "ruined", total_return: null, max_drawdown: null });
+  const measuredLoss = item({ id: "loss", total_return: -0.05, max_drawdown: 0.3 });
+
+  const metrics = listMetricsFor(ruined);
+  assert.equal(metrics.totalReturn, null);
+  assert.equal(metrics.maxDrawdown, null);
+
+  // Sorting total return ascending: the ruined run must not come before a loss.
+  const returnAsc = compareMeasuredLast(
+    sortableMetric(ruined, "total_return"),
+    sortableMetric(measuredLoss, "total_return"),
+    1,
+  );
+  assert.ok(returnAsc > 0, "unmeasured return must sort after a measured loss");
+
+  // Sorting max drawdown ascending (best first): the ruined run must not be best.
+  const drawdownAsc = compareMeasuredLast(
+    sortableMetric(ruined, "max_drawdown"),
+    sortableMetric(measuredLoss, "max_drawdown"),
+    1,
+  );
+  assert.ok(drawdownAsc > 0, "unmeasured drawdown must sort after a measured one");
+});

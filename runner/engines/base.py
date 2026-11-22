@@ -68,6 +68,39 @@ VALID_RESOLUTIONS = (
 
 ProgressCallback = Callable[[float, str], None]
 
+#: Engines frozen by the engine-consolidation decision (#318,
+#: ``docs/adr/0001-native-single-strategy-engine.md``): bug fixes only, no new
+#: features, while phase M ports the still-needed behaviour into ``native``.
+#: ``lean`` covers the LEAN *run* path only — ``LeanAdapter.import_result``
+#: and the QC/LEAN importers stay supported as oracles.
+FROZEN_ENGINES: dict[str, str] = {
+    "vectorbt": (
+        "scheduled for removal in phase L once native covers its remaining "
+        "features; 'native' is the strategic engine going forward"
+    ),
+    "pynecore": "scheduled for deletion in phase L of the #318 consolidation",
+    "lean": (
+        "the LEAN run path is frozen; LEAN becomes import-only "
+        "(LeanAdapter.import_result stays supported)"
+    ),
+}
+
+
+def warn_if_engine_frozen(name: str, *, stacklevel: int = 2) -> None:
+    """Emit a ``DeprecationWarning`` when ``name`` selects a frozen engine.
+
+    No-op for ``native`` and for names outside :data:`FROZEN_ENGINES`.
+    """
+    reason = FROZEN_ENGINES.get(str(name or "").strip().lower())
+    if reason is None:
+        return
+    warnings.warn(
+        f"Backtest engine {name!r} is frozen: {reason}. Bug fixes only, no "
+        "new features (issue #318; docs/adr/0001-native-single-strategy-engine.md).",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+
 
 class BacktestConfig(BaseModel):
     """Configuration passed to any engine adapter."""
