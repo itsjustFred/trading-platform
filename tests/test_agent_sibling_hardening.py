@@ -166,13 +166,13 @@ def test_the_two_selections_stay_identical() -> None:
     line after the per-copy name substitutions, so the next divergence fails here instead of
     grading a PR under rules it may have weakened."""
     selections = []
-    for name, pair in zip(SIBLINGS, SUBSTITUTIONS):
+    for name, pair in zip(SIBLINGS, SUBSTITUTIONS, strict=False):
         _, job = _agent_job(_load(name))
         _, lines = _selection(job)
         for old, new in pair:
             lines = [line.replace(old, new) for line in lines]
         selections.append(lines)
-    for name, lines in zip(SIBLINGS, selections):
+    for name, lines in zip(SIBLINGS, selections, strict=False):
         assert lines, f"{name}: parsed no selection lines"
     assert selections[1] == selections[0], (
         f"{SIBLINGS[1]}: skill selection diverged:\n" + "\n".join(selections[1])

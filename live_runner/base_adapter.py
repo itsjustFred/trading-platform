@@ -129,7 +129,7 @@ def money_digits_from_trader(trader: Any) -> int:
             pass
 
     try:
-        digits = int(raw)
+        digits = int(raw)  # type: ignore[call-overload]  # raw is validated by the surrounding try/except
     except (TypeError, ValueError, OverflowError):
         return _money_digits_fallback("moneyDigits is not an integer", raw)
     if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
@@ -349,7 +349,7 @@ class ControlOutcome:
         )
 
 
-def coerce_positive_live_qty(value: object, *, field_name: str = "qty") -> float:
+def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be numeric")
     try:
@@ -409,6 +409,20 @@ class BaseLiveAdapter(ABC):
     @abstractmethod
     async def get_balance(self) -> tuple[float, float]:
         """Return current account (balance, equity)."""
+
+    async def get_equity(self) -> float:
+        """Account equity including unrealized P&L, for the loss breaker (#301).
+
+        Defaults to ``get_balance()[1]``: adapters whose balance tuple already
+        carries true equity (Alpaca's ``account.equity``) need no override.
+        Adapters whose ``get_balance`` equity slot is really balance (cTrader,
+        per the #267 decision that sizing stays on realized balance) override
+        this so ONLY the breaker sees equity-with-unrealized-P&L. Sizing must
+        keep reading ``get_balance`` - this method exists so the breaker never
+        changes what sizing sees.
+        """
+        _, equity = await self.get_balance()
+        return float(equity)
 
     async def get_quote(self, symbol: str) -> LiveQuote:
         """Return the current broker bid/ask for ``symbol``.

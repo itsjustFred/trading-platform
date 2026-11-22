@@ -16,5 +16,5 @@ class BaseSignalSource(ABC):
         """Close source connections/resources."""
 
     @abstractmethod
-    async def listen_signals(self) -> AsyncIterator[TradeSignal]:
+    def listen_signals(self) -> AsyncIterator[TradeSignal]:
         """Yield parsed trade signals from this source."""

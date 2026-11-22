@@ -10,6 +10,7 @@ import yaml
 from live_runner.base_adapter import UNBOUNDED_TP_POLICY
 from risk.models import TradeSignal
 from shared.constants import normalize_timeframe
+from shared.indicators import presets
 
 _TIMEFRAME_ALIASES: dict[str, str] = {
     "1min": "1m",
@@ -42,6 +43,8 @@ class RocketFuelSignalProcessor:
         self.config = loaded
 
         self.atr_period = int(self.config.get("atr_period", 14))
+        if self.atr_period <= 0:
+            raise ValueError("rocketfuel config 'atr_period' must be a positive integer")
         self.sl_multiplier = float(self.config.get("sl_multiplier", 3.0))
         self.default_timeframe = (
             _resolve_timeframe(self.config.get("candle_timeframe", "5m")) or "5m"
@@ -83,13 +86,12 @@ class RocketFuelSignalProcessor:
 
     @staticmethod
     def _calculate_atr(df: pd.DataFrame, period: int) -> pd.DataFrame:
+        # EMA-span "ATR" parity preset (issue #317), same variant as RamJet.
         frame = df.copy()
-        frame["h_l"] = frame["high"] - frame["low"]
-        frame["h_pc"] = (frame["high"] - frame["close"].shift(1)).abs()
-        frame["l_pc"] = (frame["low"] - frame["close"].shift(1)).abs()
-        frame["tr"] = frame[["h_l", "h_pc", "l_pc"]].max(axis=1)
-        frame["atr"] = frame["tr"].ewm(span=period, adjust=False).mean()
-        return frame.drop(columns=["h_l", "h_pc", "l_pc", "tr"])
+        frame["atr"] = presets.atr_ema_span(
+            frame["high"], frame["low"], frame["close"], period
+        )
+        return frame
 
     @staticmethod
     def _normalize_action(raw_action: Any) -> str:

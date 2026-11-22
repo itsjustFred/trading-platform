@@ -225,7 +225,7 @@ class TestNoTradeTrialsCannotWin:
             n_trials=2,
             parameter_ranges={"fast_length": {"type": "int", "min": 2, "max": 10}},
         )
-        with pytest.raises(RuntimeError, match="no-trade|no trades|no completed"):
+        with pytest.raises(RuntimeError, match=r"no-trade|no trades|no completed"):
             run_optimization(config, progress_callback=None)
 
         # Whatever the value is, it must carry the explicit no-trade penalty marker.
@@ -483,6 +483,26 @@ class TestMetricDirection:
         values = [trial["value"] for trial in payload]
         assert values == sorted(values)
         assert values[0] == pytest.approx(0.01)
+
+    def test_top_trials_is_capped_at_the_limit(self):
+        """The payload carries at most `limit` trials, the best of the study.
+
+        The cap is `[:limit]`, not `[:limit + 1]`: an over-long payload published
+        one trial more than the configured limit.
+        """
+        import optuna
+
+        study = optuna.create_study(direction="minimize")
+        for value in (0.5, 0.42, 0.01, 0.9, 0.13, 0.77, 0.05, 0.66, 0.31, 0.24, 0.88, 0.19):
+            trial = study.ask()
+            trial.suggest_float("x", 0.0, 1.0)
+            study.tell(trial, value)
+        payload = optimizer_module._top_trials_payload(study.trials, limit=10, direction="minimize")
+
+        assert len(payload) == 10
+        assert [trial["value"] for trial in payload] == sorted(
+            [0.5, 0.42, 0.01, 0.9, 0.13, 0.77, 0.05, 0.66, 0.31, 0.24, 0.88, 0.19]
+        )[:10]
 
 
 class TestRiskAdjustedObjectiveWiring:
@@ -828,7 +848,7 @@ def test_three_way_split_rejects_non_positive_fractions():
 
 def test_three_way_split_rejects_sum_not_one():
     """Fractions must sum to 1.0 within 1e-9 tolerance."""
-    with pytest.raises(ValueError, match="must sum to 1.0"):
+    with pytest.raises(ValueError, match=r"must sum to 1\.0"):
         OptimizationConfig(
             base_backtest_id="bt_x",
             target_metric="sharpe_ratio",
@@ -838,7 +858,7 @@ def test_three_way_split_rejects_sum_not_one():
             test_split_pct=0.3,  # Sum = 1.1
             parameter_ranges={"x": {"type": "float", "min": 0.0, "max": 1.0}},
         )
-    with pytest.raises(ValueError, match="must sum to 1.0"):
+    with pytest.raises(ValueError, match=r"must sum to 1\.0"):
         OptimizationConfig(
             base_backtest_id="bt_x",
             target_metric="sharpe_ratio",

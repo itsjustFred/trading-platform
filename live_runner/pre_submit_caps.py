@@ -59,7 +59,7 @@ import asyncio
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Mapping, NoReturn
+from typing import TYPE_CHECKING, Any, Mapping, NoReturn, overload
 
 from live_runner.base_adapter import (
     BaseLiveAdapter,
@@ -129,7 +129,7 @@ class PreSubmitCapSettings:
     max_risk_multiple: float
 
 
-def _cap_number(raw: object, *, key: str) -> float:
+def _cap_number(raw: Any, *, key: str) -> float:
     if raw is None or isinstance(raw, bool):
         raise ValueError(f"{key} must be a number, got {raw!r}")
     try:
@@ -166,7 +166,10 @@ def _parse_cap_overrides(
         unknown = sorted(
             key
             for key in raw
-            if str(key).startswith("pre_submit") and key not in _CAP_KEYS + (_SYMBOL_CAPS_KEY,)
+            if (
+                str(key).startswith("pre_submit")
+                and key not in (*_CAP_KEYS, _SYMBOL_CAPS_KEY)
+            )
         )
         if unknown:
             raise ValueError(f"{context} has unknown cap keys: {unknown}")
@@ -251,6 +254,10 @@ def pre_submit_cap_settings(
                 )
                 break
 
+    @overload
+    def _resolve(key: str, default: float) -> float: ...
+    @overload
+    def _resolve(key: str, default: float | None) -> float | None: ...
     def _resolve(key: str, default: float | None) -> float | None:
         value = overrides.get(key, base.get(key))
         if value is None:

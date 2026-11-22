@@ -373,17 +373,17 @@ def _extract_risk_deltas(risk_delta_report: Any) -> list[StatDelta]:
     if hasattr(risk_delta_report, "trade_results"):
         for result in risk_delta_report.trade_results:
             field_results = getattr(result, "field_results", {}) or {}
-            for fcr in field_results.values():
-                risk_deltas.append(
-                    StatDelta(
-                        field=f"risk_{fcr.field}",
-                        expected=fcr.expected,
-                        actual=fcr.actual,
-                        passed=fcr.passed,
-                        explanation=fcr.message,
-                        severity="warning" if not fcr.passed else "info",
-                    )
+            risk_deltas.extend(
+                StatDelta(
+                    field=f"risk_{fcr.field}",
+                    expected=fcr.expected,
+                    actual=fcr.actual,
+                    passed=fcr.passed,
+                    explanation=fcr.message,
+                    severity="warning" if not fcr.passed else "info",
                 )
+                for fcr in field_results.values()
+            )
             if not field_results and not result.passed:
                 risk_deltas.append(
                     StatDelta(
@@ -817,8 +817,7 @@ def generate_markdown_report(
     explanations = data.get("explanations", [])
     if explanations:
         lines.append("## Explanations")
-        for exp in explanations:
-            lines.append(f"- {exp}")
+        lines.extend(f"- {exp}" for exp in explanations)
         lines.append("")
 
     # ── Trade Deltas ─────────────────────────────────────────────────────
@@ -859,8 +858,7 @@ def generate_markdown_report(
 
         for atype in sorted(grouped.keys()):
             lines.append(f"### {atype.replace('_', ' ').title()}")
-            for anom in grouped[atype]:
-                lines.append(f"- {anom.get('explanation', '')}")
+            lines.extend(f"- {anom.get("explanation", "")}" for anom in grouped[atype])
             lines.append("")
         lines.append("")
 
