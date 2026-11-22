@@ -252,8 +252,51 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   nicht im Ledger landen. **Restrisiko:** Auf einem genetteten Account senkt eine
   Broker-seitige Schließung für ein anderes Deployment die Broker-Position; die
   Deckelung schließt dann einen Teil von dessen Anteil mit. Der Alert nennt das,
-  das Ledger muss danach abgeglichen werden. Fills von Bracket-Legs gegen das
-  Parent-Signal zu buchen ist die eigentliche Lösung und ein eigenes Issue.
+  das Ledger muss danach abgeglichen werden.
+- **Broker-seitige Schließungen im Ledger (#144):** Ein Alpaca-Bracket-Leg
+  (Stop- oder Target-Leg) schließt die Position des Parent-Signals, ohne dass
+  diese Plattform je eine Order dafür abgeschickt hat. Seit #144 wird so ein Fill
+  **gegen das Ledger des Parent-Deployments gebucht**:
+  `record_live_broker_side_close_fill` legt ein Signal derselben Deployment mit
+  der *reduzierenden* Seite an (Sell für ein Buy-Entry; `source=broker_close`,
+  deterministische Id aus der Parent-Signal-Id, Metadaten `broker_side_close`,
+  `broker_close_reason`, `parent_signal_id`) und bucht den Fill im selben
+  gesperrten Insert-Pfad wie jeden anderen Fill, mit dem Broker-eigenen
+  Dedupe-Key (Leg-Order-Id + kumulierte Leg-Menge). Das Ledger des Deployments
+  sinkt damit um genau das, was der Broker geschlossen hat, und
+  `get_account_net_filled_qty_by_deployment` stimmt wieder mit der
+  Broker-Position überein - kein `exit_ledger_mismatch`-Alert mehr und der Exit
+  sized gegen den eigenen Anteil statt gegen die Deckelung.
+  Die Zuordnung Leg-Order-Id → Parent-Signal wird beim Submit und in jedem
+  Reconciliation-Pass aus den verschachtelten Legs der Parent-Order gelernt (der
+  Pass läuft beim Connect, bevor der Trading-Stream Events verarbeitet); ein
+  Fill, dessen Order-Id keine bekannte Leg ist, bleibt unverändert auf dem
+  bisherigen Pfad. Eine Leg auf der *aufbauenden* Seite, ein unbekanntes
+  Parent-Signal, ein Fill ohne Zeitstempel oder ohne nutzbare Menge wird
+  abgelehnt (geloggt, nichts geschrieben) - nie erfunden.
+  **cTrader (#144):** Eine broker-seitige Positionsschließung (SL/TP, Flatten,
+  manuell - cTrader unterscheidet die nicht) wird über die Kette **Deal →
+  `positionId` → `OrderListByPositionId` → `clientOrderId`/Order-Id des
+  eröffnenden Orders → Signal** derselben Parent-Deployment zugeordnet und über
+  denselben `record_live_broker_side_close_fill`-Pfad gebucht
+  (`broker_close_reason=ctrader_position_close`, Dedupe-Key
+  `ctrader:deal:{dealId}` - derselbe Schlüssel, den der normale Fill-Pfad für
+  dasselbe Deal ableitet, damit ein Deal, der beide Pfade erreicht, nur einmal
+  gebucht wird, gedeckelt am kumulierten Volumen des
+  schließenden Orders). Die Zuordnung zählt nur, wenn **genau ein** Signal der
+  Position zugeordnet ist: null (manuelle Position, nie eingereichte Orders)
+  oder mehrere (genettetes Buch mehrerer Deployments) werden **nicht geraten**,
+  sondern das Account+Symbol wird als `ledger_reconciliation_required` im
+  Control-Audit geflaggt und ein `ERROR`-Alert (`alert=
+  ledger_reconciliation_required`) ausgelöst - die periodische
+  Broker-Reconciliation (#330) bzw. der nächste Exit-Mismatch-Alert handelt
+  danach. Derselbe Flag wird bei `exit_ledger_mismatch` geschrieben. Der
+  Reconciliation-Pass (`reconcile_executions`) holt zusätzlich die
+  Account-Deal-Liste der letzten 7 Tage nach, um vom Stream verpasste
+  Schließungen nachzubuchen; Deals eigener Orders werden übersprungen. Ein
+  Manuell-/Flatten-Close einer Position, die genau ein Signal eröffnete, ist
+  damit **exakt** zugeordnet (kein Raten); was die Kette nicht eindeutig
+  auflösen kann, bleibt geflaggt.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.

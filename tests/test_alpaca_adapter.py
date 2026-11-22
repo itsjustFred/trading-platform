@@ -1173,6 +1173,62 @@ def test_full_exit_on_bracketed_position_cancels_legs_and_closes(
     ]
 
 
+def test_full_exit_over_a_stop_limit_protection_is_not_refused(
+    monkeypatch,
+) -> None:
+    """A stop-limit leg's limit price belongs to the plan's signature too.
+
+    The flat-remainder branch used to leave ``stop_limit_price`` unset while
+    the in-lock signature always derived it from the candidates, so every
+    full exit over a stop-limit protection was refused as "the working
+    protection changed" before any cancel.
+    """
+    stop_leg = _FakeOrder(
+        id="sl-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="stop_limit",
+        qty=10.0,
+        stop_price=190.0,
+        limit_price=189.0,
+        status="held",
+    )
+    parent = _FakeOrder(
+        id="parent-1",
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=10.0,
+        status="filled",
+        legs=[stop_leg],
+    )
+    take_profit = _FakeOrder(
+        id="tp-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        qty=10.0,
+        limit_price=210.0,
+        status="new",
+    )
+    client = _FakeTradingClient(
+        orders=[parent, take_profit],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+
+    broker_order_id = asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert broker_order_id
+    assert client.positions == []
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+
+
 def test_partial_exit_reprotects_remainder_at_original_levels(
     monkeypatch,
 ) -> None:

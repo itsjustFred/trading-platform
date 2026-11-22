@@ -97,6 +97,7 @@ from shared.database import (
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
     create_service,
+    flag_live_ledger_reconciliation,
     get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
@@ -1554,7 +1555,7 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
-def _alert_ledger_mismatch(
+async def _alert_ledger_mismatch(
     deployment: LiveDeploymentConfig,
     symbol: str,
     exc: LedgerMismatchError,
@@ -1568,7 +1569,25 @@ def _alert_ledger_mismatch(
     The residual risk is stated in the alert: on a netted account, a broker-side
     close made for another deployment lowers the broker position, and the cap
     then closes part of that deployment's share.
+
+    A mismatch means a close the ledgers never saw happened - a flatten or a
+    manual close no adapter could attribute (#144 decision). The ERROR alert is
+    the surface; the durable ``ledger_reconciliation_required`` audit flag is
+    what an operator and the periodic broker reconciliation (#330) act on.
     """
+    await asyncio.to_thread(
+        flag_live_ledger_reconciliation,
+        account_id=deployment.account_id,
+        symbol=symbol,
+        cause="exit_ledger_mismatch",
+        detail={
+            "deployment_id": str(deployment.id),
+            "own_ledger_qty": float(own_qty),
+            "exit_qty_before_step": float(exit_qty),
+            "reason": str(exc),
+            **exc.log_data(),
+        },
+    )
     logger.error(
         "ALERT: deployment ledgers do not match the broker position; submitting "
         "the exit capped at the broker position. If another deployment's "
@@ -1694,7 +1713,7 @@ async def prepare_exit_intent_order(
             tolerance=tolerance,
         )
     except LedgerMismatchError as exc:
-        _alert_ledger_mismatch(
+        await _alert_ledger_mismatch(
             deployment, signal.symbol, exc, own_qty=ledger_qty, exit_qty=target_qty
         )
     else:
@@ -1702,7 +1721,7 @@ async def prepare_exit_intent_order(
             # Offsetting ledgers of other deployments hide the overhang from
             # the total, or other working exits leave less than this
             # deployment's share; either way the own quantity exceeds the cap.
-            _alert_ledger_mismatch(
+            await _alert_ledger_mismatch(
                 deployment,
                 signal.symbol,
                 LedgerMismatchError(

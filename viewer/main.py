@@ -91,6 +91,7 @@ from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
 from shared.database import (
+    BROKER_CLOSE_SIGNAL_SOURCE,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
@@ -12723,6 +12724,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
 
     trades: list[dict[str, Any]] = []
     for row in rows:
+        # #144: a broker-side close is a ledger row for a fill the broker made, not a
+        # trade of ours: it has no theoretical price, so any P&L or slippage computed
+        # from it would be fabricated (a stop at 95 would read as a -950 loss on 10
+        # shares). The realized-PnL stats path prices it from actual prices instead.
+        if str(row.get("source") or "") == BROKER_CLOSE_SIGNAL_SOURCE:
+            continue
         signal_metadata = row.get("signal_metadata")
         metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
@@ -12783,7 +12790,16 @@ async def _live_signals_payload(account_id: str, *, limit: int = 200) -> dict[st
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
         execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
         raw_source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
-        source = "discord" if raw_source.startswith("discord") else "internal"
+        if raw_source.startswith("discord"):
+            source = "discord"
+        elif raw_source == "broker_close":
+            # A close the broker made (#144): not an entry of ours, so it gets
+            # its own label rather than reading as an internal signal. Its
+            # theoretical_price is 0.0 by construction - the marker price is the
+            # fill's actual_price, which the row already carries.
+            source = "broker_close"
+        else:
+            source = "internal"
         status = _signal_status_from_row(row)
         waiting_seconds = (
             _waiting_countdown(signal_metadata, signal_unix)

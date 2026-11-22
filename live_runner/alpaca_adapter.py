@@ -40,16 +40,24 @@ from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
 from live_runner.symbol_class import canonical_crypto_symbol, classify_symbol
 from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
+    BROKER_CLOSE_REASON_ALPACA_LEG,
+    BROKER_CLOSE_REASON_ALPACA_STOP_LEG,
+    BROKER_CLOSE_REASON_ALPACA_TARGET_LEG,
     apply_live_execution_commissions,
+    broker_close_signal_id,
     clear_live_signal_metadata_key,
     find_latest_filled_live_entry_signals,
+    flag_live_ledger_reconciliation,
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
+    get_live_signal_filled_qty_for_broker_order,
+    get_live_signal_metadata,
     get_live_signal_reconciliation_cursor,
     list_live_executions_for_broker_orders,
     list_live_executions_missing_commission,
     list_live_signal_ids_for_reconciliation,
     list_pending_exit_reprotections,
+    record_live_broker_side_close_fill,
     save_live_execution,
     save_live_execution_up_to_cumulative,
     save_live_signal,
@@ -325,6 +333,64 @@ def _is_definite_broker_rejection(exc: BaseException) -> bool:
     except ImportError:
         return False
     return isinstance(exc, APIError)
+
+
+def _bracket_leg_key(value: Any) -> str | None:
+    """A bracket leg's order id as a map key, with or without a UUID shape.
+
+    Alpaca order ids are UUIDs and `_normalize_broker_order_id` proves that. The looser text
+    form keeps the registration side (submit response, nested reconcile legs, a trailed
+    stop's replacement id) from silently dropping the mapping for a broker - or a fake
+    client - that answers with another id shape. The stream path still requires the strict
+    UUID form before it consults the map, so a non-UUID leg id is learned but its fill is
+    refused as unattributable rather than recorded - the one direction that cannot lose
+    money.
+    """
+    normalized = _normalize_broker_order_id(value)
+    if normalized is not None:
+        return normalized
+    text_value = str(value or "").strip()
+    if not text_value or text_value.lower() in {"none", "null", "false"}:
+        return None
+    return text_value
+
+
+#: Event label a bracket leg's fill is keyed by. One label for BOTH paths that record a leg fill
+#: (the trade-update stream and the reconciliation backfill): the dedupe key must be derivable
+#: identically from either, or the same leg fill could be stored twice.
+_LEG_FILL_EVENT_LABEL = "leg"
+
+
+#: Marker the re-placed exit protection's ``client_order_id`` carries (#350):
+#: ``{entry_signal_id}-reprotect-{exit_signal_id}`` and its shorter forms.
+#: Never a signal UUID, so a fill naming it is attributed through the embedded
+#: entry id - verified against the signal row, never trusted blindly.
+_REPROTECT_CLIENT_ORDER_MARKER = "-reprotect"
+
+
+def _reprotect_entry_candidate(client_order_id: str) -> str | None:
+    """The UUID a ``-reprotect`` client order id leads with, or ``None``.
+
+    ``{entry}-reprotect-{exit}``, ``{entry}-reprotect`` and ``{exit}-reprotect``
+    all lead with a UUID; whether it names the *entry* is for the caller to
+    verify - the bare form is ambiguous by construction.
+    """
+    candidate = client_order_id.split(_REPROTECT_CLIENT_ORDER_MARKER, 1)[0].strip()
+    try:
+        UUID(candidate)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return candidate
+
+
+def _bracket_leg_close_reason(leg: Any) -> str:
+    """Which kind of bracket leg this is, for the close signal's audit metadata."""
+    order_type = _order_type(leg)
+    if "stop" in order_type:
+        return BROKER_CLOSE_REASON_ALPACA_STOP_LEG
+    if order_type == "limit":
+        return BROKER_CLOSE_REASON_ALPACA_TARGET_LEG
+    return BROKER_CLOSE_REASON_ALPACA_LEG
 
 
 def _stop_candidates(order: Any) -> Iterator[Any]:
@@ -900,6 +966,23 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # #167: serialises stop amendments with the sweeps that cancel orders
         # (see `_order_book_lock`). Bound to the loop that first uses it.
         self._order_book_lock_state: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+        # #144: bracket leg order id -> the id of the signal whose position the leg closes.
+        # A leg is a broker-side child order: Alpaca gives it its own order id, so a fill of it
+        # names no signal of ours and would otherwise be dropped (`client_order_id` is not a
+        # signal), leaving the broker position smaller than every ledger on the account and
+        # #142's guard alerting on every later exit for that symbol.
+        # Learned from the parent order's nested legs whenever one is seen: at submit, on
+        # every reconciliation pass - which is the adapter's only one and runs on connect,
+        # before the trading stream consumes events, so a restart re-learns the mapping -
+        # and at once in `amend_protective_stop`, because a trailed stop's replacement is
+        # a NEW leg order id that would otherwise stay unattributable until the next pass.
+        # #350: the same map also carries the re-placed exit protection of a partial
+        # exit - its OCO legs, or the lone stop/take-profit order id itself - keyed to
+        # the ENTRY signal id embedded in its ``-reprotect`` client order id.
+        self._bracket_leg_order_id_to_signal_id: dict[str, str] = {}
+        # Broker order ids of re-protect fills already flagged
+        # ``ledger_reconciliation_required`` this process (dedupe, like cTrader's).
+        self._flagged_reprotect_order_ids: set[str] = set()
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -972,14 +1055,339 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             before=before,
         )
 
-    async def _reconcile_signal_fill(self, signal_id: str) -> bool:
-        try:
-            order = await asyncio.to_thread(
-                self._trading_client.get_order_by_client_id, signal_id
+    def _register_bracket_legs(self, parent_signal_id: str, order: Any) -> int:
+        """Learn which bracket leg order ids belong to this parent signal (#144).
+
+        The broker reports a parent order's legs nested in it, and a leg carries only its own
+        order id: nothing else connects a leg's fill to the signal whose position it closes.
+        Returns how many leg ids were learned.
+        """
+        registered = 0
+        for leg in _order_legs(order):
+            leg_key = _bracket_leg_key(_order_attr(leg, "id"))
+            if leg_key is None:
+                continue
+            self._bracket_leg_order_id_to_signal_id[leg_key] = str(parent_signal_id)
+            registered += 1
+        return registered
+
+    async def _fetch_parent_order_with_legs(self, signal_id: str) -> Any:
+        """Fetch the parent order for a signal, with its bracket legs nested in it.
+
+        ``get_order_by_client_id`` takes no ``nested`` argument in alpaca-py 0.44.0, and the
+        runbook records that a bracket's legs are only reported back nested in the parent
+        (``docs/live-deploy-runbook.md``): fetching by client id alone therefore returns no
+        legs, and the leg-order-id -> signal map this adapter depends on would never be
+        re-learned after a restart - the #144 defect itself, since the stream drops a leg
+        fill whose client order id names no signal. The persisted broker order id is used
+        with ``GetOrderByIdRequest(nested=True)`` first; only a signal submitted before that
+        id was persisted falls back to the client-id fetch, and an alpaca-py without the
+        nested filter degrades to the flat ``get_order_by_id``.
+        """
+        stored_order_id = await asyncio.to_thread(get_live_signal_broker_order_id, signal_id)
+        if stored_order_id:
+            try:
+                from alpaca.trading.requests import GetOrderByIdRequest
+            except ImportError:
+                # An alpaca-py without the nested filter request: the flat fetch below
+                # still carries the parent's own fill. `ImportError`, not
+                # `ModuleNotFoundError`: a missing NAME inside an importable
+                # module raises the former, and the fallback must still fire.
+                GetOrderByIdRequest = None  # type: ignore[assignment]
+            if GetOrderByIdRequest is not None:
+                try:
+                    return await asyncio.to_thread(
+                        self._trading_client.get_order_by_id,
+                        stored_order_id,
+                        GetOrderByIdRequest(nested=True),
+                    )
+                except TypeError:
+                    # An alpaca-py whose get_order_by_id takes no filter: ask for the
+                    # flat order instead.
+                    pass
+            return await asyncio.to_thread(
+                self._trading_client.get_order_by_id, stored_order_id
             )
+        return await asyncio.to_thread(
+            self._trading_client.get_order_by_client_id, signal_id
+        )
+
+    def _parent_signal_id_for_broker_order(self, broker_order_id: str | None) -> str | None:
+        """The signal whose bracket leg this broker order id names, or ``None``."""
+        if not broker_order_id:
+            return None
+        return self._bracket_leg_order_id_to_signal_id.get(str(broker_order_id))
+
+    async def _verified_reprotect_entry(self, candidate: str | None) -> str | None:
+        """The entry signal a ``-reprotect`` client order id attributes to.
+
+        The leading UUID is trusted only when the signal row exists and is not
+        itself exit-only or a broker-close bookkeeping row: the bare
+        ``{exit}-reprotect`` form leads with the *exit* signal's id, and
+        booking a close against it would sign the fill by the wrong action.
+        Anything unverifiable attributes to nobody - the caller flags it.
+        """
+        if not candidate:
+            return None
+        try:
+            UUID(candidate)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        try:
+            metadata = await asyncio.to_thread(get_live_signal_metadata, candidate)
+        except Exception as exc:
+            logger.debug(
+                "Alpaca re-protect entry lookup failed for %s: %r", candidate, exc
+            )
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        if metadata.get("exit_only") or metadata.get("broker_side_close"):
+            return None
+        if (
+            str(metadata.get("risk_sizing_mode") or "").strip().lower()
+            == EXIT_ONLY_RISK_SIZING_MODE
+        ):
+            return None
+        return candidate
+
+    def _flag_reprotect_fill_unattributed(
+        self, order: Any, client_order_id: Any, broker_order_id: str
+    ) -> None:
+        """Flag a re-protect fill that names no entry signal (#350 on #277).
+
+        Same surface as cTrader's unattributable closes: the durable
+        ``ledger_reconciliation_required`` audit row plus an ERROR alert; the
+        fill is never guessed into a ledger. Once per broker order id per
+        process - redeliveries and the reconcile scan see the same order again.
+        """
+        if broker_order_id in self._flagged_reprotect_order_ids:
+            return
+        self._flagged_reprotect_order_ids.add(broker_order_id)
+        symbol = _order_symbol(order)
+        flag_live_ledger_reconciliation(
+            account_id=self.account_id,
+            symbol=symbol,
+            cause="alpaca_reprotect_fill_unattributed",
+            detail={
+                "client_order_id": str(client_order_id or ""),
+                "broker_order_id": broker_order_id,
+                "order_type": _order_type(order),
+            },
+        )
+        logger.error(
+            "ALERT: Alpaca re-protection fill could not be attributed to an "
+            "entry signal; the account ledger needs reconciliation",
+            extra={
+                "data": {
+                    "alert": "ledger_reconciliation_required",
+                    "account_id": self.account_id,
+                    "symbol": symbol,
+                    "cause": "alpaca_reprotect_fill_unattributed",
+                    "client_order_id": str(client_order_id or ""),
+                    "broker_order_id": broker_order_id,
+                }
+            },
+        )
+
+    async def _handle_reprotect_trade_update(
+        self,
+        data: Any,
+        order: Any,
+        client_order_id: Any,
+        *,
+        broker_order_id: str,
+        event: str,
+    ) -> bool:
+        """Book or flag a fill of re-placed exit protection; ``True`` when handled.
+
+        Reached only when the leg map missed and ``client_order_id`` is not a
+        signal UUID - the ``-reprotect`` forms of #350. A verified entry id
+        books the fill against that signal's ledger and learns the order id
+        for the next event; anything else is flagged, never dropped.
+        """
+        coid_text = str(client_order_id or "")
+        if _REPROTECT_CLIENT_ORDER_MARKER not in coid_text:
+            return False
+        entry_signal_id = await self._verified_reprotect_entry(
+            _reprotect_entry_candidate(coid_text)
+        )
+        if entry_signal_id is None:
+            self._flag_reprotect_fill_unattributed(
+                order, client_order_id, broker_order_id
+            )
+            return True
+        self._bracket_leg_order_id_to_signal_id[broker_order_id] = entry_signal_id
+        await self._record_bracket_leg_fill(
+            entry_signal_id,
+            data,
+            order,
+            broker_order_id=broker_order_id,
+            event=event,
+        )
+        return True
+
+    async def _register_reprotect_attribution(
+        self,
+        client: Any,
+        plan: Mapping[str, Any],
+        order: Any,
+        *,
+        nested_lookup: bool,
+    ) -> None:
+        """Attribute a re-placed protection order's fills to the entry signal.
+
+        An OCO's legs are learned like a bracket's; a lone stop/take-profit has
+        no legs, so its own order id is the fill's identity. The OCO container
+        id is never mapped: a fill reported on it would double-count the leg
+        fill carrying the same quantity.
+        """
+        entry_signal_id = str(plan.get("entry_signal_id") or "").strip()
+        if not entry_signal_id:
+            return
+        if _order_legs(order):
+            self._register_bracket_legs(entry_signal_id, order)
+            return
+        if nested_lookup:
+            # An OCO submit response may not nest its legs; re-read the order
+            # with ``nested=True`` so the leg ids are learned now rather than
+            # at the next connect. The container id itself is never mapped: a
+            # fill reported on it would double-count the leg fill carrying the
+            # same quantity, and a leg fill whose id was not learned attributes
+            # through the ``-reprotect`` client order id instead.
+            broker_order_id = _normalize_broker_order_id(_order_attr(order, "id"))
+            if broker_order_id is None:
+                return
+            try:
+                from alpaca.trading.requests import GetOrderByIdRequest
+            except ImportError:
+                return
+            try:
+                fetched = await asyncio.to_thread(
+                    client.get_order_by_id,
+                    broker_order_id,
+                    GetOrderByIdRequest(nested=True),
+                )
+            except Exception:
+                return
+            if fetched is not None and _order_legs(fetched):
+                self._register_bracket_legs(entry_signal_id, fetched)
+            return
+        # A lone stop/take-profit has no legs: its own order id is the fill's
+        # identity.
+        leg_key = _bracket_leg_key(_order_attr(order, "id"))
+        if leg_key is not None:
+            self._bracket_leg_order_id_to_signal_id[leg_key] = entry_signal_id
+
+    async def _reconcile_bracket_leg_fill(self, parent_signal_id: str, leg: Any) -> bool:
+        """Backfill one bracket leg's missed fill against the parent signal's ledger (#144).
+
+        The leg's own broker cumulative is the authority. Only the slice still missing for that
+        leg order is persisted, so a leg the stream already saw in full - or in part - is not
+        counted twice, and a second pass adds nothing.
+        """
+        leg_order_id = _bracket_leg_key(_order_attr(leg, "id"))
+        if leg_order_id is None:
+            return False
+        if _order_status(leg) not in {"filled", "partially_filled"}:
+            return False
+        leg_cumulative_qty = _to_float(_order_attr(leg, "filled_qty", None), default=0.0)
+        if not math.isfinite(leg_cumulative_qty) or leg_cumulative_qty <= 0.0:
+            return False
+        close_signal_id = broker_close_signal_id(parent_signal_id)
+        recorded_qty = await asyncio.to_thread(
+            get_live_signal_filled_qty_for_broker_order, close_signal_id, leg_order_id
+        )
+        missing_qty = leg_cumulative_qty - recorded_qty
+        if missing_qty <= 0.0:
+            return False
+        fill_ts = _broker_fill_timestamp(
+            _order_attr(leg, "filled_at", None), _order_attr(leg, "updated_at", None)
+        )
+        if fill_ts is None:
+            logger.warning(
+                "Alpaca bracket leg has filled quantity but neither a usable filled_at nor "
+                "updated_at; not persisting the missed close with an invented time. reconciliation "
+                "runs only when the adapter connects, so the next adapter connect retries it",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "parent_signal_id": parent_signal_id,
+                        "leg_order_id": leg_order_id,
+                        "leg_filled_qty": leg_cumulative_qty,
+                        "leg_recorded_qty": recorded_qty,
+                    }
+                },
+            )
+            return False
+        actual_price, price_observed = _resolve_fill_price(
+            (None, None),
+            order_avg_price=_order_attr(leg, "filled_avg_price", None),
+            event_qty=missing_qty,
+            cumulative_qty=leg_cumulative_qty,
+        )
+        persisted_qty = await asyncio.to_thread(
+            record_live_broker_side_close_fill,
+            parent_signal_id=parent_signal_id,
+            close_reason=_bracket_leg_close_reason(leg),
+            filled_qty=missing_qty,
+            actual_price=actual_price,
+            actual_price_observed=price_observed,
+            commission=_known_commission(leg),
+            timestamp=fill_ts,
+            broker_order_id=leg_order_id,
+            # The leg's own cumulative and average let the insert cap the booking at
+            # what the leg has actually filled and derive the missing slice's price
+            # when this backfill covers only part of it.
+            cumulative_filled_qty=leg_cumulative_qty,
+            cumulative_avg_price=_positive_finite(
+                _order_attr(leg, "filled_avg_price", None)
+            ),
+            dedupe_key=_alpaca_fill_dedupe_key(
+                execution_id="",
+                broker_order_id=leg_order_id,
+                event=_LEG_FILL_EVENT_LABEL,
+                cumulative_filled_qty=leg_cumulative_qty,
+                raw_timestamp=None,
+                filled_qty=missing_qty,
+            )
+            or "",
+            close_side=_order_side(leg),
+        )
+        if persisted_qty <= 0.0:
+            return False
+        logger.info(
+            "Reconciled missed Alpaca bracket leg close fill",
+            extra={
+                "data": {
+                    "parent_signal_id": parent_signal_id,
+                    "close_signal_id": broker_close_signal_id(parent_signal_id),
+                    "leg_order_id": leg_order_id,
+                    "close_reason": _bracket_leg_close_reason(leg),
+                    "filled_qty": persisted_qty,
+                    "leg_cumulative_qty": leg_cumulative_qty,
+                    "leg_recorded_qty": recorded_qty,
+                }
+            },
+        )
+        return True
+
+    async def _reconcile_signal_fill(self, signal_id: str) -> int:
+        """Backfill this signal's missed fills; returns how many fills were recovered.
+
+        The order's own fill first, then - since #144 - the fills of the bracket legs that hang
+        off it: both are recovered from one fetch of the parent order.
+        """
+        try:
+            order = await self._fetch_parent_order_with_legs(signal_id)
         except Exception:
             # Unknown to this account or not found.
-            return False
+            return 0
+        recovered = 0
+        # #144: the parent order carries its nested legs, so a restart (or a rebuild after a
+        # reconnect) re-learns which leg orders close this signal's position - even for a parent
+        # whose own fill is already recorded, which returns below without fetching anything else.
+        self._register_bracket_legs(signal_id, order)
         broker_filled_qty = _to_float(
             getattr(order, "filled_qty", None), default=0.0
         )
@@ -993,92 +1401,112 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     }
                 },
             )
-            return False
+            return recovered
         local_filled_qty = await asyncio.to_thread(
             get_live_signal_filled_qty, signal_id
         )
         missing_filled_qty = broker_filled_qty - local_filled_qty
-        if missing_filled_qty <= 0:
-            return False
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
-        if broker_order_id is None:
-            return False
         # `filled_avg_price` is the broker's average over the order's WHOLE cumulative quantity.
         # Without it there is no price to record, and a fill at 0.0 is not a fill (#124): persist
         # nothing, and the next reconciliation pass retries.
-        cumulative_avg_price = _positive_finite(getattr(order, "filled_avg_price", None))
-        if cumulative_avg_price is None:
-            logger.warning(
-                "Alpaca order has filled quantity but no usable filled_avg_price; not persisting "
-                "the missed fill, the next reconciliation pass retries",
-                extra={
-                    "data": {
-                        "account_id": self.account_id,
-                        "signal_id": signal_id,
-                        "broker_order_id": broker_order_id,
-                        "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
-                        "missing_filled_qty": missing_filled_qty,
-                    }
-                },
+        cumulative_avg_price = (
+            _positive_finite(getattr(order, "filled_avg_price", None))
+            if missing_filled_qty > 0
+            else None
+        )
+        fill_ts = (
+            _broker_fill_timestamp(
+                getattr(order, "filled_at", None), getattr(order, "updated_at", None)
             )
-            return False
-        fill_ts = _broker_fill_timestamp(
-            getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+            if missing_filled_qty > 0
+            else None
         )
-        if fill_ts is None:
-            logger.warning(
-                "Alpaca order has filled quantity but neither a usable filled_at nor updated_at; "
-                "not persisting the missed fill with an invented time. reconciliation runs only "
-                "when the adapter connects, so the next adapter connect retries it",
-                extra={
-                    "data": {
-                        "account_id": self.account_id,
-                        "signal_id": signal_id,
-                        "broker_order_id": broker_order_id,
-                        "filled_at": str(getattr(order, "filled_at", None)),
-                        "updated_at": str(getattr(order, "updated_at", None)),
-                        "missing_filled_qty": missing_filled_qty,
-                    }
-                },
-            )
-            return False
-        execution = LiveExecution(
-            signal_id=UUID(signal_id),
-            # Placeholder: the save derives the remainder's own price from the cumulative average
-            # inside its transaction, because part of the order may already be recorded at a
-            # different price, and sets the verdict (`derived`, or `derived_unavailable` with the
-            # quantity still recorded at 0.0).
-            actual_price=cumulative_avg_price,
-            actual_price_observed=PRICE_DERIVED,
-            filled_qty=missing_filled_qty,
-            commission=_known_commission(order),
-            timestamp=fill_ts,
-            broker_order_id=broker_order_id,
-            dedupe_key=(
-                f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
-            ),
+        # #144: the order's own fill is booked FIRST and a leg's close only after it,
+        # because a leg closes the position that fill opened: booking a leg against a
+        # parent whose own fill could not be recovered drives the deployment's ledger
+        # below zero (the close insert refuses it outright, but the leg would then stay
+        # unbooked until the next connect - this function used to return early on exactly
+        # that, leaving an already-booked leg behind).
+        parent_fill_pending = missing_filled_qty > 0
+        parent_fill_unrecoverable = parent_fill_pending and (
+            cumulative_avg_price is None or fill_ts is None or broker_order_id is None
         )
-        persisted_qty = await asyncio.to_thread(
-            save_live_execution_up_to_cumulative,
-            execution,
-            broker_filled_qty,
-            cumulative_avg_price=cumulative_avg_price,
-        )
-        if persisted_qty <= 0.0:
-            return False
-        logger.info(
-            "Reconciled missed Alpaca fill",
-            extra={
-                "data": {
-                    "signal_id": signal_id,
-                    "broker_order_id": broker_order_id,
-                    "filled_qty": persisted_qty,
-                    "broker_cumulative_filled_qty": broker_filled_qty,
-                    "local_cumulative_filled_qty": local_filled_qty,
-                }
-            },
-        )
-        return True
+        if parent_fill_pending and broker_order_id is not None:
+            if cumulative_avg_price is None:
+                logger.warning(
+                    "Alpaca order has filled quantity but no usable filled_avg_price; not "
+                    "persisting the missed fill, the next reconciliation pass retries",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_avg_price": str(getattr(order, "filled_avg_price", None)),
+                            "missing_filled_qty": missing_filled_qty,
+                        }
+                    },
+                )
+            elif fill_ts is None:
+                logger.warning(
+                    "Alpaca order has filled quantity but neither a usable filled_at nor "
+                    "updated_at; not persisting the missed fill with an invented time. "
+                    "reconciliation runs only when the adapter connects, so the next "
+                    "adapter connect retries it",
+                    extra={
+                        "data": {
+                            "account_id": self.account_id,
+                            "signal_id": signal_id,
+                            "broker_order_id": broker_order_id,
+                            "filled_at": str(getattr(order, "filled_at", None)),
+                            "updated_at": str(getattr(order, "updated_at", None)),
+                            "missing_filled_qty": missing_filled_qty,
+                        }
+                    },
+                )
+            else:
+                execution = LiveExecution(
+                    signal_id=UUID(signal_id),
+                    # Placeholder: the save derives the remainder's own price from the
+                    # cumulative average inside its transaction, because part of the order
+                    # may already be recorded at a different price, and sets the verdict
+                    # (`derived`, or `derived_unavailable` with the quantity still
+                    # recorded at 0.0).
+                    actual_price=cumulative_avg_price,
+                    actual_price_observed=PRICE_DERIVED,
+                    filled_qty=missing_filled_qty,
+                    commission=_known_commission(order),
+                    timestamp=fill_ts,
+                    broker_order_id=broker_order_id,
+                    dedupe_key=(
+                        f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
+                    ),
+                )
+                persisted_qty = await asyncio.to_thread(
+                    save_live_execution_up_to_cumulative,
+                    execution,
+                    broker_filled_qty,
+                    cumulative_avg_price=cumulative_avg_price,
+                )
+                if persisted_qty > 0.0:
+                    logger.info(
+                        "Reconciled missed Alpaca fill",
+                        extra={
+                            "data": {
+                                "signal_id": signal_id,
+                                "broker_order_id": broker_order_id,
+                                "filled_qty": persisted_qty,
+                                "broker_cumulative_filled_qty": broker_filled_qty,
+                                "local_cumulative_filled_qty": local_filled_qty,
+                            }
+                        },
+                    )
+                    recovered += 1
+        if not parent_fill_unrecoverable:
+            for leg in _order_legs(order):
+                if await self._reconcile_bracket_leg_fill(signal_id, leg):
+                    recovered += 1
+        return recovered
 
     async def reconcile_executions(self, *, max_signals: int = 200) -> int:
         """Backfill missing fill quantity for recent signals in this Alpaca account.
@@ -1087,6 +1515,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         broker submit and stream-event persistence. Uses the client_order_id == signal.id
         convention. Broker order quantities are cumulative, while local executions are
         stored as event deltas, so only the positive cumulative difference is persisted.
+
+        Since #144 one pass also recovers the fills of a bracket's stop/target legs, which
+        close the signal's position without any order of ours. Returns the number of signals
+        with at least one recovered fill - a signal counted once however many fills it needed,
+        because a leg's fill and the order's own are backfilled from the same fetch.
         """
         if self._trading_client is None:
             return 0
@@ -1107,6 +1540,90 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if next_before is None or next_before == before:
                 break
             before = next_before
+        try:
+            await self._reconcile_reprotect_orders()
+        except Exception as exc:
+            logger.warning(
+                "Alpaca re-protect order reconciliation failed; leg fills may be "
+                "missing until the next connect",
+                extra={"data": {"account_id": self.account_id, "error": str(exc)}},
+            )
+        return recovered
+
+    async def _reconcile_reprotect_orders(self) -> int:
+        """Re-learn and backfill fills of re-placed exit protection (#350 on #277).
+
+        The ``-reprotect`` orders are not signals, so the per-signal pass never
+        sees them: this scan finds them by client order id on the ``status=all``
+        nested listing - bounded like ``_list_filled_parents_with_held_legs`` -
+        attributes their legs (or the lone order itself) to the verified entry
+        signal, and backfills each filled slice once. Fills that verify no
+        entry are flagged ``ledger_reconciliation_required``, never dropped.
+        """
+        client = self._trading_client
+        if client is None:
+            return 0
+        get_orders = getattr(client, "get_orders", None)
+        if not callable(get_orders):
+            return 0
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            nested=True,
+            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+        )
+        result = await asyncio.to_thread(get_orders, filter=request)
+        if not isinstance(result, (list, tuple)):
+            raise RuntimeError(
+                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                "refusing to treat it as complete"
+            )
+        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+            logger.warning(
+                "Alpaca returned %s orders, the page limit; re-protect orders "
+                "older than the page are not seen by this pass",
+                len(result),
+                extra={"data": {"account_id": self.account_id}},
+            )
+        recovered = 0
+        for order in result:
+            client_order_id = _order_attr(order, "client_order_id")
+            coid_text = str(client_order_id or "")
+            if _REPROTECT_CLIENT_ORDER_MARKER not in coid_text:
+                continue
+            entry_signal_id = await self._verified_reprotect_entry(
+                _reprotect_entry_candidate(coid_text)
+            )
+            legs = _order_legs(order)
+            targets = legs if legs else [order]
+            if entry_signal_id is None:
+                for item in targets:
+                    item_status = _order_status(item)
+                    item_filled = _to_float(
+                        _order_attr(item, "filled_qty", None), default=0.0
+                    )
+                    if (
+                        item_status in {"filled", "partially_filled"}
+                        and math.isfinite(item_filled)
+                        and item_filled > 0.0
+                    ):
+                        flag_key = (
+                            _bracket_leg_key(_order_attr(item, "id"))
+                            or _control_order_id(_order_attr(item, "id"))
+                            or coid_text
+                        )
+                        self._flag_reprotect_fill_unattributed(
+                            item, client_order_id, flag_key
+                        )
+                continue
+            for item in targets:
+                leg_key = _bracket_leg_key(_order_attr(item, "id"))
+                if leg_key is not None:
+                    self._bracket_leg_order_id_to_signal_id[leg_key] = entry_signal_id
+                if await self._reconcile_bracket_leg_fill(entry_signal_id, item):
+                    recovered += 1
         return recovered
 
     async def backfill_commissions(self, *, now: datetime | None = None) -> int:
@@ -1797,8 +2314,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if _is_flat(plan["reprotect_qty"]):
             # The exit covers the whole broker position: nothing is re-placed,
             # so ambiguous levels cannot hurt - but the recovery marker still
-            # gets the one unambiguous level, never a guess.
+            # gets the one unambiguous level, never a guess. ``stop_limit_price``
+            # is set here too: the in-lock signature always derives it from the
+            # candidates, and leaving it ``None`` refused every full exit over
+            # a stop-limit protection as "the working protection changed".
             plan["stop_price"] = _single_level([c["stop_price"] for c in stops])
+            plan["stop_limit_price"] = _single_level(
+                [c["limit_price"] for c in stops if c["limit_price"] is not None]
+            )
             plan["take_profit_price"] = _single_level(
                 [c["limit_price"] for c in take_profits]
             )
@@ -1877,6 +2400,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         (#277's ``record_live_broker_side_close_fill``) instead of becoming an
         unattributable fill. ``None`` when no filled entry signal is known -
         attribution is then simply absent, never guessed.
+
+        For a position scaled in by several entries this picks the *latest*
+        filled entry of the deployment: the deployment ledger is the same
+        either way (fills are summed per deployment+symbol), but the signal id
+        embedded in the client order id - and therefore the ``parent_signal_id``
+        a broker-side close is booked against - is an arbitrary one of them.
         """
         deployment_id = str(getattr(signal, "deployment_id", "") or "").strip()
         if not deployment_id:
@@ -2043,7 +2572,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return False
         try:
-            await asyncio.to_thread(client.submit_order, order_data=request)
+            order = await asyncio.to_thread(client.submit_order, order_data=request)
         except Exception as exc:
             if plan.get("stop_price") is not None:
                 logger.critical(
@@ -2076,6 +2605,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     },
                 )
             return False
+        # #350 on #277: the re-placed protection's fills are broker-side closes
+        # of the remainder - learn their order ids now so a leg fill reaching
+        # the stream before the next connect is booked against the entry's
+        # ledger instead of dropped as unattributable.
+        await self._register_reprotect_attribution(
+            client,
+            plan,
+            order,
+            nested_lookup=(
+                getattr(request, "take_profit", None) is not None
+                and getattr(request, "stop_loss", None) is not None
+            ),
+        )
         logger.info(
             "Re-placed Alpaca exit protection",
             extra={
@@ -2550,6 +3092,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             order = await self._submit_exit_releasing_protection(
                 trading_client, request, exit_plan, signal_id=canonical_signal_id
             )
+        # #144: a bracket's legs are child orders with their own broker order ids, and Alpaca
+        # reports them nested in the parent it just created. Learning them here means a leg's
+        # fill is attributed to this signal even if it arrives before the first reconciliation
+        # pass (which runs on connect).
+        self._register_bracket_legs(canonical_signal_id, order)
         broker_order_id = _normalize_broker_order_id(getattr(order, "id", None))
         if broker_order_id is None:
             raise RuntimeError(
@@ -3538,6 +4085,31 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 f"(order_id={new_order_id!r}, stop_price={confirmed_price!r}, "
                 f"requested={price!r})"
             )
+        # #144: replacing an order gives it a NEW broker order id, so the leg-order-id ->
+        # signal map this adapter learned for the old id is stale from this moment on. The
+        # replaced order here is the bracket's stop leg whenever the pre-replacement id was
+        # learned as a leg, so its fill is re-learned against the same parent signal here
+        # rather than waiting for the next adapter connect (the only other pass).
+        previous_leg_key = _bracket_leg_key(stop.order_id)
+        new_leg_key = _bracket_leg_key(new_order_id)
+        parent_signal_id = (
+            self._bracket_leg_order_id_to_signal_id.pop(previous_leg_key, None)
+            if previous_leg_key is not None
+            else None
+        )
+        if parent_signal_id is not None and new_leg_key is not None:
+            self._bracket_leg_order_id_to_signal_id[new_leg_key] = parent_signal_id
+            logger.info(
+                "Amended Alpaca stop leg re-registered against its parent signal",
+                extra={
+                    "data": {
+                        "parent_signal_id": parent_signal_id,
+                        "previous_leg_order_id": str(stop.order_id),
+                        "leg_order_id": str(new_order_id),
+                        "symbol": stop.symbol,
+                    }
+                },
+            )
         return ProtectiveStop(
             order_id=new_order_id,
             symbol=stop.symbol,
@@ -3571,9 +4143,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             payload.append(entry)
         return payload
 
-    def _parse_trade_update_event(
-        self, data: Any
-    ) -> tuple[str, Any, Any, UUID] | None:
+    def _trade_update_fill_order(self, data: Any) -> tuple[str, Any, Any] | None:
+        """The ``(event, order, client_order_id_text)`` of a fill event, or ``None``.
+
+        Split from the signal resolution below because a bracket leg's fill is a fill event whose
+        client order id names no signal of ours (#144): the order id decides that case, so the
+        event has to be readable before any client order id is interpreted.
+        """
         event = str(getattr(data, "event", "")).lower()
         if event not in {"fill", "partial_fill"}:
             return None
@@ -3587,16 +4163,145 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not client_order_id:
             logger.warning("Trade update missing client_order_id")
             return None
+        return event, order, client_order_id
 
-        try:
-            signal_uuid = UUID(str(client_order_id))
-        except ValueError:
+    async def _record_bracket_leg_fill(
+        self,
+        parent_signal_id: str,
+        data: Any,
+        order: Any,
+        *,
+        broker_order_id: str,
+        event: str,
+    ) -> None:
+        """Book one bracket leg fill against the parent signal's deployment ledger (#144).
+
+        The dedupe key is derived from the leg's own broker order id and its cumulative filled
+        quantity - the ONE derivation this path and the reconciliation pass below share, so a fill
+        the stream stored is a skip there rather than a second row, whichever of the two sees the
+        fill first. Alpaca's per-fill ``execution_id`` is deliberately NOT used for a leg: the
+        reconciliation pass reads the leg off the parent order, where no execution id exists, and
+        two derivations for one fill would let the same fill be stored twice.
+        """
+        skip, filled_qty_value = self._resolve_trade_update_qty(
+            data,
+            order,
+            event=event,
+            client_order_id=_order_attr(order, "client_order_id"),
+        )
+        if skip:
+            return
+        broker_cumulative_filled_qty = _to_float(
+            getattr(order, "filled_qty", None), default=0.0
+        )
+        # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty` may
+        # have substituted: only that proves this fill is the whole leg.
+        event_qty = getattr(data, "qty", None)
+        if event_qty is None:
+            event_qty = getattr(data, "filled_qty", None)
+        actual_price, price_observed = _resolve_fill_price(
+            (getattr(data, "fill_price", None), getattr(data, "price", None)),
+            order_avg_price=getattr(order, "filled_avg_price", None),
+            event_qty=event_qty,
+            cumulative_qty=broker_cumulative_filled_qty,
+        )
+        filled_qty = _to_float(filled_qty_value)
+        raw_fill_ts = getattr(data, "timestamp", None)
+        fill_ts = _broker_fill_timestamp(
+            raw_fill_ts, getattr(order, "filled_at", None), getattr(order, "updated_at", None)
+        )
+        execution_id = str(getattr(data, "execution_id", "") or "")
+        dedupe_key = _alpaca_fill_dedupe_key(
+            # Empty on purpose: see the docstring - the leg's id and cumulative quantity are the
+            # identity a reconciliation pass can reproduce without an execution id.
+            execution_id="",
+            broker_order_id=broker_order_id,
+            event=_LEG_FILL_EVENT_LABEL,
+            cumulative_filled_qty=broker_cumulative_filled_qty,
+            raw_timestamp=raw_fill_ts,
+            filled_qty=filled_qty,
+        )
+        if dedupe_key is None:
             logger.warning(
-                "Trade update client_order_id is not a UUID",
-                extra={"data": {"client_order_id": str(client_order_id)}},
+                "Alpaca bracket leg fill carries no execution id, no cumulative leg quantity and "
+                "no usable timestamp; refusing to derive a dedupe key that could count it twice "
+                "or drop a sibling. reconcile_executions backfills it from the parent order",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "parent_signal_id": parent_signal_id,
+                        "leg_order_id": broker_order_id,
+                        "event": event,
+                    }
+                },
             )
-            return None
-        return event, order, client_order_id, signal_uuid
+            return
+        if fill_ts is None:
+            logger.warning(
+                "Alpaca bracket leg fill carries no usable timestamp on the event or its order; "
+                "no execution row was stored (never an invented time), so the deployment's "
+                "ledger still counts the closed shares until the next adapter connect runs "
+                "reconciliation and the leg reports a fill time",
+                extra={
+                    "data": {
+                        "account_id": self.account_id,
+                        "parent_signal_id": parent_signal_id,
+                        "leg_order_id": broker_order_id,
+                        "event": event,
+                        "execution_id": execution_id,
+                        "filled_qty": filled_qty,
+                    }
+                },
+            )
+            return
+        persisted_qty = await asyncio.to_thread(
+            record_live_broker_side_close_fill,
+            parent_signal_id=parent_signal_id,
+            close_reason=_bracket_leg_close_reason(order),
+            filled_qty=filled_qty,
+            actual_price=actual_price,
+            actual_price_observed=price_observed,
+            commission=_known_commission(order),
+            timestamp=fill_ts,
+            broker_order_id=broker_order_id,
+            # The leg's broker cumulative caps the booking inside the insert: a
+            # delayed event whose slice a reconcile pass already covered is skipped
+            # there rather than double-counted here.
+            cumulative_filled_qty=(
+                broker_cumulative_filled_qty
+                if broker_cumulative_filled_qty > 0.0
+                else None
+            ),
+            cumulative_avg_price=_positive_finite(
+                getattr(order, "filled_avg_price", None)
+            ),
+            dedupe_key=dedupe_key,
+            # The leg's own side, cross-checked against the side the parent's action implies: a
+            # leg that would extend the position is refused, not recorded.
+            close_side=_order_side(order),
+        )
+        logger.info(
+            (
+                "Persisted Alpaca bracket leg close fill"
+                if persisted_qty > 0.0
+                else "No new Alpaca bracket leg close fill persisted "
+                "(duplicate or refused; the reason is logged by the insert path)"
+            ),
+            extra={
+                "data": {
+                    "parent_signal_id": parent_signal_id,
+                    "close_signal_id": broker_close_signal_id(parent_signal_id),
+                    "leg_order_id": broker_order_id,
+                    "close_reason": _bracket_leg_close_reason(order),
+                    "event": event,
+                    "filled_qty": filled_qty,
+                    "persisted_qty": persisted_qty,
+                    "actual_price": actual_price,
+                    "actual_price_observed": price_observed,
+                    "broker_cumulative_filled_qty": broker_cumulative_filled_qty,
+                }
+            },
+        )
 
     def _resolve_trade_update_qty(
         self,
@@ -3638,10 +4343,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
 
     async def _on_trade_update(self, data: Any) -> None:
         try:
-            parsed = self._parse_trade_update_event(data)
-            if parsed is None:
+            fill = self._trade_update_fill_order(data)
+            if fill is None:
                 return
-            event, order, client_order_id, signal_uuid = parsed
+            event, order, client_order_id = fill
             raw_broker_order_id = getattr(order, "id", None)
             broker_order_id = _normalize_broker_order_id(raw_broker_order_id)
             if broker_order_id is None:
@@ -3654,6 +4359,39 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                             "broker_order_id": str(raw_broker_order_id or ""),
                         }
                     },
+                )
+                return
+
+            # #144: a bracket leg's fill closes this signal's position. Booked BEFORE the
+            # client_order_id path below, because a leg may carry the parent's client order id -
+            # and booking that against the parent signal would ADD the leg's quantity to the
+            # long side (the ledger signs by the parent signal's action) instead of reducing
+            # it, leaving the ledger further from the broker position than before.
+            parent_signal_id = self._parent_signal_id_for_broker_order(broker_order_id)
+            if parent_signal_id is not None:
+                await self._record_bracket_leg_fill(
+                    parent_signal_id,
+                    data,
+                    order,
+                    broker_order_id=broker_order_id,
+                    event=event,
+                )
+                return
+
+            try:
+                signal_uuid = UUID(str(client_order_id))
+            except ValueError:
+                if await self._handle_reprotect_trade_update(
+                    data,
+                    order,
+                    client_order_id,
+                    broker_order_id=broker_order_id,
+                    event=event,
+                ):
+                    return
+                logger.warning(
+                    "Trade update client_order_id is not a UUID",
+                    extra={"data": {"client_order_id": str(client_order_id)}},
                 )
                 return
 
