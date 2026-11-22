@@ -166,11 +166,21 @@ def test_the_smoke_deployment_is_idempotent_per_account(isolated_db) -> None:
     assert len(_smoke_rows(database)) == 1, "a second deployment row was created for one label"
 
 
-def test_discord_replay_smoke_routes_to_fake_order() -> None:
+def test_discord_replay_smoke_routes_to_fake_order(tmp_path: Path) -> None:
+    """The accounts env is written here, not taken from the working directory.
+
+    ``Path(".accounts.env")`` is relative to the cwd, which for a plain ``pytest`` is the repo
+    root: the smoke run then read the checkout's real credential file, and a run in another
+    directory read nothing at all.
+    """
+    accounts_env = tmp_path / ".accounts.env"
+    accounts_env.write_text(
+        "ALPACA_API_KEY=smoke-key\nALPACA_SECRET_KEY=smoke-secret\n", encoding="utf-8"
+    )
     report = asyncio.run(
         run_smoke(
             mode="discord-replay",
-            accounts_env=Path(".accounts.env"),
+            accounts_env=accounts_env,
             alpaca_symbol="BTC/USD",
             alpaca_notional=10.0,
             ctrader_symbol="EURUSD",
@@ -185,7 +195,9 @@ def test_discord_replay_smoke_routes_to_fake_order() -> None:
     assert report.checks[0].details["broker_order_id"] == "discord-smoke-order"
 
 
-def test_stockkit_smoke_signal_validates_against_the_resolved_broker_login(monkeypatch) -> None:
+def test_stockkit_smoke_signal_validates_against_the_resolved_broker_login(
+    monkeypatch, tmp_path: Path
+) -> None:
     """The smoke deployment is validated against the account it really trades.
 
     Passing the number the route *expects* makes the check compare a value to
@@ -198,9 +210,11 @@ def test_stockkit_smoke_signal_validates_against_the_resolved_broker_login(monke
     monkeypatch.setattr(
         credential_env, "load_accounts_env_values", lambda *_args, **_kwargs: {}
     )
+    accounts_env = tmp_path / ".accounts.env"
 
     trade_signal, deployment, _live_signal = _stockkit_deployment_and_signal(
         {"DISCORD_BOT_RAMJET_CHANNEL_ID": "100000000000000002"},
+        accounts_env=accounts_env,
         route="ramjet",
         account_id="acc-1",
         broker_login="PA3T0MQAGQ51",
@@ -216,9 +230,53 @@ def test_stockkit_smoke_signal_validates_against_the_resolved_broker_login(monke
     with pytest.raises(ValueError, match="must route to Alpaca account"):
         _stockkit_deployment_and_signal(
             {"DISCORD_BOT_RAMJET_CHANNEL_ID": "100000000000000002"},
+            accounts_env=accounts_env,
             route="ramjet",
             account_id="acc-1",
             broker_login="PA-SOMEONE-ELSE",
+            symbol="AAPL",
+            message_price=200.0,
+            stock_prices={"reference": 200.0, "buy_limit": 201.0},
+            extended_hours=False,
+        )
+
+
+def test_stockkit_smoke_route_validation_reads_the_given_accounts_env(tmp_path: Path) -> None:
+    """``--accounts-env`` must drive the route check, not the project default file.
+
+    The smoke run trades with the credentials of the file it was pointed at, so
+    validating the route against a different file compares the deployment to an
+    account it is not trading on - the same split-brain the ``--accounts-env``
+    flag exists to remove.
+    """
+    from scripts.live_smoke import _stockkit_deployment_and_signal
+
+    accounts_env = tmp_path / "smoke-accounts.env"
+    accounts_env.write_text(
+        "STOCKKIT_ACCOUNT_NUMBER_RAMJET=SMOKEACCOUNT42\n", encoding="utf-8"
+    )
+
+    # The file's explicit route number wins over the static fallback table, so a
+    # pass here proves the tmp file - not the default - was the one read.
+    _stockkit_deployment_and_signal(
+        {"DISCORD_BOT_RAMJET_CHANNEL_ID": "100000000000000002"},
+        accounts_env=accounts_env,
+        route="ramjet",
+        account_id="acc-1",
+        broker_login="SMOKEACCOUNT42",
+        symbol="AAPL",
+        message_price=200.0,
+        stock_prices={"reference": 200.0, "buy_limit": 201.0},
+        extended_hours=False,
+    )
+
+    with pytest.raises(ValueError, match="SMOKEACCOUNT42"):
+        _stockkit_deployment_and_signal(
+            {"DISCORD_BOT_RAMJET_CHANNEL_ID": "100000000000000002"},
+            accounts_env=accounts_env,
+            route="ramjet",
+            account_id="acc-1",
+            broker_login="PA3T0MQAGQ51",
             symbol="AAPL",
             message_price=200.0,
             stock_prices={"reference": 200.0, "buy_limit": 201.0},

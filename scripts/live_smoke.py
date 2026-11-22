@@ -1349,6 +1349,7 @@ async def _stockkit_market_context(
 def _stockkit_deployment_and_signal(
     env: Mapping[str, str],
     *,
+    accounts_env: Path,
     route: str,
     account_id: str,
     broker_login: str,
@@ -1361,7 +1362,6 @@ def _stockkit_deployment_and_signal(
 
     from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
     from live_runner.daemon import _trade_signal_to_live_signal
-    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from shared.models import LiveDeploymentConfig
@@ -1401,8 +1401,10 @@ def _stockkit_deployment_and_signal(
     )
     # Validate routing against the broker account number the smoke run actually
     # resolved credentials for, not the number the route expects - otherwise the
-    # check compares a value to itself and can never fail.
-    smoke_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+    # check compares a value to itself and can never fail. The accounts file is
+    # the one ``--accounts-env`` named: the run trades with its credentials, so
+    # the route table must come from the same file.
+    smoke_env = load_accounts_env_values(accounts_env)
     validate_stockkit_deployment_route(
         deployment,
         account_broker_login=broker_login,
@@ -1522,6 +1524,7 @@ async def _cancel_stockkit_buy_order(
 async def _alpaca_stockkit_e2e(
     env: Mapping[str, str],
     *,
+    accounts_env: Path,
     timeout_seconds: int,
 ) -> SmokeCheck:
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
@@ -1551,6 +1554,7 @@ async def _alpaca_stockkit_e2e(
         details["market_data"] = stock_prices
         trade_signal, deployment, live_signal = _stockkit_deployment_and_signal(
             env,
+            accounts_env=accounts_env,
             route=route,
             account_id=account_id,
             broker_login=broker_login,
@@ -1665,7 +1669,7 @@ async def _live_stockkit_e2e(
     timeout_seconds: int,
 ) -> list[SmokeCheck]:
     results = await asyncio.gather(
-        _alpaca_stockkit_e2e(env, timeout_seconds=timeout_seconds),
+        _alpaca_stockkit_e2e(env, accounts_env=accounts_env, timeout_seconds=timeout_seconds),
         _ctrader_strategy_e2e(
             env,
             accounts_env=accounts_env,

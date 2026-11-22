@@ -23,7 +23,10 @@ from runner.engines.base import (
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
 )
-from runner.portfolio_optimizer import optimize_portfolio_allocation
+from runner.portfolio_optimizer import (
+    MIN_OOS_DAILY_OBSERVATIONS,
+    optimize_portfolio_allocation,
+)
 from runner.stats import merge_canonical_stats
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -252,6 +255,10 @@ def _aggregate_oos_metrics(folds: list[dict[str, Any]]) -> tuple[float | None, f
     return_values: list[float] = []
     max_drawdown = 0.0
     for fold in folds:
+        if fold.get("oos_status") == "insufficient_oos_bars":
+            # Too few daily observations: the fold's OOS metrics are noise
+            # and must not leak into the aggregate (#133).
+            continue
         curve = fold.get("oos_equity_curve")
         if not curve:
             continue
@@ -295,6 +302,20 @@ def _write_payload(payload: dict[str, Any], output_dir: str | Path | None = None
     return out_path
 
 
+def _walkforward_oos_status(folds: list[dict[str, Any]]) -> str:
+    """Aggregate per-fold OOS statuses into the payload-level status (#133)."""
+    statuses = [str(fold.get("oos_status") or "") for fold in folds]
+    if not folds:
+        return "no_oos_requested"
+    if any(status == "insufficient_oos_bars" for status in statuses):
+        return "insufficient_oos_bars"
+    if any(status == "insufficient_overlap" for status in statuses):
+        return "insufficient_overlap"
+    if all(status == "available" for status in statuses):
+        return "available"
+    return "insufficient_overlap"
+
+
 def _run_portfolio_walkforward(
     *,
     backtest_ids: list[str],
@@ -307,6 +328,7 @@ def _run_portfolio_walkforward(
     end: str = "",
     purge_days: int = 0,
     embargo_days: int = 0,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> dict[str, Any]:
     effective_step_months = test_months if step_months is None else step_months
     windows = None
@@ -344,6 +366,7 @@ def _run_portfolio_walkforward(
             train_end=window["train_end"] if window else None,
             test_start=window["test_start"] if window else None,
             test_end=window["test_end"] if window else None,
+            min_oos_daily_observations=min_oos_daily_observations,
         )
         folds.append(
             {
@@ -353,6 +376,8 @@ def _run_portfolio_walkforward(
                 "oos_sharpe": result.get("oos_sharpe"),
                 "oos_max_drawdown": result.get("oos_max_drawdown"),
                 "oos_equity_curve": result.get("oos_equity_curve", []),
+                "oos_status": result.get("oos_status"),
+                "oos_daily_observations": result.get("oos_daily_observations"),
             }
         )
 
@@ -368,9 +393,11 @@ def _run_portfolio_walkforward(
             "purge_days": purge_days,
             "embargo_days": embargo_days,
             "n_trials": n_trials,
+            "min_oos_daily_observations": min_oos_daily_observations,
         },
         "folds": folds,
         "summary": _summary_from_folds(folds),
+        "oos_status": _walkforward_oos_status(folds),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_payload(payload, output_dir)
@@ -402,6 +429,7 @@ def run_walkforward(
     max_position_pct: float | None = None,
     purge_days: int = 0,
     embargo_days: int = 0,
+    min_oos_daily_observations: int = MIN_OOS_DAILY_OBSERVATIONS,
 ) -> dict[str, Any]:
     """Run generic strategy walk-forward validation.
 
@@ -413,6 +441,12 @@ def run_walkforward(
     of equity. ``max_position_pct`` is a deprecated alias of
     ``max_position_exposure_pct``.
     """
+    if (
+        isinstance(min_oos_daily_observations, bool)
+        or not isinstance(min_oos_daily_observations, int)
+        or min_oos_daily_observations < 1
+    ):
+        raise ValueError("min_oos_daily_observations must be an int >= 1")
     if backtest_ids and not strategy:
         return _run_portfolio_walkforward(
             backtest_ids=backtest_ids,
@@ -425,6 +459,7 @@ def run_walkforward(
             end=end,
             purge_days=purge_days,
             embargo_days=embargo_days,
+            min_oos_daily_observations=min_oos_daily_observations,
         )
 
     if not strategy:
@@ -485,16 +520,50 @@ def run_walkforward(
         )
         oos_curve = test_stats.pop("_equity_curve", [])
         train_stats.pop("_equity_curve", None)
+        # #133: OOS statistics need a minimum number of DAILY observations —
+        # raw intraday bars on the same day are one observation. Below the
+        # minimum the fold is flagged and its derived metrics withheld.
+        oos_daily_observations = len(_daily_close_series(oos_curve))
+        oos_status = (
+            "available"
+            if oos_daily_observations >= min_oos_daily_observations
+            else "insufficient_oos_bars"
+        )
+        fold_oos_sharpe = _metric(test_stats, "sharpe_ratio", "sharpe")
+        fold_oos_drawdown = _metric(test_stats, "max_drawdown_pct")
+        stored_oos_stats = test_stats
+        if oos_status != "available":
+            fold_oos_sharpe = None
+            fold_oos_drawdown = None
+            # The raw stats still carry the same risk-adjusted metrics; an
+            # undersized holdout must not leak them through oos_stats either.
+            stored_oos_stats = {
+                key: value
+                for key, value in test_stats.items()
+                if key
+                not in {
+                    "sharpe_ratio",
+                    "sharpe",
+                    "sortino_ratio",
+                    "sortino",
+                    "calmar_ratio",
+                    "calmar",
+                    "max_drawdown_pct",
+                    "max_drawdown",
+                }
+            }
         folds.append(
             {
                 "fold": index,
                 **window,
                 "is_sharpe": _metric(train_stats, "sharpe_ratio", "sharpe"),
-                "oos_sharpe": _metric(test_stats, "sharpe_ratio", "sharpe"),
-                "oos_max_drawdown": _metric(test_stats, "max_drawdown_pct"),
+                "oos_sharpe": fold_oos_sharpe,
+                "oos_max_drawdown": fold_oos_drawdown,
                 "is_stats": train_stats,
-                "oos_stats": test_stats,
+                "oos_stats": stored_oos_stats,
                 "oos_equity_curve": oos_curve,
+                "oos_status": oos_status,
+                "oos_daily_observations": oos_daily_observations,
             }
         )
 
@@ -518,9 +587,11 @@ def run_walkforward(
             "max_leverage": max_leverage,
             "modeling_resolution": modeling_resolution,
             "parameters": parameters,
+            "min_oos_daily_observations": min_oos_daily_observations,
         },
         "folds": folds,
         "summary": _summary_from_folds(folds),
+        "oos_status": _walkforward_oos_status(folds),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_payload(payload, output_dir)
