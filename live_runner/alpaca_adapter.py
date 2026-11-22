@@ -61,6 +61,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
+from shared.money import parse_money, parse_optional
 
 logger = get_logger("live-runner")
 
@@ -248,16 +249,16 @@ def _protective_stop_of(
     if _order_type(candidate) != "stop":
         return None
     order_id = _control_order_id(_order_attr(candidate, "id"))
-    stop_price = _to_float(_order_attr(candidate, "stop_price", None), default=0.0)
-    if order_id is None or not math.isfinite(stop_price) or stop_price <= 0:
+    stop_price = parse_optional(_order_attr(candidate, "stop_price", None))
+    if order_id is None or stop_price is None or stop_price <= 0:
         return None
-    qty = _to_float(_order_attr(candidate, "qty", None), default=0.0)
+    qty = parse_optional(_order_attr(candidate, "qty", None))
     return ProtectiveStop(
         order_id=order_id,
         symbol=symbol,
         side=_order_side(candidate),
         stop_price=stop_price,
-        qty=qty if math.isfinite(qty) and qty > 0 else None,
+        qty=qty if qty is not None and qty > 0 else None,
     )
 
 
@@ -332,15 +333,19 @@ def _parse_bool_env(name: str, value: str | None, *, default: bool = True) -> bo
     return parse_bool_env(name, value, default=default)
 
 
-def _to_float(value: Any, *, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    if isinstance(value, Decimal):
-        return float(value)
+def _display_float(value: Any) -> float:
+    """Best-effort float for display-only payload fields.
+
+    Money fields that feed risk decisions must use ``shared.money.parse_money``
+    so an unreadable value raises. This coercion exists only so one unreadable
+    display field cannot take down a whole position listing; callers that need
+    to know the value was unreadable check the ``*_unparseable`` marker the
+    row carries alongside it (#271).
+    """
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        return parse_money(value)
+    except ValueError:
+        return 0.0
 
 
 def _positive_finite(value: Any) -> float | None:
@@ -427,10 +432,11 @@ def _is_parseable_qty(value: Any) -> bool:
 def _position_qty(position: Mapping[str, Any]) -> float:
     """The broker position's signed quantity, refusing to guess on a bad value.
 
-    ``_to_float(..., default=0.0)`` maps an *unparseable* ``qty`` onto "flat",
-    which would let a position with a malformed quantity be silently skipped as
-    "no position" — the flatten would then report success and a STOPPED
-    deployment would be stamped enforced while real exposure stayed open.
+    The display coercion in :func:`get_positions` maps an *unparseable* ``qty``
+    onto "flat" for ordinary consumers, which would let a position with a
+    malformed quantity be silently skipped as "no position" — the flatten would
+    then report success and a STOPPED deployment would be stamped enforced
+    while real exposure stayed open.
 
     :func:`get_positions` marks such a row with ``qty_unparseable`` (the
     displayed ``qty`` is still the coerced ``0.0`` so ordinary consumers keep
@@ -859,19 +865,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         except Exception:
             # Unknown to this account or not found.
             return False
-        broker_filled_qty = _to_float(
-            getattr(order, "filled_qty", None), default=0.0
-        )
-        if not math.isfinite(broker_filled_qty):
-            logger.warning(
-                "Alpaca order reports a non-finite filled_qty; not reconciling it",
-                extra={
-                    "data": {
-                        "signal_id": signal_id,
-                        "filled_qty": str(getattr(order, "filled_qty", None)),
-                    }
-                },
-            )
+        broker_filled_qty = parse_optional(getattr(order, "filled_qty", None))
+        if broker_filled_qty is None:
+            # An order that reports no filled quantity has nothing to reconcile;
+            # a present but unreadable one raises inside parse_optional.
             return False
         local_filled_qty = await asyncio.to_thread(
             get_live_signal_filled_qty, signal_id
@@ -976,8 +973,24 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if not signal_ids:
                 break
             for signal_id in signal_ids:
-                if await self._reconcile_signal_fill(signal_id):
-                    recovered += 1
+                try:
+                    if await self._reconcile_signal_fill(signal_id):
+                        recovered += 1
+                except ValueError as exc:
+                    # An unreadable money field raises inside the parse; one
+                    # malformed order must not stop the rest of the pass, and
+                    # nothing is persisted for it. The next pass retries.
+                    logger.warning(
+                        "Alpaca reconciliation skipped a signal with unreadable "
+                        "order data",
+                        extra={
+                            "data": {
+                                "account_id": self.account_id,
+                                "signal_id": signal_id,
+                                "error": str(exc),
+                            }
+                        },
+                    )
             if len(signal_ids) < max_signals:
                 break
             next_before = await asyncio.to_thread(
@@ -1576,9 +1589,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if not self._connected or self._trading_client is None:
             await self.connect()
         account = await asyncio.to_thread(self._trading_client.get_account)
-        balance = _to_float(getattr(account, "cash", None), default=0.0)
-        equity = _to_float(getattr(account, "equity", None), default=balance)
-        return balance, equity
+        balance = parse_money(getattr(account, "cash", None))
+        equity = parse_optional(getattr(account, "equity", None))
+        return balance, balance if equity is None else equity
 
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
@@ -2084,16 +2097,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 candidate_symbol = _order_symbol(candidate)
                 if candidate_symbol not in {"", symbol}:
                     continue
-                price = _to_float(
-                    _order_attr(candidate, "stop_price", None), default=0.0
-                )
-                if price > 0:
+                price = parse_optional(_order_attr(candidate, "stop_price", None))
+                if price is not None and price > 0:
                     return price
                 nested = _order_attr(candidate, "stop_loss", None)
-                nested_price = _to_float(
-                    _order_attr(nested, "stop_price", None), default=0.0
+                nested_price = parse_optional(
+                    _order_attr(nested, "stop_price", None)
                 )
-                if nested_price > 0:
+                if nested_price is not None and nested_price > 0:
                     return nested_price
         return None
 
@@ -2527,9 +2538,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 replace, stop.order_id, order_data=ReplaceOrderRequest(stop_price=price)
             )
         new_order_id = _control_order_id(_order_attr(replaced, "id"))
-        confirmed_price = _to_float(_order_attr(replaced, "stop_price", None), default=0.0)
-        if new_order_id is None or not math.isclose(
-            confirmed_price, price, rel_tol=0.0, abs_tol=1e-9
+        confirmed_price = parse_optional(_order_attr(replaced, "stop_price", None))
+        if (
+            new_order_id is None
+            or confirmed_price is None
+            or not math.isclose(confirmed_price, price, rel_tol=0.0, abs_tol=1e-9)
         ):
             # Not a confirmed amendment. The broker's own state decides what is in force; the
             # caller re-reads it on its next pass instead of trusting this response.
@@ -2556,12 +2569,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raw_qty = getattr(row, "qty", None)
             entry: dict[str, Any] = {
                 "symbol": str(getattr(row, "symbol", "")).strip().upper(),
-                "qty": _to_float(raw_qty, default=0.0),
-                "entry_price": _to_float(getattr(row, "avg_entry_price", None), default=0.0),
-                "current_price": _to_float(getattr(row, "current_price", None), default=0.0),
-                "unrealized_pnl": _to_float(getattr(row, "unrealized_pl", None), default=0.0),
+                "qty": _display_float(raw_qty),
+                "entry_price": parse_money(getattr(row, "avg_entry_price", None)),
+                "current_price": parse_money(getattr(row, "current_price", None)),
+                "unrealized_pnl": parse_money(getattr(row, "unrealized_pl", None)),
             }
-            if raw_qty is not None and not _is_parseable_qty(raw_qty):
+            if raw_qty is None or not _is_parseable_qty(raw_qty):
                 # Keep the coercion for display consumers, but remember that the
                 # broker's value could not be read: the risk paths that decide
                 # whether an account is flat must fail closed rather than treat
@@ -2663,8 +2676,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             if skip:
                 return
 
-            broker_cumulative_filled_qty = _to_float(
-                getattr(order, "filled_qty", None), default=0.0
+            cumulative_filled_qty = parse_optional(getattr(order, "filled_qty", None))
+            broker_cumulative_filled_qty = (
+                0.0 if cumulative_filled_qty is None else cumulative_filled_qty
             )
             # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty`
             # may have substituted: only that proves this fill is the whole order.
@@ -2680,7 +2694,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 cumulative_qty=broker_cumulative_filled_qty,
             )
 
-            filled_qty = _to_float(filled_qty_value)
+            event_filled_qty = parse_optional(filled_qty_value)
+            filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
             # alpaca-py has no commission field on TradeUpdate or Order; a crypto fee is posted end
             # of day and backfilled, so here it is unknown unless it is a known zero (#124).
             commission = _known_commission(order)

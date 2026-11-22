@@ -52,6 +52,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
+from shared.money import parse_money, parse_optional
 
 logger = get_logger("live-runner")
 
@@ -489,7 +490,7 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
 
 def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
     """Convert broker volume units into qty units (risk-engine units)."""
-    return _to_float(volume, default=0.0) / float(volume_per_qty)
+    return parse_money(volume) / float(volume_per_qty)
 
 
 def _light_symbol_assets(symbol: Any) -> tuple[int, int] | None:
@@ -545,9 +546,9 @@ def _deal_commission(deal: Any | None) -> float:
     """
     if deal is None:
         return 0.0
-    raw = _to_float(getattr(deal, "commission", 0))
+    raw = parse_money(getattr(deal, "commission", 0))
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
-    if not raw or not math.isfinite(raw):
+    if not raw:
         return 0.0
     return commission_cost(raw / money_scale(money_digits_from_trader(deal)))
 
@@ -2996,10 +2997,12 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
-        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        balance = parse_money(getattr(trader, "balance", 0)) / scale
         equity = balance
         if hasattr(trader, "equity"):
-            equity = _to_float(getattr(trader, "equity", balance)) / scale
+            raw_equity = parse_optional(getattr(trader, "equity", None))
+            if raw_equity is not None:
+                equity = raw_equity / scale
         return balance, equity
 
     @property
@@ -3372,9 +3375,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 unidentified.append(f"position:{getattr(position, 'positionId', None)!r}")
                 continue
             trade_data = getattr(position, "tradeData", None)
-            volume = self._positive_int(
-                _to_float(getattr(trade_data, "volume", 0)) if trade_data is not None else 0
-            )
+            try:
+                raw_volume = (
+                    parse_optional(getattr(trade_data, "volume", None))
+                    if trade_data is not None
+                    else None
+                )
+            except ValueError:
+                # An unreadable volume is unidentified, not a zero: reporting it
+                # keeps the flatten honest instead of closing nothing silently.
+                raw_volume = None
+            volume = self._positive_int(raw_volume)
             if volume is None:
                 unidentified.append(f"position:{position_id}:volume")
                 continue
@@ -3433,7 +3444,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     f"cTrader symbol id {symbol_id!r} is not in the symbols "
                     "cache; refusing to scale its position with a guess."
                 )
-            volume = _to_float(getattr(trade_data, "volume", 0))
+            volume = parse_money(getattr(trade_data, "volume", 0))
             qty = _broker_volume_to_qty(
                 volume, self._scale_for(symbol).volume_per_qty
             )
@@ -3443,7 +3454,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             row: dict[str, Any] = {
                 "symbol": normalized_symbol,
                 "qty": qty,
-                "entry_price": _to_float(getattr(position, "price", 0)),
+                "entry_price": parse_money(getattr(position, "price", 0)),
                 "current_price": 0.0,
                 "unrealized_pnl": 0.0,
             }

@@ -689,3 +689,72 @@ def test_adapter_client_after_discovery_uses_the_adapter_installed_reactor():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+
+
+def test_trader_balance_raises_on_an_unreadable_balance():
+    """A garbage broker balance must not be discovered as a 0.00 account."""
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery._trader_balance(SimpleNamespace(moneyDigits=2, balance="junk"))
+
+
+def test_discover_alpaca_accounts_raises_on_unreadable_cash(monkeypatch):
+    class _FakeAccount:
+        id = "acc-id"
+        account_number = "broker-42"
+        status = "ACTIVE"
+        equity = 1234.56
+        cash = "junk"
+
+    class _FakeTradingClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def get_account(self):
+            return _FakeAccount()
+
+    fake_module = SimpleNamespace(TradingClient=_FakeTradingClient)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "alpaca",
+        SimpleNamespace(trading=SimpleNamespace(client=fake_module)),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules, "alpaca.trading", SimpleNamespace(client=fake_module)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "alpaca.trading.client", fake_module)
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery.discover_alpaca_accounts("k", "s", True)
+
+
+def test_discover_alpaca_accounts_raises_on_unreadable_equity(monkeypatch):
+    class _FakeAccount:
+        id = "acc-id"
+        account_number = "broker-42"
+        status = "ACTIVE"
+        equity = "junk"
+        cash = 1234.56
+
+    class _FakeTradingClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def get_account(self):
+            return _FakeAccount()
+
+    fake_module = SimpleNamespace(TradingClient=_FakeTradingClient)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "alpaca",
+        SimpleNamespace(trading=SimpleNamespace(client=fake_module)),
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules, "alpaca.trading", SimpleNamespace(client=fake_module)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "alpaca.trading.client", fake_module)
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery.discover_alpaca_accounts("k", "s", True)

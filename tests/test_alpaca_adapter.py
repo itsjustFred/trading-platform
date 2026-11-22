@@ -38,6 +38,9 @@ class _FakeOrder:
 class _FakePosition:
     symbol: str
     qty: float
+    avg_entry_price: float = 1.0
+    current_price: float = 1.0
+    unrealized_pl: float = 0.0
 
 
 class _FakeTradingClient:
@@ -648,10 +651,23 @@ def test_bulk_response_shape_is_not_read_as_zero() -> None:
         asyncio.run(adapter.cancel_open_orders())
 
 
+def _position_row(**overrides):
+    """A broker position row with every money field readable by default."""
+    row = {
+        "symbol": "AAPL",
+        "qty": 1.0,
+        "avg_entry_price": 100.0,
+        "current_price": 101.0,
+        "unrealized_pl": 1.0,
+    }
+    row.update(overrides)
+    return SimpleNamespace(**row)
+
+
 def test_positions_mark_an_unparseable_qty_instead_of_reading_it_as_flat() -> None:
     """A broker row whose qty cannot be read is flagged, not silently zeroed."""
     client = _FakeTradingClient(
-        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+        positions=[_position_row(qty="not-a-number")]
     )
     adapter = _adapter(client)
 
@@ -670,7 +686,7 @@ def test_flatten_refuses_to_treat_an_unparseable_qty_as_flat() -> None:
     stamp the deployment stopped over a live position.
     """
     client = _FakeTradingClient(
-        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+        positions=[_position_row(qty="not-a-number")]
     )
     adapter = _adapter(client)
 
@@ -685,7 +701,7 @@ def test_cancel_orphaned_protections_refuses_an_unparseable_qty() -> None:
     stop that is guarding a live position.
     """
     client = _FakeTradingClient(
-        positions=[SimpleNamespace(symbol="AAPL", qty="nan-ish")],
+        positions=[_position_row(qty="nan-ish")],
         orders=[_FakeOrder(id="stop-1", symbol="AAPL", side="sell", order_type="stop")],
     )
     adapter = _adapter(client)
@@ -892,3 +908,89 @@ def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
 def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     adapter = _adapter(_FakeTradingClient())
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
+
+
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+#
+# ``_to_float(..., default=0.0)`` used to map an unreadable money field onto
+# zero: a malformed qty read as "flat", a malformed stop price as "no stop",
+# a malformed cash balance as "0.00". Every money field below now parses
+# through ``shared.money`` and raises on a value the broker did not really send.
+
+
+def test_get_balance_raises_on_an_unreadable_cash_field() -> None:
+    client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="not-a-number", equity=100.0)
+    )
+    adapter = _adapter(client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_raises_on_an_unreadable_equity_field() -> None:
+    client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash=100.0, equity="not-a-number")
+    )
+    adapter = _adapter(client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_falls_back_to_cash_when_equity_is_absent() -> None:
+    client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash=100.0, equity=None)
+    )
+    adapter = _adapter(client)  # type: ignore[arg-type]
+
+    balance, equity = asyncio.run(adapter.get_balance())
+
+    assert (balance, equity) == (100.0, 100.0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["avg_entry_price", "current_price", "unrealized_pl"],
+)
+def test_get_positions_raises_on_an_unreadable_money_field(field: str) -> None:
+    client = _FakeTradingClient(positions=[_position_row(**{field: "junk"})])
+    adapter = _adapter(client)
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_positions())
+
+
+def test_protective_stop_raises_on_an_unreadable_stop_price() -> None:
+    from live_runner.alpaca_adapter import _protective_stop_of
+
+    order = {
+        "id": "stop-1",
+        "symbol": "AAPL",
+        "side": "sell",
+        "order_type": "stop",
+        "stop_price": "junk",
+        "qty": 1.0,
+    }
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        _protective_stop_of(order, order, {"AAPL": "sell"})
+
+
+def test_best_stop_price_raises_on_an_unreadable_stop_price() -> None:
+    adapter = _adapter(_FakeTradingClient())
+    order = SimpleNamespace(symbol="AAPL", stop_price="junk")
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        adapter._best_stop_price([order], "AAPL")
+
+
+def test_reconcile_raises_on_an_unreadable_filled_qty() -> None:
+    class _OrderClient:
+        def get_order_by_client_id(self, _signal_id):
+            return SimpleNamespace(filled_qty="junk")
+
+    adapter = _adapter(_OrderClient())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter._reconcile_signal_fill("00000000-0000-0000-0000-000000000001"))
