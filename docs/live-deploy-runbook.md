@@ -16,6 +16,70 @@ Status: credential-gated as of 2026-07-13.
   a mode that only comes from the bot's own config default, which is read from the processor the
   deployment runs.
 
+## Ops Alert Channel (#304)
+
+The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
+paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, installed
+by `run_daemon()` at daemon start; importing `live_runner.daemon` does not install the alert sink
+(logging and Sentry setup still happen at import).
+
+Set the variables in the environment the daemon runs with — e.g. exported before start or in the
+sourced `.accounts.env` / a systemd `EnvironmentFile`.
+
+- `OPS_ALERT_WEBHOOK_URL` — webhook URL. **Unset disables alerting entirely**; the daemon then
+  behaves exactly as before. There is no other configuration needed to turn it on.
+- `OPS_ALERT_MAX_PER_MINUTE` (default `12`) — alerts per sliding minute; overflow is dropped and
+  the drop count is folded into the next alert that does go out.
+- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — alerts with the same dedup key inside this window
+  send once. The key is the `data.alert` marker plus the record's `account_id`,
+  `deployment_id`, `service_id` and `symbol` when present — so the same marker on a different
+  deployment is a different alert, but a changed payload (e.g. new mismatch quantities) under the
+  same marker and scope is still suppressed until the window expires. For records without a
+  marker the key is logger + level + message template (not the formatted message) plus the same
+  scope identifiers.
+- `OPS_ALERT_MIN_LEVEL` (default `ERROR`) — minimum level for level-triggered alerts, as a level
+  name (`CRITICAL`) or number. Raise it to `CRITICAL` to page only on emergencies; an explicit
+  `data.alert` marker still bypasses the floor because it is a deliberate operator alert. An
+  invalid value falls back to `ERROR` rather than muting the channel.
+- `OPS_ALERT_EVENTS` (unset = everything) — comma-separated allowlist of event classes. An entry
+  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name; when set,
+  only matching records page, so routine errors can be filtered without touching call sites. Logger
+  names match the logging hierarchy: `trading.live-runner` also covers
+  `trading.live-runner.<child>` but not `trading.live-runnerx`. **Markers and `CRITICAL` records
+  always page regardless of the allowlist** — the allowlist exists to filter routine errors, and
+  muting those two would hide real emergencies. Note that today all live modules log under the
+  single logger `trading.live-runner` (`get_logger("live-runner")`), so a logger-name allowlist can
+  only select "the whole live daemon", not one module inside it.
+- `OPS_ALERT_IGNORE` (unset = nothing ignored) — comma-separated denylist of fnmatch patterns
+  (e.g. `poll failed for *`, `*heartbeat*`) matched against the message template and the rendered
+  message. Matching is `fnmatchcase`: case-sensitive, and a pattern cannot itself contain a comma
+  (the comma separates entries). A match drops the record even when it is a `data.alert` marker or
+  `CRITICAL`, so this is the explicit "this one routine error is noise" switch — a broad pattern
+  such as `*failed*` can silently mute the known emergency markers, which is why setting it logs a
+  startup warning. Use it to mute a single noisy ERROR without touching call sites; prefer it over
+  a broad `OPS_ALERT_EVENTS` allowlist.
+
+The effective filter (min level, allowlist, denylist) is logged once at startup on the
+`trading.alerts` logger, and setting `OPS_ALERT_EVENTS` or `OPS_ALERT_IGNORE` additionally logs a
+warning — a filter that matches nothing, or a denylist wide enough to mute the emergency markers,
+would otherwise leave the channel silently dead or silently mute.
+
+What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
+any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
+at any level — `data.alert` markers route even when `LOG_LEVEL` would keep the record out of the
+file/console output — then filtered by `OPS_ALERT_IGNORE` and, for routine errors only,
+`OPS_ALERT_EVENTS`.
+
+Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
+webhook drops and counts alerts; it can never block or raise into a trading path. A failed send
+(e.g. a Discord 429 or 5xx) is counted and logged on the `trading.alerts` logger, not retried — a single
+lost alert is accepted for v1 rather than risking a retry storm against a struggling webhook.
+The sink's own logger (`trading.alerts`) never pages, so a failing webhook cannot feed alerts
+back into the channel.
+Payloads are
+redacted with the same rules as the JSON log formatter before they leave the process. Only the
+live daemon installs the sink today; other entry points are unaffected.
+
 ## Live Trailing Stops
 
 Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:
@@ -662,6 +726,20 @@ the running build does not have yet applies them on startup (see "Commission sig
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+## Indicator Kernel Warm-up (#378)
+
+The shared indicator hot loops (`shared/indicators/`) run as `numba.njit`
+compiled kernels. Importing `shared.indicators` stays cheap — numba is
+imported lazily — but the **first call of each kernel in a process pays a
+one-time compile of roughly 0.1–0.8 s** (four kernels: the two Supertrend
+recursions and the two `custom_swings` ATR loops). For a live signal bot
+that is the first bar it evaluates; for a backtest it is inside the first
+strategy evaluation and is amortised over the run. Compiled kernels are
+cached in the `__pycache__` directory next to `shared/indicators/` (or
+under `NUMBA_CACHE_DIR` when set), so a warm checkout does not recompile
+after the first process. Set `TP_DISABLE_NUMBA=1` to force the pure
+Python/NumPy path everywhere (parity is pinned bit-for-bit either way).
+
 ## Loss Circuit Breaker (#301)
 
 Every live account and every deployment carries a persisted loss breaker
@@ -947,8 +1025,8 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 ## Execution prices and commissions (Alpaca, #124)
 
 - `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet. Every reader treats `NULL` as "net PnL incomplete", never as zero: the live stats payload reports `net_pnl: null`, `net_pnl_complete: false` and `commission_unknown_count`, and trade/signal payloads carry `commission: null`.
-- Alpaca crypto fees are posted end of day as `CFEE` account activities, so crypto fills are stored with `NULL`. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST, once a trade date is two UTC days old and for fills up to 30 days back, allocates each (pair, trade date)'s fee pro rata by received quantity, converts it to USD and writes it. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules.
-- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, trade date not posted yet).
+- Alpaca crypto fees are posted as `CFEE` account activities in batches, so crypto fills are stored with `NULL`. `CFEE.date` is the *posting* date (the New York date of `created_at`), not the trade date, and observed posting delays reach ~51 h, so there is no fixed delay to wait out. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST for fills up to 30 days back. `CFEE` entries are clustered into posting batches by `created_at` (entries within 15 minutes of each other are one batch); a batch's fee covers the fills since the previous batch's latest `created_at` up to its own. A fill newer than the latest posted batch stays `NULL` and is retried on the next pass - "not posted yet" is never treated as "no fee". Two fee kinds exist: asset fees (on buys) name their pair and a base-asset `qty`; USD fees (on sells) carry only a negative `net_amount` and *no* `symbol`, so they form a per-account, per-batch USD pool that is allocated to a pair only when exactly one crypto pair has sells in the batch window - with several selling pairs the USD part fails closed while pair-attributed asset fees are still priced. Each fee is allocated pro rata by received quantity and converted to USD. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules. The first fetched batch fails closed when an earlier batch or earlier fills may exist outside the fetch window, so a posting stall longer than the lookback leaves a batch unpriced rather than risk the wrong attribution. Checking for earlier crypto fills is a full-history `FILL` scan per adapter, bounded by `MAX_ACTIVITY_PAGES` (200) requests against the shared ~200/min Alpaca budget. A found instant and an unfinished scan are cached, but a completed scan that finds *no* crypto fill is deliberately rescanned every pass - a fill posted later can still carry an earlier `transaction_time`, so `None` is not fixed history. That state only persists while crypto executions await a commission that the broker reports no fills for (for example local rows Alpaca does not report - a wrong account or symbol mismatch), which the pass logs as a warning; on a healthy account the scan resolves to a cached instant or UNKNOWN and runs once.
+- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, no posted CFEE batch covers it yet).
 - `actual_price_observed` labels every Alpaca price: `observed` (stated for this fill), `derived` (computed from broker prices: the order's `filled_avg_price` on a single-fill order, or a reconciled remainder), `sent_bad`/`absent` (no usable price), `derived_unavailable` (the remainder's price could not be derived honestly). A stream event never borrows the order's cumulative average for a partial fill.
 - A reconciled fill whose order has no usable `filled_avg_price` is not stored; the next reconciliation pass (adapter connect) retries it. Otherwise the missing QUANTITY is always stored. Its price is `(avg*broker_qty - sum(local price*qty)) / missing_qty`, labelled `derived`, when every local leg has a usable price and the result lies within 10% of the order's average (`REMAINDER_PRICE_MAX_REL_DEVIATION`); otherwise it is stored at `0.0` with `derived_unavailable`, so exit sizing and duplicate-order protection still see the quantity.
 - `live_executions.timestamp` drives PnL ordering and is never invented (#135). A fill takes the stream event's own timestamp, then the order's `filled_at`, then its `updated_at`; a stamp that carries no time of day (a bare date such as `2026-11-03`) is refused rather than read as midnight. When none parses, no row is stored: the stream path logs the quantity it dropped (`filled_qty`, `broker_cumulative_filled_qty`) and the reconciled path logs `missing_filled_qty`, and both say the retry is the next adapter connect, because Alpaca reconciliation runs on `connect()` only - there is no periodic pass. Until then the local filled quantity understates the broker's, so exit sizing and duplicate-order protection size against a flat position.
@@ -974,5 +1052,112 @@ there is deliberately no `runner.cli` subcommand for it.
   Status").
 
 ## Commission sign migration (cTrader, #205)
+
+`live_executions.commission` is a positive cost for every broker. The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge, which is indistinguishable from a new-convention rebate and is never converted. Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## Conflicting broker order id on a duplicate signal (#126)
+
+A redelivered or duplicate live signal that carries a **different non-empty**
+`broker_order_id` than the stored one means one of two things: a second broker
+order was placed for one logical signal, or the ids were mapped wrongly. Either
+way a broker order may exist that the ledger does not track, and an untracked
+open position is an unmanaged one. **Fail closed:** the deployment is halted,
+not warned at.
+
+**What the platform does** (`shared/database.py`,
+`live_runner/broker_order_conflicts.py`)
+
+- The tracked id is never overwritten. The conflicting id is recorded on the
+  signal: `live_signals.metadata_json["conflicting_broker_order_ids"]`,
+  deduplicated across redeliveries, in the same transaction as the halt.
+- The **affected deployment** is set to `PAUSED`. The other deployments on the
+  account keep trading, and their positions are untouched. A `STOPPED`
+  deployment is never downgraded: its own cancel-and-flatten enforcement handles
+  it, so check `stopped_enforced_at` on the deployment payload (and the broker)
+  before treating it as closed. A `STOPPED` row without that stamp still has
+  exposure at the broker - `exposure_may_be_open` reports exactly that.
+- `ERROR` log with `alert=live_broker_order_id_conflict` (Sentry turns it into
+  an event), naming the signal, the deployment, the tracked and the conflicting
+  id, and whether this call wrote the halt.
+- Every service sync tick re-applies the halt, before anything else in that tick
+  and in its own error handling: a restart, a status write or a row written by an
+  older build cannot leave a conflicted deployment trading again. Every halt write
+  logs the `ERROR` alert, at detection and at a tick re-halt alike; the tick adds
+  an `INFO` summary naming the deployments it re-halted. An already-halted
+  deployment logs nothing (re-writing it would move `updated_at` every pass), and
+  a halt that cannot be written is its own `ERROR` alert.
+
+**`PAUSED` still allows exits** (maintainer decision, #126). A pause blocks new
+entries and still dispatches exit-only signals, matching the `PAUSED` row of the
+"Operator safety controls" comment in `live_runner/base_adapter.py`
+("stop opening new positions; orders and positions are left untouched"): `ACTIVE` or
+`PAUSED` for a close, `ACTIVE` alone for an entry, decided per deployment from the
+raw signal - a parsed exit intent, or a plain `SELL`/`SHORT` on a deployment that
+cannot short - and checked at the fan-out, the pre-submit re-check and the atomic
+submission claim. `STOPPED` is excluded - its exposure is closed by the stop
+sweeps. This applies to every pause, manual ones included. Consequence: a
+deployment halted for a conflict can still close the position the ledger *does*
+know about; it just cannot add anything.
+
+For that to be reachable the account has to stay wired up: the broker adapter, the
+Discord listener and the per-account task set are kept for an account whose
+deployments are all `PAUSED` (they were selected from an `ACTIVE`-only account
+set, which dropped every exit at the task level). Those tasks dispatch and record;
+what may be *opened* is still decided per signal, so no entry can come out of it.
+
+**Where an operator sees it**
+
+- `GET /api/live/deployments`: `broker_order_conflicts` and
+  `halted_for_broker_order_conflict` per deployment.
+- `GET /api/live/dashboard`: `broker_order_conflicts` (fleet-wide `status`,
+  `deployment_ids`, signal rows). A halted deployment is not in
+  `active_strategies` at all, which is why the conflict has its own block.
+- SQL: `shared.database.list_live_signal_broker_order_conflicts()` (signal rows)
+  and `shared.database.deployments_with_broker_order_conflicts()` (grouped by
+  deployment).
+- Health read: `live_runner.broker_order_conflicts.check_broker_order_conflicts()`
+  → `{"status": "ok" | "error", "deployment_ids": [...], "conflicts": [...]}`.
+
+**Cost, and what grows it.** Every one of those reads scans `live_signals` for the JSON
+key, because there is no index on it: once per 60 s service-sync tick in the daemon, and
+once per dashboard or deployments request. That is fine at today's signal counts and it is
+the reason the resolution path is an endpoint rather than something a page polls in a
+loop. If the fleet ever grows enough for it to matter, the fix is structural - a partial
+index on the conflicts key, or a dedicated per-deployment flag column - and not a cap on
+the read: the reads that decide a halt and a resolution above are deliberately uncapped,
+so a trimming that hides an older conflict cannot happen there.
+
+**How to resolve one**
+
+1. Look the conflicting id up at the broker (open orders and positions). This is
+   a manual step: nothing in the platform queries the broker for the conflicting
+   id yet, so a position nobody tracks has to be found by hand. Keep the order id
+   in the reason you record below - it is the only external reference to what was
+   reconciled.
+2. **Cancel first, then close.** A conflicting id that is still resting at the broker
+   is an order the platform will never manage: cancel it at the broker and confirm it
+   reached a terminal state before you record anything. Cancelling is not closing - a
+   working order can still fill, and a fill of a cancelled order is exactly the untracked
+   position this runbook exists for.
+3. Close whatever did fill and the ledger does not track, at the broker, and account
+   for it in the ledger if it belongs to this platform.
+4. Record the resolution: `POST
+   /api/live/deployments/{id}/broker-order-conflicts/resolve` with
+   `{"confirmed_deployment_id": "<deployment id>", "reason": "<what you found>"}`.
+   The reason is
+   required and audited; the call clears every recorded conflict for the
+   deployment (a partial clear would still leave it halted) and reports the
+   in-flight submission drain with it.
+5. Resume: `PUT /api/live/deployments/{id}/status` with
+   `{"status": "ACTIVE", "confirmation": {"confirmed_deployment_id": "<deployment id>"}}`
+   (an unconfirmed write is a `428`, and a confirmation naming another deployment a
+   `409`), which does its own broker re-verification. The write is **refused with
+   `409` while a conflict is still recorded**: the way out of the halt is step 4,
+   not a status write. A resume refused with that `409` means a conflict is still
+   recorded: step 4 has not run, or a new conflict arrived since. A resume that was
+   accepted and is later re-paused means a new conflict was recorded after step 4,
+   typically a duplicate still being redelivered: the conflict ledger's own
+   read-modify-write wins that race on purpose. Investigate the new conflict and
+   repeat steps 3-5.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.

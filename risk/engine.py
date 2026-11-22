@@ -154,6 +154,25 @@ class RiskEngine:
             raise ValueError(f"{field_name} must be finite")
         return parsed
 
+    @staticmethod
+    def _caller_notional_limit(value: Any) -> float:
+        """Caller-specific notional ceiling (fraction of balance).
+
+        ``math.inf`` is the documented "uncapped" value: engines that apply
+        their own post-size caps (the native engine's free-margin leverage
+        clamp, #347) pass it so no engine-level ceiling binds. Decision
+        metadata records it as ``"uncapped"`` — ``inf`` is not JSON-safe.
+        """
+        if isinstance(value, bool):
+            raise ValueError("max_notional_per_trade must be numeric")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("max_notional_per_trade must be numeric") from exc
+        if math.isnan(parsed) or parsed == float("-inf") or parsed <= 0:
+            raise ValueError("max_notional_per_trade must be > 0")
+        return parsed
+
     def calculate_position_size(
         self,
         signal: TradeSignal,
@@ -179,6 +198,8 @@ class RiskEngine:
           EURUSD on a USD account: 1000 per 0.01 lot).
         - ``max_notional_per_trade``: optional caller-specific ceiling, used by
           engines whose leverage policy is independent of the risk config.
+          ``math.inf`` means explicitly uncapped (recorded as ``"uncapped"``
+          in the decision metadata).
 
         The returned ``SizedOrder.position_size`` is in account-currency units
         of the traded symbol (shares/lots); it is the only quantity in that
@@ -195,10 +216,8 @@ class RiskEngine:
         notional_limit = (
             self.config.max_notional_per_trade
             if max_notional_per_trade is None
-            else self._finite_number(max_notional_per_trade, "max_notional_per_trade")
+            else self._caller_notional_limit(max_notional_per_trade)
         )
-        if notional_limit <= 0:
-            raise ValueError("max_notional_per_trade must be > 0")
         exposure = self._finite_number(current_exposure, "current_exposure")
         if exposure < 0:
             raise ValueError("current_exposure must be >= 0")
@@ -397,7 +416,9 @@ class RiskEngine:
                     "stop_source": stop_source,
                     "fallback_stop_allowed": fallback_allowed and not reject_missing_stop,
                     "stop_price_provenance": stop_source,
-                    "max_notional_per_trade": notional_limit,
+                    "max_notional_per_trade": (
+                        "uncapped" if math.isinf(notional_limit) else notional_limit
+                    ),
                     "capped_by_notional": capped_by_notional,
                     **(
                         {"realized_risk_amount": realized_risk_amount}

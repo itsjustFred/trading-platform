@@ -9,7 +9,10 @@ implemented in Cleanup 16-E (#41). Pinned by `tests/test_sizing_semantics.py`.
 Every fraction below is taken of **realized cash**: `initial_capital` plus the
 net PnL of *closed* trades. The mark-to-market equity that feeds the equity
 curve is never a sizing input — an open position's paper profit is not
-spendable, and an unrealized drawdown is not a realized loss (decision record
+spendable, and an unrealized drawdown is not a realized loss. The one
+exception is the #347 free-margin leverage check, which reads
+mark-to-market equity and used margin by design (MT5-style margin) — it is
+a clamp on the sized quantity, not a sizing basis (decision record
 D2 in `docs/cleanup-16d1-money-path-semantics.md`, which also records why MT5
 and the vectorbt runner are *consistent* with this basis without being able to
 decide it). `signal replay` is the documented exception: it marks open
@@ -19,7 +22,11 @@ positions to market for sizing (decision record D9).
 
 All exposure fractions are validated as finite values in the inclusive range
 `0 < value <= 1`. `max_leverage` is a separate multiple of equity and is not a
-fraction-valued exposure field.
+fraction-valued exposure field: it is the broker maximum leverage for the
+account/asset. An unset value means an unknown maximum, and the fallback is
+per engine: native clamps to 1x (#347), while the vectorbt and pynecore
+adapters resolve it through `runner.engines._shared.resolve_max_leverage`
+to 2.0x.
 
 **Pending #240:** that `<= 1` ceiling is the current validation limit, not a permanent
 design rule. The maintainer decided on 2026-11-16 that leverage may be allowed up to the
@@ -55,9 +62,25 @@ documented here.
   when unset (equities 100%, other 20%). `risk_per_trade_pct` sizes from the
   stop distance; the position is filled up to the cap, never beyond.
 - **native (`TradeEngine`)**: the flag caps one position's notional at
-  `equity × max_position_exposure_pct`; the aggregate `RiskConfig.max_total_exposure`
+  realized cash `× max_position_exposure_pct`; the aggregate `RiskConfig.max_total_exposure`
   remains the risk engine default (`0.05`). `max_leverage` is an independent
   ceiling, so an omitted position cap preserves the native leverage behavior.
+  Since #347 the leverage check is MT5-style: the order's margin
+  (notional / `max_leverage`) must fit **free margin** — mark-to-market
+  equity minus the margin already used by open positions — and an order that
+  would need more leverage than the broker maximum is clamped down (floored
+  to `lot_step` when it binds) instead of refused. The exposure cap itself
+  stays on realized cash.
+  Two documented limitations of the native free-margin check:
+  - **Per symbol, not per account.** `TradeEngine` runs once per symbol, so
+    in multi-symbol native runs each engine judges its order against its own
+    equity and positions; margin used by other symbols' positions is
+    invisible to it (pre-existing for the leverage cap, now stated for the
+    free-margin rule).
+  - **Pending orders hold no margin.** Several pending orders created on the
+    same bar are each judged against the full free margin, so with
+    pyramiding they can jointly exceed it — the same convention MT5 applies
+    to pending orders.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.

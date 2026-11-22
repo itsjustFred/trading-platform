@@ -1472,7 +1472,7 @@ def test_discord_dispatch_threads_the_adapter_into_the_processor_gate(monkeypatc
     monkeypatch.setattr(daemon, "_apply_signal_processor", _processor)
     monkeypatch.setattr(daemon, "_validate_signal_age_before_wait", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "signal_is_fresh", lambda *a, **k: True)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _deployment: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _deployment, **_k: True)
     adapter = _adapter(_ReplacingClient())
     signal = TradeSignal(
         action="buy",

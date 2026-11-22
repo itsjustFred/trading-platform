@@ -127,3 +127,8 @@ These broad handlers landed on main while this classification was in review, and
 | `loss_breaker.py` | untrusted-fill listing for the alert, observation wrapper | loop-survival | alert/observation only |
 | `daemon.py` | `_join_default_executor` joiner-thread relay of `executor.shutdown` failures | loop-survival | infrastructure relay; re-raised on the loop thread |
 | `daemon.py` | `run_daemon` worker-join `BaseException` (interrupted or budget-expired join) | money-decision | keeps the single-instance lock and re-raises rather than handing it to a second daemon while DB writes may be in flight |
+| `broker_order_conflicts.py` | `pause_live_deployment_for_order_conflict` write failure | loop-survival | ERROR alert logged, remaining deployments still re-halted |
+| `daemon.py` | `enforce_broker_order_conflict_halts` call in `sync_services_loop` | loop-survival | ERROR alert logged, next tick retries |
+| `daemon.py` | startup failure in `_run_daemon_locked` (logs and re-raises) | money-decision | ERROR record for the alert sink, exception propagates |
+| `daemon.py` | crash handler in `_run_daemon_locked` (logs, captures, re-raises) | money-decision | ERROR record + Sentry capture, exception propagates |
+| `daemon.py` | signal-archive close in the `_run_daemon_locked` shutdown `finally` | loop-survival | WARNING logged during shutdown, nothing trades after |

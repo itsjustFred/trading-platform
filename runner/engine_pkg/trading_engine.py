@@ -442,6 +442,88 @@ class TradeEngine:
 
         return max(0.0, risk_exposure)
 
+    def _free_margin(self, mark_price: float) -> float:
+        """MT5-style free margin: equity − used margin, marked at ``mark_price``.
+
+        ``equity`` is mark-to-market — deliberately NOT the realized-cash
+        sizing basis: D2 governs what may be *risked*, while the margin
+        check governs what the broker would *accept* (#347, decisions on
+        #267/#240/#329). The balance leg is ``_sizing_equity`` — realized
+        cash net of every fee already incurred, including the entry leg of
+        still-open positions, which is what MT5 has already charged — plus
+        the floating PnL at ``mark_price``. Used margin is each open
+        position's notional at the same mark divided by the
+        account/asset maximum leverage (``_max_leverage`` — 1x when the
+        broker maximum is unknown); pending orders hold no margin, as on
+        MT5.
+        """
+        if not math.isfinite(mark_price) or mark_price <= 0:
+            return 0.0
+        leverage = self._max_leverage
+        equity = float(self._sizing_equity)
+        used_margin = 0.0
+        for position in self.positions:
+            qty = float(position.remaining_qty or 0.0)
+            if qty <= 1e-9:
+                continue
+            entry = float(position.entry_price)
+            if position.direction == "LONG":
+                equity += (mark_price - entry) * qty
+            else:
+                equity += (entry - mark_price) * qty
+            used_margin += qty * mark_price / leverage
+        return equity - used_margin
+
+    def _free_margin_quantity_cap(self, entry_price: float) -> float:
+        """Largest quantity the free-margin leverage rule affords (unfloored).
+
+        A broker accepts an order whose margin (notional / max leverage)
+        fits in free margin, i.e. ``notional <= free_margin * max_leverage``.
+        """
+        free_margin = self._free_margin(entry_price)
+        # Fail closed: a NaN free margin (e.g. a NaN mark on an open position)
+        # must not silently lift the leverage ceiling — ``nan <= 0`` is False
+        # and ``min(qty, nan)`` returns ``qty``.
+        if not math.isfinite(free_margin) or free_margin <= 0:
+            return 0.0
+        return free_margin * self._max_leverage / entry_price
+
+    def _apply_notional_caps(
+        self,
+        shares: float,
+        *,
+        entry_price: float,
+        exposure_limit: float | None,
+        lot_step: float,
+        cap_by_leverage: bool = True,
+    ) -> float:
+        """Apply the two notional ceilings to a sized quantity (#347).
+
+        The per-position exposure cap stays a sizing rule on realized cash
+        (D2). The leverage/margin check is MT5-style free margin: when it is
+        the binding constraint the quantity is clamped down and floored to
+        ``lot_step`` — to zero when no free margin remains, in which case
+        the order is skipped (logged), never refused.
+        ``cap_by_leverage=False`` is the
+        fixed-risk ``cap_fixed_risk_by_leverage=false`` opt-out.
+        """
+        exposure_qty_cap = (
+            self._sizing_equity * exposure_limit / float(entry_price)
+            if exposure_limit is not None
+            else math.inf
+        )
+        shares = min(shares, exposure_qty_cap)
+        if cap_by_leverage:
+            leverage_cap = self._free_margin_quantity_cap(float(entry_price))
+            if lot_step > 0 and 0 < leverage_cap < shares:
+                # The shared grid floor (#365/#278), not a private
+                # ``floor(x / step + 1e-12)``: the risk-engine path never
+                # re-floors its result, so an off-grid float or a one-step-low
+                # size would reach the order.
+                leverage_cap = _floor_to_lot_grid(leverage_cap, lot_step)
+            shares = min(shares, leverage_cap)
+        return max(shares, 0.0)
+
     def _calculate_position_size(
         self,
         *,
@@ -452,12 +534,14 @@ class TradeEngine:
         stop_distance: float | None = None,
         exclude_order: Order | None = None,
     ) -> float:
-        max_leverage = self._max_leverage
-        position_notional_limit = (
-            max_leverage
-            if self._max_position_exposure_pct is None
-            else min(self._max_position_exposure_pct, max_leverage)
-        )
+        # #347: two different denominators now. The per-position exposure cap
+        # stays a sizing rule on realized cash (D2); the leverage/margin
+        # check is MT5-style and judges the order against FREE MARGIN
+        # (equity − used margin), clamping to the broker maximum instead of
+        # refusing. ``self._max_leverage`` is the broker maximum for the
+        # account/asset; unknown → 1x.
+        exposure_limit = self._max_position_exposure_pct
+
         # #170: resolve -- and thereby validate -- the declared risk amount
         # here, BEFORE any stop-dependent branch. `nan > 0`, `-inf > 0` and a
         # negative amount all compare False, so a value checked after a gate is
@@ -527,12 +611,18 @@ class TradeEngine:
                     )
                     shares = min(shares, max_lot_grid)
                 uncapped_shares = shares
-                if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self._sizing_equity * position_notional_limit
-                    shares = min(shares, max_value / entry_price)
-                elif self._max_position_exposure_pct is not None:
-                    max_value = self._sizing_equity * self._max_position_exposure_pct
-                    shares = min(shares, max_value / entry_price)
+                # #347: the exposure cap (realized cash) and the free-margin
+                # leverage clamp live in `_apply_notional_caps`; the opt-out
+                # `cap_fixed_risk_by_leverage=false` skips only the margin clamp.
+                shares = self._apply_notional_caps(
+                    shares,
+                    entry_price=float(entry_price),
+                    exposure_limit=exposure_limit,
+                    lot_step=lot_step,
+                    cap_by_leverage=bool(
+                        self.config.parameters.get("cap_fixed_risk_by_leverage", True)
+                    ),
+                )
                 # Issue #151: the leverage/exposure cap is a raw
                 # equity/price ratio, so it can leave a size off the
                 # `lot_step` grid -- a size the broker would reject. Only a
@@ -619,7 +709,14 @@ class TradeEngine:
                 current_exposure=self._current_risk_exposure(
                     float(entry_price), exclude_order=exclude_order
                 ),
-                max_notional_per_trade=position_notional_limit,
+                # #347: only the realized-cash exposure cap goes into the
+                # risk engine; the leverage/margin ceiling is applied
+                # afterwards on free margin. With no exposure cap there is
+                # no engine-level ceiling — math.inf is the documented
+                # "uncapped" value (the post-cap is the real leverage bound).
+                max_notional_per_trade=(
+                    exposure_limit if exposure_limit is not None else math.inf
+                ),
             )
             shares = float(sized_order.position_size)
         else:
@@ -631,11 +728,16 @@ class TradeEngine:
                 "Set risk_per_trade_pct or fixed_risk_amount explicitly."
             )
 
-        # F21 (D2): the notional/leverage cap is denominated in the same
-        # realized sizing cash as the risk target.
-        max_value = self._sizing_equity * position_notional_limit
-        shares = min(shares, max_value / entry_price)
-        return max(shares, 0.0)
+        # F21 (D2): the per-position notional cap stays denominated in
+        # realized sizing cash; #347: the leverage/margin cap is free margin.
+        # The grid is resolved -- and thereby validated (#170) -- here for the
+        # risk-engine path; the fixed-risk branch resolved it above.
+        return self._apply_notional_caps(
+            shares,
+            entry_price=float(entry_price),
+            exposure_limit=exposure_limit,
+            lot_step=_sizing_value("lot_step", self.config.parameters.get("lot_step"), 0.0),
+        )
 
     @staticmethod
     def _to_iso(value: Any) -> str:
@@ -717,6 +819,16 @@ class TradeEngine:
             stop_distance=stop_distance,
         )
         if qty <= 0:
+            # #347: a zero size is usually the free-margin leverage clamp
+            # (no free margin remains) — log the skip like the fill-time
+            # skips instead of dropping the order silently.
+            logger.warning(
+                "Skipping %s %s order at %s: sized quantity %.6g <= 0",
+                self.symbol,
+                direction,
+                self._to_iso(row["timestamp"]),
+                qty,
+            )
             return
 
         created_time = self._to_iso(row["timestamp"])
@@ -906,6 +1018,17 @@ class TradeEngine:
                     # fill-time ledger, so that is now the basis to record.
                     order._sizing_equity = float(self._sizing_equity)
                     if order.quantity <= 0:
+                        # Usually the free-margin leverage clamp (no free
+                        # margin remains) — log like the creation skip
+                        # instead of dropping the fill silently.
+                        logger.warning(
+                            "Skipping %s %s order at %s: fill-time sized "
+                            "quantity %.6g <= 0",
+                            order.symbol,
+                            order.direction,
+                            fill_time,
+                            order.quantity,
+                        )
                         continue
                     order._equity_proportional = self._equity_proportional_for_stop(order.stop_loss)
                 if order.order_type == OrderType.MARKET:
@@ -957,6 +1080,17 @@ class TradeEngine:
                         # fill-time basis is the one to record.
                         order._sizing_equity = float(self._sizing_equity)
                         if order.quantity <= 0:
+                            # Usually the free-margin leverage clamp (no free
+                            # margin remains) — log like the creation skip
+                            # instead of dropping the fill silently.
+                            logger.warning(
+                                "Skipping %s %s order at %s: fill-time sized "
+                                "quantity %.6g <= 0",
+                                order.symbol,
+                                order.direction,
+                                fill_time,
+                                order.quantity,
+                            )
                             continue
                         # A-M4 (D5)/#170: the fill-time re-size can select a
                         # different sizing branch than the creation-time
