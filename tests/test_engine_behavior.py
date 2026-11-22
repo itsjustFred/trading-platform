@@ -960,6 +960,60 @@ class TestFreeMarginLeverageCap:
         )
         assert qty == pytest.approx(400.0)
 
+    def test_fixed_risk_exposure_cap_stays_on_realized_cash(
+        self, tmp_path: Path
+    ):
+        """The same D2 invariant on the ``fixed_risk_amount`` leg: there the
+        risk engine is bypassed, so the exposure cap inside
+        ``_apply_notional_caps`` is the ONLY realized-cash ceiling — a
+        mutant reading ``self.equity`` would silently resize the MT5-parity
+        fixed-risk strategies this branch exists for."""
+        engine = self._engine(
+            tmp_path,
+            max_leverage=10.0,
+            max_position_exposure_pct=0.4,
+            parameters={
+                "fixed_risk_amount": 5000.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+            },
+        )
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # Fixed size = 5000 / |100 - 99| = 5,000 shares; the exposure cap on
+        # realized cash is 0.4 * 100k / 100 = 400 — sizing it off
+        # ``self.equity`` (110k with the open mark) would give 440. At 10x
+        # free margin allows ~9,000, so only the exposure cap binds.
+        engine.equity = 110_000.0
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(400.0)
+
+    def test_nan_free_margin_fails_closed(self, tmp_path: Path):
+        """A NaN free margin must clamp to zero: ``nan <= 0`` is False, so
+        dropping the ``isfinite`` check would let ``min(qty, nan)`` keep
+        the uncapped size. Here a NaN entry mark on the open position
+        poisons mark-to-market equity inside ``_free_margin``."""
+        engine = self._engine(
+            tmp_path,
+            max_leverage=10.0,
+            parameters={
+                "fixed_risk_amount": 5000.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+            },
+        )
+        self._open_position(engine, entry_price=float("nan"), qty=1000.0)
+        assert engine._free_margin_quantity_cap(100.0) == 0.0
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
     def test_short_position_margin_and_pnl_signs(self, tmp_path: Path):
         engine = self._engine(tmp_path, max_leverage=2.0)
         self._open_position(
