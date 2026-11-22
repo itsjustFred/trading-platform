@@ -1593,9 +1593,10 @@ def test_commission_scaling_uses_real_protobuf_presence() -> None:
     assert _deal_commission(None) == 0.0
     assert _deal_commission(ProtoOADeal()) == 0.0
     deal = ProtoOADeal(commission=-1234, moneyDigits=3)
-    # A charge (negative broker sign) is a positive cost; a rebate stays a negative cost.
+    # A charge (negative broker sign) is a positive cost; a rebate maps to None
+    # ("fee unknown") so the fill is stored rather than refused by the write guard.
     assert _deal_commission(deal) == pytest.approx(1.234)
-    assert _deal_commission(ProtoOADeal(commission=1234, moneyDigits=3)) == pytest.approx(-1.234)
+    assert _deal_commission(ProtoOADeal(commission=1234, moneyDigits=3)) is None
     # A genuine moneyDigits of 0 is honoured, not replaced by the default.
     assert _deal_commission(ProtoOADeal(commission=-7, moneyDigits=0)) == pytest.approx(7.0)
     zero = _deal_commission(ProtoOADeal())

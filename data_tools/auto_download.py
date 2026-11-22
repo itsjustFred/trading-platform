@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -16,7 +17,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from data_tools.path_safety import ensure_dataset_path_within, validate_dataset_component
-from shared import market_calendar
+from shared import market_calendar, venue_calendar
 from shared.constants import DATA_DIR, normalize_timeframe
 
 logger = logging.getLogger(__name__)
@@ -937,14 +938,16 @@ def has_ohlcv_bars_in_range(
     return any(_parquet_has_bar_in_range(path, start_ts, end_ts) for path in matches)
 
 
-def _segment_timestamps_in_range(
+def _segment_dataset_files(
     symbol: str,
     timeframe: str,
-    start_ts: pd.Timestamp,
-    end_ts: pd.Timestamp,
-    data_dir: str | Path = "",
-) -> list[pd.Timestamp]:
-    """Collect sorted unique bar timestamps in ``[start_ts, end_ts]``."""
+    data_dir: str | Path,
+) -> list[Path]:
+    """Parquet files for ``symbol``/``timeframe`` under ``ohlcv/``.
+
+    One directory scan serves timestamp collection AND venue-pair discovery;
+    callers that need both must not ``rglob`` twice per segment.
+    """
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
     try:
@@ -952,15 +955,22 @@ def _segment_timestamps_in_range(
         validate_dataset_component(normalized_timeframe, name="timeframe")
     except ValueError:
         return []
-
     ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
-    matches = sorted(
+    return sorted(
         path
         for path in _contained_rglob(ohlcv_root, f"**/{normalized_timeframe}.parquet")
         if path.parent.name.upper() == normalized_symbol
     )
+
+
+def _timestamps_in_files(
+    files: list[Path],
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> list[pd.Timestamp]:
+    """Collect sorted unique bar timestamps in ``[start_ts, end_ts]``."""
     stamps: set[pd.Timestamp] = set()
-    for path in matches:
+    for path in files:
         try:
             frame = pd.read_parquet(path, columns=["timestamp"])
         except Exception:
@@ -1023,6 +1033,111 @@ def _uses_us_equity_calendar(
     return _US_STOCK_SYMBOL_PATTERN.fullmatch(normalized) is not None
 
 
+def _venue_pairs_from_files(
+    files: list[Path],
+    ohlcv_root: Path,
+) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for path in files:
+        parts = path.relative_to(ohlcv_root).parts
+        if len(parts) >= 4:
+            pairs.add((parts[0].lower(), parts[1].lower()))
+        elif len(parts) == 3:
+            pairs.add((parts[0].lower(), ""))
+    return pairs
+
+
+def _segment_venue_pairs(
+    symbol: str,
+    timeframe: str,
+    data_dir: str | Path,
+) -> set[tuple[str, str]]:
+    """``(source, asset_class)`` pairs declared by matching dataset paths.
+
+    Layouts are ``ohlcv/<source>/<asset_class>/.../<symbol>/<tf>.parquet``;
+    a three-component ``ohlcv/<source>/<symbol>/<tf>.parquet`` path (test
+    fixtures) contributes the source with no asset class.
+    """
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    try:
+        validate_dataset_component(normalized_symbol, name="symbol")
+        validate_dataset_component(normalized_timeframe, name="timeframe")
+    except ValueError:
+        return set()
+    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
+    return _venue_pairs_from_files(
+        _segment_dataset_files(normalized_symbol, normalized_timeframe, data_dir),
+        ohlcv_root,
+    )
+
+
+def _resolve_segment_venue_calendar(
+    symbol: str,
+    timeframe: str,
+    data_dir: str | Path,
+    pairs: set[tuple[str, str]] | None = None,
+) -> venue_calendar.VenueCalendar | None:
+    """Resolve the broker/session calendar for a coverage segment.
+
+    Every dataset path contributing bars must resolve to the SAME calendar;
+    a mixed or unknown venue returns ``None`` so the caller fails closed.
+    ``pairs`` may be supplied by a caller that already scanned the dataset
+    files, avoiding a second ``rglob`` per segment.
+    """
+    if pairs is None:
+        pairs = _segment_venue_pairs(symbol, timeframe, data_dir)
+    pairs = pairs or {("", "")}
+    calendars: list[venue_calendar.VenueCalendar] = []
+    for src, asset in sorted(pairs):
+        calendar = venue_calendar.resolve_venue_calendar(
+            symbol=symbol,
+            timeframe=timeframe,
+            data_dir=str(_resolve_data_root(data_dir)),
+            asset_class=asset or None,
+            source=src or None,
+        )
+        if calendar is None:
+            logger.info(
+                "Coverage unknown for %s %s: venue (%s, %s) resolved no calendar",
+                symbol, timeframe, src or "<none>", asset or "<none>",
+            )
+            return None
+        calendars.append(calendar)
+    signatures = {
+        (type(calendar).__name__, calendar.name, calendar.source)
+        for calendar in calendars
+    }
+    if len(signatures) != 1:
+        logger.info(
+            "Coverage unknown for %s %s: mixed venue calendars %s",
+            symbol, timeframe, sorted(signatures),
+        )
+        return None
+    return calendars[0]
+
+
+def _interval_overlap_minutes(
+    lo: pd.Timestamp,
+    hi: pd.Timestamp,
+    intervals: list[venue_calendar.TradingInterval],
+    opens: list[pd.Timestamp],
+) -> float:
+    """Minutes of ``[lo, hi)`` covered by sorted, non-overlapping intervals."""
+    if hi <= lo:
+        return 0.0
+    total = 0.0
+    first = max(0, bisect_right(opens, lo) - 1)
+    last = bisect_left(opens, hi)
+    for index in range(first, last):
+        iv = intervals[index]
+        a = max(lo, iv.open)
+        b = min(hi, iv.close)
+        if b > a:
+            total += (b - a).total_seconds() / 60.0
+    return total
+
+
 def _expected_us_equity_holidays(
     symbol: str,
     timeframe: str,
@@ -1055,13 +1170,19 @@ def has_sufficient_segment_coverage(
     session_start: str | None = None,
     session_end: str | None = None,
 ) -> bool:
-    """Return whether ``[start, end]`` has dense, gap-free coverage (#86).
+    """Return whether ``[start, end]`` has dense, gap-free coverage (#86, #133).
 
-    Expected bars = TRADING minutes / timeframe step (weekends excluded);
-    at least ``min_density`` (default 95%) must be present, and no single
-    bar-to-bar gap may exceed ``max_gap_multiplier`` x the step in trading
-    minutes (default 3x), regardless of density. A month-long segment with
-    a single bar is rejected. Unknown timeframes fail closed.
+    Expected bars come from the venue/session calendar resolved for the
+    dataset (``shared.venue_calendar``): US equities keep NYSE regular
+    sessions, FX follows the 24/5 week, crypto is continuous, and broker-CFD
+    venues use the cached cTrader/Alpaca schedule. Bars stamped outside a
+    trading session are surplus and ignored; bars missing inside a session
+    count against density, and no bar-to-bar gap may exceed
+    ``max_gap_multiplier`` x the step in TRADING minutes. A segment whose
+    venue cannot be resolved fails closed — it is never assumed 24/7.
+
+    An explicit ``session``/``session_start``/``session_end`` window keeps the
+    legacy intraday contract for callers that pass one.
     """
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
     step_minutes = TIMEFRAME_MINUTES.get(normalized_timeframe)
@@ -1075,48 +1196,186 @@ def has_sufficient_segment_coverage(
         explicit_session = _explicit_session_window(session, session_start, session_end)
     except ValueError:
         return False
-    stamps = _segment_timestamps_in_range(symbol, normalized_timeframe, start_ts, end_ts, data_dir)
+    files = _segment_dataset_files(symbol, normalized_timeframe, data_dir)
+    stamps = _timestamps_in_files(files, start_ts, end_ts)
     if not stamps:
         return False
-    if step_minutes >= 1440.0:
-        session_window = None
-    else:
-        session_window = explicit_session or _observed_session_window(
-            stamps,
-            step_minutes,
-            start_ts=start_ts,
-            end_ts=end_ts,
+
+    if explicit_session is not None and step_minutes < 1440.0:
+        session_window = explicit_session
+        holidays = _expected_us_equity_holidays(
+            symbol, normalized_timeframe, data_dir, start_ts, end_ts
         )
-    holidays = _expected_us_equity_holidays(
-        symbol,
-        normalized_timeframe,
-        data_dir,
-        start_ts,
-        end_ts,
+        expected = max(
+            _expected_trading_bars(
+                start_ts, end_ts, step_minutes, session_window, holidays
+            ),
+            1,
+        )
+        if len(stamps) / expected < min_density:
+            return False
+        limit_minutes = step_minutes * max_gap_multiplier
+        for prev, cur in zip(stamps, stamps[1:]):
+            gap_trading_minutes = _session_trading_minutes_between(
+                prev, cur, session_window, holidays
+            )
+            if gap_trading_minutes > limit_minutes:
+                return False
+        return True
+
+    ohlcv_root = _resolve_data_root(data_dir) / "ohlcv"
+    pairs = _venue_pairs_from_files(files, ohlcv_root)
+    calendar = _resolve_segment_venue_calendar(
+        symbol, normalized_timeframe, data_dir, pairs=pairs
     )
-    expected = max(
-        _expected_trading_bars(
-            start_ts,
-            end_ts,
-            step_minutes,
-            session_window,
-            holidays,
-        ),
-        1,
+    if calendar is None:
+        logger.info(
+            "Coverage unknown for %s %s %s -> %s: dataset venues %s resolved "
+            "no single venue calendar",
+            symbol, normalized_timeframe, start, end,
+            sorted(pairs) or ["<none>"],
+        )
+        return False
+
+    if isinstance(calendar, venue_calendar.ExchangeSessionCalendar) and (
+        not calendar.covers_window(start_ts, end_ts)
+    ):
+        # The fetched session list does not provably cover this window: dates
+        # absent from it may simply never have been fetched, so treating them
+        # as closed could pass coverage vacuously. US-equity datasets fall
+        # back to the built-in NYSE model instead of trusting a partial cache.
+        logger.info(
+            "Alpaca session cache for %s does not cover %s -> %s; "
+            "falling back to the built-in US-equity calendar",
+            symbol, start, end,
+        )
+        calendar = venue_calendar.NyseCalendar()
+
+    if _calendar_segment_coverage_passes(
+        calendar,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        stamps=stamps,
+        step_minutes=step_minutes,
+        min_density=min_density,
+        max_gap_multiplier=max_gap_multiplier,
+    ):
+        return True
+
+    # Broker caches only name the CURRENT year's non-recurring holidays, so a
+    # segment crossing a PAST venue holiday fails the strict checks even
+    # though the venue really was closed. Retry once with plausible US-market
+    # closure dates added — a documented over-approximation for FX venues.
+    tolerant = venue_calendar.us_holiday_tolerant_calendar(
+        calendar, start_ts, end_ts
     )
-    if len(stamps) / expected < min_density:
+    if tolerant is not calendar and _calendar_segment_coverage_passes(
+        tolerant,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        stamps=stamps,
+        step_minutes=step_minutes,
+        min_density=min_density,
+        max_gap_multiplier=max_gap_multiplier,
+    ):
+        logger.info(
+            "Coverage for %s %s %s -> %s passes only under "
+            "historical US-holiday tolerance",
+            symbol, normalized_timeframe, start, end,
+        )
+        return True
+    return False
+
+
+def _vacuous_window_is_plausible(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    step_minutes: float,
+) -> bool:
+    """Whether "zero expected bars" can be believed for this window.
+
+    The fully-closed shortcut (``expected <= 0`` -> pass) is fail-open when
+    the calendar is broken or empty: a window containing in-session weekdays
+    per the built-in NYSE model cannot really be closed everywhere. Only a
+    window the NYSE model also sees as fully closed (weekends, long holiday
+    stretches) may pass vacuously.
+
+    The probe is always ``NyseCalendar``: for a non-US venue whose calendar
+    legitimately expects zero bars on a day NYSE trades (e.g. a DAX session
+    cache omitting Whit Monday), this fails closed. That is the safe
+    direction, and practically unreachable for optimizer segments.
+    """
+    probe = venue_calendar.NyseCalendar()
+    if 1440.0 <= step_minutes < 10080.0:
+        return not probe.daily_bar_dates(start_ts, end_ts)
+    return probe.expected_bars(start_ts, end_ts, step_minutes) <= 0
+
+
+def _calendar_segment_coverage_passes(
+    calendar: venue_calendar.VenueCalendar,
+    *,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    stamps: list[pd.Timestamp],
+    step_minutes: float,
+    min_density: float,
+    max_gap_multiplier: float,
+) -> bool:
+    """Density + trading-minute gap checks under one venue calendar."""
+    if 1440.0 <= step_minutes < 10080.0:
+        # Daily bars are labelled by trading date; weekly (1w) and larger
+        # fall through to the grid path, which counts bar-start instants.
+        expected_dates = calendar.daily_bar_dates(start_ts, end_ts)
+        if not expected_dates:
+            # Window fully closed: no daily bar is expected — but only when
+            # the NYSE model agrees the window has no trading day, otherwise
+            # an empty/broken calendar would pass vacuously.
+            return _vacuous_window_is_plausible(start_ts, end_ts, step_minutes)
+        present_dates = {
+            day
+            for stamp in stamps
+            if (day := calendar.daily_bar_date(stamp)) in expected_dates
+        }
+        if len(present_dates) / len(expected_dates) < min_density:
+            return False
+        valid = sorted(
+            stamp
+            for stamp in stamps
+            if calendar.daily_bar_date(stamp) in expected_dates
+        )
+        # The gap limit is measured in MISSING DAILY BARS, not trading
+        # minutes: scaling 1440 minutes by the multiplier would let ~11 NYSE
+        # sessions go missing before failing. A gap spanning more than
+        # ``max_gap_multiplier`` bar slots fails, matching the intraday rule.
+        for prev, cur in zip(valid, valid[1:]):
+            prev_day = calendar.daily_bar_date(prev)
+            cur_day = calendar.daily_bar_date(cur)
+            if prev_day is None or cur_day is None:
+                continue
+            skipped = sum(
+                1 for day in expected_dates if prev_day < day < cur_day
+            )
+            if skipped + 1 > max_gap_multiplier:
+                return False
+        return True
+
+    step = pd.Timedelta(minutes=step_minutes)
+    intervals = calendar.trading_intervals(start_ts, end_ts)
+    opens = [iv.open for iv in intervals]
+    expected = calendar.expected_bars(start_ts, end_ts, step_minutes)
+    if expected <= 0:
+        # Same vacuous-pass guard as the daily branch above.
+        return _vacuous_window_is_plausible(start_ts, end_ts, step_minutes)
+    present = [
+        stamp
+        for stamp in stamps
+        if _interval_overlap_minutes(stamp, stamp + step, intervals, opens) > 0
+    ]
+    if len(present) / expected < min_density:
         return False
     limit_minutes = step_minutes * max_gap_multiplier
-    for prev, cur in zip(stamps, stamps[1:]):
-        if session_window is None:
-            gap_trading_minutes = _trading_minutes_between(prev, cur, holidays)
-        else:
-            gap_trading_minutes = _session_trading_minutes_between(
-                prev,
-                cur,
-                session_window,
-                holidays,
-            )
+    for prev, cur in zip(present, present[1:]):
+        gap_trading_minutes = _interval_overlap_minutes(prev, cur, intervals, opens)
         if gap_trading_minutes > limit_minutes:
             return False
     return True

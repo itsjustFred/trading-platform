@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -208,31 +207,29 @@ def test_iter_alpaca_credentials_default_block_falls_back_to_adapter_default_pai
         )
 
 
-def _tmp_accounts_env(content: str) -> Path:
-    import tempfile
-
-    fd, path = tempfile.mkstemp(suffix=".env")
-    with os.fdopen(fd, "w") as handle:
-        handle.write(content)
-    return Path(path)
+def _write_accounts_env(tmp_path: Path, content: str) -> Path:
+    path = tmp_path / ".accounts.env"
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
-def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch):
+def test_discover_configured_accounts_skips_block_with_invalid_bool(tmp_path, monkeypatch, caplog):
     """A typo'd ALPACA_PAPER_ACC{N} must skip that block with a warning, not
     abort the whole discovery run (which would also drop cTrader accounts)."""
     monkeypatch.setenv("CTRADER_APP_ID", "app")
     monkeypatch.setenv("CTRADER_APP_SECRET", "secret")
     monkeypatch.setenv("CTRADER_ACCESS_TOKEN", "token")
-    env_path = _tmp_accounts_env(
+    env_path = _write_accounts_env(
+        tmp_path,
         "ALPACA_API_KEY_ACC1=good-key\n"
         "ALPACA_SECRET_KEY_ACC1=good-secret\n"
         "ALPACA_PAPER_ACC1=false\n"
         "ALPACA_API_KEY_ACC2=bad-key\n"
         "ALPACA_SECRET_KEY_ACC2=bad-secret\n"
-        "ALPACA_PAPER_ACC2=ture\n"
+        "ALPACA_PAPER_ACC2=ture\n",
     )
 
-    async def _discover(app_id, app_secret, access_token):
+    async def _discover_ctrader(app_id, app_secret, access_token):
         return [
             LiveAccount(
                 id="47644617",
@@ -243,13 +240,40 @@ def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch)
             )
         ]
 
-    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover)
+    discovered_keys: list[str] = []
+
+    def _discover_alpaca(api_key, secret_key, paper):
+        discovered_keys.append(api_key)
+        return [
+            LiveAccount(
+                id=f"alpaca-{len(discovered_keys)}",
+                name="Alpaca paper",
+                broker="alpaca",
+                is_demo=paper,
+            )
+        ]
+
+    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover_ctrader)
+    # Stubbed: the unstubbed discovery builds a real alpaca-py client from the fixture keys, which
+    # resolves Alpaca's live host and connects. The value of this test is the skip, not the network.
+    monkeypatch.setattr(account_discovery, "discover_alpaca_accounts", _discover_alpaca)
 
     accounts = asyncio.run(account_discovery.discover_configured_accounts(accounts_env=env_path))
 
     # The cTrader account survives; the typo'd block is skipped with a warning
     # instead of aborting the whole discovery run.
     assert [account.id for account in accounts if account.broker == "ctrader"] == ["47644617"]
+    # The malformed block is skipped *with a warning*, and the healthy block is still discovered -
+    # neither half may be silent.
+    assert discovered_keys == ["good-key"]
+    assert [account.id for account in accounts if account.broker == "alpaca"] == ["alpaca-1"]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING" and "ACC2" in str(record.data)
+    ]
+    assert len(warnings) == 1, [record.getMessage() for record in caplog.records]
+    assert "ALPACA_PAPER_ACC2" in warnings[0].data["error"]
 
 
 def test_iter_alpaca_credentials_safe_keeps_valid_sibling_blocks(monkeypatch):
