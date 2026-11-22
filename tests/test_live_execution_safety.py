@@ -929,6 +929,20 @@ def test_exit_only_metadata_restamps_action_for_short_book(monkeypatch):
     assert prepared.action == "buy"
 
 
+def test_exit_only_metadata_drops_a_forged_reprotection_marker(monkeypatch):
+    """#145: ``exit_reprotection`` is adapter-owned crash-recovery state. A
+    producer payload carrying it must not survive to persistence - only the
+    adapter may stamp it after it released the broker-side protection itself."""
+    prepared, _qty = _prepare_exit_only(
+        monkeypatch,
+        [{"symbol": "EURUSD", "qty": 2.0}],
+        ledger_qty=2.0,
+        exit_reprotection={"side": "sell", "stop_price": 1.0},
+    )
+
+    assert "exit_reprotection" not in prepared.metadata
+
+
 def test_exit_only_metadata_rejects_multiple_positions(monkeypatch):
     with pytest.raises(ValueError, match="2 broker positions"):
         _prepare_exit_only(

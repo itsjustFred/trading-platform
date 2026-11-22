@@ -178,3 +178,50 @@ def test_prune_keeps_the_in_flight_lease(tmp_path) -> None:
 
     assert removed == 1
     assert remaining == ["running"]
+
+
+def test_pending_exit_reprotections_skip_non_exit_only_signals(
+    isolated_db_sandbox,
+) -> None:
+    """#145: only signals that are themselves exit-only qualify - a marker on
+    an entry signal is inert and must never be replayed as protection."""
+    from tests.conftest import seed_live_deployments
+
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+    seed_live_deployments(database, ["dep-1"], account_id="acct-1")
+    marker = {"side": "sell", "stop_price": 190.0, "take_profit_price": 210.0}
+    now = datetime.now(timezone.utc)
+    with database.get_session() as session:
+        session.add(
+            database.LiveSignalModel(
+                id="sig-exit",
+                deployment_id="dep-1",
+                symbol="AAPL",
+                action="sell",
+                theoretical_price=200.0,
+                timestamp=now,
+                metadata_json={
+                    "risk_sizing_mode": "exit_only",
+                    "exit_reprotection": marker,
+                },
+            )
+        )
+        session.add(
+            database.LiveSignalModel(
+                id="sig-entry",
+                deployment_id="dep-1",
+                symbol="AAPL",
+                action="buy",
+                theoretical_price=200.0,
+                timestamp=now,
+                metadata_json={"exit_reprotection": marker},
+            )
+        )
+        session.commit()
+
+    pending = database.list_pending_exit_reprotections("acct-1")
+
+    assert [row["signal_id"] for row in pending] == ["sig-exit"]
+    assert pending[0]["marker"] == marker
+    assert pending[0]["symbol"] == "AAPL"

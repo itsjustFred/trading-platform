@@ -1540,3 +1540,489 @@ def test_list_protective_stops_sees_an_oco_stop_leg() -> None:
     assert stops[0].order_id == "oco-1-sl"
     assert stops[0].stop_price == 190.0
     assert stops[0].side == "sell"
+
+
+# ─── #350 review: whole-share exits, pinned guards, attribution ─────────────
+
+
+def _partial_signal(qty: float) -> LiveSignal:
+    base = _exit_signal_full()
+    return base.model_copy(
+        update={
+            "metadata": {
+                **base.metadata,
+                "qty": qty,
+                "explicit_qty": qty,
+            }
+        }
+    )
+
+
+def test_partial_exit_floors_qty_so_the_remainder_stays_whole(monkeypatch) -> None:
+    """3 shares, exit 1.5: the OCO/GTC re-place rejects fractions, so the exit
+    floors to 1 and the remainder 2 is re-protected as whole shares."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(qty=3.0),
+        positions=[_FakePosition("AAPL", 3.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_partial_signal(1.5), qty=1.5))
+
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+    assert float(market_orders[0].qty) == 1.0
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 2.0
+    # The persisted signal records the floored qty that was actually sent.
+    assert captured[0].metadata["explicit_qty"] == 1.0
+    marker = captured[0].metadata["exit_reprotection"]
+    assert marker["exit_qty"] == 1.0
+    assert marker["reprotect_qty"] == 2.0
+
+
+def test_partial_exit_refuses_when_flooring_leaves_less_than_one_share(
+    monkeypatch,
+) -> None:
+    """A sub-share requested exit cannot floor to a whole share: refuse before
+    any broker write rather than leave an unprotectable remainder."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(qty=3.0),
+        positions=[_FakePosition("AAPL", 3.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    with pytest.raises(ValueError, match="floors"):
+        asyncio.run(adapter.submit_order(_partial_signal(0.5), qty=0.5))
+
+    assert client.cancelled == []
+    assert client.submitted == []
+
+
+def test_partial_exit_refuses_a_fractional_broker_position(monkeypatch) -> None:
+    """No whole-share exit leaves a whole remainder of a fractional position:
+    refuse before any broker write."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(qty=3.5),
+        positions=[_FakePosition("AAPL", 3.5)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    with pytest.raises(ValueError, match="fractional"):
+        asyncio.run(adapter.submit_order(_partial_signal(1.0), qty=1.0))
+
+    assert client.cancelled == []
+    assert client.submitted == []
+
+
+def test_position_change_during_release_refuses_and_restores(monkeypatch) -> None:
+    """The position moved between planning and release: refuse the exit and
+    put the recorded protection back on the position that remains."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    calls = {"n": 0}
+
+    async def _qty(symbol: str) -> float | None:
+        calls["n"] += 1
+        # First read plans against 10; every later read sees 9.
+        return 10.0 if calls["n"] == 1 else 9.0
+
+    monkeypatch.setattr(adapter, "_symbol_position_qty", _qty)
+
+    with pytest.raises(RuntimeError, match="position changed"):
+        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    # The exit never went out; the restore re-protected the 9 that remain.
+    assert not [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 9.0
+
+
+def test_still_working_protection_after_cancel_refuses_the_exit(monkeypatch) -> None:
+    """A cancel Alpaca accepted but has not settled still reserves the shares:
+    the re-read must refuse the exit instead of submitting into the refusal."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+        cancel_settles=False,
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    with pytest.raises(RuntimeError, match="still"):
+        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert not [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    # The protection was put back for the still-whole position.
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 10.0
+
+
+def test_exit_order_rejected_on_submission_restores_protection(monkeypatch) -> None:
+    """The broker answering 'rejected' at submit means the exit never happened:
+    the cancelled protection must be re-placed."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_submit = client.submit_order
+
+    def _reject_exit(order_data):
+        if _type_text(order_data) == "market":
+            return SimpleNamespace(
+                id=str(uuid4()), symbol="AAPL", status="rejected"
+            )
+        return real_submit(order_data)
+
+    client.submit_order = _reject_exit  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="rejected on submission"):
+        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 10.0
+
+
+def test_changed_protection_between_plan_and_release_refuses_before_cancel(
+    monkeypatch,
+) -> None:
+    """Trailing replaced the stop after the plan was computed: the in-lock
+    re-read sees a different book and refuses BEFORE the first cancel, so no
+    restore is needed and nothing is written."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_candidates = adapter._exit_protection_candidates
+    calls = {"n": 0}
+
+    async def _candidates(client_, symbol, side):
+        calls["n"] += 1
+        result = await real_candidates(client_, symbol, side)
+        if calls["n"] == 2:
+            # The second read (inside _order_book_lock) sees the protection
+            # gone - e.g. trailing replaced it a moment ago.
+            return []
+        return result
+
+    monkeypatch.setattr(adapter, "_exit_protection_candidates", _candidates)
+
+    with pytest.raises(RuntimeError, match="changed"):
+        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert client.cancelled == []
+    assert client.submitted == []
+
+
+def test_unknown_exit_submit_outcome_is_logged_and_protection_restored(
+    monkeypatch, caplog
+) -> None:
+    """A timeout is not a refusal: the log must say the outcome is unknown,
+    and protection is still restored for whatever position remains."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    def _timeout(order_data):
+        if _type_text(order_data) == "market":
+            raise TimeoutError("read timed out")
+        return _FakeTradingClient.submit_order(client, order_data)
+
+    client.submit_order = _timeout  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(TimeoutError):
+            asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert any("outcome is unknown" in record.message for record in caplog.records)
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 10.0
+
+
+def test_definite_broker_rejection_does_not_claim_unknown_outcome(
+    monkeypatch, caplog
+) -> None:
+    """An alpaca-py APIError is the broker answering 'no': no unknown-outcome
+    warning, but the protection is still restored."""
+    from alpaca.common.exceptions import APIError
+
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    def _reject(order_data):
+        if _type_text(order_data) == "market":
+            raise APIError("insufficient qty available for order to be filled")
+        return _FakeTradingClient.submit_order(client, order_data)
+
+    client.submit_order = _reject  # type: ignore[method-assign]
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(APIError):
+            asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    assert not any(
+        "outcome is unknown" in record.message for record in caplog.records
+    )
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+
+
+def test_lone_stop_limit_leg_is_replaced_as_a_stop_limit(monkeypatch) -> None:
+    """A stop-limit protection goes back as a stop-limit, not a plain stop:
+    re-placing it as a stop would widen the trigger into a market order."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="sl-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="stop_limit",
+                qty=10.0,
+                stop_price=190.0,
+                limit_price=189.5,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    stops = [
+        order
+        for order in client.submitted
+        if _type_text(order) == "stop_limit"
+    ]
+    assert len(stops) == 1
+    assert float(stops[0].stop_price) == 190.0
+    assert float(stops[0].limit_price) == 189.5
+    assert float(stops[0].qty) == 6.0
+
+
+def test_reprotect_order_names_the_parent_entry_signal(monkeypatch) -> None:
+    """The re-placed OCO's client_order_id embeds the entry signal id so a
+    later broker-side close of the remainder can be booked against the
+    parent's ledger (#277 attribution contract)."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    monkeypatch.setattr(
+        alpaca_module,
+        "find_latest_filled_live_entry_signals",
+        lambda deployment_ids, symbols: {
+            "AAPL": {"signal_id": "entry-sig-1", "deployment_id": "dep-1"}
+        },
+    )
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    client_order_id = str(getattr(oco[0], "client_order_id", ""))
+    entry_part, _, exit_part = client_order_id.partition("-reprotect-")
+    assert entry_part == "entry-sig-1"
+    assert exit_part  # the exit signal id keeps the key unique per exit
+    marker = captured[0].metadata["exit_reprotection"]
+    assert marker["entry_signal_id"] == "entry-sig-1"
+
+
+def test_recovery_replays_only_the_newest_marker_per_symbol(monkeypatch) -> None:
+    """Two pending markers on one symbol: the newest (first row) is replayed;
+    the older one is left pending rather than placing stale protection."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-new",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 195.0,
+                    "take_profit_price": 215.0,
+                },
+            },
+            {
+                "signal_id": "sig-old",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 180.0,
+                    "take_profit_price": 220.0,
+                },
+            },
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].stop_loss.stop_price) == 195.0
+    assert cleared == ["sig-new"]
+
+
+def test_recovery_sees_a_held_stop_leg_nested_under_a_filled_parent(
+    monkeypatch,
+) -> None:
+    """The held stop leg is only reachable nested under its filled parent
+    (status=all listing); without nested reads the marker looks half-missing
+    and is never cleared."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 6.0)],
+    )
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    # Both legs are seen (stop via the filled parent's held leg, tp working):
+    # the marker is satisfied and cleared, nothing is re-placed.
+    assert client.submitted == []
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_clears_a_marker_whose_side_no_longer_matches(monkeypatch) -> None:
+    """A marker for the opposite side is stale: alert, then clear it so it
+    cannot pile up ahead of recoverable markers."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "buy",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_clears_a_marker_with_no_recorded_levels(monkeypatch) -> None:
+    """A marker that never recorded levels and finds no protection can never
+    place anything: alert, then clear it."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {"side": "sell"},
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == ["sig-1"]

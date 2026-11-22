@@ -42,6 +42,7 @@ from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.database import (
     apply_live_execution_commissions,
     clear_live_signal_metadata_key,
+    find_latest_filled_live_entry_signals,
     get_live_signal_broker_order_id,
     get_live_signal_filled_qty,
     get_live_signal_reconciliation_cursor,
@@ -273,6 +274,57 @@ def _exit_protection_kind(candidate: Mapping[str, Any]) -> str | None:
     if order_type == "limit":
         return "tp"
     return None
+
+
+def _exit_protection_signature(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[str], float | None, float | None, float | None]:
+    """What an exit release depends on: cancel ids and the re-place levels.
+
+    Compared again inside ``_order_book_lock`` so a stop trailing moved (or a
+    leg replaced) between planning and release refuses the exit instead of
+    cancelling an order the plan no longer describes.
+    """
+    stops = [c for c in candidates if _exit_protection_kind(c) == "stop"]
+    take_profits = [c for c in candidates if _exit_protection_kind(c) == "tp"]
+    return (
+        sorted({cid for c in candidates for cid in c["cancel_ids"]}),
+        _single_level([c["stop_price"] for c in stops]),
+        _single_level([c["limit_price"] for c in stops if c["limit_price"] is not None]),
+        _single_level([c["limit_price"] for c in take_profits]),
+    )
+
+
+async def _clear_exit_reprotection_marker(
+    signal_id: str, symbol: str, reason: str
+) -> None:
+    """Best-effort ``exit_reprotection`` marker clear; failure only means replay re-verifies."""
+    try:
+        await asyncio.to_thread(
+            clear_live_signal_metadata_key,
+            signal_id,
+            EXIT_REPROTECTION_METADATA_KEY,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Alpaca exit re-protection marker for %s could not be cleared (%s): %r",
+            symbol,
+            reason,
+            exc,
+        )
+
+
+def _is_definite_broker_rejection(exc: BaseException) -> bool:
+    """Whether ``exc`` proves the broker answered and refused the order.
+
+    alpaca-py raises ``APIError`` for an HTTP response; a timeout or connection
+    error leaves the outcome unknown - the order may be working at the broker.
+    """
+    try:
+        from alpaca.common.exceptions import APIError
+    except ImportError:
+        return False
+    return isinstance(exc, APIError)
 
 
 def _stop_candidates(order: Any) -> Iterator[Any]:
@@ -1722,11 +1774,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         candidates = await self._exit_protection_candidates(client, symbol, side)
         if not candidates:
             return None
+        entry_signal_id = await self._entry_signal_for_position(signal, symbol)
         plan: dict[str, Any] = {
             "symbol": symbol,
             "side": side,
             "position_qty": abs(position_qty),
             "exit_qty": qty,
+            "entry_signal_id": entry_signal_id,
             "reprotect_qty": max(abs(position_qty) - qty, 0.0),
             "order_ids": sorted(
                 {cid for c in candidates for cid in c["cancel_ids"]}
@@ -1780,7 +1834,66 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         plan["stop_limit_price"] = _single_level(
             [c["limit_price"] for c in stops if c["limit_price"] is not None]
         )
+        # The re-placed OCO/GTC legs reject fractional quantities, and entries
+        # are whole shares: floor the exit so the remainder stays a whole-share
+        # position the protection can cover. Refuse before any broker write
+        # when flooring leaves less than one share to exit, or when the broker
+        # position itself is fractional so no whole-share exit leaves a whole
+        # remainder (#350 review).
+        exit_qty = _floor_to_whole_shares(plan["exit_qty"])
+        if exit_qty < 1.0:
+            raise ValueError(
+                f"Refusing Alpaca partial exit for {symbol} "
+                f"(signal_id={signal.id}): the requested qty {qty:g} floors "
+                "below one whole share, and the remainder could not be "
+                "re-protected. Nothing was cancelled and the exit was not "
+                "submitted."
+            )
+        remainder = plan["position_qty"] - exit_qty
+        nearest = round(remainder)
+        if not _is_flat(remainder) and (
+            abs(remainder - nearest) > self.position_qty_tolerance(symbol)
+            or nearest < 1.0
+        ):
+            raise ValueError(
+                f"Refusing Alpaca partial exit for {symbol} "
+                f"(signal_id={signal.id}): position {plan['position_qty']:g} "
+                f"minus the whole-share exit {exit_qty:g} leaves a fractional "
+                f"remainder {remainder:g} that Alpaca OCO/GTC orders cannot "
+                "protect. Nothing was cancelled and the exit was not "
+                "submitted."
+            )
+        plan["exit_qty"] = exit_qty
+        plan["reprotect_qty"] = max(remainder, 0.0)
         return plan
+
+    async def _entry_signal_for_position(
+        self, signal: LiveSignal, symbol: str
+    ) -> str | None:
+        """The entry signal whose position this exit reduces, best effort.
+
+        The re-protect OCO's ``client_order_id`` embeds it so a later broker-side
+        close of the remainder can be booked against the parent entry's ledger
+        (#277's ``record_live_broker_side_close_fill``) instead of becoming an
+        unattributable fill. ``None`` when no filled entry signal is known -
+        attribution is then simply absent, never guessed.
+        """
+        deployment_id = str(getattr(signal, "deployment_id", "") or "").strip()
+        if not deployment_id:
+            return None
+        try:
+            found = await asyncio.to_thread(
+                find_latest_filled_live_entry_signals, [deployment_id], [symbol]
+            )
+        except Exception as exc:
+            logger.debug(
+                "Alpaca exit re-protection: entry-signal lookup failed for %s: %r",
+                symbol,
+                exc,
+            )
+            return None
+        entry = found.get(symbol)
+        return str(entry.get("signal_id")) if entry else None
 
     async def _working_ids_for_symbol(self, client: Any, symbol: str) -> set[str]:
         """Ids of every working order and leg on ``symbol`` (post-cancel re-read).
@@ -1801,15 +1914,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     ids.add(order_id)
         return ids
 
-    def _load_exit_order_types(self) -> tuple[Any, Any, Any, Any]:
+    def _load_exit_order_types(self) -> tuple[Any, Any, Any, Any, Any]:
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce
-            from alpaca.trading.requests import LimitOrderRequest, StopOrderRequest
-        except ModuleNotFoundError as exc:
+            from alpaca.trading.requests import (
+                LimitOrderRequest,
+                StopLimitOrderRequest,
+                StopOrderRequest,
+            )
+        except ImportError as exc:
             raise RuntimeError(
                 "alpaca-py is required for AlpacaLiveAdapter. Install package 'alpaca-py'."
             ) from exc
-        return OrderSide, TimeInForce, LimitOrderRequest, StopOrderRequest
+        return (
+            OrderSide,
+            TimeInForce,
+            LimitOrderRequest,
+            StopOrderRequest,
+            StopLimitOrderRequest,
+        )
 
     def _exit_protection_request(
         self, plan: Mapping[str, Any], qty: float, *, signal_id: str | None
@@ -1824,15 +1947,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         order. ``GTC`` keeps the protection working past the session, never
         less protected than the bracket it replaces.
         """
-        order_side, time_in_force, limit_request_cls, stop_request_cls = (
+        order_side, time_in_force, limit_request_cls, stop_request_cls, stop_limit_request_cls = (
             self._load_exit_order_types()
         )
         side = order_side.SELL if plan["side"] == "sell" else order_side.BUY
         stop_price = plan.get("stop_price")
         take_profit_price = plan.get("take_profit_price")
-        client_order_id = (
-            f"{signal_id}-reprotect" if signal_id else None
-        )
+        # ``{entry_signal_id}-reprotect-{exit_signal_id}`` is the attribution
+        # contract for broker-side closes of the remainder: whichever side
+        # merges second (#350 vs #277) parses the entry id out of the
+        # client_order_id and books the leg fill against that parent signal's
+        # ledger instead of dropping it as unattributable. The exit id keeps
+        # the key unique across repeated partial exits of one position.
+        entry_signal_id = plan.get("entry_signal_id")
+        if signal_id and entry_signal_id:
+            client_order_id = f"{entry_signal_id}-reprotect-{signal_id}"
+        elif signal_id:
+            client_order_id = f"{signal_id}-reprotect"
+        elif entry_signal_id:
+            client_order_id = f"{entry_signal_id}-reprotect"
+        else:
+            client_order_id = None
         if stop_price is not None and take_profit_price is not None:
             stop_loss_kwargs: dict[str, Any] = {"stop_price": stop_price}
             if plan.get("stop_limit_price") is not None:
@@ -1850,14 +1985,22 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 client_order_id=client_order_id,
             )
         if stop_price is not None:
-            return stop_request_cls(
-                symbol=plan["symbol"],
-                qty=qty,
-                side=side,
-                time_in_force=time_in_force.GTC,
-                stop_price=stop_price,
-                client_order_id=client_order_id,
-            )
+            stop_kwargs: dict[str, Any] = {
+                "symbol": plan["symbol"],
+                "qty": qty,
+                "side": side,
+                "time_in_force": time_in_force.GTC,
+                "stop_price": stop_price,
+                "client_order_id": client_order_id,
+            }
+            if plan.get("stop_limit_price") is not None:
+                # A lone stop-limit leg goes back as a stop-limit, not a plain
+                # stop: re-placing it as a stop would widen the trigger into a
+                # market order the original protection never was.
+                return stop_limit_request_cls(
+                    **stop_kwargs, limit_price=plan["stop_limit_price"]
+                )
+            return stop_request_cls(**stop_kwargs)
         if take_profit_price is not None:
             return limit_request_cls(
                 symbol=plan["symbol"],
@@ -2006,6 +2149,29 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         """
         symbol = plan["symbol"]
         async with self._order_book_lock():
+            # The plan was computed before the signal row was persisted, outside
+            # this lock: trailing may have replaced the stop, or a leg changed,
+            # since. Re-collect inside the lock and refuse BEFORE the first
+            # cancel when the book no longer matches the plan - cancelling an
+            # order the plan does not describe could leave the position with
+            # less protection than the restore path knows how to rebuild.
+            fresh_candidates = await self._exit_protection_candidates(
+                client, symbol, plan["side"]
+            )
+            fresh_signature = _exit_protection_signature(fresh_candidates)
+            planned_signature = (
+                list(plan["order_ids"]),
+                plan.get("stop_price"),
+                plan.get("stop_limit_price"),
+                plan.get("take_profit_price"),
+            )
+            if fresh_signature != planned_signature:
+                raise RuntimeError(
+                    f"Alpaca exit for {symbol}: the working protection changed "
+                    "while the exit was being prepared "
+                    f"(planned {planned_signature}, now {fresh_signature}); "
+                    "refusing the exit order before any cancel."
+                )
             try:
                 cancel_errors: list[str] = []
                 for order_id in plan["order_ids"]:
@@ -2051,8 +2217,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     client.submit_order, order_data=request
                 )
             except Exception as exc:
+                # An HTTP rejection proves the broker never took the order; a
+                # timeout or connection error does not - the exit may be
+                # working. The restore protects whatever position remains
+                # either way, but the log must not claim a clean refusal when
+                # the outcome is unknown.
+                reason = f"exit submit failed: {exc}"
+                if not _is_definite_broker_rejection(exc):
+                    reason = (
+                        "exit submit outcome UNKNOWN - the broker may have "
+                        f"accepted the order ({exc})"
+                    )
+                    logger.warning(
+                        "Alpaca exit submit outcome is unknown for %s "
+                        "(signal_id=%s); restoring protection for the current "
+                        "position and surfacing the ambiguity",
+                        symbol,
+                        signal_id,
+                        extra={"data": {"symbol": symbol, "error": repr(exc)}},
+                    )
                 await self._restore_exit_protection(
-                    client, plan, reason=f"exit submit failed: {exc}", signal_id=signal_id
+                    client, plan, reason=reason, signal_id=signal_id
                 )
                 raise
             status = _order_status(order)
@@ -2075,24 +2260,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 reason="partial exit",
             )
             if replaced:
-                try:
-                    await asyncio.to_thread(
-                        clear_live_signal_metadata_key,
-                        signal_id,
-                        EXIT_REPROTECTION_METADATA_KEY,
-                    )
-                except Exception as exc:  # pragma: no cover - best effort
-                    logger.warning(
-                        "Alpaca exit re-protection marker could not be cleared; "
-                        "recovery will verify it is already satisfied",
-                        extra={
-                            "data": {
-                                "signal_id": signal_id,
-                                "symbol": symbol,
-                                "error": repr(exc),
-                            }
-                        },
-                    )
+                await _clear_exit_reprotection_marker(
+                    signal_id, symbol, "re-protection placed"
+                )
             return order
 
     async def _recover_exit_reprotection(self, row: Mapping[str, Any]) -> None:
@@ -2103,31 +2273,33 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         side = str(marker.get("side") or "")
         if not symbol or side not in {"buy", "sell"}:
             logger.error(
-                "Alpaca exit re-protection marker is unusable; leaving it for review",
+                "Alpaca exit re-protection marker is unusable; clearing it - "
+                "it can never be replayed",
                 extra={"data": {"signal_id": signal_id, "symbol": symbol}},
+            )
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol or "?", "unusable marker"
             )
             return
         position_qty = await self._symbol_position_qty(symbol)
         if position_qty is None:
             # Flat: the exit completed and nothing is left to protect.
-            try:
-                await asyncio.to_thread(
-                    clear_live_signal_metadata_key,
-                    signal_id,
-                    EXIT_REPROTECTION_METADATA_KEY,
-                )
-            except Exception:  # pragma: no cover - best effort
-                pass
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol, "position flat"
+            )
             return
         reducing_side = "sell" if position_qty > 0 else "buy"
         if reducing_side != side:
             logger.error(
                 "ALERT: Alpaca exit re-protection marker for %s names side %s "
                 "but the open position is on the other side; the marker is "
-                "stale and left for review",
+                "stale and cleared - reconcile manually if a remainder exists",
                 symbol,
                 side,
                 extra={"data": {"signal_id": signal_id, "symbol": symbol}},
+            )
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol, "side mismatch"
             )
             return
         client = self._trading_client
@@ -2152,7 +2324,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 logger.error(
                     "ALERT: Alpaca exit re-protection marker for %s recorded "
                     "no levels and the position has no working protection; "
-                    "reconcile manually",
+                    "reconcile manually. The marker is cleared - it can never "
+                    "place anything and would otherwise pile up ahead of "
+                    "recoverable markers",
                     symbol,
                     extra={
                         "data": {
@@ -2162,18 +2336,16 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         }
                     },
                 )
+                await _clear_exit_reprotection_marker(
+                    signal_id, symbol, "no recorded levels"
+                )
                 return
             # Whatever protection exists satisfies the marker: a stop at a
             # different price (trailing moved it) still counts - recovery
             # never moves a live stop back to a recorded level.
-            try:
-                await asyncio.to_thread(
-                    clear_live_signal_metadata_key,
-                    signal_id,
-                    EXIT_REPROTECTION_METADATA_KEY,
-                )
-            except Exception:  # pragma: no cover - best effort
-                pass
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol, "protection already present"
+            )
             return
         if (missing_stop or missing_tp) and ("stop" in kinds or "tp" in kinds):
             # Exactly one leg is missing while its sibling works: adding it as
@@ -2201,6 +2373,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             "stop_price": marker.get("stop_price"),
             "stop_limit_price": marker.get("stop_limit_price"),
             "take_profit_price": marker.get("take_profit_price"),
+            "entry_signal_id": marker.get("entry_signal_id"),
         }
         placed = await self._place_exit_protection(
             client,
@@ -2210,14 +2383,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             reason="restart recovery",
         )
         if placed:
-            try:
-                await asyncio.to_thread(
-                    clear_live_signal_metadata_key,
-                    signal_id,
-                    EXIT_REPROTECTION_METADATA_KEY,
-                )
-            except Exception:  # pragma: no cover - best effort
-                pass
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol, "recovery re-placed protection"
+            )
 
     async def _recover_exit_reprotections(self) -> None:
         """Replay persisted exit re-protection markers after a restart (#145).
@@ -2314,6 +2482,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # the release and the re-place is then replayable on connect.
             exit_plan = await self._exit_protection_plan(signal, qty)
             if exit_plan is not None:
+                planned_exit_qty = exit_plan.get("exit_qty")
+                if planned_exit_qty is not None and planned_exit_qty != qty:
+                    # The plan floored the exit to whole shares so the
+                    # remainder stays re-protectable; the submitted qty, the
+                    # persisted metadata and the marker all carry the floored
+                    # value, exactly like a bracket entry's normalized qty.
+                    logger.info(
+                        "Floored Alpaca exit qty to whole shares so the "
+                        "remainder stays protectable",
+                        extra={
+                            "data": {
+                                "signal_id": str(signal.id),
+                                "symbol": signal.symbol,
+                                "requested_qty": qty,
+                                "submitted_qty": planned_exit_qty,
+                            }
+                        },
+                    )
+                    qty = float(planned_exit_qty)
                 metadata = dict(signal.metadata or {})
                 metadata[EXIT_REPROTECTION_METADATA_KEY] = {
                     key: exit_plan[key]
@@ -2325,8 +2512,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         "position_qty",
                         "exit_qty",
                         "reprotect_qty",
+                        "entry_signal_id",
                     )
                 }
+                # The persisted qty is the one submitted (the plan may have
+                # floored it to whole shares), same invariant bracket entries
+                # keep through _normalize_bracket_entry.
+                metadata["qty"] = float(qty)
+                metadata["explicit_qty"] = float(qty)
                 signal = signal.model_copy(update={"metadata": metadata})
 
             order_side, time_in_force, market_request_cls = (
