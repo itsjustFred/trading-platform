@@ -535,7 +535,6 @@ class TradeEngine:
         # refusing. ``self._max_leverage`` is the broker maximum for the
         # account/asset; unknown → 1x.
         exposure_limit = self._max_position_exposure_pct
-        lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
 
         # #170: resolve -- and thereby validate -- the declared risk amount
         # here, BEFORE any stop-dependent branch. `nan > 0`, `-inf > 0` and a
@@ -723,11 +722,13 @@ class TradeEngine:
 
         # F21 (D2): the per-position notional cap stays denominated in
         # realized sizing cash; #347: the leverage/margin cap is free margin.
+        # The grid is resolved -- and thereby validated (#170) -- here for the
+        # risk-engine path; the fixed-risk branch resolved it above.
         return self._apply_notional_caps(
             shares,
             entry_price=float(entry_price),
             exposure_limit=exposure_limit,
-            lot_step=lot_step,
+            lot_step=_sizing_value("lot_step", self.config.parameters.get("lot_step"), 0.0),
         )
 
     @staticmethod
