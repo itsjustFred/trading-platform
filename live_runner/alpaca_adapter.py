@@ -1425,7 +1425,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 raw_cfees, after=cfee_after, until=now, field="created_at"
             )
             fill_start = fee_fill_window_start(candidate_times, cfees)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Alpaca commission backfill: reading CFEE activities failed; commissions stay "
                 "unknown until the next pass",
