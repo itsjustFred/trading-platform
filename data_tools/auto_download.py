@@ -1299,6 +1299,11 @@ def _vacuous_window_is_plausible(
     per the built-in NYSE model cannot really be closed everywhere. Only a
     window the NYSE model also sees as fully closed (weekends, long holiday
     stretches) may pass vacuously.
+
+    The probe is always ``NyseCalendar``: for a non-US venue whose calendar
+    legitimately expects zero bars on a day NYSE trades (e.g. a DAX session
+    cache omitting Whit Monday), this fails closed. That is the safe
+    direction, and practically unreachable for optimizer segments.
     """
     probe = venue_calendar.NyseCalendar()
     if 1440.0 <= step_minutes < 10080.0:

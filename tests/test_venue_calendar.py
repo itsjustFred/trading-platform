@@ -743,6 +743,34 @@ def test_covering_calendar_with_zero_expected_bars_fails_closed(tmp_path: Path):
     )
 
 
+def test_covering_calendar_with_zero_expected_daily_bars_fails_closed(tmp_path: Path):
+    """The daily branch of the same guard: a session cache whose coverage
+    reaches a weekday window but whose session list omits it expects zero
+    daily bars - believable only when the NYSE model agrees the window has
+    no trading day. 2024-01-22 is a Monday NYSE trades, so coverage must
+    fail closed; this is the ``1d`` twin of the intraday test above, and the
+    branch the bundle-26 disjoint-range hole went through."""
+    _write_cache(
+        tmp_path,
+        "alpaca",
+        "AAPL",
+        _session_cache_payload(
+            coverage_start="2024-01-01",
+            coverage_end="2024-01-31",
+            sessions=[{"date": "2024-01-02", "open": "09:30", "close": "16:00"}],
+        ),
+    )
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "alpaca", "equity", "US", "AAPL", "1d.parquet"],
+        ["2024-01-22T00:00:00+00:00"],
+    )
+    assert not _coverage(
+        symbol="AAPL", timeframe="1d",
+        start="2024-01-22", end="2024-01-23", data_dir=tmp_path,
+    )
+
+
 def test_incremental_session_cache_merges_coverage(tmp_path: Path, monkeypatch):
     """A second, narrower fetch must not shrink what the cache can prove."""
     import data_tools.downloaders.alpaca_dl as alpaca_dl
