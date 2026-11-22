@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Mapping, NoReturn
@@ -409,6 +410,149 @@ def _adapter_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
     return step if math.isfinite(step) and step > 0 else None
 
 
+async def _verify_broker_facts(
+    *,
+    adapter: BaseLiveAdapter,
+    signal: LiveSignal,
+    qty_value: float,
+    entry_price: float,
+    stop_loss: float,
+    caps: PreSubmitCapSettings,
+    max_quote_age: float,
+    base_figures: Mapping[str, Any],
+    fail: Callable[..., Awaitable[NoReturn]],
+) -> dict[str, Any]:
+    """Fetch and validate every broker fact the caps need; return ``figures``.
+
+    Covers the bounded broker reads (quote, pip value, balance, leverage,
+    used margin), their usability checks, quote freshness and the entry
+    price-deviation rule. Every failure goes through ``fail`` — the caller's
+    refusal path — so an unverifiable cap is a failed cap.
+    """
+    quote_task = asyncio.create_task(adapter.get_quote(signal.symbol))
+    pip_task = asyncio.create_task(adapter.get_pip_value(signal.symbol))
+    balance_task = asyncio.create_task(adapter.get_balance())
+    leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
+    margin_task = asyncio.create_task(_safe_used_margin(adapter))
+    try:
+        quote, pip_value, (_balance, equity), max_leverage, used_margin = (
+            await asyncio.wait_for(
+                asyncio.gather(
+                    quote_task, pip_task, balance_task, leverage_task, margin_task
+                ),
+                timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+            )
+        )
+    except Exception as exc:
+        # gather propagates the first failure but leaves the sibling reads
+        # running; cancel them so a hung broker call cannot outlive the
+        # refusal (wait_for already cancelled them on a timeout). The
+        # leverage and margin reads never raise — they degrade to None.
+        for task in (
+            quote_task,
+            pip_task,
+            balance_task,
+            leverage_task,
+            margin_task,
+        ):
+            task.cancel()
+        await asyncio.gather(
+            quote_task, pip_task, balance_task, leverage_task, margin_task,
+            return_exceptions=True,
+        )
+        await fail(
+            "broker_facts_unavailable",
+            "could not fetch the live quote, pip value and balance needed to "
+            f"verify the caps ({type(exc).__name__}: {exc})",
+        )
+
+    try:
+        bid, ask = validate_live_quote_prices(quote, symbol=signal.symbol)
+        quote_price = ask if signal.action == "buy" else bid
+        pip = float(pip_value.value)
+        equity_value = float(equity)
+    except (ValueError, TypeError, AttributeError) as exc:
+        await fail("broker_facts_unusable", str(exc))
+    if not math.isfinite(pip) or pip <= 0:
+        await fail(
+            "broker_facts_unusable", f"pip value is not positive and finite ({pip!r})"
+        )
+    if not math.isfinite(equity_value):
+        await fail(
+            "broker_facts_unusable", f"account equity is not finite ({equity!r})"
+        )
+    if used_margin is None:
+        # Fail closed like every other broker fact (#359): an understated
+        # used margin would overstate free margin and lift the leverage
+        # ceiling — the unsafe direction.
+        await fail(
+            "broker_facts_unavailable",
+            "the broker's used margin could not be determined, so the "
+            "free-margin leverage ceiling cannot be verified",
+        )
+
+    # The broker's maximum leverage for the account and asset (#240); an
+    # undeterminable maximum fails closed to 1x — never a guessed ceiling.
+    broker_leverage = max_leverage if max_leverage is not None else 1.0
+    # #359/#347: MT5-style free margin — equity minus the margin the broker
+    # already holds against open positions. May be negative on an
+    # over-margined account; the ceiling below then clamps to nothing and
+    # the order is refused, matching the backtest rule.
+    free_margin = equity_value - used_margin
+    # Price deviation: the resolved entry against the side the order fills
+    # against, as a fraction of the live quote. Absolute — a quote that ran
+    # away in either direction means the sized levels no longer describe it.
+    deviation = abs(entry_price - quote_price) / quote_price
+    figures: dict[str, Any] = {
+        **base_figures,
+        "qty": qty_value,
+        "entry_price": entry_price,
+        "stop_loss": stop_loss,
+        "quote_bid": bid,
+        "quote_ask": ask,
+        "quote_price": quote_price,
+        "pip_value": pip,
+        "account_equity": equity_value,
+        "used_margin": used_margin,
+        "free_margin": free_margin,
+        "broker_max_leverage": max_leverage,
+        "effective_max_leverage": broker_leverage,
+        "price_deviation_fraction": deviation,
+    }
+
+    # Quote freshness, the same rule the entry-deviation gate applies (#125):
+    # the caps compare against a live quote, so a stale cached spot — or one
+    # with no usable broker time — must not pass.
+    quote_time = quote.timestamp if isinstance(quote, LiveQuote) else None
+    time_rule, quote_age = live_quote_time_rule(
+        quote_time, now=datetime.now(timezone.utc), max_age_seconds=max_quote_age
+    )
+    if time_rule is not None:
+        await fail(
+            "stale_quote",
+            f"the broker quote is not current ({time_rule}): time {quote_time!r}, "
+            f"age {quote_age!r}s, limit {max_quote_age}s",
+            {
+                **figures,
+                "quote_time": (
+                    quote_time.isoformat() if isinstance(quote_time, datetime) else None
+                ),
+                "quote_age_seconds": quote_age,
+                "max_quote_age_seconds": max_quote_age,
+            },
+        )
+
+    if deviation > caps.max_price_deviation_fraction:
+        await fail(
+            "price_deviation",
+            f"entry {entry_price!r} deviates from the live quote {quote_price!r} "
+            f"by {deviation:.6f}, above the cap "
+            f"{caps.max_price_deviation_fraction!r}",
+            {**figures, "price_deviation_fraction": deviation},
+        )
+    return figures
+
+
 async def enforce_pre_submit_caps(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -497,126 +641,25 @@ async def enforce_pre_submit_caps(
             {**base_figures, "entry_price": entry_price},
         )
 
-    quote_task = asyncio.create_task(adapter.get_quote(signal.symbol))
-    pip_task = asyncio.create_task(adapter.get_pip_value(signal.symbol))
-    balance_task = asyncio.create_task(adapter.get_balance())
-    leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
-    margin_task = asyncio.create_task(_safe_used_margin(adapter))
-    try:
-        quote, pip_value, (_balance, equity), max_leverage, used_margin = (
-            await asyncio.wait_for(
-                asyncio.gather(
-                    quote_task, pip_task, balance_task, leverage_task, margin_task
-                ),
-                timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
-            )
-        )
-    except Exception as exc:
-        # gather propagates the first failure but leaves the sibling reads
-        # running; cancel them so a hung broker call cannot outlive the
-        # refusal (wait_for already cancelled them on a timeout). The
-        # leverage and margin reads never raise — they degrade to None.
-        for task in (
-            quote_task,
-            pip_task,
-            balance_task,
-            leverage_task,
-            margin_task,
-        ):
-            task.cancel()
-        await asyncio.gather(
-            quote_task, pip_task, balance_task, leverage_task, margin_task,
-            return_exceptions=True,
-        )
-        await _fail(
-            "broker_facts_unavailable",
-            "could not fetch the live quote, pip value and balance needed to "
-            f"verify the caps ({type(exc).__name__}: {exc})",
-        )
-
-    try:
-        bid, ask = validate_live_quote_prices(quote, symbol=signal.symbol)
-        quote_price = ask if signal.action == "buy" else bid
-        pip = float(pip_value.value)
-        equity_value = float(equity)
-    except (ValueError, TypeError, AttributeError) as exc:
-        await _fail("broker_facts_unusable", str(exc))
-    if not math.isfinite(pip) or pip <= 0:
-        await _fail(
-            "broker_facts_unusable", f"pip value is not positive and finite ({pip!r})"
-        )
-    if not math.isfinite(equity_value):
-        await _fail(
-            "broker_facts_unusable", f"account equity is not finite ({equity!r})"
-        )
-    if used_margin is None:
-        # Fail closed like every other broker fact (#359): an understated
-        # used margin would overstate free margin and lift the leverage
-        # ceiling — the unsafe direction.
-        await _fail(
-            "broker_facts_unavailable",
-            "the broker's used margin could not be determined, so the "
-            "free-margin leverage ceiling cannot be verified",
-        )
-
-    # The broker's maximum leverage for the account and asset (#240); an
-    # undeterminable maximum fails closed to 1x — never a guessed ceiling.
-    broker_leverage = max_leverage if max_leverage is not None else 1.0
-    # #359/#347: MT5-style free margin — equity minus the margin the broker
-    # already holds against open positions. May be negative on an
-    # over-margined account; the ceiling below then clamps to nothing and
-    # the order is refused, matching the backtest rule.
-    free_margin = equity_value - used_margin
-    figures: dict[str, Any] = {
-        **base_figures,
-        "qty": qty_value,
-        "entry_price": entry_price,
-        "stop_loss": stop_loss,
-        "quote_bid": bid,
-        "quote_ask": ask,
-        "quote_price": quote_price,
-        "pip_value": pip,
-        "account_equity": equity_value,
-        "used_margin": used_margin,
-        "free_margin": free_margin,
-        "broker_max_leverage": max_leverage,
-        "effective_max_leverage": broker_leverage,
-    }
-
-    # Quote freshness, the same rule the entry-deviation gate applies (#125):
-    # the caps compare against a live quote, so a stale cached spot — or one
-    # with no usable broker time — must not pass.
-    quote_time = quote.timestamp if isinstance(quote, LiveQuote) else None
-    time_rule, quote_age = live_quote_time_rule(
-        quote_time, now=datetime.now(timezone.utc), max_age_seconds=max_quote_age
+    figures = await _verify_broker_facts(
+        adapter=adapter,
+        signal=signal,
+        qty_value=qty_value,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        caps=caps,
+        max_quote_age=max_quote_age,
+        base_figures=base_figures,
+        fail=_fail,
     )
-    if time_rule is not None:
-        await _fail(
-            "stale_quote",
-            f"the broker quote is not current ({time_rule}): time {quote_time!r}, "
-            f"age {quote_age!r}s, limit {max_quote_age}s",
-            {
-                **figures,
-                "quote_time": (
-                    quote_time.isoformat() if isinstance(quote_time, datetime) else None
-                ),
-                "quote_age_seconds": quote_age,
-                "max_quote_age_seconds": max_quote_age,
-            },
-        )
-
-    # Price deviation: the resolved entry against the side the order fills
-    # against, as a fraction of the live quote. Absolute — a quote that ran
-    # away in either direction means the sized levels no longer describe it.
-    deviation = abs(entry_price - quote_price) / quote_price
-    if deviation > caps.max_price_deviation_fraction:
-        await _fail(
-            "price_deviation",
-            f"entry {entry_price!r} deviates from the live quote {quote_price!r} "
-            f"by {deviation:.6f}, above the cap "
-            f"{caps.max_price_deviation_fraction!r}",
-            {**figures, "price_deviation_fraction": deviation},
-        )
+    quote_price = float(figures["quote_price"])
+    pip = float(figures["pip_value"])
+    equity_value = float(figures["account_equity"])
+    used_margin = figures["used_margin"]
+    free_margin = float(figures["free_margin"])
+    broker_leverage = float(figures["effective_max_leverage"])
+    max_leverage = figures["broker_max_leverage"]
+    deviation = float(figures["price_deviation_fraction"])
 
     # Notional in account currency: qty * price * pip_value (pip_value is the
     # account-currency P&L of one qty unit per 1.0 price move).

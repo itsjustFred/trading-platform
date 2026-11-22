@@ -411,7 +411,20 @@ def test_the_adapter_balance_uses_the_same_resolution():
     response = adapter._ProtoOATraderRes()
     response.trader = trader
 
-    async def _send_response(_request, **_kwargs):
+    # Equity is mark-to-market: get_balance also asks for the unrealized PnL.
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    adapter._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+    adapter._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
+    pnl_response = ProtoOAGetPositionUnrealizedPnLRes()
+    pnl_response.moneyDigits = 0
+
+    async def _send_response(request, **_kwargs):
+        if isinstance(request, ProtoOAGetPositionUnrealizedPnLReq):
+            return pnl_response
         return response
 
     adapter._send_request = _send_response

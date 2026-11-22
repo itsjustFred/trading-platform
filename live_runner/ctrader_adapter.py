@@ -18,6 +18,7 @@ from uuid import UUID
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    MAX_MONEY_DIGITS,
     BaseLiveAdapter,
     ControlOutcome,
     LivePipValue,
@@ -412,6 +413,34 @@ def _optional_float(value: Any) -> float | None:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _unrealized_pnl_money_digits(res: Any) -> int:
+    """Decimal places for the unrealized-PnL response's money fields, or raise.
+
+    Unlike ``money_digits_from_trader`` — which falls back to the default
+    scale for monitoring paths — an absent or unusable count here is
+    fail-closed: guessing 2 decimals could mis-scale the unrealized PnL by
+    orders of magnitude and silently overstate equity.
+    """
+    raw = getattr(res, "moneyDigits", None)
+    has_field = getattr(res, "HasField", None)
+    if has_field is not None:
+        try:
+            present = bool(has_field("moneyDigits"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("unrealized-PnL moneyDigits is unreadable") from exc
+        if not present:
+            raise RuntimeError("unrealized-PnL response carried no moneyDigits")
+    elif raw is None:
+        raise RuntimeError("unrealized-PnL response carried no moneyDigits")
+    try:
+        digits = int(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("unrealized-PnL moneyDigits is not an integer") from exc
+    if isinstance(raw, bool) or not (0 <= digits <= MAX_MONEY_DIGITS):
+        raise RuntimeError(f"unrealized-PnL moneyDigits is out of range ({raw!r})")
+    return digits
 
 
 def _fallback_field(fallback: SymbolScale | None, name: str, default: Any = None) -> Any:
@@ -910,6 +939,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAUnsubscribeSpotsReq: Any = None
         self._ProtoOAGetDynamicLeverageByIDReq: Any = None
         self._ProtoOAGetDynamicLeverageByIDRes: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLReq: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLRes: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -936,6 +967,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAExecutionEvent,
                 ProtoOAGetDynamicLeverageByIDReq,
                 ProtoOAGetDynamicLeverageByIDRes,
+                ProtoOAGetPositionUnrealizedPnLReq,
+                ProtoOAGetPositionUnrealizedPnLRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -995,6 +1028,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
         self._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
         self._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+        self._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+        self._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOAReconcileReq = ProtoOAReconcileReq
@@ -3124,10 +3159,56 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
         balance = _to_float(getattr(trader, "balance", 0)) / scale
-        equity = balance
         if hasattr(trader, "equity"):
             equity = _to_float(getattr(trader, "equity", balance)) / scale
+        else:
+            # #359/#347: MT5-style equity is mark-to-market — realized balance
+            # plus the broker-reported unrealized PnL. ``ProtoOATrader`` has no
+            # equity field, and realized balance alone overstates free margin
+            # while positions are losing (the unsafe direction the caps
+            # refuse), so an unreadable PnL figure fails the whole read closed.
+            equity = balance + await self._unrealized_pnl_total()
         return balance, equity
+
+    async def _unrealized_pnl_total(self) -> float:
+        """Σ ``netUnrealizedPnL`` across the account's positions, account ccy.
+
+        ``ProtoOAGetPositionUnrealizedPnLReq`` returns one entry per position
+        with the broker-computed unrealized figure; ``netUnrealizedPnL``
+        (gross + swap + commission) is the conservative leg — it can only sit
+        below ``grossUnrealizedPnL``. Raises on any unreadable figure: an
+        understated loss would overstate equity and free margin.
+        """
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if (
+            self._ProtoOAGetPositionUnrealizedPnLReq is None
+            or self._ProtoOAGetPositionUnrealizedPnLRes is None
+        ):
+            raise RuntimeError("cTrader unrealized-PnL proto types are not loaded")
+        req = self._ProtoOAGetPositionUnrealizedPnLReq()
+        req.ctidTraderAccountId = self.ctid_trader_account_id
+        try:
+            res = await self._send_request_with_refresh_retry(req, timeout_seconds=15)
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(res, self._ProtoOAGetPositionUnrealizedPnLRes):
+            raise RuntimeError(
+                f"Unexpected unrealized-PnL response: {type(res).__name__}"
+            )
+        scale = money_scale(_unrealized_pnl_money_digits(res))
+        total = 0.0
+        for entry in getattr(res, "positionUnrealizedPnL", []) or []:
+            net = _optional_float(getattr(entry, "netUnrealizedPnL", None))
+            if net is None or not math.isfinite(net):
+                raise RuntimeError(
+                    "unrealized-PnL entry carried an unreadable netUnrealizedPnL"
+                )
+            total += net / scale
+        return total
 
     async def get_used_margin(self) -> float | None:
         """Margin held against open positions, summed in account currency (#359).

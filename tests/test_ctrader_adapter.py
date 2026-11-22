@@ -1972,3 +1972,142 @@ def test_get_used_margin_returns_none_when_reconcile_fails() -> None:
 
     adapter._reconcile_state = _fake_reconcile
     assert asyncio.run(adapter.get_used_margin()) is None
+
+
+def test_get_used_margin_returns_none_on_negative_margin_or_digits() -> None:
+    # A negative usedMargin or moneyDigits cannot scale into a trustworthy
+    # figure; treating it as 0 would overstate free margin.
+    adapter = _margin_adapter()
+    _stub_reconcile(
+        adapter,
+        [SimpleNamespace(positionStatus=1, usedMargin=-1, moneyDigits=2)],
+    )
+    assert asyncio.run(adapter.get_used_margin()) is None
+
+    adapter2 = _margin_adapter()
+    _stub_reconcile(
+        adapter2,
+        [SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits=-1)],
+    )
+    assert asyncio.run(adapter2.get_used_margin()) is None
+
+    adapter3 = _margin_adapter()
+    _stub_reconcile(
+        adapter3,
+        [SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits="x")],
+    )
+    assert asyncio.run(adapter3.get_used_margin()) is None
+
+
+# ── get_balance mark-to-market equity (#359/#347) ─────────────────────────────
+#
+# ProtoOATrader has no equity field, so equity is realized balance plus the
+# broker-reported unrealized PnL. Realized balance alone overstates free
+# margin while positions lose — the unsafe direction — so an unreadable PnL
+# figure fails the whole read closed.
+
+
+def _balance_adapter(trader: object) -> CTraderLiveAdapter:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    _stub_trader(adapter, trader)
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    adapter._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+    adapter._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
+    return adapter
+
+
+def _pnl_response(*entries: tuple[int, int], money_digits: int = 2):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    response = ProtoOAGetPositionUnrealizedPnLRes()
+    response.moneyDigits = money_digits
+    for position_id, net_pnl in entries:
+        entry = response.positionUnrealizedPnL.add()
+        entry.positionId = position_id
+        entry.netUnrealizedPnL = net_pnl
+    return response
+
+
+def _stub_pnl_send(adapter: CTraderLiveAdapter, response: object) -> None:
+    async def _fake_send(request, **_kwargs):
+        return response
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+
+def test_get_balance_equity_is_balance_plus_unrealized_pnl() -> None:
+    # balance 100_000.00 (10_000_000 at moneyDigits=2); a -5_000.00 and a
+    # +1_500.00 unrealized leg -> equity 96_500.00.
+    adapter = _balance_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(
+        adapter, _pnl_response((11, -500_000), (12, 150_000))
+    )
+    balance, equity = asyncio.run(adapter.get_balance())
+    assert balance == pytest.approx(100_000.0)
+    assert equity == pytest.approx(96_500.0)
+
+
+def test_get_balance_without_positions_keeps_equity_at_balance() -> None:
+    adapter = _balance_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(adapter, _pnl_response())
+    balance, equity = asyncio.run(adapter.get_balance())
+    assert equity == pytest.approx(balance)
+
+
+def test_get_balance_fails_closed_when_unrealized_pnl_is_unreadable() -> None:
+    adapter = _balance_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+
+    async def _fake_send(request, **_kwargs):
+        raise RuntimeError("pnl endpoint down")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    with pytest.raises(RuntimeError, match="pnl endpoint down"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_fails_closed_on_an_unexpected_pnl_response() -> None:
+    adapter = _balance_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(adapter, object())
+    with pytest.raises(RuntimeError, match="Unexpected unrealized-PnL response"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_fails_closed_when_pnl_money_digits_is_absent() -> None:
+    # The proto field has presence: unset means "not sent", and guessing a
+    # scale could mis-price the PnL by orders of magnitude.
+    adapter = _balance_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    response = ProtoOAGetPositionUnrealizedPnLRes()  # moneyDigits unset
+    _stub_pnl_send(adapter, response)
+    with pytest.raises(RuntimeError, match="moneyDigits"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_fails_closed_on_an_unreadable_pnl_entry() -> None:
+    class _Res:
+        pass
+
+    response = _Res()
+    response.moneyDigits = 2
+    response.positionUnrealizedPnL = [SimpleNamespace(netUnrealizedPnL=None)]
+    adapter = _balance_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    adapter._ProtoOAGetPositionUnrealizedPnLRes = _Res
+    _stub_pnl_send(adapter, response)
+    with pytest.raises(RuntimeError, match="netUnrealizedPnL"):
+        asyncio.run(adapter.get_balance())

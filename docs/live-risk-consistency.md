@@ -275,7 +275,12 @@ Richtung, weil eine zu kleine Used Margin die freie Marge überschätzt. Ist
 die freie Marge aufgebraucht, bleibt nach der Klemme weniger als ein
 Lot-Step und der Order wird abgelehnt (`broker_leverage_cap`) — live gibt
 es kein stilles Überspringen wie im Backtest, die Verweigerung gibt das
-Submission-Lease frei. Die Klemme wird
+Submission-Lease frei. **Bekannte Grenze:** noch nicht ausgefüllte
+Entry-Orders reservieren in keiner der beiden Margin-Größen Marge —
+weder cTrader-`usedMargin` noch Alpaca-`initial_margin` sind für offene
+Orders belastet. Zwei gleichzeitige Entries sehen daher jeweils die volle
+freie Marge; der Broker lehnt den zweiten ab, statt ihn zu klemmen.
+Die Klemme wird
 mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert (das Feld
 `broker_max_leverage_is_upper_bound` markiert die Obergrenzen-Eigenschaft;
 die Audit-Daten tragen `used_margin`, `free_margin` und `leverage_ceiling`;
@@ -291,10 +296,15 @@ Notional pro Order weiterhin bei `max_notional_per_trade` (Default 0.20;
 Notional und Stop-Risk rechnen gegen das Account-**Equity** — und auf dem
 Produktionspfad rechnen auch Sizing und Caps gegen dieselbe Basis: beide lesen
 `get_balance()[1]`, das auf Alpaca das Broker-Equity (`account.equity`) und
-auf cTrader den realisierten Balance ist (`ProtoOATrader` hat kein
-Equity-Feld); nur ein explizit übergebener `account_balance`-Parameter weicht
-ab. Die Caps sind damit kein zweites Sizing, sondern ein hartes Backstop
-gegen kaputte Größen auf derselben Basis.
+auf cTrader den **Mark-to-Market**-Wert ist: `ProtoOATrader` hat kein
+Equity-Feld, daher ist es der realisierte `balance` plus die Summe der
+broker-gemeldeten `netUnrealizedPnL` aus `ProtoOAGetPositionUnrealizedPnLReq`
+(netto = brutto + Swap + Kommission, also die konservativere Seite). Eine
+unlesbare PnL-Antwort lässt `get_balance` fehlschlagen — ein gemeldeter
+realisierter Balance-Wert allein würde die freie Marge in fallenden Märkten
+überschätzen, die unsichere Richtung. Nur ein explizit übergebener
+`account_balance`-Parameter weicht ab. Die Caps sind damit kein zweites
+Sizing, sondern ein hartes Backstop gegen kaputte Größen auf derselben Basis.
 
 Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
 Cap-Settings, Quote/Pip-Value/Balance/Used-Margin nicht abrufbar oder unbrauchbar,

@@ -640,6 +640,25 @@ def test_adapter_without_used_margin_refuses_fail_closed():
         )
 
 
+def test_base_adapter_default_used_margin_refuses_fail_closed():
+    # The base default raises NotImplementedError and ``_safe_used_margin``
+    # turns that into a refusal. Re-binding the real base method (instead of
+    # shadowing it with ``None``) pins the contract: a mutation of the base
+    # default to ``return 0.0`` would read as a flat account and must fail
+    # this test.
+    class _BaseMargin(_Broker):
+        get_used_margin = BaseLiveAdapter.get_used_margin
+
+    deployment = _deployment()
+    with pytest.raises(PreSubmitCapViolation, match="broker_facts_unavailable"):
+        _run(
+            enforce_pre_submit_caps(
+                _BaseMargin(), deployment, _signal(deployment), qty=200.0,
+                risk_config=_risk_config(),
+            )
+        )
+
+
 # ── fail closed ───────────────────────────────────────────────────────────────
 
 

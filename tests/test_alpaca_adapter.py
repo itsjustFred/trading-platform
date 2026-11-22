@@ -996,3 +996,14 @@ def test_get_used_margin_returns_none_when_a_position_value_is_unreadable() -> N
         SimpleNamespace(symbol="AAPL", market_value=None),
     ]
     assert asyncio.run(_adapter(client).get_used_margin()) is None
+
+
+def test_get_used_margin_returns_none_on_a_non_finite_position_value() -> None:
+    # market_value is Optional[str] on the broker model; "nan" parses but is
+    # not a usable notional, so the fallback must fail closed like any other
+    # unreadable figure.
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(symbol="AAPL", market_value="nan"),
+    ]
+    assert asyncio.run(_adapter(client).get_used_margin()) is None

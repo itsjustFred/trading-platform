@@ -1633,6 +1633,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ceiling :meth:`get_max_leverage` applies; an unreadable multiplier
         degrades to 1x, the conservative direction). ``None`` when neither
         figure can be determined — the pre-submit caps fail closed on it.
+
+        ``asset_marginable is not True`` maps to 1x: only an explicit broker
+        ``True`` earns the overnight leverage, so a missing flag is treated
+        like non-marginable. Shorts' higher maintenance requirement is not
+        modelled — it only matters when ``initial_margin`` is absent, since
+        the broker's own figure already prices it correctly.
         """
         if not self._connected or self._trading_client is None:
             await self.connect()
@@ -1666,7 +1672,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 return None
             if not math.isfinite(notional):
                 return None
-            if notional == 0.0:
+            if _is_flat(notional):
                 continue
             symbol = str(getattr(row, "symbol", "") or "").strip().upper()
             asset_class = str(getattr(row, "asset_class", "") or "").strip().lower()
