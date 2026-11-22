@@ -125,3 +125,5 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | account equity read in the loss-breaker entry gate | money-decision | raises `LossBreakerBreachError`, entry refused |
 | `loss_breaker.py` | breach-latch write, state read, deployment pip-value/quote/flows reads | money-decision | unmeasurable loss = entries refused |
 | `loss_breaker.py` | untrusted-fill listing for the alert, observation wrapper | loop-survival | alert/observation only |
+| `daemon.py` | `_join_default_executor` joiner-thread relay of `executor.shutdown` failures | loop-survival | infrastructure relay; re-raised on the loop thread |
+| `daemon.py` | `run_daemon` worker-join `BaseException` (interrupted or budget-expired join) | money-decision | keeps the single-instance lock and re-raises rather than handing it to a second daemon while DB writes may be in flight |

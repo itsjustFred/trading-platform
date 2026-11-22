@@ -6034,7 +6034,7 @@ def _join_default_executor(timeout: float) -> None:
     def _join() -> None:
         try:
             executor.shutdown(wait=True)
-        except BaseException as exc:  # noqa: BLE001 - relayed to the loop thread below
+        except BaseException as exc:  # noqa: BLE001  # except-kind: loop-survival - relayed to the loop thread below
             failure.append(exc)
         finally:
             finished.set()
@@ -6274,7 +6274,7 @@ async def run_daemon(
             # database work cannot finish must not hand the lock on. Blocking the loop thread here
             # cannot deadlock - none of the daemon's worker functions calls back into the loop.
             _join_default_executor(WORKER_JOIN_TIMEOUT_SECONDS)
-        except BaseException:
+        except BaseException:  # except-kind: money-decision - keeps the lock, never a success-shaped exit
             # Interrupted mid-join (a signal, a KeyboardInterrupt), or the join budget expired
             # with a worker still running. Releasing now would hand the next daemon the overlap
             # this lock exists to prevent, so the process keeps the lock and the OS releases it
