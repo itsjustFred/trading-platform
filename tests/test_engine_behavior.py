@@ -429,6 +429,9 @@ class TestPendingOrderCreationBarGuard:
         assert engine.pending_orders == [order]
 
         # Bar 2 high (102.5) still trades through -> fills at the limit.
+        # Bar 2 opens at 102.0, above the 101.0 sell limit, so a real fill
+        # would price-improve to the open; the engine deliberately does not
+        # model gap price improvement for pending orders (#371).
         engine._fill_pending_orders(frame.iloc[2], 2)
         assert len(engine.positions) == 1
         assert engine.positions[0].entry_price == pytest.approx(101.0)
@@ -438,6 +441,12 @@ class TestPendingOrderCreationBarGuard:
 
         engine = self._engine(tmp_path)
         frame = _linear_frame(4)
+        # Bar 2 must not gap through the buy stop: a stop whose bar opens
+        # above 101.0 fills at the open (gap -> open), not at the level —
+        # that fill-price gap is tracked in #371. Open 100.8 keeps this a
+        # plain through-trade so the fill lands on the stop price.
+        frame.loc[2, "open"] = 100.8
+        frame.loc[2, "low"] = 100.7
         order = self._order(
             OrderType.STOP,
             "LONG",
@@ -509,6 +518,35 @@ class TestPendingOrderCreationBarGuard:
         assert len(engine.positions) == 1
         assert engine.positions[0].entry_price == pytest.approx(100.8)
 
+    def test_stop_limit_short_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        # Only bar 2 dips through the sell stop (low 100.0 <= 100.6) while
+        # its high still reaches the limit. Bar 2 opens at 102.0, above the
+        # 100.6 stop, so this is not a gap case (#371).
+        frame.loc[2, "low"] = 100.0
+        order = self._order(
+            OrderType.STOP_LIMIT,
+            "SHORT",
+            created_index=1,
+            stop_price=100.6,
+            limit_price=101.0,
+            stop_loss=102.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1: low 100.5 <= 100.6 triggers AND high 101.5 >= 101.0
+        # reaches the limit — both legs fire on the creation bar -> guarded.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(101.0)
+
     @pytest.mark.parametrize(
         "fixed_amount,expected",
         [(500.0, False), (None, True)],
@@ -519,9 +557,11 @@ class TestPendingOrderCreationBarGuard:
     ):
         """The LIMIT/STOP fill-site re-size must refresh `_equity_proportional`
         (#288 / #170 review finding): the flag describes the branch that sized
-        the FINAL quantity, not the creation-time estimate. A manually
-        appended order carries no flag, so a missing update would leak the
-        `getattr(..., True)` default into the position meta."""
+        the FINAL quantity, not the creation-time estimate. The order is
+        pre-seeded `_equity_proportional = False` (a value `_create_order`
+        never writes for these params) so BOTH parametrizations fail if the
+        fill-site update is dropped — without the seed the percentage case
+        would pass on the `getattr(..., True)` default alone."""
         from runner.engine import OrderType
 
         params = {} if fixed_amount is None else {"fixed_risk_amount": fixed_amount}
@@ -534,6 +574,7 @@ class TestPendingOrderCreationBarGuard:
             limit_price=101.5,
             stop_loss=100.0,
         )
+        order._equity_proportional = False
         engine.pending_orders.append(order)
 
         # created_index=0 -> bar 1 is already a post-creation bar.

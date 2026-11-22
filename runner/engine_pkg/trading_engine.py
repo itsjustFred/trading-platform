@@ -732,6 +732,9 @@ class TradeEngine:
                     filled = i > order.created_index and bar_low <= order.stop_price
                     fill_price = order.stop_price
             elif order.order_type == OrderType.STOP_LIMIT:
+                # The trigger is evaluated per bar, not latched: trigger and
+                # limit must both be reached on the same bar. Whether #339
+                # needs a latched trigger is tracked in #371.
                 trigger = i > order.created_index
                 if order.direction == "LONG" and order.stop_price is not None:
                     trigger = trigger and bar_high >= order.stop_price

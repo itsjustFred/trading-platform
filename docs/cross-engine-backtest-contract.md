@@ -23,8 +23,9 @@ parent Cleanup 16 record.
   `_fill_pending_orders` only on a later bar (`i > created_index`), at
   `bar_open`. The same creation-index guard applies to the native engine's
   LIMIT/STOP/STOP_LIMIT pending-order branches (#288): a pending order may
-  never fill on the bar whose close produced its signal. `ExecutionModelSettings.market_order_timing = "next_bar_open"`
-  and `entry_price_side = "open"` document this on every native trade
+  never fill on the bar whose close produced its signal.
+  `ExecutionModelSettings.market_order_timing = "next_bar_open"` and
+  `entry_price_side = "open"` document this on every native trade
   (`trade.meta["execution_model"]`, `trade.meta["entry_fill"]`).
 - Vectorbt: strategy output is shifted one bar by
   `_prepare_next_open_execution_data` and entries fill at the execution bar's
