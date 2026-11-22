@@ -296,6 +296,7 @@ _ACCOUNTS_ENV_DEFINERS: tuple[tuple[str, str], ...] = (
     ("scripts.live_smoke", "DEFAULT_ACCOUNTS_ENV"),
     ("scripts.verify_ctrader_order", "ACCOUNTS_ENV"),
     ("live_runner.test_signal_trigger", "DEFAULT_ACCOUNTS_ENV"),
+    ("live_runner.loss_breaker", "_ACCOUNTS_ENV"),
 )
 # These import the name from a module above, and the value they bind lands in function default
 # arguments, which are frozen at import time. They are therefore imported *after* the definers
@@ -816,8 +817,13 @@ def _isolate_loss_breaker_state():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_loss_breaker_accounts_env(tmp_path):
-    """Point the loss breaker's ``.accounts.env`` at a path that does not exist.
+def _isolate_loss_breaker_accounts_env():
+    """Keep the loss breaker's ``.accounts.env`` at the session sandbox path.
+
+    The path itself is redirected for the whole session through
+    ``ACCOUNTS_ENV_MODULES`` (``live_runner.loss_breaker._ACCOUNTS_ENV``), which
+    resolves to a file that does not exist; this fixture only guarantees no test
+    inherits a ``set_accounts_env_file`` override from an earlier one.
 
     ``refuse_entry_if_loss_breaker_tripped`` and the balance-poll observation
     resolve ``LOSS_BREAKER_*`` thresholds file-first through the repo's
@@ -836,9 +842,6 @@ def _isolate_loss_breaker_accounts_env(tmp_path):
     import live_runner.loss_breaker as loss_breaker
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            loss_breaker, "_ACCOUNTS_ENV", tmp_path / "absent-accounts.env"
-        )
         # ``run_daemon`` may point the breaker at a configured accounts file;
         # tests must never inherit that override from an earlier test.
         patch.setattr(loss_breaker, "_ACCOUNTS_ENV_OVERRIDE", None)
