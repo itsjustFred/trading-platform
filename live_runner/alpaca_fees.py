@@ -47,6 +47,19 @@ earlier ``CFEE`` batch (and, when there is none, for fills before the ``FILL`` f
 passes ``first_batch_open`` when either may exist; an open first batch fails closed whenever it
 would price fills - a >``COMMISSION_BACKFILL_LOOKBACK`` posting stall can therefore leave a
 batch unpriced rather than risk assigning fills to the wrong batch.
+
+Two more guards keep a partially-posted or misattributed batch from being written:
+
+* **Settle guard.** A batch is priced only once ``now - batch.end > CFEE_BATCH_GAP``: while a
+  posting run is still receiving entries its totals are partial, and pricing them would write a
+  fee that can never be corrected (the group is then refused as already priced). Until then the
+  batch's fills stay pending and are retried on a later pass.
+* **Per-fill consistency.** #149 observed one ``CFEE`` entry per fill, with the asset fee's
+  ``price`` equal to the fill price at 2 dp. Before a side is priced, the batch's fee entries
+  for that side must match the side's fills in the window one-for-one: the same count, and for
+  asset fees the same 2 dp prices. A batch whose entries cannot be paired with the fills it
+  claims to cover (an interleaved delayed posting, an aggregate entry, a missing entry) fails
+  closed for that side instead of spreading a fee over the wrong fills.
 """
 
 from __future__ import annotations
@@ -78,6 +91,11 @@ FILL_WINDOW_SKEW = timedelta(days=1)
 MAX_PLAUSIBLE_FEE_RATE = Decimal("0.01")
 ACTIVITY_PAGE_SIZE = 100
 MAX_ACTIVITY_PAGES = 200
+#: Lower bound for the boundary probes: the account's first activity is always after this.
+ACTIVITY_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+#: ``CFEE``/``FEE`` ``after``/``until`` filter by New York calendar day (#149), not by instant,
+#: so every window is widened by one day and re-filtered client-side on the real timestamp.
+ACTIVITY_WINDOW_OVERLAP = timedelta(days=1)
 
 _QTY_REL_TOL = 1e-9
 _QTY_ABS_TOL = 1e-12
@@ -140,6 +158,78 @@ def fetch_account_activities(
     )
 
 
+def _activity_page(client: Any, activity_type: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    page = client.get(f"/account/activities/{activity_type}", params)
+    if not isinstance(page, list) or not all(isinstance(item, dict) for item in page):
+        raise ValueError(
+            f"Alpaca {activity_type} activities response is not a list of objects: "
+            f"{type(page).__name__}"
+        )
+    return page
+
+
+def has_earlier_account_activity(
+    client: Any,
+    activity_type: str,
+    *,
+    before: datetime,
+    field: str = "created_at",
+) -> bool:
+    """Whether any ``activity_type`` activity has a timestamp strictly before ``before``.
+
+    One request, no pagination: ascending from the epoch, the first item is the account's
+    oldest activity inside the window, and it is before ``before`` exactly when an earlier one
+    exists. ``until`` is widened by ``ACTIVITY_WINDOW_OVERLAP`` because ``CFEE``/``FEE`` filter
+    by New York calendar day; the returned item's real timestamp is checked client-side, so a
+    same-day item newer than ``before`` cannot produce a false positive. An activity without a
+    usable timestamp raises, so the caller fails closed.
+    """
+    page = _activity_page(
+        client,
+        activity_type,
+        {
+            "after": activity_timestamp(ACTIVITY_EPOCH),
+            "until": activity_timestamp(before + ACTIVITY_WINDOW_OVERLAP),
+            "direction": "asc",
+            "page_size": 1,
+        },
+    )
+    if not page:
+        return False
+    return _parse_activity_time(page[0].get(field)) < before
+
+
+def select_activity_window(
+    items: list[dict[str, Any]],
+    *,
+    after: datetime,
+    until: datetime,
+    field: str = "created_at",
+) -> list[dict[str, Any]]:
+    """Client-side ``(after, until]`` filter with dedupe by id for a widened listing.
+
+    Day-granular ``CFEE``/``FEE`` filtering can return items outside the requested instants;
+    this keeps exactly the intended window. An item whose timestamp cannot be parsed is kept
+    so the downstream classifier marks the index broken instead of silently dropping it.
+    """
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in items:
+        activity_id = str(raw.get("id") or "").strip()
+        if activity_id:
+            if activity_id in seen:
+                continue
+            seen.add(activity_id)
+        try:
+            moment = _parse_activity_time(raw.get(field))
+        except ValueError:
+            selected.append(raw)
+            continue
+        if after < moment <= until:
+            selected.append(raw)
+    return selected
+
+
 def _decimal(value: Any) -> Decimal:
     try:
         number = Decimal(str(value).strip())
@@ -148,6 +238,17 @@ def _decimal(value: Any) -> Decimal:
     if not number.is_finite():
         raise ValueError(f"not a finite number: {value!r}")
     return number
+
+
+_PRICE_CENT = Decimal("0.01")
+
+
+def _price_cents(value: Any) -> Decimal | None:
+    """A price at the 2 dp precision ``CFEE`` entries report it (#149); ``None`` if unusable."""
+    try:
+        return _decimal(value).quantize(_PRICE_CENT)
+    except (ValueError, InvalidOperation):
+        return None
 
 
 def _parse_activity_time(value: Any) -> datetime:
@@ -160,7 +261,7 @@ def _parse_activity_time(value: Any) -> datetime:
     return moment
 
 
-def _cfee_created_at(raw: dict[str, Any]) -> datetime:
+def cfee_created_at(raw: dict[str, Any]) -> datetime:
     try:
         return _parse_activity_time(raw.get("created_at"))
     except ValueError as exc:
@@ -235,6 +336,14 @@ class _FeeBatch:
     asset: dict[str, Decimal] = field(default_factory=lambda: defaultdict(Decimal))
     pair_usd: dict[str, Decimal] = field(default_factory=lambda: defaultdict(Decimal))
     usd_pool: Decimal = Decimal(0)
+    #: Per-fill consistency evidence (#149 posts one entry per fill): entry counts per pair and
+    #: the asset entries' 2 dp prices (``None`` when the entry's price is unusable).
+    asset_entries: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    asset_prices: dict[str, list[Decimal | None]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    pair_usd_entries: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    usd_pool_entries: int = 0
     #: ``None`` key = a problem that could concern any pair in the batch; a pair key scopes it.
     problems: dict[str | None, str] = field(default_factory=dict)
 
@@ -274,11 +383,15 @@ def _add_cfee(batch: _FeeBatch, raw: dict[str, Any]) -> None:
             )
         else:
             batch.asset[pair] -= qty
+            batch.asset_entries[pair] += 1
+            batch.asset_prices[pair].append(_price_cents(raw.get("price")))
     elif net_amount < 0 and qty == 0:
         if pair is None:
             batch.usd_pool -= net_amount
+            batch.usd_pool_entries += 1
         else:
             batch.pair_usd[pair] -= net_amount
+            batch.pair_usd_entries[pair] += 1
     else:
         batch.problems[pair] = (
             "a CFEE entry is neither an asset fee nor a USD fee "
@@ -307,7 +420,7 @@ def build_fee_batches(
     timed: list[tuple[datetime, dict[str, Any]]] = []
     for raw in cfee_activities:
         try:
-            moment = _cfee_created_at(raw)
+            moment = cfee_created_at(raw)
         except ValueError as exc:
             result.broken = str(exc)
             return result
@@ -353,7 +466,7 @@ def fee_fill_window_start(
     ``None`` when no posted batch can cover any candidate yet - every candidate is simply retried
     on a later pass. Raises ValueError when a ``CFEE`` activity has no usable ``created_at``.
     """
-    ends = _batch_end_times([_cfee_created_at(raw) for raw in cfee_activities])
+    ends = _batch_end_times([cfee_created_at(raw) for raw in cfee_activities])
     if not ends:
         return None
     moments = [
@@ -483,6 +596,26 @@ def _pool_owner(inputs: _Inputs, batch_index: int) -> str | None:
     return "ambiguous"
 
 
+def _asset_entries_match(batch: _FeeBatch, pair: str, buys: list[BrokerFill]) -> bool:
+    """One asset-fee entry per buy fill, each at the fill's 2 dp price (#149's observed shape)."""
+    prices = batch.asset_prices.get(pair, [])
+    if batch.asset_entries.get(pair, 0) != len(buys) or len(prices) != len(buys):
+        return False
+    if any(price is None for price in prices):
+        return False
+    return sorted(prices) == sorted(_price_cents(fill.price) for fill in buys)
+
+
+def _usd_entries_match(
+    batch: _FeeBatch, pair: str, owner: str | None, sells: list[BrokerFill]
+) -> bool:
+    """One USD-fee entry per sell fill the priced USD fee is meant to cover."""
+    expected = batch.pair_usd_entries.get(pair, 0)
+    if owner == pair:
+        expected += batch.usd_pool_entries
+    return expected == len(sells)
+
+
 def _allocate(
     inputs: _Inputs,
     pair: str,
@@ -519,17 +652,20 @@ def _allocate(
                 f"the base-asset CFEE {asset_fee} exceeds {MAX_PLAUSIBLE_FEE_RATE:%} of the "
                 f"{received_buy} received; refusing an implausible fee"
             )
+        elif not _asset_entries_match(batch, pair, buys):
+            problems.append(
+                "the batch's base-asset CFEE entries do not match the buy fills one-for-one "
+                "(one entry per fill at the fill's 2 dp price); refusing to spread a fee that "
+                "may cover other fills"
+            )
         else:
             for fill in buys:
                 usd_by_order[fill.order_id] += (
                     asset_fee * fill.received / received_buy * fill.price
                 )
     elif asset_fee > 0:
-        return GroupPlan(
-            pair,
-            end,
-            {},
-            "a base-asset CFEE is posted but the pair has no buys in the batch window",
+        problems.append(
+            "a base-asset CFEE is posted but the pair has no buys in the batch window"
         )
     if sells:
         if pool_problem is not None:
@@ -541,15 +677,17 @@ def _allocate(
                 f"the USD CFEE {usd_fee} exceeds {MAX_PLAUSIBLE_FEE_RATE:%} of the "
                 f"{received_sell} received; refusing an implausible fee"
             )
+        elif not _usd_entries_match(batch, pair, owner, sells):
+            problems.append(
+                "the batch's USD CFEE entries do not match the sell fills one-for-one; "
+                "refusing to spread a fee that may cover other fills"
+            )
         else:
             for fill in sells:
                 usd_by_order[fill.order_id] += usd_fee * fill.received / received_sell
     elif batch.pair_usd.get(pair, Decimal(0)) > 0:
-        return GroupPlan(
-            pair,
-            end,
-            {},
-            "a USD CFEE naming the pair is posted but the pair has no sells in the batch window",
+        problems.append(
+            "a USD CFEE naming the pair is posted but the pair has no sells in the batch window"
         )
 
     commissions: dict[str, float] = {}
@@ -614,17 +752,20 @@ def plan_commission_backfill(
     cfee_activities: list[dict[str, Any]],
     fee_activities: list[dict[str, Any]],
     local_rows: list[dict[str, Any]],
+    now: datetime,
     first_batch_open: bool = False,
 ) -> tuple[list[GroupPlan], list[str], list[str]]:
     """Plan the commissions to backfill: one `GroupPlan` per (pair, CFEE batch) to resolve.
 
     ``candidates`` are the account's crypto executions with an unknown commission; ``local_rows``
     are every execution the account recorded on the orders the broker reports for those pairs.
-    ``first_batch_open`` asserts that the first fetched ``CFEE`` batch's coverage window reaches
-    before the fetched history (an earlier batch or earlier fills may exist), so it fails closed
-    whenever it would price fills. Returns the plans, messages for candidates that could not be
-    put in any group, and messages for candidates whose fee batch is simply not posted yet
-    (retried on a later pass).
+    ``now`` is the pass's clock: a batch whose latest ``created_at`` is within ``CFEE_BATCH_GAP``
+    of it is still posting, so it is treated as unposted - its fills stay pending for a later
+    pass rather than being priced from partial totals. ``first_batch_open`` asserts that the
+    first fetched ``CFEE`` batch's coverage window reaches before the fetched history (an earlier
+    batch or earlier fills may exist), so it fails closed whenever it would price fills. Returns
+    the plans, messages for candidates that could not be put in any group, and messages for
+    candidates whose fee batch is simply not posted yet (retried on a later pass).
     """
     pairs = {pair_key(row["symbol"]) for row in candidates}
     fills_by_order: dict[str, list[BrokerFill]] = defaultdict(list)
@@ -654,6 +795,11 @@ def plan_commission_backfill(
     for row in local_rows:
         rows_by_order[row["broker_order_id"]].append(row)
     fees = build_fee_batches(cfee_activities, fee_activities)
+    # Settle guard: a batch still receiving entries has partial totals; leave it unposted so its
+    # fills stay pending instead of being priced from an incomplete fee.
+    fees.batches = [
+        batch for batch in fees.batches if now - batch.end > CFEE_BATCH_GAP
+    ]
     if first_batch_open and fees.batches:
         fees.batches[0].open_start = True
     ends = [batch.end for batch in fees.batches]

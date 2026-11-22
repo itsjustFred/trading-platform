@@ -16,11 +16,15 @@ from alpaca.trading.enums import OrderClass
 from alpaca.trading.requests import ReplaceOrderRequest, StopLossRequest, TakeProfitRequest
 
 from live_runner.alpaca_fees import (
+    ACTIVITY_WINDOW_OVERLAP,
     CFEE_LOOKBACK_MARGIN,
     COMMISSION_BACKFILL_LOOKBACK,
+    cfee_created_at,
     fee_fill_window_start,
     fetch_account_activities,
+    has_earlier_account_activity,
     plan_commission_backfill,
+    select_activity_window,
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
@@ -1047,25 +1051,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             candidate_times.append(timestamp)
 
         # CFEE first: its batches decide which fills can be priced at all, and how far back the
-        # FILL listing must reach to cover every relevant batch window.
+        # FILL listing must reach to cover every relevant batch window. CFEE/FEE filter by New
+        # York calendar day (#149), so the listing is widened by a day on both sides and
+        # re-filtered here on the real timestamps.
         cfee_after = min(candidate_times) - CFEE_LOOKBACK_MARGIN
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
         try:
-            cfees = await asyncio.to_thread(
-                fetch_account_activities, client, "CFEE", after=cfee_after, until=now
-            )
-            # Does an earlier CFEE batch exist before the fetch horizon? If so the first fetched
-            # batch's coverage window is truncated and it must fail closed when relevant. With no
-            # predecessor it is the account's first batch ever - then it is complete only if no
-            # fills exist before the FILL fetch bound either.
-            predecessor = await asyncio.to_thread(
+            raw_cfees = await asyncio.to_thread(
                 fetch_account_activities,
                 client,
                 "CFEE",
-                after=epoch,
-                until=cfee_after,
-                direction="desc",
-                page_size=1,
+                after=cfee_after - ACTIVITY_WINDOW_OVERLAP,
+                until=now + ACTIVITY_WINDOW_OVERLAP,
+            )
+            cfees = select_activity_window(
+                raw_cfees, after=cfee_after, until=now, field="created_at"
             )
             fill_start = fee_fill_window_start(candidate_times, cfees)
         except Exception as exc:
@@ -1090,25 +1089,42 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             return 0
 
-        first_batch_open = bool(predecessor)
+        # Does an earlier CFEE batch exist before the first fetched one? If so its coverage
+        # window is truncated and it must fail closed when relevant. With no predecessor it is
+        # the account's first batch ever - then it is complete only if no fills exist before
+        # the FILL fetch bound either. Both probes are single requests: the account's oldest
+        # activity inside the window decides existence, so a long history cannot stall the pass.
+        first_batch_open = False
         try:
+            if cfees:
+                first_cfee_at = min(cfee_created_at(raw) for raw in cfees)
+                first_batch_open = await asyncio.to_thread(
+                    has_earlier_account_activity,
+                    client,
+                    "CFEE",
+                    before=first_cfee_at,
+                    field="created_at",
+                )
             if not first_batch_open:
-                # No earlier CFEE batch exists, so the first fetched batch is the account's
-                # first ever; it is complete only if no fills predate the FILL fetch bound.
-                early_fills = await asyncio.to_thread(
-                    fetch_account_activities,
+                first_batch_open = await asyncio.to_thread(
+                    has_earlier_account_activity,
                     client,
                     "FILL",
-                    after=epoch,
-                    until=fill_start,
-                    page_size=1,
+                    before=fill_start,
+                    field="transaction_time",
                 )
-                first_batch_open = bool(early_fills)
             fills = await asyncio.to_thread(
                 fetch_account_activities, client, "FILL", after=fill_start, until=now
             )
-            usd_fees = await asyncio.to_thread(
-                fetch_account_activities, client, "FEE", after=cfee_after, until=now
+            raw_fees = await asyncio.to_thread(
+                fetch_account_activities,
+                client,
+                "FEE",
+                after=cfee_after - ACTIVITY_WINDOW_OVERLAP,
+                until=now + ACTIVITY_WINDOW_OVERLAP,
+            )
+            usd_fees = select_activity_window(
+                raw_fees, after=cfee_after, until=now, field="created_at"
             )
         except Exception as exc:
             logger.warning(
@@ -1136,6 +1152,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             cfee_activities=cfees,
             fee_activities=usd_fees,
             local_rows=local_rows,
+            now=now,
             first_batch_open=first_batch_open,
         )
         for message in unplaced:

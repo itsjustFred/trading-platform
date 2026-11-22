@@ -834,19 +834,47 @@ class FakeActivitiesClient:
             raise RuntimeError("503 Service Unavailable")
         prefix = "/account/activities/"
         assert path.startswith(prefix), path
-        items = self.items[path[len(prefix) :]]
+        activity_type = path[len(prefix) :]
+        items = self.items[activity_type]
 
         def stamp(item):
             return _parse_stamp(
                 item.get("transaction_time") or item.get("created_at") or item["date"]
             )
 
-        selected = [
-            item
-            for item in items
-            if ("after" not in params or stamp(item) > _parse_stamp(params["after"]))
-            and ("until" not in params or stamp(item) < _parse_stamp(params["until"]))
-        ]
+        if activity_type in {"CFEE", "FEE"}:
+            # #149: non-trade activities filter ``after``/``until`` by New York calendar day,
+            # not by instant - a boundary day's entries can be missed or over-returned.
+            from zoneinfo import ZoneInfo
+
+            ny = ZoneInfo("America/New_York")
+
+            def day_of(item):
+                return stamp(item).astimezone(ny).date()
+
+            after_day = (
+                _parse_stamp(params["after"]).astimezone(ny).date()
+                if "after" in params
+                else None
+            )
+            until_day = (
+                _parse_stamp(params["until"]).astimezone(ny).date()
+                if "until" in params
+                else None
+            )
+            selected = [
+                item
+                for item in items
+                if (after_day is None or day_of(item) > after_day)
+                and (until_day is None or day_of(item) < until_day)
+            ]
+        else:
+            selected = [
+                item
+                for item in items
+                if ("after" not in params or stamp(item) > _parse_stamp(params["after"]))
+                and ("until" not in params or stamp(item) < _parse_stamp(params["until"]))
+            ]
         selected.sort(key=lambda item: item["id"], reverse=params.get("direction") != "asc")
         token = params.get("page_token")
         if token:
@@ -892,28 +920,34 @@ def _cfee(
     status: str = "executed",
     with_created_at: bool = True,
     created_at: str | None = None,
+    price: str = "60000",
     description: str = "Coin Pair Transaction Fee (Non USD)",
 ) -> dict[str, Any]:
+    if created_at is None and with_created_at:
+        # ``CFEE.date`` is the New York date of ``created_at`` - the posting date (#149).
+        created_at = (
+            f"{(datetime.fromisoformat(day) + timedelta(days=1)):%Y-%m-%d}T05:00:00Z"
+        )
     entry = {
-        "id": f"{day.replace('-', '')}000000000::{uuid4()}",
+        # Ids order by creation time like the real API's ``direction`` does.
+        "id": (
+            _et_id(_parse_stamp(created_at))
+            if created_at
+            else f"{day.replace('-', '')}000000000::{uuid4()}"
+        ),
         "activity_type": "CFEE",
         "currency": "USD",
         "date": day,
         "net_amount": net_amount,
         "description": description,
         "qty": qty,
-        "price": "60100",
+        "price": price,
         "status": status,
     }
     if symbol is not None:
         entry["symbol"] = symbol
     if created_at is not None:
         entry["created_at"] = created_at
-    elif with_created_at:
-        # ``CFEE.date`` is the New York date of ``created_at`` - the posting date (#149).
-        entry["created_at"] = (
-            f"{(datetime.fromisoformat(day) + timedelta(days=1)):%Y-%m-%d}T05:00:00Z"
-        )
     return entry
 
 
@@ -979,12 +1013,13 @@ def test_backfill_converts_a_base_asset_fee_on_a_buy_to_usd(db):
     assert _commission(db, signal) == [pytest.approx(0.00125 * 60000.0)]
     paths = {path for path, _params in client.calls}
     assert {"/account/activities/FILL", "/account/activities/CFEE"} <= paths
-    # The listings are ascending full pages; the boundary probes are single-item lookups.
+    # The listings are ascending full pages; the boundary probes are single-item lookups
+    # answered from the account's oldest activity, so they cannot stall on a long history.
     for _path, params in client.calls:
         if int(params.get("page_size")) == 100:
             assert params.get("direction") == "asc"
     probes = [params for _path, params in client.calls if int(params.get("page_size")) == 1]
-    assert any(params.get("direction") == "desc" for params in probes), (
+    assert probes and all(params.get("direction") == "asc" for params in probes), (
         "an earlier CFEE batch must be probed so the first fetched batch's window is known"
     )
 
@@ -1006,12 +1041,20 @@ def test_backfill_allocates_a_symbol_less_usd_fee_pool_to_the_single_selling_pai
     """#346: real sell-side CFEE entries carry no ``symbol`` - they form a per-batch USD pool.
 
     With exactly one crypto pair selling in the batch window the pool is unambiguous and is
-    allocated to that pair's sells by received notional.
+    allocated to that pair's sells by received notional. #149 posts one USD entry per sell
+    fill, so two pool entries need two sell fills.
     """
     signal, order_id = _crypto_fill(db, action="sell", label="pool-sell")
+    second_at = FILL_AT + timedelta(hours=1)
+    second_signal, second_order = _crypto_fill(
+        db, action="sell", qty=0.25, label="pool-sell-2", at=second_at
+    )
     client = FakeActivitiesClient(
         fills=[
-            _fill_activity(order_id=order_id, side="sell", qty="0.5", price="60000", at=FILL_AT)
+            _fill_activity(order_id=order_id, side="sell", qty="0.5", price="60000", at=FILL_AT),
+            _fill_activity(
+                order_id=second_order, side="sell", qty="0.25", price="60000", at=second_at
+            ),
         ],
         cfees=[
             _usd_pool_cfee("-75.0", "2026-11-04T05:00:00Z"),
@@ -1021,8 +1064,10 @@ def test_backfill_allocates_a_symbol_less_usd_fee_pool_to_the_single_selling_pai
         ],
     )
 
-    assert _backfill(client) == 1
-    assert _commission(db, signal) == [pytest.approx(75.03)]
+    assert _backfill(client) == 2
+    # Pool 75.03 split by received notional: 30000 vs 15000.
+    assert _commission(db, signal) == [pytest.approx(75.03 * 30000 / 45000)]
+    assert _commission(db, second_signal) == [pytest.approx(75.03 * 15000 / 45000)]
 
 
 def test_backfill_fails_closed_on_an_ambiguous_usd_pool_but_still_prices_asset_fees(db):
@@ -1037,8 +1082,10 @@ def test_backfill_fails_closed_on_an_ambiguous_usd_pool_but_still_prices_asset_f
         db, action="sell", label="pool-btc-sell", at=sell_at
     )
     eth_sell, eth_sell_order = _crypto_fill(
+        # Notional large enough that the 75 pool is plausible for either seller: the refusal
+        # must come from the ambiguity, not the plausibility ceiling.
         db, action="sell", label="pool-eth-sell", at=sell_at, symbol="ETH/USD", price=3000.0,
-        qty=2.0,
+        qty=20.0,
     )
     client = FakeActivitiesClient(
         fills=[
@@ -1049,7 +1096,7 @@ def test_backfill_fails_closed_on_an_ambiguous_usd_pool_but_still_prices_asset_f
             _fill_activity(
                 order_id=eth_sell_order,
                 side="sell",
-                qty="2",
+                qty="20",
                 price="3000",
                 at=sell_at,
                 symbol="ETH/USD",
@@ -1086,7 +1133,12 @@ def test_backfill_leaves_an_orphan_usd_pool_unallocated(db, live_runner_logs):
 
 
 def test_backfill_allocates_an_aggregated_day_fee_by_received_quantity(db):
-    """One CFEE for the day and pair, two orders: each order carries its share of the BTC fee."""
+    """One CFEE batch for the day and pair, two orders: each order carries its share of the fee.
+
+    #149 posts one asset-fee entry per fill at the fill's 2 dp price, so the batch holds one
+    "entry" for each fill while the pair-level total is still allocated pro rata by received
+    quantity across the account's fills.
+    """
     first, first_order = _crypto_fill(db, qty=0.2, price=60000.0, label="agg-1")
     second_at = FILL_AT + timedelta(hours=2)
     second, second_order = _crypto_fill(db, qty=0.3, price=61000.0, label="agg-2", at=second_at)
@@ -1097,7 +1149,10 @@ def test_backfill_allocates_an_aggregated_day_fee_by_received_quantity(db):
                 order_id=second_order, side="buy", qty="0.3", price="61000", at=second_at
             ),
         ],
-        cfees=[_cfee(qty="-0.00125")],
+        cfees=[
+            _cfee(qty="-0.0005", price="60000"),
+            _cfee(qty="-0.00075", price="61000", created_at="2026-11-04T05:00:30Z"),
+        ],
     )
 
     assert _backfill(client) == 2
@@ -1145,6 +1200,7 @@ def test_backfill_splits_an_order_across_its_local_legs(db):
         commission=None,
         timestamp=FILL_AT + timedelta(minutes=1),
     )
+    # One fee entry per fill (#149): two fills, two entries summing to the same 0.00125 BTC.
     client = FakeActivitiesClient(
         fills=[
             _fill_activity(order_id=order_id, side="buy", qty="0.1", price="60000", at=FILL_AT),
@@ -1156,7 +1212,10 @@ def test_backfill_splits_an_order_across_its_local_legs(db):
                 at=FILL_AT + timedelta(minutes=1),
             ),
         ],
-        cfees=[_cfee(qty="-0.00125")],
+        cfees=[
+            _cfee(qty="-0.00025"),
+            _cfee(qty="-0.001", created_at="2026-11-04T05:00:30Z"),
+        ],
     )
 
     assert _backfill(client) == 2
@@ -1417,7 +1476,11 @@ def test_backfill_spans_deployments_of_the_same_account(db):
                 order_id=second_order, side="buy", qty="0.3", price="60000", at=second_at
             ),
         ],
-        cfees=[_cfee(qty="-0.00125")],
+        # One asset-fee entry per fill (#149), both at the 60000 fill price.
+        cfees=[
+            _cfee(qty="-0.0005"),
+            _cfee(qty="-0.00075", created_at="2026-11-04T05:00:30Z"),
+        ],
     )
 
     assert _backfill(client) == 2
@@ -1505,6 +1568,203 @@ def test_apply_commissions_refuses_rows_of_another_account(db):
 
     assert db.apply_live_execution_commissions("some-other-account", {execution_id: 9.0}) == 0
     assert _commission(db, signal) == [None]
+
+
+# ── bundle-40 review fixes ──────────────────────────────────────────────────────────────────────
+
+
+def test_backfill_cfee_predecessor_probe_is_a_single_request_with_long_history(db):
+    """The "is there an earlier CFEE batch" probe must not paginate the whole history.
+
+    With 250 predecessors a paginating ``page_size=1`` probe would make 200 calls and then
+    fail; the single-request probe answers from the account's oldest activity instead.
+    """
+    signal, order_id = _crypto_fill(db, label="deep-history")
+    predecessors = [
+        _cfee(
+            qty="-0.001",
+            day="2026-09-01",
+            created_at=f"2026-09-01T00:{index // 60:02d}:{index % 60:02d}Z",
+        )
+        for index in range(250)
+    ]
+    client = FakeActivitiesClient(
+        fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT)],
+        cfees=[*predecessors, _cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 0
+    assert _commission(db, signal) == [None], "an earlier batch truncates the first window"
+    probes = [
+        params
+        for path, params in client.calls
+        if path.endswith("/CFEE") and int(params.get("page_size")) == 1
+    ]
+    assert len(probes) == 1, "the predecessor probe is one request, not a paginated scan"
+
+
+def test_backfill_early_fill_probe_is_a_single_request_with_long_history(db):
+    """Same bound for the "fills before the fetch window" probe when no CFEE predecessor."""
+    signal, order_id = _crypto_fill(db, label="deep-fills")
+    early_fills = [
+        _fill_activity(
+            order_id=_order_id(f"early-{index}"),
+            side="buy",
+            qty="0.1",
+            price="3000",
+            at=datetime(2026, 10, 1, tzinfo=timezone.utc) + timedelta(seconds=index),
+            symbol="ETH/USD",
+        )
+        for index in range(250)
+    ]
+    client = FakeActivitiesClient(
+        fills=[
+            *early_fills,
+            _fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT),
+        ],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 0
+    assert _commission(db, signal) == [None]
+    probes = [
+        params
+        for path, params in client.calls
+        if path.endswith("/FILL") and int(params.get("page_size")) == 1
+    ]
+    assert len(probes) == 1, "the early-fill probe is one request, not a paginated scan"
+
+
+def test_backfill_leaves_a_still_posting_batch_pending_until_it_settles(db):
+    """A batch still receiving entries has partial totals: its fills wait, they are not priced.
+
+    At end+1 min the pass must leave the row NULL; at end+16 min (> CFEE_BATCH_GAP) the same
+    batch is settled and prices normally.
+    """
+    signal, order_id = _crypto_fill(db, label="settling")
+    client = FakeActivitiesClient(
+        fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=FILL_AT)],
+        cfees=[_cfee(qty="-0.00125", created_at="2026-11-06T11:59:00Z")],
+    )
+
+    assert _backfill(client, now=datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)) == 0
+    assert _commission(db, signal) == [None], "a posting batch is not a posted fee"
+
+    assert _backfill(client, now=datetime(2026, 11, 6, 12, 15, tzinfo=timezone.utc)) == 1
+    assert _commission(db, signal) == [pytest.approx(75.0)]
+
+
+def test_backfill_fails_closed_on_an_interleaved_delayed_usd_posting(db):
+    """A delayed sell's fee landing in a later batch must not be spread over earlier sells.
+
+    S1's USD fee is delayed ~50 h; S2's posts first. The batch's window still contains both
+    fills, but it holds one USD entry for two sells - the per-fill consistency check refuses
+    rather than writing a wrong commission that can never be corrected.
+    """
+    first_at = FILL_AT
+    second_at = FILL_AT + timedelta(hours=50)
+    first_signal, first_order = _crypto_fill(db, action="sell", label="late-1", at=first_at)
+    second_signal, second_order = _crypto_fill(
+        db, action="sell", label="late-2", at=second_at
+    )
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(
+                order_id=first_order, side="sell", qty="0.5", price="60000", at=first_at
+            ),
+            _fill_activity(
+                order_id=second_order, side="sell", qty="0.5", price="60000", at=second_at
+            ),
+        ],
+        cfees=[_usd_pool_cfee("-150.0", "2026-11-05T17:00:30Z")],
+    )
+
+    assert _backfill(client) == 0
+    assert _commission(db, first_signal) == [None]
+    assert _commission(db, second_signal) == [None]
+
+
+def test_backfill_fails_closed_when_asset_entries_do_not_match_the_buys(db):
+    """One asset-fee entry cannot cover two buy fills: the batch is refused, not spread."""
+    first, first_order = _crypto_fill(db, qty=0.2, label="mismatch-1")
+    second_at = FILL_AT + timedelta(hours=1)
+    second, second_order = _crypto_fill(db, qty=0.3, label="mismatch-2", at=second_at)
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(order_id=first_order, side="buy", qty="0.2", price="60000", at=FILL_AT),
+            _fill_activity(
+                order_id=second_order, side="buy", qty="0.3", price="60000", at=second_at
+            ),
+        ],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    assert _backfill(client) == 0
+    assert _commission(db, first) == [None]
+    assert _commission(db, second) == [None]
+
+
+def test_backfill_fails_closed_when_another_order_straddles_the_batch_window(db):
+    """An order with fills in two batches cannot be split; it poisons the batch it straddles."""
+    signal_a, order_a = _crypto_fill(db, label="straddle-a")
+    signal_b = _signal(db, symbol="BTC/USD")
+    order_b = _order_id("straddle-b")
+    straddle_times = [FILL_AT + timedelta(hours=1), FILL_AT + timedelta(days=2)]
+    for index, at in enumerate(straddle_times, start=1):
+        _local_fill(
+            db,
+            signal_b,
+            price=60000.0,
+            qty=0.2,
+            order_id=order_b,
+            key=f"alpaca:exec:straddle-b-{index}",
+            commission=None,
+            timestamp=at,
+        )
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(order_id=order_a, side="buy", qty="0.5", price="60000", at=FILL_AT),
+            _fill_activity(
+                order_id=order_b, side="buy", qty="0.2", price="60000",
+                at=FILL_AT + timedelta(hours=1),
+            ),
+            _fill_activity(
+                order_id=order_b, side="buy", qty="0.2", price="60000",
+                at=FILL_AT + timedelta(days=2),
+            ),
+        ],
+        cfees=[
+            _cfee(qty="-0.0005"),
+            _cfee(qty="-0.0005", created_at="2026-11-06T05:00:00Z"),
+        ],
+    )
+
+    assert _backfill(client, now=datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)) == 0
+    assert _commission(db, signal_a) == [None]
+    assert _commission(db, signal_b) == [None, None]
+
+
+def test_backfill_prices_two_batches_and_counts_both(db):
+    """``updated`` accumulates across plans: two settled batches price two executions."""
+    first, first_order = _crypto_fill(db, qty=0.2, label="twobatch-1")
+    second_at = datetime(2026, 11, 4, 6, 0, tzinfo=timezone.utc)
+    second, second_order = _crypto_fill(db, qty=0.3, label="twobatch-2", at=second_at)
+    client = FakeActivitiesClient(
+        fills=[
+            _fill_activity(order_id=first_order, side="buy", qty="0.2", price="60000", at=FILL_AT),
+            _fill_activity(
+                order_id=second_order, side="buy", qty="0.3", price="60000", at=second_at
+            ),
+        ],
+        cfees=[
+            _cfee(qty="-0.0005"),
+            _cfee(qty="-0.00075", created_at="2026-11-05T05:00:00Z"),
+        ],
+    )
+
+    assert _backfill(client) == 2
+    assert _commission(db, first) == [pytest.approx(0.0005 * 60000.0)]
+    assert _commission(db, second) == [pytest.approx(0.00075 * 60000.0)]
 
 
 # ── daemon wiring ──────────────────────────────────────────────────────────────────────────────
@@ -2165,10 +2425,14 @@ def test_backfill_respects_lookback_window(db):
     # Create an old fill (40 days ago, outside the 30-day lookback)
     ancient_at = FILL_AT - timedelta(days=40)
     signal, order_id = _crypto_fill(db, label="ancient", at=ancient_at)
-    
+
     client = FakeActivitiesClient(
-        fills=[_fill_activity(order_id=order_id, side="buy", qty="0.5", price="60000", at=ancient_at)],
-        cfees=[_cfee(qty="-0.00125", day=(ancient_at.date()).isoformat())],
+        fills=[
+            _fill_activity(
+                order_id=order_id, side="buy", qty="0.5", price="60000", at=ancient_at
+            )
+        ],
+        cfees=[_cfee(qty="-0.00125", day=ancient_at.date().isoformat())],
     )
 
     # Should NOT backfill - too old
@@ -2178,20 +2442,24 @@ def test_backfill_respects_lookback_window(db):
 
 
 def test_backfill_ignores_unknown_commissions_outside_the_lookback_explicit(db):
-    """Explicit test for the lookback boundary: 31 days old should be ignored, 5 days should be processed."""
+    """Explicit test for the lookback boundary: 31 days old ignored, 5 days processed."""
     # NOW = 2026-11-06 12:00:00, lookback starts at 2026-10-07 12:00:00
     # 31 days before FILL_AT (Nov 3) = Oct 3 - outside lookback
     old_at = FILL_AT - timedelta(days=31)
     old_signal, old_order = _crypto_fill(db, label="old", at=old_at)
-    
+
     # 5 days before FILL_AT = Oct 29 - inside lookback (after Oct 7)
     new_at = FILL_AT - timedelta(days=5)
     new_signal, new_order = _crypto_fill(db, label="new", at=new_at)
-    
+
     client = FakeActivitiesClient(
         fills=[
-            _fill_activity(order_id=old_order, side="buy", qty="0.5", price="60000", at=old_at),
-            _fill_activity(order_id=new_order, side="buy", qty="0.5", price="60000", at=new_at),
+            _fill_activity(
+                order_id=old_order, side="buy", qty="0.5", price="60000", at=old_at
+            ),
+            _fill_activity(
+                order_id=new_order, side="buy", qty="0.5", price="60000", at=new_at
+            ),
         ],
         cfees=[
             _cfee(qty="-0.00125", day=(old_at.date()).isoformat()),
@@ -2510,7 +2778,10 @@ def test_backfill_refuses_a_zero_quantity_order_and_keeps_the_rest(db, live_runn
                 symbol="ETH/USD",
             ),
         ],
-        cfees=[_cfee(qty="-0.00125"), _cfee(qty="-0.0025", symbol="ETHUSD")],
+        cfees=[
+            _cfee(qty="-0.00125"),
+            _cfee(qty="-0.0025", symbol="ETHUSD", price="3000"),
+        ],
     )
 
     _backfill(client)
@@ -2547,6 +2818,7 @@ def test_plan_refuses_a_zero_quantity_local_order_without_aborting_the_pass():
         cfee_activities=[_cfee(qty="-0.00125")],
         fee_activities=[],
         local_rows=rows,
+        now=NOW,
     )
 
     assert plans, "planning must not raise"
