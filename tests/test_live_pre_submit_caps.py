@@ -767,3 +767,56 @@ def test_claim_path_cap_refusal_releases_the_lease_and_never_submits(monkeypatch
     assert broker.submitted == []
     assert released, "a provably pre-request refusal must release the submission lease"
     assert "released the submission lease" in caplog.text
+
+
+def test_claim_path_submits_the_clamped_qty(monkeypatch):
+    """The Discord claim path must submit the quantity the caps returned.
+
+    Pins ``prepared_qty = await enforce_pre_submit_caps(...)`` at the claim
+    chokepoint: a mutant that drops the assignment would submit the pre-clamp
+    size on the main live path.
+    """
+    from risk import TradeSignal
+
+    deployment = _deployment(max_risk_per_trade=0.5)
+    broker = _Broker(max_leverage=2.0)
+    trade_signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"received_at": datetime.now(timezone.utc).isoformat()},
+    )
+    live_signal = daemon._trade_signal_to_live_signal(trade_signal, deployment)
+    prepared_signal = _signal(
+        deployment,
+        metadata={"entry_price": 100.0, "stop_loss": 99.9, "take_profit": 105.0},
+    )
+
+    async def _fake_prepare(adapter, dep, signal, **_kwargs):
+        # A runaway size: 5000 * 100 * 1.0 = 500k notional = 5x the 100k
+        # equity; the 2x broker maximum clamps it to 2000.
+        return prepared_signal, 5000.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _fake_prepare)
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda token: True)
+    monkeypatch.setattr(daemon, "renew_live_deployment_submission", lambda token: True)
+
+    _run(
+        daemon._prepare_claim_and_submit_signal(
+            "acc-1",
+            broker,
+            deployment,
+            trade_signal,
+            live_signal,
+            is_exit=False,
+        )
+    )
+
+    assert len(broker.submitted) == 1
+    _submitted_signal, submitted_qty = broker.submitted[0]
+    assert submitted_qty == pytest.approx(2000.0)
+    assert submitted_qty != pytest.approx(5000.0)

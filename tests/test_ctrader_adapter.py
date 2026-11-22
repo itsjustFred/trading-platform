@@ -1612,3 +1612,187 @@ def test_money_digits_fallback_is_logged(caplog) -> None:
     assert any("moneyDigits" in record.getMessage() for record in caplog.records), (
         "the fallback to the default scale was silent"
     )
+
+
+# ── get_max_leverage (#240/#302) ──────────────────────────────────────────────
+
+
+def _leverage_adapter() -> CTraderLiveAdapter:
+    """A connected, authenticated adapter with the leverage proto types bound."""
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetDynamicLeverageByIDReq,
+        ProtoOAGetDynamicLeverageByIDRes,
+    )
+
+    adapter._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
+    adapter._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+    return adapter
+
+
+def _dynamic_leverage_response(*tier_leverages: int):
+    """A ``ProtoOAGetDynamicLeverageByIDRes`` whose tiers carry raw proto values.
+
+    ``ProtoOADynamicLeverageTier.leverage`` is in cents (1:200 -> 20000), the
+    same convention as ``ProtoOATrader.leverageInCents``.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetDynamicLeverageByIDRes,
+    )
+
+    response = ProtoOAGetDynamicLeverageByIDRes()
+    for index, leverage in enumerate(tier_leverages):
+        tier = response.leverage.tiers.add()
+        tier.volume = (index + 1) * 1_000_000
+        tier.leverage = leverage
+    return response
+
+
+def test_get_max_leverage_returns_the_highest_tier_as_a_plain_ratio() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    sent: list[object] = []
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        # Tiers ascend by volume; leverage descends, so the LAST tier is the
+        # smallest — returning it instead of max() must fail this test.
+        return _dynamic_leverage_response(50000, 20000, 10000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    result = asyncio.run(adapter.get_max_leverage("eurusd"))
+
+    assert result == pytest.approx(500.0)
+    assert len(sent) == 1
+    request = sent[0]
+    assert request.leverageId == 42
+    assert request.ctidTraderAccountId == 46736452
+
+
+def test_get_max_leverage_without_a_leverage_id_never_calls_the_broker() -> None:
+    adapter = _leverage_adapter()
+
+    async def _fake_send(request, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no leverageId means no broker call")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_with_an_unusable_response_returns_none() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+
+    async def _fake_send(request, **_kwargs):
+        return object()  # not a ProtoOAGetDynamicLeverageByIDRes
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_with_empty_tiers_returns_none() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response()
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_send_failure_degrades_to_none() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+
+    async def _fake_send(request, **_kwargs):
+        raise RuntimeError("broker call failed")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_without_proto_types_returns_none() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    # _ProtoOAGetDynamicLeverageByIDReq/Res stay None (openapi types not loaded).
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def _symbol_by_id_response(leverage_id: int | None, symbol_id: int = 123):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolByIdRes
+
+    response = ProtoOASymbolByIdRes()
+    symbol = response.symbol.add()
+    symbol.symbolId = symbol_id
+    symbol.digits = 5
+    symbol.pipPosition = 4
+    if leverage_id is not None:
+        symbol.leverageId = leverage_id
+    return response
+
+
+def test_symbol_props_refresh_captures_and_drops_leverage_ids() -> None:
+    """``_load_symbol_props_into_cache`` is the only writer of
+    ``_symbol_leverage_ids``: a refresh stores the id a live symbol carries
+    and drops the stale one a refreshed symbol no longer carries."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetDynamicLeverageByIDReq,
+        ProtoOASymbolByIdReq,
+    )
+
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 7  # stale id from a prior session
+    sent: list[object] = []
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        if isinstance(request, ProtoOASymbolByIdReq):
+            # The refreshed EURUSD no longer carries a leverageId.
+            return _symbol_by_id_response(leverage_id=None)
+        if isinstance(request, ProtoOAGetDynamicLeverageByIDReq):
+            return _dynamic_leverage_response(20000)
+        raise AssertionError(f"unexpected request {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 123}))
+    assert "EURUSD" not in adapter._symbol_leverage_ids
+    # The stale id is gone: the leverage lookup must not fire a request.
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+    assert not any(
+        isinstance(request, ProtoOAGetDynamicLeverageByIDReq) for request in sent
+    )
+
+    # A refresh whose symbol carries leverageId stores it for the lookup.
+    async def _fake_send_with_id(request, **_kwargs):
+        if isinstance(request, ProtoOASymbolByIdReq):
+            return _symbol_by_id_response(leverage_id=99)
+        return _dynamic_leverage_response(20000)
+
+    adapter._send_request_with_refresh_retry = _fake_send_with_id
+    asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 123}))
+    assert adapter._symbol_leverage_ids["EURUSD"] == 99
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(200.0)
+
+
+def test_disconnect_clears_symbol_leverage_ids() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    asyncio.run(adapter.disconnect())
+    assert adapter._symbol_leverage_ids == {}

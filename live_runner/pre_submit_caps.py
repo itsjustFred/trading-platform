@@ -324,7 +324,11 @@ async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | N
     """
     try:
         value = await adapter.get_max_leverage(symbol)
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "Max leverage lookup raised; treating it as unknown (1x)",
+            extra={"data": {"symbol": symbol, "error": repr(exc)}},
+        )
         return None
     if value is None:
         return None
@@ -593,6 +597,10 @@ async def enforce_pre_submit_caps(
             "effective_max_leverage": broker_leverage,
             "leverage_ceiling": leverage_ceiling,
             "qty_step": step,
+            # The broker maximum is an upper bound (cTrader's tiered leverage
+            # is highest at the smallest volume); the broker enforces the
+            # lower tier that applies at the order's actual size.
+            "broker_max_leverage_is_upper_bound": True,
         }
         logger.warning(
             "Pre-submit caps clamped the order qty to the broker's maximum "

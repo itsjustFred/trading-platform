@@ -2995,9 +2995,16 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         ``ProtoOASymbol.leverageId`` — captured with the symbol props — resolves
         through ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
-        ascending by volume; the highest leverage sits in the first tier. The
-        answer is per account (the request carries ``ctidTraderAccountId``) and
-        per asset.
+        ascending by volume. ``ProtoOADynamicLeverageTier.leverage`` is in the
+        same cents convention as ``ProtoOATrader.leverageInCents`` (1:200 is
+        ``20000``): Spotware's own Open API example divides the field by 100
+        before display, so the plain ratio is ``value / 100``.
+
+        Leverage shrinks as position volume grows across the tiers, so the
+        maximum sits in the first tier — an upper bound: a larger order is
+        margined at a lower tier, which the broker still enforces. The answer
+        is per account (the request carries ``ctidTraderAccountId``) and per
+        asset.
 
         Returns ``None`` — never a guess — when the symbol has no leverage id,
         the proto classes are unavailable, the response is unusable, or the
@@ -3033,7 +3040,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 and math.isfinite(value)
                 and value > 0
             ]
-            return max(values) if values else None
+            # Tier leverage is in cents (1:200 -> 20000), like
+            # ProtoOATrader.leverageInCents; callers want the plain ratio.
+            return max(values) / 100.0 if values else None
         except Exception as exc:
             logger.warning(
                 "cTrader max leverage lookup failed; treating it as unknown (1x)",

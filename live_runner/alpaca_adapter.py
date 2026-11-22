@@ -1580,6 +1580,27 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         equity = _to_float(getattr(account, "equity", None), default=balance)
         return balance, equity
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The account's buying-power multiplier — Alpaca's leverage ceiling.
+
+        ``account.multiplier`` (1, 2 or 4) is the margin multiplier the broker
+        grants the account: the most notional it can hold per unit of equity
+        in marginable stocks, so it is the broker maximum the pre-submit caps
+        clamp against (#240). Alpaca offers no crypto margin, so crypto
+        symbols stay at the 1x fail-closed default (``None``). An unreadable
+        or nonpositive multiplier is ``None`` too — never a guess.
+        """
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol or classify_symbol(normalized_symbol) == "crypto":
+            return None
+        if not self._connected or self._trading_client is None:
+            await self.connect()
+        account = await asyncio.to_thread(self._trading_client.get_account)
+        multiplier = _to_float(getattr(account, "multiplier", None), default=0.0)
+        if not math.isfinite(multiplier) or multiplier <= 0:
+            return None
+        return multiplier
+
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """One share (or coin) moves the USD account by 1.0 per 1.0 USD move (#146).
 

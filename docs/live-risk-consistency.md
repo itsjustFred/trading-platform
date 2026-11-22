@@ -223,7 +223,13 @@ Fehler dort hat damit kein Cap-Backstop.
 **Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value,
 Balance und die maximale Hebel des Brokers für Account und Asset
 (`get_max_leverage`; cTrader über `ProtoOASymbol.leverageId` +
-`GetDynamicLeverageByID`, unbekannt → 1x). Menge und Preislevel stammen
+`GetDynamicLeverageByID` — der Tier-Wert steht in Cents wie
+`leverageInCents`, 1:200 = 20000, und wird vor der Nutzung durch 100
+gerechnet; Alpaca über `account.multiplier`, Crypto bleibt bei 1x;
+unbekannt → 1x). Die Tier-Hebel ist eine Obergrenze: bei cTrader sinkt die
+Hebel mit dem Volumen, daher gilt der erste (kleinste) Tier — der tatsächlich
+angewandte Hebel kann niedriger sein und wird vom Broker weiter erzwungen.
+Menge und Preislevel stammen
 dagegen aus dem gesizeten Signal — nichts wird aus dem Payload neu erfunden.
 
 Abgelehnt wird (fail-closed, ERROR-Alert `pre_submit_cap_refusal` plus
@@ -242,7 +248,10 @@ maximale Hebel des Brokers für Account und Asset (#240, Entscheidung auf
 erlaubt, wird die Menge **auf das Broker-Maximum geklemmt** (abgerundet auf
 den Lot-Step) statt abgelehnt — verbleibende Caps laufen gegen die geklemmte
 Größe. Eine unbekannte Broker-Hebel failt closed auf 1x. Die Klemme wird
-mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert; lässt das
+mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert (das Feld
+`broker_max_leverage_is_upper_bound` markiert die Obergrenzen-Eigenschaft;
+folgt auf die Klemme eine Verweigerung durch einen anderen Cap, entstehen
+bewusst zwei Audit-Zeilen — Klemme und Verweigerung); lässt das
 Broker-Maximum nicht einmal einen Lot-Step zu, wird abgelehnt
 (`broker_leverage_cap`).
 
