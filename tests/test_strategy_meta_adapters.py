@@ -105,7 +105,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert len(result.trades) == 1
     trade = result.trades[0]
     assert trade.quantity == 142.8571
-    assert trade.pnl == -142.86
+    # exit_price=101 sits below the exit bar's low (103): the level gapped the
+    # bar's open, so the fill is the open (104), not the never-traded level.
+    assert trade.exits[0].price == 104.0
+    assert trade.pnl == 285.71
+    assert trade.meta["exit_level_gapped"] is True
     assert trade.meta["RSI"] == 25
     assert trade.meta["sl_price"] == 95.0
     assert trade.meta["trailing_stop_at_exit"] == 101.0
@@ -116,7 +120,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     assert trade.meta["risk_math"]["sl_price"] == 95.0
     assert trade.meta["risk_math"]["position_size"] == trade.quantity
     assert trade.meta["risk_math"]["capped_by_max_leverage"] is False
-    assert trade.exits[0].price == 101.0
     assert trade.exits[0].reason == "trailing_stop"
 
 

@@ -39,9 +39,12 @@ from runner.engines.contract import (
     EngineStatsKeys,
     apply_date_filter,
     flag_missing_intrabar,
+    level_fill_price,
+    level_gapped_at_open,
     normalize_ohlcv_frame,
     parse_date_bound,
     resolve_intrabar_timeframe,
+    resolve_protective_exit,
     resolve_same_bar_exit,
 )
 from runner.engines.native_adapter import NativeAdapter
@@ -1674,3 +1677,100 @@ def test_intrabar_resolution_equal_to_base_resolves_to_none():
     assert resolve_intrabar_timeframe("1d", "1d") is None
     assert resolve_intrabar_timeframe("1h", "1m") == "1m"
     assert resolve_intrabar_timeframe("1h", "4h") is None
+
+
+# ─── Protective-exit gap helpers (#287) ──────────────────────────────────────
+
+
+class TestProtectiveExitGapHelpers:
+    """``level_gapped_at_open`` / ``level_fill_price`` / ``resolve_protective_exit``.
+
+    The replay flip workflow (#364) routes its stop/TP1 checks through these;
+    #208 ports the same helpers to the native engine, so they are pinned here
+    directly — including the SHORT mirror the flip tests cannot reach
+    (``test_flip_workflow_is_long_only``).
+    """
+
+    def test_long_stop_gap_and_tp_gap_at_the_open(self):
+        assert level_gapped_at_open(direction="LONG", kind="stop", level=95.0, bar_open=94.0)
+        assert level_gapped_at_open(direction="LONG", kind="tp", level=110.0, bar_open=111.0)
+        assert not level_gapped_at_open(direction="LONG", kind="stop", level=95.0, bar_open=96.0)
+        assert not level_gapped_at_open(direction="LONG", kind="tp", level=110.0, bar_open=109.0)
+
+    def test_short_mirrors_long(self):
+        # SHORT stop sits ABOVE the market, TP BELOW it.
+        assert level_gapped_at_open(direction="SHORT", kind="stop", level=105.0, bar_open=106.0)
+        assert level_gapped_at_open(direction="SHORT", kind="tp", level=90.0, bar_open=89.0)
+        assert not level_gapped_at_open(direction="SHORT", kind="stop", level=105.0, bar_open=104.0)
+        assert not level_gapped_at_open(direction="SHORT", kind="tp", level=90.0, bar_open=91.0)
+
+    def test_open_exactly_at_the_level_counts_as_a_gap(self):
+        assert level_gapped_at_open(direction="LONG", kind="stop", level=95.0, bar_open=95.0)
+        assert level_fill_price(direction="LONG", kind="stop", level=95.0, bar_open=95.0) == 95.0
+
+    def test_level_fill_price_is_the_open_on_a_gap_else_the_level(self):
+        assert level_fill_price(direction="LONG", kind="stop", level=95.0, bar_open=94.0) == 94.0
+        assert level_fill_price(direction="LONG", kind="stop", level=95.0, bar_open=96.0) == 95.0
+        assert level_fill_price(direction="LONG", kind="tp", level=110.0, bar_open=111.0) == 111.0
+
+    def test_unknown_direction_and_kind_raise(self):
+        with pytest.raises(ValueError, match="direction"):
+            level_gapped_at_open(direction="long", kind="stop", level=95.0, bar_open=94.0)
+        with pytest.raises(ValueError, match="kind"):
+            level_gapped_at_open(direction="LONG", kind="trail", level=95.0, bar_open=94.0)
+        with pytest.raises(ValueError, match="direction"):
+            resolve_protective_exit(
+                direction="SIDEWAYS",
+                bar_open=100.0,
+                high=101.0,
+                low=99.0,
+                stop_price=95.0,
+                take_profit_price=110.0,
+            )
+
+    def test_gap_is_checked_before_the_same_bar_range(self):
+        # Opens above TP1 and later trades through the stop: the TP gap wins.
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=111.0,
+            high=112.0,
+            low=94.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+        )
+        assert (kind, gapped) == ("tp", True)
+
+    def test_allow_gap_false_disables_the_open_check(self):
+        # Same bar as the entry: the open cannot have gapped through a level.
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=94.0,
+            high=96.0,
+            low=93.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+            allow_gap=False,
+        )
+        assert (kind, gapped) == ("stop", False)
+
+    def test_no_gap_falls_back_to_the_range_classification(self):
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=100.0,
+            high=112.0,
+            low=94.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+        )
+        assert (kind, gapped) == ("stop", False)
+
+    def test_nan_open_is_not_a_gap(self):
+        kind, gapped = resolve_protective_exit(
+            direction="LONG",
+            bar_open=float("nan"),
+            high=112.0,
+            low=94.0,
+            stop_price=95.0,
+            take_profit_price=110.0,
+        )
+        assert (kind, gapped) == ("stop", False)

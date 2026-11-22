@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -1593,6 +1593,7 @@ def test_arming_an_internal_source_deployment_is_refused_by_the_api(
 
 def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
     isolated_db_sandbox,
+    monkeypatch,
 ):
     """A 30s TTL is shorter than a slow broker submit, and expiry deletes the row.
 
@@ -1635,7 +1636,10 @@ def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
 
     # The TTL is set by the *first* claim. A later caller's ttl_seconds only sizes
     # the lease it would take, so it cannot shorten the wait - which is why the
-    # first claim here uses a short TTL and the second a long one.
+    # first claim here uses a short TTL and the second a long one. A fake clock
+    # moves the lease past its TTL without a real sleep.
+    now = [database_module._utcnow_naive()]
+    monkeypatch.setattr(database_module, "_utcnow_naive", lambda: now[0])
     first = database_module.claim_live_deployment_submission(
         deployment_id, "token-first", ttl_seconds=0.3
     )
@@ -1652,9 +1656,7 @@ def test_a_submission_claim_expires_while_the_first_submit_is_still_running(
     # Past the TTL the row is deleted, so the second claim succeeds. That is what
     # makes the TTL load-bearing: whatever it is set to is the real upper bound on
     # a submission, and nothing else in the code enforces one.
-    import time
-
-    time.sleep(0.5)
+    now[0] += timedelta(seconds=0.31)
     assert database_module.claim_live_deployment_submission(
         deployment_id, "token-second", ttl_seconds=30.0
     ) is True, (
@@ -2702,12 +2704,15 @@ def test_a_repoint_is_refused_when_the_broker_cannot_confirm_the_target(
 
 def _expire_a_submission_lease(database_module, deployment_id: str) -> None:
     """Leave one lease behind whose TTL elapsed without a release."""
-    import time
-
     assert database_module.claim_live_deployment_submission(
         deployment_id, "token-expired", ttl_seconds=0.01
     ), "precondition: the lease must be taken while the deployment is ACTIVE"
-    time.sleep(0.05)
+    with database_module.get_session() as session:
+        claim = session.get(database_module.LiveDeploymentSubmissionClaimModel, "token-expired")
+        assert claim is not None, "precondition: the submission lease must exist"
+        claim.expires_at = database_module._utcnow_naive() - timedelta(seconds=1)
+        session.add(claim)
+        session.commit()
     database_module.update_live_deployment_status(deployment_id, "PAUSED")
 
 
