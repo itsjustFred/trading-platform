@@ -45,7 +45,11 @@ pro Bot.
   Definition: `shared/trailing.py`.
   - **Fail closed:** Ein unbekannter Modus oder einer, den der ausführende Pfad nicht kann, wird
     abgelehnt: bei der Deployment-Validierung und erneut zur Signalzeit. Das Signal wird dann
-    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen.
+    nicht gehandelt; ein angeforderter Trail wird nie stillschweigend weggelassen. Bei der
+    Deployment-Validierung wird der Modus sowohl aus einem expliziten Override
+    (`signal_config.signal_processor_config.trailing_mode`) als auch aus dem Default der eigenen
+    Bot-Config gelesen — der Prozessor des Deployments wird dafür genauso gebaut wie vom Daemon
+    (`shared/trailing.py: validate_live_deployment_trailing_mode`).
   - **Unterstützt:** Replay-Backtest `none`, `percent`, `supertrend_flip`. Live je Broker: Alpaca `none`, `percent`;
     cTrader nur `none` (der Daemon hat keine cTrader-Marktdaten zum Nachziehen). `percent` wird
     live pro geschlossener Kerze des Signal-Timeframes mit derselben Arithmetik wie im Replay
@@ -129,6 +133,25 @@ pro Bot.
 - Tests:
   - `tests/test_signal_bot_health_check.py`
   - `tests/test_scheduler_signal_bot_health.py`
+
+### Betrieb (#158, Entscheidung 2026-11-21)
+
+Der Health-Check bleibt bewusst ein **Standalone-Skript plus Scheduler-Job** —
+kein `runner.cli`-Subcommand. So wird er ausgeführt und geplant:
+
+- **Manuell:** `python -m signal_bots.health_check` (keine Flags). Gibt das
+  JSON-Ergebnis auf stdout aus; Exit-Code `0` = alle Processor ok, `1` =
+  mindestens ein Fehler. Geprüft werden pro Processor: Import/Factory,
+  `process_signal`-Probe mit synthetischen Marktdaten und die Existenz der
+  Config-Datei aus der Registry.
+- **Geplant:** Viewer → **Services** → „+ Add Scheduled Job" mit Job Type
+  `signal_bot_health_check` und einem Cron-Ausdruck, oder direkt
+  `POST /api/services` mit `type: "scheduled_job"`, `status: "running"` und
+  `config: {"cron": "...", "job_type": "signal_bot_health_check"}`. Der Cron
+  wird in UTC interpretiert (`scheduler/scheduler.py`, `CronTrigger.from_crontab`).
+  Der `ServiceScheduler` läuft innerhalb von `live_runner.daemon`; der
+  Job-Handler schreibt das Ergebnis als Background-Task-Status in die DB
+  (Services/Tasks im Viewer). `PAUSED`/`STOPPED` des Service pausiert den Lauf.
 
 ## Risk-Engine Integration
 
@@ -262,8 +285,51 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   nicht im Ledger landen. **Restrisiko:** Auf einem genetteten Account senkt eine
   Broker-seitige Schließung für ein anderes Deployment die Broker-Position; die
   Deckelung schließt dann einen Teil von dessen Anteil mit. Der Alert nennt das,
-  das Ledger muss danach abgeglichen werden. Fills von Bracket-Legs gegen das
-  Parent-Signal zu buchen ist die eigentliche Lösung und ein eigenes Issue.
+  das Ledger muss danach abgeglichen werden.
+- **Broker-seitige Schließungen im Ledger (#144):** Ein Alpaca-Bracket-Leg
+  (Stop- oder Target-Leg) schließt die Position des Parent-Signals, ohne dass
+  diese Plattform je eine Order dafür abgeschickt hat. Seit #144 wird so ein Fill
+  **gegen das Ledger des Parent-Deployments gebucht**:
+  `record_live_broker_side_close_fill` legt ein Signal derselben Deployment mit
+  der *reduzierenden* Seite an (Sell für ein Buy-Entry; `source=broker_close`,
+  deterministische Id aus der Parent-Signal-Id, Metadaten `broker_side_close`,
+  `broker_close_reason`, `parent_signal_id`) und bucht den Fill im selben
+  gesperrten Insert-Pfad wie jeden anderen Fill, mit dem Broker-eigenen
+  Dedupe-Key (Leg-Order-Id + kumulierte Leg-Menge). Das Ledger des Deployments
+  sinkt damit um genau das, was der Broker geschlossen hat, und
+  `get_account_net_filled_qty_by_deployment` stimmt wieder mit der
+  Broker-Position überein - kein `exit_ledger_mismatch`-Alert mehr und der Exit
+  sized gegen den eigenen Anteil statt gegen die Deckelung.
+  Die Zuordnung Leg-Order-Id → Parent-Signal wird beim Submit und in jedem
+  Reconciliation-Pass aus den verschachtelten Legs der Parent-Order gelernt (der
+  Pass läuft beim Connect, bevor der Trading-Stream Events verarbeitet); ein
+  Fill, dessen Order-Id keine bekannte Leg ist, bleibt unverändert auf dem
+  bisherigen Pfad. Eine Leg auf der *aufbauenden* Seite, ein unbekanntes
+  Parent-Signal, ein Fill ohne Zeitstempel oder ohne nutzbare Menge wird
+  abgelehnt (geloggt, nichts geschrieben) - nie erfunden.
+  **cTrader (#144):** Eine broker-seitige Positionsschließung (SL/TP, Flatten,
+  manuell - cTrader unterscheidet die nicht) wird über die Kette **Deal →
+  `positionId` → `OrderListByPositionId` → `clientOrderId`/Order-Id des
+  eröffnenden Orders → Signal** derselben Parent-Deployment zugeordnet und über
+  denselben `record_live_broker_side_close_fill`-Pfad gebucht
+  (`broker_close_reason=ctrader_position_close`, Dedupe-Key
+  `ctrader:deal:{dealId}` - derselbe Schlüssel, den der normale Fill-Pfad für
+  dasselbe Deal ableitet, damit ein Deal, der beide Pfade erreicht, nur einmal
+  gebucht wird, gedeckelt am kumulierten Volumen des
+  schließenden Orders). Die Zuordnung zählt nur, wenn **genau ein** Signal der
+  Position zugeordnet ist: null (manuelle Position, nie eingereichte Orders)
+  oder mehrere (genettetes Buch mehrerer Deployments) werden **nicht geraten**,
+  sondern das Account+Symbol wird als `ledger_reconciliation_required` im
+  Control-Audit geflaggt und ein `ERROR`-Alert (`alert=
+  ledger_reconciliation_required`) ausgelöst - die periodische
+  Broker-Reconciliation (#330) bzw. der nächste Exit-Mismatch-Alert handelt
+  danach. Derselbe Flag wird bei `exit_ledger_mismatch` geschrieben. Der
+  Reconciliation-Pass (`reconcile_executions`) holt zusätzlich die
+  Account-Deal-Liste der letzten 7 Tage nach, um vom Stream verpasste
+  Schließungen nachzubuchen; Deals eigener Orders werden übersprungen. Ein
+  Manuell-/Flatten-Close einer Position, die genau ein Signal eröffnete, ist
+  damit **exakt** zugeordnet (kein Raten); was die Kette nicht eindeutig
+  auflösen kann, bleibt geflaggt.
   Unverändert: Seiten-Konflikt (eigene Seite ≠ Broker-Seite oder ≠ Nachricht)
   → abgelehnt; keine eigene Menge → ignoriert + `WARNING`; auf 0 gedeckelt bzw.
   abgerundet → ignoriert + `WARNING`.
@@ -326,6 +392,15 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   der Cursor bleibt stehen, und kommt dauerhaft nur so eine Seite, nimmt der Kanal
   bis zu einem Neustart nichts auf (danach greift das Start-Verhalten unten). Snowflake-IDs
   sind nicht fortlaufend, daher wird keine Nachrichtenanzahl berechnet.
+- **Ein einzelnes kaputtes Message-Objekt verliert nicht die ganze Seite:** Die
+  geparste Nachricht wird pro Nachricht isoliert (`_emit_polled_message`). Wirft
+  das Parsen (z. B. ein strukturell kaputtes `author`-Feld oder ein von
+  `TradeSignal` abgelehnter Preis), wird die Nachricht auf `ERROR` geloggt
+  (`Discord message dropped: emission failed` mit `channel_id`, `message_id` und
+  `error_type`), ihre ID bleibt im Seen-Set (kein Endlos-Retry) und der Poll
+  arbeitet mit dem Rest der Seite weiter. `asyncio.CancelledError` wird nicht
+  verschluckt; Auth-/Channel-Forbidden-/Rate-Limit-Fehler entstehen beim Abruf
+  und behalten ihr bestehendes Verhalten.
   Grundlage ist die Semantik von `after`: Discord liefert mit `after=<id>&limit=N`
   die N Nachrichten direkt nach der ID, im Array neueste zuerst
   ([Get Channel Messages](https://docs.discord.com/developers/resources/message#get-channel-messages):
@@ -371,3 +446,83 @@ Account-(User-)Token unverändert. Eine falsche Kombination antwortet mit
   statt den Wait stillschweigend zu überspringen; der Daemon verwirft dann
   dieses Signal und führt den Listener weiter.
 
+
+### Raw-Signal-Archiv (#308)
+
+Jede Nachricht, die `DiscordSignalSource` zur Signalverarbeitung emittiert,
+wird append-only archiviert — ob sie nun in einen `TradeSignal` geparst
+wird oder vom Parser abgelehnt wurde. Auch Nachrichten von Autoren außerhalb
+der Trusted-Author-Allowlist werden archiviert (für die
+Impostor-Auditierbarkeit) und tragen `author_trusted: false`; Inhalte werden
+nicht redigiert. Die Startup-Cursor-Priming-Seite wird nur als gesehen
+gemarkiert und nicht archiviert — auch Nachrichten, die während eines
+Daemon-Stops eintrafen, können also fehlen. Ohne dieses Archiv existieren
+die Rohsignale nur im Log-Stream und nur ab dem Tag der Aufzeichnung —
+Backtests und Meta-Labeling der Bots (nitro, ramjet, rocketfuel) brauchen
+die historische Rohdatenmenge.
+
+**Speicherort und Format.** JSON Lines unter
+`DATA_DIR / "signal_log" / "discord_signals-<YYYY-MM-DD>.jsonl"` (eine Datei
+pro UTC-Tag). JSONL statt SQLite `backtests.db` aus drei Gründen: Das Archiv
+darf nie mit der Handelsdatenbank um Locks konkurrieren, es muss für die
+offline Label-Pipeline trivial exportierbar bleiben, und „append-only" ist
+wörtlich — eine Zeile wird nie umgeschrieben. File-basierte Stores liegen im
+Repo bereits neben der DB (`DATA_DIR / "backtests"`, `"grid_results"`,
+`"signals"`), das Format passt also in das bestehende Persistenz-Layout.
+Implementierung: `live_runner/signal_archive.py`.
+
+Jeder Record trägt `schema_version` (aktuell `1`). Die Offline-Pipeline muss
+Zeilen, die nicht parsen (z. B. eine durch einen Absturz abgeschnittene
+Zeile), überspringen und auf `discord_message_id` deduplizieren — ein
+Daemon-Neustart kann zuletzt emittierte Nachrichten erneut archivieren.
+
+**Record-Typen.**
+
+- `discord_signal_received` — einmal pro zur Signalverarbeitung emittierter
+  Nachricht: Roh-Content,
+  Autor (ID, Username, Bot-Flag, `author_trusted`), Channel, Message-ID,
+  `message_created_at`, Archivierzeit (`logged_at`), Bot-Name, Account,
+  Service, `parse_status` (`parsed`/`rejected`),
+  `refusal_reason`/`refusal_detail`
+  (z. B. `untrusted_author`, `non_entry_rejection`, `malformed_levels`),
+  die geparsten Felder (`signal`: action, symbol, entry, SL, TP, timeframe,
+  signal_type) und receipt-time `features` (Clock-Features: Stunde/Wochentag
+  UTC, Content-Länge, explizites SL/TP, Exit-Flag).
+- `discord_signal_decision` — einmal pro (Signal, Deployment): Outcome
+  `traded` / `refused` / `ignored` / `unknown`, `reason` (z. B.
+  `deployment_not_active`, `symbol_not_covered`, `author_not_allowed`,
+  `unmapped_channel`, `stale_signal`, `signal_gate_rejected`,
+  `invalid_deployment_config`, `submission_claim_failed`,
+  `broker_refused_pre_request`, `broker_submit_outcome_unknown`,
+  `nothing_to_exit`, `exit_below_step`, `exit_in_flight`,
+  `unhandled_error`), `detail`,
+  `broker_order_id`, `signal_age_seconds`, Deployment-/Strategy-IDs und
+  `features`.
+
+**Signal-Pfad bleibt frei.** `record()` ist ein bounded `put_nowait` auf
+ einer Queue; Serialisierung und Disk-I/O laufen auf einem dedizierten
+Writer-Thread (`signal-archive-writer`). Eine volle Queue droppt den Record
+und zählt ihn (`dropped`), Schreibfehler zählen `write_errors`/`enqueue_errors`
+ und warnen — nichts davon blockiert, verzögert oder wirft in den
+Signalpfad. Abschalten mit `TP_SIGNAL_ARCHIVE=0`.
+
+**Market-Features — offline, nicht auf dem Signal-Pfad.** Produktiv
+tragen Discord-Signale heute keine OHLCV-Frame (`signal.metadata["market_data"]`
+wird von keinem Producer gesetzt); die Decision-Records erhalten deshalb
+keine Market-Features. Die Feature-Berechnung
+(`market_features_from_frame`) läuft netzwerkfrei über eine bereits
+vorhandene OHLCV-Frame — ATR(14) samt Perzentil-Rang im Frame, Abstände zu
+SMA20/SMA50 und VWAP (nur wenn `volume` vorhanden), Gap der letzten Bar,
+grobe Trend-Regime (`above_sma50`/`below_sma50`) — und ist damit auch für
+die spätere Offline-Berechnung aus historischen OHLCV-Daten per
+`message_created_at` nutzbar (außer Spread, der Quotes bräuchte). Zusätzlich
+schreibt der Decision-Record Prozessor-Metadaten, wenn ein Processor läuft
+(Processor-ATR, Supertrend-Entry-State, Slippage, Trailing-Mode). Die
+Clock-/Parse-Features (Stunde/Wochentag UTC, Content-Länge, explizites
+SL/TP, Exit-Flag) stehen im `discord_signal_received`-Record. Bewusst
+**nicht** drin, weil sie extra Daten bräuchten (Follow-ups): Bid/Ask-Spread
+(braucht Quotes), session-ankererter VWAP, Multi-Window-Perzentile.
+
+**Nächste Schritte (Issue #308, separat).** Jeder Signal bekommt später ein
+Triple-Barrier-Label mit den SL/TP des Bots; daraus wird ein
+regularisierter Filter trainiert und walk-forward validiert.
