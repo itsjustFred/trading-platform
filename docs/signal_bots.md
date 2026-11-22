@@ -58,7 +58,8 @@ pro Bot.
     Broker ausgeführt und dort abgelehnt (Grund und Design-Vorschlag im Runbook).
   - **`supertrend_flip` im Replay (#168):**
     1. TP1: Teilausstieg von `tp1_exit_percent` (Bruchteil, 0.5 = halbe Position) zu `tp1_price`
-       — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
+       — öffnet die Kerze über `tp1_price`, füllt der Teilausstieg zum OPEN der Kerze
+       (Gap-Regel #287), sonst zum Level — in ganzen Shares: `qty * Bruchteil` abgerundet, wie im Original-Bot
        (`int(qty * tp1_exit_percent)`, `shared/trailing.tp1_partial_quantity`). Ergibt sich 0
        (z. B. 1 Share bei 0.5), wird der Teilausstieg übersprungen, genau wie im Original-Bot:
        kein Verkauf, kein Einstands-Stop, und der restliche Workflow (Aktivierung, Flip) startet
@@ -77,7 +78,16 @@ pro Bot.
     - Ein Signal ohne `stop_loss` wird abgelehnt: vor TP1 ist der Stop der einzige Schutz,
       der Workflow setzt keinen eigenen.
     - Stop und TP1 in derselben Kerze: Stop zuerst (Konvention des Adapters,
-      `resolve_same_bar_exit`); dann gibt es kein TP1.
+      `resolve_same_bar_exit`); dann gibt es kein TP1. Ausnahme Gap (#287):
+      öffnet die Kerze bereits jenseits eines Levels (über TP1 bzw. unter dem
+      Stop), zählt der OPEN als erstes Ereignis der Kerze — der durchbrochene
+      Level füllt zum OPEN (`resolve_protective_exit` prüft die Lücke vor der
+      Stop-zuerst-Regel), auch wenn die Kerze später den anderen Level berührt.
+      Ausnahme innerhalb der Flip-Logik: nach einem TP1-Gap bleibt der Rest der
+      Position mit seinem ursprünglichen Stop für den Rest derselben Kerze
+      geschützt — der OTO-Stop steht auf dem Ausgangslevel und die
+      Breakeven-Änderung greift erst ab der nächsten Kerze; ein späterer
+      Same-Bar-Trade durch den Stop schließt den Rest zum Stop-Preis.
     - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
       `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
       Kerzen.

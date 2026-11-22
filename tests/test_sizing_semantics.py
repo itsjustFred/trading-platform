@@ -82,7 +82,7 @@ class TestBacktestConfigField:
             self._config(modeling_resolution="tick-per-second")
 
     def test_alias_is_a_documented_readonly_property(self):
-        assert isinstance(getattr(BacktestConfig, "max_position_pct"), property)
+        assert isinstance(BacktestConfig.max_position_pct, property)
         assert "max_position_exposure_pct" in BacktestConfig.model_fields
         assert "max_position_pct" not in BacktestConfig.model_fields
 
@@ -427,7 +427,7 @@ class TestBatchEntryPoints:
             start="2025-01-01",
             end="2025-01-31",
             risk_pct=0.01,
-            output_dir=tmp_path / f"out-{list(kwargs)[0]}",
+            output_dir=tmp_path / f"out-{next(iter(kwargs))}",
             max_workers=1,
             **kwargs,
         )
@@ -520,7 +520,9 @@ class TestBatchEntryPoints:
             output_dir=tmp_path / "wf",
         )
         assert len(captured) >= 2, captured
-        for train, test in zip(captured[0::2], captured[1::2]):
+        # `strict=True`: the loop pairs the records, so an unpaired trailing
+        # record used to be dropped silently instead of reported.
+        for train, test in zip(captured[0::2], captured[1::2], strict=True):
             train_fold = {k: v for k, v in train.items() if k not in {"start", "end"}}
             test_fold = {k: v for k, v in test.items() if k not in {"start", "end"}}
             assert train_fold == test_fold

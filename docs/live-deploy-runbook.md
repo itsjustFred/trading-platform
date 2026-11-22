@@ -57,7 +57,7 @@ recovery and fill reconciliation, which today assume one broker order per signal
 
 **Replay semantics to mirror live (decided 2026-11-16, `#176`)**
 
-Two rules the replay implements today; a live implementation must copy them exactly, or paper
+Three rules the replay implements today; a live implementation must copy them exactly, or paper
 results stop predicting live behaviour:
 
 - *TP1 tranche in whole shares, floored.* The tranche is
@@ -73,6 +73,18 @@ results stop predicting live behaviour:
   breakeven stop only takes effect from the next bar. Nothing that happens at or inside the
   TP1 bar after the TP1 fill may move or trigger the trailing stop — live that means the
   amendment waits for the first bar that closes after the TP1 fill.
+- *A bar that opens beyond a protective level fills at the open.* The pre-TP1 stop, the
+  post-TP1 stop (initial or breakeven) and the TP1 tranche all follow the gap rule (#287):
+  the open is the bar's first event, so a bar opening past a level fills at `bar_open` —
+  never the skipped level — and beats any later same-bar touch of the other level
+  (`contract.resolve_protective_exit` checks the gap before the stop-first same-bar policy).
+  One qualification inside the flip workflow: a bar that gaps through TP1 fills the
+  *tranche* at the open, but the remainder's pre-TP1 stop is still working for the rest of
+  that bar — the OTO stop sits at the initial level and the breakeven amendment only takes
+  effect on the next bar — so a later same-bar trade through it stops the remainder at the
+  stop level. Live that means the open-versus-level check must run before the bar's range
+  is evaluated, and an entry fill must never be checked against a level on its own fill bar
+  (the replay never evaluates the entry bar).
 
 **Where an unsupported mode is rejected**
 
@@ -358,11 +370,11 @@ additional layer under it, not a replacement. Today a promoted strategy on a
 real-money account therefore still cannot trade: preflight passes the gate,
 but the daemon will not keep a non-demo adapter. The viewer's activate path
 re-verifies the account against broker discovery and will not arm the
-deployment. The cTrader top-N deploy with `activate` is different: it creates
-the deployments `ACTIVE` directly, without that re-verification, on any account
-the gate passes. Only the daemon's demo-only block stops their orders. Refusing
-`activate` on a non-demo account there is a maintainer decision, not yet made.
-Lifting the demo-only block is a separate, deliberate step.
+deployment. The cTrader top-N deploy creates its deployments directly, without
+that re-verification, so it never arms a non-demo account either (#261): the
+rows are created `PAUSED` and a maintainer activates them by hand, which is the
+path that re-verifies - and, like every path, only arms an account the broker
+reports as demo. Lifting the demo-only block is a separate, deliberate step.
 
 ### Required evidence and thresholds
 
@@ -531,6 +543,20 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+### The cTrader top-N deploy never arms a non-demo account (#261)
+
+That endpoint creates its rows in one shot, with no per-deployment
+re-verification of the account; `activate` therefore used to be the only route
+that put an armed deployment on an account the broker does not report as demo.
+With `activate` on a broker-reported demo account the behaviour is unchanged:
+the rows are created `ACTIVE`. On any other account - a reported live account, or
+one the broker could not assert as demo, which fails closed - the rows are
+created `PAUSED` instead, and the response's `paused_as_real_money` plus a
+`WARNING` in the viewer log name each one and say why. The owner activates them
+by hand, through `PUT /api/live/deployments/{id}/status`, which re-verifies the
+account against the broker and still refuses a non-demo one. The dry run reports
+the same: a preview never shows `ACTIVE` rows the deploy would not get.
+
 ## Broker Position Quantity (#263)
 
 Every entry order reads the broker's open positions twice: as a count for
@@ -694,6 +720,169 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 > NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+## Loss Circuit Breaker (#301)
+
+Every live account and every deployment carries a persisted loss breaker
+(`live_loss_breaker_state`, one row per `account:<id>` and `deployment:<id>`
+scope). The account scope measures the broker account's equity — for cTrader
+that is balance **plus unrealized P&L** of open positions, so an open position
+under water counts before it is closed. The deployment scope cannot read a
+"deployment equity" from the broker (positions on a netted account belong to
+the account), so it observes a synthetic equity: account equity minus every
+OTHER deployment's trading P&L, reconstructed from the persisted fill ledger
+and marked to market. The scope therefore moves only with its own
+deployment's realized+unrealized P&L, on the account-equity scale:
+
+- **Daily loss** — equity down the configured fraction (default 5 %) of the
+  start-of-day equity. The baseline is the last equity observed before the UTC
+  day boundary, so an overnight gap counts as the new day's loss. The breaker
+  re-bases and clears automatically at the UTC day boundary.
+- **Overall drawdown** — equity down the configured fraction (default 20 %)
+  from the peak equity ever observed. The latch only clears on the explicit
+  operator reset, which also re-bases the peak to the current equity.
+
+On breach the breaker blocks **new entries only** — exits are never blocked
+(PAUSED semantics), and resting entry orders already at the broker are NOT
+cancelled; they are the same class of exposure a manual PAUSE leaves. A
+breach latches and alerts once per episode through the `data.alert` log path —
+until #331 lands that is an ERROR log line (picked up by Sentry), not a
+webhook. An unreadable breaker state, unreadable equity, or a deployment P&L
+that cannot be measured (untrusted fill price, missing quote/pip value) fails
+closed and refuses entries.
+
+Deposits and withdrawals are NOT separated from P&L: a 5 % withdrawal trips
+the daily breaker and a 20 % withdrawal latches drawdown. After a planned
+withdrawal, run `reset-drawdown` once the new equity is being observed.
+
+Thresholds, most specific first: deployment `settings` keys
+(`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
+`loss_breaker_max_drawdown_fraction`), then per-account env
+(`LOSS_BREAKER_<ACCOUNT>_ENABLED`, `LOSS_BREAKER_<ACCOUNT>_DAILY_LOSS_FRACTION`,
+`LOSS_BREAKER_<ACCOUNT>_MAX_DRAWDOWN_FRACTION`), then the global env
+(`LOSS_BREAKER_ENABLED`, `LOSS_BREAKER_DAILY_LOSS_FRACTION`,
+`LOSS_BREAKER_MAX_DRAWDOWN_FRACTION`), then the defaults above. Env resolves
+file-first through `.accounts.env`. Malformed values are refused at deployment
+creation and at dispatch.
+
+```bash
+# Read every scope's state, latches and current ratios (read-only):
+uv run python -m scripts.live_loss_breaker status
+uv run python -m scripts.live_loss_breaker status --account alpaca-paper
+
+# The only way to clear a drawdown latch: re-bases the peak to the current
+# equity. Resetting an account scope ALSO resets that account's deployment
+# scopes (each to its own last observed equity) and prints any scopes still
+# latched - the daily latches intentionally survive until the UTC rollover:
+uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
+uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id>
+```
+
+Without `--equity` a scope re-bases to its OWN last observed breaker equity -
+the same series the breaker measures (on cTrader that includes unrealized
+P&L, which the balance snapshot's equity slot does not carry). An account
+scope refuses an observation older than 10 minutes; pass `--equity` to state
+the figure explicitly. A deployment scope always re-bases to its own last
+observed (P&L-adjusted) equity; `--equity` does not apply to it.
+
+There is deliberately no daily reset command: the daily breaker resets itself
+at the UTC boundary.
+
+### When deployment P&L is unmeasurable (`loss_breaker_pnl_unmeasurable`)
+
+Deployment-scoped entries fail closed whenever the fill-ledger P&L cannot be
+measured exactly — that is deliberate: an unmeasurable scope is never "no
+loss". The account scope keeps observing and the account breaker still
+works; only `deployment:<id>` entries are refused. Each episode logs ONE
+ERROR with `data.alert = "loss_breaker_pnl_unmeasurable"` and a `reason`:
+
+- `unpriced_fills` — a fill on the account has no trusted price
+  (`actual_price_observed` is `sent_bad`/`absent`/`derived_unavailable`, or a
+  non-positive `actual_price`). The alert's `untrusted_fills` list names the
+  execution ids, deployments, symbols and quantities involved. Repair: fix or
+  re-derive the fill's price through the normal reconciliation path (the same
+  one that writes `actual_price_observed`), or correct the ledger row by hand
+  only with an audit entry. Until then the scope stays refused.
+- `ledger_reconciliation` — an unresolved `ledger_reconciliation_required`
+  audit row exists for the account (#277/#330 merge-order dependency: the
+  ledger may be missing broker-side closes). The alert's
+  `unresolved_flags` lists the `account:SYMBOL` targets. Repair: reconcile
+  the flagged symbol against the broker by hand, then record the resolution -
+  the audit trail is append-only, so resolving writes a
+  `ledger_reconciliation_resolved` row rather than deleting the flag:
+
+  ```bash
+  uv run python -m scripts.live_loss_breaker resolve-ledger-flag \
+      --account alpaca-paper --symbol AAPL --note "reconciled vs statement"
+  ```
+
+  A flag counts as unresolved only while it is newer than the latest
+  resolution for the same `account:SYMBOL`; a NEW flag after a resolution
+  blocks again. Until every flag on the account is resolved, deployment
+  scopes stay refused (the account scope keeps working).
+- `missing_pip_value` / `unusable_quote` — the broker could not supply a pip
+  value or a two-sided quote for a symbol with an open ledger position.
+  Usually transient (market closed, symbol halted); if it persists, check the
+  symbol's market-data classification and the adapter's quote/pip path.
+- `flows_unreadable` — the ledger query itself raised; check the database.
+
+Pip values are cached per account+symbol per UTC day (a pip value is in the
+account's currency, so accounts never share one): the ledger can name symbols
+the account traded months ago, and re-fetching a pip value for every one of
+them each poll would fail on delisted/closed symbols. The day bucket means an
+unresolvable symbol fails again the NEXT day (with an alert) - the cache only
+skips re-fetching within the same UTC day. Quotes for symbols with an
+OPEN ledger position are still fetched fresh every evaluation — a closed
+market there fails closed by design.
+
+Ledger limitations the deployment scope inherits: swap/financing charges are
+NOT in the fill ledger (they never appear as fills), so a deployment holding
+overnight FX or swap-accruing positions has a P&L the breaker cannot see;
+treat deployment scopes on such accounts as approximate. A NULL commission is
+summed as 0 — a KNOWN APPROXIMATION: Alpaca crypto fees stay NULL until the
+CFEE backfill lands (about two days), so a crypto deployment's P&L is
+overstated by those fees until then. Failing closed instead would stop crypto
+deployments for days after each fill, so this is accepted and documented
+here. Pip values convert
+through the account currency at the day's cached rate — intraday FX moves are
+not tracked.
+
+### ACTIVE deployments nothing can trade (#242)
+
+The daemon's only signal path is Discord. A deployment whose `signal_source` is `internal` (the default)
+with status `ACTIVE` has no live strategy runner behind it: it still gets a broker adapter and an execution
+listener, so the dashboard and the listener log make it look live, but it will never place an order. The same
+holds for any stored `signal_source` that is neither `internal` nor `discord`.
+
+The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
+`untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
+Where Sentry is configured (a DSN: `initialize_sentry` is a no-op without one), its `LoggingIntegration`
+sends ERROR as an event, so the alert reaches Sentry too — as a field of the record's `data` (an extra on the
+event), not as a Sentry tag, so filter it on `untradeable_reason`/`alert` as event data.
+
+It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
+each affected row, and a row is reported again only when its status or signal source changes, so restarting
+or repointing is what you see again. The daemon does not block or stop: the operator stops the row or moves
+it to a Discord signal source.
+
+Both preflights warn for these rows using the same definition
+(`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
+them, but they see different things:
+
+- **yaml preflight** (`live_runner/preflight.py`): warns for every ACTIVE non-Discord deployment in the
+  `live_deployments.yaml` it validates.
+- **`--check-db` preflight** (`live_runner/preflight_db.py`): reads the ACTIVE rows out of SQLite instead.
+  It warns for an untradeable row whose YAML twin is *tradeable* (Discord) or absent, because the YAML
+  side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
+  the pair and a second warning for the same row would only double-count. A stored `signal_source` outside
+  `KNOWN_SIGNAL_SOURCES` (`internal` plus everything the daemon can trade) still fails this preflight (exit
+  1) rather than warning, because nothing routes the row as configured. Adding a source to the daemon's
+  tradeable set does not make it storable: `LiveDeploymentConfig.signal_source` is a Literal over
+  `internal`/`discord` and the DB read coerces anything else to `internal`, so a new source is a
+  model-and-migration change (`live_runner/deployment_policy.py` says so where the set is defined).
+
+A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
+design, not by accident.
 
 ## Kill Switch (#300)
 

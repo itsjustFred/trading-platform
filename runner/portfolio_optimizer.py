@@ -23,6 +23,7 @@ import optuna
 import pandas as pd
 
 from shared.atomic_io import write_text_atomically
+from shared.constants import OPTIMIZATIONS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -596,9 +597,12 @@ def _build_optimization_result(
         "file": output_path.name,
         "created_at": now.isoformat(),
         "backtest_ids": backtest_ids,
+        # One weight per backtest id, by construction: `strict=True` makes a
+        # backtest that has no weight fail here instead of silently inheriting
+        # the weight of the next one.
         "weights": {
             backtest_id: float(weight)
-            for backtest_id, weight in zip(backtest_ids, best_weights)
+            for backtest_id, weight in zip(backtest_ids, best_weights, strict=True)
         },
         "sharpe": sharpe,
         "max_drawdown": max_drawdown,
@@ -653,9 +657,6 @@ def _build_optimization_result(
         if oos_equity_curve:
             result["oos_equity_curve"] = oos_equity_curve
     return result, output_path
-
-
-OPTIMIZATIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "optimizations"
 
 
 def _explicit_boundary(value: str, *, is_end: bool = False) -> float:

@@ -114,6 +114,15 @@ def test_platform_constants_resolve_outside_the_repo_data_and_log_dirs() -> None
         assert not _is_under(Path(path), REPO_LOG_DIR), f"{name} points into the repo log dir"
 
 
+def test_portfolio_optimizer_resolves_optimizations_dir_from_data_dir() -> None:
+    """Issue #315: portfolio_optimizer must not hardcode ``<repo>/data/optimizations``."""
+    import runner.portfolio_optimizer as portfolio_optimizer
+    import shared.constants as constants
+
+    assert portfolio_optimizer.OPTIMIZATIONS_DIR == constants.OPTIMIZATIONS_DIR
+    assert not _is_under(portfolio_optimizer.OPTIMIZATIONS_DIR, REPO_DATA_DIR)
+
+
 def test_sessionfinish_fails_the_run_when_a_watched_repo_dir_changed(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:
@@ -593,7 +602,7 @@ def test_a_loopback_connect_is_allowed_through_to_the_os(monkeypatch) -> None:
 
 def test_a_remote_name_lookup_is_refused(monkeypatch) -> None:
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
-    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match="api.alpaca.markets"):
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"api\.alpaca\.markets"):
         socket.getaddrinfo("api.alpaca.markets", 443)
     assert suite_conftest.network_violations() == ("name lookup 'api.alpaca.markets'",)
 
@@ -602,7 +611,7 @@ def test_a_remote_connect_is_refused(monkeypatch) -> None:
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
     probe = socket.socket()
     try:
-        with pytest.raises(suite_conftest.SuiteHermeticityViolation, match="35.221.23.121"):
+        with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"35\.221\.23\.121"):
             probe.connect(("35.221.23.121", 443))
     finally:
         probe.close()

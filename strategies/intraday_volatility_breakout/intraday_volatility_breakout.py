@@ -32,6 +32,7 @@ import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
 from shared.broker_clock import resolve_broker_clock
+from shared.strategy_markers import entry_exit_markers
 
 logger = logging.getLogger(__name__)
 
@@ -707,35 +708,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
     }
 
     # --- Drawings ------------------------------------------------------------
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_ts = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_ts = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        for ts in entry_ts.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Entry",
-                }
-            )
-        for ts in exit_ts.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Exit",
-                }
-            )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

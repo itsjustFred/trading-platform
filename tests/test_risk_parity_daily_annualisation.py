@@ -63,7 +63,11 @@ def test_hourly_and_daily_delivery_of_same_returns_score_identically() -> None:
     assert from_hourly["best_volatility"] == pytest.approx(
         from_daily["best_volatility"], rel=1e-9
     )
-    for a, b in zip(from_daily["evaluated_universes"], from_hourly["evaluated_universes"]):
+    # Both sides evaluate the same universe list, so the two are the same length
+    # by construction: ``strict=True`` turns them getting out of step into an error.
+    for a, b in zip(
+        from_daily["evaluated_universes"], from_hourly["evaluated_universes"], strict=True
+    ):
         assert a["symbols"] == b["symbols"]
         assert a["score"] == pytest.approx(b["score"], rel=1e-9)
         assert a["sharpe"] == pytest.approx(b["sharpe"], rel=1e-9)
@@ -236,14 +240,14 @@ def test_trade_pnl_fallback_frame_has_no_datetime_index() -> None:
     """Per-trade rows are not a time grid: the fallback frame drops the index."""
     trades = []
     for symbol, offset in (("SPY", 0.0), ("TLT", 1.0)):
-        for i in range(4):
-            trades.append(
-                SimpleNamespace(
-                    symbol=symbol,
-                    entry_time=f"2024-01-0{i + 1}T10:00:00+00:00",
-                    pnl=100.0 * (i + 1) - offset * 30.0,
-                )
+        trades.extend(
+            SimpleNamespace(
+                symbol=symbol,
+                entry_time=f"2024-01-0{i + 1}T10:00:00+00:00",
+                pnl=100.0 * (i + 1) - offset * 30.0,
             )
+            for i in range(4)
+        )
     result = SimpleNamespace(
         trades=trades, meta=SimpleNamespace(initial_capital=100_000.0)
     )

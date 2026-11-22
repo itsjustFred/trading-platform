@@ -17,7 +17,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -2419,7 +2419,7 @@ def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
     elapsed = (ended - started).total_seconds()
     if elapsed < 0:
         return 0
-    return int(round(elapsed))
+    return round(elapsed)
 
 
 def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | None) -> int | None:
@@ -2432,7 +2432,7 @@ def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | 
     eta = elapsed_seconds * (100.0 - progress) / progress
     if not math.isfinite(eta):
         return None
-    return max(0, int(round(eta)))
+    return max(0, round(eta))
 
 
 def _json_safe(value: Any) -> Any:
@@ -2572,7 +2572,7 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
     sampled.append(float(values[-1]))
     # Hard cap in case bucket logic overshoots.
     if len(sampled) > normalized_limit:
-        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+        sampled = [*sampled[: normalized_limit - 1], float(values[-1])]
     return sampled
 
 
@@ -8538,7 +8538,7 @@ def _download_and_verify_missing_data(
     for index, missing in enumerate(missing_items, start=1):
         progress_before = 10.0 + ((index - 1) / total_missing) * 35.0
         if progress_callback is not None:
-            progress_callback(progress_before, f"Downloading data... {int(round(progress_before))}%")
+            progress_callback(progress_before, f"Downloading data... {round(progress_before)}%")
 
         symbol = str(missing["symbol"])
         source = str(missing["source"])
@@ -8594,7 +8594,7 @@ def _download_and_verify_missing_data(
 
         progress_after = 10.0 + (index / total_missing) * 35.0
         if progress_callback is not None:
-            progress_callback(progress_after, f"Downloading data... {int(round(progress_after))}%")
+            progress_callback(progress_after, f"Downloading data... {round(progress_after)}%")
 
 
 def _ensure_backtest_data_availability(
@@ -8829,14 +8829,14 @@ def _aggregate_symbol_timeframe_entries(
 ) -> list[dict[str, Any]]:
     logical_entries: list[dict[str, Any]] = []
     merged_entries = merge_ohlcv_entries([entry for entry in entries if isinstance(entry, dict)])
-    for entry in merged_entries:
-        logical_entries.append(
-            _aggregate_ohlcv_entry_payload(
-                entry,
-                include_category=include_category,
-                include_size_bytes=include_size_bytes,
-            )
+    logical_entries.extend(
+        _aggregate_ohlcv_entry_payload(
+            entry,
+            include_category=include_category,
+            include_size_bytes=include_size_bytes,
         )
+        for entry in merged_entries
+    )
 
     logical_entries.sort(
         key=lambda item: (
@@ -10189,7 +10189,7 @@ def _replay_keep_mask_from_trades(df: pd.DataFrame, trade_payloads: list[dict[st
     event_count = max(1, int(event_ns.size))
     budget_per_event = max(REPLAY_MIN_BARS_PER_EVENT, REPLAY_TARGET_BARS // event_count)
     bars_per_event = min(REPLAY_MAX_BARS_PER_EVENT, budget_per_event)
-    window_before = max(1, int(round(bars_per_event * 0.6)))
+    window_before = max(1, round(bars_per_event * 0.6))
     window_after = max(1, bars_per_event - window_before)
     insert_idx = np.searchsorted(timestamp_values, event_ns, side="left")
     insert_idx = np.clip(insert_idx, 0, len(df) - 1)
@@ -10892,7 +10892,7 @@ def _backtest_runner_stage(message: str) -> tuple[float, str] | None:
             progress_message = payload[2].strip() or "Running backtest..."
             scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
             if progress_message:
-                return (scaled, f"Running backtest... {int(round(scaled))}%")
+                return (scaled, f"Running backtest... {round(scaled)}%")
             return (scaled, "Running backtest...")
         return None
     if "auto-detected date range" in normalized:
@@ -11159,13 +11159,13 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 # collects the exit status after EOF (or after the kill).
                 try:
                     returncode = proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
                     if proc.poll() is None:
                         watchdog_timed_out.set()
                         _kill_process_group(proc)
                     raise subprocess.SubprocessError(
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
-                    )
+                    ) from exc
                 if watchdog_timed_out.is_set():
                     # The watchdog killed the child, so its returncode is the
                     # signal that terminated it (-9), not a real exit status.
@@ -13252,7 +13252,11 @@ async def get_live_dashboard() -> dict[str, Any]:
         *(_live_trades_payload(account.id) for account in accounts)
     )
 
-    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
+    # Both payload lists come from `asyncio.gather` over the same `accounts`
+    # comprehension, so all three are the same length; `strict=True` turns a
+    # dropped gather result into an error instead of into another account's
+    # trades being shown under this one.
+    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads, strict=True):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
         total_equity += equity
         account_payloads.append(
@@ -13333,7 +13337,8 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         )
 
     # Promotion gate (#165), before the dry-run return on purpose: a plan that
-    # could not be deployed must not be presented as deployable.
+    # could not be deployed must not be presented as deployable. Its verdict does
+    # not depend on the status, so the pause below is free to change it afterwards.
     demo_flags: dict[str, bool | None] = {}
     for deployment in plan:
         if deployment.account_id not in demo_flags:
@@ -13342,11 +13347,16 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
             )
         _require_promotion_gate(deployment, demo_flag=demo_flags[deployment.account_id])
 
+    # #261, and before the dry-run return on purpose as well: a preview showing
+    # ACTIVE rows would advertise a deploy the account cannot have.
+    plan, paused_as_real_money = _pause_non_demo_deployments(plan, demo_flags)
+
     if payload.dry_run:
         return {
             "status": "planned",
             "dry_run": True,
             "deployments": [_serialize_live_deployment_payload(item) for item in plan],
+            "paused_as_real_money": paused_as_real_money,
         }
 
     created: list[dict[str, Any]] = []
@@ -13360,18 +13370,82 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         "status": "created",
         "dry_run": False,
         "deployments": created,
+        "paused_as_real_money": paused_as_real_money,
     }
+
+
+#: Why a top-N deployment was created PAUSED instead of ACTIVE (#261). Two texts
+#: because they ask different things of the operator: a broker-reported live
+#: account is a decision to accept, an unanswered question is a check to make.
+_PAUSE_REASON_LIVE = "the broker reports this account as live (non-demo)"
+_PAUSE_REASON_UNKNOWN = "the broker could not assert that this account is demo"
+
+
+def _pause_non_demo_deployments(
+    plan: Sequence[LiveDeploymentConfig],
+    demo_flags: Mapping[str, bool | None],
+) -> tuple[list[LiveDeploymentConfig], list[dict[str, Any]]]:
+    """Create the non-demo rows of a top-N plan PAUSED instead of ACTIVE (#261).
+
+    A bulk deploy is a one-shot action: it arms what it creates without the fresh
+    broker re-verification the single-deployment activate path performs, so
+    `activate` used to be the only route that could put an armed deployment on an
+    account the broker does not report as demo. Only the daemon's demo-only block
+    then stood between those rows and real money, and a single safeguard must not
+    be what protects a live account. A maintainer activates the rows by hand
+    instead, through the status endpoint, which re-verifies the account first.
+
+    The account classification is the shared one: :func:`is_real_money` over the
+    broker-reported flag, the same verdict the daemon's demo-only guard reaches
+    for its adapter. An account the broker did not assert as demo - including one
+    it could not answer for - is real money here too, so it fails closed. Demo
+    accounts keep the ACTIVE status they were given, and a row that was requested
+    PAUSED is never touched.
+
+    Returns the plan as it will be created, and one entry per deployment paused
+    here naming it and the reason, for the response and the log below.
+    """
+    deployments: list[LiveDeploymentConfig] = []
+    paused: list[dict[str, Any]] = []
+    labels: list[str] = []
+    for deployment in plan:
+        demo_flag = demo_flags.get(deployment.account_id)
+        if deployment.status == "ACTIVE" and is_real_money(demo_flag):
+            reason = _PAUSE_REASON_LIVE if demo_flag is False else _PAUSE_REASON_UNKNOWN
+            strategy_name = deployment.strategy_name
+            account_id = str(deployment.account_id)
+            paused.append(
+                {
+                    "strategy_name": strategy_name,
+                    "account_id": account_id,
+                    "reason": reason,
+                }
+            )
+            labels.append(f"'{strategy_name}' on account '{account_id}' ({reason})")
+            deployment = deployment.model_copy(update={"status": "PAUSED"})
+        deployments.append(deployment)
+    if paused:
+        logger.warning(
+            "cTrader top-N deploy created %d deployment(s) PAUSED instead of "
+            "ACTIVE, because a non-demo account is never armed by a bulk deploy "
+            "(#261): %s. Activate them by hand once reviewed.",
+            len(paused),
+            "; ".join(labels),
+            extra={"data": {"paused": paused}},
+        )
+    return deployments, paused
 
 
 async def _broker_reported_demo_flag(account_id: str) -> bool | None:
     """What broker discovery says about ``account_id``: demo, not demo, or unknown.
 
     The promotion gate's real-money verdict for deployment create and the
-    cTrader top-N deploy (#165). It asks broker discovery directly, bypassing the
-    30 s discovery cache, so a broker that reclassifies the account is seen at
-    once, as activation's re-verification sees it. It never reads the stored
-    account row. ``None`` means discovery failed, did not return the account, or
-    did not assert the flag; the gate treats that as real money.
+    cTrader top-N deploy (#165), and the account classification that decides
+    whether that deploy may arm its rows (#261). It asks broker discovery
+    directly, bypassing the 30 s discovery cache, so a broker that reclassifies
+    the account is seen at once, as activation's re-verification sees it. It never
+    reads the stored account row. ``None`` means discovery failed, did not return
+    the account, or did not assert the flag; the gate treats that as real money.
     """
     try:
         discovered = await asyncio.to_thread(
@@ -15579,14 +15653,14 @@ async def list_logs() -> list[LogFileModel]:
     logs: list[LogFileModel] = [
         LogFileModel(name=ALL_LOGS_NAME, size_bytes=total_size, modified=latest_modified)
     ]
-    for log_file in log_files:
-        logs.append(
-            LogFileModel(
-                name=log_file.name,
-                size_bytes=log_file.stat().st_size,
-                modified=datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).isoformat(),
-            )
+    logs.extend(
+        LogFileModel(
+            name=log_file.name,
+            size_bytes=log_file.stat().st_size,
+            modified=datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).isoformat(),
         )
+        for log_file in log_files
+    )
     return logs
 
 
