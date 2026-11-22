@@ -231,7 +231,7 @@ def _adapter_serves_bars(adapter: BaseLiveAdapter, timeframe: str) -> bool:
 def _is_crypto_symbol(symbol: str) -> bool:
     try:
         return classify_symbol(symbol) == "crypto"
-    except Exception:
+    except Exception:  # except-kind: money-decision
         # Unclassifiable symbols are treated as session-bound: refusing a
         # daily+ deployment is the fail-closed direction.
         return False
@@ -515,7 +515,7 @@ class InternalStrategyRunner:
         key = str(deployment.id)
         try:
             target = self._load_target(deployment.strategy_name)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._report_once(
                 key,
                 "strategy_target",
@@ -563,7 +563,7 @@ class InternalStrategyRunner:
                 config,
                 symbol=str(deployment.symbols[0] if deployment.symbols else ""),
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._report_once(
                 key,
                 f"strategy_load:{mtime_ns}",
@@ -609,7 +609,7 @@ class InternalStrategyRunner:
             return None
         try:
             return {str(order_id) for order_id in await getter()}
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._report_once(
                 deployment_id,
                 "working_orders",
@@ -641,7 +641,7 @@ class InternalStrategyRunner:
                 source=source or None,
                 data_dir=str(DATA_DIR),
             )
-        except Exception:
+        except Exception:  # except-kind: money-decision
             calendar = None
         if calendar is not None:
             self._calendars[key] = calendar
@@ -736,7 +736,7 @@ class InternalStrategyRunner:
             frame = await get_market_data(
                 symbol, timeframe=timeframe, limit=self._bar_limit
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._report_once(
                 state_key[0],
                 f"market_data:{state_key[1]}",
@@ -748,7 +748,7 @@ class InternalStrategyRunner:
             return
         try:
             prepared = _prepare_frame(frame)
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._report_once(
                 state_key[0],
                 f"frame:{state_key[1]}",
@@ -833,7 +833,7 @@ class InternalStrategyRunner:
             entries, exits, signals_frame = await asyncio.to_thread(
                 _run_strategy_eval
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             self._report_once(
                 state_key[0],
                 f"strategy_eval:{state_key[1]}",
@@ -927,7 +927,7 @@ class InternalStrategyRunner:
             if max_open_per_symbol > 0 and bool(entries.iloc[position]):
                 try:
                     direction = bundle.engine._resolve_direction(merged_row)
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     logger.warning(
                         "Internal strategy entry has an unresolvable direction; skipping",
                         extra={
@@ -942,7 +942,7 @@ class InternalStrategyRunner:
                     continue
                 try:
                     stop_loss, tp_levels = bundle.engine._extract_levels(merged_row)
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     logger.warning(
                         "Internal strategy entry levels are unreadable; skipping",
                         extra={
@@ -1072,7 +1072,7 @@ class InternalStrategyRunner:
                 outcome = await self._submit_signal(adapter, deployment, signal)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 self._note_submit_failure(
                     state_key,
                     symbol,
@@ -1158,7 +1158,7 @@ class InternalStrategyRunner:
                 if not bar_seconds:
                     raise ValueError(f"timeframe {timeframe!r} has no bar length")
                 symbols = _deployment_symbols(deployment)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 self._report_once(
                     deployment_id,
                     "deployment_config",
@@ -1192,7 +1192,7 @@ class InternalStrategyRunner:
             # entries-disabled marker ``_evaluate_symbol`` checks.
             try:
                 max_open_per_symbol = _max_open_per_symbol(deployment, bundle)
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 self._report_once(
                     deployment_id,
                     "open_position_cap",
@@ -1225,7 +1225,7 @@ class InternalStrategyRunner:
                             deployment_id,
                             working_ids,
                         )
-                    except Exception as exc:
+                    except Exception as exc:  # except-kind: money-decision
                         # Without the ledger the entry caps cannot be
                         # enforced; entries are disabled rather than traded
                         # uncapped, and exits still flow.
@@ -1257,7 +1257,7 @@ class InternalStrategyRunner:
                     )
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     logger.error(
                         "Internal strategy evaluation failed for symbol",
                         extra={
@@ -1287,7 +1287,7 @@ async def run_internal_strategy_loop(
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.error(
                 "Internal strategy runner tick failed",
                 extra={"data": {"error": str(exc)}},
