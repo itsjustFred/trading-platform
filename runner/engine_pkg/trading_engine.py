@@ -58,9 +58,10 @@ def _floor_to_lot_grid(size: float, lot_step: float) -> float:
     and the live order built from the same quantity cannot disagree by one
     step at the edge (``0.3`` on a ``0.1`` grid). The snap band is a fixed
     1e-6 of a step in exact decimal arithmetic, replacing the relative
-    1e-9-of-quotient band this function used to carry; both absorb the same
-    float dust, and the decimal product is returned instead of ``k *
-    lot_step`` re-evaluated in float (``0.3``, not ``0.30000000000000004``).
+    1e-9-of-quotient band this function used to carry; the new band is
+    wider than the old one below ~1000 steps and narrower above, and the
+    decimal product is returned instead of ``k * lot_step`` re-evaluated in
+    float (``0.3``, not ``0.30000000000000004``).
     The MT5 parity divergence this changes is documented in
     ``scripts/regenerate_mt5_parity_artifacts._round_mt5_lots``.
     """
@@ -88,8 +89,9 @@ def _configured_risk_amount(parameters: dict[str, Any]) -> float:
 def _require_finite(name: str, value: float) -> float:
     """Refuse a non-finite fixed-risk sizing parameter (#151).
 
-    ``inf`` crashes the lot-grid floor (``round(inf)``) or leaks into the
-    order quantity, and ``nan`` defeats every guard on the sizing path
+    ``inf`` is refused outright by the lot-grid floor's decimal finiteness
+    check (and would leak into the order quantity), and ``nan`` defeats
+    every guard on the sizing path
     (``nan`` compares false), so a strategy passing either is a config error,
     not a silent no-op. Mirrors the finite-config rule of the sibling
     validator in ``validation/risk/fixed_risk.py``.
@@ -468,13 +470,15 @@ class TradeEngine:
                 # A size below `min_lot` after the caps is SKIPPED (size 0),
                 # never raised back up: the caps make it unaffordable at the
                 # minimum, and a max_lot below min_lot admits no valid size.
-                # One exception, and only with a grid (`lot_step > 0`): a
-                # grid product can come out of the floor an ulp below
-                # `min_lot` (`3 * 0.3 == 0.8999999999999999 < 0.9`). The
+                # One exception, and only with a grid (`lot_step > 0`): the
+                # grid floor returns exact decimal products, so `shares` can
+                # only land below `min_lot` inside the snap band when
+                # `min_lot` itself is OFF the grid a hair above a grid
+                # multiple (`min_lot = 0.9000000005` vs floor 0.9). The
                 # broker accepts that size as `min_lot`, so within a small
                 # relative tolerance snap it up to `min_lot` and take the
                 # trade instead of skipping it. Without a grid there is no
-                # such product to be an ulp low: a capped raw ratio within
+                # floored product to sit an ulp low: a capped raw ratio within
                 # the band below `min_lot` is a cap the configured minimum
                 # exceeds, and raising it to `min_lot` would push the size
                 # above the cap that just reduced it -- skip it instead.

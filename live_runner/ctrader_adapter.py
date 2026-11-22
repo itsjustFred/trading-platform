@@ -463,8 +463,10 @@ def _qty_to_broker_volume(qty: float, volume_per_qty: float = QTY_VOLUME_SCALE) 
         raise ValueError("volume_per_qty must be finite and positive")
     # Floor, never round: rounding to nearest can size up by half a volume unit
     # and put the loss at the stop above the risk budget. The shared lot-grid
-    # floor's decimal noise band only absorbs binary float error
-    # (0.29 * 100 == 28.999999999999996) -- #278.
+    # floor's decimal noise band absorbs binary float error
+    # (0.29 * 100 == 28.999999999999996) and can return a value up to 1e-6 of
+    # a unit above a real fraction that close to the next unit -- below every
+    # broker's volume resolution -- #278.
     volume = int(floor_qty_to_step(qty_value * float(volume_per_qty), 1.0))
     if volume <= 0:
         raise ValueError(

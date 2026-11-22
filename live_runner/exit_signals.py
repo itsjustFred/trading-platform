@@ -244,7 +244,9 @@ def _apply_fraction(own_qty: float, fraction: float) -> float:
     raw = own_qty * fraction
     if abs(own_qty - round(own_qty)) <= _WHOLE_UNIT_TOLERANCE:
         # A whole-unit position stays whole: round DOWN, so a partial can never
-        # close more than it was asked to.
+        # close more than it was asked to. Deliberately NOT the shared
+        # lot-grid floor (#278): its 1e-6-of-a-step band could round a real
+        # fraction up past the requested close; this nudge stays at 1e-9.
         return float(math.floor(raw + _WHOLE_UNIT_TOLERANCE))
     return raw
 

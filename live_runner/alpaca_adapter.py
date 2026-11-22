@@ -151,8 +151,9 @@ def _floor_to_whole_shares(qty: float) -> float:
     A bracket/OTO entry with a fractional qty is rejected ("fractional orders
     must have order_class=simple", HTTP 422). Floor, never round up: rounding
     up would exceed the risk-sized quantity. The shared lot-grid floor's
-    decimal noise band only absorbs binary float error, never a real fraction
-    (#278).
+    decimal noise band (1e-6 of a step) can return a value a hair ABOVE a
+    real fraction that close to the next whole share -- at most 1e-6 of a
+    share, below Alpaca's quantity resolution (#278).
     """
     return floor_qty_to_step(qty, 1.0)
 

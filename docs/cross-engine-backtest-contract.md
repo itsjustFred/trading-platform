@@ -174,10 +174,11 @@ Implementation:
   live exit/entry paths use, so a backtest size and the live order built
   from it cannot disagree by one step at the edge (`0.3` on a `0.1` grid).
   With a grid
-  configured, a final size within the grid snap band (relative 1e-9) below
-  `min_lot` is snapped up to `min_lot` — that size came out of the grid
-  floor an ulp low (`3 * 0.3 == 0.8999999999999999 < 0.9`) and the broker
-  accepts it as `min_lot`. Without a grid there is no such float product,
+  configured, a final size within the `min_lot` snap band (relative 1e-9)
+  below `min_lot` is snapped up to `min_lot`. Since the decimal grid floor
+  returns exact products, that can only happen when `min_lot` itself is off
+  the grid a hair above a grid multiple, and the broker accepts the size as
+  `min_lot`. Without a grid there is no floored product to sit in the band,
   so the exception does not apply: a capped size below `min_lot` is a cap
   the configured minimum exceeds, and raising it would push the size above
   the cap. Any other final size below `min_lot` is **skipped** (size 0, no

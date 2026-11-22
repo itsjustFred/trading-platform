@@ -97,11 +97,10 @@ def test_fixed_risk_leverage_cap_floors_to_lot_step():  # Issue #151
         stop_distance=1.0,
     )
 
-    assert quantity == pytest.approx(0.3)
-    # On the 0.1 grid: the shared decimal floor returns the clean grid value
-    # 0.3, for which `quantity % 0.1` is itself float noise -- check that the
-    # floor is the identity instead (#278).
-    assert _floor_to_lot_grid(quantity, 0.1) == quantity
+    # Exact, not approx: the shared decimal floor returns the clean grid
+    # value 0.3 -- `0.1 + 0.2`-style float noise and `quantity % 0.1` are
+    # both avoided on purpose (#278).
+    assert quantity == 0.3
 
 
 def test_fixed_risk_leverage_cap_below_min_lot_skips_trade():  # Issue #151
@@ -307,10 +306,9 @@ def test_fixed_risk_max_lot_off_grid_is_floored_to_lot_step():  # Issue #151
         stop_distance=1.0,
     )
 
-    assert quantity == pytest.approx(99.9)
-    # On the 0.1 grid: `quantity % 0.1` is float noise for the clean decimal
-    # grid value 99.9, so check that the floor is the identity (#278).
-    assert _floor_to_lot_grid(quantity, 0.1) == quantity
+    # Exact, not approx: the shared decimal floor returns the clean grid
+    # value 99.9 (#278).
+    assert quantity == 99.9
 
 
 def test_fixed_risk_max_lot_on_grid_is_not_floored_below_itself():  # Issue #151
@@ -398,12 +396,12 @@ def test_fixed_risk_cap_below_min_lot_logs_skip(caplog):  # Issue #151
     assert "below min_lot" in warnings[0].getMessage()
 
 
-def test_fixed_risk_grid_size_ulp_below_min_lot_is_not_skipped():  # Issue #151
-    # A size the cap reduced is re-floored to the grid, and a grid product can
-    # land an ulp below `min_lot`: `3 * 0.3 == 0.8999999999999999 < 0.9`.
-    # The broker accepts that size as `min_lot`, so the trade must happen at
-    # 0.9 — the strict `<` float comparison must not skip it.
-    assert 3 * 0.3 < 0.9, "fixture relies on the float product being below 0.9"
+def test_fixed_risk_grid_size_at_min_lot_is_not_skipped():  # Issue #151
+    # A size the cap reduced is re-floored to the grid. The shared decimal
+    # floor returns the exact grid product -- `3 * 0.3` is 0.9, not
+    # 0.8999999999999999 -- so `shares < min_lot` is False and the ulp-snap
+    # branch is not needed: the trade happens at 0.9.
+    assert _floor_to_lot_grid(0.9, 0.3) == 0.9
     engine = _engine(
         {
             "fixed_risk_amount": 500.0,
@@ -423,14 +421,44 @@ def test_fixed_risk_grid_size_ulp_below_min_lot_is_not_skipped():  # Issue #151
         stop_distance=1.0,
     )
 
-    assert quantity == pytest.approx(0.9)
+    assert quantity == 0.9
 
 
-def test_fixed_risk_grid_size_ulp_below_min_lot_creates_order():  # Issue #151
-    # End-to-end twin of the case above: the capped size is float noise
-    # (one ulp) below min_lot, so a real order must be created at min_lot
-    # instead of the trade being skipped with size 0. Flat prices keep the
-    # fill-time re-size on the same 100.0 entry as the creation-time sizing.
+def test_fixed_risk_offgrid_min_lot_within_snap_band_is_raised(caplog):  # Issue #151
+    # The ulp-snap branch is still reachable, but only through an OFF-GRID
+    # `min_lot`: the decimal floor returns the exact grid product 0.9, so
+    # `shares < min_lot` needs a `min_lot` a hair above it. Within the
+    # 1e-9 relative band the broker's minimum is taken as the size instead
+    # of skipping the trade.
+    engine = _engine(
+        {
+            "fixed_risk_amount": 500.0,
+            "tick_size": 1.0,
+            "tick_value": 1.0,
+            "lot_step": 0.3,
+            "min_lot": 0.9000000005,
+            "max_lot": 100.0,
+        },
+        max_leverage=0.0009,  # cap = 100_000 * 0.0009 / 100 = 0.9 units = 3 steps
+    )
+
+    quantity = engine._calculate_position_size(
+        entry_price=100.0,
+        stop_loss_price=95.0,
+        direction="LONG",
+        stop_distance=1.0,
+    )
+
+    assert quantity == pytest.approx(0.9000000005)
+    assert not any("below min_lot" in r.getMessage() for r in caplog.records)
+
+
+def test_fixed_risk_grid_size_at_min_lot_creates_order():  # Issue #151
+    # End-to-end twin of the case above: the capped size lands exactly on
+    # min_lot after the decimal grid floor, so a real order must be created
+    # at min_lot instead of the trade being skipped with size 0. Flat
+    # prices keep the fill-time re-size on the same 100.0 entry as the
+    # creation-time sizing.
     frame = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(

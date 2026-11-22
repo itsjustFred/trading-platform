@@ -49,6 +49,18 @@ def test_floor_qty_to_step_edges(qty, step, expected) -> None:
     assert result - qty <= 1e-6 * step + 1e-15
 
 
+def test_noise_band_never_rounds_a_real_fraction_up() -> None:
+    # The 1e-6-of-a-step band is pinned from ABOVE as well as below: a real
+    # fraction well clear of the band must floor DOWN, never round up. On
+    # the live entry path a wider band would size an order one step above
+    # the risk budget.
+    assert floor_qty_to_step(0.1999, 0.1) == 0.1
+    for k in (1, 2, 7):
+        step = 0.1
+        qty = (k + 1) * step - 1e-4 * step
+        assert floor_qty_to_step(qty, step) == pytest.approx(k * step)
+
+
 def test_floor_qty_to_step_returns_the_decimal_grid_value() -> None:
     # The decimal product is returned, not `k * step` re-evaluated in float:
     # `3 * 0.1 == 0.30000000000000004`, the floor must give the clean 0.3.
@@ -65,7 +77,7 @@ def test_floor_qty_to_step_refuses_an_unusable_qty(qty) -> None:
 
 @pytest.mark.parametrize("step", [0.0, -1.0, float("nan"), float("inf")])
 def test_floor_qty_to_step_refuses_an_unusable_step(step) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="step must be finite and positive"):
         floor_qty_to_step(1.0, step)
 
 
