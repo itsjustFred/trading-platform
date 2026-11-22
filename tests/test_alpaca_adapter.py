@@ -393,7 +393,7 @@ def test_cancel_open_orders_reports_an_uncancelled_pending_cancel_order() -> Non
     def get_orders(filter=None):  # noqa: A002 - mirrors alpaca-py
         reads["n"] += 1
         result = original_get(filter)
-        return result + [stranger] if reads["n"] > 1 else result
+        return [*result, stranger] if reads["n"] > 1 else result
 
     client.get_orders = get_orders  # type: ignore[method-assign]
 

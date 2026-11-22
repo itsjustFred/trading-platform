@@ -23,6 +23,7 @@ from runner.engine import TradeEngine
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
+from shared.models import Trade, TradeExit
 from tests.helpers import with_zero_fees
 from tests.helpers import write_ohlcv as _write_ohlcv
 
@@ -568,8 +569,8 @@ def _gap_frame(*, spread: float = 0.0) -> pd.DataFrame:
     data: dict[str, list] = {
         "timestamp": pd.date_range("2024-01-01", periods=12, freq="h", tz="UTC"),
         "open": opens,
-        "high": [max(o, c) + 0.25 for o, c in zip(opens, closes)],
-        "low": [min(o, c) - 0.25 for o, c in zip(opens, closes)],
+        "high": [max(o, c) + 0.25 for o, c in zip(opens, closes, strict=False)],
+        "low": [min(o, c) - 0.25 for o, c in zip(opens, closes, strict=False)],
         "close": closes,
         "volume": [1000.0] * 12,
     }
@@ -939,8 +940,6 @@ class TestSharedEquity:
 def _replay_trade(trade_id: int, symbol: str, entry: str, exit: str,
                   entry_price: float, exit_price: float, qty: float,
                   equity_at_entry: float) -> "Trade":
-    from shared.models import Trade, TradeExit
-
     direction = "LONG"
     pnl = (exit_price - entry_price) * qty
     return Trade(

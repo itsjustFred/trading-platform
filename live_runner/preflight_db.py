@@ -334,20 +334,20 @@ def diff_db_and_yaml(
                 )
             continue
         matched.append(row.label)
-        for difference in _db_row_drift(row, yaml_dep):
-            warnings.append(
-                f"DB deployment {row.label}: {difference}; the daemon trades the DB value."
-            )
+        warnings.extend(
+            f"DB deployment {row.label}: {difference}; the daemon trades the DB value."
+            for difference in _db_row_drift(row, yaml_dep)
+        )
 
     only_in_yaml = [
         f"{name} ({account})"
         for (name, account) in sorted(yaml_active)
         if (name, account) not in db_by_key
     ]
-    for label in only_in_yaml:
-        warnings.append(
-            f"YAML deployment {label}: not an ACTIVE row in the DB; the daemon will not trade it."
-        )
+    warnings.extend(
+        f"YAML deployment {label}: not an ACTIVE row in the DB; the daemon will not trade it."
+        for label in only_in_yaml
+    )
     return DbPreflightReport(
         db_path=db_path,
         active_count=len(db_rows),

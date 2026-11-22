@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
@@ -932,7 +932,7 @@ def _detect_rocket_fuel_signal_type(content: str) -> str | None:
     return None
 
 
-def _resolve_action(content: str, *, signal_type: str | None) -> str | None:
+def _resolve_action(content: str, *, signal_type: str | None) -> Literal["buy", "sell"] | None:
     if signal_type in {"overbought_alert", "death_cross_warning"}:
         return None
     # A buy-side negation vetoes the inferred BUY before it is applied.
@@ -1043,7 +1043,7 @@ def _resolve_message_channel_id(message: Any) -> str:
 def _reject_untrusted_author(
     message: Any,
     author_id: str,
-    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None,
+    on_author_rejection: Callable[[str], Awaitable[None] | None] | None,
 ) -> None:
     """Record and log one message refused by the author allowlist.
 
@@ -1122,7 +1122,7 @@ def _parse_trade_signal_from_message(
     *,
     default_timeframe: str,
     trusted_author_ids: Iterable[str] | None = None,
-    on_author_rejection: Awaitable[None] | Callable[[str], Any] | None = None,
+    on_author_rejection: Callable[[str], Awaitable[None] | None] | None = None,
     on_author_accepted: Callable[[], Any] | None = None,
     outcome_sink: Callable[[str, str | None], None] | None = None,
 ) -> TradeSignal | None:
@@ -1188,7 +1188,10 @@ def _parse_trade_signal_from_message(
         _report_parse_outcome(outcome_sink, "ambiguous_exit_directive")
         return None
 
+    # Declared, not inferred: both branches produce a direction the trade model
+    # accepts, so the None check below leaves a value `TradeSignal` can take.
     signal_type = None
+    action: Literal["buy", "sell"] | None
     if _is_ramjet_signal(body):
         # Still subject to the negation guard. This branch sets the action
         # outright, so "oversold buy signal - do not buy this yet" was a long on
@@ -1337,7 +1340,7 @@ class _DiscordMessageAdapter:
     fabricated one.
     """
 
-    __slots__ = ("content", "id", "created_at", "channel", "author")
+    __slots__ = ("author", "channel", "content", "created_at", "id")
 
     def __init__(self, message: dict[str, Any]) -> None:
         self.content = str(message.get("content") or "")
@@ -1464,7 +1467,7 @@ class DiscordSignalSource(BaseSignalSource):
         self._consecutive_author_rejections = 0
         self._author_rejection_alerted = False
 
-    def _record_author_rejection(self, author_id: str) -> None:
+    def _record_author_rejection(self, author_id: str) -> Awaitable[None] | None:
         """Count the rejection synchronously; only the status write is deferred.
 
         The caller is a synchronous parser, so it can only *schedule* an
@@ -2100,7 +2103,7 @@ class DiscordSignalSource(BaseSignalSource):
         # and are always kept.
         numeric = sorted(
             (message_id for message_id in seen if _safe_message_id_int(message_id)),
-            key=_safe_message_id_int,
+            key=lambda message_id: int(message_id),
         )
         survivors = set(numeric[-SEEN_ID_RETENTION:])
         survivors.update(

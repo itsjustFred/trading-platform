@@ -241,7 +241,7 @@ def test_live_trail_matches_the_replay_adapter_on_the_same_price_series(live: _L
     closes = [100.0, 100.6, 103.0, 104.4, 104.1, 103.9]
     # Replay: the same closes, then a bar that falls through the trailed stop,
     # so the replay exit price *is* the stop the replay trailed to.
-    frame = _bars(closes + [90.0])
+    frame = _bars([*closes, 90.0])
     frame.loc[len(closes), ["open", "high"]] = [103.9, 103.9]
     frame["volume"] = 1000
     replay = SignalReplayAdapter(
