@@ -1632,12 +1632,15 @@ def test_backfill_cfee_predecessor_probe_is_a_single_request_with_long_history(d
     assert len(probes) == 1, "the predecessor probe is one request, not a paginated scan"
 
 
-def test_backfill_early_fill_probe_stops_at_the_first_crypto_fill(db):
-    """The "crypto fills before the fetch window" probe must not paginate the whole history.
+def test_backfill_crypto_fill_scan_runs_once_and_is_memoized(db):
+    """The earliest-crypto-fill scan cannot stop at the first crypto fill - it needs the
+    minimum ``transaction_time`` - but the answer is fixed history, so the adapter pages
+    the FILL activities once and later passes reuse the cached instant instead of
+    re-scanning (up to ``MAX_ACTIVITY_PAGES`` requests on every pass).
 
-    With 250 early crypto fills a paginating probe would make many calls before answering;
-    it stops at the first crypto fill on the first page instead. The CFEE predecessor probe
-    remains a single request.
+    251 fills make the scan three pages; a second pass must add no probe calls. The early
+    crypto fill keeps the first batch's window open, so the commission stays NULL and the
+    second pass reaches the probe again.
     """
     signal, order_id = _crypto_fill(db, label="deep-fills")
     early_fills = [
@@ -1658,12 +1661,202 @@ def test_backfill_early_fill_probe_stops_at_the_first_crypto_fill(db):
         ],
         cfees=[_cfee(qty="-0.00125")],
     )
+    adapter = _adapter(client=client)
 
-    assert _backfill(client) == 0
+    def probe_calls() -> list[tuple[str, dict[str, Any]]]:
+        return [
+            call
+            for call in client.calls
+            if call[0].endswith("/FILL")
+            and call[1].get("after") == "1970-01-01T00:00:00Z"
+        ]
+
+    assert asyncio.run(adapter.backfill_commissions(now=NOW)) == 0
     assert _commission(db, signal) == [None]
-    fill_calls = [call for call in client.calls if call[0].endswith("/FILL")]
-    # One probe page (the first page already holds crypto fills) plus the main listing.
-    assert len(fill_calls) == 2, "the early-fill probe stops at the first crypto fill"
+    assert len(probe_calls()) == 3, "251 fills page three times for the one-time scan"
+
+    assert asyncio.run(adapter.backfill_commissions(now=NOW)) == 0
+    assert len(probe_calls()) == 3, "the memoized scan must not re-page the history"
+    assert _commission(db, signal) == [None]
+
+
+# ── has_earlier_crypto_fill / earliest_crypto_fill_at: fail-closed branches pinned ──────────
+
+
+class _ProbeClient:
+    """``client.get`` for the FILL probe: returns queued pages and records the params."""
+
+    def __init__(self, pages: list[list[dict[str, Any]]]):
+        self._pages = list(pages)
+        self.calls: list[dict[str, Any]] = []
+
+    def get(self, path: str, data: dict[str, Any] | None = None):
+        self.calls.append({"path": path, "params": dict(data or {})})
+        return self._pages.pop(0) if self._pages else []
+
+
+def _probe_fill(
+    symbol: str | None, at: datetime, item_id: str | None = None
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "id": item_id if item_id is not None else _et_id(at),
+        "transaction_time": at.isoformat().replace("+00:00", "Z"),
+    }
+    if symbol is not None:
+        item["symbol"] = symbol
+    return item
+
+
+PROBE_BEFORE = datetime(2026, 11, 1, tzinfo=timezone.utc)
+
+
+def test_crypto_fill_probe_continues_past_a_full_page_of_equity_fills():
+    """A full first page of non-crypto fills must not end the scan: the crypto fill on
+    page 2 still opens the window, and page 2 is requested with page 1's last id."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    page1 = [
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=3 - index)) for index in range(3)
+    ]
+    crypto = _probe_fill("BTC/USD", PROBE_BEFORE - timedelta(hours=1))
+    client = _ProbeClient([page1, [crypto]])
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE, page_size=3) is True
+    assert len(client.calls) == 2
+    assert client.calls[1]["params"]["page_token"] == page1[-1]["id"]
+
+
+def test_crypto_fill_probe_ignores_crypto_fills_at_or_after_before():
+    """Crypto fills at or after ``before`` do not open the window."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    equity_page = [
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=2, hours=index))
+        for index in range(2)
+    ]
+    for moment in (PROBE_BEFORE, PROBE_BEFORE + timedelta(hours=1)):
+        client = _ProbeClient([list(equity_page), [_probe_fill("BTC/USD", moment)]])
+        assert (
+            has_earlier_crypto_fill(client, before=PROBE_BEFORE, page_size=2) is False
+        ), moment
+
+
+@pytest.mark.parametrize("symbol", [None, "", "   "])
+def test_crypto_fill_probe_fails_closed_on_a_fill_without_a_symbol(symbol):
+    """A fill whose symbol is missing cannot be ruled out as crypto: fail closed."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    item = _probe_fill(symbol, PROBE_BEFORE - timedelta(days=1))
+    client = _ProbeClient([[item]])
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE) is True
+
+
+def test_crypto_fill_probe_fails_closed_on_an_unreadable_crypto_timestamp():
+    """A crypto fill whose ``transaction_time`` cannot be parsed cannot be placed: fail closed."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    item = _probe_fill("BTC/USD", PROBE_BEFORE - timedelta(days=1))
+    item["transaction_time"] = "not-a-timestamp"
+    client = _ProbeClient([[item]])
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE) is True
+
+
+def test_crypto_fill_probe_fails_closed_when_pagination_cannot_advance():
+    """A full page whose last item has no id leaves no ``page_token``: fail closed."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    page = [
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=1, hours=index))
+        for index in range(2)
+    ]
+    page[-1].pop("id")
+    client = _ProbeClient(
+        [page, [_probe_fill("BTC/USD", PROBE_BEFORE - timedelta(days=1))]]
+    )
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE, page_size=2) is True
+    assert len(client.calls) == 1
+
+
+def test_crypto_fill_probe_fails_closed_when_the_page_token_repeats():
+    """A ``page_token`` that repeats an already-seen id cannot advance: fail closed."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    page1 = [
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=3), item_id="id-1"),
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=2), item_id="id-2"),
+    ]
+    page2 = [
+        _probe_fill("AAPL", PROBE_BEFORE - timedelta(days=1), item_id="id-3"),
+        _probe_fill("AAPL", PROBE_BEFORE, item_id="id-2"),
+    ]
+    client = _ProbeClient([page1, page2])
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE, page_size=2) is True
+    assert len(client.calls) == 2
+
+
+def test_crypto_fill_probe_fails_closed_at_the_page_cap(monkeypatch):
+    """An unfinished scan (``MAX_ACTIVITY_PAGES`` full pages) fails closed."""
+    import live_runner.alpaca_fees as alpaca_fees
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    monkeypatch.setattr(alpaca_fees, "MAX_ACTIVITY_PAGES", 2)
+    pages = [
+        [_probe_fill("AAPL", PROBE_BEFORE - timedelta(days=1), item_id=f"id-{index}")]
+        for index in range(3)
+    ]
+    client = _ProbeClient(pages)
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE, page_size=1) is True
+    assert len(client.calls) == 2
+
+
+def test_crypto_fill_probe_answers_false_on_an_empty_history():
+    """A complete scan that finds no fills at all proves the window closed."""
+    from live_runner.alpaca_fees import has_earlier_crypto_fill
+
+    client = _ProbeClient([[]])
+
+    assert has_earlier_crypto_fill(client, before=PROBE_BEFORE) is False
+    assert len(client.calls) == 1
+
+
+def test_earliest_crypto_fill_at_returns_the_minimum_across_pages():
+    """Id order is not ``transaction_time`` order: the scan keeps the minimum, so a
+    later-id fill with an earlier time still becomes the cached earliest."""
+    from live_runner.alpaca_fees import earliest_crypto_fill_at
+
+    later = PROBE_BEFORE - timedelta(hours=1)
+    earlier = PROBE_BEFORE - timedelta(days=2)
+    client = _ProbeClient(
+        [
+            [
+                _probe_fill("BTC/USD", later, item_id="id-1"),
+                _probe_fill("AAPL", PROBE_BEFORE, item_id="id-2"),
+            ],
+            [_probe_fill("BTC/USD", earlier, item_id="id-3")],
+        ]
+    )
+
+    assert (
+        earliest_crypto_fill_at(client, until=NOW, page_size=2) == earlier
+    )
+
+
+def test_earliest_crypto_fill_at_returns_none_without_crypto_fills():
+    from live_runner.alpaca_fees import earliest_crypto_fill_at
+
+    client = _ProbeClient(
+        [
+            [_probe_fill("AAPL", PROBE_BEFORE - timedelta(days=1), item_id="id-1")],
+            [],
+        ]
+    )
+
+    assert earliest_crypto_fill_at(client, until=NOW, page_size=1) is None
 
 
 def test_backfill_leaves_a_still_posting_batch_pending_until_it_settles(db):

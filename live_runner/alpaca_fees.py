@@ -199,6 +199,76 @@ def has_earlier_account_activity(
     return _parse_activity_time(page[0].get(field)) < before
 
 
+class _CryptoFillScanUnknown:
+    """The crypto-fill scan could not prove the earliest fill; callers fail closed."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "CRYPTO_FILL_SCAN_UNKNOWN"
+
+
+#: ``earliest_crypto_fill_at`` answer when the scan cannot finish honestly - an item whose
+#: symbol or crypto timestamp cannot be classified, pagination that stalls, or
+#: ``MAX_ACTIVITY_PAGES`` reached. The first CFEE batch's window is then treated as open,
+#: exactly as the unfinished probe answered before.
+CRYPTO_FILL_SCAN_UNKNOWN = _CryptoFillScanUnknown()
+
+
+def earliest_crypto_fill_at(
+    client: Any,
+    *,
+    until: datetime,
+    page_size: int = ACTIVITY_PAGE_SIZE,
+) -> datetime | _CryptoFillScanUnknown | None:
+    """The earliest crypto ``FILL`` ``transaction_time`` in the listing up to ``until``.
+
+    Pages ``FILL`` ascending from the epoch and keeps the minimum ``transaction_time`` over
+    crypto symbols; equity fills cannot sit in a crypto CFEE batch's coverage and are
+    skipped. ``None`` means the scan completed and found no crypto fill.
+    ``CRYPTO_FILL_SCAN_UNKNOWN`` means it could not prove the earliest - a missing symbol,
+    an unreadable crypto timestamp, pagination that stalls, or ``MAX_ACTIVITY_PAGES``
+    reached - so the caller must fail closed. Bounded by ``MAX_ACTIVITY_PAGES`` requests;
+    the answer is fixed history, so a caller that asks on every pass should memoize it
+    (the trading path shares Alpaca's ~200 requests/minute budget, and the daemon's
+    ``wait_for`` cannot stop a ``to_thread`` scan).
+    """
+    earliest: datetime | None = None
+    token: str | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(MAX_ACTIVITY_PAGES):
+        params: dict[str, Any] = {
+            "after": activity_timestamp(ACTIVITY_EPOCH),
+            "until": activity_timestamp(until),
+            "direction": "asc",
+            "page_size": page_size,
+        }
+        if token is not None:
+            params["page_token"] = token
+        page = _activity_page(client, "FILL", params)
+        if not page:
+            return earliest
+        for raw in page:
+            symbol_text = str(raw.get("symbol") or "").strip()
+            if not symbol_text:
+                return CRYPTO_FILL_SCAN_UNKNOWN
+            if split_crypto_pair(symbol_text) is None:
+                continue
+            try:
+                moment = _parse_activity_time(raw.get("transaction_time"))
+            except ValueError:
+                return CRYPTO_FILL_SCAN_UNKNOWN
+            if earliest is None or moment < earliest:
+                earliest = moment
+        if len(page) < page_size:
+            return earliest
+        token = str(page[-1].get("id") or "").strip()
+        if not token or token in seen_tokens:
+            return CRYPTO_FILL_SCAN_UNKNOWN
+        seen_tokens.add(token)
+    return CRYPTO_FILL_SCAN_UNKNOWN
+
+
 def has_earlier_crypto_fill(
     client: Any,
     *,
@@ -209,44 +279,20 @@ def has_earlier_crypto_fill(
 
     The first fetched ``CFEE`` batch's coverage window is open-ended, so an unfetched *crypto*
     fill inside it would make the batch's fee totals cover fills the per-fill consistency check
-    never sees. Equity fills are irrelevant - the planner ignores them - so this pages ``FILL``
-    ascending and classifies each item's symbol instead of trusting the single oldest-activity
-    probe. A missing or unreadable symbol/timestamp cannot rule a crypto fill out and answers
-    True, as does hitting ``MAX_ACTIVITY_PAGES``: an unfinished scan fails closed.
+    never sees. Equity fills are irrelevant - the planner ignores them - so this scans ``FILL``
+    ascending from the epoch and classifies each item's symbol instead of trusting the
+    single oldest-activity probe. ``until`` is widened by ``ACTIVITY_WINDOW_OVERLAP`` for the
+    same reason as the other activity listings; the client-side ``< before`` check makes the
+    extra day harmless. Every branch that cannot prove the earliest fill - a missing or
+    unreadable symbol/timestamp, stalled pagination, the page cap - answers True, so an
+    unfinished scan fails closed.
     """
-    token: str | None = None
-    seen_tokens: set[str] = set()
-    for _ in range(MAX_ACTIVITY_PAGES):
-        params: dict[str, Any] = {
-            "after": activity_timestamp(ACTIVITY_EPOCH),
-            "until": activity_timestamp(before + ACTIVITY_WINDOW_OVERLAP),
-            "direction": "asc",
-            "page_size": page_size,
-        }
-        if token is not None:
-            params["page_token"] = token
-        page = _activity_page(client, "FILL", params)
-        if not page:
-            return False
-        for raw in page:
-            symbol_text = str(raw.get("symbol") or "").strip()
-            if not symbol_text:
-                return True
-            if split_crypto_pair(symbol_text) is None:
-                continue
-            try:
-                moment = _parse_activity_time(raw.get("transaction_time"))
-            except ValueError:
-                return True
-            if moment < before:
-                return True
-        if len(page) < page_size:
-            return False
-        token = str(page[-1].get("id") or "").strip()
-        if not token or token in seen_tokens:
-            return True
-        seen_tokens.add(token)
-    return True
+    scan = earliest_crypto_fill_at(
+        client, until=before + ACTIVITY_WINDOW_OVERLAP, page_size=page_size
+    )
+    if scan is CRYPTO_FILL_SCAN_UNKNOWN:
+        return True
+    return scan is not None and scan < before
 
 
 def select_activity_window(

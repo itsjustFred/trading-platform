@@ -19,11 +19,12 @@ from live_runner.alpaca_fees import (
     ACTIVITY_WINDOW_OVERLAP,
     CFEE_LOOKBACK_MARGIN,
     COMMISSION_BACKFILL_LOOKBACK,
+    CRYPTO_FILL_SCAN_UNKNOWN,
     cfee_created_at,
+    earliest_crypto_fill_at,
     fee_fill_window_start,
     fetch_account_activities,
     has_earlier_account_activity,
-    has_earlier_crypto_fill,
     plan_commission_backfill,
     select_activity_window,
 )
@@ -79,6 +80,9 @@ _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
 _ALPACA_TICK_AT_OR_ABOVE_ONE = Decimal("0.01")
 _ALPACA_TICK_BELOW_ONE = Decimal("0.0001")
+
+#: ``AlpacaLiveAdapter._earliest_crypto_fill_at`` before its one-time FILL-history scan ran.
+_CRYPTO_FILL_SCAN_PENDING = object()
 
 _EXTENDED_HOURS_BRACKET_MESSAGE = (
     "Extended-hours entry with mandatory SL/TP is not supported: "
@@ -793,6 +797,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # #167: serialises stop amendments with the sweeps that cancel orders
         # (see `_order_book_lock`). Bound to the loop that first uses it.
         self._order_book_lock_state: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+        # The earliest crypto fill is fixed history: the FILL-history scan behind
+        # ``backfill_commissions`` runs once and later passes answer from this cache
+        # instead of re-paging up to ``MAX_ACTIVITY_PAGES`` requests every pass.
+        self._earliest_crypto_fill_at: Any = _CRYPTO_FILL_SCAN_PENDING
 
         if not self.api_key or not self.secret_key:
             raise ValueError(
@@ -1095,8 +1103,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         # the account's first batch ever - then it is complete only if no *crypto* fills exist
         # before the FILL fetch bound either (equity fills cannot sit in a crypto CFEE batch's
         # coverage, so they must not open the window). The CFEE probe is a single request; the
-        # crypto-fill probe pages FILL ascending and stops at the first crypto fill, bounded by
-        # the activity page cap - an unfinished scan answers "open", which fails closed.
+        # crypto-fill scan pages FILL ascending for the account's earliest crypto fill - once
+        # per adapter, since that instant never changes - and an unfinished scan is cached as
+        # CRYPTO_FILL_SCAN_UNKNOWN, which fails closed on every later pass exactly as
+        # re-scanning would.
         first_batch_open = False
         try:
             if cfees:
@@ -1109,10 +1119,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     field="created_at",
                 )
             if not first_batch_open:
-                first_batch_open = await asyncio.to_thread(
-                    has_earlier_crypto_fill,
-                    client,
-                    before=fill_start,
+                if self._earliest_crypto_fill_at is _CRYPTO_FILL_SCAN_PENDING:
+                    self._earliest_crypto_fill_at = await asyncio.to_thread(
+                        earliest_crypto_fill_at,
+                        client,
+                        until=now + ACTIVITY_WINDOW_OVERLAP,
+                    )
+                earliest = self._earliest_crypto_fill_at
+                first_batch_open = earliest is CRYPTO_FILL_SCAN_UNKNOWN or (
+                    earliest is not None and earliest < fill_start
                 )
             fills = await asyncio.to_thread(
                 fetch_account_activities, client, "FILL", after=fill_start, until=now
