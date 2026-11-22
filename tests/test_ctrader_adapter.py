@@ -1618,7 +1618,12 @@ def test_money_digits_fallback_is_logged(caplog) -> None:
 
 
 def _leverage_adapter() -> CTraderLiveAdapter:
-    """A connected, authenticated adapter with the leverage proto types bound."""
+    """A connected, authenticated adapter with the leverage proto types bound.
+
+    ``_fetch_trader`` is stubbed to a trader with zeroed leverage fields so
+    the account leg resolves to ``None`` without a broker call; tests that
+    need a readable account override it via ``_stub_trader``.
+    """
     adapter = CTraderLiveAdapter(
         app_id="app",
         app_secret="secret",
@@ -1634,6 +1639,7 @@ def _leverage_adapter() -> CTraderLiveAdapter:
 
     adapter._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
     adapter._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=0, maxLeverage=0))
     return adapter
 
 
@@ -1766,9 +1772,15 @@ def test_get_max_leverage_clamps_the_tier_to_the_account_leverage() -> None:
     assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(50.0)
 
 
-def test_get_max_leverage_honours_max_leverage_when_set() -> None:
-    """``ProtoOATrader.maxLeverage`` is the account's own ceiling; when it is
-    the tighter of the readable account fields it wins the min."""
+def test_get_max_leverage_ignores_max_leverage() -> None:
+    """``ProtoOATrader.maxLeverage`` is not read at all.
+
+    The field is a plain uint32 without an "InCents" suffix whose unit is
+    unverified; if it were a plain ratio (500 for 1:500) reading it as cents
+    would return 5x and silently clamp every cTrader order. It is also only
+    the broker's ceiling for *changing* leverage — ``leverageInCents`` is
+    already validated against it — so it can never be the tighter bound.
+    """
     adapter = _leverage_adapter()
     adapter._symbol_leverage_ids["EURUSD"] = 42
     _stub_trader(adapter, SimpleNamespace(leverageInCents=50000, maxLeverage=20000))
@@ -1778,7 +1790,9 @@ def test_get_max_leverage_honours_max_leverage_when_set() -> None:
 
     adapter._send_request_with_refresh_retry = _fake_send
 
-    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(200.0)
+    # leverageInCents (500x) and the tier (500x) win; a cents-reading of
+    # maxLeverage=20000 would wrongly cap at 200x.
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(500.0)
 
 
 def test_get_max_leverage_uses_whichever_side_is_readable() -> None:

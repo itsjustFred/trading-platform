@@ -225,9 +225,13 @@ Balance und die maximale Hebel des Brokers für Account und Asset
 (`get_max_leverage`; cTrader über `ProtoOASymbol.leverageId` +
 `GetDynamicLeverageByID` — der Tier-Wert steht in Cents wie
 `leverageInCents`, 1:200 = 20000, und wird vor der Nutzung durch 100
-gerechnet — geklemmt an die eigene Account-Hebel `leverageInCents` bzw.
-`maxLeverage` aus `ProtoOATrader`, wie Spotwares Beispiel mit
-`min(trader, tier)`; Alpaca über `account.multiplier`, Crypto bleibt bei
+gerechnet — geklemmt an die eigene Account-Hebel `leverageInCents` aus
+`ProtoOATrader`, wie Spotwares Beispiel mit `min(trader, tier)`;
+`ProtoOATrader.maxLeverage` wird bewusst nicht gelesen — es ist ein
+uint32 ohne „InCents“-Suffix, nur die Obergrenze für *Änderungen* der
+Hebel, gegen die `leverageInCents` bereits validiert wird; fehlt dem
+Symbol eine `leverageId`, ist die Account-Hebel allein die Obergrenze;
+Alpaca über `account.multiplier`, Crypto bleibt bei
 1x; unbekannt → 1x). Die Tier-Hebel ist eine Obergrenze: bei cTrader sinkt
 die Hebel mit dem Volumen, daher gilt der erste (kleinste) Tier — der
 tatsächlich angewandte Hebel kann niedriger sein und wird vom Broker

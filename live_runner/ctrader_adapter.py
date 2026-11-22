@@ -3005,20 +3005,22 @@ class CTraderLiveAdapter(BaseLiveAdapter):
           the maximum sits in the first tier — an upper bound: a larger order
           is margined at a lower tier, which the broker still enforces;
         * the account's own leverage — ``ProtoOATrader.leverageInCents`` is
-          the leverage the account actually trades at, and ``maxLeverage``,
-          when set, is the broker's ceiling for changing it. Spotware's
-          example computes the effective leverage as
+          the leverage the account actually trades at. Spotware's example
+          computes the effective leverage as
           ``min(trader.leverageInCents, tier.leverage) / 100``, so an account
           set to 1:50 on a symbol offering 1:500 is capped at 50 — the tier
-          alone would overstate what the broker will margin. Both fields are
-          uint32 in the same cents family as ``leverageInCents`` (it is the
-          value ``maxLeverage`` validates against); if that convention ever
-          differed, reading it as cents is the fail-closed direction.
+          alone would overstate what the broker will margin.
+          ``ProtoOATrader.maxLeverage`` is deliberately *not* read: it is a
+          plain uint32 named without an "InCents" suffix (Spotware uses it to
+          validate leverage *changes*, not margining), the broker already
+          validates ``leverageInCents`` against it so it can never be the
+          tighter bound, and reading it in the wrong unit would silently
+          shrink every order.
 
-        Either side may be unreadable (no ``leverageId``, missing proto
-        types, a failed broker call); the readable side alone still answers,
-        and ``None`` — never a guess — is returned when neither is, so callers
-        treat ``None`` as 1x.
+        The account leg degrades on its own (no readable trader record or an
+        unset/nonpositive field contributes nothing), while a failed tier
+        request fails the whole lookup closed — ``None``, never a partial
+        answer — so callers treat ``None`` as 1x.
         """
         try:
             self._raise_if_terminal_auth_failed()
@@ -3073,14 +3075,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             return None
 
     async def _account_leverage_cents(self) -> float | None:
-        """The account's own leverage ceiling in cents, or ``None``.
+        """The account's own leverage in cents, or ``None``.
 
-        Reads ``ProtoOATrader.leverageInCents`` (the leverage the account
-        trades at) and ``maxLeverage`` (the broker's ceiling for changing it,
-        when set); the tighter readable value is the account-side bound the
-        symbol tiers are clamped against. An unreadable trader record or
-        unset/nonpositive fields degrade to ``None`` — the tier leg may still
-        answer on its own.
+        Reads ``ProtoOATrader.leverageInCents`` — the leverage the account
+        actually trades at — which is the account-side bound the symbol
+        tiers are clamped against. ``maxLeverage`` is not read: its unit is
+        unverified and it is only the broker's ceiling for *changing*
+        leverage, which ``leverageInCents`` is already validated against.
+        An unreadable trader record or an unset/nonpositive field degrades
+        to ``None`` — the tier leg may still answer on its own.
         """
         try:
             trader = await self._fetch_trader()
@@ -3090,15 +3093,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"error": repr(exc)}},
             )
             return None
-        values = [
-            value
-            for value in (
-                _optional_float(getattr(trader, "leverageInCents", None)),
-                _optional_float(getattr(trader, "maxLeverage", None)),
-            )
-            if value is not None and math.isfinite(value) and value > 0
-        ]
-        return min(values) if values else None
+        value = _optional_float(getattr(trader, "leverageInCents", None))
+        if value is None or not math.isfinite(value) or value <= 0:
+            return None
+        return value
 
     async def _fetch_trader(self) -> Any:
         """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""
