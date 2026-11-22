@@ -60,6 +60,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.strategy_markers import entry_exit_markers
+
 
 def _wilder_rma(series: pd.Series, length: int) -> pd.Series:
     return series.astype(float).ewm(alpha=1.0 / float(length), adjust=False).mean()
@@ -70,7 +72,7 @@ def _parse_minutes(value: str) -> int:
     return int(hour) * 60 + int(minute)
 
 
-def generate_signals(df: pd.DataFrame, params: dict | None = None):
+def generate_signals(df: pd.DataFrame, params: dict = None):
     params = params or {}
     atr_period = int(
         params.get("daily_atr_period", params.get("atr_period", params.get("DailyATRMulti", 5)))
@@ -292,35 +294,6 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "belowBar",
-                "shape": "arrowUp",
-                "color": "#22c55e",
-                "text": "Entry",
-            }
-            for ts in entry_times.iloc[:30]
-        )
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "aboveBar",
-                "shape": "arrowDown",
-                "color": "#ef4444",
-                "text": "Exit",
-            }
-            for ts in exit_times.iloc[:30]
-        )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

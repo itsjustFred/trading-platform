@@ -56,6 +56,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.strategy_markers import entry_exit_markers
+
 
 def _wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
     # QuantConnect ATR defaults to Wilder smoothing.
@@ -88,10 +90,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
     composite = pd.Series(0.0, index=df.index)
-    # `strict=True` is a real invariant here: a shorter `weights` than
-    # `lookbacks` used to drop the longest legs silently, which both loses a
-    # signal leg and leaves the composite's weights not summing to one.
-    for lookback, weight in zip(lookbacks, weights, strict=True):
+    for lookback, weight in zip(lookbacks, weights):
         composite += close.pct_change(lookback).fillna(0) * weight
 
     vol = close.pct_change().rolling(vol_window).std() * np.sqrt(252)
@@ -165,35 +164,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "belowBar",
-                "shape": "arrowUp",
-                "color": "#22c55e",
-                "text": "Entry",
-            }
-            for ts in entry_times.iloc[:30]
-        )
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "aboveBar",
-                "shape": "arrowDown",
-                "color": "#ef4444",
-                "text": "Exit",
-            }
-            for ts in exit_times.iloc[:30]
-        )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

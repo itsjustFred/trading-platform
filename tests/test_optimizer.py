@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 import runner.optimizer as optimizer_module
 from data_tools.auto_download import has_ohlcv_bars_in_range
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
 def _optimization_config(*, train_split_pct: float) -> optimizer_module.OptimizationConfig:
@@ -283,6 +283,15 @@ def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
         "total_return": round(metric * 0.05, 6),
         "max_drawdown_pct": -0.1 if trade_count > 0 else 0.0,
     }
+    # #133: the OOS holdout needs >=20 distinct DAILY observations before its
+    # statistics are trusted; the mock curve carries 25 daily points.
+    equity_curve = [
+        EquityPoint(
+            time=f"2024-02-{day:02d}T00:00:00+00:00",
+            equity=100_000.0 + day,
+        )
+        for day in range(1, 26)
+    ]
     return BacktestResult(
         meta=BacktestMeta(
             id="trial-demo",
@@ -296,7 +305,7 @@ def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
             parameters=config.parameters,
         ),
         trades=trades,
-        equity_curve=[],
+        equity_curve=equity_curve,
         stats=stats,
     )
 
@@ -309,12 +318,14 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    # #86: dense TRAIN and VALIDATION coverage (01-01..01-07 daily) so their
-    # gates pass and the TEST gate (01-09..01-10, empty) is the one that fails.
+    # #86: dense TRAIN and VALIDATION coverage so their gates pass and the
+    # TEST gate is the one that fails. #133: weekend-dated stamps are surplus
+    # under the venue calendar, so validation's Jan-08 boundary bar must be a
+    # real weekday stamp.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
-        [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)],
+        [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 9)],
     )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
@@ -406,7 +417,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
         [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 11)],
     )
     _write_ohlcv_bars(
-        data_dir, "MSFT", [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)]
+        data_dir, "MSFT", [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 9)]
     )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
@@ -1264,3 +1275,125 @@ class TestMatrixOverviewContracts:
         assert "avg_sharpe" not in entry
         assert entry["best_sharpe"] == 2.0
         assert entry["total_trades"] == 30
+
+
+def test_risk_parity_withholds_test_stats_below_oos_minimum(
+    monkeypatch, tmp_path: Path
+):
+    """#133: with no overfitting verdict to carry the failure, the risk-parity
+    path withholds OOS statistics instead of publishing them as evidence."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 3
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["oos_status"] == "insufficient_oos_bars"
+    assert payload["oos_daily_observations"] == 3
+    assert payload["min_oos_daily_observations"] == 20
+    # Risk-adjusted ratios are withheld; factual fields remain for diagnostics.
+    assert "sharpe_ratio" not in payload["test_stats"]
+    assert "max_drawdown_pct" not in payload["test_stats"]
+    assert payload["test_stats"]["total_pnl"] is not None
+
+
+@pytest.mark.parametrize(
+    "observations,expected_status",
+    [(19, "insufficient_oos_bars"), (20, "available")],
+)
+def test_risk_parity_oos_daily_observation_boundary(
+    monkeypatch, tmp_path: Path, observations: int, expected_status: str
+):
+    """The risk-parity OOS minimum is inclusive: exactly 20 daily observations
+    is available, 19 is insufficient. Pins the ``>=`` against ``>`` mutants."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: observations
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["oos_status"] == expected_status
+    assert payload["oos_daily_observations"] == observations
+    if expected_status == "available":
+        assert "sharpe_ratio" in payload["test_stats"]
+    else:
+        assert "sharpe_ratio" not in payload["test_stats"]
+        assert payload["test_stats"]["total_pnl"] is not None

@@ -37,6 +37,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from shared.strategy_markers import signal_markers
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +84,7 @@ def _ny_dates(df: pd.DataFrame):
     return ts_ny.dt.date.to_numpy(), ts_ny
 
 
-def generate_signals(df: pd.DataFrame, params: dict | None = None):
+def generate_signals(df: pd.DataFrame, params: dict = None):
     params = params or {}
     channel_length = int(params.get("channel_length", params.get("Length", 5)))
     ema_period = int(params.get("ema_period", params.get("EmaPeriod", 200)))
@@ -382,43 +384,13 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        ts_all = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        long_mask = entries & (direction == "LONG")
-        short_mask = entries & (direction == "SHORT")
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "belowBar",
-                "shape": "arrowUp",
-                "color": "#22c55e",
-                "text": "Long",
-            }
-            for ts in ts_all.loc[long_mask].dropna().iloc[:30]
-        )
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "aboveBar",
-                "shape": "arrowDown",
-                "color": "#f97316",
-                "text": "Short",
-            }
-            for ts in ts_all.loc[short_mask].dropna().iloc[:30]
-        )
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "aboveBar",
-                "shape": "arrowDown",
-                "color": "#ef4444",
-                "text": "Exit",
-            }
-            for ts in ts_all.loc[exits].dropna().iloc[:30]
-        )
+    drawings = signal_markers(
+        df,
+        [
+            (entries & (direction == "LONG"), "belowBar", "arrowUp", "#22c55e", "Long", 30),
+            (entries & (direction == "SHORT"), "aboveBar", "arrowDown", "#f97316", "Short", 30),
+            (exits, "aboveBar", "arrowDown", "#ef4444", "Exit", 30),
+        ],
+    )
 
     return entries, exits, indicators_dict, drawings

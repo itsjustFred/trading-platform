@@ -203,8 +203,8 @@ def _normalize_symbol(value: object) -> str:
 
 
 def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = (deployment.signal_config or {}).get("timeframe")
-    return str(configured or deployment.timeframe or "").strip()
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 def _position_qty(position: Mapping[str, Any]) -> float:

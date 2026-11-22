@@ -7,7 +7,8 @@ deployment is later checked against.
 
 Every piece of evidence is mandatory. The out-of-sample evidence is read from
 the optimization result file; the paper-trading and parity evidence must each
-name a report file that exists, whose SHA256 is recorded in the ledger.
+name a report file that exists, whose path and SHA256 are recorded in the
+ledger and re-hashed every time the promotion is checked (#260).
 """
 
 from __future__ import annotations
@@ -66,7 +67,8 @@ def add_promote_parser(subparsers: Any) -> argparse.ArgumentParser:
         required=True,
         help=(
             "Optimization result JSON with a three-way split. Verdict, test window "
-            "and test trade count are read from it."
+            "and test trade count are read from it; its path and SHA256 are recorded "
+            "and re-hashed on every check."
         ),
     )
     parser.add_argument("--paper-account-id", required=True, help="Paper/demo account id")
@@ -79,7 +81,9 @@ def add_promote_parser(subparsers: Any) -> argparse.ArgumentParser:
         "--paper-trades", required=True, type=int, help="Number of paper/demo trades"
     )
     parser.add_argument(
-        "--paper-report", required=True, help="Paper-trading report file (hashed into the ledger)"
+        "--paper-report",
+        required=True,
+        help="Paper-trading report file (path and SHA256 recorded in the ledger)",
     )
     parser.add_argument(
         "--parity-reference",
@@ -97,7 +101,9 @@ def add_promote_parser(subparsers: Any) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--parity-report", required=True, help="Parity report file (hashed into the ledger)"
+        "--parity-report",
+        required=True,
+        help="Parity report file (path and SHA256 recorded in the ledger)",
     )
     parser.set_defaults(func=cmd_promote)
     return parser
@@ -159,8 +165,12 @@ def record_promotion(args: argparse.Namespace) -> dict[str, Any]:
     except PromotionTargetError as exc:
         raise InvalidPromotionError(str(exc)) from exc
 
-    paper_report_file, paper_report_sha256 = report_reference(args.paper_report)
-    parity_report_file, parity_report_sha256 = report_reference(args.parity_report)
+    paper_report_file, paper_report_path, paper_report_sha256 = report_reference(
+        args.paper_report
+    )
+    parity_report_file, parity_report_path, parity_report_sha256 = report_reference(
+        args.parity_report
+    )
     evidence = PromotionEvidence(
         out_of_sample=out_of_sample_evidence_from_result(args.optimization_result),
         paper_trading=PaperTradingEvidence.from_mapping(
@@ -171,6 +181,7 @@ def record_promotion(args: argparse.Namespace) -> dict[str, Any]:
                 "end": args.paper_end,
                 "trade_count": args.paper_trades,
                 "report_file": paper_report_file,
+                "report_path": paper_report_path,
                 "report_sha256": paper_report_sha256,
             }
         ),
@@ -179,6 +190,7 @@ def record_promotion(args: argparse.Namespace) -> dict[str, Any]:
                 "reference": args.parity_reference,
                 "deviations": _parse_deviations(args.parity_deviation),
                 "report_file": parity_report_file,
+                "report_path": parity_report_path,
                 "report_sha256": parity_report_sha256,
             }
         ),
