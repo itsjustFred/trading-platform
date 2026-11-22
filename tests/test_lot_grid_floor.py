@@ -104,6 +104,16 @@ _PARITY_CASES = [
 ]
 
 
+def test_exit_signals_keeps_the_round_exit_qty_down_alias() -> None:
+    # Open PRs (#329, #369, #350, #367) still import the pre-#278 name from
+    # ``live_runner.exit_signals``; the alias keeps them working on an
+    # unprotected main until they have landed and migrated. Remove it in a
+    # follow-up once they are in.
+    from live_runner import exit_signals
+
+    assert exit_signals.round_exit_qty_down is floor_qty_to_step
+
+
 def test_engine_floor_is_the_shared_helper() -> None:
     # The native engine's `_floor_to_lot_grid` delegates to the shared floor,
     # so a capped backtest size and a live order on the same quantity/step

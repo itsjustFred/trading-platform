@@ -36,6 +36,7 @@ from dataclasses import dataclass
 
 from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 
 logger = get_logger("live-runner")
 
@@ -113,6 +114,13 @@ class ExitBelowStepError(ValueError):
         super().__init__(message)
         self.requested_qty = float(requested_qty)
         self.qty_step = float(qty_step)
+
+
+# Deprecated alias for the pre-#278 name. Open PRs (#329, #369, #350, #367)
+# still import ``round_exit_qty_down`` from this module; main is not
+# branch-protected, so deleting it would break them silently on merge.
+# Remove this alias in a follow-up once those PRs have landed and migrated.
+round_exit_qty_down = floor_qty_to_step
 
 
 @dataclass(frozen=True, slots=True)
