@@ -817,7 +817,8 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
 
     Uses the same candidate selection (source priority, match cap) so the
     class matches the data actually loaded; ``""`` when the symbol cannot
-    be classified — the slippage model then records an explicit ``none``.
+    be classified or the merged matches span more than one asset class —
+    the slippage model then records an explicit ``none``.
     """
     normalized_symbol = str(symbol or "").strip().upper()
     normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
@@ -830,7 +831,14 @@ def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
     matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
     if not matches or len(matches) > _OHLCV_MAX_MATCHES:
         return ""
-    return contract.ohlcv_path_metadata(matches[0])["asset_class"]
+    # ``_load_ohlcv_df`` merges every selected match, so the class is only
+    # well-defined when all of them agree on one asset class.
+    asset_classes = {
+        contract.ohlcv_path_metadata(path)["asset_class"] for path in matches
+    }
+    if len(asset_classes) != 1:
+        return ""
+    return asset_classes.pop()
 
 
 def _infer_symbol_data_category(symbol: str) -> str:

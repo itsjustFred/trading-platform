@@ -11,6 +11,7 @@ run records the resolved model in ``meta.data["slippage"]``; ``slippage:
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -715,3 +716,230 @@ class TestViewerOhlcvAssetClass:
         assert core.ohlcv_asset_class("EURUSD", "1h") == "forex"
         assert core.ohlcv_asset_class("MISSING", "1h") == ""
         assert core.ohlcv_asset_class("*", "1h") == ""
+
+    def test_mixed_asset_class_matches_are_unclassified(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """``_load_ohlcv_df`` merges every selected match; when they span
+        more than one asset class there is no single correct class, so the
+        symbol must classify as ``""`` (explicit ``none`` downstream)."""
+        from tests.helpers import write_ohlcv
+        from viewer import core
+
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        frame = _engine_frame()
+        write_ohlcv(tmp_path, "MIXED", frame, asset_class="equities")
+        write_ohlcv(tmp_path, "MIXED", frame, asset_class="crypto")
+
+        assert core.ohlcv_asset_class("MIXED", "1h") == ""
+
+
+class TestViewerSlippageWiring:
+    """Endpoint-level coverage for the #130 viewer replay wiring: the
+    replay must classify each symbol from its OHLCV path and forward any
+    declared slippage params to ``SignalReplayAdapter``."""
+
+    @pytest.fixture
+    def replay_client(self, monkeypatch, tmp_path: Path):
+        from fastapi.testclient import TestClient
+
+        import viewer.main as viewer_app_module
+        from viewer import core as legacy_module
+
+        for module in (viewer_app_module, legacy_module):
+            monkeypatch.setattr(module, "DATA_DIR", tmp_path)
+            monkeypatch.setattr(module, "BACKTESTS_DIR", tmp_path / "backtests")
+            monkeypatch.setattr(module, "LOGS_DIR", tmp_path / "logs")
+            monkeypatch.setattr(
+                module, "TASK_LOGS_DIR", tmp_path / "logs" / "tasks"
+            )
+            monkeypatch.setattr(
+                module, "OPTIMIZATIONS_DIR", tmp_path / "optimizations"
+            )
+            monkeypatch.setattr(module, "PORTFOLIOS_DIR", tmp_path / "portfolios")
+        viewer_app_module.DATA_TASKS.clear()
+
+        captured: dict[str, Any] = {}
+
+        class _FakeAdapter:
+            def __init__(self, **kwargs):
+                captured["adapter_kwargs"] = kwargs
+
+            def run(self, **_kwargs):
+                from shared.models import (
+                    BacktestMeta,
+                    BacktestResult,
+                    EquityPoint,
+                )
+
+                meta = BacktestMeta(
+                    id=f"replay-{uuid.uuid4().hex[:8]}",
+                    created_at="2026-03-11T10:00:00Z",
+                    engine="native",
+                    strategies=["signal replay"],
+                    backtest_start="2024-01-01",
+                    backtest_end="2024-01-10",
+                    initial_capital=100000.0,
+                    duration_days=9,
+                    data={"symbols": ["BTCUSDT"], "timeframes": ["1h"]},
+                )
+                return BacktestResult(
+                    meta=meta,
+                    trades=[],
+                    equity_curve=[
+                        EquityPoint(
+                            time="2024-01-02T00:00:00Z", equity=100000.0
+                        )
+                    ],
+                )
+
+        monkeypatch.setattr(
+            viewer_app_module, "SignalReplayAdapter", _FakeAdapter
+        )
+        monkeypatch.setattr(
+            viewer_app_module, "save_result_to_sqlite", lambda _r: None
+        )
+        monkeypatch.setattr(
+            viewer_app_module, "_upsert_backtest_meta_cache", lambda _i: None
+        )
+        return TestClient(viewer_app_module.app), captured
+
+    @staticmethod
+    def _wait_for_task(client, task_id: str) -> dict:
+        import time
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            response = client.get(f"/api/backtests/run/{task_id}/status")
+            body = response.json()
+            if body.get("status") in {"completed", "failed"}:
+                return body
+            time.sleep(0.05)
+        raise AssertionError(f"replay task {task_id} did not finish")
+
+    def _post_replay(self, client, tmp_path: Path, **slippage):
+        from tests.helpers import write_ohlcv
+
+        write_ohlcv(
+            tmp_path,
+            "BTCUSDT",
+            _engine_frame(),
+            source="yfinance",
+            asset_class="crypto",
+        )
+        payload = {
+            "signals": [
+                {
+                    "timestamp": "2024-01-02T10:00:00Z",
+                    "symbol": "BTCUSDT",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                    "timeframe": "1h",
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-10",
+            "timeframe": "1h",
+            "capital": 100000.0,
+            "auto_download": False,
+            **slippage,
+        }
+        response = client.post("/api/backtests/run-signals", json=payload)
+        assert response.status_code == 202, response.text
+        body = self._wait_for_task(client, response.json()["task_id"])
+        assert body.get("status") == "completed", body.get("error")
+        return body
+
+    def test_run_signals_forwards_class_and_slippage_params(
+        self, replay_client, tmp_path: Path
+    ) -> None:
+        client, captured = replay_client
+
+        self._post_replay(
+            client,
+            tmp_path,
+            slippage="bps",
+            slippage_bps=7.5,
+            slippage_default_bps=2.5,
+        )
+
+        adapter_kwargs = captured["adapter_kwargs"]
+        assert adapter_kwargs["asset_class_by_symbol"] == {
+            "BTCUSDT": "crypto"
+        }
+        assert adapter_kwargs["slippage_params"] == {
+            "slippage": "bps",
+            "slippage_bps": 7.5,
+            "slippage_default_bps": 2.5,
+        }
+
+    def test_run_signals_without_slippage_sends_empty_params(
+        self, replay_client, tmp_path: Path
+    ) -> None:
+        client, captured = replay_client
+
+        self._post_replay(client, tmp_path)
+
+        adapter_kwargs = captured["adapter_kwargs"]
+        assert adapter_kwargs["asset_class_by_symbol"] == {
+            "BTCUSDT": "crypto"
+        }
+        assert adapter_kwargs["slippage_params"] == {}
+
+    def test_run_backtest_from_signals_forwards_slippage_fields(
+        self, monkeypatch, replay_client, tmp_path: Path
+    ) -> None:
+        import viewer.main as viewer_app_module
+
+        client, _captured = replay_client
+        forwarded: list[Any] = []
+
+        async def _fake_run_signals(payload):
+            forwarded.append(payload)
+            return {"task_id": "fake", "job_id": "fake", "status": "queued"}
+
+        monkeypatch.setattr(
+            viewer_app_module, "run_backtest_signals", _fake_run_signals
+        )
+
+        slippage = {
+            "slippage": "bps",
+            "slippage_bps": 7.5,
+            "slippage_default_bps": 2.5,
+        }
+        response = client.post(
+            "/api/backtests/run-from-signals",
+            json={
+                "signal_source": "discord-history",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-10",
+                "timeframe": "1h",
+                **slippage,
+            },
+        )
+        assert response.status_code == 202, response.text
+
+        csv_path = tmp_path / "signals" / "replay.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.write_text(
+            "Symbol;Signal Price;Datum;Zeit;Signal Type\n"
+            "AAPL;173,79;2026-02-23;09:32:00-05:00;BUY\n",
+            encoding="utf-8",
+        )
+        response = client.post(
+            "/api/backtests/run-from-signals",
+            json={
+                "signal_source": "csv",
+                "filepath": str(csv_path),
+                "start_date": "2026-02-23",
+                "end_date": "2026-02-24",
+                **slippage,
+            },
+        )
+        assert response.status_code == 202, response.text
+
+        assert len(forwarded) == 2
+        for payload in forwarded:
+            assert payload.slippage == "bps"
+            assert payload.slippage_bps == 7.5
+            assert payload.slippage_default_bps == 2.5
