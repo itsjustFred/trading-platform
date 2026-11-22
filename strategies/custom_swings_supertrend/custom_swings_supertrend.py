@@ -29,6 +29,8 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
+
 
 def _coerce_bool(value):
     if isinstance(value, bool):
@@ -36,75 +38,6 @@ def _coerce_bool(value):
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INDICATOR CALCULATIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _calc_atr(df: pd.DataFrame, period: int) -> np.ndarray:
-    """True Range → Wilder's ATR (equivalent to ta.atr in Pine)."""
-    high = df["high"].values
-    low = df["low"].values
-    close = df["close"].values
-
-    tr = np.zeros(len(close))
-    for i in range(1, len(close)):
-        tr[i] = max(
-            high[i] - low[i],
-            abs(high[i] - close[i - 1]),
-            abs(low[i] - close[i - 1]),
-        )
-
-    # Wilder's smoothed ATR (RMA)
-    atr = np.zeros(len(close))
-    if period < len(close):
-        atr[period] = np.mean(tr[1 : period + 1])
-        alpha = 1.0 / period
-        for i in range(period + 1, len(close)):
-            atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
-    return atr
-
-
-def _calc_supertrend(
-    df: pd.DataFrame, atr_arr: np.ndarray, multiplier: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Supertrend — mirrors Pine Script logic exactly.
-
-    Returns:
-        trend  : +1 (UP) or -1 (DOWN)
-        up_band: lower support band (used as Long stop)
-        dn_band: upper resistance band (used as Short stop)
-    """
-    high = df["high"].values
-    low = df["low"].values
-    close = df["close"].values
-    src = (high + low) / 2.0  # hl2
-
-    n = len(close)
-    up_band = np.zeros(n)
-    dn_band = np.zeros(n)
-    trend = np.ones(n, dtype=int)
-
-    for i in range(1, n):
-        up_raw = src[i] - multiplier * atr_arr[i]
-        dn_raw = src[i] + multiplier * atr_arr[i]
-
-        # up band: only rises (when in uptrend)
-        up_band[i] = max(up_raw, up_band[i - 1]) if close[i - 1] > up_band[i - 1] else up_raw
-        # dn band: only falls (when in downtrend)
-        dn_band[i] = min(dn_raw, dn_band[i - 1]) if close[i - 1] < dn_band[i - 1] else dn_raw
-
-        # trend flip logic
-        if trend[i - 1] == -1 and close[i] > dn_band[i - 1]:
-            trend[i] = 1
-        elif trend[i - 1] == 1 and close[i] < up_band[i - 1]:
-            trend[i] = -1
-        else:
-            trend[i] = trend[i - 1]
-
-    return trend, up_band, dn_band
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,11 +122,16 @@ def generate_signals(
     n = len(close)
 
     # ── Indicators ────────────────────────────────────────────────────────────
-    atr_arr = _calc_atr(df, st_period)
-    trend_arr, up_arr, dn_arr = _calc_supertrend(df, atr_arr, st_multiplier)
+    st = presets.supertrend_custom_swings(
+        df["high"], df["low"], df["close"], st_period, st_multiplier
+    )
+    trend_arr = st.trend.to_numpy(dtype=float)
+    up_arr = st.lower_band.to_numpy(dtype=float)
+    dn_arr = st.upper_band.to_numpy(dtype=float)
+    atr_arr = st.atr.to_numpy(dtype=float)
 
-    ema_fast_s = df["close"].ewm(span=ema_fast, adjust=False).mean().values
-    ema_slow_s = df["close"].ewm(span=ema_slow, adjust=False).mean().values
+    ema_fast_s = presets.ema_pine_ta(df["close"], ema_fast).to_numpy(dtype=float)
+    ema_slow_s = presets.ema_pine_ta(df["close"], ema_slow).to_numpy(dtype=float)
 
     # ── Pre-compute Supertrend flip signals ───────────────────────────────────
     buy_signal = np.zeros(n, dtype=bool)   # trend flips UP
