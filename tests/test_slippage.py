@@ -375,6 +375,16 @@ class TestResolveSlippageModel:
                 asset_class="equities",
             )
 
+    def test_fixed_bps_ignores_an_empty_slippage_defaults_dict(self) -> None:
+        """``slippage_defaults: {}`` configures nothing, so beside a fixed
+        ``slippage_bps`` it is not dead config and must not trip the
+        rejection the populated dict does."""
+        model = resolve_slippage_model(
+            {"slippage_bps": 3.0, "slippage_defaults": {}}, asset_class="forex"
+        )
+        assert isinstance(model, FixedBpsSlippage)
+        assert model.bps == pytest.approx(3.0)
+
 
 class TestSlipPrice:
     def test_fixed_bps_adverse_direction(self) -> None:

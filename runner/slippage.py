@@ -430,12 +430,16 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
     # 2026-11-22, fail closed like fees #84). An explicit declaration —
     # ``slippage='none'`` for a deliberate parity run, or ``'bps'`` /
     # ``'spread'`` / ``slippage_bps`` for a costed run — never reaches
-    # this point.
+    # this point. A value that is no known class at all may be a symbol
+    # segment from a legacy ``ohlcv/{source}/{symbol}/...`` layout, so the
+    # message says so rather than blaming an invented class name.
     raise ValueError(
         f"slippage: asset_class={ac!r} is not mapped to a slippage model. "
-        "Refusing to run gross — pass an explicit slippage: 'none' for a "
-        "deliberate parity run, or 'bps'/'spread'/slippage_bps for a "
-        "costed run."
+        "If the run reads a legacy ohlcv/{source}/{symbol}/ layout, this "
+        "value is the symbol and the asset class is genuinely "
+        "undetermined. Refusing to run gross — pass an explicit slippage: "
+        "'none' for a deliberate parity run, or 'bps'/'spread'/"
+        "slippage_bps for a costed run."
     )
 
 
@@ -481,6 +485,16 @@ def _bps_model(bps_override: Any, asset_class: str, params: dict[str, Any]) -> S
     )
 
 
+def _fallback_key_present(params: dict[str, Any], key: str) -> bool:
+    """A fallback key that actually configures something.
+
+    ``slippage_defaults: {}`` declares no overrides, so it is absent for
+    every dead-config and cost-declaration check.
+    """
+    value = params.get(key)
+    return value is not None and value != {}
+
+
 def _reject_dead_fallback_keys(params: dict[str, Any]) -> None:
     """Reject fallback keys a fixed ``slippage_bps`` makes unreachable.
 
@@ -492,7 +506,7 @@ def _reject_dead_fallback_keys(params: dict[str, Any]) -> None:
     stray = [
         key
         for key in ("slippage_default_bps", "slippage_defaults")
-        if params.get(key) is not None
+        if _fallback_key_present(params, key)
     ]
     if stray:
         raise ValueError(
@@ -582,7 +596,7 @@ def resolve_slippage_model(
         stray = [
             key
             for key in ("slippage_bps", "slippage_default_bps", "slippage_defaults")
-            if params.get(key) is not None
+            if _fallback_key_present(params, key)
         ]
         if stray:
             raise ValueError(
@@ -606,7 +620,7 @@ def resolve_slippage_model(
             stray = [
                 key
                 for key in ("slippage_default_bps", "slippage_defaults")
-                if params.get(key) is not None
+                if _fallback_key_present(params, key)
             ]
             if stray:
                 raise ValueError(
@@ -647,14 +661,16 @@ def _slippage_params_declare_cost(params: dict[str, Any]) -> bool:
             # ``none`` plus tuning keys is rejected by resolve_slippage_model;
             # treat the declaration as gross only when it is clean.
             return any(
-                params.get(key) is not None
+                _fallback_key_present(params, key)
+                or (key == "slippage_bps" and params.get(key) is not None)
                 for key in ("slippage_bps", "slippage_default_bps", "slippage_defaults")
             )
         return True
     if explicit is not None:
         return True
     return any(
-        params.get(key) is not None
+        _fallback_key_present(params, key)
+        or (key == "slippage_bps" and params.get(key) is not None)
         for key in ("slippage_bps", "slippage_default_bps", "slippage_defaults")
     )
 
