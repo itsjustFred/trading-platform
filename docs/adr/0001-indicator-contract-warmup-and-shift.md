@@ -55,8 +55,9 @@ All shared indicators in `shared/indicators/core.py` obey:
 - Tests can rely on uniform warm-up semantics: `NaN` means "not ready",
   and consumers must gate on `NaN`/`ready` rather than on `!= 0`.
 - Characterisation tests (`tests/indicators/`) pin every preset against
-  the implementation it replaced, so preset names are evidence, not
-  marketing.
+  the implementation it replaced — a live copy where one remains, or a
+  frozen reference where P1 deleted the copy — so preset names are
+  evidence, not marketing.
 - Parity fixes that intentionally change outputs (Pine `ta.atr` = RMA,
   SMA-seeded EMAs, the `pine_supertrend_dema` band condition, zero-fill
   warm-ups) are separate, golden-moving PRs (phase P3) — they are *not*

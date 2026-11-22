@@ -43,6 +43,8 @@ class RocketFuelSignalProcessor:
         self.config = loaded
 
         self.atr_period = int(self.config.get("atr_period", 14))
+        if self.atr_period <= 0:
+            raise ValueError("rocketfuel config 'atr_period' must be a positive integer")
         self.sl_multiplier = float(self.config.get("sl_multiplier", 3.0))
         self.default_timeframe = (
             _resolve_timeframe(self.config.get("candle_timeframe", "5m")) or "5m"

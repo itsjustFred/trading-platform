@@ -1660,7 +1660,7 @@ def _compute_indicator_series(
         return [(f"SMA({p})", _indicator_to_points(df, vals, time_set), "overlay", "#d29922", 0)]
     if kind == "EMA":
         p = period or 12
-        vals = indicator_presets.ema_first_seed(close, p)
+        vals = indicators.ema(close, p, seed="first", min_periods=p)
         return [(f"EMA({p})", _indicator_to_points(df, vals, time_set), "overlay", "#f97316", 0)]
     if kind == "RSI":
         p = period or 14
@@ -1679,35 +1679,53 @@ def _compute_indicator_series(
     return []
 
 
+def _compute_series_payloads(
+    df: pd.DataFrame,
+    specs: list[tuple[pd.Series, str, str, int]],
+    time_set: set[float],
+    pane: str,
+) -> list[tuple[str, list[dict], str, str, int]]:
+    return [
+        (
+            label,
+            _indicator_to_points(df, series, time_set),
+            pane,
+            color,
+            line_style,
+        )
+        for series, label, color, line_style in specs
+    ]
+
+
 def _compute_bollinger_series(
     df: pd.DataFrame, p: int, time_set: set[float]
 ) -> list[tuple[str, list[dict], str, str, int]]:
     bb = indicators.bbands(df["close"], p, std_mult=2.0)
-    payloads = []
-    for series, label, color in [
-        (bb.upper, f"BB Upper ({p})", "#6366f1"),
-        (bb.mid, f"BB Mid ({p})", "#94a3b8"),
-        (bb.lower, f"BB Lower ({p})", "#6366f1"),
-    ]:
-        data = _indicator_to_points(df, series, time_set)
-        payloads.append(
-            (label, data, "overlay", color, 2 if "Mid" not in label else 0)
-        )
-    return payloads
+    return _compute_series_payloads(
+        df,
+        [
+            (bb.upper, f"BB Upper ({p})", "#6366f1", 2),
+            (bb.mid, f"BB Mid ({p})", "#94a3b8", 0),
+            (bb.lower, f"BB Lower ({p})", "#6366f1", 2),
+        ],
+        time_set,
+        "overlay",
+    )
 
 
 def _compute_macd_series(
     df: pd.DataFrame, time_set: set[float]
 ) -> list[tuple[str, list[dict], str, str, int]]:
     result = indicators.macd(df["close"], 12, 26, 9)
-    payloads = []
-    for series, label, color in [
-        (result.macd, "MACD", "#3b82f6"),
-        (result.signal, "Signal", "#f97316"),
-    ]:
-        data = _indicator_to_points(df, series, time_set)
-        payloads.append((label, data, "panel", color, 0))
-    return payloads
+    return _compute_series_payloads(
+        df,
+        [
+            (result.macd, "MACD", "#3b82f6", 0),
+            (result.signal, "Signal", "#f97316", 0),
+        ],
+        time_set,
+        "panel",
+    )
 
 
 def _compute_supertrend_series(

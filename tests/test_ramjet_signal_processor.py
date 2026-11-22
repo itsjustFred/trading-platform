@@ -140,6 +140,15 @@ def test_trailing_percent_boundaries_rejected(trailing_percent):
         )
 
 
+@pytest.mark.parametrize("key", ["atr_period", "supertrend_period"])
+@pytest.mark.parametrize("value", [0, -1, 0.5])
+def test_non_positive_indicator_periods_rejected(key, value):
+    """A non-positive period must fail at config time, not clamp to 1 and
+    size a live stop from a one-bar ATR."""
+    with pytest.raises(ValueError, match=key):
+        RamJetSignalProcessor({"ram_jet": {key: value}})
+
+
 def test_process_signal_rejects_non_buy_actions():
     processor = RamJetSignalProcessor({"ram_jet": {"candle_timeframe": "5Min"}})
     with pytest.raises(ValueError, match="BUY/LONG"):

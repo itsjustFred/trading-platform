@@ -15,8 +15,10 @@ import pytest
 from shared.indicators.core import (
     atr,
     atr_from_tr,
+    bbands,
     ema,
     lagged,
+    macd,
     rma,
     rsi,
     sma,
@@ -244,6 +246,109 @@ class TestAtr:
             rma(s, 2, seed="sma", min_periods=1)
         with pytest.raises(ValueError, match="min_periods"):
             rma(s, 2, seed="first", skipna=True, min_periods=1)
+
+
+class TestBollingerBands:
+    def test_warmup_nan_and_legs(self):
+        close = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+        result = bbands(close, 3, std_mult=2.0)
+
+        assert result.mid.iloc[:2].isna().all()
+        assert result.upper.iloc[:2].isna().all()
+        assert result.lower.iloc[:2].isna().all()
+
+        expected_mid = close.rolling(3, min_periods=3).mean()
+        expected_std = close.rolling(3, min_periods=3).std()
+        pd.testing.assert_series_equal(
+            result.mid, expected_mid, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            result.upper, expected_mid + 2.0 * expected_std, check_names=False
+        )
+        pd.testing.assert_series_equal(
+            result.lower, expected_mid - 2.0 * expected_std, check_names=False
+        )
+        # window=3, ddof=1: mid=2, std=1 -> upper=4, lower=0 at bar 2.
+        assert result.upper.iloc[2] == pytest.approx(4.0)
+        assert result.lower.iloc[2] == pytest.approx(0.0)
+
+
+class TestMacd:
+    def test_warmup_nan_and_ema_legs(self):
+        close = pd.Series(np.linspace(10.0, 20.0, 40))
+        result = macd(close, 3, 5, 2)
+
+        expected_macd = close.ewm(
+            span=3, min_periods=3, adjust=False
+        ).mean() - close.ewm(span=5, min_periods=5, adjust=False).mean()
+        expected_signal = expected_macd.ewm(
+            span=2, min_periods=2, adjust=False
+        ).mean()
+        pd.testing.assert_series_equal(
+            result.macd, expected_macd, check_names=False, rtol=1e-12, atol=1e-12
+        )
+        pd.testing.assert_series_equal(
+            result.signal,
+            expected_signal,
+            check_names=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        pd.testing.assert_series_equal(
+            result.histogram,
+            result.macd - result.signal,
+            check_names=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+        # ADR warm-up: the slow leg needs 5 bars, the signal needs two
+        # defined MACD values after that.
+        assert result.macd.iloc[:4].isna().all()
+        assert result.macd.iloc[4:].notna().all()
+        assert pd.isna(result.signal.iloc[4])
+        assert result.signal.iloc[5:].notna().all()
+
+
+class TestPeriodValidation:
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda: sma(pd.Series([1.0, 2.0]), 0),
+            lambda: ema(pd.Series([1.0, 2.0]), 0, seed="first"),
+            lambda: rma(pd.Series([1.0, 2.0]), 0, seed="first"),
+            lambda: rsi(pd.Series([1.0, 2.0, 3.0]), 0, flat="none"),
+            lambda: bbands(pd.Series([1.0, 2.0, 3.0]), 0, std_mult=2.0),
+            lambda: macd(pd.Series(np.arange(10, dtype=float)), 0, 5, 2),
+        ],
+    )
+    def test_non_positive_periods_raise(self, call):
+        with pytest.raises(ValueError, match="positive|>= 1|period|span|window|length"):
+            call()
+
+    def test_atr_from_tr_rejects_non_positive_period(self):
+        with pytest.raises(ValueError, match="period"):
+            atr_from_tr(
+                pd.Series([1.0, 2.0, 3.0]),
+                0,
+                smoothing="wilder",
+                seed="first",
+            )
+
+    def test_supertrend_rejects_non_positive_period(self):
+        high, low, close = _ohlc(10, seed=1)
+        with pytest.raises(ValueError, match="period"):
+            supertrend(
+                high,
+                low,
+                close,
+                0,
+                1.0,
+                atr_smoothing="wilder",
+                atr_seed="first",
+                rule="ta",
+                atr_first_bar="hl",
+            )
 
 
 class TestRsi:

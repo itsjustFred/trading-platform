@@ -272,7 +272,8 @@ def supertrend_chart(
     :func:`supertrend_ramjet` — pandas_ta was never importable in a
     supported environment, so there is no library output to preserve; the
     chart plots the active band (``lower_band`` in an uptrend,
-    ``upper_band`` otherwise) masked to ``ready`` bars.
+    ``upper_band`` otherwise) masked to ``ready`` bars. Its outputs are the
+    RamJet semantics, including the legacy NaN-band ``or``-chain.
     """
     return supertrend_ramjet(high, low, close, period, multiplier)
 

@@ -72,6 +72,12 @@ class RamJetSignalProcessor:
         self.tp1_exit_percent = float(self.config.get("tp1_exit_percent", 0.50))
         self.supertrend_period = int(self.config.get("supertrend_period", 10))
         self.supertrend_multiplier = float(self.config.get("supertrend_multiplier", 3.0))
+        for key, value in (
+            ("atr_period", self.atr_period),
+            ("supertrend_period", self.supertrend_period),
+        ):
+            if value <= 0:
+                raise ValueError(f"ramjet config '{key}' must be a positive integer")
         # #150: the trailing mode is a bot/deployment setting, never hard-coded.
         # Fail closed on unknown modes here (bot-config validation); modes the
         # executing path cannot run are rejected later, per path.
