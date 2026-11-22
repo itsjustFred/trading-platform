@@ -638,7 +638,7 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert [row["date"] for row in daily_rows] == sorted(expected_daily_pnl)
     assert set(last_exit_by_day) <= {row["date"] for row in daily_rows}
     running_equity = 100_000.0
-    for index, row in enumerate(daily_rows, start=1):
+    for row in daily_rows:
         day_pnl = expected_daily_pnl[row["date"]]
         expected_close = running_equity + day_pnl
         # The day's close is the LAST curve observation of that UTC day (every

@@ -1,29 +1,30 @@
-"""Reporting equity is MARK-TO-MARKET on every engine path.
+"""Reporting equity is MARK-TO-MARKET on the native engine path.
 
 Regression for the realized-only equity curve: drawdown / Sharpe / volatility /
 Calmar were computed from a curve credited only at trade exit, so the paper
 drawdown of an open position was invisible (a 40 % crash inside one long hold
 reported ``max_drawdown_pct == 0``). Sizing is a separate concern and stays on
 realized cash (``tests/test_engine_behavior.py::TestSizingEquityExcludesUnrealizedPnl``).
+Only the native adapter is re-scoped: vectorbt, pynecore and the signal replay
+are frozen (ADR ``docs/adr/0001-native-single-strategy-engine.md``) and keep
+their existing realized-only curves until they are removed.
 
 Layout:
 
 * ``TestBuilder*`` - the shared builder (``runner/engines/mtm_equity.py``) on
   hand-built trades with independently computed expectations.
 * ``TestStats*`` - ``compute_stats`` on the MTM curve vs the realized balance.
-* ``TestEnginePaths`` - native (single + multi symbol), vectorbt (single + multi),
-  signal replay and pynecore (CLI stubbed at the subprocess boundary), each on
-  the same 40 % mid-hold crash fixture.
+* ``TestEnginePaths`` - the native adapter (single + multi symbol) on the same
+  40 % mid-hold crash fixture. The frozen engines (vectorbt, pynecore, signal
+  replay) keep their realized-only curves per ADR 0001 and are not covered
+  here.
 * ``TestPublishedDailySeries`` - ``stats.daily_returns`` / ``daily_equity_curve``
   describe the same equity path as the persisted curve.
 """
 
 from __future__ import annotations
 
-import subprocess
-from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -41,9 +42,6 @@ from runner.engines.mtm_equity import (
     closes_from_frame,
 )
 from runner.engines.native_adapter import NativeAdapter
-from runner.engines.pynecore_adapter import PyneCoreAdapter
-from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
-from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import compute_stats, compute_stats_for_result
 from shared.models import EquityPoint, Trade, TradeExit
 
@@ -469,8 +467,6 @@ def _write_symbol(data_dir: Path, symbol: str, frame: pd.DataFrame, timeframe: s
     frame.to_parquet(target / f"{timeframe}.parquet", index=False)
 
 
-def _pyne_time(stamp: pd.Timestamp) -> str:
-    return stamp.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _strategy(tmp_path: Path) -> Path:
@@ -556,102 +552,6 @@ class TestEnginePaths:
         # its own notional, i.e. at least a -30 % portfolio drawdown.
         assert stats["max_drawdown_pct"] <= -0.30
         assert stats["max_drawdown_realized_pct"] == pytest.approx(0.0, abs=1e-3)
-
-    def test_vectorbt_single_symbol(self, tmp_path):
-        _write_symbol(tmp_path, "CRA", _crash_frame())
-        result = VectorbtAdapter().run(_config(tmp_path, ["CRA"]), str(_strategy(tmp_path)))
-        _assert_crash_visible(result, exposure=1.0)
-
-    def test_vectorbt_multi_symbol_portfolio(self, tmp_path):
-        _write_symbol(tmp_path, "CRA", _crash_frame())
-        _write_symbol(tmp_path, "CRB", _crash_frame(crash=(0, 0)))
-        result = VectorbtAdapter().run(_config(tmp_path, ["CRA", "CRB"]), str(_strategy(tmp_path)))
-        assert len(result.trades) == 2
-        assert result.meta.data[EQUITY_CURVE_BASIS_KEY] == BASIS_MARK_TO_MARKET
-        stats = compute_stats_for_result(result)
-        assert stats["max_drawdown_pct"] <= -0.30
-
-    def test_native_and_vectorbt_report_the_same_drawdown(self, tmp_path):
-        _write_symbol(tmp_path, "CRA", _crash_frame())
-        native = NativeAdapter().run(_config(tmp_path, ["CRA"]), str(_strategy(tmp_path)))
-        vbt = VectorbtAdapter().run(_config(tmp_path, ["CRA"]), str(_strategy(tmp_path)))
-        assert compute_stats_for_result(native)["max_drawdown_pct"] == pytest.approx(
-            compute_stats_for_result(vbt)["max_drawdown_pct"], abs=2e-3
-        )
-
-    def test_signal_replay(self, tmp_path):
-        frame = _crash_frame()
-        stamps = frame["timestamp"]
-        signals = [
-            ReplaySignal.from_payload(
-                {
-                    "timestamp": stamps[1].isoformat(),
-                    "symbol": "CRA",
-                    "action": "buy",
-                    "entry_price": 100.0,
-                    # far stop: the replay engine exits on its fallback stop
-                    # otherwise, which the crash would hit
-                    "stop_loss": 10.0,
-                }
-            ),
-            ReplaySignal.from_payload(
-                {
-                    "timestamp": stamps[BARS - 4].isoformat(),
-                    "symbol": "CRA",
-                    "action": "sell",
-                    "entry_price": 100.0,
-                    "metadata": {"exit_only": True},
-                }
-            ),
-        ]
-        adapter = SignalReplayAdapter(fee_params={"fees": "zero"}, initial_capital=CAPITAL)
-        result = adapter.run(signals=signals, ohlcv_by_symbol={"CRA": frame}, timeframe="1d")
-        assert len(result.trades) == 1
-        trade = result.trades[0]
-        exposure = trade.quantity * 100.0 / CAPITAL
-        assert exposure > 0.005
-        assert trade.pnl == pytest.approx(0.0, abs=1.0)
-        assert result.meta.data[EQUITY_CURVE_BASIS_KEY] == BASIS_MARK_TO_MARKET
-        stats = result.stats
-        assert stats["max_drawdown_pct"] == pytest.approx(-0.40 * exposure, abs=2e-4)
-        assert stats["max_drawdown_realized_pct"] == pytest.approx(0.0, abs=1e-4)
-
-    def test_pynecore_with_stubbed_cli(self, tmp_path):
-        frame = _crash_frame()
-        _write_symbol(tmp_path, "CRA", frame)
-        stamps = frame["timestamp"]
-        trade_csv = (
-            "Trade #,Bar Index,Type,Signal,Date/Time,Price USD,Contracts,"
-            "Profit USD,Profit %,Cumulative profit USD,Cumulative profit %,"
-            "Run-up USD,Run-up %,Drawdown USD,Drawdown %\n"
-            f"1,1,Entry long,Long,{_pyne_time(stamps[1])},100.0,100.0,0.0,0.00,0.0,"
-            "0.00,0.0,0.0,0.0,0.0\n"
-            f"1,{BARS - 4},Exit long,Close,{_pyne_time(stamps[BARS - 4])},100.0,"
-            "100.0,0.0,0.00,0.0,0.00,0.0,0.0,0.0,0.0\n"
-        )
-        stats_csv = (
-            "Metric,All USD,All %,Long USD,Long %,Short USD,Short %\nNet profit,0,0,0,0,0,0\n"
-        )
-
-        def fake_run(cmd, **kwargs):
-            Path(cmd[cmd.index("--trade") + 1]).write_text(trade_csv)
-            Path(cmd[cmd.index("--strat") + 1]).write_text(stats_csv)
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch("runner.engines.pynecore_adapter.shutil.which", return_value="/usr/bin/pyne")
-            )
-            stack.enter_context(
-                patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run)
-            )
-            result = PyneCoreAdapter().run(_config(tmp_path, ["CRA"]), str(_strategy(tmp_path)))
-        assert len(result.trades) == 1
-        exposure = result.trades[0].quantity * 100.0 / CAPITAL
-        assert exposure > 0.0
-        assert result.meta.data[EQUITY_CURVE_BASIS_KEY] == BASIS_MARK_TO_MARKET
-        stats = compute_stats_for_result(result)
-        assert stats["max_drawdown_pct"] == pytest.approx(-0.40 * exposure, abs=2e-3)
 
     def test_missing_mark_data_is_reported_in_meta(self, tmp_path):
         """A traded symbol without bars degrades loudly, never silently."""

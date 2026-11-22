@@ -1,4 +1,4 @@
-"""Mark-to-market (MTM) reporting equity curve for every engine adapter.
+"""Mark-to-market (MTM) reporting equity curve for the native engine adapter.
 
 Why this exists
 ---------------
@@ -15,8 +15,9 @@ Position *sizing* is a separate matter and is deliberately untouched: it keeps
 drawing on realized cash (``TradeEngine._sizing_equity``, see
 ``docs/sizing-semantics.md``). This module only builds the *reporting* curve.
 
-Semantics (one definition for native, vectorbt, pynecore, signal replay and the
-shared multi-symbol replay):
+Semantics (native adapter, single- and multi-symbol; the frozen vectorbt /
+pynecore / signal-replay adapters keep their realized-only curves until they
+are removed under ADR ``docs/adr/0001-native-single-strategy-engine.md``):
 
 * The curve has one observation per bar timestamp of the traded symbols (plus
   every entry / exit leg time), starting at ``start_time`` with the initial
@@ -37,11 +38,10 @@ shared multi-symbol replay):
   and for ``max_drawdown_pct``; underwater flat bars are kept, so
   ``max_drawdown_duration`` (counted in curve points) stays counted in bars of
   the underlying price series.
-* Exit legs inside a bar (e.g. a vectorbt intrabar stop at 10:30 within the
-  10:00 hourly bar) are realized at their own timestamp, which falls after the
-  grid point of the bar that contains them; that grid point still shows the
-  position marked at that bar's close. This only orders the points, the final
-  numbers are unaffected.
+* Exit legs inside a bar are realized at their own timestamp, which falls
+  after the grid point of the bar that contains them; that grid point still
+  shows the position marked at that bar's close. This only orders the points,
+  the final numbers are unaffected.
 """
 
 from __future__ import annotations
@@ -177,10 +177,10 @@ def build_mark_to_market_curve(
     for symbol, series in clean.items():
         marks[symbol] = series.reindex(grid, method="ffill").to_numpy(dtype=float)
 
-    for trade, entry_ts, legs_ts in zip(trade_list, entry_times, leg_times):
+    for trade, entry_ts, legs_ts in zip(trade_list, entry_times, leg_times, strict=True):
         sign = 1.0 if str(trade.direction).upper() == "LONG" else -1.0
         entry_price = float(trade.entry_price)
-        legs = sorted(zip(legs_ts, trade.exits), key=lambda item: item[0])
+        legs = sorted(zip(legs_ts, trade.exits, strict=True), key=lambda item: item[0])
         total_qty = sum(float(leg.quantity or 0.0) for _, leg in legs)
         a = entry_idx = int(grid.searchsorted(entry_ts, side="left"))
         if not legs:
@@ -226,7 +226,7 @@ def build_mark_to_market_curve(
         keep[1:-1] = ~(same_prev & same_next & interior_flat & at_peak[1:-1])
 
     curve: list[EquityPoint] = [start_point]
-    for ts, value in zip(grid[keep], equity[keep]):
+    for ts, value in zip(grid[keep], equity[keep], strict=True):
         point = EquityPoint(time=pd.Timestamp(ts).isoformat(), equity=round(float(value), 2))
         if pd.Timestamp(ts) == start_ts:
             curve[0] = EquityPoint(time=start_time, equity=point.equity)

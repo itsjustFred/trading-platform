@@ -390,9 +390,11 @@ Implementation:
 
 Drawdown, Sharpe, Sortino, volatility and Calmar are computed from the
 persisted `equity_curve`, so that curve must show the paper PnL of open
-positions. **Every engine persists a mark-to-market (MTM) portfolio curve**
-(`runner/engines/mtm_equity.py`, native / vectorbt / pynecore / signal-replay,
-single- and multi-symbol alike):
+positions. **The native engine persists a mark-to-market (MTM) portfolio
+curve** (`runner/engines/mtm_equity.py`, single- and multi-symbol). The frozen
+vectorbt / pynecore / signal-replay adapters keep their realized-only curves
+until they are removed (ADR `docs/adr/0001-native-single-strategy-engine.md`),
+so cross-engine stat comparisons must account for the different curve basis:
 
 - one observation per bar of the traded symbols plus every entry / exit-leg
   time, starting at `start_date` with the initial capital; the observation at
