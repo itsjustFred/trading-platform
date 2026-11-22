@@ -396,6 +396,9 @@ def _process_symbol(
     direction_series = _find_direction_series(execution_signals, execution_indicators)
     exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
     exit_reason_series = _find_exit_reason_series(execution_signals, execution_indicators)
+    exit_order_type_series = _find_exit_order_type_series(
+        execution_signals, execution_indicators
+    )
 
     trades: list[Trade] = []
     in_trade = False
@@ -446,13 +449,93 @@ def _process_symbol(
                 # (in_trade=False above); skip before sizing/equity.
                 continue
             trade_counter += 1
+            # Explicit exit order type (#243): "market" ignores exit_price and
+            # fills at the signal-exit convention price; "level" fills at
+            # exit_price (a missing/unusable level falls back to the market
+            # fill and is flagged). Unspecified keeps the legacy rule — a
+            # usable exit_price is a level. The order type is only evaluated
+            # on a real exit signal: the forced end-of-data close on the last
+            # bar keeps the convention fill and ignores exit_price entirely,
+            # matching native's end_of_data close.
+            is_signal_exit = bool(exits.iloc[i])
+            exit_order_type = None
+            order_type_invalid = False
+            level_missing_price = False
+            level_unreachable = False
+            level_gapped = False
+            effective_exit_price_series = exit_price_series
+            if is_terminal_bar and not is_signal_exit:
+                effective_exit_price_series = None
+            if is_signal_exit:
+                exit_order_type, order_type_invalid = _exit_order_type_at(
+                    exit_order_type_series, i
+                )
+                if order_type_invalid:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_order_type_invalid"),
+                        "%s/%s: unrecognized exit_order_type value; expected "
+                        "'market' or 'level'. Falling back to the legacy rule "
+                        "(a usable exit_price fills at the level).",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                if exit_order_type == contract.EXIT_ORDER_TYPE_MARKET:
+                    effective_exit_price_series = None
+                elif exit_order_type == contract.EXIT_ORDER_TYPE_LEVEL and (
+                    contract.usable_exit_price(
+                        exit_price_series.iloc[i]
+                        if exit_price_series is not None
+                        else None
+                    )
+                    is None
+                ):
+                    effective_exit_price_series = None
+                    level_missing_price = True
+            # A level is only honored inside the exit bar's traded range.
+            # Beyond it on the untraded side the order could never have
+            # filled — fall back to the market fill rather than book a
+            # fantasy price. Beyond it on the marketable side the order was
+            # marketable at the open, so it fills at the bar's open
+            # (gap-through-level). This applies to every level fill,
+            # explicit or legacy implicit.
+            level_fill_price = (
+                contract.usable_exit_price(effective_exit_price_series.iloc[i])
+                if effective_exit_price_series is not None
+                else None
+            )
+            if level_fill_price is not None and is_signal_exit:
+                # A-H4 (D3)/A-L5: a SHORT exit buys the ask, so reachability
+                # is judged on the ask range when ask-side data is enabled —
+                # mirroring native _close_position/_ask_bar.
+                bar_high = exit_row.get("high")
+                bar_low = exit_row.get("low")
+                if direction != "LONG":
+                    ask_high, ask_low = _vbt_ask_bar(exit_row, resolved_parameters)
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                level_disposition = contract.exit_level_disposition(
+                    direction=direction,
+                    level=level_fill_price,
+                    high=bar_high,
+                    low=bar_low,
+                )
+                if level_disposition == contract.EXIT_LEVEL_UNREACHABLE:
+                    effective_exit_price_series = None
+                    level_unreachable = True
+                elif level_disposition == contract.EXIT_LEVEL_GAPPED:
+                    effective_exit_price_series = None
+                    level_gapped = True
             exit_price = _resolve_exit_price(
                 exit_row,
                 i,
-                exit_price_series,
+                effective_exit_price_series,
                 signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
                 parameters=resolved_parameters,
                 direction=direction,
+                gap_open=level_gapped,
             )
             exit_reason = _resolve_exit_reason(i, exit_reason_series)
             if is_terminal_bar and not bool(exits.iloc[i]):
@@ -460,6 +543,10 @@ def _process_symbol(
             entry_ts = str(entry_row.get("timestamp", entry_row.name))
             exit_ts = str(exit_row.get("timestamp", exit_row.name))
             trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+            if exit_order_type is not None:
+                # Canonical value, matching native's position.meta — the
+                # indicator extraction above may have recorded the raw cell.
+                trade_meta["exit_order_type"] = exit_order_type
             stop_price = _resolve_level_value(stop_loss_series, entry_idx)
             take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
             risk_target_usd: float | None = None
@@ -489,6 +576,43 @@ def _process_symbol(
                 exit_ts = intrabar_exit["time"]
                 exit_reason = intrabar_exit["reason"]
                 trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
+            elif is_signal_exit:
+                # The level governed the exit only when no protective
+                # stop/TP superseded the signal exit — flag and warn then,
+                # never for trades that actually left on a stop or TP.
+                if level_missing_price:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_missing_price"),
+                        "%s/%s: exit_order_type='level' but no usable "
+                        "exit_price on the exit bar; falling back to the "
+                        "market fill.",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_missing_price"] = True
+                if level_unreachable:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_unreachable"),
+                        "%s/%s: exit level %.6f is outside the exit bar's "
+                        "traded range; falling back to the market fill.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_unreachable"] = True
+                if level_gapped:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_gapped"),
+                        "%s/%s: exit level %.6f gapped the exit bar's open; "
+                        "filling at the open instead of the level.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_gapped"] = True
 
             sizing = _size_trade(
                 config=config,
@@ -1061,6 +1185,18 @@ def _is_exit_column(name: str, explicit_roles: Mapping[str, str] | None = None) 
     )
 
 
+def _exit_order_type_at(
+    series: pd.Series | None, idx: int
+) -> tuple[str | None, bool]:
+    """``(canonical exit_order_type, unrecognized_value_present)`` at ``idx``."""
+    if series is None:
+        return None, False
+    raw = series.iloc[idx]
+    order_type = contract.normalize_exit_order_type(raw)
+    invalid = order_type is None and contract.exit_order_type_is_present(raw)
+    return order_type, invalid
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
@@ -1092,6 +1228,7 @@ def _prepare_next_open_execution_data(
             "entry_stop",
             "exit_price",
             "exit_reason",
+            "exit_order_type",
         }
         for column in signals.columns:
             if str(column).lower() not in canonical and str(column) not in roles:
@@ -1182,7 +1319,7 @@ def _infer_indicator_when(name: str, explicit_when: str) -> str:
 
 def _indicator_meta_key(name: str) -> str:
     lowered = name.lower()
-    if lowered in {"exit_price", "exit_reason"}:
+    if lowered in {"exit_price", "exit_reason", "exit_order_type"}:
         return lowered
     if lowered.startswith("exit_"):
         return name[5:]
@@ -1208,12 +1345,16 @@ def _find_indicator_series(
         return signals["exit_price"]
     if kind == "exit_reason" and "exit_reason" in signals.columns:
         return signals["exit_reason"]
+    if kind == "exit_order_type" and "exit_order_type" in signals.columns:
+        return signals["exit_order_type"]
     if kind == "atr":
         for column in signals.columns:
             if str(column).lower().startswith("atr"):
                 return signals[column]
 
-    desired_when = "exit" if kind in {"exit_price", "exit_reason"} else "entry"
+    desired_when = (
+        "exit" if kind in {"exit_price", "exit_reason", "exit_order_type"} else "entry"
+    )
     for name, (series, explicit_when) in indicators.items():
         when = _infer_indicator_when(name, explicit_when)
         if when != desired_when:
@@ -1231,6 +1372,8 @@ def _find_indicator_series(
         if kind == "exit_price" and lowered == "exit_price":
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
+            return series
+        if kind == "exit_order_type" and lowered == "exit_order_type":
             return series
         if kind == "entry_stop" and lowered == "entry_stop":
             return series
@@ -1266,6 +1409,12 @@ def _find_exit_price_series(signals: pd.DataFrame, indicators: IndicatorMap) -> 
 
 def _find_exit_reason_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="exit_reason")
+
+
+def _find_exit_order_type_series(
+    signals: pd.DataFrame, indicators: IndicatorMap
+) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="exit_order_type")
 
 
 def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
@@ -1323,20 +1472,27 @@ def _resolve_exit_price(
     signal_exit_fill: str = "close",
     parameters: dict[str, Any] | None = None,
     direction: str | None = None,
+    gap_open: bool = False,
 ) -> float:
     # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
     # Signal exits stay on the trigger bar (see
     # _prepare_next_open_execution_data) and fill at its close (or open with
     # signal_exit_fill="open", mirroring native _close_position); stop/TP
     # legs resolve via the intrabar walk at their levels. An explicit
-    # strategy exit_price level always wins.
+    # strategy exit_price level always wins — except a level that gapped
+    # the bar's open (gap_open=True), which fills at the open under the
+    # gap-through-level convention regardless of signal_exit_fill.
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
-    if exit_price_series is not None:
-        exit_price = exit_price_series.iloc[exit_idx]
-        if pd.notna(exit_price) and float(exit_price) > 0:
-            return float(exit_price)
-    fill_at_open = str(signal_exit_fill or "close").lower() == "open"
+    if exit_price_series is not None and not gap_open:
+        # Same usability rule as the explicit ``level`` contract
+        # (contract.usable_exit_price): positive, finite — an inf/NaN level
+        # falls back to the convention fill instead of booking a fantasy
+        # price.
+        level = contract.usable_exit_price(exit_price_series.iloc[exit_idx])
+        if level is not None:
+            return level
+    fill_at_open = gap_open or str(signal_exit_fill or "close").lower() == "open"
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")
     open_ok = open_value is not None and pd.notna(open_value)
