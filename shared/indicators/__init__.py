@@ -3,6 +3,10 @@
 Phase P0 adds the module and its tests only; no strategy, bot, engine or
 viewer code consumes it yet. See ``presets.py`` for the named parity
 profiles that reproduce each existing per-strategy/bot implementation.
+
+Hot sequential kernels may run compiled with numba when it is importable
+(issue #378); the pure Python/NumPy kernels remain the reference and the
+fallback — see ``_numba.py`` and ``TP_DISABLE_NUMBA``.
 """
 
 from .core import (

@@ -23,6 +23,16 @@ Contract (pinned by ``tests/indicators/``):
 - NaN handling is part of each function's documented semantics; the
   ``skipna`` ATR variants skip NaN true-range positions entirely (the
   ``_valid_values`` behaviour of ``intraday_volatility_breakout``).
+
+Performance (issue #378): the sequential recursions behind
+:func:`supertrend` (``rule="pine"``, ``"pine_dema"``, ``"pine_superosc"``
+and ``"ta"``) run as pure-NumPy kernels (``*_kernel_py``) that are also
+compiled with ``numba.njit(cache=True, fastmath=False)`` when numba is
+importable — see :mod:`shared.indicators._numba` for the dispatch and
+fallback rules (``TP_DISABLE_NUMBA=1`` forces the Python path). The two
+paths are pinned bit-identical by ``tests/indicators/test_numba_parity.py``;
+all NaN, dtype and index-alignment semantics live in the Python wrappers
+and are unchanged.
 """
 
 from __future__ import annotations
@@ -33,6 +43,8 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
+
+from . import _numba
 
 #: How a recursive smoother weights history.
 #: - ``"sma"``: plain rolling mean (MT5 ``iATR``, several Pine ports).
@@ -422,46 +434,74 @@ class SupertrendResult:
     ready: pd.Series
 
 
-def _pine_band_step(
-    src_i: float,
-    close_prev: float,
-    lower_prev: float,
-    upper_prev: float,
-    atr_i: float,
+def _supertrend_pine_kernel_py(
+    src: np.ndarray,
+    close: np.ndarray,
+    atr_values: np.ndarray,
     multiplier: float,
-    band_condition: Literal["same", "cross"],
-) -> tuple[float, float]:
-    """One Pine-style band ratchet step (see :func:`_supertrend_pine`)."""
-    raw_low = src_i - multiplier * atr_i
-    raw_high = src_i + multiplier * atr_i
-    if band_condition == "same":
-        low_ok = close_prev > lower_prev
-        high_ok = close_prev < upper_prev
-    else:
-        low_ok = close_prev > upper_prev
-        high_ok = close_prev < lower_prev
-    lower = (
-        max(raw_low, lower_prev)
-        if low_ok and not np.isnan(lower_prev)
-        else raw_low
-    )
-    upper = (
-        min(raw_high, upper_prev)
-        if high_ok and not np.isnan(upper_prev)
-        else raw_high
-    )
-    return lower, upper
+    cross: int,
+    first_i: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pine-style band ratchet + previous-band flip (reference kernel).
+
+    ``cross == 0`` is the ``band_condition="same"`` rule of
+    ``custom_swings_supertrend`` / ``pine_superosc_vumanchu``: each band
+    only ratchets while the previous close is beyond *that* band.
+    ``cross == 1`` is the ``"cross"`` rule of ``pine_supertrend_dema``:
+    a band only ratchets while the previous close is beyond the *opposite*
+    band. ``cross`` is an int (not the ``Literal``) so the same source
+    compiles under numba.
+
+    Written with explicit comparisons instead of ``max``/``min`` so the
+    NaN semantics are identical in CPython and in the numba-compiled copy
+    (``b > a`` is False for NaN on both paths, matching ``max(a, b)``
+    returning ``a``).
+    """
+    n = len(close)
+    lower = np.full(n, np.nan)
+    upper = np.full(n, np.nan)
+    trend = np.full(n, np.nan)
+    # Both legacy Pine ports initialise trend to +1 and leave it untouched
+    # before the first computed bar.
+    trend[: max(first_i, 1)] = 1.0
+    prev_trend = 1.0
+    for i in range(first_i, n):
+        a = atr_values[i]
+        if np.isnan(a):
+            trend[i] = prev_trend
+            continue
+        raw_low = src[i] - multiplier * a
+        raw_high = src[i] + multiplier * a
+        close_prev = close[i - 1]
+        lower_prev = lower[i - 1]
+        upper_prev = upper[i - 1]
+        if cross == 0:
+            low_ok = close_prev > lower_prev
+            high_ok = close_prev < upper_prev
+        else:
+            low_ok = close_prev > upper_prev
+            high_ok = close_prev < lower_prev
+        if low_ok and not np.isnan(lower_prev) and lower_prev > raw_low:
+            lower[i] = lower_prev
+        else:
+            lower[i] = raw_low
+        if high_ok and not np.isnan(upper_prev) and upper_prev < raw_high:
+            upper[i] = upper_prev
+        else:
+            upper[i] = raw_high
+        close_i = close[i]
+        if prev_trend < 0.0 and close_i > upper_prev:
+            new_trend = 1.0
+        elif prev_trend > 0.0 and close_i < lower_prev:
+            new_trend = -1.0
+        else:
+            new_trend = prev_trend
+        trend[i] = new_trend
+        prev_trend = new_trend
+    return trend, upper, lower
 
 
-def _pine_trend_step(
-    prev_trend: float, close_i: float, lower_prev: float, upper_prev: float
-) -> float:
-    """One Pine-style previous-band flip step."""
-    if prev_trend < 0 and close_i > upper_prev:
-        return 1.0
-    if prev_trend > 0 and close_i < lower_prev:
-        return -1.0
-    return prev_trend
+_supertrend_pine_kernel_nb = _numba.compile_kernel(_supertrend_pine_kernel_py)
 
 
 def _supertrend_pine(
@@ -481,65 +521,86 @@ def _supertrend_pine(
     ``pine_supertrend_dema`` rule: a band only ratchets while the
     previous close is beyond the *opposite* band.
     """
+    return _numba.call(
+        _supertrend_pine_kernel_py,
+        _supertrend_pine_kernel_nb,
+        src,
+        close,
+        atr_values,
+        multiplier,
+        1 if band_condition == "cross" else 0,
+        first_i,
+    )
+
+
+def _supertrend_ta_kernel_py(
+    src: np.ndarray,
+    close: np.ndarray,
+    atr_values: np.ndarray,
+    multiplier: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """The RamJet/pandas_ta band recursion (fail-closed pre-warm-up).
+
+    Reference kernel for :func:`_supertrend_ta`; see its docstring for the
+    semantics. Returns ``(trend, upper, lower, first_valid)`` where
+    ``first_valid`` is the first bar index with a usable ATR/src pair, or
+    ``-1`` when there is none (the wrapper maps that to ``None``).
+    """
     n = len(close)
-    lower = np.full(n, np.nan)
+    basic_upper = src + multiplier * atr_values
+    basic_lower = src - multiplier * atr_values
     upper = np.full(n, np.nan)
-    trend = np.full(n, np.nan)
-    # Both legacy Pine ports initialise trend to +1 and leave it untouched
-    # before the first computed bar.
-    trend[: max(first_i, 1)] = 1.0
-    prev_trend = 1.0
-    for i in range(first_i, n):
-        a = atr_values[i]
-        if np.isnan(a):
-            trend[i] = prev_trend
-            continue
-        lower[i], upper[i] = _pine_band_step(
-            src[i],
-            close[i - 1],
-            lower[i - 1],
-            upper[i - 1],
-            a,
-            multiplier,
-            band_condition,
-        )
-        trend[i] = _pine_trend_step(
-            prev_trend, close[i], lower[i - 1], upper[i - 1]
-        )
-        prev_trend = trend[i]
-    return trend, upper, lower
+    lower = np.full(n, np.nan)
+    trend = np.full(n, -1.0)
 
+    first_valid = -1
+    for i in range(n):
+        if not np.isnan(basic_upper[i]) and not np.isnan(basic_lower[i]):
+            first_valid = i
+            break
+    if first_valid < 0:
+        return trend, upper, lower, -1
 
-def _ta_next_bands(
-    basic_upper: float,
-    basic_lower: float,
-    upper_prev: float,
-    lower_prev: float,
-    close_prev: float,
-) -> tuple[float, float]:
-    """One RamJet/pandas_ta band ratchet step."""
-    upper = (
-        basic_upper
-        if basic_upper < upper_prev or close_prev > upper_prev
-        else upper_prev
+    upper[first_valid] = basic_upper[first_valid]
+    lower[first_valid] = basic_lower[first_valid]
+    trend[first_valid] = (
+        1.0 if close[first_valid] >= lower[first_valid] else -1.0
     )
-    lower = (
-        basic_lower
-        if basic_lower > lower_prev or close_prev < lower_prev
-        else lower_prev
-    )
-    return upper, lower
+    for i in range(first_valid + 1, n):
+        if np.isnan(basic_upper[i]) or np.isnan(basic_lower[i]):
+            upper[i] = upper[i - 1]
+            lower[i] = lower[i - 1]
+        else:
+            basic_u = basic_upper[i]
+            basic_l = basic_lower[i]
+            upper_prev = upper[i - 1]
+            lower_prev = lower[i - 1]
+            close_prev = close[i - 1]
+            upper[i] = (
+                basic_u
+                if basic_u < upper_prev or close_prev > upper_prev
+                else upper_prev
+            )
+            lower[i] = (
+                basic_l
+                if basic_l > lower_prev or close_prev < lower_prev
+                else lower_prev
+            )
+        close_i = close[i]
+        lower_i = lower[i]
+        upper_i = upper[i]
+        prev_trend = trend[i - 1]
+        if np.isnan(close_i) or np.isnan(lower_i) or np.isnan(upper_i):
+            new_trend = prev_trend
+        elif prev_trend > 0.0:
+            new_trend = 1.0 if close_i > lower_i else -1.0
+        else:
+            new_trend = 1.0 if close_i >= upper_i else -1.0
+        trend[i] = new_trend
+    return trend, upper, lower, first_valid
 
 
-def _ta_trend_step(
-    prev_trend: float, close_i: float, lower_i: float, upper_i: float
-) -> float:
-    """One RamJet/pandas_ta direction step (fail-closed pre-warm-up)."""
-    if np.isnan(close_i) or np.isnan(lower_i) or np.isnan(upper_i):
-        return prev_trend
-    if prev_trend > 0:
-        return 1.0 if close_i > lower_i else -1.0
-    return 1.0 if close_i >= upper_i else -1.0
+_supertrend_ta_kernel_nb = _numba.compile_kernel(_supertrend_ta_kernel_py)
 
 
 def _supertrend_ta(
@@ -557,43 +618,15 @@ def _supertrend_ta(
     all-False. An interior NaN ATR/src carries the previous bands forward;
     the direction is still evaluated against those carried bands.
     """
-    n = len(close)
-    basic_upper = src + multiplier * atr_values
-    basic_lower = src - multiplier * atr_values
-    upper = np.full(n, np.nan)
-    lower = np.full(n, np.nan)
-    trend = np.full(n, -1.0)
-
-    first_valid = next(
-        (
-            i
-            for i in range(n)
-            if not np.isnan(basic_upper[i]) and not np.isnan(basic_lower[i])
-        ),
-        None,
+    trend, upper, lower, first_valid = _numba.call(
+        _supertrend_ta_kernel_py,
+        _supertrend_ta_kernel_nb,
+        src,
+        close,
+        atr_values,
+        multiplier,
     )
-    if first_valid is None:
-        return trend, upper, lower, None
-
-    upper[first_valid] = basic_upper[first_valid]
-    lower[first_valid] = basic_lower[first_valid]
-    trend[first_valid] = (
-        1.0 if close[first_valid] >= lower[first_valid] else -1.0
-    )
-    for i in range(first_valid + 1, n):
-        if np.isnan(basic_upper[i]) or np.isnan(basic_lower[i]):
-            upper[i] = upper[i - 1]
-            lower[i] = lower[i - 1]
-        else:
-            upper[i], lower[i] = _ta_next_bands(
-                basic_upper[i],
-                basic_lower[i],
-                upper[i - 1],
-                lower[i - 1],
-                close[i - 1],
-            )
-        trend[i] = _ta_trend_step(trend[i - 1], close[i], lower[i], upper[i])
-    return trend, upper, lower, first_valid
+    return trend, upper, lower, None if first_valid < 0 else first_valid
 
 
 def supertrend(
