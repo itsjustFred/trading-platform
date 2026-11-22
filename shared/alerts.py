@@ -24,10 +24,16 @@ Design constraints, all deliberate for a live-trading process:
   lowers) the level at which records page - default ``ERROR``, so out of the
   box every ERROR/CRITICAL record alerts. ``OPS_ALERT_EVENTS`` is a
   comma-separated allowlist of event classes - a record's ``data.alert``
-  marker or its logger name - and when set, only matching records page. Both
-  filters live here, so routine errors can be silenced without touching call
-  sites; an explicit ``data.alert`` marker still bypasses the level floor (it
-  is a deliberate operator alert) but not the allowlist.
+  marker or its logger name (exact or dotted-parent prefix) - and when set,
+  only matching records page; markers and CRITICAL records always page
+  regardless. ``OPS_ALERT_IGNORE`` is a comma-separated denylist of fnmatch
+  patterns matched against the message template and the rendered message; it
+  mutes even markers and CRITICAL, so it is the explicit "this one routine
+  error is noise" switch. All filters live here, so routine errors can be
+  silenced without touching call sites; an explicit ``data.alert`` marker
+  still bypasses the level floor and the allowlist (it is a deliberate
+  operator alert) but not the denylist, which is the explicit mute switch
+  and wins over everything.
 
 ``install_alert_sink`` attaches the handler to every ``trading.*`` service
 logger that exists now and, through a hook in ``shared.logging.get_logger``,
@@ -37,6 +43,7 @@ entry points are unaffected unless they opt in.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
@@ -63,6 +70,9 @@ DEFAULT_MIN_LEVEL = logging.ERROR
 #: Comma-separated allowlist of event classes (``data.alert`` marker or logger
 #: name). Unset/empty means every alert-worthy record may page.
 EVENTS_ENV = "OPS_ALERT_EVENTS"
+#: Comma-separated denylist of fnmatch patterns matched against the message
+#: template and the rendered message. Mutes even markers and CRITICAL.
+IGNORE_ENV = "OPS_ALERT_IGNORE"
 #: Bound on queued alerts; a full queue drops and counts.
 DEFAULT_QUEUE_SIZE = 256
 #: Backend call timeout. Runs on the worker thread, never on a caller.
@@ -350,10 +360,11 @@ def _parse_event_allowlist(value: str | None) -> frozenset[str] | None:
 
 def _alert_filter_from_env(
     values: Mapping[str, str],
-) -> tuple[int, frozenset[str] | None]:
+) -> tuple[int, frozenset[str] | None, frozenset[str] | None]:
     return (
         _parse_min_level(values.get(MIN_LEVEL_ENV)),
         _parse_event_allowlist(values.get(EVENTS_ENV)),
+        _parse_event_allowlist(values.get(IGNORE_ENV)),
     )
 
 
@@ -363,10 +374,16 @@ class AlertLogHandler(logging.Handler):
     Alert-worthy means ``min_level`` or above (default ERROR), or any record
     whose ``data`` carries an ``alert`` key (the explicit operator-alert
     marker used e.g. by ``exit_ledger_mismatch``) - markers bypass the level
-    floor because they are deliberate. When ``allowed_events`` is set, the
-    record's ``data.alert`` marker or its logger name must be listed or the
-    record does not page. ``emit`` never raises and never blocks: the sink
-    queue is bounded and ``put_nowait`` drops on overflow.
+    floor because they are deliberate. ``ignored_patterns`` is a denylist of
+    fnmatch patterns matched against the message template and the rendered
+    message; a match drops the record even when it is a marker or CRITICAL.
+    When ``allowed_events`` is set, only records whose ``data.alert`` marker
+    or logger name match may page - except markers and CRITICAL records,
+    which always page because muting them would be fail-open. A logger-name
+    entry matches the logger exactly or as a dotted parent (``trading.x``
+    covers ``trading.x.worker`` but not ``trading.xy``). ``emit`` never
+    raises and never blocks: the sink queue is bounded and ``put_nowait``
+    drops on overflow.
     """
 
     def __init__(
@@ -375,11 +392,42 @@ class AlertLogHandler(logging.Handler):
         *,
         min_level: int = DEFAULT_MIN_LEVEL,
         allowed_events: frozenset[str] | None = None,
+        ignored_patterns: frozenset[str] | None = None,
     ) -> None:
         super().__init__(level=logging.NOTSET)
         self._sink = sink
         self._min_level = min_level
         self._allowed_events = allowed_events
+        self._ignored_patterns = ignored_patterns
+
+    def _is_ignored(self, record: logging.LogRecord) -> bool:
+        if not self._ignored_patterns:
+            return False
+        template = str(record.msg)
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = template
+        return any(
+            fnmatch.fnmatchcase(template, pattern)
+            or fnmatch.fnmatchcase(rendered, pattern)
+            for pattern in self._ignored_patterns
+        )
+
+    def _passes_allowlist(
+        self, record: logging.LogRecord, alert_name: str | None
+    ) -> bool:
+        if self._allowed_events is None:
+            return True
+        # Markers and CRITICAL always page: the allowlist filters routine
+        # errors, and muting these two would be a fail-open foot-gun.
+        if alert_name is not None or record.levelno >= logging.CRITICAL:
+            return True
+        if record.name in self._allowed_events:
+            return True
+        return any(
+            record.name.startswith(f"{entry}.") for entry in self._allowed_events
+        )
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -389,9 +437,9 @@ class AlertLogHandler(logging.Handler):
             )
             if alert_name is None and record.levelno < self._min_level:
                 return
-            if self._allowed_events is not None and not (
-                {alert_name, record.name} & self._allowed_events
-            ):
+            if self._is_ignored(record):
+                return
+            if not self._passes_allowlist(record, alert_name):
                 return
             # Redact before anything leaves the process: record.data and
             # getMessage() are raw, the JSON formatter only redacts at format
@@ -464,10 +512,28 @@ def install_alert_sink(
     _ALERT_SINK = sink or create_sink_from_env(env=values)
     if _ALERT_SINK is None:
         return None
-    min_level, allowed_events = _alert_filter_from_env(values)
+    min_level, allowed_events, ignored_patterns = _alert_filter_from_env(values)
     _ALERT_HANDLER = AlertLogHandler(
-        _ALERT_SINK, min_level=min_level, allowed_events=allowed_events
+        _ALERT_SINK,
+        min_level=min_level,
+        allowed_events=allowed_events,
+        ignored_patterns=ignored_patterns,
     )
+    # The filter decides what pages; a misconfiguration (e.g. an allowlist
+    # matching nothing) must be visible in the log, not a silently dead
+    # channel. Logged once per install.
+    _logger.info(
+        "ops alert filter: min_level=%s allowed_events=%s ignored=%s",
+        logging.getLevelName(min_level),
+        sorted(allowed_events) if allowed_events else None,
+        sorted(ignored_patterns) if ignored_patterns else None,
+    )
+    if allowed_events is not None:
+        _logger.warning(
+            "ops alert allowlist %s is set: only matching event classes page "
+            "(data.alert markers and CRITICAL records always page)",
+            sorted(allowed_events),
+        )
     _ALERT_HANDLER.setFormatter(logging.Formatter("%(message)s"))
     # Loggers created through shared.logging.get_logger keep LOG_LEVEL on their
     # file/console handlers, so lowering the logger itself does not change what

@@ -475,6 +475,164 @@ class TestFiltering:
                 logger.removeHandler(handler)
             sink.close()
 
+    def test_ignore_denylist_drops_matching_template(self):
+        """OPS_ALERT_IGNORE mutes one noisy routine ERROR without a call-site
+        change: fnmatch against the message template (and rendered message)."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink, ignored_patterns=frozenset({"poll failed for *", "*heartbeat*"})
+        )
+        logger = logging.getLogger("trading.test-alerts-ignore")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            logger.error("poll failed for %s", "EURUSD")
+            logger.error("broker heartbeat %s", "ok")
+            logger.error("real failure")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["message"] for a in backend.sent] == ["real failure"]
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
+    def test_ignore_denylist_applies_to_markers_and_critical(self):
+        """The denylist is an explicit mute: it wins over markers and CRITICAL,
+        unlike the allowlist which never filters those."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink, ignored_patterns=frozenset({"known flap*"})
+        )
+        logger = logging.getLogger("trading.test-alerts-ignore-marker")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            logger.critical("known flap")
+            logger.error(
+                "known flap marker",
+                extra={"data": {"alert": "flap"}},
+            )
+            logger.error("not ignored", extra={"data": {"alert": "flap"}})
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a.get("message") for a in backend.sent] == ["not ignored"]
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
+    def test_allowlist_uses_logger_hierarchy_prefix(self):
+        """An allowlist entry for a parent logger covers its children, matching
+        logging's dotted-name hierarchy."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink, allowed_events=frozenset({"trading.test-alerts-hier"})
+        )
+        child = logging.getLogger("trading.test-alerts-hier.worker")
+        sibling = logging.getLogger("trading.test-alerts-hierx")
+        for logger in (child, sibling):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+            logger.addHandler(handler)
+        try:
+            sibling.error("filtered out")
+            child.error("pages via parent entry")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["message"] for a in backend.sent] == [
+                "pages via parent entry"
+            ]
+        finally:
+            for logger in (child, sibling):
+                logger.removeHandler(handler)
+            sink.close()
+
+    def test_allowlist_never_filters_markers_or_critical(self):
+        """Markers and CRITICAL always page: the allowlist exists to filter
+        routine errors, and muting those two would be a fail-open foot-gun."""
+        backend = FakeBackend()
+        sink = _sink(backend)
+        handler = AlertLogHandler(
+            sink, allowed_events=frozenset({"something-else"})
+        )
+        logger = logging.getLogger("trading.test-alerts-allow-bypass")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            logger.error("routine error")
+            logger.critical("emergency")
+            logger.error(
+                "marker below error",
+                extra={"data": {"alert": "exit_ledger_mismatch"}},
+            )
+            backend.wait_for(2)
+            time.sleep(0.2)
+            assert sorted(a.get("alert") or a["level"] for a in backend.sent) == [
+                "CRITICAL",
+                "exit_ledger_mismatch",
+            ]
+        finally:
+            logger.removeHandler(handler)
+            sink.close()
+
+    def test_ignore_env_is_parsed_like_the_allowlist(self):
+        assert alerts._parse_event_allowlist("a, b ,,c ") == frozenset(
+            {"a", "b", "c"}
+        )
+
+    def test_install_reads_ignore_from_env(self):
+        backend = FakeBackend()
+        noisy = logging.getLogger("trading.test-alerts-env-noisy")
+        quiet = logging.getLogger("trading.test-alerts-env-quiet")
+        for logger in (noisy, quiet):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+        sink = install_alert_sink(
+            sink=_sink(backend),
+            env={"OPS_ALERT_IGNORE": "routine *"},
+        )
+        assert sink is not None
+        try:
+            noisy.error("routine poll failed")
+            quiet.error("real failure")
+            backend.wait_for(1)
+            time.sleep(0.2)
+            assert [a["message"] for a in backend.sent] == ["real failure"]
+        finally:
+            alerts._reset_for_tests()
+
+    def test_install_logs_the_effective_filter(self, caplog):
+        """A misconfigured filter must be visible in the log, not silent."""
+        backend = FakeBackend()
+        with caplog.at_level(logging.INFO, logger="alerts"):
+            sink = install_alert_sink(
+                sink=_sink(backend),
+                env={
+                    "OPS_ALERT_MIN_LEVEL": "CRITICAL",
+                    "OPS_ALERT_EVENTS": "trading.live-runner",
+                    "OPS_ALERT_IGNORE": "flap*",
+                },
+            )
+            assert sink is not None
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("min_level" in m and "CRITICAL" in m for m in messages)
+        assert any("trading.live-runner" in m for m in messages)
+        assert any("flap*" in m for m in messages)
+        # The allowlist being set is itself warned about: it can mute the
+        # whole channel, so it must not install silently.
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        alerts._reset_for_tests()
+
     def test_invalid_min_level_falls_back_to_error(self):
         assert alerts._parse_min_level("bogus") == logging.ERROR
         assert alerts._parse_min_level("") == logging.ERROR

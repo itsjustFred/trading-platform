@@ -38,14 +38,29 @@ sourced `.accounts.env` / a systemd `EnvironmentFile`.
   `data.alert` marker still bypasses the floor because it is a deliberate operator alert. An
   invalid value falls back to `ERROR` rather than muting the channel.
 - `OPS_ALERT_EVENTS` (unset = everything) — comma-separated allowlist of event classes. An entry
-  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name (e.g.
-  `trading.live.daemon`); when set, only matching records page, so routine errors can be filtered
-  without touching call sites. The allowlist applies to markers too.
+  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name; when set,
+  only matching records page, so routine errors can be filtered without touching call sites. Logger
+  names match the logging hierarchy: `trading.live-runner` also covers
+  `trading.live-runner.<child>` but not `trading.live-runnerx`. **Markers and `CRITICAL` records
+  always page regardless of the allowlist** — the allowlist exists to filter routine errors, and
+  muting those two would hide real emergencies. Note that today all live modules log under the
+  single logger `trading.live-runner` (`get_logger("live-runner")`), so a logger-name allowlist can
+  only select "the whole live daemon", not one module inside it.
+- `OPS_ALERT_IGNORE` (unset = nothing ignored) — comma-separated denylist of fnmatch patterns
+  (e.g. `poll failed for *`, `*heartbeat*`) matched against the message template and the rendered
+  message. A match drops the record even when it is a `data.alert` marker or `CRITICAL`, so this is
+  the explicit "this one routine error is noise" switch. Use it to mute a single noisy ERROR
+  without touching call sites; prefer it over a broad `OPS_ALERT_EVENTS` allowlist.
+
+The effective filter (min level, allowlist, denylist) is logged once at startup on the `alerts`
+logger, and setting `OPS_ALERT_EVENTS` additionally logs a warning — a filter that matches nothing
+would otherwise leave the channel silently dead.
 
 What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
 any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
 at any level — `data.alert` markers route even when `LOG_LEVEL` would keep the record out of the
-file/console output — filtered by `OPS_ALERT_EVENTS` when that allowlist is set.
+file/console output — then filtered by `OPS_ALERT_IGNORE` and, for routine errors only,
+`OPS_ALERT_EVENTS`.
 
 Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
 webhook drops and counts alerts; it can never block or raise into a trading path. A failed send

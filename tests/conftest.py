@@ -34,6 +34,7 @@ os.environ["OPS_ALERT_WEBHOOK_URL"] = ""
 # change which records the suite's alert-sink tests see.
 os.environ["OPS_ALERT_MIN_LEVEL"] = ""
 os.environ["OPS_ALERT_EVENTS"] = ""
+os.environ["OPS_ALERT_IGNORE"] = ""
 
 
 def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
