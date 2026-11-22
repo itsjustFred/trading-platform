@@ -2638,6 +2638,116 @@ def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
     )
 
 
+#: What :func:`_pause_live_deployment_for_conflict` reports about the halt.
+#: "PAUSED": this call wrote the pause. "already-halted": the deployment was already
+#: PAUSED or STOPPED, so no new halt was needed (a redelivered conflict).
+CONFLICT_HALT_PAUSED = "PAUSED"
+CONFLICT_HALT_ALREADY_HALTED = "already-halted"
+
+#: The status a deployment may open a new position from (#126 decision: a pause or a stop
+#: blocks entries in every wording of the rule).
+LIVE_DISPATCH_ENTRY_STATUSES: tuple[str, ...] = ("ACTIVE",)
+
+#: The statuses a deployment may close a position from. PAUSED is included on purpose
+#: (#126 decision): "stop opening new positions" must not also stop a deployment closing
+#: what it already holds, or a pause forced by a broker-order-id conflict would leave the
+#: known position open until its stop. STOPPED keeps its own cancel-and-flatten
+#: enforcement and is absent.
+#:
+#: One definition for every gate that has to answer it, here and not next to any one of
+#: them, because the three callers live in three modules and widening the exit rule in one
+#: of them only is how a close silently stops reaching the broker: the daemon's dispatch
+#: statuses (:data:`live_runner.daemon.EXIT_DISPATCH_STATUSES`), the atomic submission
+#: claim's SQL filter (:func:`claim_live_deployment_submission`) and the halt's
+#: "already halted" set (:func:`pause_live_deployment_for_order_conflict`) all derive from
+#: this tuple. The values are module constants written here, never caller text, so no
+#: request payload can widen them.
+LIVE_DISPATCH_EXIT_STATUSES: tuple[str, ...] = ("ACTIVE", "PAUSED")
+
+#: The statuses a conflict halt never touches: they are a stronger operator intent (or a
+#: row that is already halted), so a re-pause must leave them exactly as they are.
+CONFLICT_HALT_EXEMPT_STATUSES: tuple[str, ...] = ("PAUSED", "STOPPED")
+
+
+def _pause_live_deployment_for_conflict(session: Session, deployment_id: object) -> str:
+    """Halt the deployment named by a conflicted signal, in the caller's transaction.
+
+    The pause is *narrow* on purpose: only this deployment stops. Other deployments on
+    the same broker account keep trading, and their positions are untouched.
+
+    Writes through the caller's ``session`` rather than :func:`update_live_deployment_status`
+    so the halt and the conflict record that justifies it commit together; a second
+    session would take its own write lock inside the open transaction and deadlock. The
+    row write itself is the shared one (:func:`_apply_live_deployment_status_row`), so
+    the stamp and timestamp rules cannot drift between the two writers.
+
+    Refuses (:data:`CONFLICT_HALT_ALREADY_HALTED`) when the row is already PAUSED - a
+    redelivered conflict re-halts nothing - and when it is STOPPED, which is a stronger
+    operator intent with its own cancel-and-flatten enforcement that this must never
+    downgrade. A deleted deployment is left deleted: the conflict record on the signal is
+    the evidence that survives.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    row = session.get(LiveDeploymentModel, normalized)
+    if row is None:
+        logger.warning(
+            "Broker order id conflict on a signal whose deployment no longer exists "
+            "(deployment_id=%s); the conflict stays recorded on the signal",
+            normalized,
+        )
+        return CONFLICT_HALT_ALREADY_HALTED
+    current_status = str(row.status or "").strip().upper()
+    if current_status in {"PAUSED", "STOPPED"}:
+        return CONFLICT_HALT_ALREADY_HALTED
+    # The same row write `update_live_deployment_status` performs, in this transaction
+    # rather than through a second session: a conflict halt that took its own write lock
+    # inside this one would deadlock, and one that committed separately would leave a
+    # crash between the two commits with a persisted conflict on a still-ACTIVE row.
+    _apply_live_deployment_status_row(row, "PAUSED")
+    session.add(row)
+    return CONFLICT_HALT_PAUSED
+
+
+def pause_live_deployment_for_order_conflict(deployment_id: str) -> str:
+    """Pause one deployment for an unresolved broker order id conflict, atomically.
+
+    The periodic half of the halt (the detection half is
+    :func:`_reconcile_existing_live_signal`, which writes inside its own transaction).
+    Same rule, one conditional statement: the ``WHERE`` re-tests the row status, so a
+    deployment that became ``STOPPED`` between a caller's decision and this call cannot
+    be turned into ``PAUSED`` - a weaker state, whose write clears
+    ``stopped_enforced_at`` and would report a stop that never got proved.
+
+    Returns:
+
+    * :data:`CONFLICT_HALT_PAUSED` - this call wrote the pause;
+    * :data:`CONFLICT_HALT_ALREADY_HALTED` - nothing to do (already PAUSED or STOPPED,
+      already deleted, or no such deployment).
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    now = _utcnow_naive()
+    init_db()
+    # The same shared tuple the daemon's halt set and the claim filter read, so the three
+    # copies of "which statuses stop a conflict re-pause" cannot widen apart.
+    halt_exempt_list = ", ".join(f"'{status}'" for status in CONFLICT_HALT_EXEMPT_STATUSES)
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET status = 'PAUSED', stopped_enforced_at = NULL, updated_at = :now "
+                "WHERE id = :deployment_id "
+                f"AND UPPER(status) NOT IN ({halt_exempt_list})"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
+        session.commit()
+    return CONFLICT_HALT_PAUSED if int(result.rowcount or 0) == 1 else CONFLICT_HALT_ALREADY_HALTED
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
@@ -2690,14 +2800,38 @@ def _reconcile_existing_live_signal(
         metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
         existing.metadata_json = metadata
         session.add(existing)
+    # Fail closed (#126): the halt and the conflict record share one transaction. A warning
+    # alone leaves the deployment trading while a broker order it does not track may hold
+    # a position, so the affected deployment is paused here and cannot place further
+    # entries. Committing the pause separately would leave a crash between the two commits
+    # with a persisted conflict on a still-ACTIVE deployment.
+    halt_now = _pause_live_deployment_for_conflict(session, existing.deployment_id)
     # Ends the write transaction opened above; a no-op commit when nothing changed.
     session.commit()
     logger.error(
-        "Conflicting broker_order_id for duplicate live signal: an untracked broker "
-        "order may exist (signal_id=%s, tracked=%s, conflicting=%s)",
+        "ALERT: conflicting broker_order_id for duplicate live signal: an untracked "
+        "broker order may exist and the deployment was halted. Resolve the conflict "
+        "with the broker before reactivating the deployment "
+        "(signal_id=%s, deployment_id=%s, tracked=%s, conflicting=%s, halt=%s)",
         existing.id,
+        existing.deployment_id,
         existing_broker_id,
         new_broker_id,
+        halt_now,
+        extra={
+            "data": {
+                "alert": "live_broker_order_id_conflict",
+                "signal_id": str(existing.id),
+                "deployment_id": str(existing.deployment_id),
+                "tracked_broker_order_id": existing_broker_id,
+                "conflicting_broker_order_id": new_broker_id,
+                "conflicting_broker_order_ids": list(conflicts),
+                # What this call did to the halt: "PAUSED" when it wrote the pause, and
+                # "already-halted" when the deployment was already PAUSED/STOPPED, so a
+                # redelivery is not reported as a fresh halt.
+                "deployment_halt": halt_now,
+            }
+        },
     )
 
 
@@ -4125,11 +4259,16 @@ def _newest_filled_entry_signal(
         offset += len(rows)
 
 
-def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, Any]]:
+def list_live_signal_broker_order_conflicts(limit: int | None = 200) -> list[dict[str, Any]]:
     """Signals whose duplicate delivery carried a different broker order id.
 
     Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
     should be checked against the broker's open orders and positions.
+
+    ``limit=None`` reads every conflicted signal. It is for the reads that must not
+    silently truncate the truth - the halt enforcement and the health read - and it
+    costs no extra work: the scan behind this is a full table scan either way, so the
+    cap only bounds the rows that come back, not the query.
     """
     init_db()
     # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
@@ -4142,13 +4281,13 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
     conflict_count = func.json_array_length(
         LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
     )
+    statement = (
+        select(LiveSignalModel).where(conflict_count > 0).order_by(LiveSignalModel.timestamp.desc())
+    )
+    if limit is not None:
+        statement = statement.limit(max(1, int(limit)))
     with get_session() as session:
-        rows = session.exec(
-            select(LiveSignalModel)
-            .where(conflict_count > 0)
-            .order_by(LiveSignalModel.timestamp.desc())
-            .limit(max(1, int(limit)))
-        ).all()
+        rows = session.exec(statement).all()
     conflicts: list[dict[str, Any]] = []
     for row in rows:
         ids = _conflicting_broker_order_ids(row.metadata_json or {})
@@ -4164,6 +4303,80 @@ def list_live_signal_broker_order_conflicts(limit: int = 200) -> list[dict[str, 
             }
         )
     return conflicts
+
+
+def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
+    """Clear the recorded conflicting broker order ids for one signal.
+
+    The way out of a conflict halt (#126): while a conflict stays recorded the daemon
+    keeps the deployment paused, so a resolution cannot be a status write and nothing
+    else. This removes the key from the signal's metadata and returns the ids it
+    removed. A malformed value stored under the key (not a list) is removed too: it
+    keeps the signal in every conflict listing, and nothing can be reconciled against
+    a spelling the ledger refuses to read.
+
+    The caller is an explicit operator action - the viewer's resolve endpoint, which
+    requires a confirmation naming the deployment and audits the call. It is not
+    reachable from a signal payload: :meth:`LiveSignalModel.from_live_signal` drops a
+    producer-supplied conflict list, and nothing else writes this key.
+
+    Returns ``[]`` for an unknown signal or one with no recorded conflict, so a caller
+    can tell "nothing to resolve" from "resolved" without reading the row.
+
+    A duplicate that lands *after* this commit still re-records the conflict, and the
+    daemon re-pauses the deployment at the next tick. That is the fail-closed direction
+    and the operator sees it in the same health read; a duplicate that commits *before*
+    this read is the one the write lock covers, because it has to be seen rather than
+    clobbered.
+    """
+    normalized = str(signal_id or "").strip()
+    if not normalized:
+        return []
+    init_db()
+    with get_session() as session:
+        # Take the write lock before reading, exactly like the conflict ledger's own
+        # read-modify-write does. Without it a duplicate committing between this read
+        # and this write would be clobbered by a stale copy of the metadata: the operator
+        # would be told the conflict was resolved and the recording that replaced it
+        # would have vanished with no record anywhere.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveSignalModel, normalized)
+        if record is None:
+            return []
+        metadata = dict(record.metadata_json or {})
+        removed = _conflicting_broker_order_ids(metadata)
+        if not removed and BROKER_ORDER_CONFLICTS_KEY not in metadata:
+            return []
+        metadata.pop(BROKER_ORDER_CONFLICTS_KEY, None)
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return removed
+
+
+def deployments_with_broker_order_conflicts(
+    limit: int | None = 200,
+) -> dict[str, list[dict[str, Any]]]:
+    """Unresolved broker order id conflicts, grouped by deployment id.
+
+    The read behind the halt: the daemon's conflict enforcement re-pauses every
+    deployment that still carries an unresolved conflict, and the viewer reports them
+    to operators. One query for the whole fleet, so neither side scans signals per
+    deployment. Both callers are periodic (a 60 s service-sync tick and an HTTP
+    request), so the cost to remember is the one already documented on
+    ``list_live_signal_broker_order_conflicts``: the scan behind this has no index for
+    the JSON key.
+
+    ``limit=None`` reads the whole ledger. The enforcement uses it on purpose: a cap
+    that silently dropped an older conflict would leave a deployment the resolution
+    cannot clear and the halt never re-asserts, and that truncation would be invisible
+    in the response. Bounded callers (an HTTP payload) keep an explicit limit and say
+    so, rather than inheriting a default nobody asked for.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for conflict in list_live_signal_broker_order_conflicts(limit=limit):
+        grouped.setdefault(str(conflict["deployment_id"]), []).append(conflict)
+    return grouped
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
@@ -4786,6 +4999,28 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> None:
+    """Write a deployment's status (and the fields that go with it) on a loaded row.
+
+    One definition for every writer of `live_deployments.status`, in-session and
+    session-of-its-own alike, so the two rules that travel with a status change cannot
+    drift apart between them. Those rules are what makes a status readable afterwards:
+    an unchanged `updated_at` hides the write, and a `stopped_enforced_at` left on a
+    non-STOPPED row makes the next skip of the stop enforcement look proven (see the
+    STOPPED -> PAUSED -> STOPPED cycle below).
+    """
+    row.status = status
+    if status != "STOPPED":
+        # Clear the enforcement stamp in the *same* transaction as the status change.
+        # Without this a STOPPED -> PAUSED -> STOPPED cycle keeps the old stamp, and the
+        # second stop is skipped as "already enforced" while its positions are still
+        # open. Doing it in one commit matters: a crash between the two writes must not
+        # leave a non-STOPPED deployment carrying a stamp that disables the next
+        # enforcement.
+        row.stopped_enforced_at = None
+    row.updated_at = _utcnow_naive()
+
+
 def update_live_deployment_status(
     deployment_id: str, status: str
 ) -> LiveDeploymentConfig | None:
@@ -4797,17 +5032,7 @@ def update_live_deployment_status(
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return None
-        record.status = next_status
-        if next_status != "STOPPED":
-            # Clear the enforcement stamp in the *same* transaction as the
-            # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle
-            # keeps the old stamp, and the second stop is skipped as "already
-            # enforced" while its positions are still open. Doing it in one
-            # commit matters: a crash between the two writes must not leave a
-            # non-STOPPED deployment carrying a stamp that disables the next
-            # enforcement.
-            record.stopped_enforced_at = None
-        record.updated_at = _utcnow_naive()
+        _apply_live_deployment_status_row(record, next_status)
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -5145,15 +5370,21 @@ def claim_live_deployment_submission(
     token: str,
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    allow_paused: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
-    Two independent facts have to hold, and both are decided by the database
+    Three independent facts have to hold, and the first two are decided by the database
     rather than by a status snapshot taken earlier in the dispatch:
 
-    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
-      live row, so a PAUSE that committed first wins the race);
+    * the deployment is in a dispatchable status (the ``INSERT ... SELECT`` reads
+      the live row, so a PAUSE that committed first wins the race) - ``ACTIVE``
+      always, and ``PAUSED`` only when ``allow_paused`` is set;
     * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    ``allow_paused`` is for exits only (the #126 decision): a PAUSED deployment closes
+    what it holds but opens nothing. The caller is the daemon's claim site, which knows
+    the signal kind; leaving it at the default keeps a plain status gate for entries.
 
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
@@ -5168,6 +5399,12 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    # Built from the shared status tuple, never from caller text, so the set cannot be
+    # widened by anything but this flag - and so the daemon's dispatch statuses and this
+    # filter cannot drift apart.
+    allowed = LIVE_DISPATCH_EXIT_STATUSES if allow_paused else LIVE_DISPATCH_ENTRY_STATUSES
+    status_list = ", ".join(f"'{status}'" for status in allowed)
+    status_filter = f"UPPER(status) IN ({status_list})"
     with get_session() as session:
         session.exec(
             delete(LiveDeploymentSubmissionClaimModel).where(
@@ -5183,7 +5420,7 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                    f"WHERE id = :deployment_id AND {status_filter}"
                 ),
                 {
                     "token": normalized_token,

@@ -125,6 +125,8 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | account equity read in the loss-breaker entry gate | money-decision | raises `LossBreakerBreachError`, entry refused |
 | `loss_breaker.py` | breach-latch write, state read, deployment pip-value/quote/flows reads | money-decision | unmeasurable loss = entries refused |
 | `loss_breaker.py` | untrusted-fill listing for the alert, observation wrapper | loop-survival | alert/observation only |
+| `broker_order_conflicts.py` | `pause_live_deployment_for_order_conflict` write failure | loop-survival | ERROR alert logged, remaining deployments still re-halted |
+| `daemon.py` | `enforce_broker_order_conflict_halts` call in `sync_services_loop` | loop-survival | ERROR alert logged, next tick retries |
 | `daemon.py` | startup failure in `run_daemon` (logs and re-raises) | money-decision | ERROR record for the alert sink, exception propagates |
 | `daemon.py` | crash handler in `run_daemon` (logs, captures, re-raises) | money-decision | ERROR record + Sentry capture, exception propagates |
 | `daemon.py` | signal-archive close in the `run_daemon` shutdown `finally` | loop-survival | WARNING logged during shutdown, nothing trades after |

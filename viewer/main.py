@@ -107,6 +107,7 @@ from shared.database import (
     delete_backtest,
     delete_live_deployment,
     delete_service,
+    deployments_with_broker_order_conflicts,
     ensure_live_account,
     get_background_task_record,
     get_latest_live_balances,
@@ -192,6 +193,10 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
         return []
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.broker_order_conflicts import (
+    CONFLICT_SCAN_LIMIT,
+    resolve_broker_order_conflicts,
+)
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
 from shared.models import (
@@ -5194,7 +5199,51 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
     }
 
 
-def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
+#: How many conflicting signals one deployment's payload may carry before the viewer
+#: truncates the list. The halt is binary; the ids are the evidence an operator needs
+#: to reconcile, so the cap is generous and states itself when it bites.
+MAX_BROKER_ORDER_CONFLICT_ROWS = 20
+
+
+def _broker_order_conflict_health(
+    grouped: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Fleet-wide unresolved broker order id conflicts (#126), for the dashboard.
+
+    Same read as :func:`live_runner.broker_order_conflicts.check_broker_order_conflicts`,
+    kept here because the payload caps how many rows it carries: the daemon loop wants
+    every one, a dashboard wants the shape of the problem.
+
+    ``grouped`` is the already-read mapping. The dashboard needs it anyway to annotate
+    its ACTIVE rows, and the read is a full scan of the signal table, so a caller that
+    has it passes it rather than scanning twice for one response.
+    """
+    if grouped is None:
+        grouped = deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT)
+    conflicts = [conflict for rows in grouped.values() for conflict in rows]
+    return {
+        "status": "error" if conflicts else "ok",
+        "deployment_ids": sorted(grouped),
+        "conflicts": conflicts[:MAX_BROKER_ORDER_CONFLICT_ROWS],
+        "truncated": len(conflicts) > MAX_BROKER_ORDER_CONFLICT_ROWS,
+    }
+
+
+def _serialize_live_deployment_payload(
+    deployment: LiveDeploymentConfig,
+    broker_order_conflicts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Serialize one deployment for the API.
+
+    ``broker_order_conflicts`` are this deployment's unresolved broker order id
+    conflicts (#126), already grouped for it by the caller, or ``None`` when the
+    caller did not read them. A deployment that is not ACTIVE *and* carries a
+    conflict is reported as ``halted_for_broker_order_conflict``: that is the
+    answer to "why is this paused" for a pause the operator did not set, and it
+    is what the operator needs to see before they resume anything. Callers that
+    did not read the conflicts pass the rows as an empty list rather than
+    ``None`` when they want the key to be decisive.
+    """
     # STOPPED is a request, not a fact. The daemon marks
     # `stopped_enforced_at` only after a *complete* cancel-and-flatten sweep, so
     # a STOPPED row without that stamp still has exposure at the broker. The
@@ -5204,6 +5253,25 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
     exposure_may_be_open = (
         str(deployment.status or "").strip().upper() == "STOPPED"
         and stopped_enforced_at is None
+    )
+    # None means "this response did not read the conflict ledger", which is a different
+    # statement from "there is none" - the same distinction that makes
+    # `exposure_may_be_open` worth reporting. A create, update or re-point response never
+    # reads conflicts, so it must not answer for them.
+    read_conflicts = None if broker_order_conflicts is None else list(broker_order_conflicts)
+    conflicts = None
+    conflicts_truncated = False
+    if read_conflicts is not None:
+        # An HTTP payload has to be bounded, and a deployment with a pathological
+        # conflict backlog must not drag the whole deployments list with it. So the
+        # list is cut at the cap the dashboard already uses and the cut is *said*: a
+        # silently shortened list would read as "these are all of them" to the operator
+        # deciding whether to resolve, and the halt itself is unaffected - it is decided
+        # by the presence of any conflict, never by the count.
+        conflicts = read_conflicts[:MAX_BROKER_ORDER_CONFLICT_ROWS]
+        conflicts_truncated = len(read_conflicts) > MAX_BROKER_ORDER_CONFLICT_ROWS
+    halted_for_conflict = bool(read_conflicts) and (
+        str(deployment.status or "").strip().upper() != "ACTIVE"
     )
     payload = {
         "id": str(deployment.id),
@@ -5216,6 +5284,12 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
             stopped_enforced_at.isoformat() if stopped_enforced_at is not None else None
         ),
         "exposure_may_be_open": exposure_may_be_open,
+        # (#126) broker order ids recorded as conflicting for this deployment's
+        # signals: a broker order may exist that the ledger does not track. None when
+        # this response did not read them (see above).
+        "broker_order_conflicts": conflicts,
+        "broker_order_conflicts_truncated": conflicts_truncated,
+        "halted_for_broker_order_conflict": halted_for_conflict,
         "signal_source_type": deployment.signal_source_type,
         "signal_source_id": deployment.signal_source_id,
         "symbol_filter": deployment.symbol_filter,
@@ -13221,8 +13295,22 @@ async def _resolve_live_deployment_signal_source(
 @app.get(LIVE_DEPLOYMENTS_PATH)
 async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
-    deployments = await asyncio.to_thread(list_live_deployments)
-    return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
+    deployments, conflicts_by_deployment = await asyncio.gather(
+        asyncio.to_thread(list_live_deployments),
+        # The shared scan limit, not the database default: a deployment halted by a
+        # conflict older than the 200-row default would report no conflict and no halt
+        # reason, which is the one fact this payload exists to carry.
+        asyncio.to_thread(deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT),
+    )
+    return [
+        _serialize_live_deployment_payload(
+            # Read, and none: an empty list. `None` means the ledger was not read at
+            # all (see the serializer), which is a different answer to give.
+            deployment,
+            conflicts_by_deployment.get(str(deployment.id), []),
+        )
+        for deployment in deployments
+    ]
 
 
 @app.get("/api/live/dashboard")
@@ -13239,6 +13327,9 @@ async def get_live_dashboard() -> dict[str, Any]:
     active_deployments = [
         deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
     ]
+    conflicts_by_deployment = await asyncio.to_thread(
+        deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT
+    )
 
     # Fetch stats and trades for all accounts concurrently instead of
     # serially awaiting a full stats+trades scan per account.
@@ -13251,6 +13342,10 @@ async def get_live_dashboard() -> dict[str, Any]:
     trades_payloads = await asyncio.gather(
         *(_live_trades_payload(account.id) for account in accounts)
     )
+    # Read once for the whole dashboard: the conflict ledger is fleet-wide state, not
+    # per-account state (#126), and this response already needs the grouping to
+    # annotate its own rows.
+    conflict_health = _broker_order_conflict_health(conflicts_by_deployment)
 
     # Both payload lists come from `asyncio.gather` over the same `accounts`
     # comprehension, so all three are the same length; `strict=True` turns a
@@ -13287,7 +13382,10 @@ async def get_live_dashboard() -> dict[str, Any]:
         )
         active_strategies.append(
             {
-                **_serialize_live_deployment_payload(deployment),
+                **_serialize_live_deployment_payload(
+                    deployment,
+                    conflicts_by_deployment.get(str(deployment.id), []),
+                ),
                 "capital_allocation": round(allocation, 6),
                 "account_equity": round(account_equity, 2),
             }
@@ -13298,6 +13396,11 @@ async def get_live_dashboard() -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "accounts": account_payloads,
         "active_strategies": active_strategies,
+        # (#126) Fleet health for the one failure a dashboard of ACTIVE rows cannot
+        # show: a deployment halted because a duplicate live signal carried a broker
+        # order id the ledger does not track is not in `active_strategies` at all, so
+        # the conflict has to be reported on its own or the halt is invisible.
+        "broker_order_conflicts": conflict_health,
         "capital": {
             "total_equity": round(total_equity, 2),
             "active_account_count": len(account_payloads),
@@ -13778,7 +13881,14 @@ async def _reverify_account_against_broker(account_id: str) -> bool:
 
 @app.put(
     "/api/live/deployments/{deployment_id}/status",
-    responses={409: {"description": "Activation is refused by the promotion gate (#165)"}},
+    responses={
+        409: {
+            "description": (
+                "Activation is refused by the promotion gate (#165) or by an "
+                "unresolved broker order id conflict (#126)"
+            )
+        }
+    },
 )
 async def update_live_deployment_status_endpoint(
     deployment_id: str,
@@ -13804,6 +13914,49 @@ async def update_live_deployment_status_endpoint(
         deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
         if deployment is None:
             raise HTTPException(status_code=404, detail="Live deployment not found")
+
+        # Fail closed (#126): a deployment that still carries a broker order id conflict is
+        # halted, and this endpoint is the documented way back - so it must not be the way
+        # *out*. Writing ACTIVE here re-opens ENTRY_DISPATCH_STATUSES and the submission
+        # claim immediately, while `enforce_broker_order_conflict_halts` only re-pauses it
+        # on the next service-sync tick: an entry accepted inside that window is a live
+        # order on a deployment whose broker exposure the ledger cannot explain. One extra
+        # read per operator action, on a path that is about to spend broker round-trips.
+        recorded_conflicts = await asyncio.to_thread(
+            deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT
+        )
+        conflicting_ids = sorted(
+            {
+                str(conflicting_id)
+                for conflict in recorded_conflicts.get(deployment_id, [])
+                for conflicting_id in conflict["conflicting_broker_order_ids"]
+            }
+        )
+        if conflicting_ids:
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "unresolved broker order id conflict",
+                    "account_id": str(deployment.account_id or ""),
+                    "conflicting_broker_order_ids": conflicting_ids,
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment is halted for an unresolved broker order id "
+                    f"conflict (conflicting ids: {', '.join(conflicting_ids)}). An "
+                    "untracked broker order may exist, so it cannot be activated. "
+                    "Reconcile the conflicting id with the broker, then clear it with "
+                    f"POST /api/live/deployments/{deployment_id}/broker-order-conflicts/resolve"
+                    " before resuming."
+                ),
+            )
 
         # Check what can actually trade before spending a broker round-trip on
         # it. An internal-source deployment has no live evaluator, so no account
@@ -13965,6 +14118,138 @@ async def update_live_deployment_status_endpoint(
                 },
             )
     return payload
+
+
+@app.post(
+    "/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+    responses={
+        400: {"description": "The resolution carries no reason"},
+        428: {"description": "The control was not confirmed"},
+        404: {"description": "Live deployment not found"},
+    },
+)
+async def resolve_live_deployment_broker_order_conflicts_endpoint(
+    deployment_id: str,
+    payload: LiveControlConfirmation | None = None,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Record that a deployment's broker order id conflicts were reconciled (#126).
+
+    The way out of a conflict halt. While a conflict is recorded the daemon keeps
+    the deployment paused, so a resolution cannot be a status write and nothing
+    else: this clears the recorded ids and reports what it cleared, and the
+    operator then resumes the deployment through the status endpoint (which does
+    its own broker re-verification).
+
+    The confirmation and the reason are required on purpose. Clearing one of these
+    says "there is no untracked broker order any more", which is a statement about
+    the broker, not about the UI; the reason is the evidence of the reconciliation
+    and it goes into the audit trail next to who made it.
+    """
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        deployment_id=deployment_id,
+    )
+    await _require_live_control_confirmation(
+        action="deployment.broker_order_conflict.resolve",
+        deployment_id=deployment_id,
+        confirmation=payload,
+        request=request,
+    )
+    reason = str(payload.reason or "").strip()
+    if not reason:
+        await _audit_live_control(
+            action="deployment.broker_order_conflict.resolve",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no resolution reason supplied"},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Record what you reconciled at the broker in confirmation.reason; "
+                "resolving a conflict says there is no untracked broker order, "
+                "and that has to be attributable."
+            ),
+        )
+    deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if deployment is None:
+        await _audit_live_control(
+            action="deployment.broker_order_conflict.resolve",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "deployment not found", "resolution_reason": reason},
+        )
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+
+    # Inventory the leases before clearing anything: an exit already in flight was
+    # sized against a ledger that has not seen its fill yet, so the operator has to
+    # hear about it while deciding to resume.
+    pending_claims = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+    drain = await _drain_live_deployment_submissions(
+        deployment_id, initial_claims=pending_claims
+    )
+    resolved = await asyncio.to_thread(resolve_broker_order_conflicts, deployment_id)
+
+    await _audit_live_control(
+        action="deployment.broker_order_conflict.resolve",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        request=request,
+        detail={
+            "resolution_reason": reason,
+            "account_id": str(deployment.account_id or ""),
+            "resolved": resolved,
+            "submission_drain_outcome": drain.outcome.value,
+            "in_flight_submissions": drain.in_flight,
+            "expired_unreleased_submissions": drain.expired_unreleased,
+        },
+    )
+    if not drain.complete:
+        logger.error(
+            "Broker order id conflict resolved while submissions were still "
+            "unaccounted for; verify the broker before resuming the deployment",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "submission_drain_outcome": drain.outcome.value,
+                    "in_flight_submissions": drain.in_flight,
+                    "expired_unreleased_submissions": drain.expired_unreleased,
+                }
+            },
+        )
+
+    response: dict[str, Any] = {
+        "deployment_id": deployment_id,
+        "resolved": resolved,
+        "resolved_count": len(resolved),
+        "submission_drain_outcome": drain.outcome.value,
+        "submission_drain_complete": drain.complete,
+        "in_flight_submissions": drain.in_flight,
+        "expired_unreleased_submissions": drain.expired_unreleased,
+    }
+    # Both warnings are kept, in one message: the drain outcome and the resolution are
+    # different facts about the same call, and the second used to overwrite the first -
+    # dropping "verify the broker" for exactly the operator who most needs it.
+    warnings: list[str] = []
+    if not drain.complete:
+        warnings.append(
+            "The conflicts are resolved, but submissions were still unaccounted "
+            "for at the broker. Verify the broker before resuming the deployment."
+        )
+    if not resolved:
+        warnings.append(
+            "This deployment had no recorded broker order id conflict."
+        )
+    if warnings:
+        response["warning"] = " ".join(warnings)
+    return response
 
 
 # ── Kill switch (#300) ───────────────────────────────────────────────────────

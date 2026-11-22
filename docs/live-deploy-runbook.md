@@ -1010,4 +1010,111 @@ there is deliberately no `runner.cli` subcommand for it.
 
 ## Commission sign migration (cTrader, #205)
 
+`live_executions.commission` is a positive cost for every broker. The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge, which is indistinguishable from a new-convention rebate and is never converted. Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## Conflicting broker order id on a duplicate signal (#126)
+
+A redelivered or duplicate live signal that carries a **different non-empty**
+`broker_order_id` than the stored one means one of two things: a second broker
+order was placed for one logical signal, or the ids were mapped wrongly. Either
+way a broker order may exist that the ledger does not track, and an untracked
+open position is an unmanaged one. **Fail closed:** the deployment is halted,
+not warned at.
+
+**What the platform does** (`shared/database.py`,
+`live_runner/broker_order_conflicts.py`)
+
+- The tracked id is never overwritten. The conflicting id is recorded on the
+  signal: `live_signals.metadata_json["conflicting_broker_order_ids"]`,
+  deduplicated across redeliveries, in the same transaction as the halt.
+- The **affected deployment** is set to `PAUSED`. The other deployments on the
+  account keep trading, and their positions are untouched. A `STOPPED`
+  deployment is never downgraded: its own cancel-and-flatten enforcement handles
+  it, so check `stopped_enforced_at` on the deployment payload (and the broker)
+  before treating it as closed. A `STOPPED` row without that stamp still has
+  exposure at the broker - `exposure_may_be_open` reports exactly that.
+- `ERROR` log with `alert=live_broker_order_id_conflict` (Sentry turns it into
+  an event), naming the signal, the deployment, the tracked and the conflicting
+  id, and whether this call wrote the halt.
+- Every service sync tick re-applies the halt, before anything else in that tick
+  and in its own error handling: a restart, a status write or a row written by an
+  older build cannot leave a conflicted deployment trading again. Every halt write
+  logs the `ERROR` alert, at detection and at a tick re-halt alike; the tick adds
+  an `INFO` summary naming the deployments it re-halted. An already-halted
+  deployment logs nothing (re-writing it would move `updated_at` every pass), and
+  a halt that cannot be written is its own `ERROR` alert.
+
+**`PAUSED` still allows exits** (maintainer decision, #126). A pause blocks new
+entries and still dispatches exit-only signals, matching the `PAUSED` row of the
+"Operator safety controls" comment in `live_runner/base_adapter.py`
+("stop opening new positions; orders and positions are left untouched"): `ACTIVE` or
+`PAUSED` for a close, `ACTIVE` alone for an entry, decided per deployment from the
+raw signal - a parsed exit intent, or a plain `SELL`/`SHORT` on a deployment that
+cannot short - and checked at the fan-out, the pre-submit re-check and the atomic
+submission claim. `STOPPED` is excluded - its exposure is closed by the stop
+sweeps. This applies to every pause, manual ones included. Consequence: a
+deployment halted for a conflict can still close the position the ledger *does*
+know about; it just cannot add anything.
+
+For that to be reachable the account has to stay wired up: the broker adapter, the
+Discord listener and the per-account task set are kept for an account whose
+deployments are all `PAUSED` (they were selected from an `ACTIVE`-only account
+set, which dropped every exit at the task level). Those tasks dispatch and record;
+what may be *opened* is still decided per signal, so no entry can come out of it.
+
+**Where an operator sees it**
+
+- `GET /api/live/deployments`: `broker_order_conflicts` and
+  `halted_for_broker_order_conflict` per deployment.
+- `GET /api/live/dashboard`: `broker_order_conflicts` (fleet-wide `status`,
+  `deployment_ids`, signal rows). A halted deployment is not in
+  `active_strategies` at all, which is why the conflict has its own block.
+- SQL: `shared.database.list_live_signal_broker_order_conflicts()` (signal rows)
+  and `shared.database.deployments_with_broker_order_conflicts()` (grouped by
+  deployment).
+- Health read: `live_runner.broker_order_conflicts.check_broker_order_conflicts()`
+  → `{"status": "ok" | "error", "deployment_ids": [...], "conflicts": [...]}`.
+
+**Cost, and what grows it.** Every one of those reads scans `live_signals` for the JSON
+key, because there is no index on it: once per 60 s service-sync tick in the daemon, and
+once per dashboard or deployments request. That is fine at today's signal counts and it is
+the reason the resolution path is an endpoint rather than something a page polls in a
+loop. If the fleet ever grows enough for it to matter, the fix is structural - a partial
+index on the conflicts key, or a dedicated per-deployment flag column - and not a cap on
+the read: the reads that decide a halt and a resolution above are deliberately uncapped,
+so a trimming that hides an older conflict cannot happen there.
+
+**How to resolve one**
+
+1. Look the conflicting id up at the broker (open orders and positions). This is
+   a manual step: nothing in the platform queries the broker for the conflicting
+   id yet, so a position nobody tracks has to be found by hand. Keep the order id
+   in the reason you record below - it is the only external reference to what was
+   reconciled.
+2. **Cancel first, then close.** A conflicting id that is still resting at the broker
+   is an order the platform will never manage: cancel it at the broker and confirm it
+   reached a terminal state before you record anything. Cancelling is not closing - a
+   working order can still fill, and a fill of a cancelled order is exactly the untracked
+   position this runbook exists for.
+3. Close whatever did fill and the ledger does not track, at the broker, and account
+   for it in the ledger if it belongs to this platform.
+4. Record the resolution: `POST
+   /api/live/deployments/{id}/broker-order-conflicts/resolve` with
+   `{"confirmed_deployment_id": "<deployment id>", "reason": "<what you found>"}`.
+   The reason is
+   required and audited; the call clears every recorded conflict for the
+   deployment (a partial clear would still leave it halted) and reports the
+   in-flight submission drain with it.
+5. Resume: `PUT /api/live/deployments/{id}/status` with
+   `{"status": "ACTIVE", "confirmation": {"confirmed_deployment_id": "<deployment id>"}}`
+   (an unconfirmed write is a `428`, and a confirmation naming another deployment a
+   `409`), which does its own broker re-verification. The write is **refused with
+   `409` while a conflict is still recorded**: the way out of the halt is step 4,
+   not a status write. A resume refused with that `409` means a conflict is still
+   recorded: step 4 has not run, or a new conflict arrived since. A resume that was
+   accepted and is later re-paused means a new conflict was recorded after step 4,
+   typically a duplicate still being redelivered: the conflict ledger's own
+   read-modify-write wins that race on purpose. Investigate the new conflict and
+   repeat steps 3-5.
+
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
