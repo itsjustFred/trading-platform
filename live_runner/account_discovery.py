@@ -490,7 +490,7 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
             )
             if isinstance(payload, dict):
                 return payload
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
     if not hasattr(message, "ListFields"):
         return {}
@@ -722,7 +722,7 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
             },
         )
         raise _CtraderStreamError(str(exc)) from exc
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         logger.debug(
             "Optional cTrader account detail request failed",
             extra={
@@ -851,7 +851,7 @@ def _build_ctrader_live_account(
         _load_ctrader_trader_details(ctx, account_id)
     except _CtraderStreamError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         error_text = repr(exc)
         if _handle_ctrader_trader_error(error_text, host, account_id) == "skip":
             return None
@@ -916,7 +916,7 @@ async def discover_ctrader_accounts(
                 app_secret=app_secret,
                 access_token=access_token,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             error_text = repr(exc)
             if _is_expected_ctrader_host_route_error(error_text):
                 logger.info(
@@ -980,7 +980,7 @@ async def discover_configured_accounts(
                     }
                 },
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping cTrader account discovery because of runtime error",
                 extra={"data": {"error": repr(exc)}},
@@ -993,7 +993,7 @@ async def discover_configured_accounts(
                 credentials["secret_key"],
                 bool(credentials["paper"]),
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping Alpaca account discovery for credential block",
                 extra={

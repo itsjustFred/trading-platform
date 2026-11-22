@@ -1113,7 +1113,7 @@ def _report_parse_outcome(
         return
     try:
         outcome_sink(reason, detail)
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         pass
 
 
@@ -1585,8 +1585,9 @@ class DiscordSignalSource(BaseSignalSource):
         # authors the allowlist does not trust - by definition untrusted channel members -
         # so letting three of them flip the service status would hand any member of the
         # channel the ability to take the bot out of service (the daemon stops
-        # every discord service that is not RUNNING). The refusal itself is already correct; this alert is the signal for
-        # the operator, who checks the logged `rejected_author_ids` against the allowlist.
+        # every discord service that is not RUNNING). The refusal itself is already
+        # correct; this alert is the signal for the operator, who checks the logged
+        # `rejected_author_ids` against the allowlist.
 
     def author_rejection_summary(self) -> dict[str, Any]:
         """How many messages were dropped for authorship, and by whom.
@@ -1650,7 +1651,7 @@ class DiscordSignalSource(BaseSignalSource):
                 last_activity=last_activity,
                 respect_operator_intent=True,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Failed to update discord service status",
                 extra={
@@ -2003,7 +2004,7 @@ class DiscordSignalSource(BaseSignalSource):
             await self._emit_parsed_message(channel_id, message, message_id)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.error(
                 "Discord message dropped: emission failed",
                 extra={
@@ -2064,7 +2065,7 @@ class DiscordSignalSource(BaseSignalSource):
                     author_trusted=author_trusted,
                 )
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             signal_archive.get_signal_archive().enqueue_errors += 1
             logger.warning(
                 "Discord signal archive record failed",
@@ -2167,7 +2168,7 @@ class DiscordSignalSource(BaseSignalSource):
                     },
                 )
                 continue
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 logger.warning(
                     "Discord cursor priming failed",
                     extra={
@@ -2226,7 +2227,7 @@ class DiscordSignalSource(BaseSignalSource):
                             }
                         },
                     )
-                except Exception as exc:
+                except Exception as exc:  # except-kind: loop-survival
                     logger.warning(
                         "Discord poll iteration failed",
                         extra={
@@ -2280,7 +2281,7 @@ class DiscordSignalSource(BaseSignalSource):
                 },
             )
             raise DiscordAuthenticationError(message) from exc
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Initial discord poll failed; continuing with background loop",
                 extra={
