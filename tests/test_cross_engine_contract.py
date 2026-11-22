@@ -117,12 +117,16 @@ def _load_strategy_fn(strategy_text: str, tmp_path: Path, name: str):
 
 
 class TestSignalExitConvention:
-    """Signal exits fill at the NEXT bar's open, both engines.
+    """Signal exits fill at the NEXT bar's open on native; the frozen
+    vectorbt adapter keeps its documented signal-bar close fill.
 
     Owner decision 2026-11-13 supersedes D4 (A-M1) "Fill-zum-Trigger-Close".
     """
 
-    def test_exit_price_equals_next_open_on_both_engines(self, tmp_path: Path):
+    def test_exit_fill_convention_per_engine(self, tmp_path: Path):
+        # Owner decision 2026-11-13: the native engine fills a signal exit at
+        # the NEXT bar's open; the frozen vectorbt adapter keeps its documented
+        # signal-bar close fill (next_open is mapped to close with a warning).
         frame = _frame()
         text = _strategy_text(entry_bar=2, exit_bar=7)
         strategy_fn = _load_strategy_fn(text, tmp_path, "contract_exit")
@@ -133,16 +137,16 @@ class TestSignalExitConvention:
         assert len(native.trades) == 1
         assert len(vectorbt.trades) == 1
         expected_entry = float(frame["open"].iloc[3])  # next-open after bar 2
-        expected_exit = float(frame["open"].iloc[8])  # next open after bar 7
         for result in (native, vectorbt):
             trade = result.trades[0]
             assert trade.entry_price == pytest.approx(expected_entry)
-            assert trade.exits[0].price == pytest.approx(expected_exit)
             assert trade.exits[0].reason == "signal"
-        # Exit timestamps agree (same fill bar, format-insensitive).
-        native_ts = pd.to_datetime(native.trades[0].exits[0].time, utc=True)
-        vbt_ts = pd.to_datetime(vectorbt.trades[0].exits[0].time, utc=True)
-        assert native_ts == vbt_ts
+        assert native.trades[0].exits[0].price == pytest.approx(
+            float(frame["open"].iloc[8])
+        )  # next open after bar 7
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(
+            float(frame["close"].iloc[7])
+        )  # frozen legacy signal-bar close
 
     def test_long_market_entry_pays_spread_on_both_engines(self, tmp_path: Path):
         frame = _frame(spread=0.5)
@@ -185,11 +189,13 @@ def generate_signals(df, params):
 
         assert len(native.trades) == 1
         assert len(vectorbt.trades) == 1
-        # Entry signal bar 6 fills at bar 7 open; exit signal bar 8 at bar 9 open.
+        # Entry signal bar 6 fills at bar 7 open on both. Exit signal bar 8
+        # fills at bar 9 open on native (next_open) and at bar 8's close on
+        # the frozen vectorbt adapter (legacy signal-bar fill).
         assert native.trades[0].entry_price == pytest.approx(float(frame["open"].iloc[7]))
         assert vectorbt.trades[0].entry_price == pytest.approx(float(frame["open"].iloc[7]))
         assert native.trades[0].exits[0].price == pytest.approx(float(frame["open"].iloc[9]))
-        assert vectorbt.trades[0].exits[0].price == pytest.approx(float(frame["open"].iloc[9]))
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(float(frame["close"].iloc[8]))
 
     def test_warmup_without_start_date_fails_loudly(self, tmp_path: Path):
         text = _strategy_text()
@@ -283,9 +289,11 @@ class TestExitOrderType:
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
-        # Bar 7 close is 107.0; the level 105.5 must be ignored.
-        for result in (native, vectorbt):
-            assert result.trades[0].exits[0].price == pytest.approx(107.0)
+        # The 105.5 level is ignored on both. Native's market signal exit
+        # fills at the next bar's open (108); the frozen vectorbt adapter
+        # keeps its signal-bar close fill (107).
+        assert native.trades[0].exits[0].price == pytest.approx(108.0)
+        assert vectorbt.trades[0].exits[0].price == pytest.approx(107.0)
 
     def test_level_fills_at_exit_price_on_both_engines(self, tmp_path: Path):
         frame = _frame()
@@ -314,7 +322,8 @@ class TestExitOrderType:
 
     def test_unspecified_keeps_legacy_rule_per_engine(self, tmp_path: Path):
         # No exit_order_type: vectorbt honors a usable exit_price as a level
-        # (legacy), native fills at the convention close (legacy).
+        # (legacy); native ignores exit_price implicitly and its market signal
+        # exit fills at the next bar's open (the next_open convention).
         frame = _frame()
         text = _exit_order_type_strategy_text(order_type=None, exit_price=107.1)
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_type_legacy")
@@ -322,7 +331,7 @@ class TestExitOrderType:
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
-        assert native.trades[0].exits[0].price == pytest.approx(107.0)
+        assert native.trades[0].exits[0].price == pytest.approx(108.0)
         assert vectorbt.trades[0].exits[0].price == pytest.approx(107.1)
 
     def test_level_via_dataframe_columns(self, tmp_path: Path):
@@ -369,7 +378,8 @@ def generate_signals(df, params):
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
-        assert native.trades[0].exits[0].price == pytest.approx(107.0)
+        # Native falls back to its market convention: next bar's open (108).
+        assert native.trades[0].exits[0].price == pytest.approx(108.0)
         assert vectorbt.trades[0].exits[0].price == pytest.approx(107.1)
 
     def test_level_whitespace_spelling_fills_at_price(self, tmp_path: Path):
@@ -454,7 +464,11 @@ class TestExitLevelReachability:
         native = _native_result(frame, strategy_fn)
         vectorbt = _vectorbt_result(tmp_path, frame, text)
 
-        assert native.trades[0].exits[0].price == pytest.approx(107.0)
+        # Native never reads exit_price implicitly: the market signal exit
+        # fills at the next bar's open (108). vectorbt's legacy rule treats a
+        # usable exit_price as a level; 500 is unreachable on bar 7, so it
+        # falls back to the signal-bar close, flagged.
+        assert native.trades[0].exits[0].price == pytest.approx(108.0)
         trade = vectorbt.trades[0]
         assert trade.exits[0].price == pytest.approx(107.0)
         assert trade.meta.get("exit_level_unreachable") is True
@@ -912,7 +926,9 @@ class TestSharedEquity:
             sum(notionals), rel=1e-4
         )
         final = result.equity_curve[-1].equity
-        expected = 100_000.0 + sum(t.net_pnl if t.net_pnl is not None else t.pnl for t in result.trades)
+        expected = 100_000.0 + sum(
+            t.net_pnl if t.net_pnl is not None else t.pnl for t in result.trades
+        )
         assert final == pytest.approx(expected, abs=0.02)
 
     def test_native_multi_symbol_replays_shared_equity(self, tmp_path: Path):

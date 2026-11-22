@@ -261,6 +261,10 @@ class RefConfig:
     native_risk_ceiling: bool = True
     #: honour protective stop / target levels as exits (False = vectorbt, no intrabar)
     protective: bool = True
+    #: fill a signal exit at the signal bar's CLOSE (the frozen vectorbt
+    #: convention) instead of parking it for the next bar's open (native's
+    #: ``signal_exit_fill="next_open"`` default, owner decision 2026-11-13)
+    signal_exit_close: bool = False
     #: skip a trade whose sizing stop is on the wrong side of the fill (LONG: stop >= fill);
     #: False reproduces the documented vectorbt sizing-only defect
     skip_wrong_side_stop: bool = True
@@ -385,7 +389,13 @@ def ref_execute(frame: pd.DataFrame, sig: Signals, cfg: RefConfig) -> list[RefTr
         if sig.entries[i] and position is None and pending is None:
             pending = i
         if sig.exits[i]:
-            exit_pending = True
+            if cfg.signal_exit_close:
+                # Frozen vectorbt convention: the exit fills at this bar's
+                # close, after the bar's other events.
+                if position is not None:
+                    close_position(i, c[i], "signal")
+            else:
+                exit_pending = True
     if position is not None:
         if not _finite(c[n - 1]):
             # The end-of-data mark is the last close. An unpriced last bar has none, and
@@ -418,6 +428,7 @@ def _config(
     params=None,
     start="2000-01-01",
     end="2100-01-01",
+    signal_exit_fill: str | None = None,
 ) -> BacktestConfig:
     parameters = dict(params or {})
     if fee_rate or fee_flat:
@@ -438,6 +449,7 @@ def _config(
         modeling_resolution="main_timeframe",
         data_dir=str(data_dir),
         parameters=parameters,
+        **({"signal_exit_fill": signal_exit_fill} if signal_exit_fill else {}),
     )
 
 
@@ -607,7 +619,10 @@ class Case:
 
     def reference(self, *, vectorbt: bool = False, **overrides) -> list[RefTrade]:
         cfg = self.ref_cfg(
-            protective=not vectorbt, native_risk_ceiling=not vectorbt, **overrides
+            protective=not vectorbt,
+            native_risk_ceiling=not vectorbt,
+            signal_exit_close=vectorbt,
+            **overrides,
         )
         return ref_execute(self.frame, self.sig, cfg)
 
@@ -646,7 +661,12 @@ def check_vectorbt(tmp_path: Path, case: Case) -> None:
 
 
 def check_engines_agree(tmp_path: Path, case: Case) -> None:
-    """Native == vectorbt where the contract says they must (fills + sizing, no protective exit)."""
+    """Native == vectorbt where the contract says they must (fills + sizing, no protective exit).
+
+    The frozen vectorbt adapter keeps the signal-bar-close exit fill, so the
+    native side is pinned to ``signal_exit_fill="close"`` for this comparison;
+    native's ``next_open`` default is covered by tests/test_realistic_fills.py.
+    """
     if case.has_protective_exit():
         # vectorbt does not enforce protective levels without intrabar data, so a scenario
         # whose reference takes a stop/target exit has no vectorbt comparison to agree
@@ -654,7 +674,14 @@ def check_engines_agree(tmp_path: Path, case: Case) -> None:
         # decided at collection time - which cannot work for a scenario whose frame comes
         # from a download that need not be present (see ``_make_params``).
         pytest.skip("documented: vectorbt has no protective exits without intrabar data")
-    native = run_native(tmp_path, case.frame, case.strategy, case.params, **dict(case.cfg_kwargs))
+    native = run_native(
+        tmp_path,
+        case.frame,
+        case.strategy,
+        case.params,
+        signal_exit_fill="close",
+        **dict(case.cfg_kwargs),
+    )
     vbt = run_vbt(tmp_path, case.frame, case.strategy, case.params, **dict(case.cfg_kwargs))
     assert_trades_match(
         _engine_trades(native),

@@ -1134,12 +1134,18 @@ def _normalize_trade_exits(trades: list[Trade], df: pd.DataFrame | None = None) 
         exit_leg = trade.exits[-1]
         bar_open = _exit_bar_open(df, exit_leg.time)
 
-        def _restated(level: float, kind: str) -> float:
-            if bar_open is None:
+        def _restated(
+            level: float,
+            kind: str,
+            *,
+            _open: float | None = bar_open,
+            _direction: str = trade.direction,
+        ) -> float:
+            if _open is None:
                 return round(level, 6)
             return round(
                 contract.level_fill_price(
-                    direction=trade.direction, kind=kind, level=level, bar_open=bar_open
+                    direction=_direction, kind=kind, level=level, bar_open=_open
                 ),
                 6,
             )

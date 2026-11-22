@@ -318,13 +318,16 @@ class TestNativeSignalExitNextOpen:
         # Bar4 opens at 103, then crashes through the stop at 95. The signal exit
         # already filled at the open, so the later crash is not the position's.
         rows = [_flat(100.0), _flat(100.0), _flat(101.0), _flat(102.0), (103.0, 103.5, 80.0, 82.0)]
-        result = _native(rows + [_flat(82.0)], exit_bar=3, stop=95.0)
+        result = _native([*rows, _flat(82.0)], exit_bar=3, stop=95.0)
         (trade,) = result.trades
         assert trade.exits[-1].price == pytest.approx(103.0)
         assert trade.exits[-1].reason == "signal"
 
     def test_gap_through_the_stop_on_the_exit_bar_keeps_the_stop_reason(self):
-        rows = [_flat(100.0), _flat(100.0), _flat(101.0), _flat(102.0), (90.0, 91.0, 88.0, 89.0), _flat(89.0)]
+        rows = [
+            _flat(100.0), _flat(100.0), _flat(101.0), _flat(102.0),
+            (90.0, 91.0, 88.0, 89.0), _flat(89.0),
+        ]
         result = _native(rows, exit_bar=3, stop=95.0)
         (trade,) = result.trades
         assert trade.exits[-1].price == pytest.approx(90.0)
@@ -334,7 +337,7 @@ class TestNativeSignalExitNextOpen:
         # Bar0 enters long (fills bar1). Bar3 signals exit AND a new entry: the
         # old position closes at bar4's open, then the new one opens at that same
         # open - the exit must not eat the fresh position.
-        frame = _bars(self.ROWS + [_flat(105.0), _flat(106.0)])
+        frame = _bars([*self.ROWS, _flat(105.0), _flat(106.0)])
 
         def strategy_fn(df, params):
             entries = pd.Series(False, index=df.index)
@@ -461,14 +464,18 @@ class TestSignalReplayGaps:
 
     def test_short_gap_through_stop_fills_at_open(self):
         trade = _replay(
-            _replay_frame([100, 110, 110], [100.5, 112, 110.5], [99.5, 109, 109.5], [100, 111, 110]),
+            _replay_frame(
+                [100, 110, 110], [100.5, 112, 110.5], [99.5, 109, 109.5], [100, 111, 110]
+            ),
             action="sell", stop=105.0, tp=60.0,
         )
         assert trade.exits[-1].price == pytest.approx(110.0)
 
     def test_long_gap_through_target_fills_at_open(self):
         trade = _replay(
-            _replay_frame([100, 115, 115], [100.5, 116, 115.5], [99.5, 114, 114.5], [100, 115, 115]),
+            _replay_frame(
+                [100, 115, 115], [100.5, 116, 115.5], [99.5, 114, 114.5], [100, 115, 115]
+            ),
             action="buy", stop=90.0, tp=110.0,
         )
         assert trade.exit_reason == "take_profit"
@@ -504,7 +511,14 @@ class TestSignalReplayGaps:
 # --------------------------------------------------------------------------- #
 
 
-def _pyne_trade(direction: str, exit_price: float, *, sl=None, tp=None, exit_time="2024-01-01T02:00:00+00:00") -> Trade:
+def _pyne_trade(
+    direction: str,
+    exit_price: float,
+    *,
+    sl=None,
+    tp=None,
+    exit_time="2024-01-01T02:00:00+00:00",
+) -> Trade:
     return Trade(
         id=1,
         symbol="T",
