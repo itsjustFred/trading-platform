@@ -286,14 +286,14 @@ def test_atr_sma_tr_matches_channel_breakout(ohlcv):
     _assert_series_equal(preset, indicators["ATR"], exact=True)
 
 
-def test_atr_sma_tr_matches_ema_crossover(ohlcv):
+def test_atr_pine_ta_matches_ema_crossover(ohlcv):
     module = _load_strategy(
         "strategies/ema_crossoiver_conversion_test/ema_crossoiver_conversion_test.py",
         "char_ec",
     )
     _, _, indicators, _ = module.generate_signals(ohlcv, {"atr_period": 14})
     high, low, close = _ohlc(ohlcv)
-    preset = presets.atr_sma_tr(high, low, close, 14, tr_first="hl")
+    preset = presets.atr_pine_ta(high, low, close, 14)
     _assert_series_equal(preset, indicators["atr_value"], exact=True)
 
 
@@ -653,76 +653,66 @@ def test_supertrend_chart_is_registered_ramjet_alias(ohlcv):
         )
 
 
-def test_supertrend_custom_swings_matches_bands(ohlcv):
+def test_supertrend_custom_swings_pine_exact(ohlcv):
     module = _load_strategy(
         "strategies/custom_swings_supertrend/custom_swings_supertrend.py",
         "char_cs",
     )
     period, mult = 12, 3.0
-    legacy_atr = pd.Series(module._calc_atr(ohlcv, period), index=ohlcv.index)
-    trend_arr, up_arr, dn_arr = module._calc_supertrend(
-        ohlcv, legacy_atr.to_numpy(), mult
-    )
+    _, _, indicators, _ = module.generate_signals(ohlcv)
     high, low, close = _ohlc(ohlcv)
     result = presets.supertrend_custom_swings(high, low, close, period, mult)
     _assert_series_equal(
         result.trend,
-        pd.Series(trend_arr, index=ohlcv.index).astype(float),
-        exact=True,
-    )
-    # legacy band arrays are 0.0-seeded; the preset emits NaN at bar 0
-    # (core contract) — identical from bar 1 on.
-    _assert_series_equal(
-        result.lower_band,
-        pd.Series(up_arr, index=ohlcv.index),
-        start=1,
+        indicators["Supertrend_Trend"],
         exact=True,
     )
     _assert_series_equal(
-        result.upper_band,
-        pd.Series(dn_arr, index=ohlcv.index),
-        start=1,
-        exact=True,
+        result.lower_band, indicators["Supertrend_Up_Band"], exact=True
     )
-    _assert_series_equal(result.atr, legacy_atr, exact=True)
+    _assert_series_equal(
+        result.upper_band, indicators["Supertrend_Dn_Band"], exact=True
+    )
+    _assert_series_equal(result.atr, indicators["atr"], exact=True)
+    # Pine ta.atr warm-up: NaN until the SMA seed lands (period-1 bars).
+    assert result.lower_band.iloc[: period - 1].isna().all()
+    assert result.atr.iloc[: period - 1].isna().all()
 
 
-def test_supertrend_pine_dema_matches_bands(ohlcv):
+def test_supertrend_pine_dema_pine_exact(ohlcv):
     module = _load_strategy(
         "strategies/pine_supertrend_dema/pine_supertrend_dema.py", "char_pd"
     )
     period, mult = 10, 3.0
-    trend, lower_band, upper_band = module._calc_supertrend(
-        ohlcv, period, mult
-    )
+    _, _, indicators, _ = module.generate_signals(ohlcv, {})
     high, low, close = _ohlc(ohlcv)
     result = presets.supertrend_pine_dema(high, low, close, period, mult)
     _assert_series_equal(
-        result.trend,
-        pd.Series(trend, index=ohlcv.index).astype(float),
-        exact=True,
-    )
-    # legacy bands are 0.0 before the loop start (bar `period`)
-    _assert_series_equal(
-        result.lower_band,
-        pd.Series(lower_band, index=ohlcv.index),
-        start=period,
-        exact=True,
+        result.trend, indicators["Supertrend_Trend"], exact=True
     )
     _assert_series_equal(
-        result.upper_band,
-        pd.Series(upper_band, index=ohlcv.index),
-        start=period,
-        exact=True,
+        result.lower_band, indicators["Supertrend_Lower"], exact=True
     )
+    _assert_series_equal(
+        result.upper_band, indicators["Supertrend_Upper"], exact=True
+    )
+    assert result.lower_band.iloc[: period - 1].isna().all()
+    assert result.atr.iloc[: period - 1].isna().all()
 
 
-def test_superosc_vumanchu_matches_oscillator(ohlcv):
+def test_superosc_vumanchu_pine_exact(ohlcv):
     module = _load_strategy(
         "strategies/pine_superosc_vumanchu/pine_superosc_vumanchu.py",
         "char_pso",
     )
-    legacy = module._calc_supertrend_osc(ohlcv, 10, 8.0)
+    _, _, indicators, _ = module.generate_signals(ohlcv, {})
     high, low, close = _ohlc(ohlcv)
-    preset = presets.superosc_vumanchu(high, low, close, 10, 8.0)
-    _assert_series_equal(preset, legacy, exact=True)
+    osc = presets.superosc_luxalgo(high, low, close, 10, 8.0)
+    _assert_series_equal(osc, indicators["STO_Osc"], exact=True)
+    wt1, wt2 = presets.wavetrend_vumanchu(
+        high, low, close, 9, 12, 3
+    )
+    _assert_series_equal(wt1, indicators["WaveTrend_1"], exact=True)
+    _assert_series_equal(wt2, indicators["WaveTrend_2"], exact=True)
+    atr = presets.atr_pine_ta(high, low, close, 13)
+    _assert_series_equal(atr, indicators["ATR"], exact=True)

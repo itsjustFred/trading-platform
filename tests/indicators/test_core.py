@@ -404,11 +404,15 @@ class TestSupertrend:
     def test_hand_computed_pine_rule(self):
         # 3 bars, period=1, multiplier=1, SMA ATR -> atr == tr == [2,2,2]
         # src = hl2 = [9,10,11]
-        # i=1: raw_low=8, raw_high=12; prev bands NaN -> lower=8, upper=12;
-        #       trend stays +1 (close[1]=10 not < NaN)
-        # i=2: raw_low=9, raw_high=13; close[1]=10 > lower[1]=8 ->
-        #       lower=max(9,8)=9; close[1]=10 < upper[1]=12 ->
-        #       upper=min(13,12)=12; close[2]=11 not < lower[1]=8 -> +1
+        # i=0: raw_low=7, raw_high=11; no previous bands -> nz fallback makes
+        #       up1=7/dn1=11; close[-1] is NaN so bands stay raw (7/11);
+        #       close=9 is not < up1=7 -> trend stays +1.
+        # i=1: raw_low=8, raw_high=12; close[0]=9 > up1=7 ->
+        #       lower=max(8,7)=8; close[0]=9 < dn1=11 -> upper=min(12,11)=11;
+        #       close[1]=10 not < up1=7 -> +1.
+        # i=2: raw_low=9, raw_high=13; close[1]=10 > up1=8 ->
+        #       lower=max(9,8)=9; close[1]=10 < dn1=11 -> upper=min(13,11)=11;
+        #       close[2]=11 not < up1=8 -> +1.
         idx = pd.RangeIndex(3)
         high = pd.Series([10.0, 11.0, 12.0], index=idx)
         low = pd.Series([8.0, 9.0, 10.0], index=idx)
@@ -419,10 +423,10 @@ class TestSupertrend:
             atr_first_bar="hl",
         )
         _assert_close(result.trend, [1.0, 1.0, 1.0])
-        _assert_close(result.lower_band, [np.nan, 8.0, 9.0])
-        _assert_close(result.upper_band, [np.nan, 12.0, 12.0])
+        _assert_close(result.lower_band, [7.0, 8.0, 9.0])
+        _assert_close(result.upper_band, [11.0, 11.0, 11.0])
         _assert_close(result.atr, [2.0, 2.0, 2.0])
-        assert result.ready.tolist() == [False, True, True]
+        assert result.ready.tolist() == [True, True, True]
 
     def test_bands_ordered_and_trend_binary(self):
         high, low, close = _ohlc(80, seed=3)
@@ -624,7 +628,7 @@ class TestNoLookahead:
 
     @pytest.mark.parametrize("frame_kind", ["clean", "nan"])
     @pytest.mark.parametrize(
-        "rule", ["pine", "pine_dema", "pine_superosc", "ta"]
+        "rule", ["pine", "ta"]
     )
     @pytest.mark.parametrize(
         "atr_smoothing,atr_seed,atr_min_periods,atr_skipna",
@@ -698,7 +702,7 @@ class TestWarmupNaN:
 
     def test_ready_is_false_wherever_bands_are_nan(self):
         high, low, close = _ohlc(80, seed=6)
-        for rule in ("pine", "pine_dema", "pine_superosc", "ta"):
+        for rule in ("pine", "ta"):
             result = supertrend(
                 high, low, close, 10, 3.0,
                 atr_smoothing="wilder", atr_seed="first", rule=rule,
@@ -709,7 +713,7 @@ class TestWarmupNaN:
 
     def test_supertrend_direction_never_zero_filled(self):
         high, low, close = _ohlc(60)
-        for rule in ("pine", "pine_dema", "pine_superosc", "ta"):
+        for rule in ("pine", "ta"):
             result = supertrend(
                 high, low, close, 10, 3.0,
                 atr_smoothing="wilder", atr_seed="sma", rule=rule,

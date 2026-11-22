@@ -17,10 +17,12 @@ ATR smoothing legend (the four meanings of "ATR" in the repo):
   valid TR values, then Wilder recursion — Pine ``ta.atr`` and the
   ``intraday_volatility_breakout`` loop.
 - ``sma``: rolling mean of TR — MT5 ``iATR`` (valid-window variant) and
-  the ``pine_*`` ports (plain rolling variant, ``TR[0]`` seeded ``0`` or
-  ``h-l``).
+  the legacy ``atr_sma_tr`` parity path (plain rolling variant,
+  ``TR[0]`` seeded ``0`` or ``h-l``). The ``pine_*`` ports now use
+  :func:`atr_pine_ta` (``wilder`` + ``seed="sma"`` + ``first_bar="hl"``).
 - ``ema`` + ``seed="first"``: ``ewm(span=n)`` seeded at ``TR[0]`` — the
-  live bots' stop-distance ATR.
+  live bots' stop-distance ATR. Pine ``ta.ema`` is ``ema_pine_ta``
+  (``seed="sma"``).
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from .core import (
     ema,
     rma,
     rsi,
+    sma,
     supertrend,
 )
 
@@ -100,14 +103,11 @@ def atr_sma_tr(
     *,
     tr_first: TrFirstBar,
 ) -> pd.Series:
-    """``true_range(...).rolling(period).mean()`` — the ``pine_*`` ports.
+    """``true_range(...).rolling(period).mean()`` — the legacy SMA-ATR path.
 
-    Reproduces the stop/ATR series of ``strategies/channel_breakout`` and
-    ``strategies/ema_crossoiver_conversion_test`` (``tr_first="hl"``)
-    and the band/stop ATRs inside ``strategies/pine_supertrend_dema`` and
-    ``strategies/pine_superosc_vumanchu`` (``tr_first="zero"``: their
-    ``np.zeros`` TR seeds bar 0 with ``0.0``, which *is* counted in the
-    first rolling window).
+    Reproduces the stop/ATR series of ``strategies/channel_breakout``
+    (``tr_first="hl"``). The ``pine_*`` ports moved to
+    :func:`atr_pine_ta` (Pine ``ta.atr`` is Wilder/RMA, not a rolling SMA).
     """
     return atr(
         high,
@@ -117,6 +117,25 @@ def atr_sma_tr(
         smoothing="sma",
         seed="sma",
         first_bar=tr_first,
+    )
+
+
+def atr_pine_ta(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int
+) -> pd.Series:
+    """Pine ``ta.atr(period)`` — Wilder/RMA, SMA seed, ``high-low`` bar 0.
+
+    This is the ATR the ``pine_*`` ports were always meant to compute; the
+    legacy copies used a rolling SMA of a zero-seeded true range instead.
+    """
+    return atr(
+        high,
+        low,
+        close,
+        period,
+        smoothing="wilder",
+        seed="sma",
+        first_bar="hl",
     )
 
 
@@ -165,6 +184,27 @@ def ema_first_seed(series: pd.Series, span: int) -> pd.Series:
     return ema(series, span, seed="first", min_periods=0)
 
 
+def ema_pine_ta(series: pd.Series, length: int) -> pd.Series:
+    """Pine ``ta.ema(source, length)`` — SMA seed, NaN warm-up.
+
+    The ``pine_*`` ports used ``ewm(span=length, adjust=False)`` seeded at
+    the first value; TradingView seeds the recursion at the SMA of the
+    first ``length`` values instead.
+    """
+    return ema(series, length, seed="sma")
+
+
+def dema_pine_ta(series: pd.Series, length: int) -> pd.Series:
+    """Double EMA ``2 * ta.ema(src, l) - ta.ema(ta.ema(src, l), l)``.
+
+    The ``pine_supertrend_dema`` port used two first-seeded ``ewm`` calls;
+    TradingView's double-EMA uses the SMA-seeded ``ta.ema`` at both stages.
+    """
+    first = ema_pine_ta(series, length)
+    second = ema_pine_ta(first, length)
+    return (2.0 * first - second).rename(series.name)
+
+
 # ── RSI presets ────────────────────────────────────────────────────────
 
 
@@ -194,38 +234,35 @@ def rsi_wilder_fill50(close: pd.Series, period: int) -> pd.Series:
     return rsi(close, period, min_periods=period, flat="fill50")
 
 
-# ── Supertrend presets ─────────────────────────────────────────────────
+# ── Supertrend / oscillator presets ────────────────────────────────────
 
 
-def _custom_swings_atr(
-    high: pd.Series, low: pd.Series, close: pd.Series, period: int
-) -> pd.Series:
-    """Bit-exact ``_calc_atr`` of ``strategies/custom_swings_supertrend``.
+def supertrend_pine_ta(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int,
+    multiplier: float,
+) -> SupertrendResult:
+    """TradingView-exact manual Supertrend for the ``pine_*`` strategies.
 
-    The legacy loop uses ``alpha * tr[i] + (1 - alpha) * atr[i - 1]`` and
-    ``np.mean`` for the seed, which is *not* the same floating-point
-    operation order as the shared Wilder kernel. Keep this parity path
-    local to the preset so ``supertrend_custom_swings`` stays bit-identical
-    without forcing every RMA consumer onto the legacy order.
+    ``ta.atr(period)`` is Wilder/RMA with an SMA seed over the first
+    ``period`` valid true ranges and ``ta.tr(true)`` first-bar ``high-low``;
+    bands stay NaN through warm-up and the recursion ratchets/flips on the
+    previous/next close exactly as the Pine source does.
     """
-    high_v = high.to_numpy()
-    low_v = low.to_numpy()
-    close_v = close.to_numpy()
-    n = len(close_v)
-    tr = np.zeros(n)
-    for i in range(1, n):
-        tr[i] = max(
-            high_v[i] - low_v[i],
-            abs(high_v[i] - close_v[i - 1]),
-            abs(low_v[i] - close_v[i - 1]),
-        )
-    atr_values = np.zeros(n)
-    if period < n:
-        atr_values[period] = np.mean(tr[1 : period + 1])
-        alpha = 1.0 / period
-        for i in range(period + 1, n):
-            atr_values[i] = alpha * tr[i] + (1 - alpha) * atr_values[i - 1]
-    return pd.Series(atr_values, index=close.index, name="atr")
+    return supertrend(
+        high,
+        low,
+        close,
+        period,
+        multiplier,
+        atr_smoothing="wilder",
+        atr_seed="sma",
+        rule="pine",
+        atr_first_bar="hl",
+        atr_skipna=False,
+    )
 
 
 def supertrend_ramjet(
@@ -285,27 +322,15 @@ def supertrend_custom_swings(
     period: int,
     multiplier: float,
 ) -> SupertrendResult:
-    """Pine-style Supertrend of ``strategies/custom_swings_supertrend``.
+    """Pine ``ta.atr`` Supertrend of ``strategies/custom_swings_supertrend``.
 
-    The legacy ``_calc_atr`` returns ``0.0`` during warm-up and the
-    ``_calc_supertrend`` loop consumes it, so the bands ratchet around
-    ``hl2`` before the ATR is real. The preset passes the same ATR
-    explicitly via :func:`_custom_swings_atr`; ``result.lower_band``/
-    ``upper_band`` correspond to the legacy ``up_band``/``dn_band``.
+    The legacy ``_calc_atr``/``_calc_supertrend`` claimed ``ta.atr`` parity
+    but seeded TR with ``0.0`` and ratcheted bands around ``hl2`` through
+    warm-up; this preset uses the real ``ta.atr`` and NaN bands instead.
+    ``result.lower_band``/``upper_band`` correspond to the legacy
+    ``up_band``/``dn_band``.
     """
-    atr_values = _custom_swings_atr(high, low, close, period)
-    return supertrend(
-        high,
-        low,
-        close,
-        period,
-        multiplier,
-        atr_smoothing="wilder",
-        atr_seed="sma",
-        rule="pine",
-        atr_first_bar="nan",
-        atr=atr_values,
-    )
+    return supertrend_pine_ta(high, low, close, period, multiplier)
 
 
 def supertrend_pine_dema(
@@ -315,71 +340,123 @@ def supertrend_pine_dema(
     period: int,
     multiplier: float,
 ) -> SupertrendResult:
-    """Supertrend of ``strategies/pine_supertrend_dema`` (cross-condition).
+    """Pine ``ta.atr`` Supertrend of ``strategies/pine_supertrend_dema``.
 
-    Reproduces ``_calc_supertrend`` there, including the suspected port
-    bug: each band only ratchets while the previous close is beyond the
-    *opposite* band, and the TR seeds bar 0 with ``0.0`` inside the first
-    rolling-ATR window.
+    The legacy ``_calc_supertrend`` used a rolling SMA of a zero-seeded TR
+    and the suspected opposite-band ratchet; this preset is the
+    TradingView-faithful manual recursion.
     """
-    return supertrend(
-        high,
-        low,
-        close,
-        period,
-        multiplier,
-        atr_smoothing="sma",
-        atr_seed="sma",
-        rule="pine_dema",
-        atr_first_bar="zero",
-    )
+    return supertrend_pine_ta(high, low, close, period, multiplier)
 
 
-def supertrend_pine_superosc(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int,
-    multiplier: float,
-) -> SupertrendResult:
-    """Band/trend recursion inside ``_calc_supertrend_osc``.
-
-    Same band ratchet as the ``"pine"`` rule but the loop starts one bar
-    after the first valid ATR (the legacy ``range(length, ...)`` start)
-    and the TR seeds bar 0 with ``0.0``. The strategy consumes the
-    oscillator built on top — see :func:`superosc_vumanchu`.
-    """
-    return supertrend(
-        high,
-        low,
-        close,
-        period,
-        multiplier,
-        atr_smoothing="sma",
-        atr_seed="sma",
-        rule="pine_superosc",
-        atr_first_bar="zero",
-    )
-
-
-def superosc_vumanchu(
+def superosc_luxalgo(
     high: pd.Series,
     low: pd.Series,
     close: pd.Series,
     period: int,
     multiplier: float,
 ) -> pd.Series:
-    """The ``_calc_supertrend_osc`` oscillator of ``pine_superosc_vumanchu``.
+    """LuxAlgo ``SuperTrend Oscillator`` main oscillator.
 
-    ``clip((close - spt) / (upper - lower), -1, 1)`` with a ``1e-10``
-    denominator floor, ``spt`` the active band.
+    Reproduces the ``upper``/``lower``/``trend``/``Spt``/``osc`` chain of
+    the LuxAlgo Pine source: ``ta.atr`` bands off ``hl2``, same-band
+    ratchets on the previous close, direction flips on the current close
+    versus the *previous* bands (1 = bullish/lower, 0 = bearish/upper,
+    NaN until the first flip), and
+    ``clip((close - Spt) / (upper - lower), -1, 1)`` with Pine safe
+    division (zero width -> NaN).
     """
-    result = supertrend_pine_superosc(high, low, close, period, multiplier)
-    spt = result.lower_band.where(result.trend == 1, result.upper_band)
-    band_width = result.upper_band - result.lower_band
-    den = band_width.mask(band_width.abs() < 1e-10, 1e-10)
-    osc = ((close - spt) / den).clip(-1, 1)
-    return osc.astype(float)
+    atr_v = atr_pine_ta(high, low, close, period).to_numpy(dtype=float)
+    hl2_v = ((high + low) / 2.0).to_numpy(dtype=float)
+    close_v = close.to_numpy(dtype=float)
+    n = len(close_v)
+    upper = np.full(n, np.nan)
+    lower = np.full(n, np.nan)
+    trend = np.full(n, np.nan)
+    prev_upper = np.nan
+    prev_lower = np.nan
+    prev_trend = np.nan
+    for i in range(n):
+        a = atr_v[i]
+        src_i = hl2_v[i]
+        close_i = close_v[i]
+        close_prev = close_v[i - 1] if i > 0 else np.nan
+        raw_up = (
+            src_i + multiplier * a
+            if not (np.isnan(src_i) or np.isnan(a))
+            else np.nan
+        )
+        raw_lo = (
+            src_i - multiplier * a
+            if not (np.isnan(src_i) or np.isnan(a))
+            else np.nan
+        )
+        if (
+            not np.isnan(raw_up)
+            and not np.isnan(prev_upper)
+            and not np.isnan(close_prev)
+            and close_prev < prev_upper
+        ):
+            upper[i] = min(raw_up, prev_upper)
+        else:
+            upper[i] = raw_up
+        if (
+            not np.isnan(raw_lo)
+            and not np.isnan(prev_lower)
+            and not np.isnan(close_prev)
+            and close_prev > prev_lower
+        ):
+            lower[i] = max(raw_lo, prev_lower)
+        else:
+            lower[i] = raw_lo
+        if (
+            not np.isnan(close_i)
+            and not np.isnan(prev_upper)
+            and close_i > prev_upper
+        ):
+            trend[i] = 1.0
+        elif (
+            not np.isnan(close_i)
+            and not np.isnan(prev_lower)
+            and close_i < prev_lower
+        ):
+            trend[i] = 0.0
+        else:
+            trend[i] = prev_trend
+        prev_upper = upper[i]
+        prev_lower = lower[i]
+        prev_trend = trend[i]
+    spt = trend * lower + (1.0 - trend) * upper
+    width = upper - lower
+    with np.errstate(divide="ignore", invalid="ignore"):
+        osc = np.where(width == 0, np.nan, (close_v - spt) / width)
+    osc = np.clip(osc, -1.0, 1.0)
+    return pd.Series(osc, index=close.index, name="superosc", dtype=float)
+
+
+def wavetrend_vumanchu(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    channel_len: int,
+    avg_len: int,
+    ma_len: int,
+) -> tuple[pd.Series, pd.Series]:
+    """VuManChu WaveTrend ``(wt1, wt2)`` on Pine ``ta.ema``/``ta.sma``.
+
+    ``esa``/``de`` use the SMA-seeded ``ta.ema`` at ``channel_len``;
+    ``wt1`` is ``ta.ema(ci, avg_len)`` and ``wt2`` is ``ta.sma(wt1,
+    ma_len)``. Division by a zero ``0.015 * de`` follows Pine safe
+    division and yields NaN.
+    """
+    hlc3 = (high + low + close) / 3.0
+    esa = ema_pine_ta(hlc3, channel_len)
+    de = ema_pine_ta((hlc3 - esa).abs(), channel_len)
+    den = 0.015 * de
+    ci = (hlc3 - esa) / den.where(den != 0)
+    wt1 = ema_pine_ta(ci, avg_len)
+    wt2 = sma(wt1, ma_len)
+    return wt1.rename("wt1"), wt2.rename("wt2")
 
 
 # ── Registry of presets ────────────────────────────────────────────────
@@ -389,16 +466,20 @@ PRESETS: dict[str, Callable] = {
     "atr_mt5_iatr": atr_mt5_iatr,
     "atr_wilder_sma_seed": atr_wilder_sma_seed,
     "atr_sma_tr": atr_sma_tr,
+    "atr_pine_ta": atr_pine_ta,
     "atr_ema_span": atr_ema_span,
     "atr_wilder_rma_first": atr_wilder_rma_first,
     "ema_first_seed": ema_first_seed,
+    "ema_pine_ta": ema_pine_ta,
+    "dema_pine_ta": dema_pine_ta,
     "rsi_wilder": rsi_wilder,
     "rsi_wilder_masked": rsi_wilder_masked,
     "rsi_wilder_fill50": rsi_wilder_fill50,
     "supertrend_ramjet": supertrend_ramjet,
     "supertrend_chart": supertrend_chart,
+    "supertrend_pine_ta": supertrend_pine_ta,
     "supertrend_custom_swings": supertrend_custom_swings,
     "supertrend_pine_dema": supertrend_pine_dema,
-    "supertrend_pine_superosc": supertrend_pine_superosc,
-    "superosc_vumanchu": superosc_vumanchu,
+    "superosc_luxalgo": superosc_luxalgo,
+    "wavetrend_vumanchu": wavetrend_vumanchu,
 }

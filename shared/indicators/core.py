@@ -218,7 +218,10 @@ def _ema_valid(
             out_values[positions[0]] = previous
         start = 1
     for k in range(start, len(valid)):
-        previous = alpha * valid[k] + (1.0 - alpha) * previous
+        # Pine ``ta.ema`` measured law: ``prev + alpha * (x - prev)``. The
+        # algebraically equal ``alpha * x + (1 - alpha) * prev`` drifts from
+        # TradingView on more than half of the bars (PyneCore probe m558).
+        previous = previous + alpha * (valid[k] - previous)
         if k + 1 >= need:
             out_values[positions[k]] = previous
     return pd.Series(
@@ -466,7 +469,7 @@ def rsi(
 #: reproduces one existing implementation; see ``presets.py`` for the
 #: named parity profiles and ``tests/indicators`` for the
 #: characterisation evidence.
-SupertrendRule = Literal["pine", "pine_dema", "pine_superosc", "ta"]
+SupertrendRule = Literal["pine", "ta"]
 
 
 @dataclass(frozen=True)
@@ -490,91 +493,86 @@ class SupertrendResult:
     ready: pd.Series
 
 
-def _pine_band_step(
-    src_i: float,
-    close_prev: float,
-    lower_prev: float,
-    upper_prev: float,
-    atr_i: float,
-    multiplier: float,
-    band_condition: Literal["same", "cross"],
-) -> tuple[float, float]:
-    """One Pine-style band ratchet step (see :func:`_supertrend_pine`)."""
-    raw_low = src_i - multiplier * atr_i
-    raw_high = src_i + multiplier * atr_i
-    if band_condition == "same":
-        low_ok = close_prev > lower_prev
-        high_ok = close_prev < upper_prev
-    else:
-        low_ok = close_prev > upper_prev
-        high_ok = close_prev < lower_prev
-    lower = (
-        max(raw_low, lower_prev)
-        if low_ok and not np.isnan(lower_prev)
-        else raw_low
-    )
-    upper = (
-        min(raw_high, upper_prev)
-        if high_ok and not np.isnan(upper_prev)
-        else raw_high
-    )
-    return lower, upper
-
-
-def _pine_trend_step(
-    prev_trend: float, close_i: float, lower_prev: float, upper_prev: float
-) -> float:
-    """One Pine-style previous-band flip step."""
-    if prev_trend < 0 and close_i > upper_prev:
-        return 1.0
-    if prev_trend > 0 and close_i < lower_prev:
-        return -1.0
-    return prev_trend
-
-
 def _supertrend_pine(
     src: np.ndarray,
     close: np.ndarray,
     atr_values: np.ndarray,
     multiplier: float,
-    *,
-    band_condition: Literal["same", "cross"],
-    first_i: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Shared Pine-style band ratchet + previous-band flip.
+    """Pine ``ta.atr`` Supertrend (the manual ``up``/``dn``/``trend`` port).
 
-    ``band_condition="same"`` is the ``custom_swings_supertrend`` /
-    ``pine_superosc_vumanchu`` rule: each band only ratchets while the
-    previous close is beyond *that* band. ``"cross"`` is the
-    ``pine_supertrend_dema`` rule: a band only ratchets while the
-    previous close is beyond the *opposite* band.
+    This is the TradingView-faithful recursion used by the ``pine_*``
+    strategies: ``up``/``dn`` ratchet only while the previous close is beyond
+    *that same* band, with the ``nz(band[1], band)`` fallback to the current
+    raw band when no previous band exists, and the direction flips on the
+    current close versus those same reference bands. The direction starts
+    bullish and persists through the ATR warm-up; bands stay NaN until the
+    first usable ATR value.
     """
     n = len(close)
     lower = np.full(n, np.nan)
     upper = np.full(n, np.nan)
-    trend = np.full(n, np.nan)
-    # Both legacy Pine ports initialise trend to +1 and leave it untouched
-    # before the first computed bar.
-    trend[: max(first_i, 1)] = 1.0
+    trend = np.ones(n, dtype=float)
     prev_trend = 1.0
-    for i in range(first_i, n):
-        a = atr_values[i]
-        if np.isnan(a):
+    prev_lower = np.nan
+    prev_upper = np.nan
+    for i in range(n):
+        atr_i = atr_values[i]
+        src_i = src[i]
+        close_i = close[i]
+        close_prev = close[i - 1] if i > 0 else np.nan
+        raw_low = (
+            src_i - multiplier * atr_i
+            if not (np.isnan(src_i) or np.isnan(atr_i))
+            else np.nan
+        )
+        raw_high = (
+            src_i + multiplier * atr_i
+            if not (np.isnan(src_i) or np.isnan(atr_i))
+            else np.nan
+        )
+        up1 = prev_lower if not np.isnan(prev_lower) else raw_low
+        dn1 = prev_upper if not np.isnan(prev_upper) else raw_high
+
+        if (
+            not np.isnan(raw_low)
+            and not np.isnan(up1)
+            and not np.isnan(close_prev)
+            and close_prev > up1
+        ):
+            lower[i] = max(raw_low, up1)
+        else:
+            lower[i] = raw_low
+        if (
+            not np.isnan(raw_high)
+            and not np.isnan(dn1)
+            and not np.isnan(close_prev)
+            and close_prev < dn1
+        ):
+            upper[i] = min(raw_high, dn1)
+        else:
+            upper[i] = raw_high
+
+        if (
+            prev_trend < 0
+            and not np.isnan(close_i)
+            and not np.isnan(dn1)
+            and close_i > dn1
+        ):
+            trend[i] = 1.0
+        elif (
+            prev_trend > 0
+            and not np.isnan(close_i)
+            and not np.isnan(up1)
+            and close_i < up1
+        ):
+            trend[i] = -1.0
+        else:
             trend[i] = prev_trend
-            continue
-        lower[i], upper[i] = _pine_band_step(
-            src[i],
-            close[i - 1],
-            lower[i - 1],
-            upper[i - 1],
-            a,
-            multiplier,
-            band_condition,
-        )
-        trend[i] = _pine_trend_step(
-            prev_trend, close[i], lower[i - 1], upper[i - 1]
-        )
+
         prev_trend = trend[i]
+        prev_lower = lower[i]
+        prev_upper = upper[i]
     return trend, upper, lower
 
 
@@ -679,18 +677,10 @@ def supertrend(
 
     ``rule`` selects the recursion (see :data:`SupertrendRule`):
 
-    - ``"pine"``: the ``custom_swings_supertrend`` /
-      ``pine_superosc_vumanchu`` band ratchet — each band only tightens
-      while the previous close is beyond *that* band; flips compare the
-      close against the *previous* opposite band. Runs from bar 1.
-    - ``"pine_dema"``: the ``pine_supertrend_dema`` variant — a band only
-      ratchets while the previous close is beyond the *opposite* band
-      (the suspected port bug, preserved for parity). Runs from the first
-      bar after the first valid ATR.
-    - ``"pine_superosc"``: the ``pine_superosc_vumanchu`` band/trend
-      recursion — same ratchet and flip as ``"pine"``, but the loop
-      starts one bar after the first valid ATR (the legacy
-      ``range(length, ...)`` start) and bands stay NaN until then.
+    - ``"pine"``: the TradingView-faithful manual Supertrend used by the
+      ``pine_*`` strategies — same-band ratchet with the ``nz`` fallback,
+      direction flips on the current close versus the reference bands, and
+      a bullish initial state that persists through the ATR warm-up.
     - ``"ta"``: the RamJet/pandas_ta recursion — bands reset when the raw
       band crosses or the previous close is beyond the previous band;
       direction compares the close against the *current* band; pre-warm-up
@@ -736,22 +726,8 @@ def supertrend(
         else:
             ready_v = np.arange(n) >= first_valid + period
     else:
-        band_condition: Literal["same", "cross"] = "same"
-        first_i = 1
-        if rule in ("pine_dema", "pine_superosc"):
-            # Both legacy loops start at ``range(period, ...)`` /
-            # ``range(length, ...)`` regardless of where the first valid
-            # ATR lands; NaN ATR bars leave NaN bands until one is usable.
-            first_i = min(period, n)
-            if rule == "pine_dema":
-                band_condition = "cross"
         trend_v, upper_v, lower_v = _supertrend_pine(
-            src,
-            close_v,
-            atr_v,
-            multiplier,
-            band_condition=band_condition,
-            first_i=first_i,
+            src, close_v, atr_v, multiplier
         )
         ready_v = (
             (~np.isnan(trend_v))
