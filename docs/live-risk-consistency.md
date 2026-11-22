@@ -80,6 +80,13 @@ Risk policy comes exclusively from deployment/runtime config (`RiskConfig`), sta
 (`current_positions`, `current_exposure`) from the portfolio/broker source of truth. The
 former `qty`/`explicit_qty` bypass around the whole risk engine is removed;
 `size_live_signal_for_submission` sizes every live signal through `RiskEngine`.
+State fail-closed (#263): a broker position whose `qty` is unreadable (not numeric,
+`nan`/`inf`, missing, or Alpaca's `qty_unparseable` marker) is no longer counted as 0 -
+that would read as "the account is flat", and the next entry would be sized against an
+empty book although `max_positions` or `max_total_exposure` are already full. The count
+raises `UnreadableBrokerPositionQtyError`, the entry is refused (nothing goes to the
+broker) and an operator gets an ERROR alert. Exit orders are not affected: they size
+against the deployment's own ledger, not against the count.
 
 ## Broker Pip Value (#146)
 
@@ -222,23 +229,56 @@ signals; refused ones are not persisted yet, only logged).
 On entries, payload values under these keys are overwritten; on exits (which run no gate)
 they are removed. A schema for quote snapshots (of refused signals too) is #134.
 
+## Kill Switch (#300)
+
+Before every entry `prepare_order_with_risk()` refuses the order when the account is
+halted (`live_runner.kill_switch.refuse_entry_while_halted`). The check sits **after** the
+exit branch, so it never blocks closing a position, and **before** any broker access: a
+halted account costs no round trip.
+
+The state lives in `live_kill_switch` (one row per scope: `global` plus one per live
+account) and is re-read on every entry and on every tick - no process cache, or a restart
+would lift the halt. The strictest mode wins (`entries` < `orders` < `flatten`); an account
+scope can never soften a global halt.
+
+Fail closed deliberately means the cheap side here: an unreadable state or a mode that
+cannot be interpreted refuses entries and does not touch the broker. An empty read cannot
+be told apart from "nothing is halted" - the one answer a kill switch must never produce
+by accident.
+
+Set, lift and read: `scripts/live_kill_switch.py` (CLI) and `/api/live/kill-switch`
+(viewer); operating details in `docs/live-deploy-runbook.md`.
+
 ## Commission Sign (#184 finding 14)
 
-`live_executions.commission` is a **positive cost value** on **all** brokers (fee =
-positive, rebate = negative, known-null = `0.0`; only the cTrader path can store a rebate,
-`apply_live_execution_commissions` (Alpaca CFEE) refuses negative values). Net P&L is
+`live_executions.commission` is a **non-negative cost value** on **all** brokers (fee =
+positive, known-null = `0.0`; #285). Net P&L is
 `gross - commission` everywhere (viewer, `net_pnl`, Alpaca CFEE backfill from #143).
 Adapters normalize before storing: cTrader reports `ProtoOADeal.commission` as a signed
-cash flow (fee negative) and is negated via `base_adapter.commission_cost`; Alpaca reports
+cash flow (fee negative) and is negated via `base_adapter.commission_from_signed_cash_flow`; Alpaca reports
 no commission (known null `0.0` or NULL, see #124) and backfills CFEE as a positive cost.
+Since #285 the value is guarded on the write side: `LiveExecution.commission` validates
+through `shared.models.validate_commission_cost` (`mode="before"`; `bool` and numeric
+strings are refused too) and raises `ValidationError` on a negative or non-finite value;
+at the persistence threshold `LiveExecutionModel.from_live_execution` checks again and
+raises `ValueError`. Only this funnel is guarded - a direct `LiveExecutionModel(...)` or
+`session.add` does not validate. `commission_from_signed_cash_flow` is the only permitted
+conversion of the sign convention; its negative result (i.e. a cTrader rebate) is stored
+by the adapter as `commission=NULL` ("fee unknown") plus an ERROR log so the fill is not
+lost - how a rebate should actually be represented is an open maintainer decision.
+`apply_live_execution_commissions` (Alpaca CFEE) refuses negative values as well. The read
+path (`LiveExecutionModel.to_live_execution`) builds a `LiveExecution` and so validates
+again; it currently has no production callers - the net-P&L readers consume the raw
+`live_executions` rows directly.
 Already-stored cTrader rows (before this change) carried the raw negative sign; `init_db`
 converts them once via migration (`_migrate_ctrader_commission_to_cost`, `abs` of the
 stored value) into a positive cost. Only accounts with broker `ctrader` are affected;
 NULL (unknown) and `0.0` stay. The migration is recorded in `schema_data_migrations` and
-runs exactly once: a second `abs` would turn a rebate stored by the corrected adapter
-(negative) into a fee. A cTrader rebate stored before the change (raw positive) cannot be
-distinguished from a new fee and stays positive.
-`commission_cost` refuses non-finite values with `ValueError` (no silent `0.0`).
+runs exactly once: since #285 no negative value can be written any more, but a second
+`abs` would needlessly touch an already converted value. A cTrader rebate stored before
+the change (raw positive) cannot be distinguished from a new fee and stays positive.
+`commission_from_signed_cash_flow` refuses non-finite values with `ValueError` (no silent
+`0.0`).
 Deployment note: stop the daemon before the first start of the new build (see
 `docs/live-deploy-runbook.md`); an old build that still writes a raw negative fee after
 the migration record is no longer converted.

@@ -1309,6 +1309,95 @@ def test_live_preflight_crash_path_redacts_expanded_values_in_json(
     ]
 
 
+def test_preflight_main_uses_accounts_env_flag_for_result_and_redaction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--accounts-env`` must reach the same file the crash redaction reads.
+
+    ``--accounts-env`` defaults to ``None``, so the resolver - not argparse - picks the file.
+    If ``main()`` kept using the raw argument for redaction, a crash could print a credential
+    from the named file while the result named the default.
+    """
+    import json
+
+    import live_runner.preflight as preflight
+    from shared import logging as shared_logging
+
+    monkeypatch.delenv("PREFLIGHT_TEST_SECRET_REF", raising=False)
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml",
+        """
+        accounts:
+          - id: alpaca-paper
+            broker: alpaca
+
+        deployments:
+          - strategy_name: equity_momentum
+            account_id: alpaca-paper
+            symbols: [AAPL]
+            timeframe: 1h
+            signal_source: discord
+            signal_config:
+              channel_id: "${PREFLIGHT_TEST_SECRET_REF}"
+        """,
+    )
+    accounts_env = tmp_path / "override.accounts.env"
+    accounts_env.write_text(
+        f"PREFLIGHT_TEST_SECRET_REF={_SECRET_REF_VALUE}\n", encoding="utf-8"
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"deployment check saw {_SECRET_REF_VALUE}")
+
+    monkeypatch.setattr(preflight, "_validate_deployments", _boom)
+    monkeypatch.setattr(shared_logging, "_loggers", {})
+    monkeypatch.setattr(shared_logging, "_console_stream_name", "stdout")
+    monkeypatch.setattr(shared_logging, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(preflight, "logger", shared_logging.get_logger("preflight-override"))
+
+    rc = preflight.main(
+        ["--config", str(config_path), "--accounts-env", str(accounts_env)]
+    )
+
+    captured = capsys.readouterr()
+    assert _SECRET_REF_VALUE not in captured.out
+    document = json.loads(captured.out)
+    assert rc == 1
+    assert document["accounts_env_path"] == str(accounts_env)
+    assert document["deployment_errors"] == [
+        "RuntimeError: deployment check saw ${PREFLIGHT_TEST_SECRET_REF}"
+    ]
+
+
+def test_preflight_main_ignores_a_stale_tp_accounts_env(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """There is no environment override: a stale ``TP_ACCOUNTS_ENV`` changes nothing.
+
+    The variable named a real credential file for whichever reader honoured it, so an env-var
+    override gave two components different views of the accounts file. Only ``--accounts-env``
+    and the module default resolve a path now.
+    """
+    import json
+
+    import live_runner.preflight as preflight
+
+    config_path = _write_config(
+        tmp_path / "live_deployments.yaml", "accounts: []\ndeployments: []\n"
+    )
+    monkeypatch.setenv("TP_ACCOUNTS_ENV", str(tmp_path / "stale.accounts.env"))
+
+    rc = preflight.main(["--config", str(config_path)])
+
+    document = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert document["accounts_env_path"] == str(preflight.DEFAULT_ACCOUNTS_ENV)
+
+
 def test_live_preflight_unreadable_config_crash_redacts_all_expansion_values(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

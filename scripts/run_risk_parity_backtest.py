@@ -598,20 +598,30 @@ def run_backtest(
     portfolio_value_at_rebalance = float(initial_cash)
     last_rebalance_value_date = returns.index[0]
 
-    def advance_portfolio_value(rebalance_date: pd.Timestamp) -> dict[str, float]:
-        """Mark the previous rebalance's holdings to market through the rebalance date.
+    def _drift_weights(end_bar: pd.Timestamp) -> tuple[dict[str, float], float]:
+        """Drift ``current_weights`` from ``last_rebalance_value_date`` through ``end_bar``.
 
-        Positions are held (buy-and-hold), so a leg's weight drifts with its own price.
-        Returns the drifted weights; updates ``portfolio_value_at_rebalance``.
+        Pure mark-to-market: returns ``(drifted_weights, portfolio_growth)`` and
+        does not touch ``portfolio_value_at_rebalance`` /
+        ``last_rebalance_value_date`` — the caller commits those. Positions are
+        held (buy-and-hold), so a leg's weight drifts with its own price.
         """
-        nonlocal portfolio_value_at_rebalance, last_rebalance_value_date
-        growth = compounded_growth(returns, last_rebalance_value_date, rebalance_date)
+        growth = compounded_growth(returns, last_rebalance_value_date, end_bar)
         grown = {t: current_weights[t] * growth[t] for t in TICKERS}
         cash_weight = 1.0 - sum(current_weights.values())
         total = cash_weight + sum(grown.values())
+        return {t: grown[t] / total for t in TICKERS}, total
+
+    def advance_portfolio_value(rebalance_date: pd.Timestamp) -> dict[str, float]:
+        """Mark the previous rebalance's holdings to market through the rebalance date.
+
+        Returns the drifted weights; updates ``portfolio_value_at_rebalance``.
+        """
+        nonlocal portfolio_value_at_rebalance, last_rebalance_value_date
+        drifted_weights, total = _drift_weights(rebalance_date)
         portfolio_value_at_rebalance *= total
         last_rebalance_value_date = rebalance_date
-        return {t: grown[t] / total for t in TICKERS}
+        return drifted_weights
 
     def execution_price(ticker: str, date: pd.Timestamp) -> float:
         """Fill at the rebalance-day close (QuantConnect MarketOnClose).
@@ -644,15 +654,40 @@ def run_backtest(
             )
             continue
         interval_start_portfolio_value = portfolio_value_at_rebalance
+        # QC evaluates the 2% drifted-weight gate at 10:00 (AfterMarketOpen 30), i.e. on
+        # HoldingsValue/TotalPortfolioValue marked through the PREVIOUS close. The
+        # rebalance day's own return only reaches the MarketOnClose fill at
+        # ``reb_date``'s close, so it must not move the gate: marking the gate basis
+        # through ``reb_date``'s close is a one-day look-ahead that trades on a move
+        # the 10:00 decision could not observe (#259). Computed BEFORE
+        # ``advance_portfolio_value`` moves ``last_rebalance_value_date`` to
+        # ``reb_date``; the published portfolio value still marks through
+        # ``reb_date``'s close.
+        gate_loc = returns.index.get_loc(reb_date)
+        gate_bar = returns.index[gate_loc - 1]
+        # ``_price_returns`` drops a bar (and the next) when any ticker's close is
+        # missing, so the gate mark can be older than QC's previous-session snapshot.
+        # Not look-ahead — just staler than the 10:00 HoldingsValue read — but it must
+        # be visible rather than silent.
+        prev_session_bar = prices.index[prices.index.get_loc(reb_date) - 1]
+        if gate_bar != prev_session_bar:
+            logger.warning(
+                "Rebalance %s: the 2%% drift gate marks through %s, not the previous "
+                "session %s — dropped return bars (missing closes) make the snapshot "
+                "staler than QC's 10:00 HoldingsValue read",
+                reb_date.date(),
+                gate_bar.date(),
+                prev_session_bar.date(),
+            )
+        gate_weights, _ = _drift_weights(gate_bar)
         drifted_weights = advance_portfolio_value(reb_date)
         current_portfolio_value = portfolio_value_at_rebalance
         # QC's Rebalance runs at 10:00 (AfterMarketOpen 30) on daily data: History() and the
         # SMA only contain bars up to the PREVIOUS close, while the MarketOnClose fill happens
         # at ``reb_date``'s close. The decision window therefore ends before ``reb_date``'s own
         # return; using it would be a one-day look-ahead (it flips the hedge in 2020-03/2022-03).
-        loc = returns.index.get_loc(reb_date)
-        hist_start = max(0, loc - lookback_corr)
-        ret_matrix = returns.iloc[hist_start:loc].T.values
+        hist_start = max(0, gate_loc - lookback_corr)
+        ret_matrix = returns.iloc[hist_start:gate_loc].T.values
         if ret_matrix.shape[1] < lookback_corr:
             logger.warning(
                 "Rebalance %s: covariance window has %d of %d return observations "
@@ -736,7 +771,12 @@ def run_backtest(
             # Weight at the last rebalance (attribution) vs weight now (QC's trade gate:
             # ``Portfolio[symbol].HoldingsValue / TotalPortfolioValue``).
             held_weight = current_weights.get(ticker, 0.0)
-            prev_weight = drifted_weights[ticker]
+            # Two marks of the same book: ``gate_weight`` through the previous close is
+            # the snapshot QC's 10:00 decision reads (the 2% gate, the trade delta and
+            # the realized-PnL check all key off it, #259); ``book_weight`` through
+            # ``reb_date``'s close is the post-fill weight carried into ``next_weights``.
+            book_weight = drifted_weights[ticker]
+            prev_weight = gate_weights[ticker]
             if last_processed_reb_date is not None and held_weight:
                 attribution_price = float(prices[ticker].loc[reb_date])
                 attribution_prev_price = float(prices[ticker].loc[last_processed_reb_date])
@@ -748,13 +788,12 @@ def run_backtest(
                 )
                 rebalance_attribution_pnls.append(round(attribution_pnl, 2))
 
-            # Gate basis: the drifted weight marked through ``reb_date``'s close (same bar the
-            # MOC fill uses). QC evaluates HoldingsValue/TotalPortfolioValue at 10:00, i.e.
-            # through the previous close; the residual is documented in
-            # docs/comparison-matrix-change-notes.md (#188).
+            # Gate basis: ``prev_weight`` marked through the previous close — the same
+            # HoldingsValue/TotalPortfolioValue snapshot QC reads at 10:00 (#259).
+            # ``reb_date``'s own close is only visible to the MOC fill, not the decision.
             delta = weights[ticker] - prev_weight
             if abs(delta) <= rebalance_threshold:
-                next_weights[ticker] = prev_weight  # position kept, weight carried as drifted
+                next_weights[ticker] = book_weight  # position kept, weight carried as drifted
                 continue
 
             price = execution_price(ticker, reb_date)
@@ -848,6 +887,7 @@ def run_backtest(
         "portfolio_value": portfolio_value,
         "portfolio_target_signals": portfolio_target_signals,
         "trades": trades,
+        "rebalance_schedule": rebalance_schedule,
         "stats": stats,
         "initial_capital": float(initial_cash),
     }
