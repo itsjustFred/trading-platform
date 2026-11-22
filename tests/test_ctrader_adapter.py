@@ -1,4 +1,5 @@
 import asyncio
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from live_runner.ctrader_adapter import (
+    _EXECUTION_RECONCILE_WAKE,
     CTraderApiError,
     CTraderAuthTerminalError,
     CTraderLiveAdapter,
@@ -350,6 +352,64 @@ def test_stale_execution_callback_cannot_request_reconciliation() -> None:
     adapter._on_message(object(), SimpleNamespace(payloadType=200))
 
     assert adapter._reconciliation_required is False
+
+
+def test_execution_payload_decode_failure_requires_reconciliation() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+    current_client = object()
+    adapter._client = current_client
+    adapter._execution_payload_type = 200
+    adapter._heartbeat_payload_type = -1
+
+    def extract(_message):
+        raise ValueError("undecodable execution payload")
+
+    adapter._Protobuf = SimpleNamespace(extract=extract)
+    # Seed a positive retry time so the == 0.0 reset below is observable.
+    adapter._reconciliation_retry_at = time.monotonic() + 100
+
+    adapter._on_message(current_client, SimpleNamespace(payloadType=200))
+
+    assert adapter._reconciliation_required is True
+    assert adapter._reconciliation_retry_at == 0.0
+    # The listener is woken through a sentinel so reconciliation is not left
+    # waiting out the 30 s queue timeout.
+    assert adapter._execution_queue.get_nowait() is _EXECUTION_RECONCILE_WAKE
+
+
+def test_symbol_props_fetch_failure_fails_closed() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    async def fail_send(_request, *, timeout_seconds: int = 15):
+        raise RuntimeError("symbol props unavailable")
+
+    adapter._send_request_with_refresh_retry = fail_send
+
+    with pytest.raises(RuntimeError, match="symbol props unavailable"):
+        asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 1}))
+
+    assert adapter._symbol_props == {}
+
+
+def test_symbol_props_unexpected_response_fails_closed() -> None:
+    """A non-ProtoOASymbolByIdRes reply must abort auth, not use fallback scales."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="1"
+    )
+
+    async def wrong_send(_request, *, timeout_seconds: int = 15):
+        return object()
+
+    adapter._send_request_with_refresh_retry = wrong_send
+
+    with pytest.raises(RuntimeError, match="Unexpected symbol-props response"):
+        asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 1}))
+
+    assert adapter._symbol_props == {}
 
 
 def test_unmapped_execution_fill_is_not_acknowledged_as_persisted(monkeypatch) -> None:
