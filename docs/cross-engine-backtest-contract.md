@@ -221,7 +221,12 @@ The workflow's level exits — the stop before and after TP1, and the TP1
 tranche — follow the §1 gap rule (#287): a bar
 that opens beyond the level fills at the open (`contract.resolve_protective_exit`,
 gap checked before the stop-first same-bar policy), an intrabar touch at the
-level. The entry bar is never evaluated (the fill bar's close is the entry and
+level. One qualification inside the TP1 bar: a bar that gaps through TP1
+fills the tranche at the open, but the remainder's pre-TP1 stop — still
+working live until the breakeven amendment takes effect on the next bar —
+is checked against the rest of that bar's range, so a later same-bar trade
+through it stops the remainder at the stop level. The entry bar is never
+evaluated (the fill bar's close is the entry and
 `last_checked_at` starts there), so no `allow_gap=False` exemption is needed.
 
 **Pynecore restatement containment.** `_normalize_trade_exits` tightens a

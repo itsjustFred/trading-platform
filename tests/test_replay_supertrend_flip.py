@@ -448,14 +448,36 @@ def test_a_gap_past_the_stop_beats_a_later_same_bar_tp1_touch(monkeypatch) -> No
     assert trade.meta["supertrend_flip"]["tp1_time"] is None
 
 
-def test_a_gap_through_tp1_beats_a_later_same_bar_stop_touch(monkeypatch) -> None:
-    """The other half of gap-beats-same-bar: the bar opens ABOVE TP1 (111 >
-    110) and later trades down through the stop (low 94 < 95). The open is the
-    bar's first event, so TP1 fills at 111 and the remainder survives — a
-    regression to plain ``resolve_same_bar_exit`` would stop the whole
-    position out at 95 instead."""
+def test_a_gap_through_tp1_fills_the_tranche_then_stops_the_remainder(
+    monkeypatch,
+) -> None:
+    """The bar opens ABOVE TP1 (111 > 110): the TP1 tranche fills at the open,
+    and the remainder's still-working pre-TP1 stop (95) fires later in the
+    same bar when its low reaches 94 — live the remainder sits in an OTO
+    whose initial stop works all bar and the breakeven amendment only takes
+    effect next bar (#176). The tranche fill is not a gap through the stop,
+    so the remainder exits AT the stop level, not the open."""
     gap_tp1_then_stop = (111.0, 112.0, 94.0, 105.0)
     frame = _frame([ENTRY_BAR, gap_tp1_then_stop, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["tp1", "stop_loss"]
+    assert trade.exits[0].price == 111.0
+    assert trade.exits[0].time == _times(frame, 1)
+    remainder = trade.exits[1]
+    assert remainder.price == STOP
+    assert remainder.time == _times(frame, 1)
+    assert remainder.pnl == pytest.approx((STOP - ENTRY) * remainder.quantity)
+
+
+def test_a_gap_through_tp1_spares_the_remainder_above_the_stop(
+    monkeypatch,
+) -> None:
+    """Same gap, but the bar's low (96) stays above the pre-TP1 stop (95):
+    the remainder survives the TP1 bar and the dead-bar rule applies."""
+    gap_tp1_above_stop = (111.0, 112.0, 96.0, 105.0)
+    frame = _frame([ENTRY_BAR, gap_tp1_above_stop, _flat(), _flat()])
     _stub_supertrend(monkeypatch, "rrrr")
     trade = _run(frame).trades[0]
 

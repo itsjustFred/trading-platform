@@ -79,6 +79,11 @@ pro Bot.
       Stop), zählt der OPEN als erstes Ereignis der Kerze — der durchbrochene
       Level füllt zum OPEN (`resolve_protective_exit` prüft die Lücke vor der
       Stop-zuerst-Regel), auch wenn die Kerze später den anderen Level berührt.
+      Ausnahme innerhalb der Flip-Logik: nach einem TP1-Gap bleibt der Rest der
+      Position mit seinem ursprünglichen Stop für den Rest derselben Kerze
+      geschützt — der OTO-Stop steht auf dem Ausgangslevel und die
+      Breakeven-Änderung greift erst ab der nächsten Kerze; ein späterer
+      Same-Bar-Trade durch den Stop schließt den Rest zum Stop-Preis.
     - Supertrend: dieselbe Implementierung wie der Processor (`calculate_supertrend`), mit
       `supertrend_period`/`supertrend_multiplier` aus `trailing_sl_config`, nur aus geschlossenen
       Kerzen.

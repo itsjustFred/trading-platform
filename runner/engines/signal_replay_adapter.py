@@ -772,6 +772,29 @@ class SignalReplayAdapter:
         )
         if trade is not None:
             return trade
+        # A gap through TP1 makes the open the bar's first event, but the
+        # bar's remaining range is still live for the remainder: live keeps
+        # the remainder's ORIGINAL stop working all bar (the breakeven
+        # amendment only takes effect on the next bar, #176), so a later
+        # same-bar trade through that stop exits the remainder at the stop
+        # level. The fill cannot itself be a gap — the open already sat
+        # beyond TP1, on the stop's safe side. An intrabar (non-gap) TP1
+        # fill needs no check: ``resolve_same_bar_exit`` only returns "tp"
+        # when the stop was not touched.
+        if gapped and stop_price is not None:
+            stopped = (
+                low <= stop_price
+                if position.direction == "LONG"
+                else high >= stop_price
+            )
+            if stopped:
+                return self._close_position(
+                    position,
+                    exit_time=bar_time,
+                    exit_price=float(stop_price),
+                    exit_reason="stop_loss",
+                    exit_bar_index=index,
+                )
         # The TP1 bar after the TP1 fill is dead for the workflow: its close is
         # not read (no activation, no flip) and its range is not checked against
         # the stop moved on it — the next bar's intrabar pass is the first one
