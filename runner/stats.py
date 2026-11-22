@@ -670,6 +670,14 @@ def _daily_returns_series_from_equity_curve(
     days the venue was closed, whose forward-filled equity can only produce
     a zero return — before the ratios are computed. ``None`` keeps every
     calendar day.
+
+    The filter is applied to the equity LEVELS, not the returns: a real P&L
+    print on a venue-closed UTC day (an FX book's Sunday-evening session, or
+    weekend crypto inside a mixed book) must fold into the next trading
+    day's return rather than be deleted, so the filtered series still
+    compounds to the run's total return. The last observed day is always
+    kept — a curve ending mid-session carries that day's P&L even though
+    the venue's daily bar has not closed yet.
     """
     if len(equity_curve) < 2:
         return None
@@ -682,6 +690,13 @@ def _daily_returns_series_from_equity_curve(
         series = pd.Series(equities, index=timestamps, dtype=float).sort_index(kind="stable")
         series = series.groupby(level=0).last()
         daily_equity = series.resample("D").last().ffill()
+        if trading_dates is not None:
+            last_observed_day = daily_equity.index[-1]
+            keep = [
+                timestamp.date() in trading_dates or timestamp == last_observed_day
+                for timestamp in daily_equity.index
+            ]
+            daily_equity = daily_equity.loc[keep]
         previous = daily_equity.shift(1)
         # The curve's first observation is the OPENING equity of its first day,
         # and therefore the base of that day's return. Resampling to the last
@@ -695,15 +710,17 @@ def _daily_returns_series_from_equity_curve(
         # measure and must not be given a synthetic flat one.
         first_day = series.index[0].normalize()
         observations_on_first_day = int((series.index.normalize() == first_day).sum())
-        if observations_on_first_day >= 2 and daily_equity.index[0] == first_day:
+        if daily_equity.index[0] == first_day:
+            if observations_on_first_day >= 2:
+                previous.iloc[0] = float(series.iloc[0])
+        else:
+            # The first kept day is not the curve's first day (leading
+            # venue-closed days were filtered out): measure its return from
+            # the curve's opening equity so P&L accrued before it is not lost.
             previous.iloc[0] = float(series.iloc[0])
         returns = (daily_equity - previous) / previous
         returns.loc[previous <= 0] = pd.NA
         returns = returns.replace([math.inf, -math.inf], pd.NA).dropna()
-        if trading_dates is not None:
-            returns = returns[
-                [timestamp.date() in trading_dates for timestamp in returns.index]
-            ]
         return returns if not returns.empty else None
     except Exception:
         logger.debug("Could not build daily returns series from equity curve", exc_info=True)
