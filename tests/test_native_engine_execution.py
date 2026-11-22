@@ -98,7 +98,10 @@ def test_fixed_risk_leverage_cap_floors_to_lot_step():  # Issue #151
     )
 
     assert quantity == pytest.approx(0.3)
-    assert quantity % 0.1 == pytest.approx(0.0, abs=1e-12)
+    # On the 0.1 grid: the shared decimal floor returns the clean grid value
+    # 0.3, for which `quantity % 0.1` is itself float noise -- check that the
+    # floor is the identity instead (#278).
+    assert _floor_to_lot_grid(quantity, 0.1) == quantity
 
 
 def test_fixed_risk_leverage_cap_below_min_lot_skips_trade():  # Issue #151
@@ -154,9 +157,10 @@ def test_fixed_risk_uncapped_path_is_unchanged_by_cap_normalisation():  # Issue 
 
 def test_fixed_risk_uncapped_size_is_not_floored_a_second_time():  # Issue #151
     # A plain `math.floor` of `k * lot_step / lot_step` loses a step for this
-    # k: the quotient lands an ulp below k. `_floor_to_lot_grid` snaps the
-    # same fixture back to `k * lot_step` (its relative 1e-9 band covers the
-    # ulp), so re-flooring an on-grid uncapped size is idempotent and this
+    # k: the quotient lands an ulp below k. `_floor_to_lot_grid` (the shared
+    # decimal floor, #278) snaps the same fixture back to `k * lot_step` --
+    # its 1e-6-of-a-step noise band covers the ulp -- so re-flooring an
+    # on-grid uncapped size is idempotent and this
     # test alone does NOT pin the `shares < uncapped_shares` guard. What the
     # guard protects is an uncapped size raised to an off-grid `min_lot` --
     # pinned by `test_fixed_risk_uncapped_size_raised_to_min_lot_is_not_regridded`,
@@ -304,7 +308,9 @@ def test_fixed_risk_max_lot_off_grid_is_floored_to_lot_step():  # Issue #151
     )
 
     assert quantity == pytest.approx(99.9)
-    assert quantity % 0.1 == pytest.approx(0.0, abs=1e-9)
+    # On the 0.1 grid: `quantity % 0.1` is float noise for the clean decimal
+    # grid value 99.9, so check that the floor is the identity (#278).
+    assert _floor_to_lot_grid(quantity, 0.1) == quantity
 
 
 def test_fixed_risk_max_lot_on_grid_is_not_floored_below_itself():  # Issue #151
@@ -497,8 +503,9 @@ def test_floor_to_lot_grid_never_exceeds_size_by_more_than_the_band():  # Issue 
     # (the grid multiple a float product already represents), and that is
     # what keeps a cap exact: an on-grid `max_lot` must not floor one whole
     # lot below itself. Pin the documented bound instead of a strict floor:
-    # the overshoot never exceeds the relative band
-    # (`1e-9 * max(1, |quotient|)`), so a capped value is only ever read as
+    # since #278 the shared decimal floor's overshoot is bounded by its noise
+    # band (1e-6 of a step, `shared.lot_grid._STEP_NOISE`), far below any
+    # broker's quantity resolution, so a capped value is only ever read as
     # the grid multiple it already was. A strict floor would instead cut an
     # on-grid cap by a lot (`25602 * 0.01` -> 256.01, see
     # `test_fixed_risk_max_lot_on_grid_is_not_floored_below_itself`) and drop
@@ -509,7 +516,7 @@ def test_floor_to_lot_grid_never_exceeds_size_by_more_than_the_band():  # Issue 
     floored = _floor_to_lot_grid(size, _NON_IDEMPOTENT_LOT_STEP)
 
     assert floored == pytest.approx(grid_multiple)
-    assert floored - size <= 1e-9 * size
+    assert floored - size <= 1e-6 * _NON_IDEMPOTENT_LOT_STEP
 
 
 def test_fixed_risk_max_lot_without_lot_step_applies_raw():  # Issue #151

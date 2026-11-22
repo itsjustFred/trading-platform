@@ -55,7 +55,6 @@ from live_runner.exit_signals import (
     is_exit_intent,
     is_exit_order,
     resolve_exit_order,
-    round_exit_qty_down,
     usable_qty_tolerance,
 )
 from live_runner.promotion import (
@@ -114,6 +113,7 @@ from shared.database import (
 )
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
+from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     LiveAccountConfig,
     LiveBalanceRecord,
@@ -1390,7 +1390,7 @@ def _round_exit_qty_to_adapter_step(
     if not callable(method):
         return float(qty)
     step = float(method(symbol))
-    rounded = round_exit_qty_down(qty, step)
+    rounded = floor_qty_to_step(qty, step)
     if rounded <= 0.0:
         raise ExitBelowStepError(
             f"Exit for {symbol} ignored: the requested {qty:g} is below the "

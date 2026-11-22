@@ -359,15 +359,17 @@ def test_bug3b_tick_sizing_matches_mt5_and_clamps():
 def test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon():
     # Pin the documented divergence between the two lot-floor rules of the
     # parity pair (the generator's docstring cites this test): the generator
-    # keeps MT5's ABSOLUTE `+ 1e-12` in the quotient, the engine snaps with a
-    # RELATIVE 1e-9 band. They disagree on exactly the sizes whose quotient
-    # is more than 1e-12 (absolute) off an integer step while still inside
-    # the engine's relative band -- the `k * lot_step` ulp case from step
-    # counts of a few thousand and up.
+    # keeps MT5's ABSOLUTE `+ 1e-12` in the quotient, while the engine's
+    # shared decimal floor (#278, `shared.lot_grid.floor_qty_to_step`) works
+    # on the exact `repr` decimals with a 1e-6-of-a-step noise band. They
+    # disagree on exactly the sizes whose float quotient lands an ulp off
+    # an integer step -- the `k * lot_step` ulp case from step counts of a
+    # few thousand and up.
 
     # 25602 * 0.01 is the double nearest 256.02, but dividing it back by the
-    # step lands an ulp pair below 25602 (off by ~4e-12 -- above the
-    # generator's absolute epsilon, far inside the engine's relative band).
+    # step in float lands an ulp pair below 25602 -- off by ~4e-12, above
+    # the generator's absolute epsilon. The engine's decimal floor reads the
+    # `repr` of the size ('256.02'), so its quotient is exactly 25602.
     ulp_low = 25602 * 0.01
     assert ulp_low / 0.01 < 25602
     assert 25602 - ulp_low / 0.01 > 1e-12
