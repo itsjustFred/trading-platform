@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 # All exposure values are FRACTIONS OF ACCOUNT EQUITY in [0, 1]:
 #   - max_risk_per_trade: maximum loss on a single trade (as a fraction of
@@ -61,7 +62,7 @@ class RiskConfig:
             raise ValueError("max_notional_per_trade must be > 0 and <= 1")
 
     @staticmethod
-    def _finite_float(value: object, field_name: str) -> float:
+    def _finite_float(value: Any, field_name: str) -> float:
         if isinstance(value, bool):
             raise ValueError(f"{field_name} must be numeric")
         try:
@@ -73,7 +74,7 @@ class RiskConfig:
         return parsed
 
     @staticmethod
-    def _positive_int(value: object, field_name: str) -> int:
+    def _positive_int(value: Any, field_name: str) -> int:
         if isinstance(value, bool):
             raise ValueError(f"{field_name} must be an integer")
         try:

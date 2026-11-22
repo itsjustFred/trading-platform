@@ -285,7 +285,6 @@ def test_run_reports_timeout_reason_not_kill_exit_code(
     assert isinstance(thread, threading.Thread), f"task {task_id} has no worker thread"
     thread.join(timeout=30)
     assert not thread.is_alive(), "backtest worker did not reach a terminal state"
-
     task = viewer_app_module.DATA_TASKS[task_id]
     assert task["status"] == "failed"
     error_text = str(task.get("error") or "")

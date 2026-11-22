@@ -7,13 +7,14 @@ Universal backtesting framework — run strategies across multiple engines (vect
 ```bash
 # Clone and setup
 git clone <repo-url> && cd trading-platform
-python -m venv .venv
 
-# Activate virtual environment
+# Install dependencies (the locked environment; CI runs uv sync --frozen --all-extras)
+uv sync --all-extras
+
+# Alternative without uv: a virtualenv plus a pip install
+python -m venv .venv
 source .venv/bin/activate        # Linux/macOS / Git Bash
 # .venv\Scripts\activate         # Windows (PowerShell / cmd)
-
-# Install dependencies
 pip install -e ".[all]"
 # or: pip install -r requirements.txt
 
@@ -90,17 +91,15 @@ python -m runner.converters.cli lean path/to/lean_result.json -o output.trades.j
 # Build data catalog
 python -m data_tools.catalog_builder -o "$DATA_DIR/catalog.json"
 
-# Migrate CSV data to Parquet
-python -m data_tools.migrate_csv --execute
-
 # Grid testing for strategy optimization
-python -m runner.backtest_grid --strategy strategies/example_sma.py --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
+python -m runner.backtest_grid --strategy strategies/example_sma/example_sma.py --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d
 
-# Portfolio optimization
-python -m runner.portfolio_optimizer --backtest-ids bt_001,bt_002,bt_003
+# Portfolio optimization (one ID per argument, not comma-separated)
+python -m runner.portfolio_optimizer --backtest-ids bt_001 bt_002 bt_003
 
-# Walk-forward validation
-python -m runner.cli walkforward --strategy example_sma --train-months 12 --test-months 3
+# Walk-forward validation (--symbols, --start and --end are required)
+python -m runner.cli walkforward --strategy strategies/example_sma/example_sma.py \
+  --symbols AAPL --start 2024-01-01 --end 2025-12-31 --train-months 12 --test-months 3
 ```
 
 ## Advanced Workflows
@@ -108,7 +107,7 @@ python -m runner.cli walkforward --strategy example_sma --train-months 12 --test
 - **Grid Testing:** `runner/backtest_grid.py` - Symbol × Timeframe × ParamSet grid execution (canonical engine); `runner/backtest_matrix.py` - multi-strategy orchestration/aggregation over it
 - **Portfolio Optimization:** `runner/portfolio_optimizer.py` - Multi-strategy allocation with OOS validation
 - **Walk-Forward Analysis:** Stability validation with train/test splits. Note: folds run one fixed parameter set — no in-sample parameter selection happens (see `docs/walk_forward.md`, "Expectation Gap")
-- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for ramjet, rocketfuel, and nitro processors
+- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for ramjet, rocketfuel, and nitro processors; run `python -m signal_bots.health_check` or schedule the `signal_bot_health_check` job on the viewer Services page (see `docs/signal_bots.md`)
 - **Live Risk Consistency:** Backtest vs live position sizing behavior and stop-direction validation
 
 Documentation: See `docs/backtest_grid.md`, `docs/portfolio_optimizer.md`, `docs/walk_forward.md`, `docs/signal_bots.md`, and `docs/live-risk-consistency.md`

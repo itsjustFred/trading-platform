@@ -713,3 +713,65 @@ class TestWindowBuilderGuards:
 
         stats = {"sharpe_ratio": 1.5, "sharpe": 99.0}
         assert _metric(stats, "sharpe_ratio", "sharpe") == 1.5
+
+
+class _SparseOosEngine(_FakeEngine):
+    """Engine whose OOS runs emit only 5 daily equity observations (#133)."""
+
+    def run(
+        self, config: BacktestConfig, strategy_path: str, progress_callback=None
+    ) -> BacktestResult:
+        self.configs.append(config)
+        is_oos = len(self.configs) % 2 == 0
+        points = 5 if is_oos else 30
+        timestamps = pd.date_range(config.start_date, config.end_date, periods=points)
+        equity = config.initial_capital
+        equities = []
+        for index in range(points):
+            if index > 0:
+                equity *= 1.001 if is_oos else 1.005
+            equities.append(equity)
+        curve = [
+            EquityPoint(time=timestamp.isoformat(), equity=value)
+            for timestamp, value in zip(timestamps, equities, strict=True)
+        ]
+        return _fake_result(
+            config,
+            strategy_path,
+            len(self.configs),
+            curve,
+            {
+                "sharpe_ratio": 0.4 if is_oos else 1.4,
+                "max_drawdown_pct": -0.05,
+                "total_trades": 1,
+            },
+        )
+
+
+def test_walkforward_marks_short_oos_window_insufficient(tmp_path: Path) -> None:
+    """#133: OOS folds below 20 daily observations are flagged, not scored."""
+    engine = _SparseOosEngine()
+    result = wf_module.run_walkforward(
+        strategy="strategies/example.py",
+        engine=engine,
+        symbols=["SPY"],
+        timeframe="1d",
+        start="2020-01-01",
+        end="2021-06-30",
+        train_months=12,
+        test_months=1,
+        step_months=6,
+        output_dir=tmp_path / "walkforward_results",
+    )
+
+    assert result["oos_status"] == "insufficient_oos_bars"
+    assert result["config"]["min_oos_daily_observations"] == 20
+    for fold in result["folds"]:
+        assert fold["oos_status"] == "insufficient_oos_bars"
+        assert fold["oos_daily_observations"] == 5
+        assert fold["oos_sharpe"] is None
+        assert fold["oos_max_drawdown"] is None
+    # Insufficient folds contribute nothing to the aggregate.
+    assert result["summary"]["avg_oos_sharpe"] is None
+    assert result["summary"]["aggregate_oos_sharpe"] is None
+    assert result["summary"]["n_profitable_folds"] == 0

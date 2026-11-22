@@ -179,7 +179,10 @@ class HistdataDownloader(Downloader):
         # Determine years to download
         if years is None:
             start_year = int(effective_start[:4]) if effective_start else 2020
-            end_year = int(end[:4]) if end else datetime.now().year
+            # UTC, matching the clock the catalog and every other year bucket in
+            # this repo is bucketed by: the newest year histdata.com can have is
+            # the UTC one.
+            end_year = int(end[:4]) if end else datetime.now(timezone.utc).year
             years = list(range(start_year, end_year + 1))
 
         logger.info("Downloading %s from histdata.com for years %s", symbol, years)
