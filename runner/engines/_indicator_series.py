@@ -24,6 +24,7 @@ HIDDEN_DISPLAY_HINTS = (
     "take_profit",
     "exit_price",
     "exit_reason",
+    "exit_order_type",
     "direction",
 )
 
