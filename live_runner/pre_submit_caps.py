@@ -7,8 +7,8 @@ after the submission claim, and immediately before ``adapter.submit_order``.
 It is wired into the daemon's two submit chokepoints (``submit_order_with_risk``
 and ``_prepare_claim_and_submit_signal``); the direct ``adapter.submit_order``
 calls in ``scripts/live_smoke.py`` (:596 entry, :1481 close) and
-``live_runner/test_signal_trigger.py`` bypass it (its
-``submit_order_with_risk`` calls do run the caps).
+``live_runner/test_signal_trigger.py`` bypass it, while live_smoke's own
+``submit_order_with_risk`` calls (:702, :1130, :1570) do run the caps.
 
 Only the broker facts are re-derived here — the live quote (with its freshness
 checked against ``max_entry_quote_age_seconds``), the pip value and the

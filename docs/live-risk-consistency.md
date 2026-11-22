@@ -273,11 +273,12 @@ Notional pro Order weiterhin bei `max_notional_per_trade` (Default 0.20;
 #240-Entscheidung bestehen.
 
 Notional und Stop-Risk rechnen gegen das Account-**Equity** — und auf dem
-Produktionspfad rechnet auch das Sizing gegen dieselbe Basis:
-`_resolve_account_balance` (`daemon.py`) liefert `get_balance()[1]`, also
-das Equity; nur ein explizit übergebener `account_balance`-Parameter weicht
+Produktionspfad rechnen auch Sizing und Caps gegen dieselbe Basis: beide lesen
+`get_balance()[1]`, das auf Alpaca das Broker-Equity (`account.equity`) und
+auf cTrader den realisierten Balance ist (`ProtoOATrader` hat kein
+Equity-Feld); nur ein explizit übergebener `account_balance`-Parameter weicht
 ab. Die Caps sind damit kein zweites Sizing, sondern ein hartes Backstop
-gegen kaputte Größen auf derselben Equity-Basis.
+gegen kaputte Größen auf derselben Basis.
 
 Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
 Cap-Settings, Quote/Pip-Value/Balance nicht abrufbar oder unbrauchbar,
