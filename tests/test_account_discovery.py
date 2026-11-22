@@ -417,8 +417,9 @@ def test_the_adapter_balance_uses_the_same_resolution():
     )
 
     async def _send_response(request, **_kwargs):
-        # get_balance now also asks for open-position unrealized P&L (#301);
-        # an empty P&L book keeps equity == balance for this assertion.
+        # get_balance keeps realized-balance semantics (#267): it no longer
+        # asks for open-position unrealized P&L - that is get_equity's job.
+        # The branch stays so the mock also serves a get_equity call.
         if isinstance(request, ProtoOAGetPositionUnrealizedPnLReq):
             return ProtoOAGetPositionUnrealizedPnLRes()
         return response

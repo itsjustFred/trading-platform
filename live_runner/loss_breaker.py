@@ -65,8 +65,10 @@ from typing import Any
 from live_runner.base_adapter import validate_live_quote_prices
 from live_runner.credential_env import load_accounts_env_values
 from shared.database import (
+    account_has_ledger_reconciliation_flags,
     get_account_deployment_trading_flows,
     latch_live_loss_breaker_breach,
+    list_untrusted_fill_references,
     observe_live_loss_breaker,
     reset_live_loss_breaker_drawdown,
 )
@@ -88,6 +90,27 @@ _SETTINGS_DAILY = "loss_breaker_daily_loss_fraction"
 _SETTINGS_DRAWDOWN = "loss_breaker_max_drawdown_fraction"
 
 _ACCOUNTS_ENV = Path(__file__).resolve().parent.parent / ".accounts.env"
+
+#: Optional override for ``_ACCOUNTS_ENV``: ``run_daemon`` points it at the
+#: ``--accounts-env`` file it was started with, so per-account
+#: ``LOSS_BREAKER_<ACCOUNT>_*`` values in a non-default accounts file are
+#: honoured instead of silently replaced by the defaults.
+_ACCOUNTS_ENV_OVERRIDE: Path | None = None
+
+
+def set_accounts_env_file(path: Path | str | None) -> None:
+    """Point ``LOSS_BREAKER_*`` env resolution at ``path`` (``None`` = default).
+
+    Called by ``run_daemon`` with its configured ``accounts_env``. Env values
+    are still re-read on every resolution, so an operator editing the file
+    sees the change without a restart.
+    """
+    global _ACCOUNTS_ENV_OVERRIDE
+    _ACCOUNTS_ENV_OVERRIDE = Path(path) if path is not None else None
+
+
+def _accounts_env_path() -> Path:
+    return _ACCOUNTS_ENV_OVERRIDE if _ACCOUNTS_ENV_OVERRIDE is not None else _ACCOUNTS_ENV
 
 
 def account_loss_breaker_scope(account_id: str) -> str:
@@ -177,7 +200,7 @@ def _accounts_env_values() -> dict[str, str]:
     poll and rare entry checks, and a stale cache would pin thresholds an
     operator just changed.
     """
-    return load_accounts_env_values(_ACCOUNTS_ENV)
+    return load_accounts_env_values(_accounts_env_path())
 
 
 def _env_key(account_id: str | None, suffix: str) -> str | None:
@@ -383,16 +406,16 @@ def _observe_scope(
     account_id: str,
     equity: float,
     now: datetime,
-    seed_record: LiveLossBreakerRecord | None = None,
 ) -> LiveLossBreakerRecord:
-    """One equity observation for ``scope``; deployment scopes seed from the account row."""
-    seed: dict[str, float] = {}
-    if seed_record is not None:
-        seed = {
-            "seed_day_start_equity": seed_record.day_start_equity,
-            "seed_peak_equity": seed_record.peak_equity,
-        }
-    return observe_live_loss_breaker(scope, account_id, equity, now, **seed)
+    """One equity observation for ``scope``.
+
+    A scope's first observation seeds its own baseline from the equity it
+    observes - never from another scope's record. A deployment scope observes
+    a synthetic equity on a different basis than the account scope, so an
+    account-seeded baseline would trip a brand-new deployment instantly (or
+    hide its first-day losses when other deployments run at a loss).
+    """
+    return observe_live_loss_breaker(scope, account_id, equity, now)
 
 
 def _evaluate_kinds(
@@ -455,15 +478,13 @@ def _gate_scope(
     limits: LossBreakerLimits,
     deployment_id: str | None = None,
     symbol: str | None = None,
-    seed_record: LiveLossBreakerRecord | None = None,
 ) -> LiveLossBreakerRecord:
     """Observe ``scope`` and refuse the entry when its breaker is breached.
 
     Observes (the equity series must advance for a scope that is checked, or a
     later re-enable would start blind); evaluates only when ``limits`` enables
     the breaker. The caller decides which scopes reach this function - both
-    disabled scopes return before any observation. Returns the observed record
-    so a deployment scope can seed its baseline from the account scope's.
+    disabled scopes return before any observation. Returns the observed record.
     """
     try:
         record = _observe_scope(
@@ -471,7 +492,6 @@ def _gate_scope(
             account_id=account_id,
             equity=equity,
             now=now,
-            seed_record=seed_record,
         )
         kinds = (
             _evaluate_kinds(
@@ -528,6 +548,108 @@ def _gate_scope(
     return record
 
 
+#: ``(account_id, reason)`` pairs already alerted for an unmeasurable
+#: deployment P&L. Fail-closed refusal on every poll and entry would
+#: otherwise repeat the same ERROR forever; one alert per episode - cleared
+#: when the P&L becomes measurable again - is the surface an operator needs.
+_PNL_UNMEASURABLE_ALERTED: set[tuple[str, str]] = set()
+
+#: Pip values cached per ``(symbol, UTC day)``: the poll resolves the pip
+#: value of EVERY symbol the account ever traded, once a minute, and a
+#: long-closed symbol becoming unresolvable must not fail the scopes closed
+#: forever. A pip value is an FX conversion that moves slowly; a day of
+#: staleness is far below the mark-to-market noise the breaker already
+#: tolerates. Entries still resolve pip values fresh through their own path.
+_PIP_VALUE_CACHE: dict[tuple[str, str], float] = {}
+
+
+def _alert_pnl_unmeasurable(
+    account_id: str, reason: str, detail: Mapping[str, Any]
+) -> None:
+    """One ERROR ``data.alert`` per unmeasurable-P&L episode.
+
+    The deployment breaker is enabled by default, so an unmeasurable P&L
+    refuses every deployment-scoped entry on the account - a silent,
+    indefinite stop without this alert. ``reason`` distinguishes the cause
+    (``ledger_reconciliation``, ``unpriced_fills``, ``missing_pip_value``,
+    ``unusable_quote``, ``flows_unreadable``).
+    """
+    key = (str(account_id), reason)
+    if key in _PNL_UNMEASURABLE_ALERTED:
+        return
+    _PNL_UNMEASURABLE_ALERTED.add(key)
+    logger.error(
+        "Deployment trading P&L is unmeasurable; deployment-scoped loss "
+        "breaker entries on this account are refused until it can be "
+        "measured again (see docs/live-deploy-runbook.md, Loss Circuit "
+        "Breaker, for the repair path)",
+        extra={
+            "data": {
+                "alert": "loss_breaker_pnl_unmeasurable",
+                "account_id": str(account_id),
+                "reason": reason,
+                **dict(detail),
+            }
+        },
+    )
+
+
+def _clear_pnl_unmeasurable(account_id: str) -> None:
+    """End every unmeasurable-P&L episode on ``account_id`` (P&L measured)."""
+    _PNL_UNMEASURABLE_ALERTED.difference_update(
+        {
+            key
+            for key in _PNL_UNMEASURABLE_ALERTED
+            if key[0] == str(account_id)
+        }
+    )
+
+
+async def _untrusted_fill_refs(account_id: str) -> list[dict[str, Any]]:
+    """The untrusted fills behind an ``unpriced_fills`` failure, for the alert."""
+    try:
+        return await asyncio.to_thread(list_untrusted_fill_references, account_id)
+    except Exception:
+        logger.exception(
+            "Could not list untrusted fill references for the P&L alert",
+            extra={"data": {"account_id": account_id}},
+        )
+        return []
+
+
+async def _pip_value_for_symbol(
+    adapter: Any, symbol: str, *, day_key: str
+) -> float | None:
+    """The symbol's pip value, cached per UTC day (see ``_PIP_VALUE_CACHE``)."""
+    key = (symbol, day_key)
+    cached = _PIP_VALUE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        pip_value = await adapter.get_pip_value(symbol)
+        value = float(pip_value.value)
+    except Exception as exc:
+        logger.warning(
+            "Deployment P&L is unmeasurable: no pip value for %s (%r)",
+            symbol,
+            exc,
+            extra={"data": {"symbol": symbol}},
+        )
+        return None
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "Deployment P&L is unmeasurable: pip value for %s is %r",
+            symbol,
+            value,
+            extra={"data": {"symbol": symbol}},
+        )
+        return None
+    if len(_PIP_VALUE_CACHE) > 2000:
+        _PIP_VALUE_CACHE.clear()
+    _PIP_VALUE_CACHE[key] = value
+    return value
+
+
 async def account_deployment_trading_pnls(
     adapter: Any,
     account_id: str,
@@ -547,11 +669,29 @@ async def account_deployment_trading_pnls(
     without fills are absent - their P&L is 0.
 
     Returns ``None`` when ANY deployment's P&L cannot be measured exactly - an
-    untrusted fill price, a missing or unusable quote or pip value, or an
-    unreadable ledger. Callers treat ``None`` as "deployment scopes cannot be
-    evaluated" and fail closed: an unmeasurable P&L is never "no loss".
+    untrusted fill price, a missing or unusable quote or pip value, an
+    unresolved ``ledger_reconciliation_required`` flag on the account (the
+    ledger may be missing fills, #277/#330), or an unreadable ledger. Callers
+    treat ``None`` as "deployment scopes cannot be evaluated" and fail
+    closed: an unmeasurable P&L is never "no loss". Every ``None`` also raises
+    one ERROR ``loss_breaker_pnl_unmeasurable`` alert per episode.
     """
     try:
+        if await asyncio.to_thread(
+            account_has_ledger_reconciliation_flags, account_id
+        ):
+            _alert_pnl_unmeasurable(
+                account_id,
+                "ledger_reconciliation",
+                {
+                    "detail": (
+                        "an unresolved ledger_reconciliation_required audit "
+                        "row exists for this account; the fill ledger may be "
+                        "missing broker-side closes (#277/#330)"
+                    )
+                },
+            )
+            return None
         flows = await asyncio.to_thread(get_account_deployment_trading_flows, account_id)
     except Exception:
         logger.exception(
@@ -559,33 +699,25 @@ async def account_deployment_trading_pnls(
             "scopes cannot be measured",
             extra={"data": {"account_id": account_id}},
         )
+        _alert_pnl_unmeasurable(
+            account_id, "flows_unreadable", {"detail": "ledger read raised"}
+        )
         return None
     if not flows:
+        _clear_pnl_unmeasurable(account_id)
         return {}
     symbols = sorted({symbol for dep in flows.values() for symbol in dep})
     pip_values: dict[str, float] = {}
     marks: dict[str, tuple[float, float]] = {}
+    day_key = datetime.now(timezone.utc).date().isoformat()
     for symbol in symbols:
-        try:
-            pip_value = await adapter.get_pip_value(symbol)
-            value = float(pip_value.value)
-        except Exception as exc:
-            logger.warning(
-                "Deployment P&L is unmeasurable: no pip value for %s (%r)",
-                symbol,
-                exc,
-                extra={"data": {"account_id": account_id, "symbol": symbol}},
+        pip = await _pip_value_for_symbol(adapter, symbol, day_key=day_key)
+        if pip is None:
+            _alert_pnl_unmeasurable(
+                account_id, "missing_pip_value", {"symbol": symbol}
             )
             return None
-        if not math.isfinite(value) or value <= 0:
-            logger.warning(
-                "Deployment P&L is unmeasurable: pip value for %s is %r",
-                symbol,
-                value,
-                extra={"data": {"account_id": account_id, "symbol": symbol}},
-            )
-            return None
-        pip_values[symbol] = value
+        pip_values[symbol] = pip
     open_symbols = {
         symbol
         for dep in flows.values()
@@ -607,6 +739,9 @@ async def account_deployment_trading_pnls(
                 exc,
                 extra={"data": {"account_id": account_id, "symbol": symbol}},
             )
+            _alert_pnl_unmeasurable(
+                account_id, "unusable_quote", {"symbol": symbol}
+            )
             return None
         marks[symbol] = (bid, ask)
     pnls: dict[str, float] = {}
@@ -614,18 +749,15 @@ async def account_deployment_trading_pnls(
         total = 0.0
         for symbol, flow in dep_flows.items():
             if flow["unpriced_fills"]:
-                logger.warning(
-                    "Deployment P&L is unmeasurable: %d untrusted fill price(s) "
-                    "for %s on deployment %s",
-                    flow["unpriced_fills"],
-                    symbol,
-                    deployment_id,
-                    extra={
-                        "data": {
-                            "account_id": account_id,
-                            "symbol": symbol,
-                            "deployment_id": deployment_id,
-                        }
+                fills = await _untrusted_fill_refs(account_id)
+                _alert_pnl_unmeasurable(
+                    account_id,
+                    "unpriced_fills",
+                    {
+                        "symbol": symbol,
+                        "deployment_id": deployment_id,
+                        "unpriced_fill_count": int(flow["unpriced_fills"]),
+                        "untrusted_fills": fills,
                     },
                 )
                 return None
@@ -639,6 +771,7 @@ async def account_deployment_trading_pnls(
                 - flow["commission"]
             )
         pnls[deployment_id] = total
+    _clear_pnl_unmeasurable(account_id)
     return pnls
 
 
@@ -676,20 +809,37 @@ def refuse_entry_if_loss_breaker_tripped(
             deployment_id=str(deployment.id),
             state_unreadable=True,
         )
-    account_limits = account_loss_breaker_limits(
-        deployment.account_id, env_values=env_values
-    )
-    deployment_limits = deployment_loss_breaker_limits(
-        deployment, env_values=env_values
-    )
+    try:
+        account_limits = account_loss_breaker_limits(
+            deployment.account_id, env_values=env_values
+        )
+        deployment_limits = deployment_loss_breaker_limits(
+            deployment, env_values=env_values
+        )
+    except ValueError as exc:
+        # A malformed LOSS_BREAKER_* value or deployment setting is a
+        # configuration error, not a breach - but it must still refuse
+        # distinctly ("loss breaker configuration invalid"), never fall into
+        # the generic refusal handler where it reads as an unrelated failure.
+        raise LossBreakerBreachError(
+            f"Refusing a live entry: the loss breaker configuration for "
+            f"'{deployment.account_id}' is invalid ({exc}); fix the "
+            "LOSS_BREAKER_* settings or the deployment's loss_breaker_* "
+            "settings - an unverifiable configuration is never 'all clear'.",
+            scope=account_loss_breaker_scope(deployment.account_id),
+            kind="config_invalid",
+            account_id=deployment.account_id,
+            deployment_id=str(deployment.id),
+            state_unreadable=True,
+        ) from exc
     if not (account_limits.enabled or deployment_limits.enabled):
         return
     account_id = deployment.account_id
     account_scope = account_loss_breaker_scope(account_id)
     deployment_scope = deployment_loss_breaker_scope(str(deployment.id))
     # The account scope is observed first even when its own breaker is
-    # disabled: its record is the baseline a deployment scope seeds from.
-    account_record = _gate_scope(
+    # disabled: its record keeps the equity series warm for a later re-enable.
+    _gate_scope(
         scope=account_scope,
         account_id=account_id,
         equity=equity_value,
@@ -722,7 +872,6 @@ def refuse_entry_if_loss_breaker_tripped(
         limits=deployment_limits,
         deployment_id=str(deployment.id),
         symbol=symbol,
-        seed_record=account_record,
     )
 
 
@@ -775,8 +924,8 @@ def observe_account_loss_breaker_equity(
         account_limits = account_loss_breaker_limits(
             account_id, env_values=env_values
         )
-        # The account scope is always observed: deployment scopes seed their
-        # baseline from its record even when the account breaker itself is
+        # The account scope is always observed: deployment scopes need the
+        # account equity series even when the account breaker itself is
         # disabled. A breach latches and alerts inside _evaluate_kinds; the
         # poll itself never refuses anything - the entry gate does that.
         account_record = _observe_scope(
@@ -817,7 +966,6 @@ def observe_account_loss_breaker_equity(
                 account_id=account_id,
                 equity=scope_equity,
                 now=observed_at,
-                seed_record=account_record,
             )
             scopes.append(
                 (

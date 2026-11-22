@@ -4901,9 +4901,6 @@ def observe_live_loss_breaker(
     account_id: str,
     equity: float,
     observed_at: datetime,
-    *,
-    seed_day_start_equity: float | None = None,
-    seed_peak_equity: float | None = None,
 ) -> LiveLossBreakerRecord:
     """Record one equity observation for ``scope`` and return the new state.
 
@@ -4915,10 +4912,12 @@ def observe_live_loss_breaker(
     is re-based solely by ``reset_live_loss_breaker_drawdown``. Breach flags
     are not evaluated here; ``latch_live_loss_breaker_breach`` owns them.
 
-    ``seed_*`` apply only when the row does not exist yet: a deployment scope
-    created mid-stream inherits the account scope's baselines (its synthetic
-    equity lives on the same account-equity scale) instead of starting blind
-    at the current equity.
+    A scope's first-ever observation always seeds ``day_start_equity`` and
+    ``peak_equity`` from THAT observation - never from another scope's
+    baseline. A deployment scope observes a synthetic equity
+    (``account_equity - other deployments' P&L``) on a different basis than
+    the account scope, so inheriting the account row's baseline would trip a
+    brand-new deployment instantly (or hide its first-day losses).
     """
     normalized_scope = str(scope or "").strip()
     normalized_account = str(account_id or "").strip()
@@ -4938,16 +4937,8 @@ def observe_live_loss_breaker(
                 scope=normalized_scope,
                 account_id=normalized_account,
                 utc_day=utc_day,
-                day_start_equity=(
-                    float(seed_day_start_equity)
-                    if seed_day_start_equity is not None
-                    else equity_value
-                ),
-                peak_equity=(
-                    float(seed_peak_equity)
-                    if seed_peak_equity is not None
-                    else equity_value
-                ),
+                day_start_equity=equity_value,
+                peak_equity=equity_value,
                 daily_breached=False,
                 drawdown_breached=False,
                 last_equity=equity_value,
@@ -5155,6 +5146,107 @@ def get_account_deployment_trading_flows(
         flow["commission"] += float(commission or 0.0)
         flow["unpriced_fills"] += int(unpriced_count or 0)
     return flows
+
+
+#: ``live_control_audit.action`` written when a broker-side close could not be
+#: attributed to one deployment's ledger (#144; the writer lands with #277).
+#: The loss breaker treats any such row on the account as "the fill ledger may
+#: be incomplete" and fails deployment scopes closed until an operator
+#: reconciles it - a stale ledger P&L would otherwise move every OTHER
+#: deployment's synthetic equity.
+LEDGER_RECONCILIATION_AUDIT_ACTION = "ledger_reconciliation_required"
+
+
+def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
+    """Whether ``account_id`` has an unresolved ledger-reconciliation flag.
+
+    ``flag_live_ledger_reconciliation`` (added by #277) writes one audit row
+    per ``account:symbol`` whose broker position the persisted fill ledger
+    cannot explain. Nothing clears them automatically - periodic broker
+    reconciliation (#330) and the operator act on them - so ANY row means the
+    ledger may be missing fills and deployment P&L derived from it is not
+    trustworthy. ``target_id`` is ``<account_id>:<SYMBOL>``; the trailing colon
+    in the LIKE pattern keeps ``acc-1`` from matching ``acc-10:SYM``.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return False
+    escaped_account = (
+        normalized_account.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    init_db()
+    with get_session() as session:
+        row = session.exec(
+            select(LiveControlAuditModel.id)
+            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
+            .where(
+                LiveControlAuditModel.target_id.like(
+                    f"{escaped_account}:%", escape="\\"
+                )
+            )
+            .limit(1)
+        ).first()
+    return row is not None
+
+
+def list_untrusted_fill_references(
+    account_id: str, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Identities of the account's fills whose price cannot be trusted.
+
+    The counterpart of ``unpriced_fills`` in
+    :func:`get_account_deployment_trading_flows` for alerting: the aggregate
+    only counts them, this names them so an operator can find and repair the
+    rows. Same trust rule (``_TRUSTED_FILL_PRICE_OBSERVED`` + positive price).
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    trusted = or_(
+        LiveExecutionModel.actual_price_observed.is_(None),
+        LiveExecutionModel.actual_price_observed.in_(_TRUSTED_FILL_PRICE_OBSERVED),
+    )
+    priced = and_(
+        LiveExecutionModel.actual_price > 0,
+        trusted,
+    )
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveExecutionModel.id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                LiveExecutionModel.filled_qty,
+                LiveExecutionModel.actual_price,
+                LiveExecutionModel.actual_price_observed,
+                LiveExecutionModel.broker_order_id,
+                LiveExecutionModel.timestamp,
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account)
+            .where(~priced)
+            .order_by(LiveExecutionModel.timestamp.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+    return [
+        {
+            "execution_id": str(row[1]),
+            "deployment_id": str(row[0]),
+            "symbol": str(row[2]),
+            "action": str(row[3] or ""),
+            "filled_qty": float(row[4] or 0.0),
+            "actual_price": float(row[5] or 0.0),
+            "actual_price_observed": row[6],
+            "broker_order_id": str(row[7] or ""),
+            "timestamp": row[8].isoformat() if row[8] else None,
+        }
+        for row in rows
+    ]
 
 
 def list_live_signal_executions_for_deployments(

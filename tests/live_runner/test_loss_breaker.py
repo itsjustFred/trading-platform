@@ -382,16 +382,21 @@ def test_deployment_breach_blocks_only_that_deployment():
     )
     loose = _deployment(account_id="acc-mix")
     _observe("acc-mix", 100_000.0, DAY1)
+    # The deployment scope seeds its baseline from its OWN first observation
+    # (flat P&L -> V == account equity), then measures the drop against it.
+    _gate(tight, equity=100_000.0, now=DAY1, env_values=NO_ENV)
     # 2 % down: over the tight deployment's 1 % daily limit, under the
     # account's 5 %.
     with pytest.raises(LossBreakerBreachError) as excinfo:
         _gate(
-            tight, equity=98_000.0, now=DAY1, env_values=NO_ENV
+            tight, equity=98_000.0, now=DAY1 + timedelta(minutes=1), env_values=NO_ENV
         )
     assert excinfo.value.scope == deployment_loss_breaker_scope(str(tight.id))
-    # The sibling deployment on the same account still trades.
+    # The sibling deployment on the same account still trades: its scope
+    # seeds at the current 98k (its own first observation) and the account
+    # scope is only -2 %.
     _gate(
-        loose, equity=98_000.0, now=DAY1, env_values=NO_ENV
+        loose, equity=98_000.0, now=DAY1 + timedelta(minutes=1), env_values=NO_ENV
     )
 
 
@@ -697,10 +702,16 @@ def test_deployment_scope_trips_on_own_pnl_while_account_stays_under():
 def test_gate_uses_deployment_equity_not_account_equity():
     dep = _deployment(account_id="acc-v")
     _observe("acc-v", 100_000.0, DAY1)
+    # The deployment scope seeds its baseline from its OWN first observation:
+    # flat synthetic equity first, then the -6% drop is measured against it.
+    _gate(dep, equity=100_000.0, now=DAY1, deployment_equity=100_000.0)
     # Account equity flat at 100k but this deployment's synthetic equity is
     # 94k (-6%): only the deployment scope trips.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        _gate(dep, equity=100_000.0, now=DAY1, deployment_equity=94_000.0)
+        _gate(
+            dep, equity=100_000.0, now=DAY1 + timedelta(minutes=1),
+            deployment_equity=94_000.0,
+        )
     assert excinfo.value.scope == deployment_loss_breaker_scope(str(dep.id))
 
 
@@ -917,7 +928,9 @@ def test_poll_adapter_balance_latches_account_and_deployment_scopes():
     dep_state = get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep.id)))
     assert dep_state is not None
     assert dep_state.daily_breached is True
-    # Seeded from the account row's baseline, not blind at 94k.
+    # The deployment scope seeds its baseline from its OWN first observation
+    # (here V == account equity because no other deployment has P&L) - never
+    # from the account row's baseline.
     assert dep_state.day_start_equity == pytest.approx(100_000.0)
 
 
@@ -1058,3 +1071,413 @@ def test_breaker_records_broker_equity_not_account_balance_override():
                 adapter, dep, _entry_signal(dep), account_balance=1_000_000.0
             )
         )
+
+
+# ─── Bundle-32 review fixes (#301) ────────────────────────────────────────────
+
+
+def test_new_deployment_scope_seeds_from_own_equity_not_account_baseline():
+    """The bundle-32 probe: D1 has +7 000 lifetime P&L, account equity 107 000.
+
+    A brand-new D2 must seed day_start/peak from its OWN synthetic equity
+    V = E - others' P&L = 100 000 - not from the account row's 107 000, which
+    would trip its daily breaker at once. The reverse direction (others at a
+    loss) must not hide D2's first-day losses either.
+    """
+    dep_old = _deployment(account_id="acc-seed")
+    dep_new = _deployment(account_id="acc-seed")
+    old_id, new_id = str(dep_old.id), str(dep_new.id)
+    deployments = [dep_old, dep_new]
+    pnls_profit = {old_id: 7_000.0, new_id: 0.0}
+    # Poll 1: account equity 107k, D1 up 7k -> D2's V = 107k - 7k = 100k.
+    observe_account_loss_breaker_equity(
+        "acc-seed", 107_000.0, now=DAY1,
+        deployments=deployments, deployment_pnls=pnls_profit, env_values=NO_ENV,
+    )
+    state_new = get_live_loss_breaker_state(
+        deployment_loss_breaker_scope(new_id)
+    )
+    assert state_new.day_start_equity == pytest.approx(100_000.0)
+    assert state_new.peak_equity == pytest.approx(100_000.0)
+    assert state_new.daily_breached is False
+    assert state_new.drawdown_breached is False
+    # Poll 2, same equity: nothing trips.
+    observe_account_loss_breaker_equity(
+        "acc-seed", 107_000.0, now=DAY1 + timedelta(minutes=1),
+        deployments=deployments, deployment_pnls=pnls_profit, env_values=NO_ENV,
+    )
+    state_new = get_live_loss_breaker_state(
+        deployment_loss_breaker_scope(new_id)
+    )
+    assert state_new.daily_breached is False
+
+
+def test_new_deployment_scope_does_not_hide_own_losses_behind_others():
+    """Reverse direction: D1 at a loss must not push D2's baseline below its
+    own V (the old account-seed made V > baseline, hiding D2's first losses)."""
+    dep_old = _deployment(account_id="acc-seed2")
+    dep_new = _deployment(account_id="acc-seed2")
+    old_id, new_id = str(dep_old.id), str(dep_new.id)
+    deployments = [dep_old, dep_new]
+    pnls_loss = {old_id: -10_000.0, new_id: 0.0}
+    # Account equity 90k with D1 -10k -> D2's V = 90k - (-10k) = 100k.
+    observe_account_loss_breaker_equity(
+        "acc-seed2", 90_000.0, now=DAY1,
+        deployments=deployments, deployment_pnls=pnls_loss, env_values=NO_ENV,
+    )
+    state_new = get_live_loss_breaker_state(
+        deployment_loss_breaker_scope(new_id)
+    )
+    assert state_new.day_start_equity == pytest.approx(100_000.0)
+    # Consistent account equity: E = K + total P&L = 100k + (-22k) = 78k.
+    # D2's V = E - others' P&L = 78k - (-16k) = 94k -> -6% vs its own 100k
+    # baseline: the daily breaker trips on D2's OWN loss even though the
+    # account equity move (-12k) is mostly D1's.
+    observe_account_loss_breaker_equity(
+        "acc-seed2", 78_000.0, now=DAY1 + timedelta(minutes=1),
+        deployments=deployments,
+        deployment_pnls={old_id: -16_000.0, new_id: -6_000.0},
+        env_values=NO_ENV,
+    )
+    state_new = get_live_loss_breaker_state(
+        deployment_loss_breaker_scope(new_id)
+    )
+    assert state_new.daily_breached is True
+
+
+def test_unmeasurable_pnl_alerts_once_per_episode_and_names_fills(
+    caplog,
+):
+    """An untrusted-price fill fails closed AND raises one ERROR
+    ``loss_breaker_pnl_unmeasurable`` per episode naming the fill - not a
+    silent WARNING on every poll."""
+    import logging
+
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-unpriced", dep_id, "AAPL", "buy", 10.0, 100.0, observed="absent")
+    logger = loss_breaker.logger
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        for _ in range(3):
+            pnls = asyncio.run(
+                account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-unpriced")
+            )
+            assert pnls is None
+    alerts = [
+        r for r in caplog.records
+        if getattr(r, "data", {}).get("alert") == "loss_breaker_pnl_unmeasurable"
+    ]
+    assert len(alerts) == 1
+    assert alerts[0].data["reason"] == "unpriced_fills"
+    assert alerts[0].data["unpriced_fill_count"] == 1
+    named = alerts[0].data["untrusted_fills"]
+    assert named and named[0]["symbol"] == "AAPL"
+    assert named[0]["actual_price_observed"] == "absent"
+
+
+def test_unmeasurable_pnl_alert_clears_when_measurable_again(caplog):
+    import logging
+
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-unpriced2", dep_id, "AAPL", "buy", 10.0, 100.0, observed="absent")
+    logger = loss_breaker.logger
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        assert (
+            asyncio.run(
+                account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-unpriced2")
+            )
+            is None
+        )
+    # Repair the price verdict, then measure: the episode ends and a NEW
+    # unmeasurable episode would alert again.
+    from sqlalchemy import update
+
+    import shared.database as database
+
+    with database.get_session() as session:
+        session.exec(
+            update(database.LiveExecutionModel)
+            .where(database.LiveExecutionModel.actual_price_observed == "absent")
+            .values(actual_price_observed="observed")
+        )
+        session.commit()
+    pnls = asyncio.run(
+        account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-unpriced2")
+    )
+    assert pnls is not None
+    assert ("acc-unpriced2", "unpriced_fills") not in loss_breaker._PNL_UNMEASURABLE_ALERTED
+
+
+def test_ledger_reconciliation_flag_fails_deployment_pnl_closed(caplog):
+    """An unresolved ``ledger_reconciliation_required`` audit row on the
+    account means the fill ledger may be missing closes (#277/#330): the
+    deployment P&L is untrustworthy, so it fails closed with an alert."""
+    import logging
+
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+    from shared.database import record_live_control_audit
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-recon", dep_id, "AAPL", "buy", 10.0, 100.0)
+    record_live_control_audit(
+        action="ledger_reconciliation_required",
+        target_type="account_symbol",
+        target_id="acc-recon:AAPL",
+        actor="test",
+        detail={"cause": "unattributed close"},
+    )
+    logger = loss_breaker.logger
+    with caplog.at_level(logging.ERROR, logger=logger.name):
+        pnls = asyncio.run(
+            account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-recon")
+        )
+    assert pnls is None
+    alerts = [
+        r for r in caplog.records
+        if getattr(r, "data", {}).get("alert") == "loss_breaker_pnl_unmeasurable"
+    ]
+    assert alerts and alerts[0].data["reason"] == "ledger_reconciliation"
+
+
+def test_ledger_reconciliation_flag_does_not_leak_across_account_prefix():
+    """``acc-1``'s flag must not fail ``acc-10``'s scopes closed."""
+    from shared.database import account_has_ledger_reconciliation_flags, record_live_control_audit
+
+    record_live_control_audit(
+        action="ledger_reconciliation_required",
+        target_type="account_symbol",
+        target_id="acc-1:AAPL",
+        actor="test",
+        detail={},
+    )
+    assert account_has_ledger_reconciliation_flags("acc-1") is True
+    assert account_has_ledger_reconciliation_flags("acc-10") is False
+    assert account_has_ledger_reconciliation_flags("") is False
+
+
+def test_deployment_pnl_marks_long_at_bid_and_short_at_ask():
+    """The conservative side of the book: a long marks at bid, a short at ask.
+    With bid != ask the two marks differ - pinning gross-vs-net and the side."""
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    class _SpreadAdapter(_PnlAdapter):
+        async def get_quote(self, symbol):
+            return LiveQuote(bid=99.0, ask=101.0, timestamp=datetime.now(timezone.utc))
+
+    dep_id = str(uuid4())
+    # Long 10 @ 100, mark bid 99 -> pnl = -1000 + 10*99 = -10.
+    _persist_fill("acc-spread", dep_id, "AAPL", "buy", 10.0, 100.0)
+    pnls = asyncio.run(account_deployment_trading_pnls(_SpreadAdapter(), "acc-spread"))
+    assert pnls is not None
+    assert pnls[dep_id] == pytest.approx(-10.0)
+
+    # Short 10 @ 100 (sell fill), mark ask 101 -> cash +1000, net_qty -10:
+    # pnl = 1000 + (-10)*101 = -10.
+    dep2 = str(uuid4())
+    _persist_fill("acc-spread2", dep2, "AAPL", "sell", 10.0, 100.0)
+    pnls = asyncio.run(account_deployment_trading_pnls(_SpreadAdapter(), "acc-spread2"))
+    assert pnls is not None
+    assert pnls[dep2] == pytest.approx(-10.0)
+
+
+def test_deployment_pnl_sums_positions_net_not_gross():
+    """Two positions on one deployment+symbol: buy 10@100, sell 4@110, mark 100.
+
+    Net: cash -1000+440=-560, net_qty 6 -> pnl = -560 + 600 = 40.
+    Gross (wrong): would treat the sell as closing nothing -> -1000+1000=0 plus
+    the sell proceeds counted differently; the net figure is what the ledger
+    means. Also covers a second symbol to pin the per-symbol aggregation.
+    """
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-net", dep_id, "AAPL", "buy", 10.0, 100.0)
+    _persist_fill("acc-net", dep_id, "AAPL", "sell", 4.0, 110.0)
+    _persist_fill("acc-net", dep_id, "MSFT", "buy", 5.0, 200.0)
+    pnls = asyncio.run(account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-net"))
+    assert pnls is not None
+    # AAPL: -560 + 6*100 = 40. MSFT: -1000 + 5*100(pip=1, mark=100) = -500.
+    # _PnlAdapter marks every symbol at 100.0.
+    assert pnls[dep_id] == pytest.approx(40.0 - 500.0)
+
+
+def test_prepare_order_refuses_losing_deployment_at_dispatch():
+    """End-to-end dispatch pin (#14 mutant): the deployment scope's synthetic
+    equity - breaker_equity - total_pnl + own_pnl - is what the gate sees.
+
+    dep_a -25k and dep_b +25k net to zero account-equity move, so ONLY the
+    deployment scope can trip: dep_a's V = 100k - 0 + (-25k) = 75k (-25%
+    drawdown vs its 100k peak - the entry gate runs on the real clock, so the
+    timeless drawdown latch is what fires, not the UTC-day daily breaker),
+    dep_b's V = 125k (+25%).
+    """
+    account_id = "acc-dispatch"
+    dep_a = _deployment(account_id=account_id)
+    dep_b = _deployment(account_id=account_id)
+    a_id, b_id = str(dep_a.id), str(dep_b.id)
+    deployments = [dep_a, dep_b]
+    # First poll: flat P&L -> both deployment scopes baseline at V = 100k.
+    observe_account_loss_breaker_equity(
+        account_id, 100_000.0, now=DAY1,
+        deployments=deployments,
+        deployment_pnls={a_id: 0.0, b_id: 0.0},
+        env_values=NO_ENV,
+    )
+    adapter = _Adapter(equity=100_000.0)
+
+    async def _pnls(adapter_arg, acct):
+        return {a_id: -25_000.0, b_id: 25_000.0}
+
+    import live_runner.daemon as daemon_module
+
+    original = daemon_module.account_deployment_trading_pnls
+    daemon_module.account_deployment_trading_pnls = _pnls
+    try:
+        with pytest.raises(LossBreakerBreachError) as excinfo:
+            asyncio.run(
+                daemon.prepare_order_with_risk(
+                    adapter, dep_a, _entry_signal(dep_a)
+                )
+            )
+        assert excinfo.value.scope == deployment_loss_breaker_scope(a_id)
+        # dep B's V = 100k - 0 + 25k = 125k -> +25%: allowed.
+        prepared, qty = asyncio.run(
+            daemon.prepare_order_with_risk(adapter, dep_b, _entry_signal(dep_b))
+        )
+        assert qty > 0
+    finally:
+        daemon_module.account_deployment_trading_pnls = original
+
+
+def test_prepare_order_uses_get_equity_not_the_sizing_balance():
+    """The breaker reads ``adapter.get_equity`` - the separate equity path -
+    never ``get_balance``'s equity slot that sizing uses (#267)."""
+    account_id = "acc-eqpath"
+    dep = _deployment(account_id=account_id)
+    _observe(account_id, 100_000.0, DAY1)
+
+    class _SplitAdapter(_Adapter):
+        async def get_balance(self):
+            # Sizing sees realized balance; equity slot = balance here.
+            return 100_000.0, 100_000.0
+
+        async def get_equity(self):
+            # True equity incl. unrealized: -30% drawdown vs the 100k peak
+            # trips on the real clock (the entry gate takes no ``now``).
+            return 70_000.0
+
+    adapter = _SplitAdapter(equity=100_000.0)
+    with pytest.raises(LossBreakerBreachError):
+        asyncio.run(
+            daemon.prepare_order_with_risk(adapter, dep, _entry_signal(dep))
+        )
+
+
+def test_prepare_order_refuses_on_malformed_loss_breaker_config():
+    """A bad ``loss_breaker_*`` deployment setting is a distinct
+    configuration refusal (``config_invalid``), not a generic error."""
+    account_id = "acc-badcfg"
+    dep_bad = _deployment(
+        account_id=account_id,
+        settings={"loss_breaker_daily_loss_fraction": "bogus"},
+    )
+    _observe(account_id, 100_000.0, DAY1)
+    adapter = _Adapter(equity=100_000.0)
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        asyncio.run(
+            daemon.prepare_order_with_risk(adapter, dep_bad, _entry_signal(dep_bad))
+        )
+    assert excinfo.value.kind == "config_invalid"
+    assert "invalid" in str(excinfo.value).lower()
+
+
+def test_gate_refuses_on_malformed_env_config():
+    dep = _deployment(account_id="acc-badcfg2")
+    _observe("acc-badcfg2", 100_000.0, DAY1)
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        _gate(
+            dep, equity=100_000.0, now=DAY1,
+            env_values={"LOSS_BREAKER_DAILY_LOSS_FRACTION": "bogus"},
+        )
+    assert excinfo.value.kind == "config_invalid"
+    assert excinfo.value.state_unreadable is True
+
+
+def test_poll_observes_equity_not_balance():
+    """#18 pin: the poll hands the breaker's equity (get_balance()[1] via the
+    fallback path) to the observation - a (balance, equity) split must record
+    equity, not balance."""
+    account_id = "acc-eqvsbal"
+    dep = _deployment(account_id=account_id)
+
+    class _SplitPollAdapter(_PollAdapter):
+        async def get_balance(self):
+            return 100_000.0, 94_000.0
+
+    adapter = _SplitPollAdapter([1.0])
+    asyncio.run(
+        daemon._poll_adapter_balance(
+            {account_id: adapter},
+            account_id,
+            adapter,
+            DAY1,
+            current_deployments=lambda: [dep],
+        )
+    )
+    state = get_live_loss_breaker_state(account_loss_breaker_scope(account_id))
+    assert state.last_equity == pytest.approx(94_000.0)
+    # The saved balance snapshot keeps its own (balance, equity) record.
+    latest = get_latest_live_balance(account_id)
+    assert latest.balance == pytest.approx(100_000.0)
+    assert latest.equity == pytest.approx(94_000.0)
+
+
+def test_zero_equity_poll_writes_no_baseline_row():
+    """#5 pin: a zero/negative equity observation must not write a zero
+    baseline that would later read as a breach or poison the series."""
+    observe_account_loss_breaker_equity(
+        "acc-zero", 0.0, now=DAY1, deployments=[], deployment_pnls={}, env_values=NO_ENV
+    )
+    observe_account_loss_breaker_equity(
+        "acc-zero", -50.0, now=DAY1, deployments=[], deployment_pnls={}, env_values=NO_ENV
+    )
+    assert list_live_loss_breaker_states("acc-zero") == []
+
+
+def test_pip_values_are_cached_per_symbol_and_day():
+    """The poll resolves pip values for every symbol the account ever traded;
+    a cached value must not be re-fetched within the same UTC day."""
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    calls = []
+
+    class _CountingAdapter(_PnlAdapter):
+        async def get_pip_value(self, symbol):
+            calls.append(symbol)
+            return await super().get_pip_value(symbol)
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-pipcache", dep_id, "AAPL", "buy", 10.0, 100.0)
+    adapter = _CountingAdapter(100.0)
+    first = asyncio.run(account_deployment_trading_pnls(adapter, "acc-pipcache"))
+    second = asyncio.run(account_deployment_trading_pnls(adapter, "acc-pipcache"))
+    assert first is not None and second is not None
+    assert calls == ["AAPL"]
+
+
+def test_accounts_env_file_override_is_honoured(tmp_path):
+    """``set_accounts_env_file`` points LOSS_BREAKER_* resolution at the
+    daemon's configured accounts file (the --accounts-env fix)."""
+    env_file = tmp_path / "custom.accounts.env"
+    env_file.write_text("LOSS_BREAKER_DAILY_LOSS_FRACTION=0.07\n")
+    loss_breaker.set_accounts_env_file(env_file)
+    try:
+        limits = account_loss_breaker_limits("acc-x", env_values=None)
+        assert limits.daily_loss_fraction == pytest.approx(0.07)
+    finally:
+        loss_breaker.set_accounts_env_file(None)
+    limits = account_loss_breaker_limits("acc-x", env_values=None)
+    assert limits.daily_loss_fraction == pytest.approx(0.05)

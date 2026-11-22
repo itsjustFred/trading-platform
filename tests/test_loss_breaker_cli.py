@@ -322,3 +322,82 @@ def test_reset_drawdown_requires_equity_when_no_snapshot_exists(tmp_path: Path) 
 
     assert result.returncode == 1
     assert "--equity" in result.stderr
+
+
+def test_reset_drawdown_refuses_a_non_positive_balance_snapshot(tmp_path: Path) -> None:
+    """A zero/negative snapshot equity is not a re-base figure: refuse it."""
+    data_dir = tmp_path / "data"
+    _seed_state(data_dir)
+    seed_balance = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from datetime import datetime, timezone;"
+            "from shared.database import save_live_balance;"
+            "from shared.models import LiveBalanceRecord;"
+            "save_live_balance(LiveBalanceRecord("
+            "    account_id='acc-cli',"
+            "    timestamp=datetime.now(timezone.utc),"
+            "    balance=0.0, equity=0.0))",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert seed_balance.returncode == 0, seed_balance.stderr
+
+    result = _run(["reset-drawdown", "--account", ACCOUNT], data_dir)
+
+    assert result.returncode == 1
+    assert "unusable" in result.stderr
+
+    # --equity still works: the operator states the figure explicitly.
+    explicit = _run(
+        ["reset-drawdown", "--account", ACCOUNT, "--equity", "81000"], data_dir
+    )
+    assert explicit.returncode == 0, explicit.stderr
+
+
+def test_reset_drawdown_exits_nonzero_when_a_cascade_scope_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """A partial cascade is not a success: the account scope resets but the
+    deployment scope cannot be re-based (no usable last observed equity), so
+    entries may still be refused - the CLI must exit non-zero."""
+    data_dir = tmp_path / "data"
+    _seed_account_with_deployment(data_dir)
+    # Strip the deployment row's last_equity: its re-base lives in
+    # P&L-adjusted units and there is nothing to fall back to.
+    strip = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from shared.database import get_session, LiveLossBreakerStateModel\n"
+            "from sqlalchemy import update\n"
+            "with get_session() as s:\n"
+            "    s.exec(update(LiveLossBreakerStateModel)\n"
+            "        .where(LiveLossBreakerStateModel.scope == 'deployment:dep-1')\n"
+            "        .values(last_equity=None))\n"
+            "    s.commit()\n",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert strip.returncode == 0, strip.stderr
+
+    result = _run(
+        ["reset-drawdown", "--account", ACCOUNT, "--equity", "82000"], data_dir
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    # The account scope DID reset - the failure is partial, not total.
+    assert any(s["scope"] == f"account:{ACCOUNT}" for s in payload["scopes"])
+    skipped = {s["scope"] for s in payload["skipped"]}
+    assert "deployment:dep-1" in skipped
+    assert "deployment:dep-1" in result.stderr

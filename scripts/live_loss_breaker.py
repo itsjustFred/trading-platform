@@ -353,6 +353,14 @@ def _cmd_reset_drawdown(args: argparse.Namespace) -> int:
     if skipped:
         payload["skipped"] = skipped
     print(json.dumps(payload, indent=2, default=str))
+    if failed or skipped:
+        # The requested scope failed, or a cascade target could not be
+        # re-based: entries may still be refused, so the command did not
+        # fully succeed even though part of the reset landed. The JSON
+        # payload above names what was skipped; exit non-zero for scripts.
+        for entry in skipped:
+            print(f"error: {entry['scope']}: {entry['reason']}", file=sys.stderr)
+        return 1
     return 0
 
 

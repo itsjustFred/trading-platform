@@ -61,9 +61,11 @@ from live_runner.exit_signals import (
 from live_runner.loss_breaker import (
     LossBreakerBreachError,
     account_deployment_trading_pnls,
+    account_loss_breaker_scope,
     deployment_loss_breaker_limits,
     observe_account_loss_breaker_equity,
     refuse_entry_if_loss_breaker_tripped,
+    set_accounts_env_file,
 )
 from live_runner.promotion import (
     deployment_signal_processor_name,
@@ -1922,16 +1924,42 @@ async def prepare_order_with_risk(
     # drawdown limits, checked at the same chokepoint every entry passes
     # through and *after* the exit branch above, so closing a position is never
     # blocked - PAUSED semantics, exits stay allowed. The breaker observes
-    # BROKER equity: when the caller supplied ``account_balance`` (a sizing
-    # input, not broker truth) the persisted equity series must not record it,
-    # so the breaker reads the adapter's equity itself. Runs in a thread: it
-    # is several SQLite round-trips and must not stall the loop.
-    breaker_equity = resolved_balance
-    if account_balance is not None:
+    # BROKER equity through the adapter's separate equity path (``get_equity``):
+    # sizing stays on ``get_balance`` semantics (#267 decision - realized
+    # balance), and a caller-supplied ``account_balance`` must never reach the
+    # persisted equity series. An adapter without ``get_equity`` (a test
+    # double) falls back to the balance tuple's equity slot. A failed equity
+    # read refuses the entry: unreadable equity is never "no loss".
+    get_equity = getattr(adapter, "get_equity", None)
+    if get_equity is not None:
+        try:
+            breaker_equity = float(await get_equity())
+        except Exception as exc:
+            raise LossBreakerBreachError(
+                f"Refusing a live entry: account equity for "
+                f"'{deployment.account_id}' could not be read ({exc!r}); the "
+                "loss breaker cannot measure a loss without it.",
+                scope=account_loss_breaker_scope(deployment.account_id),
+                account_id=deployment.account_id,
+                deployment_id=str(deployment.id),
+                state_unreadable=True,
+            ) from exc
+    else:
         _, broker_equity = await adapter.get_balance()
         breaker_equity = float(broker_equity)
     deployment_equity: float | None = None
-    if deployment_loss_breaker_limits(deployment).enabled:
+    try:
+        deployment_breaker_enabled = deployment_loss_breaker_limits(
+            deployment
+        ).enabled
+    except ValueError:
+        # A malformed LOSS_BREAKER_* value is a configuration error, not a
+        # breach: still call the gate so it raises the distinct "loss breaker
+        # configuration invalid" refusal instead of the generic handler. The
+        # P&L lookup below is irrelevant then - the gate refuses before it
+        # could matter.
+        deployment_breaker_enabled = True
+    if deployment_breaker_enabled:
         # The deployment scope measures the deployment's own P&L: synthetic
         # equity = account equity - every OTHER deployment's P&L. ``None``
         # (unmeasurable) fails closed inside the gate.
@@ -4061,10 +4089,23 @@ async def _poll_adapter_balance(
         # logged inside the breaker and never reaches the poll.
         deployments = current_deployments() if current_deployments is not None else ()
         deployment_pnls = await account_deployment_trading_pnls(adapter, account_id)
+        # The breaker observes equity-with-unrealized-P&L through the adapter's
+        # separate equity path (``get_equity``), NOT the balance snapshot's
+        # equity slot: on cTrader that slot is realized balance by design
+        # (#267 - sizing stays on balance). An adapter without ``get_equity``
+        # (a test double) falls back to the tuple's equity slot. A failed
+        # equity read is logged inside the breaker and skips the observation -
+        # the entry gate re-checks and fails closed.
+        get_equity = getattr(adapter, "get_equity", None)
+        breaker_equity = (
+            float(await get_equity())
+            if get_equity is not None
+            else float(equity)
+        )
         await asyncio.to_thread(
             observe_account_loss_breaker_equity,
             account_id,
-            float(equity),
+            breaker_equity,
             now=snapshot_time,
             deployments=deployments,
             deployment_pnls=deployment_pnls,
@@ -5291,6 +5332,10 @@ async def run_daemon(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},
     )
+    # The loss breaker resolves LOSS_BREAKER_* env file-first through the same
+    # accounts file the daemon was started with; without this a per-account
+    # override in a non-default --accounts-env file would be silently ignored.
+    set_accounts_env_file(accounts_env)
     active_adapters: dict[str, BaseLiveAdapter] = {}
     active_listener_tasks: dict[str, asyncio.Task[None]] = {}
     active_discord_tasks: dict[str, asyncio.Task[None]] = {}

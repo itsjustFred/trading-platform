@@ -126,12 +126,18 @@ class _CTrader:
         async def get_balance() -> tuple[float, float]:
             return balance, balance
 
+        async def get_equity() -> float:
+            # The breaker reads the separate equity path (#267); this fixture
+            # has no unrealized-P&L book, so equity == realized balance.
+            return balance
+
         async def get_positions() -> list[dict[str, Any]]:
             return []
 
         adapter.get_quote = get_quote
         adapter._send_request_with_refresh_retry = send
         adapter.get_balance = get_balance
+        adapter.get_equity = get_equity
         adapter.get_positions = get_positions
 
 

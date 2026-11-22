@@ -339,10 +339,25 @@ def _isolate_loss_breaker_state():
     try:
         from sqlalchemy import text
 
+        import live_runner.loss_breaker as loss_breaker
         import shared.database as database
 
         with database.get_engine().begin() as conn:
             conn.execute(text("DELETE FROM live_loss_breaker_state"))
+            # ``ledger_reconciliation_required`` audit rows also latch breaker
+            # behaviour (deployment P&L fails closed) and, unlike the state
+            # table, nothing else clears them between tests.
+            conn.execute(
+                text(
+                    "DELETE FROM live_control_audit "
+                    "WHERE action = 'ledger_reconciliation_required'"
+                )
+            )
+        # Process-local breaker caches must not leak between tests either: a
+        # latched unmeasurable-P&L alert or a cached pip value would silently
+        # change a later test's behaviour.
+        loss_breaker._PNL_UNMEASURABLE_ALERTED.clear()
+        loss_breaker._PIP_VALUE_CACHE.clear()
     except Exception:
         pass
     yield
@@ -372,4 +387,7 @@ def _isolate_loss_breaker_accounts_env(tmp_path):
         patch.setattr(
             loss_breaker, "_ACCOUNTS_ENV", tmp_path / "absent-accounts.env"
         )
+        # ``run_daemon`` may point the breaker at a configured accounts file;
+        # tests must never inherit that override from an earlier test.
+        patch.setattr(loss_breaker, "_ACCOUNTS_ENV_OVERRIDE", None)
         yield

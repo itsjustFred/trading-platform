@@ -503,6 +503,44 @@ apply to it.
 There is deliberately no daily reset command: the daily breaker resets itself
 at the UTC boundary.
 
+### When deployment P&L is unmeasurable (`loss_breaker_pnl_unmeasurable`)
+
+Deployment-scoped entries fail closed whenever the fill-ledger P&L cannot be
+measured exactly — that is deliberate: an unmeasurable scope is never "no
+loss". The account scope keeps observing and the account breaker still
+works; only `deployment:<id>` entries are refused. Each episode logs ONE
+ERROR with `data.alert = "loss_breaker_pnl_unmeasurable"` and a `reason`:
+
+- `unpriced_fills` — a fill on the account has no trusted price
+  (`actual_price_observed` is `sent_bad`/`absent`/`derived_unavailable`, or a
+  non-positive `actual_price`). The alert's `untrusted_fills` list names the
+  execution ids, deployments, symbols and quantities involved. Repair: fix or
+  re-derive the fill's price through the normal reconciliation path (the same
+  one that writes `actual_price_observed`), or correct the ledger row by hand
+  only with an audit entry. Until then the scope stays refused.
+- `ledger_reconciliation` — an unresolved `ledger_reconciliation_required`
+  audit row exists for the account (#277/#330 merge-order dependency: the
+  ledger may be missing broker-side closes). Repair: resolve the flagged
+  reconciliation first; the breaker refuses until no unresolved flag remains.
+- `missing_pip_value` / `unusable_quote` — the broker could not supply a pip
+  value or a two-sided quote for a symbol with an open ledger position.
+  Usually transient (market closed, symbol halted); if it persists, check the
+  symbol's market-data classification and the adapter's quote/pip path.
+- `flows_unreadable` — the ledger query itself raised; check the database.
+
+Pip values are cached per symbol per UTC day: the ledger can name symbols the
+account traded months ago, and re-fetching a pip value for every one of them
+each poll would fail on delisted/closed symbols. Quotes for symbols with an
+OPEN ledger position are still fetched fresh every evaluation — a closed
+market there fails closed by design.
+
+Ledger limitations the deployment scope inherits: swap/financing charges are
+NOT in the fill ledger (they never appear as fills), so a deployment holding
+overnight FX or swap-accruing positions has a P&L the breaker cannot see;
+treat deployment scopes on such accounts as approximate. Pip values convert
+through the account currency at the day's cached rate — intraday FX moves are
+not tracked.
+
 ## Market-data symbol classification (Alpaca, #122)
 
 `live_runner/symbol_class.py` decides which feed a symbol belongs to, by *asset class* and never by string shape alone: a pair is recognised only when its base currency is in `CRYPTO_BASES` and its quote currency is in `CRYPTO_QUOTES` (that quote list is shared with `shared/alpaca_symbols.py`, so fee backfill and market-data routing cannot drift on it). Share-class equities (`BRK.B`, `BF-B`) are equities, exactly as in the fee backfill.
