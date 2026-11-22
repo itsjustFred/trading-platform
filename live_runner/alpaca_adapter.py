@@ -652,8 +652,10 @@ def _order_filled_qty(order: Any) -> float | None:
     excusal needs this number, and a number nobody could read answers "unknown" -
     the same fail-closed answer the rest of this file gives a row it cannot read.
     """
-    value = _to_float(_order_attr(order, "filled_qty", None), default=float("nan"))
-    return value if math.isfinite(value) else None
+    try:
+        return parse_optional(_order_attr(order, "filled_qty", None))
+    except MoneyParseError:
+        return None
 
 
 class _RestingLeg(NamedTuple):
@@ -1161,8 +1163,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             return False
         if _order_status(leg) not in {"filled", "partially_filled"}:
             return False
-        leg_cumulative_qty = _to_float(_order_attr(leg, "filled_qty", None), default=0.0)
-        if not math.isfinite(leg_cumulative_qty) or leg_cumulative_qty <= 0.0:
+        # Absent reads as nothing filled; a present but unreadable quantity raises
+        # MoneyParseError (#280), which the reconciliation pass skips per signal.
+        parsed_leg_qty = parse_optional(_order_attr(leg, "filled_qty", None))
+        leg_cumulative_qty = 0.0 if parsed_leg_qty is None else parsed_leg_qty
+        if leg_cumulative_qty <= 0.0:
             return False
         close_signal_id = broker_close_signal_id(parent_signal_id)
         recorded_qty = await asyncio.to_thread(
@@ -3494,8 +3499,9 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         )
         if skip:
             return
-        broker_cumulative_filled_qty = _to_float(
-            getattr(order, "filled_qty", None), default=0.0
+        cumulative_filled_qty = parse_optional(getattr(order, "filled_qty", None))
+        broker_cumulative_filled_qty = (
+            0.0 if cumulative_filled_qty is None else cumulative_filled_qty
         )
         # The event's OWN quantity, not the cumulative fallback `_resolve_trade_update_qty` may
         # have substituted: only that proves this fill is the whole leg.
@@ -3508,7 +3514,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             event_qty=event_qty,
             cumulative_qty=broker_cumulative_filled_qty,
         )
-        filled_qty = _to_float(filled_qty_value)
+        event_filled_qty = parse_optional(filled_qty_value)
+        filled_qty = 0.0 if event_filled_qty is None else event_filled_qty
         raw_fill_ts = getattr(data, "timestamp", None)
         fill_ts = _broker_fill_timestamp(
             raw_fill_ts, getattr(order, "filled_at", None), getattr(order, "updated_at", None)
