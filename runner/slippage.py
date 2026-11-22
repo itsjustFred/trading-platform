@@ -476,6 +476,27 @@ def _bps_model(bps_override: Any, asset_class: str, params: dict[str, Any]) -> S
     )
 
 
+def _reject_dead_fallback_keys(params: dict[str, Any]) -> None:
+    """Reject fallback keys a fixed ``slippage_bps`` makes unreachable.
+
+    ``slippage_default_bps``/``slippage_defaults`` are fallbacks consulted
+    only when no fixed bps is declared; beside ``slippage_bps`` they would
+    be silently ignored — the same config lie ``slippage=<number>`` already
+    rejects.
+    """
+    stray = [
+        key
+        for key in ("slippage_default_bps", "slippage_defaults")
+        if params.get(key) is not None
+    ]
+    if stray:
+        raise ValueError(
+            "params['slippage_bps'] fixes the bps for every asset class; "
+            f"{', '.join(stray)} would be silently ignored. Drop them or "
+            "remove slippage_bps."
+        )
+
+
 def _numeric_slippage_or_raise(explicit: str, asset_class: str) -> SlippageModel:
     """A ``slippage`` string that is neither a spelling nor a number."""
     try:
@@ -525,6 +546,13 @@ def resolve_slippage_model(
     """
     params = dict(params or {})
     ac = _normalize_asset_class(asset_class)
+    # ``slippage_defaults`` keys are config, not data: a typo must raise on
+    # EVERY resolution path. Validation used to live inside
+    # ``_class_default_bps``, which gross/unclassified runs never reach —
+    # ``{"slippage_defaults": {"equitys": 20}}`` resolved to ``none`` with
+    # no error. Normalizing up front rejects bad keys (and non-dict values)
+    # before any early return.
+    _normalized_slippage_defaults(params)
 
     model = params.get("slippage_model")
     if model is not None:
@@ -580,9 +608,15 @@ def resolve_slippage_model(
                     f"slippage={explicit!r} declares a gross run; "
                     f"{', '.join(stray)} would be silently ignored. Drop them."
                 )
+        if bps_override is not None:
+            # Only the 'bps'/'spread' spellings reach this point with a
+            # slippage_bps (the others raised above): the fixed bps wins for
+            # every asset class, so the fallback keys are silently dead.
+            _reject_dead_fallback_keys(params)
         return _resolve_string_slippage(explicit, params, ac, bps_override)
 
     if bps_override is not None:
+        _reject_dead_fallback_keys(params)
         return FixedBpsSlippage(
             bps=_positive_float(bps_override, field="slippage_bps"), asset_class=ac
         )

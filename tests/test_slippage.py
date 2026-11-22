@@ -310,6 +310,49 @@ class TestResolveSlippageModel:
                 {"slippage_defaults": ["equities"]}, asset_class="equities"
             )
 
+    def test_fixed_bps_rejects_dead_fallback_keys(self) -> None:
+        """``slippage_bps`` fixes every asset class, so ``slippage_default_bps``
+        / ``slippage_defaults`` beside it are silently dead config — reject,
+        the same rule ``slippage=<number>`` already follows."""
+        for extra in (
+            {"slippage_default_bps": 2.0},
+            {"slippage_defaults": {"forex": 2.0}},
+        ):
+            with pytest.raises(ValueError, match="slippage"):
+                resolve_slippage_model(
+                    {"slippage_bps": 3.0, **extra}, asset_class="forex"
+                )
+        # Same under the explicit 'bps' and 'spread' spellings (where
+        # slippage_bps is the fixed value / the bar-less fallback).
+        for spelling in ("bps", "spread"):
+            with pytest.raises(ValueError, match="slippage"):
+                resolve_slippage_model(
+                    {
+                        "slippage": spelling,
+                        "slippage_bps": 3.0,
+                        "slippage_defaults": {"forex": 2.0},
+                    },
+                    asset_class="forex",
+                )
+
+    def test_slippage_defaults_validated_on_gross_and_fixed_paths(self) -> None:
+        """A typo'd ``slippage_defaults`` key must raise even when the run
+        never reaches ``_class_default_bps``: an unclassified asset resolves
+        gross, and a fixed ``slippage_bps`` never consults the fallbacks."""
+        with pytest.raises(ValueError, match="asset class"):
+            resolve_slippage_model(
+                {"slippage_defaults": {"equitys": 20.0}}, asset_class=""
+            )
+        with pytest.raises(ValueError, match="asset class"):
+            resolve_slippage_model(
+                {
+                    "slippage": "bps",
+                    "slippage_bps": 3.0,
+                    "slippage_defaults": {"bogus": 1.0},
+                },
+                asset_class="equities",
+            )
+
 
 class TestSlipPrice:
     def test_fixed_bps_adverse_direction(self) -> None:
