@@ -30,13 +30,17 @@ logger = logging.getLogger(__name__)
 @dataclass
 class StrategyEquityPoint:
     """Equity point from a single strategy backtest."""
+
     time: int  # Unix timestamp in seconds
     equity: float
 
 
 #: Annualization convention for the portfolio Sharpe (Cleanup 16-D1, F36):
 #: daily equity curves are the documented default cadence, annualized with
-#: 252 trading periods — the same convention as ``runner/stats.py``.
+#: 252 trading periods. Since #229 ``runner/stats.py`` annualises with the
+#: measured observation density instead (~365 for the calendar-filled
+#: production curves), so this fixed-252 convention is only approximately
+#: aligned — aligning it is tracked as a follow-up (#353).
 PORTFOLIO_PERIODS_PER_YEAR_DEFAULT = 252.0
 
 #: Timestamps (as datetime-like objects) of the equity matrix most recently
@@ -71,6 +75,7 @@ def _parse_time_to_ts(time_str: str | int) -> float:
     # Try ISO format first
     try:
         from datetime import datetime
+
         if isinstance(time_str, str):
             dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
             if dt.tzinfo is None:
@@ -194,9 +199,7 @@ def _load_strategy_equity(
         if end_ts is not None and time_ts > end_ts:
             continue
         if math.isfinite(time_ts) and math.isfinite(float(point.equity)):
-            points.append(
-                StrategyEquityPoint(time=int(time_ts), equity=float(point.equity))
-            )
+            points.append(StrategyEquityPoint(time=int(time_ts), equity=float(point.equity)))
     return points
 
 
@@ -287,8 +290,7 @@ def _align_equity_curves(
         return np.empty((0, len(curves)))
 
     aligned_columns = [
-        _aligned_curve_values(curve, sorted_times, require_overlap)
-        for curve in curves
+        _aligned_curve_values(curve, sorted_times, require_overlap) for curve in curves
     ]
     return np.array(aligned_columns, dtype=float).T
 
@@ -366,8 +368,9 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
     # Equity curves are trading-day series in practice; a calendar-daily
-    # cadence is mapped onto the 252 trading-day convention so the number is
-    # comparable with stats.py's daily Sharpe.
+    # cadence is mapped onto the 252 trading-day convention. Since #229
+    # stats.py annualises calendar-filled curves at ~365 measured density,
+    # this mapping is approximate — realignment is tracked in #353.
     if 350.0 <= periods_per_year <= 380.0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
     # Coarser-than-daily cadences (weekly ≈ 52, biweekly ≈ 26, monthly ≈ 12)
@@ -408,11 +411,7 @@ def _portfolio_sharpe_from_weights(
     std_ret = np.std(returns)
 
     periods_per_year = _infer_portfolio_periods_per_year(equity_matrix)
-    sharpe = (
-        float(mean_ret / std_ret) * math.sqrt(periods_per_year)
-        if std_ret > 0
-        else 0.0
-    )
+    sharpe = float(mean_ret / std_ret) * math.sqrt(periods_per_year) if std_ret > 0 else 0.0
 
     # Max drawdown
     peak = np.maximum.accumulate(portfolio_eq)
@@ -448,17 +447,14 @@ def _build_objective(
 
     def objective(trial: optuna.Trial) -> float:
         weights_raw = [
-            trial.suggest_float(f"weight_{index}", 0.0, 1.0)
-            for index in range(len(backtest_ids))
+            trial.suggest_float(f"weight_{index}", 0.0, 1.0) for index in range(len(backtest_ids))
         ]
         weights = _normalize_weights(np.array(weights_raw))
         sharpe, max_drawdown = _portfolio_sharpe_from_weights(weights, equity_matrix)
         # #87: per-trial weighted penalty — weight-dependent, so the
         # optimizer can actually see diversification.
         penalty = _weighted_correlation_penalty(weights, correlation_matrix)
-        score = sharpe - (5.0 * penalty) - (
-            3.0 * max(0, max_drawdown - 0.3)
-        )
+        score = sharpe - (5.0 * penalty) - (3.0 * max(0, max_drawdown - 0.3))
         score -= max(0.0, float(target_sharpe) - sharpe)
 
         trial.report(sharpe, trial.number)
@@ -530,9 +526,7 @@ def _compute_oos_metrics(
         return None, None
     # Annualization cadence must come from the OOS timestamps themselves,
     # not the IS matrix recorded earlier.
-    _record_portfolio_timestamps(
-        test_curves, _common_timestamps(test_curves, require_overlap=True)
-    )
+    _record_portfolio_timestamps(test_curves, _common_timestamps(test_curves, require_overlap=True))
     try:
         return _portfolio_sharpe_from_weights(best_weights, oos_equity_matrix)
     finally:
@@ -568,8 +562,7 @@ def _build_optimization_result(
         "created_at": now.isoformat(),
         "backtest_ids": backtest_ids,
         "weights": {
-            backtest_id: float(weight)
-            for backtest_id, weight in zip(backtest_ids, best_weights)
+            backtest_id: float(weight) for backtest_id, weight in zip(backtest_ids, best_weights)
         },
         "sharpe": sharpe,
         "max_drawdown": max_drawdown,
@@ -737,9 +730,7 @@ def optimize_portfolio_allocation(
             test_end=test_end,
         )
     else:
-        train_curves, test_curves = _split_equity_curves_by_time(
-            curves, train_months, test_months
-        )
+        train_curves, test_curves = _split_equity_curves_by_time(curves, train_months, test_months)
 
     curves_to_optimize = train_curves if has_explicit_boundaries or train_curves else curves
     equity_matrix = _align_equity_curves(curves_to_optimize, require_overlap=True)
@@ -791,10 +782,7 @@ def optimize_portfolio_allocation(
             "backtest_ids": backtest_ids,
         }
 
-    best_raw = [
-        study.best_trial.params[f"weight_{index}"]
-        for index in range(len(backtest_ids))
-    ]
+    best_raw = [study.best_trial.params[f"weight_{index}"] for index in range(len(backtest_ids))]
     best_weights = _normalize_weights(np.array(best_raw))
     sharpe, max_drawdown = _portfolio_sharpe_from_weights(
         best_weights,

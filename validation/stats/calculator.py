@@ -10,7 +10,9 @@ Mathematical conventions (kept explicit so results are reproducible):
   "returns" series is the per-trade realized PnL sequence and ``P`` is the
   number of trades per year derived from the trade timestamps
   (``n_trades / span_years``) — compatible with ``runner/stats.py``, which
-  annualizes daily equity returns with 252 periods. When the timestamps
+  annualizes daily equity returns with the measured observation density
+  (#229; ~365 for calendar-filled curves, ~252 for observed-day
+  business-day curves). When the timestamps
   cannot support a trade-frequency annualization (fewer than 2 dated
   trades, zero span, or more than one trade per day on average — e.g.
   intraday or synthetic fixtures), it falls back to ``sqrt(252)``.
@@ -216,10 +218,9 @@ def _daily_net_series(
         exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
         if pd.isna(exit_ts):
             return None
-        day_totals[pd.Timestamp(exit_ts).normalize().date().isoformat()] = (
-            day_totals.get(pd.Timestamp(exit_ts).normalize().date().isoformat(), 0.0)
-            + _net_realized_pnl(trade)
-        )
+        day_totals[pd.Timestamp(exit_ts).normalize().date().isoformat()] = day_totals.get(
+            pd.Timestamp(exit_ts).normalize().date().isoformat(), 0.0
+        ) + _net_realized_pnl(trade)
     days = int((end - start).total_seconds() // 86400) + 1
     series: List[float] = []
     cursor = start

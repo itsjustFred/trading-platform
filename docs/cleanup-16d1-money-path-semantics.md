@@ -300,8 +300,11 @@ this code (older persisted artifacts keep their original numbers):
 - Portfolio-optimizer `sharpe`/`oos_sharpe` are annualized (F36); values
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
-- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(252)` on daily
-  returns, on both code paths. When the equity curve's timestamps cannot be
+- `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(periods)` on
+  daily returns, on both code paths, where `periods` is the measured
+  observation density of the return series (#229 — ~365 for the
+  calendar-filled production curves, ~252 for observed-day business-day
+  curves). When the equity curve's timestamps cannot be
   parsed the observation spacing is unknown, so the annualisation factor is
   unknown: Sharpe, Sortino and PSR are listed in `undefined_metrics` (and
   published as `0.0`, the repo's convention for an undefined metric) and

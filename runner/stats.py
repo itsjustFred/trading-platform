@@ -193,13 +193,12 @@ def compute_stats(
         #   compounded product of resampled daily returns;
         # - calmar_ratio: CAGR (elapsed-time based, identical on both paths)
         #   divided by max drawdown;
-        # - sharpe/sortino: daily-resampled returns, annualized with 252
-        #   periods (quantstats when available, manual fallback otherwise).
+        # - sharpe/sortino: daily-resampled returns, annualized with the
+        #   measured observation density (quantstats when available, manual
+        #   fallback otherwise; #229).
         max_drawdown_pct = -_max_drawdown_pct_manual(equities)
         total_return = (
-            (equities[-1] / float(initial_capital)) - 1
-            if float(initial_capital) > 0
-            else 0
+            (equities[-1] / float(initial_capital)) - 1 if float(initial_capital) > 0 else 0
         )
         calmar_ratio = _safe_calmar_ratio(cagr, max_drawdown_pct)
         max_drawdown_duration = _max_drawdown_duration(equities)
@@ -341,8 +340,11 @@ def compute_stats(
                 return_frequency, return_frequency_reason
             ),
             # #229: the density Sharpe/Sortino were annualised with, measured
-            # off the observed-day return series (~252 business-day, ~365
-            # 24/7). None when the series has no measurable span.
+            # off the observed-day return series. Production daily-equity
+            # curves are calendar-filled (attach_daily_equity emits a point
+            # per calendar day), so they measure ~365/yr; a curve carrying
+            # only observed trading days measures ~252 business-day or ~365
+            # 24/7. None when the series has no measurable span.
             "equity_return_periods_per_year": (
                 round(periods_per_year, 4) if periods_per_year is not None else None
             ),
@@ -439,9 +441,7 @@ def _as_readable_equity_point(point: EquityPoint) -> EquityPoint:
     return EquityPoint(time=point.time, equity=equity)
 
 
-def _finite_or_undefined(
-    value: float, metric: str, undefined_metrics: set[str]
-) -> float | None:
+def _finite_or_undefined(value: float, metric: str, undefined_metrics: set[str]) -> float | None:
     """``value`` when it is a finite measurement, else ``None`` named undefined.
 
     Non-finite is absence, not a number: NaN/inf cannot be stored in the stats
@@ -668,14 +668,10 @@ def _resolve_backtest_period_bounds(
     carries no usable timestamps.
     """
     configured_start = (
-        pd.to_datetime(backtest_start, utc=True, errors="coerce")
-        if backtest_start
-        else pd.NaT
+        pd.to_datetime(backtest_start, utc=True, errors="coerce") if backtest_start else pd.NaT
     )
     configured_end = (
-        pd.to_datetime(backtest_end, utc=True, errors="coerce")
-        if backtest_end
-        else pd.NaT
+        pd.to_datetime(backtest_end, utc=True, errors="coerce") if backtest_end else pd.NaT
     )
     if (
         not pd.isna(configured_start)
@@ -908,7 +904,7 @@ def _one_sided_p_value(returns: list[float]) -> float:
 
 def _period_risk_free_rate(
     risk_free_rate: float,
-    periods: int = DAILY_RETURN_PERIODS_PER_YEAR,
+    periods: float = DAILY_RETURN_PERIODS_PER_YEAR,
 ) -> float:
     """Convert an annual risk-free rate to a per-period rate.
 
@@ -933,8 +929,10 @@ def _sharpe_manual(
     scaled by ``sqrt(periods_per_year)``.
 
     ``periods_per_year`` is the measured observation density of the return
-    series (#229, ``_return_periods_per_year``): ~252 for a business-day
-    curve, ~365 for a 24/7 curve. It is a required keyword — the old fixed
+    series (#229, ``_return_periods_per_year``): ~365 for a calendar-filled
+    daily curve (the production ``attach_daily_equity`` shape), ~252 for a
+    curve carrying only business days, ~365 for a 24/7 observed-day curve.
+    It is a required keyword — the old fixed
     sqrt(252) is exactly the convention that understated business-day
     Sharpes by sqrt(252/365), and a silent default would let a caller
     reintroduce it. ``DAILY_RETURN_PERIODS_PER_YEAR`` remains only as the

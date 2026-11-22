@@ -244,16 +244,24 @@ collision, so consumers always read the canonical value.
 **Sharpe/Sortino convention (#229).** The equity curve is resampled to one
 observation per *observed* day — calendar days the curve carries no point
 for contribute no zero-return observation — and the ratio is annualised
-with the measured observation density (`extras.equity_return_periods_per_year`:
-~252 for a Mon–Fri curve, ~365 for a 24/7 curve, ~52 for weekly). A
-calendar-filled curve that carries explicit flat weekend points measures
-~365 observations/year; the flat days dilute the per-observation ratio by
-the same factor the higher density annualises it, so both curve shapes
-publish the same Sharpe. Cross-platform parity (the MT5 audit matrix in
-`validation/statistics/cross_platform.py`) applies this identical formula
-to both equity curves — ours and the trade-derived imported one — rather
-than comparing against MT5's printed Sharpe-Ratio, which uses MT5's own
-convention; the printed value is kept as `sharpe_ratio_reported`.
+with the measured observation density (`extras.equity_return_periods_per_year`).
+The production daily-equity path (`attach_daily_equity`) calendar-fills the
+curve — one point per calendar day, flat days included — so published
+backtests measure ~365 observations/year regardless of the strategy's
+trading calendar; a curve carrying only observed trading days measures
+~252 for a Mon–Fri book, ~365 for a 24/7 book, ~52 for weekly. Because the
+flat days dilute the per-observation ratio by the same factor the higher
+density annualises it, calendar-filled and observed-day constructions
+publish approximately the same Sharpe (exact equality only holds when the
+return series is identical). Cross-platform parity (the MT5 audit matrix
+in `validation/statistics/cross_platform.py`) applies this identical formula
+to both equity curves — ours and the trade-derived imported one, which is
+rebuilt with the same calendar-filled daily shape — rather than comparing
+against MT5's printed Sharpe-Ratio, which uses MT5's own convention; the
+printed value is kept as `sharpe_ratio_reported`. The platform curve is
+mark-to-market while the imported curve is realized-only (PnL booked on
+exit days), so parity Sharpes are approximately — not exactly — equal; the
+trade list remains the primary parity evidence.
 
 ## 7. `total_bars`
 

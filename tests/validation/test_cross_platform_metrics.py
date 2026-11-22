@@ -31,7 +31,9 @@ def test_cross_platform_matrix_includes_reference_metrics():
         "sharpe_ratio",
     }
     assert rows["intraday_volatility_breakout_sp500_m1"]["reference"]["trade_count"] == 512
-    assert rows["intraday_volatility_breakout_sp500_m1"]["reference"]["win_rate"] == pytest.approx(0.4492)
+    assert rows["intraday_volatility_breakout_sp500_m1"]["reference"]["win_rate"] == pytest.approx(
+        0.4492
+    )
     assert rows["intraday_volatility_breakout_sp500_m1"]["reference"]["cagr"] is not None
     assert rows["intraday_volatility_breakout_sp500_m1"]["platform_path"].endswith(
         "data/backtests/intraday_volatility_breakout_sp500_m1.json"
@@ -139,9 +141,7 @@ def test_cross_platform_matrix_reads_mt5_reference_timestamps_on_the_broker_cloc
         )
     platform = json.loads(platform_path.read_text(encoding="utf-8"))
     reference_entries = {trade.entry_time for trade in reference.trades}
-    platform_entries = {
-        trade["entry_time"].replace("+00:00", "Z") for trade in platform["trades"]
-    }
+    platform_entries = {trade["entry_time"].replace("+00:00", "Z") for trade in platform["trades"]}
 
     assert reference.trades[0].entry_time == "2018-01-16T14:45:00Z"
     # Legacy index history is fixed UTC+2: Athens would read 15:00Z / 15:45Z.
@@ -191,8 +191,7 @@ def test_comparison_matrix_parses_each_mt5_report_on_its_case_broker_clock(monke
     )
 
     assert recorded == {
-        f"{case['label']}.xlsx": {"broker_clock": case["broker_clock"]}
-        for case in COMPARISON_CASES
+        f"{case['label']}.xlsx": {"broker_clock": case["broker_clock"]} for case in COMPARISON_CASES
     }
 
 
@@ -326,26 +325,75 @@ def test_reference_sharpe_uses_platform_formula_on_imported_curve():
     sharpe = _reference_sharpe_ratio(reference)
 
     assert sharpe is not None
-    # Same-formula check: rebuilding the curve by hand and running
-    # compute_stats gives the identical number.
+    # Same-formula check, independently rebuilt: the reference curve is
+    # calendar-filled (one point per calendar day, flat between exits) —
+    # the shape production publishes via attach_daily_equity — so the
+    # measured density is ~365/yr, not the exit frequency.
+    from datetime import datetime, timedelta, timezone
+
     from runner.stats import compute_stats
     from shared.models import EquityPoint
 
-    equity = 100_000.0
-    points = [EquityPoint(time="2024-01-02T08:00:00+00:00", equity=equity)]
+    pnl_by_day: dict[str, float] = {}
     for trade in trades:
-        equity += float(trade.net_pnl)
+        day = trade.exits[-1].time[:10]
+        pnl_by_day[day] = pnl_by_day.get(day, 0.0) + float(trade.net_pnl)
+
+    start = datetime(2024, 1, 2, 8, 0, tzinfo=timezone.utc)
+    last_day = datetime(2024, 1, 15, tzinfo=timezone.utc).date()
+    equity = 100_000.0
+    points = [EquityPoint(time=start.isoformat(), equity=equity)]
+    day = start.date()
+    while day <= last_day:
+        equity += pnl_by_day.get(day.isoformat(), 0.0)
         points.append(
-            EquityPoint(time=trade.exits[-1].time, equity=equity)
+            EquityPoint(
+                time=datetime.combine(day, datetime.max.time(), tzinfo=timezone.utc).isoformat(),
+                equity=equity,
+            )
         )
-    expected = compute_stats(
-        [], initial_capital=100_000.0, equity_curve=points
-    )["sharpe_ratio"]
+        day += timedelta(days=1)
+
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=points)
+    assert stats["equity_return_periods_per_year"] == pytest.approx(365.25, rel=0.02)
+    expected = stats["sharpe_ratio"]
     assert sharpe == pytest.approx(expected, abs=1e-4)
+    # An exits-only curve would measure ~10 exits over ~14 days (~260/yr)
+    # and publish a different Sharpe — pinning the calendar-fill choice.
+    exit_only_stats = compute_stats(
+        [],
+        initial_capital=100_000.0,
+        equity_curve=[
+            EquityPoint(time=start.isoformat(), equity=100_000.0),
+            *[
+                EquityPoint(
+                    time=t.exits[-1].time,
+                    equity=100_000.0 + sum(float(x.net_pnl) for x in trades[: i + 1]),
+                )
+                for i, t in enumerate(trades)
+            ],
+        ],
+    )
+    assert exit_only_stats["sharpe_ratio"] != pytest.approx(sharpe, abs=1e-4)
 
 
 def test_reference_sharpe_fails_closed_without_enough_exits():
     reference = _mt5_like_reference([_mt5_trade("2024-01-02", 100.0)])
+
+    assert _reference_sharpe_ratio(reference) is None
+
+
+def test_reference_sharpe_fails_closed_on_unparseable_exit_time():
+    trade = _mt5_trade("2024-01-02", 100.0)
+    trade.exits[0].time = "not-a-timestamp"
+    reference = _mt5_like_reference([trade, _mt5_trade("2024-01-03", 50.0)])
+
+    assert _reference_sharpe_ratio(reference) is None
+
+
+def test_reference_sharpe_fails_closed_on_non_finite_pnl():
+    trade = _mt5_trade("2024-01-02", float("nan"))
+    reference = _mt5_like_reference([trade, _mt5_trade("2024-01-03", 50.0)])
 
     assert _reference_sharpe_ratio(reference) is None
 
@@ -357,8 +405,21 @@ def test_mt5_row_reports_printed_sharpe_separately_from_the_comparison(matrix):
         "intraday_volatility_breakout_sp500_m1"
     ]
 
+    reference = MT5XLSXImporter().load(
+        Path(row["reference_path"]),
+        broker_clock=row["reference_broker_clock"],
+    )
+
     assert row["reference"]["sharpe_ratio_reported"] is not None
     assert row["reference"]["sharpe_ratio"] is not None
+    # The comparison value IS the canonical recomputation on the imported
+    # trade list — not the printed MT5 number, and not a lookalike.
+    assert row["reference"]["sharpe_ratio"] == pytest.approx(
+        _reference_sharpe_ratio(reference), rel=1e-6
+    )
+    assert row["reference"]["sharpe_ratio"] != pytest.approx(
+        row["reference"]["sharpe_ratio_reported"], rel=1e-3
+    )
     assert any("sharpe_ratio_reported" in note for note in row["notes"])
 
 

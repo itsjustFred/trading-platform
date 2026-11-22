@@ -16,7 +16,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -116,8 +116,12 @@ def build_comparison_matrix(
 
 def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
     reference = MT5XLSXImporter().load(case.reference_path, broker_clock=case.broker_clock)
-    reference_stats = _normalize_mt5_stats(reference.stats, case.reference_path, reference.raw_metadata)
-    platform_stats = _load_platform_stats(case.platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
+    reference_stats = _normalize_mt5_stats(
+        reference.stats, case.reference_path, reference.raw_metadata
+    )
+    platform_stats = _load_platform_stats(
+        case.platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE
+    )
     # #229 maintainer decision: Sharpe parity must apply OUR formula to BOTH
     # equity curves — the platform's and the imported MT5 one — not compare
     # against MT5's printed Sharpe-Ratio, which uses MT5's own convention.
@@ -164,6 +168,17 @@ def _reference_sharpe_ratio(reference: Any) -> float | None:
     identical observed-day return series and measured-density annualisation
     used for the platform artifact, which is what makes the two Sharpes
     comparable (#229).
+
+    The rebuilt curve is calendar-filled — one point per calendar day, flat
+    between exits — because that is the curve shape production publishes:
+    ``attach_daily_equity`` emits a point for every calendar day, so its
+    measured density is ~365/yr. An exits-only curve would measure the exit
+    frequency instead and annualise on a different basis than the platform
+    side, which is exactly the mismatch this comparison exists to remove.
+
+    Fails closed (``None``) when the trade list cannot support the curve:
+    fewer than two exits, an unparseable exit timestamp, or a non-finite
+    PnL — a silently thinned curve would compare a different strategy.
     """
     from runner.stats import compute_stats
     from shared.models import EquityPoint
@@ -176,13 +191,13 @@ def _reference_sharpe_ratio(reference: Any) -> float | None:
             continue
         exit_ts = pd.to_datetime(str(trade.exits[-1].time), utc=True, errors="coerce")
         if pd.isna(exit_ts):
-            continue
+            return None
         if trade.net_pnl is not None:
             pnl = float(trade.net_pnl)
         else:
             pnl = float(trade.pnl or 0.0) - float(trade.fees or 0.0)
         if not math.isfinite(pnl):
-            continue
+            return None
         exits.append((pd.Timestamp(exit_ts), pnl))
     if len(exits) < 2:
         return None
@@ -195,11 +210,26 @@ def _reference_sharpe_ratio(reference: Any) -> float | None:
             start_candidates.append(pd.Timestamp(entry_ts))
     start = min(start_candidates) if start_candidates else exits[0][0]
 
+    pnl_by_day: dict[Any, float] = {}
+    for exit_ts, pnl in exits:
+        day = exit_ts.date()
+        pnl_by_day[day] = pnl_by_day.get(day, 0.0) + pnl
+
     points = [EquityPoint(time=start.isoformat(), equity=float(initial_capital))]
     equity = float(initial_capital)
-    for exit_ts, pnl in exits:
-        equity += pnl
-        points.append(EquityPoint(time=exit_ts.isoformat(), equity=equity))
+    day = start.date()
+    last_day = exits[-1][0].date()
+    while day <= last_day:
+        equity += pnl_by_day.get(day, 0.0)
+        # End-of-day stamp: always after the day's own timestamps, so the
+        # daily resample in compute_stats books that day's exits on that day.
+        points.append(
+            EquityPoint(
+                time=datetime.combine(day, datetime.max.time(), tzinfo=timezone.utc).isoformat(),
+                equity=equity,
+            )
+        )
+        day += timedelta(days=1)
 
     stats = compute_stats(
         [],
@@ -211,7 +241,9 @@ def _reference_sharpe_ratio(reference: Any) -> float | None:
     return sharpe
 
 
-def _build_json_reference_row(case_id: str, reference_path: Path, platform_path: Path) -> dict[str, Any]:
+def _build_json_reference_row(
+    case_id: str, reference_path: Path, platform_path: Path
+) -> dict[str, Any]:
     reference_payload = json.loads(reference_path.read_text(encoding="utf-8"))
     reference_stats = _normalize_reference_stats(reference_payload.get("stats", {}))
     platform_stats = _load_platform_stats(platform_path, risk_free_rate=REFERENCE_RISK_FREE_RATE)
@@ -286,9 +318,7 @@ def _metric_delta(
         )
     # #128: signed drift against the reference magnitude — max(|reference|,
     # |platform|) halved real drift (100 -> 200 read as 50%, not 100%).
-    return MetricDelta(
-        metric, reference, platform, absolute, absolute / abs(reference)
-    )
+    return MetricDelta(metric, reference, platform, absolute, absolute / abs(reference))
 
 
 def _normalize_mt5_stats(
@@ -300,7 +330,12 @@ def _normalize_mt5_stats(
     meta = raw_metadata.get("parsed_meta", {}) if isinstance(raw_metadata, dict) else {}
     initial_capital = _safe_float(meta.get("initial_capital"))
     period = _extract_mt5_period(reference_path)
-    if normalized["cagr"] is None and initial_capital and normalized["net_profit"] is not None and period:
+    if (
+        normalized["cagr"] is None
+        and initial_capital
+        and normalized["net_profit"] is not None
+        and period
+    ):
         start, end = period
         days = (end - start).total_seconds() / (24 * 60 * 60)
         ending = initial_capital + normalized["net_profit"]
