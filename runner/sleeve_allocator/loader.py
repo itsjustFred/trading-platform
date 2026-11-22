@@ -241,7 +241,7 @@ def align_sleeve_returns(
             sleeve_id=sleeve_id,
             first_date=observed.index[0].date().isoformat() if len(observed) else None,
             last_date=observed.index[-1].date().isoformat() if len(observed) else None,
-            n_observations=int(len(observed)),
+            n_observations=len(observed),
         )
     return SleeveReturns(returns=frame, metadata=built)
 

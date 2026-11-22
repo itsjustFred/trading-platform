@@ -371,8 +371,9 @@ def _watched_repo_dirs_changed() -> list[str]:
         return []
     changes: list[str] = []
     for root, before in _REPO_TREES_BEFORE.items():
-        for change in diff_snapshots(before, snapshot_tree(Path(root))):
-            changes.append(f"{root}: {change}")
+        changes.extend(
+            f"{root}: {change}" for change in diff_snapshots(before, snapshot_tree(Path(root)))
+        )
     return changes
 
 

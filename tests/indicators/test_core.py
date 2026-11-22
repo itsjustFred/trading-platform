@@ -466,7 +466,7 @@ class TestNoLookahead:
         high, low, close = _property_frames()[frame_kind]
         for smoothing, seed, skipna, min_periods in _ATR_CASES:
             _assert_no_lookahead(
-                lambda h, lo, c: atr(
+                lambda h, lo, c, smoothing=smoothing, seed=seed, min_periods=min_periods, skipna=skipna: atr(
                     h, lo, c, 14,
                     smoothing=smoothing, seed=seed, first_bar="hl",
                     min_periods=min_periods, skipna=skipna,

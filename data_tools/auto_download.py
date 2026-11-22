@@ -10,6 +10,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Callable
 
@@ -783,16 +784,16 @@ def _find_gaps_inside_file(
     diffs = series.diff().dropna()
     large = diffs[diffs > threshold]
     gaps: list[InternalGap] = []
-    for index in large.index:
-        gaps.append(
-            InternalGap(
-                start=series[index - 1].date().isoformat(),
-                end=series[index].date().isoformat(),
-                gap_days=diffs[index].total_seconds() / 86_400,
-                start_ts=series[index - 1].isoformat(),
-                end_ts=series[index].isoformat(),
-            )
+    gaps.extend(
+        InternalGap(
+            start=series[index - 1].date().isoformat(),
+            end=series[index].date().isoformat(),
+            gap_days=diffs[index].total_seconds() / 86400,
+            start_ts=series[index - 1].isoformat(),
+            end_ts=series[index].isoformat(),
         )
+        for index in large.index
+    )
 
     # Every hole above the threshold, largest first - not just the largest.
     #
@@ -863,7 +864,7 @@ def find_internal_gaps(
 
     # Gap between the bars of adjacent files (e.g. monthly/segmented storage).
     bounds.sort(key=lambda item: item[0])
-    for (_, previous_end, _), (next_start, _, _) in zip(bounds, bounds[1:]):
+    for (_, previous_end, _), (next_start, _, _) in pairwise(bounds):
         gap_days = (next_start - previous_end).total_seconds() / 86_400
         if gap_days > threshold_days:
             gaps.append(

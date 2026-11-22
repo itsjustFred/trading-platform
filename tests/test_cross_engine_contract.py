@@ -569,8 +569,8 @@ def _gap_frame(*, spread: float = 0.0) -> pd.DataFrame:
     data: dict[str, list] = {
         "timestamp": pd.date_range("2024-01-01", periods=12, freq="h", tz="UTC"),
         "open": opens,
-        "high": [max(o, c) + 0.25 for o, c in zip(opens, closes)],
-        "low": [min(o, c) - 0.25 for o, c in zip(opens, closes)],
+        "high": [max(o, c) + 0.25 for o, c in zip(opens, closes, strict=False)],
+        "low": [min(o, c) - 0.25 for o, c in zip(opens, closes, strict=False)],
         "close": closes,
         "volume": [1000.0] * 12,
     }

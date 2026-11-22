@@ -376,7 +376,7 @@ def _compare_canonical(expected, actual, path: str = "$") -> list[str]:
         if len(expected) != len(actual):
             mismatches.append(f"{path}: length {len(expected)} != {len(actual)}")
             return mismatches
-        for i, (e, a) in enumerate(zip(expected, actual)):
+        for i, (e, a) in enumerate(zip(expected, actual, strict=False)):
             mismatches.extend(_compare_canonical(e, a, f"{path}[{i}]"))
             if len(mismatches) >= 10:
                 return mismatches
