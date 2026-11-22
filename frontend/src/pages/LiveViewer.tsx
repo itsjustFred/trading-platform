@@ -86,7 +86,12 @@ function signalMarker(signal: LiveSignalLog): TradeMarker | null {
   const side =
     String(signal.action || "").toLowerCase() === "sell" ? "SELL" : "BUY";
   const qty = Number(signal.signal_metadata?.qty ?? signal.filled_qty ?? 0);
-  const price = signal.theoretical_price;
+  // A broker-side close (#144) has no theoretical price of ours (0.0); its
+  // marker shows the fill's actual price instead.
+  const price =
+    signal.source === "broker_close"
+      ? (signal.actual_price ?? signal.theoretical_price)
+      : signal.theoretical_price;
   return {
     id: `signal-${signal.signal_id}`,
     time: t,
@@ -893,7 +898,13 @@ function SignalLogTable({
           {signals.slice(0, 200).map((signal) => (
             <tr key={signal.signal_id}>
               <td style={tdStyle}>{formatTableTime(signal.signal_timestamp)}</td>
-              <td style={tdStyle}>{signal.source === "discord" ? "Discord" : "Internal"}</td>
+              <td style={tdStyle}>
+                {signal.source === "discord"
+                  ? "Discord"
+                  : signal.source === "broker_close"
+                    ? "Broker"
+                    : "Internal"}
+              </td>
               <td style={tdStyle}>{String(signal.action || "").toUpperCase()}</td>
               <td style={tdStyle}>{signal.symbol}</td>
               <td style={tdStyle}>

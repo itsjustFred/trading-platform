@@ -27,8 +27,12 @@ TP1, so a TP1 *partial* exit needs a different entry order structure first
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, annotations only
+    from shared.models import LiveDeploymentConfig
 
 #: Metadata key a signal processor uses to request trailing-stop behaviour.
 TRAILING_SL_CONFIG_METADATA_KEY = "trailing_sl_config"
@@ -226,6 +230,48 @@ class _AnyBroker:
 ANY_BROKER: Any = _AnyBroker()
 
 
+def _validate_trailing_mode_for_stage(
+    value: Any,
+    *,
+    broker: Any,
+    timeframe: Any,
+    context: str,
+) -> None:
+    """Validate one trailing mode against a broker, and a timeframe when known.
+
+    The two stages of the deployment contract, in one place so every gate that
+    reads a deployment's mode decides identically:
+
+    - ``ANY_BROKER`` (model validation, where only the account id is known —
+      and the daemon's load path, which must not refuse more than the
+      signal-time gates do): the mode must be one that at least one live broker
+      executes. The timeframe is unknown there, so it is not gated.
+    - a concrete broker (deployment creation, account re-point, YAML parse —
+      wherever the account is resolved): the mode must be supported by that
+      broker (``None``/unknown brokers fail closed to ``none`` only) and, when
+      a timeframe is given, trailable on it.
+    """
+    if broker is ANY_BROKER:
+        validate_trailing_mode(
+            value,
+            supported=LIVE_ANY_BROKER_TRAILING_MODES,
+            context=context,
+        )
+        return
+    mode = validate_trailing_mode(
+        value,
+        supported=live_supported_trailing_modes(broker),
+        context=context,
+    )
+    if timeframe is not None:
+        validate_live_trailing_timeframe(
+            mode,
+            timeframe,
+            supported_timeframes=live_trailing_timeframes(broker),
+            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
+        )
+
+
 def validate_live_deployment_trailing_override(
     signal_config: Any,
     *,
@@ -255,30 +301,90 @@ def validate_live_deployment_trailing_override(
     processor_config = signal_config.get("signal_processor_config")
     if not isinstance(processor_config, dict) or "trailing_mode" not in processor_config:
         return
-    if broker is ANY_BROKER:
-        supported = LIVE_ANY_BROKER_TRAILING_MODES
-        where = f"{context} signal_processor_config.trailing_mode (any live broker)"
-    else:
-        supported = live_supported_trailing_modes(broker)
-        broker_label = str(broker or "").strip().lower() or "unknown"
-        where = (
-            f"{context} signal_processor_config.trailing_mode "
-            f"on broker {broker_label!r}"
-        )
-    mode = validate_trailing_mode(
+    where = f"{context} signal_processor_config.trailing_mode"
+    _validate_trailing_mode_for_stage(
         processor_config.get("trailing_mode"),
-        supported=supported,
+        broker=broker,
+        timeframe=timeframe,
         context=where,
     )
-    # With a broker AND a timeframe (the stages that know both) the mode must
-    # also be trailable on that timeframe.
-    if broker is not ANY_BROKER and timeframe is not None:
-        validate_live_trailing_timeframe(
-            mode,
-            timeframe,
-            supported_timeframes=live_trailing_timeframes(broker),
-            context=f"{context} on broker {str(broker or '').strip().lower() or 'unknown'!r}",
-        )
+
+
+def validate_live_deployment_trailing_mode(
+    deployment: "LiveDeploymentConfig",
+    *,
+    context: str,
+    broker: Any = ANY_BROKER,
+    timeframe: Any = None,
+) -> None:
+    """Validate the trailing mode a live deployment would run, fail closed.
+
+    #150, the deployment-validation stage: a mode that is unknown, or that the
+    live path cannot execute on this broker and timeframe, is rejected with a
+    ``ValueError`` before the deployment exists — it is never created and then
+    refused signal by signal. Callers that only validate a stored deployment
+    (the daemon's load path) catch the error and log it.
+
+    The mode reaches a deployment through one of two places and both are
+    checked here:
+
+    - an explicit ``signal_processor_config.trailing_mode`` override
+      (:func:`validate_live_deployment_trailing_override`), and
+    - the signal processor's own default, read from the processor the
+      deployment actually runs — the bot config merged with the deployment's
+      overrides, exactly as the daemon builds it. The mode is a setting of the
+      *bot* (``signal_bots/<bot>/config.yaml``) and the processor emits it with
+      every signal, which is where the issue's defect came from: a bot default
+      that live cannot execute used to be invisible until the first signal was
+      refused at runtime.
+
+    A deployment without a signal processor, and a processor that declares no
+    trailing mode at all (e.g. RocketFuel), pass untouched.
+    """
+    validate_live_deployment_trailing_override(
+        deployment.signal_config,
+        context=context,
+        broker=broker,
+        timeframe=timeframe,
+    )
+    processor_name = deployment.signal_processor_name
+    if not processor_name:
+        return
+    processor_config = deployment.signal_config.get("signal_processor_config")
+    if isinstance(processor_config, Mapping) and "trailing_mode" in processor_config:
+        # The override check above already owns this deployment's mode; building
+        # its processor for it would only repeat the work.
+        return
+    if not isinstance(processor_config, Mapping):
+        processor_config = {}
+    # Imported here, not at module level: the signal processors import
+    # ``shared.trailing``, so a module-level import of the registry would be a
+    # cycle (shared.trailing -> signal_bots.registry -> shared.trailing).
+    from signal_bots.registry import get_signal_processor
+
+    try:
+        processor = get_signal_processor(processor_name, dict(processor_config))
+    except Exception as exc:
+        # An unregistered id or a bot config that no longer loads is a client
+        # error (the API answers 400 with this detail), not a 500; at the
+        # daemon's load path it is a configuration error that must not cost the
+        # whole deployment list its sync tick.
+        raise ValueError(
+            f"{context}: its signal processor '{processor_name}' could not be "
+            f"built to check the trailing mode it would emit: {exc}"
+        ) from exc
+    mode = getattr(processor, "trailing_mode", None)
+    if mode is None:
+        return
+    _validate_trailing_mode_for_stage(
+        mode,
+        broker=broker,
+        timeframe=timeframe,
+        context=(
+            f"{context}: its signal processor '{processor_name}' requests "
+            f"trailing mode {normalize_trailing_mode(mode)!r}"
+        ),
+    )
 
 
 def live_trailing_timeframes(broker: Any) -> frozenset[str]:
