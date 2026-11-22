@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import math
-import sys
 from typing import Any, Callable
 
 import pandas as pd
@@ -495,12 +494,10 @@ class TradeEngine:
                 # #347: only the realized-cash exposure cap goes into the
                 # risk engine; the leverage/margin ceiling is applied
                 # afterwards on free margin. With no exposure cap there is
-                # no engine-level ceiling — float_info.max stands in for
-                # "uncapped" (the post-cap is the real leverage bound).
+                # no engine-level ceiling — math.inf is the documented
+                # "uncapped" value (the post-cap is the real leverage bound).
                 max_notional_per_trade=(
-                    exposure_limit
-                    if exposure_limit is not None
-                    else sys.float_info.max
+                    exposure_limit if exposure_limit is not None else math.inf
                 ),
             )
             shares = float(sized_order.position_size)

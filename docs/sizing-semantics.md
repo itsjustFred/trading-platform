@@ -59,6 +59,16 @@ documented here.
   would need more leverage than the broker maximum is clamped down (floored
   to `lot_step` when it binds) instead of refused. The exposure cap itself
   stays on realized cash.
+  Two documented limitations of the native free-margin check:
+  - **Per symbol, not per account.** `TradeEngine` runs once per symbol, so
+    in multi-symbol native runs each engine judges its order against its own
+    equity and positions; margin used by other symbols' positions is
+    invisible to it (pre-existing for the leverage cap, now stated for the
+    free-margin rule).
+  - **Pending orders hold no margin.** Several pending orders created on the
+    same bar are each judged against the full free margin, so with
+    pyramiding they can jointly exceed it — the same convention MT5 applies
+    to pending orders.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.

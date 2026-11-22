@@ -126,7 +126,10 @@ for the account/asset; unknown → 1x) must fit **free margin** =
 mark-to-market equity − margin already used by open positions, marked at
 the sizing price. An order that would need more leverage than the broker
 maximum is clamped down (floored to `lot_step` when the leverage cap binds)
-instead of refused, matching the live pre-submit caps (#329). The
+instead of refused. The live pre-submit caps (#329) still judge against
+`broker_leverage × equity` without used margin — moving them to the same
+free-margin rule is tracked as a follow-up to #347 (backtest and live do
+NOT yet apply the identical rule). The
 mark-to-market equity here is the *margin-check* input only — the sizing
 target, the exposure cap and the aggregate-exposure denominator all stay on
 realized cash. Pinned by
