@@ -70,9 +70,20 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # agent job installs anything, and a cap, rate limit or region refusal there
 # skips the agent job - a grey check, not a red one - while the post job
 # comments "not run: quota" and warns (decision of 2026-11-21, issue #296).
-# A quota error that only appears mid-run takes the same path inside the agent
-# step: the run reports the skip instead of failing, and the pending mark it
-# already wrote is rewritten to say "Not run: quota" rather than `error`.
+# The probe's reply is logged on every path, its quota signature is grepped
+# over stdout and stderr whatever the exit status (opencode has been seen
+# exiting 0 on the cap for this tiny prompt), and `available=true` is only
+# claimed when the reply actually carries the OK token - every other outcome
+# fails open so a genuine failure still fails.
+#
+# The honest limit of the probe: it is a one-word ping, and a cap that is a
+# token budget can still pass it - the ping fits under a ceiling the real run
+# does not. Then the mid-run path below is the usual one: the agent step
+# reports the skip instead of failing, the run's check is green (a job that
+# ran cannot show skipped), the comment says "not run: quota" and the pending
+# mark it wrote is rewritten to say so rather than `error`. Grey is only
+# reachable on the pre-install skip; once the agent job has run, green-with-
+# the-skip-commented is the answer the API allows.
 # Anything the probe cannot classify as quota still runs the agent job, so a
 # genuine failure - a broken install, a misconfigured model, a crashed agent -
 # still fails the run and is reported as `error`, like any other transient
@@ -320,8 +331,11 @@ jobs:
   # agent job installs anything: an exhausted cap, a rate limit or a region
   # refusal is an infrastructure state, not a pre-mortem result, so it must not
   # turn the run red. The probe pings the same model and variant the agent will
-  # use; only a positive quota signature reports `available=false`, and
-  # everything else - a success, a failure of any other kind, even a dead probe
+  # use; only a positive quota signature - grepped over stdout and stderr,
+  # whatever the exit status, because opencode has been seen exiting 0 on the
+  # cap for this tiny prompt - reports `available=false`, and `available=true`
+  # is only claimed when the reply actually carries the OK token. Everything
+  # else - a success without OK, a failure of any other kind, even a dead probe
   # job - leaves the agent job to run and surface the genuine failure itself.
   # The agent job is gated on the output, so a quota skip shows as a skipped
   # (grey) check, and the post job comments "not run: quota" and warns.
@@ -362,16 +376,10 @@ jobs:
             printf 'description: Read-only model quota probe (CI only)\n'
             printf 'mode: primary\n'
             printf 'model: "%s"\n' "$model"
+            # The ping needs no tool at all: deny everything, so a misbehaving
+            # model reply cannot make the probe act.
             printf 'permissions:\n'
             printf '  - { action: "*", resource: "*", effect: deny }\n'
-            printf '  - { action: read, resource: "*", effect: allow }\n'
-            printf '  - { action: glob, resource: "*", effect: allow }\n'
-            printf '  - { action: grep, resource: "*", effect: allow }\n'
-            printf '  - { action: shell, resource: "*", effect: allow }\n'
-            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
-            printf '  - { action: edit, resource: "*", effect: deny }\n'
-            printf '  - { action: read, resource: "*.env", effect: deny }\n'
-            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
             printf -- '---\n'
             printf 'Reply with the single word OK and nothing else.\n'
           } > "$conf/agents/quota-probe.md"
@@ -384,31 +392,42 @@ jobs:
           set -euo pipefail
           probe_dir="$RUNNER_TEMP/quota-probe"
           mkdir -p "$probe_dir"
-          if raw=$(opencode run --standalone --archived --agent quota-probe \
-            "Reply with the single word: OK" 2> "$probe_dir/stderr"); then
+          # opencode has been seen exiting 0 on the cap for this tiny prompt,
+          # so the exit status alone cannot clear the model: the quota
+          # signature is grepped over BOTH streams whatever the status, and
+          # `available=true` is only claimed when the reply actually carries
+          # the OK token. Every other outcome - a non-quota failure, a zero
+          # exit with no OK, even a dead probe - fails open: the agent job runs
+          # and the genuine failure surfaces there.
+          status=0
+          raw=$(opencode run --standalone --archived --agent quota-probe \
+            "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
+          printf '%s\n' "$raw" > "$probe_dir/stdout"
+          cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
+          # Always logged, bounded like the agent step's echo: run 44962236033
+          # passed this probe and hit "Free usage limit reached" 26 s later,
+          # and with the output unlogged there was no way to tell a real reach
+          # from a capped one - the success path used to log nothing at all.
+          echo "::group::Quota probe output (last 4000 bytes)"
+          tail -c 4000 "$probe_dir/combined"
+          echo "::endgroup::"
+          # Only a positive quota signature skips the agent job - on either
+          # stream, whatever the exit status. The pattern is the transient
+          # class the agent step below classifies with - a cap, a rate limit,
+          # an exhausted quota or a region refusal - and deliberately not the
+          # misconfiguration class (a model or variant that cannot be resolved
+          # at all): that is a genuine failure, and the agent job reports it.
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stdout" "$probe_dir/stderr"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The free model is capped, rate-limited or region-refused; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
+          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Quota probe reached the model; the agent job will run."
           else
-            printf '%s\n' "$raw" > "$probe_dir/raw"
-            cat "$probe_dir/stderr" >> "$probe_dir/raw"
-            # Bounded like the agent step's echo: a runaway probe cannot flood the log.
-            echo "::group::Quota probe output (last 4000 bytes)"
-            tail -c 4000 "$probe_dir/raw"
-            echo "::endgroup::"
-            # Only a positive quota signature skips the agent job. The pattern is the
-            # transient class the agent step below classifies with - a cap, a rate
-            # limit, an exhausted quota or a region refusal - and deliberately not
-            # the misconfiguration class (a model or variant that cannot be resolved
-            # at all): that is a genuine failure, and the agent job reports it.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stderr"; then
-              echo "available=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::The free model is capped, rate-limited or region-refused; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
-            else
-              # Not a quota signature: fail open. The agent job runs and the genuine
-              # failure surfaces there, exactly as it did before the probe existed.
-              echo "available=true" >> "$GITHUB_OUTPUT"
-              echo "::warning::The quota probe failed for a reason that is not a quota signature; the agent job will run and report the real failure."
-            fi
+            # Inconclusive - a non-quota failure, or a zero exit whose reply
+            # carried no OK. Fail open, exactly as before the probe existed.
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::The quota probe was inconclusive (exit ${status}, no OK token, no quota signature); the agent job will run and report the real failure."
           fi
 
   premortem:
@@ -616,6 +635,13 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$raw" > "$out.raw"
+          # stderr went to a file for the failure classifier; on success it
+          # would otherwise never reach the log, so it is echoed bounded too.
+          if [ -s "$out.stderr" ]; then
+            echo "::group::Agent stderr (last 4000 bytes)"
+            tail -c 4000 "$out.stderr"
+            echo "::endgroup::"
+          fi
           # opencode prints every assistant message; keep only the final comment,
           # which starts at the last "**Summary:**" line. Drop a closing code
           # fence the model may have wrapped around it.
@@ -802,6 +828,11 @@ jobs:
       # head does not overwrite the comment (its status still lands on its SHA).
       - name: Post or update pre-mortem comment
         if: needs.premortem.result == 'success' || needs.quota-probe.outputs.available == 'false'
+        env:
+          # True when the body being posted is the "not run: quota" report -
+          # the probe path's or the mid-run path's - so the guard below can
+          # keep it from overwriting a real verdict for this same head.
+          QUOTA_SKIP: ${{ needs.premortem.outputs.quota == 'true' || needs.quota-probe.outputs.available == 'false' }}
         run: |
           set -euo pipefail
           current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
@@ -825,6 +856,21 @@ jobs:
           if [ "$moved" != "$HEAD_SHA" ]; then
             echo "::notice::PR head moved to ${moved} while this comment was being posted; not updating the comment for ${HEAD_SHA}."
             exit 0
+          fi
+          # A quota skip must not overwrite a real verdict for this same head:
+          # a manual re-run of an unchanged head after the cap resets is exactly
+          # the case where the "not run: quota" body would replace a verdict
+          # that is still current. A quota body over an older quota comment, or
+          # any real verdict, still writes.
+          if [ "$QUOTA_SKIP" = "true" ] && [ -n "$existing" ]; then
+            for id in $existing; do
+              prior=$(gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" --jq .body)
+              if printf '%s\n' "$prior" | grep -q 'Verdict:' \
+                && printf '%s\n' "$prior" | grep -q "${HEAD_SHA:0:8}"; then
+                echo "::notice::The existing pre-mortem comment is a real verdict for ${HEAD_SHA}; the quota skip did not overwrite it."
+                exit 0
+              fi
+            done
           fi
           if [ -n "$existing" ]; then
             # More than one comment can carry the marker (a duplicate from an

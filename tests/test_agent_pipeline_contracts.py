@@ -1844,11 +1844,16 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
 _STUB_OPENCODE = """#!/usr/bin/env bash
 # A stand-in for the `opencode` the quota probe and the agent step call.
 # $STUB_OPENCODE_MODE selects the reply: ok, quota (a cap signature on stderr,
-# exit 1), other (a non-quota failure, exit 1).
+# exit 1), quota-out / quota-err (the same signature on a ZERO exit - the shape
+# run 44962236033 showed the probe cannot currently see), no-ok (a zero exit
+# whose reply carries no OK token), other (a non-quota failure, exit 1).
 set -u
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
+  quota-out) printf 'Free usage limit reached for this model\\n'; exit 0 ;;
+  quota-err) printf 'Free usage limit reached for this model\\n' >&2; exit 0 ;;
+  no-ok) printf 'Here is the answer you asked for.\\n'; exit 0 ;;
   other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
 esac
 """
@@ -1897,6 +1902,13 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
     result, written = _run_probe_step(tmp_path, "ok")
     assert result.returncode == 0, f"probe step failed: {result.stderr}"
     assert "available=true" in written, "a reachable model did not clear the agent job"
+    # The probe's output is logged on every path, bounded: run 44962236033
+    # passed the probe and hit "Free usage limit reached" 26 s later, and with
+    # the output unlogged there was no way to tell a real reach from a capped
+    # one - the success path used to log nothing at all.
+    assert "::group::Quota probe output" in result.stdout, (
+        "the probe does not log its output on the success path"
+    )
 
     result, written = _run_probe_step(tmp_path, "quota")
     assert result.returncode == 0, f"probe step failed on a quota reply: {result.stderr}"
@@ -1904,12 +1916,67 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
     assert "::warning::" in result.stdout, "the quota skip does not warn"
     assert "not run: quota" in result.stdout, "the quota skip does not name itself"
 
+    # The cap has been observed arriving on a ZERO exit, on either stream: the
+    # signature is grepped over stdout and stderr whatever the status, so a
+    # capped model cannot report `available=true`.
+    for mode in ("quota-out", "quota-err"):
+        result, written = _run_probe_step(tmp_path, mode)
+        assert result.returncode == 0, f"probe step failed on {mode}: {result.stderr}"
+        assert "available=false" in written, (
+            f"{mode}: a quota signature on a zero exit did not skip the agent job"
+        )
+        assert "not run: quota" in result.stdout, f"{mode}: the skip does not name itself"
+
+    result, written = _run_probe_step(tmp_path, "no-ok")
+    assert result.returncode == 0, f"probe step failed on a no-OK reply: {result.stderr}"
+    assert "available=true" in written, (
+        "a zero exit without the OK token skipped the agent job - only a quota "
+        "signature may do that"
+    )
+    assert "::warning::" in result.stdout, (
+        "the inconclusive probe (no OK, no signature) fails open silently"
+    )
+
     result, written = _run_probe_step(tmp_path, "other")
     assert result.returncode == 0, f"probe step failed on a non-quota reply: {result.stderr}"
     assert "available=true" in written, (
         "a non-quota probe failure skipped the agent job - a genuine failure would go grey"
     )
     assert "::warning::" in result.stdout, "the fail-open path does not say what it did"
+
+
+def test_the_quota_probe_agent_is_denied_every_tool() -> None:
+    """The probe pings the model with a one-word prompt; it needs no tool at
+    all. Its agent config is a deny-all, so a misbehaving model reply cannot
+    make the probe act - the earlier copy allowed shell, read and
+    external_directory for a ping that uses none of them."""
+    job = _load(PREMORTEM)["jobs"]["quota-probe"]
+    body = _run(_find_step(job, r"^Configure quota probe agent$"))
+    assert "effect: allow" not in body, (
+        "the quota probe agent is allowed tools it does not need"
+    )
+    assert 'effect: deny' in body, "the quota probe agent has no deny rule at all"
+
+
+def test_the_quota_probe_is_identical_in_every_workflow_that_has_one() -> None:
+    """The probe job is copied into each agent workflow; a fix to the
+    classification that lands in one copy and not the others is the drift the
+    bundle-26 review found. Every workflow that defines `quota-probe` must
+    carry the same probe agent config and the same probe step body."""
+    seen: dict[str, dict[str, str]] = {}
+    for name in AGENT_WORKFLOWS:
+        job = _load(name)["jobs"].get("quota-probe")
+        if job is None:
+            continue
+        for step_name in ("Configure quota probe agent", "Probe model quota"):
+            body = _run(_find_step(job, rf"^{re.escape(step_name)}$"))
+            seen.setdefault(step_name, {})[name] = body
+    for step_name, by_workflow in seen.items():
+        unique = set(by_workflow.values())
+        assert len(unique) == 1, (
+            f"{step_name} differs across {sorted(by_workflow)} - the probe "
+            "classification must not drift between the agent workflows"
+        )
 
 
 def _agent_step_env(tmp_path, head: str) -> dict:
@@ -2036,6 +2103,111 @@ def test_the_quota_reporter_rewrites_only_this_runs_pending_mark(tmp_path) -> No
     result, calls = _run_reporter("post", "Report quota skip", tmp_path, [])
     assert result.returncode == 0, f"quota reporter failed with no status: {result.stderr}"
     assert "--method" not in calls, "the quota reporter wrote a status where none exists"
+
+
+# A stand-in for the `gh` the comment-posting step calls: it serves the PR head
+# read, the marker comment list and one comment body, and records every write.
+_STUB_GH_COMMENTS = """#!/usr/bin/env bash
+set -u
+printf '%s\\n' "$*" >> "$STUB_LOG"
+# Any write (POST/PATCH) is recorded by the log line above and acknowledged.
+if [[ "$*" == *"--method"* ]]; then exit 0; fi
+case "$*" in
+  *"/pulls/"*) printf '%s\\n' "$STUB_HEAD_SHA" ;;
+  *"/issues/comments/"*) cat "$STUB_COMMENT_BODY" ;;
+  *"/issues/"*"/comments"*) cat "$STUB_COMMENT_IDS" ;;
+  *) : ;;
+esac
+exit 0
+"""
+
+
+def _run_comment_post(tmp_path, *, quota_skip: bool, prior_body: str | None):
+    """Execute 'Post or update pre-mortem comment' against the comments stub.
+
+    `prior_body` is the body of the one existing marker comment (None: no
+    comment yet). Returns (result, calls log)."""
+    step = _find_step(_load(PREMORTEM)["jobs"]["post"], r"^Post or update pre-mortem comment$")
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "gh"
+    stub.write_text(_STUB_GH_COMMENTS, encoding="utf-8")
+    stub.chmod(0o755)
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    (work / "comment.md").write_text(
+        "# Pre-Mortem Action\n\n**Summary:** Not run: quota\n", encoding="utf-8"
+    )
+    ids = tmp_path / "ids"
+    ids.write_text("42\n" if prior_body is not None else "", encoding="utf-8")
+    body = tmp_path / "prior-body"
+    body.write_text(prior_body or "", encoding="utf-8")
+    log = tmp_path / "calls.log"
+    log.unlink(missing_ok=True)
+    env = {
+        "PATH": os.pathsep.join([str(bindir), os.environ["PATH"]]),
+        "STUB_LOG": str(log),
+        "STUB_HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
+        "STUB_COMMENT_IDS": str(ids),
+        "STUB_COMMENT_BODY": str(body),
+        "GITHUB_REPOSITORY": REPORTER_ENV["GITHUB_REPOSITORY"],
+        "PR_NUMBER": REPORTER_ENV["PR_NUMBER"],
+        "HEAD_SHA": REPORTER_ENV["HEAD_SHA"],
+        "BASE_SHA": REPORTER_ENV["BASE_SHA"],
+        "QUOTA_SKIP": "true" if quota_skip else "false",
+    }
+    script = tmp_path / "post.sh"
+    script.write_text(_run(step), encoding="utf-8")
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", str(script)],
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    calls = log.read_text(encoding="utf-8") if log.exists() else ""
+    return result, calls
+
+
+@needs_bash
+def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_path) -> None:
+    """A manual re-run of the same head after a real verdict must not replace it
+    with 'not run: quota'. Executed against the comments stub: when the body
+    being posted is a quota skip and the existing marker comment is a real
+    verdict for this head, the write is skipped; every other combination still
+    writes."""
+    head8 = REPORTER_ENV["HEAD_SHA"][:8]
+    verdict_body = (
+        "<!-- actions-pre-mortem -->\n# Pre-Mortem Action\n\n"
+        "**Summary:** scenarios\n\nVerdict: PASS\n\n"
+        f"_Analysed base `{'1' * 8}` ... head `{head8}`._\n"
+    )
+    quota_body = (
+        "<!-- actions-pre-mortem -->\n# Pre-Mortem Action\n\n"
+        "**Summary:** Not run: quota\n\n"
+        f"_Analysed base `{'1' * 8}` ... head `{head8}`._\n"
+    )
+
+    result, calls = _run_comment_post(tmp_path, quota_skip=True, prior_body=verdict_body)
+    assert result.returncode == 0, f"comment post failed: {result.stderr}"
+    assert "--method" not in calls, (
+        "a quota skip overwrote a real verdict for the same head"
+    )
+    assert "::notice::" in result.stdout, "the skipped overwrite is silent"
+
+    case = tmp_path / "quota-prior"
+    case.mkdir()
+    result, calls = _run_comment_post(case, quota_skip=True, prior_body=quota_body)
+    assert result.returncode == 0, f"comment post failed: {result.stderr}"
+    assert "--method PATCH" in calls, (
+        "a quota skip over an older quota comment did not refresh it"
+    )
+
+    case = tmp_path / "verdict-prior"
+    case.mkdir()
+    result, calls = _run_comment_post(case, quota_skip=False, prior_body=verdict_body)
+    assert result.returncode == 0, f"comment post failed: {result.stderr}"
+    assert "--method" in calls, "a real verdict did not overwrite the prior comment"
 
 
 def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:
