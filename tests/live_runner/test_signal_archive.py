@@ -242,15 +242,20 @@ def _signal(**metadata_overrides):
     )
 
 
-def _deployment(**overrides) -> SimpleNamespace:
+def _deployment(**overrides) -> LiveDeploymentConfig:
+    """A real deployment model: the recorder resolves the processor through the model's
+    ``signal_processor_name`` (#150), which a bare namespace does not carry."""
     options = {
-        "id": "dep-1",
+        "id": "00000000-0000-0000-0000-0000000000d1",
         "strategy_name": "ramjet-live",
+        "account_id": "acc-1",
+        "symbols": ["AAPL"],
+        "timeframe": "1h",
         "signal_config": {"signal_processor": "ramjet"},
         "settings": {},
     }
     options.update(overrides)
-    return SimpleNamespace(**options)
+    return LiveDeploymentConfig(**options)
 
 
 def test_decision_recorder_writes_one_record_with_features(archive: SignalArchive) -> None:
@@ -273,7 +278,7 @@ def test_decision_recorder_writes_one_record_with_features(archive: SignalArchiv
     assert record["outcome"] == "traded"
     assert record["reason"] is None
     assert record["broker_order_id"] == "broker-123"
-    assert record["deployment_id"] == "dep-1"
+    assert record["deployment_id"] == "00000000-0000-0000-0000-0000000000d1"
     assert record["strategy_name"] == "ramjet-live"
     assert record["signal_processor"] == "ramjet"
     assert record["discord_message_id"] == "123456789"
@@ -480,7 +485,7 @@ def test_run_daemon_shutdown_flushes_signal_archive(
         return None
 
     monkeypatch.setattr(
-        daemon, "_discover_and_register_discord_services", lambda **_kwargs: []
+        daemon, "_discover_and_register_discord_services", lambda *_args, **_kwargs: []
     )
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", _Scheduler)

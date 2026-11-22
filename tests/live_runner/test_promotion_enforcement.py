@@ -4,17 +4,24 @@ Per point: a non-promoted deployment on real money is refused with a clear
 error, a promoted one passes, paper/demo passes without promotion, and an
 account whose type is unknown is treated as real money. The existing demo-only
 block is additionally pinned to still refuse real money for promoted code.
+
+The cTrader top-N deploy gets its own section (#261): `activate` there arms the
+rows it creates, with none of the activate path's fresh broker re-verification,
+so a non-demo account gets PAUSED rows that the response and the log name.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
-from typing import Any
+from types import ModuleType
+from typing import Any, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -373,7 +380,13 @@ def test_viewer_broker_verdict_is_fresh_not_the_30s_cache(monkeypatch: pytest.Mo
     assert asyncio.run(viewer._broker_reported_demo_flag("a")) is False
 
 
-def _top_n(monkeypatch: pytest.MonkeyPatch, *, is_demo: bool | None, dry_run: bool = True):
+def _top_n(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_demo: bool | None,
+    dry_run: bool = True,
+    activate: bool = False,
+):
     import viewer.main as viewer
 
     monkeypatch.setattr(viewer, "_seed_default_live_accounts", lambda: None)
@@ -407,7 +420,8 @@ def _top_n(monkeypatch: pytest.MonkeyPatch, *, is_demo: bool | None, dry_run: bo
     created: list[Any] = []
     monkeypatch.setattr(viewer, "create_live_deployment", lambda d: created.append(d) or d)
     response = TestClient(viewer.app).post(
-        "/api/live/deployments/ctrader/top5", json={"dry_run": dry_run}
+        "/api/live/deployments/ctrader/top5",
+        json={"dry_run": dry_run, "activate": activate},
     )
     return response, created
 
@@ -440,6 +454,116 @@ def test_viewer_top_n_dry_run_accepts_a_promoted_strategy_on_real_money(
     promote_strategy_file(strategies_dir)
     response, _ = _top_n(monkeypatch, is_demo=False)
     assert response.status_code == 200, response.text
+
+
+# --------------------------------------------------------------------------- #
+# Viewer: cTrader top-N `activate` never arms a non-demo account (#261)
+# --------------------------------------------------------------------------- #
+
+
+def test_viewer_top_n_activate_creates_paused_on_real_money(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#261: the broker reporting a live account is a refuse-to-arm answer."""
+    promote_strategy_file(strategies_dir)
+    response, created = _top_n(monkeypatch, is_demo=False, dry_run=False, activate=True)
+    assert response.status_code == 200, response.text
+    assert [deployment.status for deployment in created] == ["PAUSED"]
+    [paused] = response.json()["paused_as_real_money"]
+    assert paused["strategy_name"] == STRATEGY_NAME
+    assert paused["account_id"] == "ct-1"
+    assert "non-demo" in paused["reason"]
+
+
+def test_viewer_top_n_activate_creates_paused_on_an_unknown_account(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#261: an unanswered demo question fails closed, like the daemon's block."""
+    promote_strategy_file(strategies_dir)
+    response, created = _top_n(monkeypatch, is_demo=None, dry_run=False, activate=True)
+    assert response.status_code == 200, response.text
+    assert [deployment.status for deployment in created] == ["PAUSED"]
+    [paused] = response.json()["paused_as_real_money"]
+    assert paused["account_id"] == "ct-1"
+    assert "demo" in paused["reason"]
+
+
+@contextmanager
+def _viewer_log_records(viewer: ModuleType) -> Iterator[list[logging.LogRecord]]:
+    """Capture exactly what the viewer logger emits, and restore it afterwards.
+
+    The service loggers do not propagate (``shared.logging.get_logger``), so a
+    handler hung on the root logger - caplog's - sees nothing. One dedicated
+    handler on the viewer logger itself is both the accurate way to observe them
+    and immune to whatever handlers a session has already left around.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    viewer.logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        viewer.logger.removeHandler(handler)
+
+
+def test_viewer_top_n_pause_on_real_money_is_logged_with_the_reason(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#261: the operator is told, in the log as well as in the response."""
+    import viewer.main as viewer
+
+    promote_strategy_file(strategies_dir)
+    with _viewer_log_records(viewer) as records:
+        response, created = _top_n(monkeypatch, is_demo=False, dry_run=False, activate=True)
+    assert response.status_code == 200, response.text
+    assert [deployment.status for deployment in created] == ["PAUSED"]
+    [record] = [item for item in records if "PAUSED instead of ACTIVE" in item.getMessage()]
+    assert record.levelname == "WARNING"
+    assert STRATEGY_NAME in record.getMessage()
+    assert "live (non-demo)" in record.getMessage()
+    assert record.data["paused"][0]["account_id"] == "ct-1"
+
+
+def test_viewer_top_n_dry_run_reports_paused_not_active_for_real_money(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview must not show a deployment an `activate` would not get (#261)."""
+    promote_strategy_file(strategies_dir)
+    response, created = _top_n(monkeypatch, is_demo=False, dry_run=True, activate=True)
+    assert response.status_code == 200, response.text
+    assert created == []
+    assert response.json()["deployments"][0]["status"] == "PAUSED"
+
+
+def test_viewer_top_n_activate_creates_active_on_demo(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#261: the demo path is unchanged - an activate on demo still arms it."""
+    import viewer.main as viewer
+
+    with _viewer_log_records(viewer) as records:
+        response, created = _top_n(monkeypatch, is_demo=True, dry_run=False, activate=True)
+    assert response.status_code == 200, response.text
+    assert [deployment.status for deployment in created] == ["ACTIVE"]
+    assert response.json()["paused_as_real_money"] == []
+    # ...and nothing claims a pause that did not happen.
+    assert not [item for item in records if "PAUSED instead of ACTIVE" in item.getMessage()]
+
+
+def test_viewer_top_n_without_activate_reports_nothing_paused(
+    strategies_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#261: nothing is reported as paused when PAUSED was requested already."""
+    promote_strategy_file(strategies_dir)
+    response, created = _top_n(monkeypatch, is_demo=False, dry_run=False, activate=False)
+    assert response.status_code == 200, response.text
+    assert [deployment.status for deployment in created] == ["PAUSED"]
+    assert response.json()["paused_as_real_money"] == []
 
 
 def _create(

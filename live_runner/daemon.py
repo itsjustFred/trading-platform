@@ -9,7 +9,7 @@ import os
 import re
 import uuid
 import weakref
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,11 @@ from live_runner.credential_env import (
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
+from live_runner.deployment_policy import (
+    normalize_deployment_status,
+    signal_source_can_trade,
+    untradeable_signal_source_reason,
+)
 from live_runner.exit_signals import (
     DEFAULT_QTY_TOLERANCE,
     EXIT_POSITION_SIDE_KEY,
@@ -2409,7 +2414,9 @@ def _active_discord_deployments_for_account(
         for deployment in deployments
         if deployment.account_id == account_id
         and _normalize_deployment_status(deployment.status) == "ACTIVE"
-        and str(deployment.signal_source or "internal").lower() == "discord"
+        # The same set the untradeable-row warning reads (#242): a source is
+        # routed because this process can run it, and for no other reason.
+        and signal_source_can_trade(deployment.signal_source)
     ]
 
 
@@ -4704,11 +4711,10 @@ def _start_missing_tasks(
         )
 
 
-def _normalize_deployment_status(status: str) -> str:
-    normalized_status = str(status or "").upper()
-    if normalized_status in {"ACTIVE", "PAUSED", "STOPPED"}:
-        return normalized_status
-    return "UNKNOWN"
+# #242: the status/source vocabulary is shared with both preflights (they must
+# never disagree about what "ACTIVE" and "tradeable" mean). Kept under the name
+# every call site in this module already uses.
+_normalize_deployment_status = normalize_deployment_status
 
 
 def _log_deployment_status_observations(
@@ -5284,6 +5290,70 @@ async def _load_db_accounts_and_deployments(
     return accounts, deployments
 
 
+def _warn_untradeable_active_deployments(
+    deployments: Sequence[LiveDeploymentConfig],
+    already_warned: dict[str, str] | None = None,
+) -> None:
+    """Alert (ERROR, which Sentry turns into an event) per untradeable ACTIVE deployment (#242).
+
+    An ``internal`` deployment (or any signal source other than ``discord``)
+    has no live strategy runner behind it: it can be ACTIVE, hold an adapter and
+    an execution listener, and still never place an order. The daemon does not
+    block on this -- the operator stops or repoints the row -- but silence makes
+    an untradeable ACTIVE deployment look live.
+
+    The definition of "untradeable" is ``live_runner.deployment_policy``'s,
+    so the daemon log and both preflights cannot drift apart.
+
+    ``already_warned`` is the operator's memory of what this process already
+    reported, keyed by deployment id: the same reason for the same row is not
+    repeated on every sync tick (a daemon polls forever), but a row that becomes
+    untradeable, stops being it, or changes how it is untradeable is reported
+    again. Pass None to log every row unconditionally (what the unit tests do).
+    """
+    still_untradeable: dict[str, str] = {}
+    for deployment in deployments:
+        if _normalize_deployment_status(deployment.status) != "ACTIVE":
+            continue
+        reason = untradeable_signal_source_reason(deployment.signal_source)
+        if reason is None:
+            continue
+        deployment_id = str(deployment.id)
+        # A change of state, never a repeat of one already reported: the reason
+        # also encodes the signal source, so repointing a row re-warns it.
+        if already_warned is not None and already_warned.get(deployment_id) == reason:
+            still_untradeable[deployment_id] = reason
+            continue
+        signal_source = str(deployment.signal_source or "internal").lower()
+        logger.error(
+            "ACTIVE live deployment cannot trade: %s. It will never place an order; "
+            "stop it or move it to a signal source the daemon runs.",
+            f"{deployment.strategy_name} ({deployment.id}, account "
+            f"{deployment.account_id}): {reason}",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                    "strategy_name": deployment.strategy_name,
+                    "signal_source": signal_source,
+                    "untradeable_reason": reason,
+                    # #242 asks for an alert, not just a log line. In this daemon the
+                    # alert *is* the ERROR record: Sentry's LoggingIntegration sends
+                    # event_level=ERROR (where a DSN is configured), and this field
+                    # rides in the record's data -- a log field and Sentry extra,
+                    # not a Sentry tag.
+                    "alert": "untradeable_active_deployment",
+                }
+            },
+        )
+        still_untradeable[deployment_id] = reason
+    if already_warned is not None:
+        # Drop rows that are no longer ACTIVE/untradeable, so a row that comes
+        # back to it is alerted again instead of staying quiet.
+        already_warned.clear()
+        already_warned.update(still_untradeable)
+
+
 async def _ensure_adapter_for_active_account(
     account_id: str,
     account_lookup: dict[str, LiveAccountConfig],
@@ -5504,7 +5574,7 @@ def _discord_active_account_ids(
         deployment.account_id
         for deployment in deployments
         if _normalize_deployment_status(deployment.status) == "ACTIVE"
-        and str(deployment.signal_source or "internal").lower() == "discord"
+        and signal_source_can_trade(deployment.signal_source)
         and _deployment_has_discord_channel(deployment)
     }
 
@@ -5534,6 +5604,10 @@ async def sync_deployments_loop(
 ) -> None:
     accounts_env = _accounts_env_file(accounts_env)
     known_deployment_statuses: dict[str, str] = {}
+    # #242: what this process has already alerted about, keyed by deployment id, so
+    # an untradeable ACTIVE row is reported on the first tick of every start and
+    # again whenever it changes, but not on every tick of a loop that runs for days.
+    already_warned_untradeable: dict[str, str] = {}
     # Seeded from the database, not empty. Every restart used to re-run cancel
     # and flatten for deployments that were already stopped, because this set
     # was process-local while the stamp it mirrors is persisted.
@@ -5575,6 +5649,11 @@ async def sync_deployments_loop(
             # unreadable state answers 'halted in entries mode'.
             await asyncio.to_thread(halt_state.refresh)
             accounts, deployments = await _load_db_accounts_and_deployments()
+            # #242: an ACTIVE row nothing can trade gets a broker adapter and an
+            # execution listener, so it looks live in the log and the dashboard.
+            _warn_untradeable_active_deployments(
+                deployments, already_warned=already_warned_untradeable
+            )
             if deployment_snapshot is not None:
                 # Shared with the trailing-stop loop (#167) so it never has to
                 # query deployments itself. Replaced in place: the reader
