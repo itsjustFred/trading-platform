@@ -467,6 +467,133 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         daemon.release_live_deployment_submission = original_release
 
 
+def _run_internal_submit(adapter, deployment, trade_signal) -> str:
+    """Drive the real chokepoint for an internal-runner signal and return
+    its ``SUBMIT_OUTCOME_*`` — the outcome contract the runner escalates on
+    (#360). Only the claim/active seams are stubbed, exactly like
+    ``_run_submit``; prepare, sizing and submission are the production path.
+    """
+    import live_runner.daemon as daemon
+
+    original_active = daemon._deployment_is_currently_active
+    original_claim = daemon.claim_live_deployment_submission
+    original_release = daemon.release_live_deployment_submission
+    daemon._deployment_is_currently_active = lambda _deployment: True
+    daemon.claim_live_deployment_submission = lambda *_a, **_k: True
+    daemon.release_live_deployment_submission = lambda *_a, **_k: True
+    try:
+        return asyncio.run(
+            daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
+        )
+    finally:
+        daemon._deployment_is_currently_active = original_active
+        daemon.claim_live_deployment_submission = original_claim
+        daemon.release_live_deployment_submission = original_release
+
+
+def _internal_exit_trade_signal() -> TradeSignal:
+    return TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "signal_intent": "exit",
+            "exit_only": True,
+            "risk_sizing_mode": "exit_only",
+            "exit_fraction": 1.0,
+            "idempotency_key": "b" * 32,
+        },
+    )
+
+
+def test_internal_submit_reports_ignored_for_nothing_to_exit(monkeypatch) -> None:
+    """Real chokepoint: an exit with no position returns ``ignored`` — a
+    clean no-op the runner must not count as a failure."""
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _Adapter([])
+
+    outcome = _run_internal_submit(adapter, deployment, _internal_exit_trade_signal())
+
+    assert outcome == "ignored"
+    assert adapter.submitted == []
+
+
+def test_internal_submit_reports_refused_for_short_on_long_only(
+    monkeypatch,
+) -> None:
+    """Real chokepoint: the pre-chokepoint short gate reports ``refused`` —
+    a normal outcome the runner counts toward escalation, not an exception."""
+    deployment = _deployment()  # allow_short=False
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _Adapter([])
+    signal = TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "internal_direction": "SHORT",
+            "idempotency_key": "c" * 32,
+        },
+    )
+
+    outcome = _run_internal_submit(adapter, deployment, signal)
+
+    assert outcome == "refused"
+    assert adapter.submitted == []
+
+
+def test_internal_submit_reports_submitted_end_to_end(monkeypatch) -> None:
+    """Real chokepoint: a well-formed internal entry reaches the broker and
+    reports ``submitted`."""
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _Adapter([])
+    # Demo/paper skips the promotion gate; the point here is the outcome
+    # contract, not promotion (covered by the promotion tests).
+    adapter.demo = True
+
+    async def _quote(_symbol: str):
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
+
+    # Entries need a fresh broker quote for the #125 deviation gate.
+    adapter.get_quote = _quote
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "internal_direction": "LONG",
+            "idempotency_key": "d" * 32,
+        },
+    )
+
+    outcome = _run_internal_submit(adapter, deployment, signal)
+
+    assert outcome == "submitted"
+    assert len(adapter.submitted) == 1
+
+
 def test_exit_without_a_position_is_ignored_and_logged(monkeypatch, caplog) -> None:
     deployment = _deployment()
     _patch_ledger(monkeypatch, deployment, 0.0)
@@ -1824,25 +1951,3 @@ def test_a_stale_exit_is_logged_at_warning_an_entry_at_info(caplog, exit_signal)
     assert _records_at(caplog, level, "stale discord signal")
     assert not _records_at(caplog, logging.INFO if exit_signal else logging.WARNING, "stale")
 
-
-def test_ledger_net_qty_by_symbol_groups_the_same_attribution(isolated_db) -> None:
-    """The by-symbol ledger the internal runner's entry caps read nets buys
-    and sells per symbol over this deployment's own fills only (#348)."""
-    from tests.conftest import seed_live_deployments
-
-    database, _engine, _data_dir = isolated_db
-    mine = str(uuid.uuid4())
-    other = str(uuid.uuid4())
-    seed_live_deployments(database, [mine, other])
-
-    _save_signal_with_fill(database, deployment_id=mine, symbol="AAPL", action="buy", qty=10.0)
-    _save_signal_with_fill(database, deployment_id=mine, symbol="aapl", action="sell", qty=4.0)
-    _save_signal_with_fill(database, deployment_id=mine, symbol="MSFT", action="buy", qty=7.0)
-    _save_signal_with_fill(database, deployment_id=other, symbol="AAPL", action="buy", qty=100.0)
-
-    by_symbol = database.list_live_deployment_net_filled_qty_by_symbol(mine)
-    assert by_symbol["AAPL"] == pytest.approx(6.0)
-    assert by_symbol["MSFT"] == pytest.approx(7.0)
-    assert "TSLA" not in by_symbol
-    other_by_symbol = database.list_live_deployment_net_filled_qty_by_symbol(other)
-    assert other_by_symbol == {"AAPL": pytest.approx(100.0)}

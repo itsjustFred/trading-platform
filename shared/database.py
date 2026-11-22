@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -3797,46 +3797,63 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     return net
 
 
-def list_live_deployment_net_filled_qty_by_symbol(deployment_id: str) -> dict[str, float]:
-    """``{SYMBOL: signed net filled qty}`` over one deployment's own ledger (#348).
+def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[str]:
+    """Order references of this deployment's entries that have no fills yet (#360).
 
-    Same attribution rules as :func:`get_live_deployment_net_filled_qty`,
-    grouped by symbol so callers can enforce per-symbol and total position
-    caps without one query per symbol. Symbols whose net is exactly zero are
-    still listed; callers filter on magnitude.
+    Returns every broker order id *and* signal id (the broker's client order
+    id is the canonical signal id) carried by entry signals whose persisted
+    fill quantity is at most ``_EXIT_FILL_TOLERANCE``. Only the broker can say
+    whether such an order is still working or dead, so the caller asks for the
+    working-order list only when this set is non-empty.
     """
     normalized_deployment_id = str(deployment_id or "").strip()
     if not normalized_deployment_id:
-        raise ValueError("A deployment id is required for the ledger quantities")
+        raise ValueError("A deployment id is required for the unfilled entry refs")
     init_db()
     with get_session() as session:
-        rows = session.exec(
+        signal_rows = session.exec(
             select(
-                func.upper(LiveSignalModel.symbol),
-                LiveSignalModel.action,
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
                 func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
             )
-            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
             .where(LiveSignalModel.deployment_id == normalized_deployment_id)
-            .group_by(func.upper(LiveSignalModel.symbol), LiveSignalModel.action)
+            .group_by(LiveExecutionModel.signal_id)
         ).all()
-    net: dict[str, float] = {}
-    for symbol, action, filled in rows:
-        normalized_action = str(action or "").strip().lower()
-        quantity = float(filled or 0.0)
-        if normalized_action == "buy":
-            net[symbol] = net.get(symbol, 0.0) + quantity
-        elif normalized_action == "sell":
-            net[symbol] = net.get(symbol, 0.0) - quantity
-        else:
-            raise ValueError(
-                f"Live signal action {action!r} for deployment {normalized_deployment_id} "
-                f"({symbol}) has no known position sign; refusing to size an exit."
-            )
-    return net
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    refs: set[str] = set()
+    for signal_id, symbol, broker_order_id, source, metadata in signal_rows:
+        if not str(symbol or "").strip():
+            continue
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            continue
+        if filled_by_signal.get(str(signal_id), 0.0) > _EXIT_FILL_TOLERANCE:
+            continue
+        refs.add(str(signal_id))
+        if broker_order_id:
+            refs.add(str(broker_order_id))
+    return refs
 
 
-def list_live_deployment_open_entry_counts_by_symbol(deployment_id: str) -> dict[str, int]:
+def list_live_deployment_open_entry_counts_by_symbol(
+    deployment_id: str,
+    working_order_ids: Collection[str] | None = None,
+) -> dict[str, int]:
     """Open entry count per symbol for one deployment (#360 maintainer decision).
 
     An *open entry* is a persisted entry signal — not exit-only and not a
@@ -3851,11 +3868,17 @@ def list_live_deployment_open_entry_counts_by_symbol(deployment_id: str) -> dict
     matters: a partially closed oldest entry keeps counting until its own
     residual reaches zero.
 
-    An entry with a broker order id but no fills yet also counts as one open
-    position: its order may still be working, and counting it is the
-    fail-closed direction (a dead order can only over-count, never
-    under-count). Entries with neither fills nor a broker order id never
-    reached the broker and do not count.
+    An entry with no fills yet counts as one open position **only while the
+    broker still lists its order as working** — a DAY entry that expired
+    unfilled or an order cancelled after acceptance must not lock the symbol
+    forever (#360 review). ``working_order_ids`` is the adapter's
+    ``working_order_ids()`` result: broker order ids and client order ids
+    (the canonical signal id). An entry matches on either its persisted
+    ``broker_order_id`` or its signal id. When ``working_order_ids`` is
+    ``None`` the working status cannot be proven, so every unfilled entry
+    that carries a broker order id still counts — the fail-closed direction.
+    Entries with neither fills nor any order reference never reached the
+    broker and do not count.
 
     Returns ``{SYMBOL: open entry count}`` for symbols with at least one
     open entry; flat symbols are absent.
@@ -3863,6 +3886,11 @@ def list_live_deployment_open_entry_counts_by_symbol(deployment_id: str) -> dict
     normalized_deployment_id = str(deployment_id or "").strip()
     if not normalized_deployment_id:
         raise ValueError("A deployment id is required for the open entry counts")
+    working = (
+        {str(order_id) for order_id in working_order_ids}
+        if working_order_ids is not None
+        else None
+    )
     init_db()
     with get_session() as session:
         signal_rows = session.exec(
@@ -3928,7 +3956,14 @@ def list_live_deployment_open_entry_counts_by_symbol(deployment_id: str) -> dict
         for entry in entries:
             entry_qty = max(0.0, entry["filled_qty"])
             if entry_qty <= _EXIT_FILL_TOLERANCE:
-                if entry["broker_order_id"]:
+                if working is None:
+                    still_open = bool(entry["broker_order_id"])
+                else:
+                    still_open = (
+                        entry["broker_order_id"] in working
+                        or entry["signal_id"] in working
+                    )
+                if still_open:
                     open_count += 1
                 continue
             closed = min(entry_qty, remaining_reduction)

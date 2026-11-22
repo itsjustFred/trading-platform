@@ -293,17 +293,31 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   position per deployment+symbol**. Only `1` is accepted today — N>1 is not
   supported end-to-end (per-position sizing, protection and exits on the
   qty-netted live ledger are unresolved; tracked as an open decision on the
-  PR), so any other value fails closed and the deployment is skipped. Open
-  positions are counted from the deployment's own persisted ledger, the
-  count is updated within a pass so same-pass signals cannot exceed the cap,
-  and the deployment total is capped at the engine maximum of 5.
+  PR), so any other value fails closed: **entries are disabled for the
+  deployment but exits keep flowing** — a bad cap must never suppress an
+  exit on an open position. Open positions are counted from the
+  deployment's own persisted ledger with oldest-first FIFO attribution of
+  reducing fills; an entry with no fills counts only while the broker still
+  lists its order as working, so a canceled or expired unfilled order does
+  not lock the symbol. The count is updated within a pass so same-pass
+  signals cannot exceed the cap, and the deployment total is capped at the
+  engine maximum of 5. If the ledger or the broker's working-order list
+  cannot be read, entries fail closed the same way — exits still evaluate.
+  A same-bar reversal (exit + new entry on one bar) emits the exit but the
+  entry waits one bar: the closing position still counts against the cap
+  until the next evaluation.
 - **Session-bound symbols** (anything the venue calendar does not resolve to
-  24/7) are only evaluated while the venue is open, using
+  24/7) are only *actioned* while the venue is open, using
   `shared.venue_calendar`. Daily-and-longer bars may be held over the market
   close; a bar whose data runs into the session close becomes actionable at
-  the next session open, matching the engine's next-bar-open fill. Bars
-  outside trading sessions produce no signals, and an unresolvable venue
-  calendar fails closed.
+  the next session open, matching the engine's next-bar-open fill. A bar
+  counts when it *overlaps* a trading interval, not when it opens inside
+  one — a 09:00 ET hourly bar is regular-hours data for its 09:30-10:00
+  portion. Session logic gates actionability, never the indicator input:
+  intraday strategies see every nominally closed feed bar, including
+  extended-hours bars, matching the unfiltered backtest dataset. Bars with
+  no session overlap produce no signals, and an unresolvable venue calendar
+  fails closed.
 
 **What runs.** For each deployment symbol the runner fetches bars through the
 adapter's existing `get_market_data` (no new network client; an adapter that
@@ -325,7 +339,9 @@ Live maps this to: evaluate on the just-closed bar T and submit immediately —
 the broker fill lands at (or very near) the open of bar T+1 for entries, and
 at approximately T's close for exits. Sizing geometry uses T's `close`, the
 same reference the engine records. A signal is only actionable while bar T+1
-is still forming (timeframe length + 30 s grace); an older bar is stale and is
+is still forming (30 s grace plus a feed-lag allowance of
+`min(120 s, 10% of the bar)`, measured from the bar's session-aware close —
+never a full extra bar); an older bar is stale and is
 never traded. Bars that closed while the daemon was down are stale by
 definition: only the newest closed bar is actionable after a restart, and
 missed bars are never backfilled with orders. Missing, malformed, unclosed or
@@ -343,9 +359,16 @@ never open or extend a position. A `SHORT` entry on a deployment without
 carrying more than one take-profit level — or a single partial (`tp_pct` /
 `fraction < 1`) level — are skipped: the live bracket carries a single
 full-size TP and emitting only the first would silently drop the native
-partial-exit ladder. An entry with no TP level is emitted with the
-unbounded-TP policy above; an entry with no stop gets the fallback-distance
-broker stop, so the daemon's SL/TP guard always sees a real stop.
+partial-exit ladder. Entries carrying engine sizing-only stop fields
+(`sizing_sl_price`/`sizing_stop`/`sizing_sl`/`stop_distance`) are likewise
+skipped — the live path cannot reproduce the engine's sizing math. A
+`signal_processor` configuration is refused outright: processors are a
+Discord-pipeline concept the internal path never runs. An entry with no TP
+level is emitted with the unbounded-TP policy above; an entry with no stop
+gets the fallback-distance broker stop, so the daemon's SL/TP guard always
+sees a real stop. A *stale* exit is skipped like a stale entry — with the
+unbounded-TP policy the position is then held until the fallback stop or
+the next exit signal.
 
 **Idempotency.** Each emitted intent carries a producer-stable
 `metadata.idempotency_key` derived from deployment, symbol, timeframe, bar

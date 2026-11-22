@@ -63,7 +63,13 @@ from live_runner.exit_signals import (
     resolve_exit_order,
     usable_qty_tolerance,
 )
-from live_runner.internal_strategy_runner import run_internal_strategy_loop
+from live_runner.internal_strategy_runner import (
+    SUBMIT_OUTCOME_IGNORED,
+    SUBMIT_OUTCOME_REFUSED,
+    SUBMIT_OUTCOME_SUBMITTED,
+    SUBMIT_OUTCOME_UNKNOWN,
+    run_internal_strategy_loop,
+)
 from live_runner.kill_switch import (
     PENDING_CANCEL_ESCALATION_PASSES,
     KillSwitchMode,
@@ -2997,7 +3003,7 @@ async def _submit_internal_strategy_signal(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
     trade_signal: TradeSignal,
-) -> None:
+) -> str:
     """Route one internally generated strategy signal through the shared chokepoint.
 
     The signal was produced by ``internal_strategy_runner`` on a closed bar;
@@ -3006,6 +3012,10 @@ async def _submit_internal_strategy_signal(
     short-side check: ``_trade_signal_to_live_signal`` would otherwise turn a
     SHORT entry on a long-only deployment into a full exit, which is the
     opposite of what the strategy asked for — skip it instead.
+
+    Returns the chokepoint's ``SUBMIT_OUTCOME_*`` so the runner can count
+    refusals toward its escalation; its own pre-chokepoint skips report
+    ``refused``.
     """
     account_id = str(deployment.account_id)
     direction = str(
@@ -3027,7 +3037,7 @@ async def _submit_internal_strategy_signal(
                     }
                 },
             )
-            return
+            return SUBMIT_OUTCOME_REFUSED
         if not allows_short:
             logger.warning(
                 "Internal strategy SHORT entry skipped: deployment does not allow shorts",
@@ -3039,7 +3049,7 @@ async def _submit_internal_strategy_signal(
                     }
                 },
             )
-            return
+            return SUBMIT_OUTCOME_REFUSED
     try:
         live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
     except ValueError:
@@ -3053,16 +3063,15 @@ async def _submit_internal_strategy_signal(
                 }
             },
         )
-        return
+        return SUBMIT_OUTCOME_REFUSED
 
     is_exit = is_exit_order(live_signal.action, live_signal.metadata)
     if is_exit:
         async with _exit_lock(account_id, live_signal.symbol):
-            await _prepare_claim_and_submit_signal(
+            return await _prepare_claim_and_submit_signal(
                 account_id, adapter, deployment, trade_signal, live_signal, is_exit=True
             )
-        return
-    await _prepare_claim_and_submit_signal(
+    return await _prepare_claim_and_submit_signal(
         account_id, adapter, deployment, trade_signal, live_signal, is_exit=False
     )
 
@@ -3076,7 +3085,15 @@ async def _prepare_claim_and_submit_signal(
     *,
     is_exit: bool,
     decision: SignalDecisionRecorder | None = None,
-) -> None:
+) -> str:
+    """Prepare, claim and submit one signal; report the outcome.
+
+    Returns one of the ``SUBMIT_OUTCOME_*`` constants: ``submitted`` reached
+    the broker, ``ignored`` was a deliberate no-op, ``refused`` was rejected
+    before the broker saw anything, ``unknown`` means the broker may have the
+    order. Callers that only fan out (Discord) ignore the value; the internal
+    strategy runner counts non-clean outcomes toward its escalation.
+    """
     # This chokepoint serves Discord and internal-strategy signals alike;
     # refusal logs name the actual metadata source, not a hardcoded "Discord".
     _metadata = getattr(live_signal, "metadata", None) or {}
@@ -3112,12 +3129,12 @@ async def _prepare_claim_and_submit_signal(
         )
         if decision is not None:
             decision.ignored("nothing_to_exit", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_IGNORED
     except ExitBelowStepError as exc:
         _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
         if decision is not None:
             decision.ignored("exit_below_step", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_IGNORED
     except ExitInFlightError as exc:
         # An error, not a skipped signal: nothing was sent and this deployment's
         # position stays open (a later exit signal is sized once the earlier
@@ -3138,7 +3155,7 @@ async def _prepare_claim_and_submit_signal(
         )
         if decision is not None:
             decision.refused("exit_in_flight", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_REFUSED
     except LiveHaltError as exc:
         # The kill switch (#300) refused this entry. Nothing was sent, which is
         # the halt working; reported as its own reason rather than as a generic
@@ -3157,7 +3174,7 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
-        return
+        return SUBMIT_OUTCOME_REFUSED
     except LossBreakerBreachError as exc:
         # The loss circuit breaker (#301) refused this entry. Nothing was sent,
         # which is the breaker working; reported distinctly so an operator sees
@@ -3177,7 +3194,7 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
-        return
+        return SUBMIT_OUTCOME_REFUSED
     except Exception as exc:
         if is_exit:
             # A refused exit leaves this deployment's position open: an operator
@@ -3197,7 +3214,7 @@ async def _prepare_claim_and_submit_signal(
             )
             if decision is not None:
                 decision.refused("exit_pre_submission_error", detail=str(exc))
-            return
+            return SUBMIT_OUTCOME_REFUSED
         logger.warning(
             f"{source_label} signal refused before submission; nothing was sent to the broker",
             extra={
@@ -3211,7 +3228,7 @@ async def _prepare_claim_and_submit_signal(
         )
         if decision is not None:
             decision.refused("pre_submission_error", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_REFUSED
 
     # Kill switch (#300), read again at the last moment before the broker sees
     # anything. The gate in `prepare_order_with_risk` ran before the broker
@@ -3242,7 +3259,7 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
-            return
+            return SUBMIT_OUTCOME_REFUSED
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
@@ -3271,7 +3288,7 @@ async def _prepare_claim_and_submit_signal(
         )
         if decision is not None:
             decision.refused("submission_claim_failed")
-        return
+        return SUBMIT_OUTCOME_REFUSED
 
     # The claim itself awaited the database, so a halt written while it ran is
     # still unseen by the gate above. Read the halt one last time now that the
@@ -3308,7 +3325,7 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
-            return
+            return SUBMIT_OUTCOME_REFUSED
 
     renew_task = asyncio.create_task(
         _renew_submission_claim_until_cancelled(claim_token),
@@ -3341,7 +3358,7 @@ async def _prepare_claim_and_submit_signal(
                     )
                     if decision is not None:
                         decision.ignored("exit_below_step", detail=str(exc))
-                    return
+                    return SUBMIT_OUTCOME_IGNORED
                 # A refused exit leaves the position open (#121): error, so an
                 # operator sees it. A refused entry opened nothing: warning.
                 log = logger.error if is_exit else logger.warning
@@ -3371,7 +3388,7 @@ async def _prepare_claim_and_submit_signal(
                         else "exit_refused_pre_request",
                         detail=str(exc),
                     )
-                return
+                return SUBMIT_OUTCOME_REFUSED
             # **Do not release the lease.** The broker may have accepted the
             # order and only the response was lost; releasing would let the next
             # signal submit a duplicate before anyone reconciled. The lease is
@@ -3396,7 +3413,7 @@ async def _prepare_claim_and_submit_signal(
                 decision.unknown(
                     "broker_submit_outcome_unknown", detail=str(exc)
                 )
-            return
+            return SUBMIT_OUTCOME_UNKNOWN
     finally:
         renew_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -3433,6 +3450,7 @@ async def _prepare_claim_and_submit_signal(
                 str(broker_order_id) if broker_order_id is not None else None
             ),
         )
+    return SUBMIT_OUTCOME_SUBMITTED
 
 
 def _deployment_accepts_signal_author(

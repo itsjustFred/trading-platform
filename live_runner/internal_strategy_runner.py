@@ -24,11 +24,15 @@ Live cannot know the next open in advance, so the mapping is:
   the market close fills at approximately the trigger bar's close, matching
   the engine's default signal-exit fill.
 
-A signal is only actionable while bar T+1 is still forming
-(``close_age <= timeframe + SUBMIT_GRACE_SECONDS``). Older bars are stale:
-their entries are skipped rather than traded late. Exits follow the same
-freshness rule — a stale exit is skipped because the broker-side SL/TP legs
-placed at entry remain the bound on the position.
+A signal is only actionable while bar T+1 is still forming: the window is
+``SUBMIT_GRACE_SECONDS`` (30 s) plus a small feed-lag allowance of
+``min(120 s, 10% of the bar)``, measured from the bar's *session-aware*
+close — never a full extra bar, so a signal cannot trade an hour late.
+Older bars are stale: their entries are skipped rather than traded late.
+Exits follow the same freshness rule — a stale exit is skipped because the
+broker-side SL/TP legs placed at entry remain the bound on the position;
+with an unbounded take-profit policy that means the position is then held
+until the fallback stop or the next exit signal.
 
 Catch-up policy: only the newest closed bar is actionable after a restart or
 downtime. Bars that closed while the daemon was down are stale by definition
@@ -74,16 +78,30 @@ Risk-policy notes (maintainer decision 2026-11-22):
   protection and exits on the qty-netted live ledger are unresolved; see the
   PR's "Open decision" section) and any other value fails closed. Open
   positions are counted from the deployment's own persisted ledger —
-  filled residuals allocated FIFO plus working (filled=0, broker order
-  known) entries — and the total is capped at ``TRADE_ENGINE_MAX_POSITIONS``.
+  filled residuals allocated FIFO plus unfilled entries the broker still
+  lists as working — and the total is capped at ``TRADE_ENGINE_MAX_POSITIONS``.
+  When the cap or the ledger cannot be read, entries are disabled for the
+  deployment while exits keep flowing.
 * **Session-bound symbols** (everything the venue calendar does not resolve
-  to 24/7) are only evaluated while the venue is open, using
-  ``shared.venue_calendar``: daily-and-longer bars are allowed and may be
-  held over the market close; their signals become actionable at the next
-  session open. Intraday bars must open inside a trading interval; a bar
-  that runs into the session close is clipped to it and likewise becomes
-  actionable at the next session open. Bars outside sessions produce no
-  signals.
+  to 24/7) are only *evaluated* while the venue is open, using
+  ``shared.venue_calendar``. Only actionability is session-gated, never the
+  indicator input: intraday bars are closed at their nominal close and the
+  strategy sees every closed bar the feed serves — including extended-hours
+  bars, matching the unfiltered backtest dataset. A bar *produces a signal*
+  only when it overlaps a trading interval; daily-and-longer bars are allowed
+  and may be held over the market close, their signals becoming actionable at
+  the next session open. An intraday bar whose data runs into the session
+  close is clipped to it and likewise becomes actionable at the next session
+  open; a bar that ends inside the session is actionable once its close plus
+  the freshness window has passed.
+* Only **ACTIVE** deployments are evaluated — a PAUSED internal deployment
+  gets no exits from this runner, unlike PAUSED Discord deployments which
+  #311 still lets exit (documented divergence; the Discord path is the
+  operator's manual-exit channel).
+* A same-bar reversal (exit + new entry on one bar) emits the exit but
+  skips the entry: ``open_entries`` still counts the position the exit is
+  closing, so the entry waits for the next bar's evaluation — a one-bar
+  delay, not a dropped signal (documented divergence).
 
 Submission: intents are handed to the daemon's ``submit_signal`` callback,
 which routes them through ``_trade_signal_to_live_signal`` and
@@ -121,6 +139,7 @@ from shared.constants import normalize_symbols, normalize_timeframe
 from shared.database import (
     DATA_DIR,
     list_live_deployment_open_entry_counts_by_symbol,
+    list_live_deployment_unfilled_entry_order_refs,
 )
 from shared.logging import get_logger
 from shared.models import VALID_TIMEFRAMES, LiveDeploymentConfig
@@ -155,8 +174,27 @@ SESSION_LOOKAHEAD_DAYS = 14
 #: Consecutive submission failures before a one-time ERROR escalation.
 SUBMIT_FAILURE_ESCALATION = 3
 
+#: Outcomes the daemon's submit chokepoint reports back through
+#: ``SubmitSignal``. ``submitted`` reached the broker; ``ignored`` was a
+#: deliberate no-op (e.g. an exit with nothing to close); ``refused`` was
+#: rejected before the broker saw anything; ``unknown`` means the broker may
+#: have the order and reconciliation is required. Anything else is treated
+#: as a failure.
+SUBMIT_OUTCOME_SUBMITTED = "submitted"
+SUBMIT_OUTCOME_REFUSED = "refused"
+SUBMIT_OUTCOME_IGNORED = "ignored"
+SUBMIT_OUTCOME_UNKNOWN = "unknown"
+_SUBMIT_OK_OUTCOMES = frozenset(
+    {SUBMIT_OUTCOME_SUBMITTED, SUBMIT_OUTCOME_IGNORED}
+)
+#: Outcomes where an entry may exist at the broker, so this pass's caps must
+#: count it even though no clean submission was confirmed.
+_SUBMIT_MAY_HAVE_REACHED_BROKER = frozenset(
+    {SUBMIT_OUTCOME_SUBMITTED, SUBMIT_OUTCOME_UNKNOWN}
+)
+
 SubmitSignal = Callable[
-    [BaseLiveAdapter, LiveDeploymentConfig, TradeSignal], Awaitable[None]
+    [BaseLiveAdapter, LiveDeploymentConfig, TradeSignal], Awaitable[str]
 ]
 
 
@@ -222,7 +260,8 @@ def _max_open_per_symbol(
     the per-strategy fallback. Default 1. Only 1 is accepted: N>1 per-symbol
     entries is not supported end-to-end on the qty-netted live ledger
     (maintainer decision 2026-11-22, open decision) — anything else, or an
-    unreadable value, fails closed (the caller refuses the deployment).
+    unreadable value, fails closed (the caller disables entries while exits
+    keep flowing).
     """
     settings = deployment.settings or {}
     if MAX_OPEN_PER_SYMBOL_KEY in settings:
@@ -257,25 +296,6 @@ def _adapter_calendar_source(adapter: BaseLiveAdapter) -> str:
     return ""
 
 
-def _interval_containing(
-    calendar: venue_calendar.VenueCalendar, ts: pd.Timestamp
-) -> venue_calendar.TradingInterval | None:
-    """The trading interval containing ``ts``, or ``None`` when closed.
-
-    The query window is padded a full day on both sides so the returned
-    interval is not clipped at the probe edges — callers need the session's
-    true open/close, not the query boundary.
-    """
-    ts = pd.Timestamp(ts)
-    candidates = calendar.trading_intervals(
-        ts - pd.Timedelta(days=1), ts + pd.Timedelta(days=1)
-    )
-    for interval in reversed(candidates):
-        if interval.open <= ts < interval.close:
-            return interval
-    return None
-
-
 def _next_session_open(
     calendar: venue_calendar.VenueCalendar, ts: pd.Timestamp
 ) -> pd.Timestamp | None:
@@ -307,27 +327,29 @@ def _effective_bar_close(
     """
     bar_open = pd.Timestamp(bar_open)
     nominal_close = bar_open + pd.Timedelta(seconds=bar_seconds)
+    # A bar counts when it *overlaps* a trading interval, not when it opens
+    # inside one: clock-aligned feeds stamp e.g. the 09:00 ET 1h bar, whose
+    # 09:30-10:00 ET portion is regular-hours data even though the bar opened
+    # pre-market. Requiring ``bar_open`` inside the session dropped exactly
+    # those bars (and every 4h bar stamped before the open) from the
+    # strategy's input — a backtest-parity bug.
+    intervals = calendar.trading_intervals(
+        bar_open - pd.Timedelta(days=1), nominal_close + pd.Timedelta(days=1)
+    )
+    overlapping = [
+        interval
+        for interval in intervals
+        if interval.open < nominal_close and interval.close > bar_open
+    ]
+    if not overlapping:
+        return None
+    session_close = overlapping[-1].close
     if bar_seconds >= 86_400:
         # Daily+: the stamped bar spans whole sessions; its effective close
-        # is the last session close overlapping the span. The query is
-        # padded so interval bounds are not clipped at the span edges.
-        intervals = calendar.trading_intervals(
-            bar_open - pd.Timedelta(days=1), nominal_close + pd.Timedelta(days=1)
-        )
-        overlapping = [
-            interval
-            for interval in intervals
-            if interval.open < nominal_close and interval.close > bar_open
-        ]
-        if not overlapping:
-            return None
-        return overlapping[-1].close, True
-    interval = _interval_containing(calendar, bar_open)
-    if interval is None:
-        return None
-    if nominal_close >= interval.close:
-        return interval.close, True
-    return nominal_close, False
+        # is the last session close overlapping the span.
+        return session_close, True
+    effective_close = min(nominal_close, session_close)
+    return effective_close, nominal_close >= session_close
 
 
 def _has_sizing_only_stop_fields(row: pd.Series) -> bool:
@@ -448,6 +470,46 @@ class InternalStrategyRunner:
         self._reported.add(marker)
         getattr(logger, level)(message, extra={"data": extra})
 
+    def _note_submit_failure(
+        self,
+        state_key: tuple[str, str],
+        symbol: str,
+        signal: TradeSignal,
+        *,
+        message: str,
+        level: str = "error",
+        **detail: Any,
+    ) -> None:
+        """Count one non-submission (exception or refused/unknown outcome).
+
+        Refusals return normally through the chokepoint, so without this they
+        would never escalate: three consecutive signals that never reach the
+        broker means the deployment is effectively not trading.
+        """
+        failures = self._submit_failures.get(state_key, 0) + 1
+        self._submit_failures[state_key] = failures
+        if failures == SUBMIT_FAILURE_ESCALATION:
+            self._report_once(
+                state_key[0],
+                f"submit_failures:{state_key[1]}",
+                "Internal strategy signal submission keeps failing; "
+                "the deployment is effectively not trading",
+                deployment_id=state_key[0],
+                symbol=symbol,
+                consecutive_failures=failures,
+            )
+        getattr(logger, level)(
+            message,
+            extra={
+                "data": {
+                    "deployment_id": state_key[0],
+                    "symbol": symbol,
+                    "action": signal.action,
+                    **detail,
+                }
+            },
+        )
+
     def _bundle(self, deployment: LiveDeploymentConfig, timeframe: str) -> _StrategyBundle | None:
         """Resolve + load the deployment's strategy, cached by file mtime."""
         key = str(deployment.id)
@@ -521,25 +583,69 @@ class InternalStrategyRunner:
         self._reported.discard((key, "strategy_target"))
         return bundle
 
+    async def _working_order_ids(
+        self, adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig
+    ) -> set[str] | None:
+        """The adapter's working-order ids, or ``None`` when unprovable.
+
+        Called only when the ledger holds unfilled entries: such an entry
+        counts as open only while the broker still lists its order, so a dead
+        unfilled order cannot lock the symbol. ``None`` fails closed — the
+        caller disables entries rather than guess which orders are dead —
+        and is reported once per deployment.
+        """
+        deployment_id = str(deployment.id)
+        getter = getattr(adapter, "working_order_ids", None)
+        if not callable(getter):
+            self._report_once(
+                deployment_id,
+                "working_orders",
+                "Adapter cannot list working orders; unfilled entries cannot "
+                "be told from dead ones, so entries are disabled (exits "
+                "still evaluated)",
+                deployment_id=deployment_id,
+                adapter=type(adapter).__name__,
+            )
+            return None
+        try:
+            return {str(order_id) for order_id in await getter()}
+        except Exception as exc:
+            self._report_once(
+                deployment_id,
+                "working_orders",
+                "Broker working orders could not be read; unfilled entries "
+                "cannot be told from dead ones, so entries are disabled "
+                "(exits still evaluated)",
+                deployment_id=deployment_id,
+                error=str(exc),
+            )
+            return None
+
     def _symbol_calendar(
         self, adapter: BaseLiveAdapter, symbol: str
     ) -> venue_calendar.VenueCalendar | None:
-        """Venue calendar for session checks; ``None`` = venue unknown."""
+        """Venue calendar for session checks; ``None`` = venue unknown.
+
+        Only successes are cached: a transient resolution failure must not
+        disable the symbol until a restart — the next tick retries.
+        """
         source = _adapter_calendar_source(adapter)
         key = (source, symbol.upper())
-        if key not in self._calendars:
-            asset_class = "crypto" if _is_crypto_symbol(symbol) else "stock"
-            try:
-                calendar = venue_calendar.resolve_venue_calendar(
-                    symbol=symbol,
-                    asset_class=asset_class,
-                    source=source or None,
-                    data_dir=str(DATA_DIR),
-                )
-            except Exception:
-                calendar = None
+        if key in self._calendars:
+            return self._calendars[key]
+        asset_class = "crypto" if _is_crypto_symbol(symbol) else "stock"
+        try:
+            calendar = venue_calendar.resolve_venue_calendar(
+                symbol=symbol,
+                asset_class=asset_class,
+                source=source or None,
+                data_dir=str(DATA_DIR),
+            )
+        except Exception:
+            calendar = None
+        if calendar is not None:
             self._calendars[key] = calendar
-        return self._calendars[key]
+        return calendar
 
     # ── per-symbol evaluation ────────────────────────────────────────────
 
@@ -612,8 +718,22 @@ class InternalStrategyRunner:
                     return
             elif moment_ts < nominal_next_close:
                 return
+        # ``get_market_data`` is a duck-typed adapter capability (not on
+        # ``BaseLiveAdapter``), resolved the same way ``_adapter_serves_bars``
+        # and the trailing-stop manager probe it.
+        get_market_data = getattr(adapter, "get_market_data", None)
+        if not callable(get_market_data):
+            self._report_once(
+                state_key[0],
+                f"market_data:{state_key[1]}",
+                "Adapter cannot serve market data for this timeframe; "
+                "internal strategy evaluation fails closed",
+                deployment_id=state_key[0],
+                symbol=symbol,
+            )
+            return
         try:
-            frame = await adapter.get_market_data(
+            frame = await get_market_data(
                 symbol, timeframe=timeframe, limit=self._bar_limit
             )
         except Exception as exc:
@@ -642,15 +762,27 @@ class InternalStrategyRunner:
             return
 
         if session_bound:
-            # A bar is closed once its *session-aware* close has passed —
-            # for daily+ bars that is the session close, well before the
-            # nominal open+timeframe stamp would suggest. Bars outside
-            # trading time never close and produce no signal.
+            # Daily+ bars are closed once their *session-aware* close has
+            # passed — the session close, well before the nominal
+            # open+timeframe stamp would suggest. Intraday bars are closed at
+            # their nominal close: the feed's bar is final then, and keeping
+            # extended-hours bars in the frame is what the backtest dataset
+            # contains (the downloader stores the same feed unfiltered). A
+            # bar with no session overlap still produces no signal — only
+            # actionability is session-gated, never the indicator input.
             closed_positions: list[int] = []
             for position in range(len(prepared)):
                 bar_open = pd.Timestamp(prepared.iloc[position]["timestamp"])
-                effective = _effective_bar_close(calendar, bar_open, bar_seconds)
-                if effective is not None and effective[0] <= moment_ts:
+                if bar_seconds < 86_400:
+                    closed = (
+                        bar_open + pd.Timedelta(seconds=bar_seconds) <= moment_ts
+                    )
+                else:
+                    effective = _effective_bar_close(
+                        calendar, bar_open, bar_seconds
+                    )
+                    closed = effective is not None and effective[0] <= moment_ts
+                if closed:
                     closed_positions.append(position)
             if not closed_positions:
                 return
@@ -684,11 +816,22 @@ class InternalStrategyRunner:
                 return
 
         # Run the strategy once over the closed-bar window — the same call
-        # shape the engine makes — then read the candidate rows.
-        try:
+        # shape the engine makes — then read the candidate rows. The call,
+        # normalization and signals-frame read run on a worker thread: over up
+        # to 1000 bars per symbol they would otherwise block the daemon's
+        # event loop (listeners, stream handlers, kill-switch paths) for the
+        # whole evaluation. Bundles are per-deployment and evaluations are
+        # sequential, so the shared engine state stays single-threaded.
+        def _run_strategy_eval() -> tuple[Any, Any, pd.DataFrame | None]:
             output = bundle.engine._call_strategy(bundle.generate_signals, eval_frame)
-            entries, exits, _indicators, _drawings = (
+            norm_entries, norm_exits, _indicators, _drawings = (
                 bundle.engine._normalize_strategy_output(output, eval_frame)
+            )
+            return norm_entries, norm_exits, bundle.engine._signals_frame
+
+        try:
+            entries, exits, signals_frame = await asyncio.to_thread(
+                _run_strategy_eval
             )
         except Exception as exc:
             self._report_once(
@@ -701,7 +844,6 @@ class InternalStrategyRunner:
             )
             return
 
-        signals_frame = bundle.engine._signals_frame
         intents: list[tuple[int, TradeSignal]] = []
         # A signal is actionable only while the next bar is still forming:
         # grace for feed/tick jitter plus a small feed-lag allowance — never
@@ -779,7 +921,10 @@ class InternalStrategyRunner:
                         ),
                     )
                 )
-            if bool(entries.iloc[position]):
+            # ``max_open_per_symbol == 0`` means entries are disabled for this
+            # deployment (cap or ledger unreadable): exits still flow, entries
+            # do not — the fail-closed direction for new exposure.
+            if max_open_per_symbol > 0 and bool(entries.iloc[position]):
                 try:
                     direction = bundle.engine._resolve_direction(merged_row)
                 except Exception as exc:
@@ -821,7 +966,6 @@ class InternalStrategyRunner:
                         "the live path cannot honor them and the signal is skipped",
                         deployment_id=state_key[0],
                         symbol=symbol,
-                        level="warning",
                     )
                     continue
                 if len(tp_levels) > 1 or (
@@ -925,43 +1069,43 @@ class InternalStrategyRunner:
 
         for _position, signal in intents:
             try:
-                await self._submit_signal(adapter, deployment, signal)
+                outcome = await self._submit_signal(adapter, deployment, signal)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                failures = self._submit_failures.get(state_key, 0) + 1
-                self._submit_failures[state_key] = failures
-                if failures == SUBMIT_FAILURE_ESCALATION:
-                    self._report_once(
-                        state_key[0],
-                        f"submit_failures:{state_key[1]}",
-                        "Internal strategy signal submission keeps failing; "
-                        "the deployment is effectively not trading",
-                        deployment_id=state_key[0],
-                        symbol=symbol,
-                        consecutive_failures=failures,
-                    )
-                logger.error(
-                    "Internal strategy signal submission failed",
-                    extra={
-                        "data": {
-                            "deployment_id": state_key[0],
-                            "symbol": symbol,
-                            "action": signal.action,
-                            "error": str(exc),
-                        }
-                    },
+                self._note_submit_failure(
+                    state_key,
+                    symbol,
+                    signal,
+                    message="Internal strategy signal submission failed",
+                    error=str(exc),
                 )
-            else:
+                continue
+            if outcome in _SUBMIT_OK_OUTCOMES:
                 self._submit_failures.pop(state_key, None)
-                if (signal.metadata or {}).get("internal_direction"):
-                    # Count the submitted entry against this pass's caps so a
-                    # second entry on the same symbol later in the same pass
-                    # cannot slip past the per-symbol or engine limits. The
-                    # persisted ledger recounts it on the next pass.
-                    open_entries[symbol.upper()] = (
-                        open_entries.get(symbol.upper(), 0) + 1
-                    )
+            else:
+                # A refusal is not an exception, but it is still a signal that
+                # never reached the broker — it counts toward the same
+                # escalation so a permanently refused deployment surfaces.
+                self._note_submit_failure(
+                    state_key,
+                    symbol,
+                    signal,
+                    message="Internal strategy signal was not submitted",
+                    level="warning",
+                    outcome=str(outcome),
+                )
+            if (
+                (signal.metadata or {}).get("internal_direction")
+                and outcome in _SUBMIT_MAY_HAVE_REACHED_BROKER
+            ):
+                # Count the submitted entry against this pass's caps so a
+                # second entry on the same symbol later in the same pass
+                # cannot slip past the per-symbol or engine limits. The
+                # persisted ledger recounts it on the next pass.
+                open_entries[symbol.upper()] = (
+                    open_entries.get(symbol.upper(), 0) + 1
+                )
 
     async def run_once(
         self,
@@ -1040,34 +1184,61 @@ class InternalStrategyRunner:
             bundle = self._bundle(deployment, timeframe)
             if bundle is None:
                 continue
+            # Entry caps need the configured per-symbol limit AND a readable
+            # ledger. When either is unusable the deployment's *entries* are
+            # disabled — but exits must keep flowing: skipping the whole
+            # deployment would leave open positions bounded only by the
+            # broker stop. ``max_open_per_symbol = 0`` is the
+            # entries-disabled marker ``_evaluate_symbol`` checks.
             try:
                 max_open_per_symbol = _max_open_per_symbol(deployment, bundle)
             except Exception as exc:
                 self._report_once(
                     deployment_id,
-                    "deployment_config",
+                    "open_position_cap",
                     "Internal deployment open-position cap is unusable; "
-                    "skipping",
+                    "entries are disabled and exits still evaluated",
                     deployment_id=deployment_id,
                     error=str(exc),
                 )
-                continue
-            try:
-                open_entries = await asyncio.to_thread(
-                    list_live_deployment_open_entry_counts_by_symbol, deployment_id
+                max_open_per_symbol = 0
+            open_entries: dict[str, int] = {}
+            if max_open_per_symbol > 0:
+                unfilled_refs = await asyncio.to_thread(
+                    list_live_deployment_unfilled_entry_order_refs, deployment_id
                 )
-            except Exception as exc:
-                # Without the ledger the entry caps cannot be enforced; fail
-                # closed for this deployment rather than trade uncapped.
-                self._report_once(
-                    deployment_id,
-                    "ledger",
-                    "Internal deployment ledger is unreadable; entry caps "
-                    "cannot be enforced and evaluation fails closed",
-                    deployment_id=deployment_id,
-                    error=str(exc),
-                )
-                continue
+                working_ids: set[str] = set()
+                if unfilled_refs:
+                    # An entry with no fills counts as open only while the
+                    # broker still lists its order — a dead unfilled order
+                    # must not lock the symbol forever. The broker read
+                    # happens only when such rows exist.
+                    fetched = await self._working_order_ids(adapter, deployment)
+                    if fetched is None:
+                        max_open_per_symbol = 0
+                    else:
+                        working_ids = fetched
+                if max_open_per_symbol > 0:
+                    try:
+                        open_entries = await asyncio.to_thread(
+                            list_live_deployment_open_entry_counts_by_symbol,
+                            deployment_id,
+                            working_ids,
+                        )
+                    except Exception as exc:
+                        # Without the ledger the entry caps cannot be
+                        # enforced; entries are disabled rather than traded
+                        # uncapped, and exits still flow.
+                        self._report_once(
+                            deployment_id,
+                            "ledger",
+                            "Internal deployment ledger is unreadable; entry "
+                            "caps cannot be enforced so entries are disabled "
+                            "(exits still evaluated)",
+                            deployment_id=deployment_id,
+                            error=str(exc),
+                        )
+                        max_open_per_symbol = 0
             for symbol in symbols:
                 # Fresh wall-clock per symbol: a pass over many symbols must
                 # not judge the last ones by the pass's start time.

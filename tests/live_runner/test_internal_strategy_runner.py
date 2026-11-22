@@ -48,6 +48,7 @@ class FakeAdapter:
         self.frame = frame if frame is not None else _bars()
         self.serve_bars = serve_bars
         self.calls: list[tuple[str, str, int]] = []
+        self.working_ids: set[str] | None = None
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         self.calls.append((symbol, timeframe, limit))
@@ -55,6 +56,11 @@ class FakeAdapter:
 
     def supports_market_data_timeframe(self, timeframe: str) -> bool:
         return self.serve_bars
+
+    async def working_order_ids(self) -> set[str]:
+        if self.working_ids is None:
+            raise RuntimeError("working orders endpoint unavailable")
+        return set(self.working_ids)
 
 
 class NoBarsAdapter(FakeAdapter):
@@ -120,8 +126,9 @@ def _runner(
 def _collect() -> tuple[list[TradeSignal], Any]:
     sent: list[TradeSignal] = []
 
-    async def submit(adapter: Any, deployment: LiveDeploymentConfig, signal: TradeSignal) -> None:
+    async def submit(adapter: Any, deployment: LiveDeploymentConfig, signal: TradeSignal) -> str:
         sent.append(signal)
+        return "submitted"
 
     return sent, submit
 
@@ -846,7 +853,7 @@ def test_open_position_blocks_pyramiding(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id: {"AAPL": 1},
+        lambda deployment_id, working_order_ids=None: {"AAPL": 1},
     )
 
     asyncio.run(
@@ -869,7 +876,7 @@ def test_max_positions_cap_uses_deployment_ledger(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id: {
+        lambda deployment_id, working_order_ids=None: {
             "AAA": 1, "BBB": 1, "CCC": 1, "DDD": 1, "EEE": 1,
         },
     )
@@ -899,7 +906,7 @@ def test_max_open_per_symbol_above_one_is_refused(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id: {"AAPL": 1},
+        lambda deployment_id, working_order_ids=None: {"AAPL": 1},
     )
     adapter = FakeAdapter()
     deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
@@ -911,8 +918,10 @@ def test_max_open_per_symbol_above_one_is_refused(
     )
 
     assert sent == []
-    assert adapter.calls == []
-    assert (str(deployment.id), "deployment_config") in runner._reported
+    # Entries are disabled, but the deployment is still evaluated so exits
+    # keep flowing — the market-data fetch proves evaluation ran.
+    assert adapter.calls != []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
 
 
 def test_max_open_per_symbol_above_engine_maximum_is_refused(
@@ -928,7 +937,7 @@ def test_max_open_per_symbol_above_engine_maximum_is_refused(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id: {"AAPL": 5},
+        lambda deployment_id, working_order_ids=None: {"AAPL": 5},
     )
     adapter = FakeAdapter()
     deployment = _deployment(settings={"internal_max_open_per_symbol": 99})
@@ -940,8 +949,8 @@ def test_max_open_per_symbol_above_engine_maximum_is_refused(
     )
 
     assert sent == []
-    assert adapter.calls == []
-    assert (str(deployment.id), "deployment_config") in runner._reported
+    assert adapter.calls != []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
 
 
 def test_max_open_per_symbol_invalid_fails_closed(
@@ -960,8 +969,8 @@ def test_max_open_per_symbol_invalid_fails_closed(
     )
 
     assert sent == []
-    assert adapter.calls == []
-    assert (str(deployment.id), "deployment_config") in runner._reported
+    assert adapter.calls != []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
 
 
 def test_engine_position_cap_counts_same_pass_submits(
@@ -990,7 +999,7 @@ def test_engine_position_cap_counts_same_pass_submits(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id: {"H1": 1, "H2": 1, "H3": 1, "H4": 1},
+        lambda deployment_id, working_order_ids=None: {"H1": 1, "H2": 1, "H3": 1, "H4": 1},
     )
     symbols = ["N1", "N2", "N3"]
     deployment = _deployment(symbols=symbols)
@@ -1077,3 +1086,338 @@ def test_consecutive_submit_failures_escalate_once(tmp_path: Path) -> None:
 
     assert runner._submit_failures[(str(deployment.id), "AAPL")] == 3
     assert (str(deployment.id), "submit_failures:AAPL") in runner._reported
+
+
+# ── Bundle 47: session overlap, entries-disabled exits, outcome escalation ──
+
+
+def test_first_hour_bar_overlapping_session_open_is_evaluated(
+    tmp_path: Path,
+) -> None:
+    """A 1h bar stamped 09:00 ET opens before the 09:30 NYSE open but its
+    09:30-10:00 portion is regular-hours data. Session *overlap*, not bar
+    open inside the session, decides actionability — the bar must trade."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    # Hourly bars; the newest opens 09:00 ET = 14:00 UTC and closes 10:00 ET.
+    last_open = datetime(2026, 1, 5, 14, 0, tzinfo=timezone.utc)
+    adapter = FakeAdapter(
+        _bars(count=30, last_open=last_open, step_seconds=3600)
+    )
+    deployment = _deployment(timeframe="1h")
+    # 10:01:30 ET — just after the bar's 10:00 ET close, inside the window.
+    now = datetime(2026, 1, 5, 15, 1, 30, tzinfo=timezone.utc)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    assert len(sent) == 1
+    assert sent[0].symbol == "AAPL"
+
+
+def test_session_bound_frame_keeps_extended_hours_bars(tmp_path: Path) -> None:
+    """Session logic gates actionability, not indicator input: the strategy
+    sees every nominally closed feed bar — including pre-market bars the
+    venue calendar would never open a position on — matching the unfiltered
+    backtest dataset. A still-forming bar stays excluded."""
+    seen: dict[str, pd.DataFrame] = {}
+
+    def recording_strategy(df: pd.DataFrame, params: dict[str, Any]):
+        seen["df"] = df.copy()
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        return entries, exits, {}, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(recording_strategy))
+    # Hourly bars; the feed's newest bar opens 10:00 ET and is still forming.
+    last_open = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+    adapter = FakeAdapter(
+        _bars(count=31, last_open=last_open, step_seconds=3600)
+    )
+    deployment = _deployment(timeframe="1h")
+    # 10:30 ET: the 09:00-10:00 ET bar is the newest closed one.
+    now = datetime(2026, 1, 5, 15, 30, tzinfo=timezone.utc)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    frame = seen["df"]
+    stamps = [pd.Timestamp(ts) for ts in frame["timestamp"]]
+    # The still-forming 10:00 ET bar is not in the strategy's input.
+    assert stamps[-1] == pd.Timestamp("2026-01-05T14:00:00+00:00")
+    # Pre-market bars (e.g. 04:00 ET = 09:00 UTC) are preserved for
+    # indicator parity with the backtest dataset.
+    assert pd.Timestamp("2026-01-05T09:00:00+00:00") in stamps
+    assert sent == []
+
+
+def _exit_and_entry_strategy(df: pd.DataFrame, params: dict[str, Any]):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[-1] = True
+    exits.iloc[-1] = True
+    indicators = _indicators(
+        sl_price=[95.0] * len(df),
+        tp_price=[110.0] * len(df),
+        direction=["LONG"] * len(df),
+    )
+    return entries, exits, indicators, []
+
+
+def test_working_unfilled_entry_counts_against_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unfilled entry still working at the broker counts toward the cap;
+    the adapter's working-order ids are what the ledger filters on."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-1"},
+    )
+    seen_working: list[set[str]] = []
+
+    def fake_counts(deployment_id, working_order_ids=None):
+        seen_working.append(set(working_order_ids or ()))
+        return {"AAPL": 1}
+
+    monkeypatch.setattr(
+        runner_mod, "list_live_deployment_open_entry_counts_by_symbol", fake_counts
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.working_ids = {"bo-1"}
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert seen_working == [{"bo-1"}]
+    assert sent == []
+
+
+def test_dead_unfilled_entry_does_not_block_reentry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A canceled/expired unfilled order is absent from the broker's working
+    list, so the ledger counts nothing and the next entry submits."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-dead"},
+    )
+    seen_working: list[set[str]] = []
+
+    def fake_counts(deployment_id, working_order_ids=None):
+        seen_working.append(set(working_order_ids or ()))
+        return {}
+
+    monkeypatch.setattr(
+        runner_mod, "list_live_deployment_open_entry_counts_by_symbol", fake_counts
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.working_ids = set()
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert seen_working == [set()]
+    assert len(sent) == 1
+
+
+def test_unreadable_working_orders_disable_entries_but_exits_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the broker's working-order list cannot be read, unfilled entries
+    cannot be told from dead ones: entries fail closed, exits still go out."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-1"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    adapter = FakeAdapter()  # working_ids=None -> working_order_ids raises
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "working_orders") in runner._reported
+
+
+def test_unreadable_ledger_disables_entries_but_exits_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable entry-count ledger must not suppress exits: entries are
+    disabled for the pass, the exit intent still submits."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    def _boom(deployment_id, working_order_ids=None):
+        raise RuntimeError("ledger locked")
+
+    monkeypatch.setattr(
+        runner_mod, "list_live_deployment_open_entry_counts_by_symbol", _boom
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "ledger") in runner._reported
+
+
+def test_cap_refusal_still_allows_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cap the runner cannot honor disables entries only — an exit signal
+    on the same bar still reaches the submit chokepoint."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None: {},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def test_refused_submit_outcome_counts_toward_escalation(tmp_path: Path) -> None:
+    """A normal refusal is not an exception, but the signal still never
+    reached the broker — three in a row must escalate like failures do."""
+    path = _strategy_file(tmp_path, META)
+    deployment = _deployment()
+
+    async def refusing_submit(
+        adapter: Any, dep: LiveDeploymentConfig, signal: TradeSignal
+    ) -> str:
+        return "refused"
+
+    runner = _runner(refusing_submit, path=path, module=_module_with(_entry_strategy))
+    for offset in (70, 130, 190):
+        feed = _bars(count=30 + offset // 60, last_open=BASE + timedelta(seconds=offset - 10))
+        asyncio.run(
+            runner.run_once(
+                [deployment], {"acct-1": FakeAdapter(feed)}, now=BASE + timedelta(seconds=offset)
+            )
+        )
+
+    assert runner._submit_failures[(str(deployment.id), "AAPL")] == 3
+    assert (str(deployment.id), "submit_failures:AAPL") in runner._reported
+
+
+def test_same_bar_entry_and_exit_have_distinct_idempotency_keys(
+    tmp_path: Path,
+) -> None:
+    """An exit and an entry emitted on the same bar must never collide on
+    the producer-stable idempotency key — the ``kind`` component differs."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 2
+    keys = {signal.metadata["idempotency_key"] for signal in sent}
+    assert len(keys) == 2
+
+
+def test_run_daemon_creates_and_cancels_internal_strategy_task(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``run_daemon`` must own the internal strategy loop like every other
+    long-running task: created with the deployment snapshot and cancelled
+    (awaited) on shutdown."""
+    import live_runner.daemon as daemon
+
+    events: list[str] = []
+
+    class _Scheduler:
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.sleep(0.01)
+        raise RuntimeError("sync boom")
+
+    async def _noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _internal_loop(*_args: Any, **_kwargs: Any) -> None:
+        events.append("started")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+
+    monkeypatch.setattr(
+        daemon, "_discover_and_register_discord_services", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
+    monkeypatch.setattr(daemon, "ServiceScheduler", lambda: _Scheduler())
+    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda: object())
+    monkeypatch.setattr(daemon, "sync_deployments_loop", _boom)
+    monkeypatch.setattr(daemon, "sync_services_loop", _noop)
+    monkeypatch.setattr(daemon, "_poll_balances", _noop)
+    monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop)
+    monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop)
+    monkeypatch.setattr(daemon, "run_internal_strategy_loop", _internal_loop)
+
+    with pytest.raises(RuntimeError, match="sync boom"):
+        asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
+
+    assert events == ["started", "cancelled"]
