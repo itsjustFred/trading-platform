@@ -227,6 +227,9 @@ class _FakeTradingClient:
                 if stop_loss is not None and getattr(stop_loss, "limit_price", None) is not None
                 else None
             )
+            # Alpaca's real OCO shape: the parent IS the take-profit order
+            # (a limit order carrying limit_price); the stop-loss is its only
+            # leg, with a broker-assigned client order id of its own.
             parent = _FakeOrder(
                 id=str(uuid4()),
                 symbol=symbol,
@@ -234,17 +237,9 @@ class _FakeTradingClient:
                 order_type="limit",
                 order_class="oco",
                 qty=qty,
+                limit_price=tp_price,
                 status="new",
                 legs=[
-                    _FakeOrder(
-                        id=str(uuid4()),
-                        symbol=symbol,
-                        side=side,
-                        order_type="limit",
-                        qty=qty,
-                        limit_price=tp_price,
-                        status="new",
-                    ),
                     _FakeOrder(
                         id=str(uuid4()),
                         symbol=symbol,
@@ -1291,7 +1286,13 @@ def test_partial_exit_reprotects_at_current_trailing_level(monkeypatch) -> None:
 
 
 def test_second_partial_exit_releases_the_oco_pair(monkeypatch) -> None:
-    """An exit over a position protected by a re-placed OCO releases it too."""
+    """An exit over a position protected by a re-placed OCO releases it too.
+
+    Alpaca's real OCO shape: the parent IS the take-profit (a limit order
+    carrying ``limit_price``); the stop is its only leg. Both levels must be
+    found - the parent's take-profit price is what the remainder's new OCO
+    re-places, per the #145 decision.
+    """
     client = _FakeTradingClient(
         orders=[
             _FakeOrder(
@@ -1301,17 +1302,9 @@ def test_second_partial_exit_releases_the_oco_pair(monkeypatch) -> None:
                 order_type="limit",
                 order_class="oco",
                 qty=6.0,
+                limit_price=210.0,
                 status="new",
                 legs=[
-                    _FakeOrder(
-                        id=str(uuid4()),
-                        symbol="AAPL",
-                        side="sell",
-                        order_type="limit",
-                        qty=6.0,
-                        limit_price=210.0,
-                        status="new",
-                    ),
                     _FakeOrder(
                         id=str(uuid4()),
                         symbol="AAPL",
@@ -1335,10 +1328,13 @@ def test_second_partial_exit_releases_the_oco_pair(monkeypatch) -> None:
     )
     asyncio.run(adapter.submit_order(signal, qty=2.0))
 
-    # The OCO parent and both legs were cancelled; the remainder is re-protected.
+    # The OCO parent and its stop leg were cancelled; the remainder is
+    # re-protected with BOTH recorded levels.
     oco = [order for order in client.submitted if _class_text(order) == "oco"]
     assert len(oco) == 1
     assert float(oco[0].qty) == 4.0
+    assert float(oco[0].take_profit.limit_price) == 210.0
+    assert float(oco[0].stop_loss.stop_price) == 190.0
     assert client.positions[0].qty == 4.0
 
 
@@ -2082,3 +2078,158 @@ def test_recovery_clears_a_marker_with_no_recorded_levels(monkeypatch) -> None:
 
     assert client.submitted == []
     assert cleared == ["sig-1"]
+
+
+# ─── #350 bundle-32 review: real OCO shape, ambiguous-level restore ────────
+
+
+def test_a_working_market_exit_is_never_cancelled_as_protection() -> None:
+    """A working market order on the reducing side is an exit in flight, not
+    bracket protection: it must not be collected as a cancel candidate."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="mkt-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+
+    candidates = asyncio.run(adapter._exit_protection_candidates(client, "AAPL", "sell"))
+
+    assert candidates == []
+
+
+def test_recovery_replaces_a_lone_recorded_stop(monkeypatch) -> None:
+    """A marker carrying only a stop level and no working stop gets that stop
+    re-placed as a lone order on recovery."""
+    client = _FakeTradingClient(positions=[_FakePosition("AAPL", 6.0)])
+    adapter = _adapter(client)
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: [
+            {
+                "signal_id": "sig-1",
+                "symbol": "AAPL",
+                "deployment_id": "dep-1",
+                "timestamp": datetime.now(timezone.utc),
+                "marker": {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "stop_limit_price": None,
+                    "take_profit_price": None,
+                    "position_qty": 10.0,
+                    "exit_qty": 4.0,
+                    "reprotect_qty": 6.0,
+                },
+            }
+        ],
+    )
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert not [order for order in client.submitted if _class_text(order) == "oco"]
+    stops = [
+        order
+        for order in client.submitted
+        if "stop" in _type_text(order) or getattr(order, "stop_price", None) is not None
+    ]
+    assert len(stops) == 1
+    assert float(stops[0].stop_price) == 190.0
+    assert float(stops[0].qty) == 6.0
+    assert cleared == ["sig-1"]
+
+
+def _filled_bracket_tranche(
+    symbol: str, qty: float, *, stop_id: str, tp_id: str, parent_id: str,
+    stop_price: float, tp_price: float,
+) -> list[_FakeOrder]:
+    """One filled bracket tranche with distinct order ids (pyramided entries)."""
+    stop_leg = _FakeOrder(
+        id=stop_id,
+        symbol=symbol,
+        side="sell",
+        order_type="stop",
+        qty=qty,
+        stop_price=stop_price,
+        status="held",
+    )
+    parent = _FakeOrder(
+        id=parent_id,
+        symbol=symbol,
+        side="buy",
+        order_type="market",
+        order_class="bracket",
+        qty=qty,
+        status="filled",
+        legs=[stop_leg],
+    )
+    take_profit = _FakeOrder(
+        id=tp_id,
+        symbol=symbol,
+        side="sell",
+        order_type="limit",
+        qty=qty,
+        limit_price=tp_price,
+        status="new",
+    )
+    return [parent, take_profit]
+
+
+def test_a_full_exit_over_ambiguous_levels_restores_each_recorded_candidate(
+    monkeypatch,
+) -> None:
+    """Pyramided protection (two stops, two take-profits) on a FULL exit whose
+    submit is then refused: the marker's per-candidate record lets the restore
+    re-place each tranche as its own OCO - nothing is left unprotected."""
+    orders = _filled_bracket_tranche(
+        "AAPL", 5.0, stop_id="sl-a", tp_id="tp-a", parent_id="parent-a",
+        stop_price=190.0, tp_price=210.0,
+    ) + _filled_bracket_tranche(
+        "AAPL", 5.0, stop_id="sl-b", tp_id="tp-b", parent_id="parent-b",
+        stop_price=185.0, tp_price=215.0,
+    )
+    client = _FakeTradingClient(
+        orders=orders,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+    real_submit = client.submit_order
+
+    def _fail_exit(order_data):
+        if _type_text(order_data) == "market":
+            raise RuntimeError("broker rejected the exit")
+        return real_submit(order_data)
+
+    client.submit_order = _fail_exit  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="broker rejected the exit"):
+        asyncio.run(adapter.submit_order(_exit_signal_full(), qty=10.0))
+
+    # The marker recorded every candidate, not just the ambiguous Nones.
+    marker = captured[0].metadata["exit_reprotection"]
+    assert marker["stop_price"] is None
+    assert marker["take_profit_price"] is None
+    assert len(marker["protection"]) == 4
+
+    # The restore re-placed both tranches as OCO pairs at their own levels.
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 2
+    assert sorted(float(order.qty) for order in oco) == [5.0, 5.0]
+    assert sorted(float(order.stop_loss.stop_price) for order in oco) == [185.0, 190.0]
+    assert sorted(float(order.take_profit.limit_price) for order in oco) == [210.0, 215.0]

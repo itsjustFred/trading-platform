@@ -1152,38 +1152,45 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         return candidate
 
     def _flag_reprotect_fill_unattributed(
-        self, order: Any, client_order_id: Any, broker_order_id: str
+        self,
+        order: Any,
+        client_order_id: Any,
+        broker_order_id: str,
+        *,
+        cause: str = "alpaca_reprotect_fill_unattributed",
     ) -> None:
-        """Flag a re-protect fill that names no entry signal (#350 on #277).
+        """Flag a fill that names no entry signal (#350 on #277).
 
         Same surface as cTrader's unattributable closes: the durable
         ``ledger_reconciliation_required`` audit row plus an ERROR alert; the
         fill is never guessed into a ledger. Once per broker order id per
         process - redeliveries and the reconcile scan see the same order again.
+        The id is marked only AFTER the audit write lands: a failed write must
+        not suppress the flag for the rest of the process.
         """
         if broker_order_id in self._flagged_reprotect_order_ids:
             return
-        self._flagged_reprotect_order_ids.add(broker_order_id)
         symbol = _order_symbol(order)
         flag_live_ledger_reconciliation(
             account_id=self.account_id,
             symbol=symbol,
-            cause="alpaca_reprotect_fill_unattributed",
+            cause=cause,
             detail={
                 "client_order_id": str(client_order_id or ""),
                 "broker_order_id": broker_order_id,
                 "order_type": _order_type(order),
             },
         )
+        self._flagged_reprotect_order_ids.add(broker_order_id)
         logger.error(
-            "ALERT: Alpaca re-protection fill could not be attributed to an "
-            "entry signal; the account ledger needs reconciliation",
+            "ALERT: Alpaca fill could not be attributed to an entry signal; "
+            "the account ledger needs reconciliation",
             extra={
                 "data": {
                     "alert": "ledger_reconciliation_required",
                     "account_id": self.account_id,
                     "symbol": symbol,
-                    "cause": "alpaca_reprotect_fill_unattributed",
+                    "cause": cause,
                     "client_order_id": str(client_order_id or ""),
                     "broker_order_id": broker_order_id,
                 }
@@ -1237,47 +1244,46 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
     ) -> None:
         """Attribute a re-placed protection order's fills to the entry signal.
 
-        An OCO's legs are learned like a bracket's; a lone stop/take-profit has
-        no legs, so its own order id is the fill's identity. The OCO container
-        id is never mapped: a fill reported on it would double-count the leg
-        fill carrying the same quantity.
+        Every fillable order id is learned like a bracket leg's: an OCO
+        parent's own id (it IS the take-profit - its fill is a separate fill
+        from the stop leg's, never a container echo), each leg's id, and a
+        lone stop/take-profit's own id.
         """
         entry_signal_id = str(plan.get("entry_signal_id") or "").strip()
         if not entry_signal_id:
             return
-        if _order_legs(order):
-            self._register_bracket_legs(entry_signal_id, order)
+        order_key = _bracket_leg_key(_order_attr(order, "id"))
+        if order_key is not None:
+            self._bracket_leg_order_id_to_signal_id[order_key] = entry_signal_id
+        self._register_bracket_legs(entry_signal_id, order)
+        if _order_legs(order) or not nested_lookup:
             return
-        if nested_lookup:
-            # An OCO submit response may not nest its legs; re-read the order
-            # with ``nested=True`` so the leg ids are learned now rather than
-            # at the next connect. The container id itself is never mapped: a
-            # fill reported on it would double-count the leg fill carrying the
-            # same quantity, and a leg fill whose id was not learned attributes
-            # through the ``-reprotect`` client order id instead.
-            broker_order_id = _normalize_broker_order_id(_order_attr(order, "id"))
-            if broker_order_id is None:
-                return
-            try:
-                from alpaca.trading.requests import GetOrderByIdRequest
-            except ImportError:
-                return
-            try:
-                fetched = await asyncio.to_thread(
-                    client.get_order_by_id,
-                    broker_order_id,
-                    GetOrderByIdRequest(nested=True),
-                )
-            except Exception:
-                return
-            if fetched is not None and _order_legs(fetched):
-                self._register_bracket_legs(entry_signal_id, fetched)
+        # An OCO submit response may not nest its legs; re-read the order
+        # with ``nested=True`` so the leg ids are learned now rather than
+        # at the next connect. Until they are, a leg fill whose id was not
+        # learned attributes through its own client order id or is flagged
+        # for reconciliation - never guessed into a ledger.
+        broker_order_id = _normalize_broker_order_id(_order_attr(order, "id"))
+        if broker_order_id is None:
             return
-        # A lone stop/take-profit has no legs: its own order id is the fill's
-        # identity.
-        leg_key = _bracket_leg_key(_order_attr(order, "id"))
-        if leg_key is not None:
-            self._bracket_leg_order_id_to_signal_id[leg_key] = entry_signal_id
+        try:
+            from alpaca.trading.requests import GetOrderByIdRequest
+        except ImportError:
+            return
+        try:
+            fetched = await asyncio.to_thread(
+                client.get_order_by_id,
+                broker_order_id,
+                GetOrderByIdRequest(nested=True),
+            )
+        except Exception:
+            return
+        if fetched is None:
+            return
+        fetched_key = _bracket_leg_key(_order_attr(fetched, "id"))
+        if fetched_key is not None:
+            self._bracket_leg_order_id_to_signal_id[fetched_key] = entry_signal_id
+        self._register_bracket_legs(entry_signal_id, fetched)
 
     async def _reconcile_bracket_leg_fill(self, parent_signal_id: str, leg: Any) -> bool:
         """Backfill one bracket leg's missed fill against the parent signal's ledger (#144).
@@ -1597,7 +1603,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 _reprotect_entry_candidate(coid_text)
             )
             legs = _order_legs(order)
-            targets = legs if legs else [order]
+            if _order_class_text(order) == "oco":
+                # Alpaca's OCO parent IS the take-profit order; the stop is
+                # its only leg. Both are fillable orders with their own fills,
+                # so both are reconciled - a filled parent is a real close,
+                # not a container echo of its leg.
+                targets = [order, *legs]
+            else:
+                targets = legs if legs else [order]
             if entry_signal_id is None:
                 for item in targets:
                     item_status = _order_status(item)
@@ -2168,14 +2181,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         nothing that is open yet. Legs are collected only under a *filled*
         parent (the held stop leg of a filled bracket) or a working ``oco``
         parent (the re-placed protection of an earlier partial exit, #145).
-        An OCO parent with legs is itself only a container - its legs carry
-        the prices - so it is skipped like an entry parent; with no legs it
-        degrades to a plain candidate rather than becoming invisible.
+        Alpaca's OCO parent IS the take-profit order - the ``oco`` class marks
+        the pair, the parent carries the limit price and the stop is its only
+        leg - so the parent is a candidate like any other working order, and
+        cancelling it cancels the pair.
         """
         order_class = _order_class_text(order)
         legs = _order_legs(order)
-        oco_container = order_class == "oco" and bool(legs)
-        if order_class not in _ENTRY_ORDER_CLASSES and not oco_container:
+        if order_class not in _ENTRY_ORDER_CLASSES:
             self._add_exit_protection_candidate(
                 order,
                 symbol=symbol,
@@ -2305,6 +2318,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             "stop_price": None,
             "stop_limit_price": None,
             "take_profit_price": None,
+            # Every candidate verbatim: when the levels are ambiguous the
+            # scalar fields above stay ``None``, but the recovery marker and
+            # the restore path still know exactly which orders protected the
+            # position and at which levels/quantities (#350 review).
+            "protection": [
+                {
+                    "kind": _exit_protection_kind(c),
+                    "order_type": c["order_type"],
+                    "stop_price": c["stop_price"],
+                    "limit_price": c["limit_price"],
+                    "qty": c["qty"],
+                }
+                for c in candidates
+            ],
         }
         stops = [c for c in candidates if _exit_protection_kind(c) == "stop"]
         take_profits = [c for c in candidates if _exit_protection_kind(c) == "tp"]
@@ -2664,6 +2691,14 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 extra={"data": {"symbol": plan.get("symbol")}},
             )
             return True
+        if plan.get("protection"):
+            return await self._restore_recorded_candidates(
+                client,
+                plan,
+                position_qty=abs(current_qty),
+                reason=reason,
+                signal_id=signal_id,
+            )
         return await self._place_exit_protection(
             client,
             plan,
@@ -2671,6 +2706,222 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             signal_id=signal_id,
             reason=reason,
         )
+
+    async def _restore_recorded_candidates(
+        self,
+        client: Any,
+        plan: Mapping[str, Any],
+        *,
+        position_qty: float,
+        reason: str,
+        signal_id: str | None,
+    ) -> bool:
+        """Re-place every recorded protection candidate on the current position.
+
+        Used when the plan's scalar levels are ambiguous (pyramided entries
+        working several stops or take-profits): each candidate goes back at
+        its own level and tranche quantity. A stop and a take-profit covering
+        the same shares must share ONE order's quantity reservation - two
+        standalone orders would each reserve the full tranche and the second
+        would be refused - so candidates are paired by quantity into ``oco``
+        orders; an unpaired candidate goes back as a lone order while the
+        position's reservation budget lasts. A stop that cannot be rebuilt is
+        CRITICAL: the position would otherwise sit unprotected.
+        """
+        symbol = str(plan["symbol"])
+        side = str(plan["side"])
+        budget = abs(position_qty)
+        placed = True
+
+        def _entry_qty(entry: Mapping[str, Any], partner: Mapping[str, Any] | None) -> float | None:
+            for source in (entry, partner):
+                if source is None:
+                    continue
+                qty = source.get("qty")
+                if isinstance(qty, (int, float)) and math.isfinite(qty) and qty > 0:
+                    return float(qty)
+            return None
+
+        entries = [
+            dict(item)
+            for item in (plan.get("protection") or [])
+            if isinstance(item, Mapping)
+        ]
+        stops = [e for e in entries if e.get("kind") == "stop"]
+        take_profits = [e for e in entries if e.get("kind") == "tp"]
+        # Greedy quantity pairing: each stop claims the unused take-profit
+        # closest to its own tranche size, so equal-size pyramided tranches
+        # rebuild as the OCO pairs they were.
+        pairs: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+        lone_tps: list[Mapping[str, Any]] = []
+        for stop in stops:
+            best_index = None
+            best_diff = math.inf
+            stop_qty = _entry_qty(stop, None)
+            for index, tp in enumerate(take_profits):
+                if tp.get("_paired"):
+                    continue
+                tp_qty = _entry_qty(tp, None)
+                if stop_qty is None or tp_qty is None:
+                    diff = 0.0
+                else:
+                    diff = abs(stop_qty - tp_qty)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_index = index
+            if best_index is None:
+                continue
+            tp = take_profits[best_index]
+            tp["_paired"] = True
+            pairs.append((stop, tp))
+        lone_tps = [tp for tp in take_profits if not tp.get("_paired")]
+
+        async def _submit_one(
+            sub_plan: dict[str, Any], qty: float, *, index: int, has_stop: bool
+        ) -> bool:
+            nonlocal budget
+            # Each restored order needs its own client order id: the
+            # ``-reprotect`` suffix still leads with the entry UUID, so
+            # attribution survives the index.
+            tag = f"{signal_id}-{index}" if signal_id else f"restore-{index}"
+            request = self._exit_protection_request(
+                sub_plan, qty, signal_id=tag
+            )
+            if request is None:
+                (logger.critical if has_stop else logger.error)(
+                    "Alpaca exit %s: recorded protection for %s cannot be "
+                    "rebuilt (no usable level); the position may be unprotected",
+                    reason,
+                    symbol,
+                    extra={
+                        "data": {
+                            "symbol": symbol,
+                            "qty": qty,
+                            "plan": dict(sub_plan),
+                        }
+                    },
+                )
+                return False
+            try:
+                order = await asyncio.to_thread(client.submit_order, order_data=request)
+            except Exception as exc:
+                (logger.critical if has_stop else logger.error)(
+                    "Alpaca exit %s: restoring recorded protection for %s "
+                    "failed (%r); the position may be unprotected",
+                    reason,
+                    symbol,
+                    exc,
+                    extra={
+                        "data": {
+                            "symbol": symbol,
+                            "qty": qty,
+                            "stop_price": sub_plan.get("stop_price"),
+                            "take_profit_price": sub_plan.get("take_profit_price"),
+                        }
+                    },
+                )
+                return False
+            await self._register_reprotect_attribution(
+                client,
+                sub_plan,
+                order,
+                nested_lookup=(
+                    getattr(request, "take_profit", None) is not None
+                    and getattr(request, "stop_loss", None) is not None
+                ),
+            )
+            budget = max(budget - qty, 0.0)
+            return True
+
+        index = 0
+        for stop, tp in pairs:
+            stop_qty = _entry_qty(stop, tp)
+            tp_qty = _entry_qty(tp, stop)
+            qtys = [q for q in (stop_qty, tp_qty) if q is not None]
+            # The tranche's recorded size is capped by what the position's
+            # reservation budget still holds: the position may have shrunk
+            # since the candidates were recorded.
+            qty = min(min(qtys) if qtys else budget, budget)
+            if qty <= 0:
+                logger.critical(
+                    "ALERT: Alpaca exit %s: recorded protection tranche for %s "
+                    "has no reservation budget left; it is NOT restored",
+                    reason,
+                    symbol,
+                    extra={"data": {"symbol": symbol, "budget": budget}},
+                )
+                placed = False
+                continue
+            sub_plan = {
+                "symbol": symbol,
+                "side": side,
+                "stop_price": stop.get("stop_price"),
+                "stop_limit_price": (
+                    stop.get("limit_price")
+                    if "stop" in str(stop.get("order_type") or "")
+                    else None
+                ),
+                "take_profit_price": tp.get("limit_price"),
+                "entry_signal_id": plan.get("entry_signal_id"),
+            }
+            index += 1
+            if not await _submit_one(sub_plan, qty, index=index, has_stop=True):
+                placed = False
+        lone_stops = [
+            e
+            for e in entries
+            if e.get("kind") == "stop"
+            and all(e is not s for s, _tp in pairs)
+        ]
+        for entry, has_stop in [(e, True) for e in lone_stops] + [
+            (e, False) for e in lone_tps
+        ]:
+            entry_qty = _entry_qty(entry, None)
+            qty = min(entry_qty if entry_qty is not None else budget, budget)
+            if qty <= 0:
+                (logger.critical if has_stop else logger.error)(
+                    "ALERT: Alpaca exit %s: recorded %s protection for %s "
+                    "has no reservation budget left; it is NOT restored",
+                    reason,
+                    "stop" if has_stop else "take-profit",
+                    symbol,
+                    extra={"data": {"symbol": symbol, "budget": budget}},
+                )
+                placed = False
+                continue
+            if entry.get("kind") == "stop":
+                sub_plan = {
+                    "symbol": symbol,
+                    "side": side,
+                    "stop_price": entry.get("stop_price"),
+                    "stop_limit_price": entry.get("limit_price"),
+                    "take_profit_price": None,
+                    "entry_signal_id": plan.get("entry_signal_id"),
+                }
+            else:
+                sub_plan = {
+                    "symbol": symbol,
+                    "side": side,
+                    "stop_price": None,
+                    "stop_limit_price": None,
+                    "take_profit_price": entry.get("limit_price"),
+                    "entry_signal_id": plan.get("entry_signal_id"),
+                }
+            index += 1
+            if not await _submit_one(sub_plan, qty, index=index, has_stop=has_stop):
+                placed = False
+        for entry in entries:
+            if entry.get("kind") not in {"stop", "tp"}:
+                logger.error(
+                    "Alpaca exit %s: recorded protection candidate for %s has "
+                    "unrecognised kind %r; it cannot be rebuilt",
+                    reason,
+                    symbol,
+                    entry.get("kind"),
+                    extra={"data": {"symbol": symbol, "entry": dict(entry)}},
+                )
+                placed = False
+        return placed
 
     async def _submit_exit_releasing_protection(
         self,
@@ -2849,6 +3100,79 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             raise RuntimeError("Alpaca trading client is unavailable")
         candidates = await self._exit_protection_candidates(client, symbol, side)
         kinds = {_exit_protection_kind(c) for c in candidates}
+        recorded = [
+            dict(item)
+            for item in (marker.get("protection") or [])
+            if isinstance(item, Mapping)
+        ]
+        if recorded:
+            # The marker kept every candidate verbatim (ambiguous levels):
+            # recovery works at kind granularity like the scalar path - a
+            # working kind counts however its price moved (trailing), and a
+            # partially present book is alerted, never guessed at.
+            needed = {
+                item.get("kind") for item in recorded
+                if item.get("kind") in {"stop", "tp"}
+            }
+            if not needed:
+                logger.error(
+                    "ALERT: Alpaca exit re-protection marker for %s recorded "
+                    "protection candidates with no recognisable kind; the "
+                    "position's protection cannot be verified or rebuilt - "
+                    "reconcile manually. The marker is cleared",
+                    symbol,
+                    extra={
+                        "data": {
+                            "signal_id": signal_id,
+                            "symbol": symbol,
+                            "marker": dict(marker),
+                        }
+                    },
+                )
+                await _clear_exit_reprotection_marker(
+                    signal_id, symbol, "unrecognised recorded protection"
+                )
+                return
+            missing = needed - kinds
+            if not missing:
+                await _clear_exit_reprotection_marker(
+                    signal_id, symbol, "protection already present"
+                )
+                return
+            if needed & kinds:
+                logger.error(
+                    "ALERT: Alpaca exit re-protection for %s is incomplete at "
+                    "restart (missing %s while sibling protection works); "
+                    "the remainder is partially protected - reconcile manually",
+                    symbol,
+                    ",".join(sorted(missing)),
+                    extra={
+                        "data": {
+                            "signal_id": signal_id,
+                            "symbol": symbol,
+                            "marker": dict(marker),
+                        }
+                    },
+                )
+                return
+            plan = {
+                "symbol": symbol,
+                "side": side,
+                "entry_signal_id": marker.get("entry_signal_id"),
+                "protection": recorded,
+            }
+            placed = await self._restore_recorded_candidates(
+                client,
+                plan,
+                position_qty=abs(position_qty),
+                reason="restart recovery",
+                signal_id=signal_id,
+            )
+            if placed:
+                await _clear_exit_reprotection_marker(
+                    signal_id, symbol, "recovery re-placed protection"
+                )
+            return
         missing_stop = (
             marker.get("stop_price") is not None and "stop" not in kinds
         )
@@ -3055,6 +3379,7 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                         "exit_qty",
                         "reprotect_qty",
                         "entry_signal_id",
+                        "protection",
                     )
                 }
                 # The persisted qty is the one submitted (the plan may have
@@ -4392,6 +4717,25 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 logger.warning(
                     "Trade update client_order_id is not a UUID",
                     extra={"data": {"client_order_id": str(client_order_id)}},
+                )
+                return
+
+            # A UUID client order id that names no persisted signal is not a
+            # signal fill we may book: Alpaca gives each OCO leg its own
+            # UUID-shaped client order id, so a re-placed stop leg whose id
+            # registration was lost arrives here looking exactly like a signal
+            # fill. Persisting it would write an execution against a signal
+            # that does not exist; flag the account for reconciliation instead
+            # (#277's never-guess rule).
+            signal_metadata = await asyncio.to_thread(
+                get_live_signal_metadata, str(signal_uuid)
+            )
+            if not isinstance(signal_metadata, dict):
+                self._flag_reprotect_fill_unattributed(
+                    order,
+                    client_order_id,
+                    broker_order_id,
+                    cause="alpaca_unattributed_order_fill",
                 )
                 return
 

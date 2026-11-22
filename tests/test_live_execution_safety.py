@@ -2350,6 +2350,9 @@ def test_alpaca_partial_fill_persists_event_qty_not_cumulative(monkeypatch):
         return execution.filled_qty
 
     monkeypatch.setattr(module, "save_live_execution_up_to_cumulative", _capture)
+    # The fill pipeline is under test, not attribution: this UUID names no
+    # persisted signal, so the stream's unknown-signal guard would flag it.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
 
     signal_id = str(uuid4())
     update = SimpleNamespace(
@@ -2428,6 +2431,9 @@ def test_alpaca_delayed_stream_fill_is_reported_as_duplicate(monkeypatch):
     monkeypatch.setattr(
         module, "save_live_execution_up_to_cumulative", lambda _execution, _cumulative: 0.0
     )
+    # The fill pipeline is under test, not attribution: this UUID names no
+    # persisted signal, so the stream's unknown-signal guard would flag it.
+    monkeypatch.setattr(module, "get_live_signal_metadata", lambda _sid: {})
     update = SimpleNamespace(
         event="fill",
         qty="1",
