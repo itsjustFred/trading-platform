@@ -801,6 +801,27 @@ class TestMinOosDailyObservations:
         sharpe, _dd = _compute_oos_metrics(curves, weights, min_daily_observations=5)
         assert sharpe is not None
 
+    def test_exactly_minimum_daily_observations_pass(self) -> None:
+        """The daily-observation minimum is inclusive: exactly ``min`` distinct
+        days computes OOS metrics, ``min - 1`` does not."""
+        curves = [
+            [
+                StrategyEquityPoint(time=1700000000 + i * 86400, equity=100000.0 + i)
+                for i in range(5)
+            ],
+            [
+                StrategyEquityPoint(time=1700000000 + i * 86400, equity=100000.0 + i * 2)
+                for i in range(5)
+            ],
+        ]
+        weights = np.array([0.5, 0.5])
+        sharpe, _dd = _compute_oos_metrics(curves, weights, min_daily_observations=5)
+        assert sharpe is not None
+        assert _compute_oos_metrics(curves, weights, min_daily_observations=6) == (
+            None,
+            None,
+        )
+
 
 class TestOosStatusLabels:
     """#133: no-overlap is not the same failure as too-few-daily-bars."""

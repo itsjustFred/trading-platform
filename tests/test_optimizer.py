@@ -1334,3 +1334,66 @@ def test_risk_parity_withholds_test_stats_below_oos_minimum(
     assert "sharpe_ratio" not in payload["test_stats"]
     assert "max_drawdown_pct" not in payload["test_stats"]
     assert payload["test_stats"]["total_pnl"] is not None
+
+
+@pytest.mark.parametrize(
+    "observations,expected_status",
+    [(19, "insufficient_oos_bars"), (20, "available")],
+)
+def test_risk_parity_oos_daily_observation_boundary(
+    monkeypatch, tmp_path: Path, observations: int, expected_status: str
+):
+    """The risk-parity OOS minimum is inclusive: exactly 20 daily observations
+    is available, 19 is insufficient. Pins the ``>=`` against ``>`` mutants."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: observations
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["oos_status"] == expected_status
+    assert payload["oos_daily_observations"] == observations
+    if expected_status == "available":
+        assert "sharpe_ratio" in payload["test_stats"]
+    else:
+        assert "sharpe_ratio" not in payload["test_stats"]
+        assert payload["test_stats"]["total_pnl"] is not None

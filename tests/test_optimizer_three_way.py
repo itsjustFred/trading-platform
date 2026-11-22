@@ -1032,6 +1032,51 @@ def test_insufficient_oos_daily_observations_fail_the_overfitting_verdict(
     assert payload["three_way"]["oos_metrics_withheld"] is True
 
 
+@pytest.mark.parametrize(
+    "observations,expected_status",
+    [(19, "insufficient_oos_bars"), (20, "available")],
+)
+def test_oos_daily_observation_boundary(
+    monkeypatch, tmp_path: Path, observations: int, expected_status: str
+) -> None:
+    """The minimum is inclusive: exactly ``min_oos_daily_observations`` daily
+    observations is available; one fewer is insufficient. Pins the ``>=`` at
+    the boundary against ``>`` mutants."""
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 3.0, 2: 4.0},
+            "test": {1: 5.0, 2: 6.0},
+        },
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "daily_observation_count",
+        lambda *args, **kwargs: observations,
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["oos_status"] == expected_status
+    assert payload["oos_daily_observations"] == observations
+    overfitting = payload["three_way"]["overfitting"]
+    if expected_status == "available":
+        assert "oos_daily_observations" not in overfitting["checks"]
+        assert "sharpe_ratio" in payload["final_test_stats"]
+    else:
+        assert overfitting["checks"]["oos_daily_observations"] == {
+            "value": 19,
+            "threshold": 20,
+            "passed": False,
+            "computable": True,
+        }
+        assert "sharpe_ratio" not in payload["final_test_stats"]
+
+
 def test_configurable_oos_minimum_admits_a_smaller_holdout(
     monkeypatch, tmp_path: Path
 ) -> None:

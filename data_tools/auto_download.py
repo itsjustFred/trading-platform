@@ -1287,6 +1287,25 @@ def has_sufficient_segment_coverage(
     return False
 
 
+def _vacuous_window_is_plausible(
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    step_minutes: float,
+) -> bool:
+    """Whether "zero expected bars" can be believed for this window.
+
+    The fully-closed shortcut (``expected <= 0`` -> pass) is fail-open when
+    the calendar is broken or empty: a window containing in-session weekdays
+    per the built-in NYSE model cannot really be closed everywhere. Only a
+    window the NYSE model also sees as fully closed (weekends, long holiday
+    stretches) may pass vacuously.
+    """
+    probe = venue_calendar.NyseCalendar()
+    if 1440.0 <= step_minutes < 10080.0:
+        return not probe.daily_bar_dates(start_ts, end_ts)
+    return probe.expected_bars(start_ts, end_ts, step_minutes) <= 0
+
+
 def _calendar_segment_coverage_passes(
     calendar: venue_calendar.VenueCalendar,
     *,
@@ -1303,7 +1322,10 @@ def _calendar_segment_coverage_passes(
         # fall through to the grid path, which counts bar-start instants.
         expected_dates = calendar.daily_bar_dates(start_ts, end_ts)
         if not expected_dates:
-            return True  # window fully closed: no daily bar is expected
+            # Window fully closed: no daily bar is expected — but only when
+            # the NYSE model agrees the window has no trading day, otherwise
+            # an empty/broken calendar would pass vacuously.
+            return _vacuous_window_is_plausible(start_ts, end_ts, step_minutes)
         present_dates = {
             day
             for stamp in stamps
@@ -1337,7 +1359,8 @@ def _calendar_segment_coverage_passes(
     opens = [iv.open for iv in intervals]
     expected = calendar.expected_bars(start_ts, end_ts, step_minutes)
     if expected <= 0:
-        return True  # window fully closed: no intraday bar is expected
+        # Same vacuous-pass guard as the daily branch above.
+        return _vacuous_window_is_plausible(start_ts, end_ts, step_minutes)
     present = [
         stamp
         for stamp in stamps

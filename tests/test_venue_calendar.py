@@ -614,6 +614,135 @@ def test_live_unknown_session_state_uses_flat_age_rule(tmp_path, monkeypatch):
         _staleness_check("AAPL", "1h", False, pd.Timestamp("2024-06-01T15:00:00Z"), now)
 
 
+def test_disjoint_session_cache_ranges_do_not_cover_the_gap():
+    """Two non-contiguous fetches must not merge into one covered envelope.
+
+    The cache is per symbol but downloads are per timeframe with their own
+    resume start, so AAPL 1d for 2015 followed by AAPL 1h for 2024 leaves a
+    real gap. min(start)/max(end) merging used to mark the gap covered.
+    """
+    first = venue_calendar.exchange_sessions_payload(
+        source="alpaca",
+        symbol="AAPL",
+        sessions=[{"date": "2015-01-02", "open": "09:30", "close": "16:00"}],
+        coverage_start="2015-01-01",
+        coverage_end="2015-01-31",
+    )
+    second = venue_calendar.exchange_sessions_payload(
+        source="alpaca",
+        symbol="AAPL",
+        sessions=[{"date": "2024-06-03", "open": "09:30", "close": "16:00"}],
+        coverage_start="2024-06-01",
+        coverage_end="2024-06-30",
+        prior=first,
+    )
+    calendar = ExchangeSessionCalendar(second)
+    # Each fetched range stays covered...
+    assert calendar.covers_window(
+        pd.Timestamp("2015-01-05T00:00:00Z"), pd.Timestamp("2015-01-28T00:00:00Z")
+    )
+    assert calendar.covers_window(
+        pd.Timestamp("2024-06-10T00:00:00Z"), pd.Timestamp("2024-06-20T00:00:00Z")
+    )
+    # ...but the gap between them is not, and neither is a window spanning
+    # both ranges (no single fetched range can prove it).
+    assert not calendar.covers_window(
+        pd.Timestamp("2020-01-02T00:00:00Z"), pd.Timestamp("2020-01-31T00:00:00Z")
+    )
+    assert not calendar.covers_window(
+        pd.Timestamp("2015-01-05T00:00:00Z"), pd.Timestamp("2024-06-10T00:00:00Z")
+    )
+    # Live 'now' inside the gap is unknown, never closed.
+    assert calendar.session_state(pd.Timestamp("2020-01-07T15:00:00Z")) == "unknown"
+
+
+def test_touching_session_cache_ranges_merge():
+    """Ranges that overlap or touch (end + 1 day == next start) are contiguous
+    coverage and must merge, or incremental fetches would fragment."""
+    first = venue_calendar.exchange_sessions_payload(
+        source="alpaca",
+        symbol="AAPL",
+        sessions=[{"date": "2024-01-02", "open": "09:30", "close": "16:00"}],
+        coverage_start="2024-01-01",
+        coverage_end="2024-01-31",
+    )
+    second = venue_calendar.exchange_sessions_payload(
+        source="alpaca",
+        symbol="AAPL",
+        sessions=[{"date": "2024-02-01", "open": "09:30", "close": "16:00"}],
+        coverage_start="2024-02-01",
+        coverage_end="2024-02-29",
+        prior=first,
+    )
+    calendar = ExchangeSessionCalendar(second)
+    assert calendar.covers_window(
+        pd.Timestamp("2024-01-15T00:00:00Z"), pd.Timestamp("2024-02-15T00:00:00Z")
+    )
+
+
+def test_merged_disjoint_cache_gap_fails_coverage(tmp_path: Path):
+    """End-to-end: one stray bar inside a cache gap is not coverage."""
+    first = venue_calendar.exchange_sessions_payload(
+        source="alpaca",
+        symbol="AAPL",
+        sessions=[{"date": "2015-01-02", "open": "09:30", "close": "16:00"}],
+        coverage_start="2015-01-01",
+        coverage_end="2015-01-31",
+    )
+    second = venue_calendar.exchange_sessions_payload(
+        source="alpaca",
+        symbol="AAPL",
+        sessions=[{"date": "2024-06-03", "open": "09:30", "close": "16:00"}],
+        coverage_start="2024-06-01",
+        coverage_end="2024-06-30",
+        prior=first,
+    )
+    save_cached_calendar(
+        data_dir=tmp_path, source="alpaca", symbol="AAPL", payload=second
+    )
+    for timeframe in ("1h", "1d"):
+        _write_bars(
+            tmp_path,
+            ["ohlcv", "alpaca", "equity", "US", "AAPL", f"{timeframe}.parquet"],
+            ["2020-01-15T15:00:00+00:00" if timeframe == "1h" else "2020-01-15T00:00:00+00:00"],
+        )
+        assert not _coverage(
+            symbol="AAPL", timeframe=timeframe,
+            start="2020-01-02", end="2020-01-31", data_dir=tmp_path,
+        ), f"{timeframe} must fail closed inside the unfetched gap"
+
+
+def test_covering_calendar_with_zero_expected_bars_fails_closed(tmp_path: Path):
+    """A calendar that claims the window but expects zero bars while the
+    built-in NYSE model sees trading days is broken, not 'fully closed'."""
+    # Exchange-session cache whose coverage reaches the window but whose
+    # session list contains nothing inside it.
+    _write_cache(
+        tmp_path,
+        "alpaca",
+        "AAPL",
+        _session_cache_payload(
+            coverage_start="2024-01-01",
+            coverage_end="2024-01-31",
+            sessions=[{"date": "2024-01-02", "open": "09:30", "close": "16:00"}],
+        ),
+    )
+    # Window fully inside coverage but containing no listed session:
+    # 2024-01-22 is absent from the session list while coverage claims it.
+    stamps = [
+        f"2024-01-22T{hour:02d}:00:00+00:00" for hour in range(14, 21)
+    ]
+    _write_bars(
+        tmp_path,
+        ["ohlcv", "alpaca", "equity", "US", "AAPL", "1h.parquet"],
+        stamps,
+    )
+    assert not _coverage(
+        symbol="AAPL", timeframe="1h",
+        start="2024-01-22", end="2024-01-22T23:00", data_dir=tmp_path,
+    )
+
+
 def test_incremental_session_cache_merges_coverage(tmp_path: Path, monkeypatch):
     """A second, narrower fetch must not shrink what the cache can prove."""
     import data_tools.downloaders.alpaca_dl as alpaca_dl
@@ -645,9 +774,19 @@ def test_incremental_session_cache_merges_coverage(tmp_path: Path, monkeypatch):
         pd.Timestamp("2024-01-02").date(),
         pd.Timestamp("2024-03-01").date(),
     }
-    # The union of both fetched ranges stays covered.
+    # Each fetched range stays covered; the unfetched gap between them does
+    # not — disjoint ranges must never merge into one envelope.
     assert calendar.covers_window(
+        pd.Timestamp("2024-01-15T00:00:00Z"), pd.Timestamp("2024-01-20T00:00:00Z")
+    )
+    assert calendar.covers_window(
+        pd.Timestamp("2024-03-10T00:00:00Z"), pd.Timestamp("2024-03-20T00:00:00Z")
+    )
+    assert not calendar.covers_window(
         pd.Timestamp("2024-01-15T00:00:00Z"), pd.Timestamp("2024-03-15T00:00:00Z")
+    )
+    assert not calendar.covers_window(
+        pd.Timestamp("2024-02-01T00:00:00Z"), pd.Timestamp("2024-02-29T00:00:00Z")
     )
 
 
@@ -852,3 +991,64 @@ def test_past_broker_holiday_is_tolerated_for_historical_segments(tmp_path: Path
         symbol="XAGUSD", timeframe="1h",
         start="2023-12-18", end="2023-12-29T23:00", data_dir=tmp_path,
     )
+
+
+def test_broker_schedule_stamp_at_rollover_opens_the_new_daily_bar():
+    """Daily bars are stamped at their OPEN (repo OHLCV convention): a stamp
+    exactly on the 22:00Z rollover belongs to the window starting there, not
+    the one that just closed."""
+    calendar = _broker_schedule_calendar()
+    # Sun 2024-01-07 .. Thu 2024-01-11 at 22:00Z: each stamp opens the next
+    # daily window, so the labels are Mon Jan 8 .. Fri Jan 12.
+    dates = [
+        calendar.daily_bar_date(pd.Timestamp(f"2024-01-{day:02d}T22:00:00Z"))
+        for day in range(7, 12)
+    ]
+    assert dates == [
+        pd.Timestamp(f"2024-01-{day:02d}").date() for day in range(8, 13)
+    ]
+    # A stamp exactly at the Friday close has no window opening there: the
+    # venue is shut until Sunday, so it is surplus.
+    assert (
+        calendar.daily_bar_date(pd.Timestamp("2024-01-12T22:00:00Z")) is None
+    )
+    # Mid-window and 00:00Z stamps are unaffected.
+    assert calendar.daily_bar_date(pd.Timestamp("2024-01-09T12:00:00Z")) == (
+        pd.Timestamp("2024-01-09").date()
+    )
+    assert calendar.daily_bar_date(pd.Timestamp("2024-01-09T00:00:00Z")) == (
+        pd.Timestamp("2024-01-09").date()
+    )
+
+
+def test_fx_daily_bar_stamp_at_rollover_opens_the_new_daily_bar():
+    """Same off-by-one on the FX week calendar: 22:00Z == 17:00 ET in
+    January, exactly on each NY-close boundary."""
+    calendar = FxWeekCalendar()
+    dates = [
+        calendar.daily_bar_date(pd.Timestamp(f"2024-01-{day:02d}T22:00:00Z"))
+        for day in range(7, 12)
+    ]
+    assert dates == [
+        pd.Timestamp(f"2024-01-{day:02d}").date() for day in range(8, 13)
+    ]
+    # Friday 17:00 ET close: no bar opens there (market shut until Sunday).
+    assert calendar.daily_bar_date(pd.Timestamp("2024-01-12T22:00:00Z")) is None
+
+
+def test_fx_daily_dates_exclude_the_still_open_bar():
+    """A daily bar whose window has not closed at ``end`` is not expected —
+    matching BrokerScheduleCalendar's 'hi <= end' rule."""
+    calendar = FxWeekCalendar()
+    # Ends Sunday 2024-01-14 23:59Z: Monday Jan 15's bar (window opens
+    # Sun 22:00Z, closes Mon 22:00Z) is still open and must not count.
+    dates = calendar.daily_bar_dates(
+        pd.Timestamp("2024-01-08T00:00:00Z"), pd.Timestamp("2024-01-14T23:59:59Z")
+    )
+    assert pd.Timestamp("2024-01-15").date() not in dates
+    assert len(dates) == 5
+    # Once the window closes inside the segment it counts again.
+    dates_closed = calendar.daily_bar_dates(
+        pd.Timestamp("2024-01-08T00:00:00Z"), pd.Timestamp("2024-01-15T23:00:00Z")
+    )
+    assert pd.Timestamp("2024-01-15").date() in dates_closed

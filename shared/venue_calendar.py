@@ -314,7 +314,14 @@ class FxWeekCalendar(VenueCalendar):
                 segment_open = pd.Timestamp(
                     (boundary_local - dt.timedelta(days=1)).astimezone(UTC)
                 )
-                if segment_open < end and boundary_utc > start:
+                # A bar is expected only once its window has CLOSED inside
+                # the segment (``boundary_utc <= end``), matching
+                # ``BrokerScheduleCalendar.daily_bar_dates``.
+                if (
+                    segment_open < end
+                    and boundary_utc > start
+                    and boundary_utc <= end
+                ):
                     dates.add(day)
             day += dt.timedelta(days=1)
         return dates
@@ -335,14 +342,16 @@ class FxWeekCalendar(VenueCalendar):
             open_utc = pd.Timestamp(open_local.astimezone(UTC))
             close_local = open_local + dt.timedelta(days=5)
             close_utc = pd.Timestamp(close_local.astimezone(UTC))
-            if not (open_utc <= ts <= close_utc):
+            # Half-open [open, close): a stamp exactly on a daily boundary is
+            # the OPEN of the next bar (bars are stamped at their open), not
+            # the close of the previous one.
+            if not (open_utc <= ts < close_utc):
                 continue
             for k in range(1, 6):
                 boundary_local = open_local + dt.timedelta(days=k)
                 boundary_utc = pd.Timestamp(boundary_local.astimezone(UTC))
-                if ts <= boundary_utc:
+                if ts < boundary_utc:
                     return boundary_local.date()
-            return close_local.date()
         return None
 
 
@@ -411,30 +420,31 @@ class ExchangeSessionCalendar(VenueCalendar):
             if open_t is None or close_t is None or close_t <= open_t:
                 continue
             self.sessions[day] = (open_t, close_t)
-        # Fetched coverage, as UTC instants: [coverage_start 00:00, coverage_end+1 00:00).
-        # A payload without bounds (written before coverage tracking existed)
-        # covers nothing: it cannot prove which dates were ever fetched.
-        self._covered_lo: pd.Timestamp | None = None
-        self._covered_hi: pd.Timestamp | None = None
-        raw_start = payload.get("coverage_start")
-        raw_end = payload.get("coverage_end")
-        try:
-            if raw_start is not None and raw_end is not None:
-                start_day = dt.date.fromisoformat(str(raw_start))
-                end_day = dt.date.fromisoformat(str(raw_end))
-                if end_day >= start_day:
-                    self._covered_lo = pd.Timestamp(start_day, tz=UTC)
-                    self._covered_hi = pd.Timestamp(end_day + dt.timedelta(days=1), tz=UTC)
-        except (TypeError, ValueError):
-            self._covered_lo = None
-            self._covered_hi = None
+        # Fetched coverage, as UTC instants: a sorted list of disjoint
+        # ``[start, end)`` ranges, each spanning whole dates
+        # ([coverage_start 00:00, coverage_end+1 00:00)). Coverage is per
+        # RANGE, not per envelope: downloads are per timeframe with their own
+        # resume start, so two fetches can leave a real gap that min(start)/
+        # max(end) merging would falsely mark as covered. A payload without
+        # bounds (written before coverage tracking existed) covers nothing:
+        # it cannot prove which dates were ever fetched.
+        self._covered_ranges: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for start_day, end_day in _payload_coverage_date_ranges(payload):
+            self._covered_ranges.append(
+                (
+                    pd.Timestamp(start_day, tz=UTC),
+                    pd.Timestamp(end_day + dt.timedelta(days=1), tz=UTC),
+                )
+            )
 
     def covers_window(self, start: pd.Timestamp, end: pd.Timestamp) -> bool:
         start = _as_utc(start)
         end = _as_utc(end)
-        if self._covered_lo is None or self._covered_hi is None:
-            return False
-        return self._covered_lo <= start and end <= self._covered_hi
+        # A window is covered only when ONE fetched range contains it whole;
+        # spanning two disjoint ranges proves nothing about the gap between.
+        return any(
+            lo <= start and end <= hi for lo, hi in self._covered_ranges
+        )
 
     def trading_intervals(
         self, start: pd.Timestamp, end: pd.Timestamp
@@ -479,6 +489,62 @@ def _parse_hhmm(value: Any) -> dt.time | None:
     return dt.time(hour, minute)
 
 
+def _parse_coverage_date(value: Any) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_coverage_date_ranges(
+    payload: Mapping[str, Any],
+) -> list[tuple[dt.date, dt.date]]:
+    """Covered ``(start, end)`` date pairs from a cache payload.
+
+    ``coverage_ranges`` (written by current versions) is authoritative: a
+    payload carrying the key yields ONLY its parsed ranges, so a corrupt or
+    empty list can never fall back to the envelope fields and reopen the
+    disjoint-range hole. Legacy payloads without the key contribute their
+    single ``coverage_start``/``coverage_end`` pair.
+    """
+    ranges: list[tuple[dt.date, dt.date]] = []
+    if "coverage_ranges" in payload:
+        raw_ranges = payload.get("coverage_ranges")
+        if not isinstance(raw_ranges, list):
+            return ranges
+        for item in raw_ranges:
+            start_raw = end_raw = None
+            if isinstance(item, Mapping):
+                start_raw = item.get("start", item.get("coverage_start"))
+                end_raw = item.get("end", item.get("coverage_end"))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                start_raw, end_raw = item[0], item[1]
+            start_day = _parse_coverage_date(start_raw)
+            end_day = _parse_coverage_date(end_raw)
+            if start_day is not None and end_day is not None and end_day >= start_day:
+                ranges.append((start_day, end_day))
+        return ranges
+    start_day = _parse_coverage_date(payload.get("coverage_start"))
+    end_day = _parse_coverage_date(payload.get("coverage_end"))
+    if start_day is not None and end_day is not None and end_day >= start_day:
+        return [(start_day, end_day)]
+    return []
+
+
+def _merge_coverage_date_ranges(
+    ranges: Iterable[tuple[dt.date, dt.date]],
+) -> list[tuple[dt.date, dt.date]]:
+    """Sort and merge ranges that overlap or touch (end + 1 day == start)."""
+    merged: list[tuple[dt.date, dt.date]] = []
+    for start_day, end_day in sorted(ranges):
+        if merged and start_day <= merged[-1][1] + dt.timedelta(days=1):
+            if end_day > merged[-1][1]:
+                merged[-1] = (merged[-1][0], end_day)
+        else:
+            merged.append((start_day, end_day))
+    return merged
+
+
 def exchange_sessions_payload(
     *,
     source: str,
@@ -495,12 +561,12 @@ def exchange_sessions_payload(
     ``coverage_start``/``coverage_end`` are the ISO dates the fetch covered;
     the calendar is only authoritative inside them. ``prior`` is an existing
     payload of the same kind: sessions are merged (new entries win on a date
-    collision) and the coverage range becomes the union, so an incremental
-    download never shrinks what the cache can prove.
+    collision) and coverage ranges are merged — overlapping or touching
+    ranges fuse, disjoint ones stay separate so an incremental download
+    never claims the unfetched gap between them.
     """
     merged: dict[str, dict[str, str]] = {}
-    cov_start = coverage_start
-    cov_end = coverage_end
+    covered: list[tuple[dt.date, dt.date]] = []
     stamp = fetched_at
     if isinstance(prior, Mapping) and prior.get("kind") == "exchange_sessions":
         for item in prior.get("sessions") or []:
@@ -510,15 +576,14 @@ def exchange_sessions_payload(
                     "open": str(item.get("open") or ""),
                     "close": str(item.get("close") or ""),
                 }
-        prior_start = prior.get("coverage_start")
-        prior_end = prior.get("coverage_end")
-        if prior_start is not None and (cov_start is None or str(prior_start) < str(cov_start)):
-            cov_start = str(prior_start)
-        if prior_end is not None and (cov_end is None or str(prior_end) > str(cov_end)):
-            cov_end = str(prior_end)
+        covered.extend(_payload_coverage_date_ranges(prior))
         prior_stamp = prior.get("fetched_at")
         if prior_stamp is not None and (stamp is None or str(prior_stamp) > str(stamp)):
             stamp = str(prior_stamp)
+    new_start = _parse_coverage_date(coverage_start)
+    new_end = _parse_coverage_date(coverage_end)
+    if new_start is not None and new_end is not None and new_end >= new_start:
+        covered.append((new_start, new_end))
     for item in sessions:
         if isinstance(item, Mapping) and item.get("date") is not None:
             merged[str(item["date"])] = {
@@ -526,6 +591,7 @@ def exchange_sessions_payload(
                 "open": str(item.get("open") or ""),
                 "close": str(item.get("close") or ""),
             }
+    covered = _merge_coverage_date_ranges(covered)
     payload: dict[str, Any] = {
         "kind": "exchange_sessions",
         "name": f"{source}-{symbol.upper()}-exchange",
@@ -535,10 +601,15 @@ def exchange_sessions_payload(
         "fetched_at": stamp or dt.datetime.now(UTC).isoformat(),
         "sessions": [merged[key] for key in sorted(merged)],
     }
-    if cov_start is not None:
-        payload["coverage_start"] = str(cov_start)
-    if cov_end is not None:
-        payload["coverage_end"] = str(cov_end)
+    if covered:
+        payload["coverage_ranges"] = [
+            {"start": start_day.isoformat(), "end": end_day.isoformat()}
+            for start_day, end_day in covered
+        ]
+        # Envelope fields kept for readability and older readers; they are
+        # NOT authoritative — coverage_ranges is.
+        payload["coverage_start"] = covered[0][0].isoformat()
+        payload["coverage_end"] = covered[-1][1].isoformat()
     return payload
 
 
@@ -691,9 +762,12 @@ class BrokerScheduleCalendar(VenueCalendar):
             local_day + dt.timedelta(days=2),
         ):
             lo, hi = self._daily_window(day)
-            if lo < ts <= hi:
-                # A stamp inside a window with no trading at all is surplus;
-                # the same window is also absent from ``daily_bar_dates``.
+            # Half-open [lo, hi): daily bars are stamped at their OPEN, so a
+            # stamp exactly on the rollover belongs to the window starting
+            # there. A stamp inside a window with no trading at all is
+            # surplus; the same window is also absent from
+            # ``daily_bar_dates``.
+            if lo <= ts < hi:
                 if self.trading_minutes_between(lo, hi) > 0:
                     return day
                 return None
