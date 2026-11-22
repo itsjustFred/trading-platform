@@ -21,6 +21,11 @@ name: randomised-tests
 #
 # Scope: ubuntu only. The matrix in `ci` already covers windows-latest for the
 # deterministic run; order dependence is a property of the suite, not the OS.
+#
+# A red run notifies the last committer of this file (GitHub's scheduled-
+# workflow behaviour). Triage it like a `ci` failure: reproduce with the
+# printed seed and file an issue for a real order-dependent test - #381 is
+# the first catch.
 
 on:
   schedule:
