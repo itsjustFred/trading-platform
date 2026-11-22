@@ -31,7 +31,7 @@ from live_runner.base_adapter import (
     validate_live_quote_prices,
 )
 from live_runner.credential_env import resolve_accounts_env_path, resolve_env_value
-from live_runner.exit_signals import ExitBelowStepError, round_exit_qty_down
+from live_runner.exit_signals import ExitBelowStepError
 from shared import venue_calendar
 from shared.constants import DATA_DIR
 from shared.database import (
