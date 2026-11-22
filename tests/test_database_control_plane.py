@@ -203,6 +203,7 @@ def test_pending_exit_reprotections_skip_non_exit_only_signals(
                 timestamp=now,
                 metadata_json={
                     "risk_sizing_mode": "exit_only",
+                    "signal_intent": "exit",
                     "exit_reprotection": marker,
                 },
             )
@@ -215,7 +216,13 @@ def test_pending_exit_reprotections_skip_non_exit_only_signals(
                 action="buy",
                 theoretical_price=200.0,
                 timestamp=now,
-                metadata_json={"exit_reprotection": marker},
+                # Even fully forged exit fields on an entry row must not
+                # qualify: ``signal_intent`` is the intent stamp every real
+                # exit carries (#350 review).
+                metadata_json={
+                    "risk_sizing_mode": "exit_only",
+                    "exit_reprotection": marker,
+                },
             )
         )
         session.commit()
@@ -225,3 +232,4 @@ def test_pending_exit_reprotections_skip_non_exit_only_signals(
     assert [row["signal_id"] for row in pending] == ["sig-exit"]
     assert pending[0]["marker"] == marker
     assert pending[0]["symbol"] == "AAPL"
+    assert pending[0]["broker_order_id"] == ""

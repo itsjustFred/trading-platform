@@ -240,7 +240,11 @@ Preisraster an (0.01 ab 1 USD, 0.0001 darunter). `AlpacaLiveAdapter` normalisier
 jede Entry vor dem Persistieren: die risk-gesizte `qty` wird auf ganze Stück
 **abgerundet** (unter 1 Stück → abgelehnt), SL und TP werden **zum Entry hin**
 gerundet. Damit liegt das tatsächliche Risiko nie über dem gesizten Budget. Exit-only
-Orders (simple) bleiben unverändert.
+Orders selbst bleiben simple Market/Limit-CloseOrders; eine **partielle** Exit-only-Order
+jedoch gibt vorher den reservierten Bracket-/OCO-Schutz der Position frei und platziert
+für den Restbestand ein neues OCO zum ursprünglichen SL/TP (bzw. aktuellen Trailing-Level)
+neu (#145/#350) - ein persistierter `exit_reprotection`-Marker sichert die Wiederherstellung
+nach einem Crash, und Recovery füllt fehlende Stücke nach, sobald die Exit-Order terminal ist.
 
 Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
 Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,

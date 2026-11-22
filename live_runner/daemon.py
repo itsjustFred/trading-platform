@@ -1901,6 +1901,11 @@ async def prepare_order_with_risk(
             signal,
             instruction=None if is_exit_intent(metadata) else FULL_EXIT,
         )
+    # ``exit_reprotection`` is adapter-owned crash-recovery state stamped only
+    # on exits (#145): a payload value on an entry must never reach
+    # persistence, or the recovery sweep would replay protection for a signal
+    # that never exited (#350 review).
+    metadata.pop(EXIT_REPROTECTION_METADATA_KEY, None)
     # #150 fail closed at the last chokepoint before the broker: an entry
     # signal carrying a trailing config this adapter cannot execute (#167:
     # per-broker table + the adapter's stop-amendment capability) is refused —
@@ -2080,6 +2085,9 @@ async def prepare_order_with_risk(
     # under one of these keys can neither shadow nor survive them.
     final_metadata.update(quote_metadata)
     final_metadata.update(pip_metadata)
+    # The sized metadata is built from the original signal, so the entry-path
+    # pop above cannot reach it: strip the adapter-owned marker here as well.
+    final_metadata.pop(EXIT_REPROTECTION_METADATA_KEY, None)
     # theoretical_price carries the resolved entry so an adapter that places
     # SL/TP as distances from it (cTrader) uses the distance that was sized.
     sized_signal = sized_signal.model_copy(

@@ -82,6 +82,10 @@ _SL_METADATA_KEYS = ("stop_loss", "sl_price", "stop_price", "resolved_stop_loss"
 _TP_METADATA_KEYS = ("take_profit", "tp_price")
 #: Newest orders requested per lookup of held bracket stop legs (Alpaca's maximum is 500).
 _ALPACA_HELD_LEG_LOOKUP_LIMIT = 500
+#: ``status=all`` listings paginate backwards with ``until``; this caps the
+#: total orders scanned so a pathological account fails closed instead of
+#: looping forever (25 pages = 12,500 orders).
+_ALPACA_ORDER_LOOKUP_MAX_PAGES = 25
 
 #: Alpaca rejects sub-penny prices: two decimals at or above $1, four below
 #: ("sub-penny increment does not fulfill minimum pricing criteria", HTTP 422).
@@ -282,6 +286,60 @@ def _exit_protection_kind(candidate: Mapping[str, Any]) -> str | None:
     if order_type == "limit":
         return "tp"
     return None
+
+
+def _covered_exit_protection_qty(candidates: list[Mapping[str, Any]]) -> float:
+    """Shares ``candidates`` protect, counting each broker order once.
+
+    An OCO parent and its stop leg are two candidates for the same shares;
+    their ``cancel_ids`` chains overlap, so candidates sharing an id form one
+    unit and the unit protects the largest quantity among its orders.
+    Distinct units (pyramided tranches, or a stop and a take profit placed as
+    separate orders) sum. Used to tell "protected, maybe at a moved price"
+    apart from "the exit under-filled and shares are naked" (#350 review).
+    """
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    keys: list[str] = []
+    for candidate in candidates:
+        ids = [
+            str(item)
+            for item in (candidate.get("cancel_ids") or ())
+            if str(item or "")
+        ]
+        order_id = str(candidate.get("order_id") or "")
+        unit = ([order_id] if order_id else []) + ids
+        key = unit[0] if unit else ""
+        keys.append(key)
+        for other in unit[1:]:
+            union(key, other)
+    covered: dict[str, float] = {}
+    for candidate, key in zip(candidates, keys):
+        if not key:
+            continue
+        root = find(key)
+        qty = candidate.get("qty")
+        value = (
+            float(qty)
+            if isinstance(qty, (int, float)) and math.isfinite(qty)
+            else 0.0
+        )
+        covered[root] = max(covered.get(root, 0.0), value)
+    return sum(covered.values())
 
 
 def _exit_protection_signature(
@@ -1572,27 +1630,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         get_orders = getattr(client, "get_orders", None)
         if not callable(get_orders):
             return 0
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            nested=True,
-            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
-        )
-        result = await asyncio.to_thread(get_orders, filter=request)
-        if not isinstance(result, (list, tuple)):
-            raise RuntimeError(
-                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
-                "refusing to treat it as complete"
-            )
-        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
-            logger.warning(
-                "Alpaca returned %s orders, the page limit; re-protect orders "
-                "older than the page are not seen by this pass",
-                len(result),
-                extra={"data": {"account_id": self.account_id}},
-            )
+        # ``status=all`` is paged backwards through every page of history:
+        # re-protect orders can be arbitrarily old, and a single newest-first
+        # page would silently drop the fills of any beyond it (#350 review).
+        # The pass raises rather than truncate, so the connect wrapper logs
+        # and the next connect retries.
+        result = await self._list_orders_status_all(client)
         recovered = 0
         for order in result:
             client_order_id = _order_attr(order, "client_order_id")
@@ -3045,17 +3088,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     f"Alpaca exit order for {symbol} was {status} on submission "
                     f"(signal_id={signal_id})."
                 )
-            replaced = await self._place_exit_protection(
+            await self._place_exit_protection(
                 client,
                 plan,
                 qty=plan["reprotect_qty"],
                 signal_id=signal_id,
                 reason="partial exit",
             )
-            if replaced:
-                await _clear_exit_reprotection_marker(
-                    signal_id, symbol, "re-protection placed"
-                )
+            # The marker is deliberately NOT cleared here even when the
+            # re-place succeeded: it now doubles as the under-fill watchdog.
+            # If the exit order later expires or fills short, the replayed
+            # marker is the only record that the uncovered shares need
+            # protection; ``_recover_exit_reprotection`` clears it once the
+            # exit order is terminal and coverage is verified (#350 review).
             return order
 
     async def _recover_exit_reprotection(self, row: Mapping[str, Any]) -> None:
@@ -3098,8 +3143,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         client = self._trading_client
         if client is None:
             raise RuntimeError("Alpaca trading client is unavailable")
+        exit_terminal = await self._reprotect_exit_terminal(row, client)
+        if exit_terminal is False:
+            # The exit order is still working (a resting DAY order, say): the
+            # remainder's re-placement is correct for now. The marker stays so
+            # a later connect re-checks once the order reaches a terminal
+            # state - an exit that expires or is only partially filled would
+            # otherwise leave the uncovered shares naked forever (#350 review).
+            return
         candidates = await self._exit_protection_candidates(client, symbol, side)
         kinds = {_exit_protection_kind(c) for c in candidates}
+        uncovered = abs(position_qty) - _covered_exit_protection_qty(candidates)
+        if candidates and uncovered > self.position_qty_tolerance(symbol):
+            await self._top_up_exit_protection(
+                client,
+                marker,
+                symbol=symbol,
+                side=side,
+                uncovered=uncovered,
+                exit_terminal=exit_terminal,
+                signal_id=signal_id,
+            )
+            return
         recorded = [
             dict(item)
             for item in (marker.get("protection") or [])
@@ -3251,6 +3316,143 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if placed:
             await _clear_exit_reprotection_marker(
                 signal_id, symbol, "recovery re-placed protection"
+            )
+
+    async def _reprotect_exit_terminal(
+        self, row: Mapping[str, Any], client: Any
+    ) -> bool | None:
+        """Whether the exit order behind ``row``'s marker has finished.
+
+        ``True``/``False`` from the broker's order status; ``None`` when the
+        outcome cannot be determined (no persisted order id or a failed
+        lookup). ``None`` never counts as finished: protection is only topped
+        up on a proven-terminal exit, never against one that may still work.
+        """
+        order_id = str(row.get("broker_order_id") or "").strip()
+        if not order_id:
+            return None
+        get_order = getattr(client, "get_order_by_id", None)
+        if not callable(get_order):
+            return None
+        try:
+            order = await asyncio.to_thread(get_order, order_id)
+        except Exception as exc:
+            logger.debug(
+                "Alpaca could not re-read exit order %s for re-protection "
+                "recovery: %r",
+                order_id,
+                exc,
+                extra={
+                    "data": {
+                        "signal_id": row.get("signal_id"),
+                        "symbol": row.get("symbol"),
+                    }
+                },
+            )
+            return None
+        return _order_status(order) in _TERMINAL_ORDER_STATUSES
+
+    async def _top_up_exit_protection(
+        self,
+        client: Any,
+        marker: Mapping[str, Any],
+        *,
+        symbol: str,
+        side: str,
+        uncovered: float,
+        exit_terminal: bool | None,
+        signal_id: str,
+    ) -> None:
+        """Close a protection quantity gap left by an under-filled exit.
+
+        The re-place after a partial exit covers only the planned remainder;
+        if the exit then expires or fills short, the difference is naked.
+        With a proven-terminal exit the gap is topped up at the recorded
+        levels; with an unproven outcome or ambiguous recorded levels the
+        marker stays and a CRITICAL alert asks for manual reconciliation -
+        never a guess at levels, never a reservation against a still-working
+        exit (#350 review).
+        """
+        if exit_terminal is not True:
+            logger.error(
+                "ALERT: Alpaca exit re-protection for %s leaves %.8g shares "
+                "unprotected and the exit order's outcome cannot be "
+                "confirmed; the marker stays pending - reconcile manually",
+                symbol,
+                uncovered,
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "uncovered_qty": uncovered,
+                        "marker": dict(marker),
+                    }
+                },
+            )
+            return
+        recorded_items = [
+            dict(item)
+            for item in (marker.get("protection") or [])
+            if isinstance(item, Mapping)
+        ]
+        if recorded_items:
+            logger.error(
+                "ALERT: Alpaca exit re-protection for %s under-filled and "
+                "the recorded protection is per-candidate (ambiguous "
+                "levels); %.8g shares are unprotected - reconcile manually. "
+                "The marker stays pending",
+                symbol,
+                uncovered,
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "uncovered_qty": uncovered,
+                        "marker": dict(marker),
+                    }
+                },
+            )
+            return
+        plan = {
+            "symbol": symbol,
+            "side": side,
+            "stop_price": marker.get("stop_price"),
+            "stop_limit_price": marker.get("stop_limit_price"),
+            "take_profit_price": marker.get("take_profit_price"),
+            "entry_signal_id": marker.get("entry_signal_id"),
+        }
+        if plan["stop_price"] is None and plan["take_profit_price"] is None:
+            # No levels were ever recorded: nothing can be placed. Same
+            # verdict as the kind-check path - alert and spend the marker,
+            # which would otherwise pile up ahead of recoverable markers.
+            logger.error(
+                "ALERT: Alpaca exit re-protection marker for %s recorded no "
+                "levels and %.8g shares are unprotected; reconcile manually. "
+                "The marker is cleared - it can never place anything",
+                symbol,
+                uncovered,
+                extra={
+                    "data": {
+                        "signal_id": signal_id,
+                        "symbol": symbol,
+                        "uncovered_qty": uncovered,
+                    }
+                },
+            )
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol, "no recorded levels"
+            )
+            return
+        placed = await self._place_exit_protection(
+            client,
+            plan,
+            qty=uncovered,
+            signal_id=signal_id,
+            reason="exit under-fill top-up",
+        )
+        if placed:
+            await _clear_exit_reprotection_marker(
+                signal_id, symbol, "under-fill topped up"
             )
 
     async def _recover_exit_reprotections(self) -> None:
@@ -4338,34 +4540,87 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         get_orders = getattr(client, "get_orders", None)
         if not symbols or not callable(get_orders):
             return []
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-
-        request = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            symbols=sorted(symbols),
-            nested=True,
-            limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
-        )
-        result = await asyncio.to_thread(get_orders, filter=request)
-        if not isinstance(result, (list, tuple)):
-            raise RuntimeError(
-                f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
-                "refusing to report a clean sweep"
-            )
-        if len(result) >= _ALPACA_HELD_LEG_LOOKUP_LIMIT:
-            # The listing is newest-first: a full page may have cut off the filled parent
-            # that owns the held stop leg, and "no stop" would then be a lie.
-            raise RuntimeError(
-                f"Alpaca returned {len(result)} orders, the page limit; "
-                "refusing to treat the list as complete"
-            )
+        result = await self._list_orders_status_all(client, symbols=symbols)
         return [
             order
             for order in result
             if _order_status(order) == "filled"
             and any(_order_status(leg) == "held" for leg in _order_legs(order))
         ]
+
+    async def _list_orders_status_all(
+        self, client: Any, *, symbols: set[str] | None = None
+    ) -> list[Any]:
+        """Every ``status=all`` order, paged backwards with ``until``.
+
+        ``get_orders`` returns at most ``limit`` orders per call and offers no
+        page token, so history longer than one page is walked back explicitly:
+        each full page moves ``until`` to its oldest ``submitted_at`` and ids
+        already seen are skipped (``until`` is inclusive, so a page boundary
+        can repeat orders). A page that cannot advance - a missing timestamp,
+        or a full page of already-seen ids - raises, as does exceeding
+        ``_ALPACA_ORDER_LOOKUP_MAX_PAGES``: a silently truncated ``status=all``
+        listing is the #174/#350 failure mode - a held stop leg or a
+        ``-reprotect`` order read as absent.
+        """
+        get_orders = getattr(client, "get_orders", None)
+        if not callable(get_orders):
+            raise RuntimeError("Alpaca client cannot list orders")
+        from alpaca.common.enums import Sort
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        collected: list[Any] = []
+        seen: set[str] = set()
+        until: Any = None
+        for _ in range(_ALPACA_ORDER_LOOKUP_MAX_PAGES):
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.ALL,
+                symbols=sorted(symbols) if symbols else None,
+                nested=True,
+                limit=_ALPACA_HELD_LEG_LOOKUP_LIMIT,
+                until=until,
+                direction=Sort.DESC,
+            )
+            result = await asyncio.to_thread(get_orders, filter=request)
+            if not isinstance(result, (list, tuple)):
+                raise RuntimeError(
+                    f"Alpaca order list has an unrecognised shape ({type(result).__name__}); "
+                    "refusing to treat it as complete"
+                )
+            new_on_page = 0
+            oldest: Any = None
+            for order in result:
+                order_id = _control_order_id(_order_attr(order, "id"))
+                if order_id is not None:
+                    if order_id in seen:
+                        continue
+                    seen.add(order_id)
+                new_on_page += 1
+                collected.append(order)
+                submitted = _order_attr(order, "submitted_at")
+                if submitted is not None and (
+                    oldest is None or submitted < oldest
+                ):
+                    oldest = submitted
+            if len(result) < _ALPACA_HELD_LEG_LOOKUP_LIMIT:
+                return collected
+            if (
+                oldest is None
+                or new_on_page == 0
+                or (until is not None and oldest >= until)
+            ):
+                raise RuntimeError(
+                    "Alpaca order pagination cannot advance past "
+                    f"{len(collected)} orders; refusing to treat the list "
+                    "as complete"
+                )
+            until = oldest
+        raise RuntimeError(
+            f"Alpaca order history exceeds {_ALPACA_ORDER_LOOKUP_MAX_PAGES} "
+            f"pages ({len(collected)} orders); refusing to treat the list "
+            "as complete"
+        )
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         value = float(price)

@@ -3843,6 +3843,7 @@ def list_pending_exit_reprotections(
         EXIT_ONLY_RISK_SIZING_MODE,
         EXIT_REPROTECTION_METADATA_KEY,
     )
+    from live_runner.exit_signals import SIGNAL_INTENT_EXIT, SIGNAL_INTENT_KEY
 
     normalized_account_id = str(account_id or "").strip()
     if not normalized_account_id:
@@ -3872,12 +3873,18 @@ def list_pending_exit_reprotections(
             continue
         if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
             continue
+        # Every persisted exit is stamped ``signal_intent == "exit"`` by
+        # ``prepare_exit_intent_order``; requiring it keeps a marker smuggled
+        # onto a non-exit row from ever consuming this page (#350 review).
+        if str(metadata.get(SIGNAL_INTENT_KEY) or "") != SIGNAL_INTENT_EXIT:
+            continue
         pending.append(
             {
                 "signal_id": str(row.id),
                 "symbol": str(row.symbol or "").strip().upper(),
                 "deployment_id": str(row.deployment_id),
                 "timestamp": row.timestamp,
+                "broker_order_id": str(row.broker_order_id or ""),
                 "marker": dict(recorded),
             }
         )

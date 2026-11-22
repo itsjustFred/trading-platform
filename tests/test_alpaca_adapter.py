@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -33,6 +33,7 @@ class _FakeOrder:
     limit_price: float | None = None
     status: object = "new"
     legs: list["_FakeOrder"] = field(default_factory=list)
+    submitted_at: datetime | None = None
 
 
 @dataclass
@@ -113,7 +114,32 @@ class _FakeTradingClient:
                 for order in result
                 if str(getattr(order, "symbol", "") or "").strip().upper() in wanted
             ]
+        until = getattr(filter, "until", None)
+        after = getattr(filter, "after", None)
+        if until is not None:
+            result = [
+                order
+                for order in result
+                if getattr(order, "submitted_at", None) is None
+                or order.submitted_at <= until
+            ]
+        if after is not None:
+            result = [
+                order
+                for order in result
+                if getattr(order, "submitted_at", None) is None
+                or order.submitted_at >= after
+            ]
         return result[:limit]
+
+    def get_order_by_id(self, order_id: str):
+        for order in self.orders:
+            if order.id == order_id:
+                return order
+            for leg in order.legs:
+                if leg.id == order_id:
+                    return leg
+        raise KeyError(order_id)
 
     def get_all_positions(self):
         return list(self.positions)
@@ -1256,9 +1282,11 @@ def test_partial_exit_reprotects_remainder_at_original_levels(
     assert float(oco[0].take_profit.limit_price) == 210.0
     assert float(oco[0].stop_loss.stop_price) == 190.0
     assert _side_text(oco[0]) == "sell"
-    # The persisted signal carried the recovery marker, cleared once protected.
+    # The persisted signal carried the recovery marker. It is NOT cleared at
+    # submit any more: it doubles as the under-fill watchdog until a connect
+    # replay proves the exit order terminal and the coverage complete.
     assert captured and "exit_reprotection" in (captured[0].metadata or {})
-    assert cleared
+    assert cleared == []
 
 
 def test_partial_exit_reprotects_at_current_trailing_level(monkeypatch) -> None:
@@ -1592,6 +1620,234 @@ def test_list_protective_stops_sees_an_oco_stop_leg() -> None:
     assert stops[0].order_id == "oco-1-sl"
     assert stops[0].stop_price == 190.0
     assert stops[0].side == "sell"
+
+
+def test_partial_exit_submits_beyond_a_full_order_history_page(
+    monkeypatch,
+) -> None:
+    """500 newer orders on the symbol must not blind the exit (#350 blocker).
+
+    ``status=all`` is paged backwards with ``until``: the filled bracket
+    parent owning the held stop leg sits on the second page and is still
+    found, where the old single-page read raised and refused every exit on a
+    long-lived symbol.
+    """
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    history = [
+        _FakeOrder(
+            id=f"hist-{index}",
+            symbol="AAPL",
+            side="buy",
+            order_type="limit",
+            status="canceled",
+            qty=1.0,
+            submitted_at=base + timedelta(seconds=600 - index),
+        )
+        for index in range(500)
+    ]
+    bracket = _filled_bracket()
+    for order in bracket:
+        order.submitted_at = base
+        for leg in order.legs:
+            leg.submitted_at = base
+    client = _FakeTradingClient(
+        orders=history + bracket,
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    captured: list[LiveSignal] = []
+    _patched_signal_store(monkeypatch, captured)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    market_orders = [
+        order for order in client.submitted if _type_text(order) == "market"
+    ]
+    assert len(market_orders) == 1
+    oco = [order for order in client.submitted if _class_text(order) == "oco"]
+    assert len(oco) == 1
+    assert float(oco[0].qty) == 6.0
+
+
+def _reprotect_row(marker: dict, **overrides) -> dict:
+    row = {
+        "signal_id": "sig-1",
+        "symbol": "AAPL",
+        "deployment_id": "dep-1",
+        "timestamp": datetime.now(timezone.utc),
+        "broker_order_id": "",
+        "marker": marker,
+    }
+    row.update(overrides)
+    return row
+
+
+def _working_oco(qty: float = 6.0) -> _FakeOrder:
+    return _FakeOrder(
+        id=str(uuid4()),
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        order_class="oco",
+        qty=qty,
+        limit_price=210.0,
+        status="new",
+        legs=[
+            _FakeOrder(
+                id=str(uuid4()),
+                symbol="AAPL",
+                side="sell",
+                order_type="stop",
+                qty=qty,
+                stop_price=190.0,
+                status="new",
+            )
+        ],
+    )
+
+
+def _patch_pending_reprotections(monkeypatch, rows: list[dict]) -> None:
+    monkeypatch.setattr(
+        alpaca_module,
+        "list_pending_exit_reprotections",
+        lambda account_id, *, limit=50: rows,
+    )
+
+
+def _patch_marker_clears(monkeypatch) -> list[str]:
+    cleared: list[str] = []
+    monkeypatch.setattr(
+        alpaca_module,
+        "clear_live_signal_metadata_key",
+        lambda signal_id, key: cleared.append(signal_id) or True,
+    )
+    return cleared
+
+
+def test_recovery_tops_up_shares_an_underfilled_exit_left_naked(
+    monkeypatch,
+) -> None:
+    """Exit expired after re-place: 6 of 10 shares protected, 4 naked.
+
+    The persisted marker used to be cleared the moment re-protection was
+    placed, so an exit that later expired or filled short left the uncovered
+    shares unprotected with no record. The marker now survives until replay
+    proves the exit order terminal; the uncovered quantity is topped up at
+    the recorded levels (#350 review).
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _working_oco(qty=6.0),
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="market",
+                qty=4.0,
+                status="expired",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                    "entry_signal_id": "entry-1",
+                },
+                broker_order_id="exit-1",
+            )
+        ],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    top_ups = [
+        order
+        for order in client.submitted
+        if _class_text(order) == "oco" and float(order.qty) == 4.0
+    ]
+    assert len(top_ups) == 1
+    assert float(top_ups[0].stop_loss.stop_price) == 190.0
+    assert float(top_ups[0].take_profit.limit_price) == 210.0
+    assert cleared == ["sig-1"]
+
+
+def test_recovery_keeps_marker_while_the_exit_order_still_works(
+    monkeypatch,
+) -> None:
+    """A resting exit is not terminal: nothing is topped up, marker stays."""
+    client = _FakeTradingClient(
+        orders=[
+            _working_oco(qty=6.0),
+            _FakeOrder(
+                id="exit-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="limit",
+                qty=4.0,
+                status="new",
+            ),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                },
+                broker_order_id="exit-1",
+            )
+        ],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == []
+
+
+def test_recovery_alerts_but_keeps_marker_when_exit_outcome_unknown(
+    monkeypatch, caplog
+) -> None:
+    """No persisted order id: cannot prove the exit finished - alert, keep."""
+    client = _FakeTradingClient(
+        orders=[_working_oco(qty=6.0)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [
+            _reprotect_row(
+                {
+                    "side": "sell",
+                    "stop_price": 190.0,
+                    "take_profit_price": 210.0,
+                }
+            )
+        ],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    with caplog.at_level("ERROR"):
+        asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == []
+    assert any("unprotected" in record.message for record in caplog.records)
 
 
 # ─── #350 review: whole-share exits, pinned guards, attribution ─────────────
