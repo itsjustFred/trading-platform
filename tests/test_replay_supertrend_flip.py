@@ -370,6 +370,146 @@ def test_supertrend_is_ignored_before_tp1(monkeypatch) -> None:
     assert [leg.reason for leg in trade.exits] == ["end_of_data"]
 
 
+# ── gap fills at the open (#287) ─────────────────────────────────────────────
+#
+# Owner decision (same as #208 / the native engine): a bar that OPENS beyond a
+# protective level gapped through it — the fill is the bar's open, the price
+# actually available, never the skipped level. Intrabar touches keep filling at
+# the level. The flip workflow's stop and TP1 exits follow the same rule; the
+# open is the bar's first event, so a gap also beats a later same-bar touch of
+# the other level.
+
+
+def test_gap_through_the_stop_before_tp1_fills_at_the_open(monkeypatch) -> None:
+    """Bar 2 opens at 94, below the 95 stop: the stop fills at 94, not 95."""
+    gap_stop_bar = (94.0, 94.5, 93.0, 94.2)
+    frame = _frame([ENTRY_BAR, _flat(), gap_stop_bar, TP1_BAR])
+    _stub_supertrend(monkeypatch, "gggg")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["stop_loss"]
+    assert trade.exits[0].price == 94.0
+    assert trade.exits[0].time == _times(frame, 2)
+
+
+def test_gap_through_tp1_fills_the_tranche_at_the_open(monkeypatch) -> None:
+    """Bar 1 opens at 111, above TP1 110: the TP1 tranche fills at 111."""
+    gap_tp1_bar = (111.0, 112.0, 110.5, 111.5)
+    frame = _frame([ENTRY_BAR, gap_tp1_bar, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame).trades[0]
+
+    tp1_leg, last = trade.exits
+    assert tp1_leg.reason == "tp1"
+    assert tp1_leg.price == 111.0
+    assert tp1_leg.time == _times(frame, 1)
+    assert tp1_leg.pnl == pytest.approx((111.0 - ENTRY) * tp1_leg.quantity)
+    assert last.reason == "end_of_data"
+
+
+def test_gap_through_tp1_with_a_full_fraction_closes_at_the_open(monkeypatch) -> None:
+    gap_tp1_bar = (111.0, 112.0, 110.5, 111.5)
+    frame = _frame([ENTRY_BAR, gap_tp1_bar, _flat()])
+    _stub_supertrend(monkeypatch, "rrr")
+    trade = _run(frame, signals=[_signal(metadata={"tp1_exit_percent": 1.0})]).trades[0]
+
+    assert len(trade.exits) == 1
+    assert trade.exits[0].reason == "tp1"
+    assert trade.exits[0].price == 111.0
+    assert trade.exits[0].quantity == pytest.approx(trade.quantity)
+
+
+def test_gap_through_the_breakeven_stop_fills_at_the_open(monkeypatch) -> None:
+    """After TP1 the stop sits at breakeven (100); a bar opening at 99 gaps
+    through it and fills at 99, not 100."""
+    gap_bar = (99.0, 99.5, 98.0, 98.5)
+    frame = _frame([ENTRY_BAR, TP1_BAR, _flat(), gap_bar, _flat()])
+    _stub_supertrend(monkeypatch, "rrrrr")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["tp1", "breakeven_stop"]
+    remainder = trade.exits[1]
+    assert remainder.price == 99.0
+    assert remainder.time == _times(frame, 3)
+    assert remainder.pnl == pytest.approx((99.0 - ENTRY) * remainder.quantity)
+
+
+def test_a_gap_past_the_stop_beats_a_later_same_bar_tp1_touch(monkeypatch) -> None:
+    """The open is the bar's first event: a bar that opens below the stop and
+    later trades up through TP1 still stops out — at the open."""
+    gap_and_recover = (94.0, 111.5, 93.0, 105.0)
+    frame = _frame([ENTRY_BAR, _flat(), gap_and_recover, _flat()])
+    _stub_supertrend(monkeypatch, "gggg")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["stop_loss"]
+    assert trade.exits[0].price == 94.0
+    assert trade.exits[0].time == _times(frame, 2)
+    assert trade.meta["supertrend_flip"]["tp1_time"] is None
+
+
+def test_a_gap_through_tp1_fills_the_tranche_then_stops_the_remainder(
+    monkeypatch,
+) -> None:
+    """The bar opens ABOVE TP1 (111 > 110): the TP1 tranche fills at the open,
+    and the remainder's still-working pre-TP1 stop (95) fires later in the
+    same bar when its low reaches 94 — live the remainder sits in an OTO
+    whose initial stop works all bar and the breakeven amendment only takes
+    effect next bar (#176). The tranche fill is not a gap through the stop,
+    so the remainder exits AT the stop level, not the open."""
+    gap_tp1_then_stop = (111.0, 112.0, 94.0, 105.0)
+    frame = _frame([ENTRY_BAR, gap_tp1_then_stop, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["tp1", "stop_loss"]
+    assert trade.exits[0].price == 111.0
+    assert trade.exits[0].time == _times(frame, 1)
+    remainder = trade.exits[1]
+    assert remainder.price == STOP
+    assert remainder.time == _times(frame, 1)
+    assert remainder.pnl == pytest.approx((STOP - ENTRY) * remainder.quantity)
+
+
+def test_a_gap_through_tp1_spares_the_remainder_above_the_stop(
+    monkeypatch,
+) -> None:
+    """Same gap, but the bar's low (96) stays above the pre-TP1 stop (95):
+    the remainder survives the TP1 bar and the dead-bar rule applies."""
+    gap_tp1_above_stop = (111.0, 112.0, 96.0, 105.0)
+    frame = _frame([ENTRY_BAR, gap_tp1_above_stop, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["tp1", "end_of_data"]
+    assert trade.exits[0].price == 111.0
+    assert trade.exits[0].time == _times(frame, 1)
+
+
+def test_an_open_exactly_at_the_level_fills_at_that_price(monkeypatch) -> None:
+    """Open == stop counts as a gap, but the fill price is identical either
+    way: the level."""
+    at_level_bar = (95.0, 95.5, 94.5, 95.2)
+    frame = _frame([ENTRY_BAR, _flat(), at_level_bar, _flat()])
+    _stub_supertrend(monkeypatch, "gggg")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["stop_loss"]
+    assert trade.exits[0].price == STOP
+
+
+def test_an_intrabar_stop_touch_still_fills_at_the_level(monkeypatch) -> None:
+    """No gap (the bar opens above the stop): the intrabar touch keeps the
+    level fill — the pre-#287 behaviour is unchanged off-gap."""
+    touch_bar = (96.0, 96.5, 94.0, 95.5)
+    frame = _frame([ENTRY_BAR, _flat(), touch_bar, _flat()])
+    _stub_supertrend(monkeypatch, "gggg")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["stop_loss"]
+    assert trade.exits[0].price == STOP
+
+
 # ── activation and flip exit ─────────────────────────────────────────────────
 
 
