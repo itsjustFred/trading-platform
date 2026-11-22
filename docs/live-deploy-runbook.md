@@ -455,6 +455,25 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 - `live_executions.timestamp` drives PnL ordering and is never invented (#135). A fill takes the stream event's own timestamp, then the order's `filled_at`, then its `updated_at`; a stamp that carries no time of day (a bare date such as `2026-11-03`) is refused rather than read as midnight. When none parses, no row is stored: the stream path logs the quantity it dropped (`filled_qty`, `broker_cumulative_filled_qty`) and the reconciled path logs `missing_filled_qty`, and both say the retry is the next adapter connect, because Alpaca reconciliation runs on `connect()` only - there is no periodic pass. Until then the local filled quantity understates the broker's, so exit sizing and duplicate-order protection size against a flat position.
 - Every PnL reader treats a `sent_bad`/`absent`/`derived_unavailable` (or non-positive) price as unknown: API rows carry `actual_price: null` and `slippage: null`, and live stats report `total_pnl: null`, `pnl_complete: false` and `price_unknown_count`; the frontend shows "incomplete" instead of a number.
 
+## Signal Bot Health Check (#158)
+
+The signal bot health check stays a standalone script plus scheduler job —
+there is deliberately no `runner.cli` subcommand for it.
+
+- Run it manually (no flags; JSON on stdout, exit code `0` = ok, `1` = error):
+
+  ```bash
+  uv run python -m signal_bots.health_check
+  ```
+
+- Schedule it via the viewer **Services** page ("+ Add Scheduled Job", job type
+  `signal_bot_health_check`, cron in UTC) or `POST /api/services` with
+  `type: "scheduled_job"`, `status: "running"`, and
+  `config: {"cron": "...", "job_type": "signal_bot_health_check"}`. The
+  scheduler runs inside `live_runner.daemon`; results land as background task
+  records visible in the viewer. Details: `docs/signal_bots.md` ("Health-Check
+  Status").
+
 ## Commission sign migration (cTrader, #205)
 
 `live_executions.commission` is a positive cost for every broker. The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge, which is indistinguishable from a new-convention rebate and is never converted. Roll out as stop, deploy, start; do not run old and new builds side by side.

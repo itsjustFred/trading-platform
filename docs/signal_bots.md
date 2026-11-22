@@ -120,6 +120,25 @@ pro Bot.
   - `tests/test_signal_bot_health_check.py`
   - `tests/test_scheduler_signal_bot_health.py`
 
+### Betrieb (#158, Entscheidung 2026-11-21)
+
+Der Health-Check bleibt bewusst ein **Standalone-Skript plus Scheduler-Job** —
+kein `runner.cli`-Subcommand. So wird er ausgeführt und geplant:
+
+- **Manuell:** `python -m signal_bots.health_check` (keine Flags). Gibt das
+  JSON-Ergebnis auf stdout aus; Exit-Code `0` = alle Processor ok, `1` =
+  mindestens ein Fehler. Geprüft werden pro Processor: Import/Factory,
+  `process_signal`-Probe mit synthetischen Marktdaten und die Existenz der
+  Config-Datei aus der Registry.
+- **Geplant:** Viewer → **Services** → „+ Add Scheduled Job" mit Job Type
+  `signal_bot_health_check` und einem Cron-Ausdruck, oder direkt
+  `POST /api/services` mit `type: "scheduled_job"`, `status: "running"` und
+  `config: {"cron": "...", "job_type": "signal_bot_health_check"}`. Der Cron
+  wird in UTC interpretiert (`scheduler/scheduler.py`, `CronTrigger.from_crontab`).
+  Der `ServiceScheduler` läuft innerhalb von `live_runner.daemon`; der
+  Job-Handler schreibt das Ergebnis als Background-Task-Status in die DB
+  (Services/Tasks im Viewer). `PAUSED`/`STOPPED` des Service pausiert den Lauf.
+
 ## Risk-Engine Integration
 
 1. Signal-Processor berechnet `entry_price`, `stop_loss`, `take_profit`

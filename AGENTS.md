@@ -19,6 +19,14 @@ The suite never touches the repo's `data/`: `tests/conftest.py` forces `DATA_DIR
 
 When creating an issue, give the appropriate labels. If things are unclear, give the `needs-decision` label. This signals that a maintainer needs to look at the issue and decide on unclear points, like open questions.
 
+## Code Quality (Sonar)
+
+The Sonar gate applies to **new code on PRs only**. The existing S3776
+(cognitive-complexity) backlog in old code is not chased item by item; it may
+be reduced opportunistically — money path (`live_runner`, `risk`, engines)
+first, and only where tests pin the behaviour. Splitting `viewer/main.py` to
+retire most of that backlog is tracked in #283.
+
 ## Pull Requests
 
 Before creating a PR, make sure to have a complete, review-ready change. This includes running all relevant tests making sure none fails. If a required check cannot run, report the limitation and do not claim the change is ready.
