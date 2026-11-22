@@ -1679,19 +1679,32 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
         )
     # The transient class takes the quota path: a warning that names the remedy, the
     # "not run: quota" comment body, the `quota` output the post job reads, and a clean
-    # exit - the step does not fail, so the job does not go red.
+    # exit - the step does not fail, so the job does not go red. The body lives in
+    # `report_quota_skip`, reached from the non-zero-exit classifier and from the two
+    # zero-exit dead ends (no summary line, no valid verdict) where the cap has been
+    # seen arriving on a zero exit.
     quota_branch = body.split("grep -qiE '" + transient + "'", 1)[1]
     head = quota_branch.split("elif", 1)[0]
-    assert "::warning::" in head and "not run: quota" in head, (
+    assert "report_quota_skip" in head, "the transient class does not take the quota path"
+    func_body = body.split("report_quota_skip() {", 1)[1].split("\n          }", 1)[0]
+    assert "::warning::" in func_body and "not run: quota" in func_body, (
         "the transient class does not warn and name the quota skip"
     )
-    assert 'echo "quota=true" >> "$GITHUB_OUTPUT"' in head, (
+    assert 'echo "quota=true" >> "$GITHUB_OUTPUT"' in func_body, (
         "the agent step does not report the quota skip to the post job"
     )
-    assert "Not run: quota" in head and "comment.md" in head, (
+    assert "Not run: quota" in func_body and "comment.md" in func_body, (
         "the mid-run quota path writes no 'not run: quota' comment"
     )
-    assert "exit 0" in head, "the mid-run quota path still fails the step"
+    assert "exit 0" in func_body, "the mid-run quota path still fails the step"
+    # The zero-exit dead ends classify before they fail: the transient signature is
+    # grepped over the raw stream and stderr at both, so a cap on a zero exit takes
+    # the quota path instead of going red. Only on those paths - a produced report's
+    # own text may mention "quota".
+    dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
+    assert body.count(dead_end_grep) == 2, (
+        "the two zero-exit dead ends do not both classify the quota signature"
+    )
     # The reason is only in stderr. A failed run has ended with a bare "exit code 1" and no
     # cause, so a capped model and a broken prompt could not be told apart from the log: the
     # captured output is echoed, bounded so a runaway agent cannot flood the log.
@@ -1844,15 +1857,24 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
 _STUB_OPENCODE = """#!/usr/bin/env bash
 # A stand-in for the `opencode` the quota probe and the agent step call.
 # $STUB_OPENCODE_MODE selects the reply: ok, quota (a cap signature on stderr,
-# exit 1), quota-out / quota-err (the same signature on a ZERO exit - the shape
-# run 44962236033 showed the probe cannot currently see), no-ok (a zero exit
-# whose reply carries no OK token), other (a non-quota failure, exit 1).
+# exit 1), quota-out / quota-err / quota-zero (the same signature on a ZERO
+# exit - the shape run 44962236033 showed the probe cannot currently see),
+# quota-verdict (a started report that never reaches a verdict, cap signature
+# on stdout, exit 0), garbage (a zero exit with no signature and no report),
+# no-ok (a zero exit whose reply carries no OK token), other (a non-quota
+# failure, exit 1).
 set -u
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
   quota-out) printf 'Free usage limit reached for this model\\n'; exit 0 ;;
   quota-err) printf 'Free usage limit reached for this model\\n' >&2; exit 0 ;;
+  quota-zero) printf 'Free usage limit reached for this model\\n'; exit 0 ;;
+  quota-verdict)
+    printf '**Summary:** the agent started.\\nFree usage limit reached for this model\\n'
+    exit 0
+    ;;
+  garbage) printf 'The agent said something unrelated.\\n'; exit 0 ;;
   no-ok) printf 'Here is the answer you asked for.\\n'; exit 0 ;;
   other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
 esac
@@ -2040,7 +2062,18 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
     stub.write_text(_STUB_OPENCODE, encoding="utf-8")
     stub.chmod(0o755)
 
-    for mode, expect_ok in (("quota", True), ("other", False)):
+    # The cap has been seen arriving on a ZERO exit: the signature is grepped
+    # over the raw stream and stderr at both dead ends, so a capped model that
+    # exits 0 - with no report at all, or with a report that never reaches a
+    # verdict - takes the quota path instead of failing the run. A zero exit
+    # with no signature is still a failure.
+    for mode, expect_ok in (
+        ("quota", True),
+        ("quota-zero", True),
+        ("quota-verdict", True),
+        ("garbage", False),
+        ("other", False),
+    ):
         case = tmp_path / mode
         case.mkdir()
         env = {**os.environ, **_agent_step_env(case, head)}
@@ -2208,6 +2241,33 @@ def test_a_quota_skip_does_not_overwrite_a_real_verdict_for_the_same_head(tmp_pa
     result, calls = _run_comment_post(case, quota_skip=False, prior_body=verdict_body)
     assert result.returncode == 0, f"comment post failed: {result.stderr}"
     assert "--method" in calls, "a real verdict did not overwrite the prior comment"
+
+    # The guard is scoped to *this* head: a real verdict for a different commit
+    # must not pin the comment forever, so a quota skip over it still writes.
+    case = tmp_path / "verdict-other-head"
+    case.mkdir()
+    other_head_body = verdict_body.replace(head8, "f" * 8)
+    result, calls = _run_comment_post(case, quota_skip=True, prior_body=other_head_body)
+    assert result.returncode == 0, f"comment post failed: {result.stderr}"
+    assert "--method PATCH" in calls, (
+        "a quota skip refused to refresh a verdict for a different head"
+    )
+
+    # And the guard is fed by both quota paths: the probe's `available=false`
+    # and the agent step's own `quota` output. Dropping either clause from the
+    # QUOTA_SKIP expression unpins the mid-run path, so the expression itself
+    # is asserted, not just the shell it feeds.
+    step = _find_step(
+        _load(PREMORTEM)["jobs"]["post"], r"^Post or update pre-mortem comment$"
+    )
+    quota_skip_env = str((step.get("env") or {}).get("QUOTA_SKIP", ""))
+    for clause in (
+        "needs.premortem.outputs.quota",
+        "needs.quota-probe.outputs.available",
+    ):
+        assert clause in quota_skip_env, (
+            f"QUOTA_SKIP does not read {clause}: {quota_skip_env!r}"
+        )
 
 
 def test_the_pre_mortem_comment_records_whose_rules_ran() -> None:

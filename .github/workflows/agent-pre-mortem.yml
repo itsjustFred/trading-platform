@@ -419,7 +419,7 @@ jobs:
           # at all): that is a genuine failure, and the agent job reports it.
           if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stdout" "$probe_dir/stderr"; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::The free model is capped, rate-limited or region-refused; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
+            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
           elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Quota probe reached the model; the agent job will run."
@@ -584,6 +584,29 @@ jobs:
           # fallback's whole point: while the base branch has no skill, the PR's own copy
           # runs. Name it in the log and in the comment footer (below), so a verdict produced
           # by a PR's own rules is never indistinguishable from one the base produced.
+          # The quota path is one body reached from three places: the non-zero-exit
+          # classifier below, and the two zero-exit dead ends (no summary line, no
+          # valid verdict) where the cap has been seen arriving on a zero exit -
+          # opencode exiting 0 on "Free usage limit reached" is exactly the run
+          # shape that used to reach "no summary line" and go red, the outcome
+          # the decision of 2026-11-21 forbids. It writes the same "not run:
+          # quota" report the probe-skip path posts, sets the `quota` output the
+          # post job reads, and exits clean, so the step does not fail.
+          report_quota_skip() {
+            echo "::warning::The pre-mortem agent could not run - the free model was capped, rate-limited, refused or unavailable (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: not run: quota. Re-run this job after the quota resets."
+            # The same report the probe-skip path posts, written here because the agent
+            # job already ran: the comment is the PR's view either way, and the `quota`
+            # output is what keeps the post job from mapping an empty verdict to `error`.
+            {
+              printf '# Pre-Mortem Action\n\n'
+              printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable while the agent ran; no pre-mortem was produced for this commit.\n\n'
+              printf 'Re-run the job after the quota resets.\n'
+              printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+              printf '\n---\n_Automated pre-mortem not run: quota (%s)_\n' "${MODEL#*/}${VARIANT:+ (${VARIANT})}"
+            } > "$RUNNER_TEMP/premortem/comment.md"
+            echo "quota=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           echo "::notice::Pre-mortem rules from: ${SKILL_SOURCE}."
           if ! raw=$(opencode run --standalone --archived --agent pr-premortem \
             "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}." 2> "$out.stderr"); then
@@ -614,19 +637,7 @@ jobs:
             # the captured stderr above it, which is the reason itself - better than guessing
             # for it.
             if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.stderr"; then
-              echo "::warning::The pre-mortem agent could not run - the free model was capped, rate-limited or refused (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: not run: quota. Re-run this job after the quota resets."
-              # The same report the probe-skip path posts, written here because the agent
-              # job already ran: the comment is the PR's view either way, and the `quota`
-              # output is what keeps the post job from mapping an empty verdict to `error`.
-              {
-                printf '# Pre-Mortem Action\n\n'
-                printf '**Summary:** Not run: quota - the free model was capped, rate-limited or refused while the agent ran; no pre-mortem was produced for this commit.\n\n'
-                printf 'Re-run the job after the quota resets.\n'
-                printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
-                printf '\n---\n_Automated pre-mortem not run: quota (%s)_\n' "${MODEL#*/}${VARIANT:+ (${VARIANT})}"
-              } > "$RUNNER_TEMP/premortem/comment.md"
-              echo "quota=true" >> "$GITHUB_OUTPUT"
-              exit 0
+              report_quota_skip
             elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
               echo "::error::The pre-mortem agent could not resolve its model - PREMORTEM_MODEL / PREMORTEM_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes. The stage status is reported as \`error\`."
             else
@@ -647,6 +658,17 @@ jobs:
           # fence the model may have wrapped around it.
           start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
           if [ -z "$start" ]; then
+            # opencode has been seen exiting 0 on the cap, with the signature on
+            # stdout: a zero exit is not a clean run, so this dead end is
+            # classified before it fails. The grep covers the raw stream and
+            # stderr both, and runs only here - a real report's own text may
+            # mention "quota", so a produced report is never re-classified.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.raw" "$out.stderr"; then
+              echo "::group::Agent output (last 4000 bytes)"
+              tail -c 4000 "$out.raw"
+              echo "::endgroup::"
+              report_quota_skip
+            fi
             echo "::error::Pre-mortem output has no summary line; not posting."
             cat "$out.raw"
             exit 1
@@ -683,6 +705,14 @@ jobs:
           verdict=$(printf '%s\n' "$last" | tr -d '*' \
             | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^[:alpha:]_-].*)?$/\1/p')
           if [ -z "$verdict" ]; then
+            # Same zero-exit cap as above: a report that starts but never reaches
+            # a valid verdict can still be the quota signature, on either stream.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.raw" "$out.stderr"; then
+              echo "::group::Agent output (last 4000 bytes)"
+              tail -c 4000 "$out.raw"
+              echo "::endgroup::"
+              report_quota_skip
+            fi
             echo "::error::Pre-mortem output does not end with a valid verdict line; not posting."
             cat "$out.raw"
             exit 1
@@ -812,7 +842,7 @@ jobs:
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
           {
             printf '# Pre-Mortem Action\n\n'
-            printf '**Summary:** Not run: quota - the free model was capped, rate-limited or refused before the agent could start; no pre-mortem was produced for this commit.\n\n'
+            printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable before the agent could start; no pre-mortem was produced for this commit.\n\n'
             printf 'Re-run the workflow after the quota resets.\n'
             printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
             printf '\n---\n_Automated pre-mortem not run: quota (%s skill)_\n' "$skill_name"
