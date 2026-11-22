@@ -19,8 +19,19 @@ import math
 from typing import Any
 
 
+class MoneyParseError(ValueError):
+    """A broker money field that is present but not readable as a finite float.
+
+    A ``ValueError`` subclass so every existing ``except ValueError`` keeps
+    working, but distinct enough for a caller to catch *only* parse failures:
+    ``reconcile_executions`` skips one malformed order per pass without also
+    swallowing programming errors or database-layer ``ValueError``s as
+    "unreadable order data".
+    """
+
+
 def parse_money(value: Any) -> float:
-    """``value`` as a finite float, or ``ValueError`` when it is not readable.
+    """``value`` as a finite float, or ``MoneyParseError`` when it is not readable.
 
     ``None`` is unreadable for a required money field: a broker that omits a
     quantity, price or balance has not told us zero, it has told us nothing.
@@ -29,13 +40,13 @@ def parse_money(value: Any) -> float:
     downstream.
     """
     if value is None or isinstance(value, bool):
-        raise ValueError(f"unreadable money value: {value!r}")
+        raise MoneyParseError(f"unreadable money value: {value!r}")
     try:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"unreadable money value: {value!r}") from exc
+        raise MoneyParseError(f"unreadable money value: {value!r}") from exc
     if not math.isfinite(parsed):
-        raise ValueError(f"non-finite money value: {value!r}")
+        raise MoneyParseError(f"non-finite money value: {value!r}")
     return parsed
 
 

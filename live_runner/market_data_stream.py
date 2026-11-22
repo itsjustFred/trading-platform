@@ -60,6 +60,12 @@ def _is_connection_limit_error(error: BaseException) -> bool:
 
 
 def _serialize_bar_payload(bar: Any) -> dict[str, Any]:
+    """Serialize one bar; every money field is strict-parsed.
+
+    ``volume=None`` drops the bar via the caller's ``ValueError`` handler —
+    fine for Alpaca, whose ``Bar.volume`` is required, but a feed that can
+    legitimately report no volume must not reuse this serializer unchanged.
+    """
     symbol = _normalize_symbol(getattr(bar, "symbol", ""))
     ts = getattr(bar, "timestamp", None)
     if isinstance(ts, str):
@@ -368,6 +374,7 @@ class LiveMarketDataStreamService:
             # zeros: a 0.0 close is a price a strategy could trade on.
             logger.error(
                 "Dropping market-data bar with unreadable price/volume",
+                exc_info=exc,
                 extra={
                     "data": {
                         "symbol": _normalize_symbol(getattr(bar, "symbol", "")),

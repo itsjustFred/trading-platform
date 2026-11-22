@@ -12,7 +12,16 @@ from decimal import Decimal
 
 import pytest
 
-from shared.money import parse_money, parse_optional
+from shared.money import MoneyParseError, parse_money, parse_optional
+
+
+def test_parse_failures_are_money_parse_errors() -> None:
+    # MoneyParseError is a ValueError (every existing handler keeps working)
+    # but distinct, so reconcile_executions can skip parse failures without
+    # also swallowing programming errors or database ValueErrors.
+    with pytest.raises(MoneyParseError):
+        parse_money("junk")
+    assert issubclass(MoneyParseError, ValueError)
 
 
 @pytest.mark.parametrize("value", [0, 0.0, -1.5, "12.5", " 3 ", Decimal("2.5")])

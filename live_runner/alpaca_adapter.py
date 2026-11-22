@@ -61,7 +61,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
-from shared.money import parse_money, parse_optional
+from shared.money import MoneyParseError, parse_money, parse_optional
 
 logger = get_logger("live-runner")
 
@@ -225,6 +225,29 @@ def _order_type(order: Any) -> str:
     return text.rsplit(".", 1)[-1]
 
 
+def _usable_stop_price(order: Any) -> float | None:
+    """An order's ``stop_price`` when it parses, else ``None`` — never raises.
+
+    The flatten reads this only to *restore* a protection if the close fails;
+    one malformed leg must not abort the flatten for every remaining symbol,
+    so an unreadable price is logged and treated as "no usable stop here".
+    """
+    try:
+        return parse_optional(_order_attr(order, "stop_price", None))
+    except ValueError:
+        logger.warning(
+            "Skipping an order with an unreadable stop_price",
+            extra={
+                "data": {
+                    "order_id": _control_order_id(_order_attr(order, "id")),
+                    "symbol": _order_symbol(order),
+                    "stop_price_raw": _order_attr(order, "stop_price", None),
+                }
+            },
+        )
+        return None
+
+
 def _stop_candidates(order: Any) -> Iterator[Any]:
     """Orders that may be a position's working stop: the order, and a filled parent's held legs.
 
@@ -249,10 +272,41 @@ def _protective_stop_of(
     if _order_type(candidate) != "stop":
         return None
     order_id = _control_order_id(_order_attr(candidate, "id"))
-    stop_price = parse_optional(_order_attr(candidate, "stop_price", None))
+    try:
+        stop_price = parse_optional(_order_attr(candidate, "stop_price", None))
+    except ValueError:
+        # One malformed candidate must not take down the whole account's
+        # protective-stop listing: skipping it leaves the symbol with zero
+        # listed stops, and the trailing path refuses to amend on anything
+        # but exactly one — the position keeps its broker-side stop.
+        logger.warning(
+            "Skipping a protective-stop candidate with an unreadable stop_price",
+            extra={
+                "data": {
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "stop_price_raw": _order_attr(candidate, "stop_price", None),
+                }
+            },
+        )
+        return None
     if order_id is None or stop_price is None or stop_price <= 0:
         return None
-    qty = parse_optional(_order_attr(candidate, "qty", None))
+    try:
+        qty = parse_optional(_order_attr(candidate, "qty", None))
+    except ValueError:
+        # Informational only: an unreadable quantity must not hide the stop.
+        logger.warning(
+            "Protective stop has an unreadable qty; reporting it as unknown",
+            extra={
+                "data": {
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "qty_raw": _order_attr(candidate, "qty", None),
+                }
+            },
+        )
+        qty = None
     return ProtectiveStop(
         order_id=order_id,
         symbol=symbol,
@@ -346,6 +400,24 @@ def _display_float(value: Any) -> float:
         return parse_money(value)
     except ValueError:
         return 0.0
+
+
+def _optional_display_money(value: Any, entry: dict[str, Any], field: str) -> float | None:
+    """Display-only optional money: absent stays ``None``; garbage is marked, not raised.
+
+    ``current_price``/``unrealized_pl`` are ``Optional[str]`` on the Alpaca
+    position model — null is a legitimate broker answer — and no risk path
+    reads them, so one malformed row must not take down ``get_positions``
+    (and with it the flatten and exit-sizing paths).
+    """
+    if value is None:
+        return None
+    try:
+        return parse_money(value)
+    except ValueError:
+        entry[f"{field}_unparseable"] = True
+        entry[f"{field}_raw"] = value
+        return None
 
 
 def _positive_finite(value: Any) -> float | None:
@@ -976,10 +1048,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 try:
                     if await self._reconcile_signal_fill(signal_id):
                         recovered += 1
-                except ValueError as exc:
+                except MoneyParseError as exc:
                     # An unreadable money field raises inside the parse; one
                     # malformed order must not stop the rest of the pass, and
-                    # nothing is persisted for it. The next pass retries.
+                    # nothing is persisted for it. The next pass retries. Only
+                    # parse failures are skipped — a programming error or a
+                    # database ValueError must surface, not read as "unreadable
+                    # order data".
                     logger.warning(
                         "Alpaca reconciliation skipped a signal with unreadable "
                         "order data",
@@ -2097,13 +2172,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 candidate_symbol = _order_symbol(candidate)
                 if candidate_symbol not in {"", symbol}:
                     continue
-                price = parse_optional(_order_attr(candidate, "stop_price", None))
+                price = _usable_stop_price(candidate)
                 if price is not None and price > 0:
                     return price
                 nested = _order_attr(candidate, "stop_loss", None)
-                nested_price = parse_optional(
-                    _order_attr(nested, "stop_price", None)
-                )
+                nested_price = _usable_stop_price(nested)
                 if nested_price is not None and nested_price > 0:
                     return nested_price
         return None
@@ -2571,9 +2644,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "symbol": str(getattr(row, "symbol", "")).strip().upper(),
                 "qty": _display_float(raw_qty),
                 "entry_price": parse_money(getattr(row, "avg_entry_price", None)),
-                "current_price": parse_money(getattr(row, "current_price", None)),
-                "unrealized_pnl": parse_money(getattr(row, "unrealized_pl", None)),
             }
+            entry["current_price"] = _optional_display_money(
+                getattr(row, "current_price", None), entry, "current_price"
+            )
+            entry["unrealized_pnl"] = _optional_display_money(
+                getattr(row, "unrealized_pl", None), entry, "unrealized_pnl"
+            )
             if raw_qty is None or not _is_parseable_qty(raw_qty):
                 # Keep the coercion for display consumers, but remember that the
                 # broker's value could not be read: the risk paths that decide
