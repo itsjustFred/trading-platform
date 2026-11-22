@@ -17,7 +17,11 @@ This file imports ``live_runner.daemon`` in a clean interpreter and scans every
 repo module that lands in ``sys.modules`` - the whole process, not just
 ``live_runner/``: the daemon also runs ``shared/``, ``risk/``, ``scheduler/``,
 ``signal_bots/`` and the ``runner/``/``data_tools/`` modules they pull in. A
-teardown hook in any of them never runs either. It fails on:
+teardown hook in any of them never runs either. Only first-party modules are
+scanned: third-party packages (which the probe finds whenever the venv lives
+inside the checkout, e.g. ``.venv/lib/.../site-packages/``) are excluded -
+their exit hooks are equally skipped under ``os._exit``, but policing
+their internals is not this guard's job. It fails on:
 
 * ``atexit`` imports and registrations (``atexit.register``, ``__import__`` or
   ``importlib`` loading of the module);
@@ -51,17 +55,29 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIVE_RUNNER = REPO_ROOT / "live_runner"
 
+# First-party top-level packages: directories in the checkout that are Python
+# packages. Anything else under the repo root - ``.venv/`` when the venv lives
+# inside the checkout (CI's ``uv sync`` layout), an editable-install target, a
+# vendored tree - is third-party or tooling code, not daemon surface.
+_FIRST_PARTY_PACKAGES = frozenset(
+    p.name
+    for p in REPO_ROOT.iterdir()
+    if p.is_dir() and (p / "__init__.py").is_file()
+)
+
 # ``os._exit`` is the contract itself; it may only be reached from the bounded
-# exit path and the second-signal force exit.
-OS_EXIT_ALLOWED = {"daemon.py", "shutdown.py"}
+# exit path and the second-signal force exit. Keyed by repo-relative path, not
+# bare filename: the scan is process-wide, so any other ``*/daemon.py`` must
+# not inherit the exemption.
+OS_EXIT_ALLOWED = {"live_runner/daemon.py", "live_runner/shutdown.py"}
 
 # ``signal.signal`` is the shutdown coordinator's deliberate choice (it works on
 # Windows and while the loop is busy); no other daemon module may install a
 # handler, and ``add_signal_handler`` is banned everywhere because the
 # coordinator's docstring records why it was rejected. Self-signals are held to
 # the same rule: they exist to drive the handler path, which only the
-# coordinator owns.
-SIGNAL_INSTALL_ALLOWED = {"shutdown.py"}
+# coordinator owns. Keyed by repo-relative path for the same reason as above.
+SIGNAL_INSTALL_ALLOWED = {"live_runner/shutdown.py"}
 _SIGNAL_FUNCTIONS = {"signal", "raise_signal", "pthread_kill"}
 
 _BANNED_MODULES = {"atexit", "multiprocessing"}
@@ -107,7 +123,9 @@ def _is_main_guard(test: ast.expr) -> bool:
 def _scan_source(rel_path: str, source: str) -> list[str]:
     """Every teardown-hook violation in one daemon-process module's source."""
     tree = ast.parse(source, filename=rel_path)
-    filename = Path(rel_path).name
+    # Allowlist keys are repo-relative paths with ``/`` separators, matching
+    # what ``_daemon_process_modules`` emits on every platform.
+    rel_key = rel_path.replace("\\", "/")
 
     # Nodes inside ``if __name__ == "__main__":`` only run when the file is the
     # process entry point; the daemon imports the module, so they are not part
@@ -262,13 +280,13 @@ def _scan_source(rel_path: str, source: str) -> list[str]:
         elif (
             module == "signal"
             and name in _SIGNAL_FUNCTIONS
-            and filename not in SIGNAL_INSTALL_ALLOWED
+            and rel_key not in SIGNAL_INSTALL_ALLOWED
         ):
             violations.append(
                 f"{rel_path}:{node.lineno} installs a signal handler"
             )
         elif module == "os" and name == "_exit":
-            if filename not in OS_EXIT_ALLOWED:
+            if rel_key not in OS_EXIT_ALLOWED:
                 violations.append(f"{rel_path}:{node.lineno} calls os._exit()")
         elif module == "sys" and name == "exit":
             violations.append(f"{rel_path}:{node.lineno} calls sys.exit()")
@@ -280,11 +298,30 @@ def _scan_source(rel_path: str, source: str) -> list[str]:
     return violations
 
 
+def _is_first_party(rel: str) -> bool:
+    """Whether a repo-root-relative path is a first-party daemon module.
+
+    First-party means the top-level segment is one of the checkout's Python
+    packages (``live_runner/``, ``shared/``, ...). Everything else under the
+    root - ``.venv/lib/.../site-packages/`` when CI's ``uv sync`` puts the venv
+    inside the checkout, a stray ``venv/``, an editable install - is excluded,
+    so third-party teardown hooks (Sentry's flush, certifi's temp files) are
+    not policed here.
+    """
+    parts = rel.split("/")
+    return (
+        parts[0] in _FIRST_PARTY_PACKAGES
+        and "site-packages" not in parts
+        and "__pycache__" not in parts
+    )
+
+
 def _daemon_process_modules() -> list[str]:
     """Repo-relative ``.py`` paths imported by ``live_runner.daemon``.
 
     Runs in a clean interpreter so ``sys.modules`` is exactly the daemon's
     import closure, independent of what this pytest session already loaded.
+    Only first-party modules are returned (see ``_is_first_party``).
     Paths use ``/`` separators so the result is portable.
     """
     probe = (
@@ -308,7 +345,7 @@ def _daemon_process_modules() -> list[str]:
         text=True,
         check=True,
     )
-    return json.loads(proc.stdout)
+    return [p for p in json.loads(proc.stdout) if _is_first_party(p)]
 
 
 def test_daemon_process_modules_have_no_interpreter_teardown_hooks() -> None:
@@ -344,6 +381,38 @@ def test_daemon_process_modules_have_no_interpreter_teardown_hooks() -> None:
         "the daemon leaves through os._exit, so interpreter-teardown hooks never "
         "run; these would break silently:\n" + "\n".join(violations)
     )
+
+
+def test_the_probe_scans_only_first_party_modules() -> None:
+    """The scan must never reach third-party code, wherever the venv lives.
+
+    CI's ``uv sync`` creates ``<repo>/.venv``, so third-party modules sit under
+    the repo root and a bare ``startswith(root)`` filter would scan them -
+    their ``__del__``/``atexit`` hooks are none of this guard's business, and
+    scanning them made CI red. Pin both the filter and the emitted paths.
+    """
+    # Synthetic paths the probe can emit when the venv is inside the checkout.
+    for third_party in (
+        ".venv/lib/python3.12/site-packages/anyio/_core/_sockets.py",
+        ".venv/lib/python3.12/site-packages/numpy/__init__.py",
+        "venv/Lib/site-packages/certifi/core.py",
+        "live_runner/vendor/site-packages/pkg/mod.py",
+        "scripts/one_off.py",
+        "docs/conf.py",
+    ):
+        assert not _is_first_party(third_party), third_party
+    for first_party in (
+        "live_runner/daemon.py",
+        "shared/database.py",
+        "risk/sizing.py",
+    ):
+        assert _is_first_party(first_party), first_party
+
+    rel_paths = _daemon_process_modules()
+    for rel in rel_paths:
+        assert "site-packages" not in rel.split("/"), rel
+        assert not rel.startswith((".venv/", "venv/")), rel
+        assert _is_first_party(rel), rel
 
 
 def test_the_guard_catches_a_planted_exit_hook() -> None:
