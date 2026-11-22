@@ -715,30 +715,37 @@ class TradeEngine:
                 else:
                     fill_price = bar_open
             elif order.order_type == OrderType.LIMIT:
+                # #288: like MARKET, a pending order may never fill on its
+                # creation bar — the signal is computed from that bar's
+                # close, so spending its range would be lookahead.
                 if order.direction == "LONG" and order.limit_price is not None:
-                    filled = bar_low <= order.limit_price
+                    filled = i > order.created_index and bar_low <= order.limit_price
                     fill_price = order.limit_price
                 elif order.direction == "SHORT" and order.limit_price is not None:
-                    filled = bar_high >= order.limit_price
+                    filled = i > order.created_index and bar_high >= order.limit_price
                     fill_price = order.limit_price
             elif order.order_type == OrderType.STOP:
                 if order.direction == "LONG" and order.stop_price is not None:
-                    filled = bar_high >= order.stop_price
+                    filled = i > order.created_index and bar_high >= order.stop_price
                     fill_price = order.stop_price
                 elif order.direction == "SHORT" and order.stop_price is not None:
-                    filled = bar_low <= order.stop_price
+                    filled = i > order.created_index and bar_low <= order.stop_price
                     fill_price = order.stop_price
             elif order.order_type == OrderType.STOP_LIMIT:
-                trigger = False
+                trigger = i > order.created_index
                 if order.direction == "LONG" and order.stop_price is not None:
-                    trigger = bar_high >= order.stop_price
+                    trigger = trigger and bar_high >= order.stop_price
                     filled = (
-                        trigger and order.limit_price is not None and bar_low <= order.limit_price
+                        trigger
+                        and order.limit_price is not None
+                        and bar_low <= order.limit_price
                     )
                 elif order.direction == "SHORT" and order.stop_price is not None:
-                    trigger = bar_low <= order.stop_price
+                    trigger = trigger and bar_low <= order.stop_price
                     filled = (
-                        trigger and order.limit_price is not None and bar_high >= order.limit_price
+                        trigger
+                        and order.limit_price is not None
+                        and bar_high >= order.limit_price
                     )
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
