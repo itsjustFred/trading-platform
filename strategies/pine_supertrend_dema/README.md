@@ -33,6 +33,9 @@ Keine Partial Exits implementiert.
 | Supertrend | Multiplier | 3.0 |
 | DEMA | Length | 9 |
 
+### Indikator-Semantik (P3, #317)
+Supertrend nutzt `ta.atr` (Wilder/RMA, SMA-Seed) und die manuelle Pine-Bandrekursion (`nz(band[1], band)`); DEMA ist `2*ta.ema - ta.ema(ta.ema)` mit SMA-Seed. Warm-up-Bars sind `NaN`, nie `0`. Gegenueber der Legacy-Implementierung: kein SMA(TR), kein Null-Warm-up, keine First-Seed-EMAs.
+
 ## Risk-Management
 - Stop-Distanz: Supertrend-/ATR-basiert ueber das untere Band
 - Position Sizing: Runner berechnet die Positionsgroesse ueber `--risk-pct` und `sl_price`

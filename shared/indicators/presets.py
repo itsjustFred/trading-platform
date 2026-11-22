@@ -248,8 +248,10 @@ def supertrend_pine_ta(
 
     ``ta.atr(period)`` is Wilder/RMA with an SMA seed over the first
     ``period`` valid true ranges and ``ta.tr(true)`` first-bar ``high-low``;
-    bands stay NaN through warm-up and the recursion ratchets/flips on the
-    previous/next close exactly as the Pine source does.
+    bands stay NaN through warm-up, ratchet on the previous close, and the
+    direction flips on the *current* close versus the previous-band
+    references (``up1``/``dn1``), exactly as the manual Pine Supertrend
+    does.
     """
     return supertrend(
         high,
@@ -359,12 +361,19 @@ def superosc_luxalgo(
     """LuxAlgo ``SuperTrend Oscillator`` main oscillator.
 
     Reproduces the ``upper``/``lower``/``trend``/``Spt``/``osc`` chain of
-    the LuxAlgo Pine source: ``ta.atr`` bands off ``hl2``, same-band
-    ratchets on the previous close, direction flips on the current close
-    versus the *previous* bands (1 = bullish/lower, 0 = bearish/upper,
-    NaN until the first flip), and
-    ``clip((close - Spt) / (upper - lower), -1, 1)`` with Pine safe
-    division (zero width -> NaN).
+    the ``pine_superosc_vumanchu`` source (manual Pine conversion from
+    indikatoren-repo): ``ta.atr`` bands off ``hl2``, same-band ratchets on
+    the previous close, direction flips on the current close versus the
+    *previous* bands (1 = bullish/lower, 0 = bearish/upper, NaN until the
+    first flip), and ``clip((close - Spt) / (upper - lower), -1, 1)`` with
+    Pine safe division (zero width -> NaN).
+
+    Source caveat: community ports of the public LuxAlgo script
+    (TradingView ``dVau7zqn``) flip the direction against the *current*
+    bar's bands; this preset keeps the previous-band flip because that is
+    what the strategy's own source computes. Whether the indikatoren-repo
+    Pine original matches LuxAlgo or the legacy Python is an open question
+    for the maintainer (#317 P3).
     """
     atr_v = atr_pine_ta(high, low, close, period).to_numpy(dtype=float)
     hl2_v = ((high + low) / 2.0).to_numpy(dtype=float)
@@ -444,6 +453,7 @@ def wavetrend_vumanchu(
 ) -> tuple[pd.Series, pd.Series]:
     """VuManChu WaveTrend ``(wt1, wt2)`` on Pine ``ta.ema``/``ta.sma``.
 
+    Verbatim from the public Cipher B Pine source (``f_wavetrend``):
     ``esa``/``de`` use the SMA-seeded ``ta.ema`` at ``channel_len``;
     ``wt1`` is ``ta.ema(ci, avg_len)`` and ``wt2`` is ``ta.sma(wt1,
     ma_len)``. Division by a zero ``0.015 * de`` follows Pine safe
