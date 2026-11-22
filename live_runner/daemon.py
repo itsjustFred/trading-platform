@@ -656,7 +656,7 @@ def _live_account_broker_login(account_id: str) -> str:
     """
     try:
         account = get_live_account(str(account_id))
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # `exception()` and not `error()`: this is an unexpected failure on the
         # routing path, and the traceback is the only thing that says whether the
         # account lookup itself blew up or something below it did. The empty
@@ -749,7 +749,7 @@ def _mark_discord_deployment_service_unhealthy(
                 }
             },
         )
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         logger.exception(
             "Could not mark the Discord service unhealthy after a StockKit route refusal",
             extra={"data": {"deployment_id": str(deployment.id)}},
@@ -886,7 +886,7 @@ def _apply_signal_processor(
         # must never change the trading decision.
         try:
             decision.set_features(market_features_from_frame(market_data))
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             logger.debug("Signal archive market features failed", exc_info=True)
     raw_signal = {
         "symbol": signal.symbol,
@@ -1215,7 +1215,7 @@ async def _check_entry_deviation(
         quote = await asyncio.wait_for(
             get_quote(signal.symbol), timeout=ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.warning(
             "Live quote unavailable; refusing the entry (deviation gate fails closed)",
             extra={"data": {**log_data, "error": str(exc)}},
@@ -1361,7 +1361,7 @@ async def _resolve_live_pip_value(
         resolved = await asyncio.wait_for(
             get_pip_value(signal.symbol), timeout=PIP_VALUE_FETCH_TIMEOUT_SECONDS
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         raise _refuse(f"{type(exc).__name__}: {exc}") from exc
     if not isinstance(resolved, LivePipValue):
         raise _refuse(f"adapter returned {type(resolved).__name__}, not LivePipValue")
@@ -1434,7 +1434,7 @@ def _position_qty_tolerance(adapter: BaseLiveAdapter, symbol: str) -> float:
         return DEFAULT_QTY_TOLERANCE
     try:
         raw = method(symbol)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.warning(
             "Could not read the instrument quantity precision; using the strict default",
             extra={"data": {"symbol": symbol, "error": str(exc)}},
@@ -1548,7 +1548,7 @@ async def _ensure_no_exit_in_flight(
         )
     try:
         working = {str(order_id) for order_id in await working_order_ids()}
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         raise ExitInFlightError(
             f"Refusing exit for {symbol}: a previous exit on this account is not "
             f"known to be finished and the broker's working orders could not be read "
@@ -2169,7 +2169,7 @@ async def prepare_order_with_risk(
         if get_equity is not None:
             try:
                 breaker_equity = float(await get_equity())
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 raise LossBreakerBreachError(
                     f"Refusing a live entry: account equity for "
                     f"'{deployment.account_id}' could not be read ({exc!r}); the "
@@ -2517,7 +2517,7 @@ def _deployment_is_currently_active(deployment: LiveDeploymentConfig) -> bool:
     """
     try:
         current = get_live_deployment(str(deployment.id))
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.warning(
             "Deployment status recheck failed; refusing to trade from stale snapshot",
             extra={
@@ -2745,7 +2745,7 @@ async def _renew_submission_claim_until_cancelled(token: str) -> None:
             renewed = await asyncio.to_thread(
                 renew_live_deployment_submission, token
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             # Keep trying: a transient DB error must not be what lets the lease
             # expire under an in-flight order.
             logger.error(
@@ -2982,7 +2982,7 @@ async def _submit_normalized_discord_signal(
             is_exit=False,
             decision=decision,
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         # Issue #308: an unexpected failure must still leave a decision
         # record — "one per (signal, deployment)" is only true if the escape
         # path records too. The exception is re-raised unchanged.
@@ -3095,7 +3095,7 @@ async def _prepare_claim_and_submit_signal(
             },
         )
         return
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         if is_exit:
             # A refused exit leaves this deployment's position open: an operator
             # has to look at it, so it is an error, not a skipped signal (#121).
@@ -3206,7 +3206,7 @@ async def _prepare_claim_and_submit_signal(
                 await asyncio.to_thread(
                     release_live_deployment_submission, claim_token
                 )
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 # The lease expires on its own; never let the cleanup turn a
                 # handled refusal into an exception that aborts the fan-out.
                 logger.exception("Could not release the submission lease")
@@ -3235,7 +3235,7 @@ async def _prepare_claim_and_submit_signal(
             broker_order_id = await adapter.submit_order(
                 prepared_signal, qty=prepared_qty
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             if is_order_not_submitted(exc):
                 # The adapter marked the failure as provably pre-request: the
                 # order never left the process, so the lease can be released
@@ -3244,7 +3244,7 @@ async def _prepare_claim_and_submit_signal(
                     await asyncio.to_thread(
                         release_live_deployment_submission, claim_token
                     )
-                except Exception:
+                except Exception:  # except-kind: loop-survival
                     # The lease expires on its own. Never let the cleanup turn a
                     # handled refusal into an exception that aborts the fan-out
                     # to the remaining deployments.
@@ -3320,7 +3320,7 @@ async def _prepare_claim_and_submit_signal(
 
     try:
         await asyncio.to_thread(release_live_deployment_submission, claim_token)
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         # The order is already at the broker, so the lease expiring on its own
         # is harmless. A cleanup failure must not abort the fan-out or skip the
         # "submitted" log line below.
@@ -3825,7 +3825,7 @@ def _create_adapter_for_account(
                 paper=paper,
                 account_id=account.id,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Could not initialize alpaca adapter",
                 extra={"data": {"account_id": account.id, "error": str(exc)}},
@@ -3853,7 +3853,7 @@ def _create_adapter_for_account(
                 accounts_env_path=_accounts_env_file(accounts_env_path or None),
                 connect_max_attempts=1,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Could not initialize ctrader adapter",
                 extra={"data": {"account_id": account.id, "error": str(exc)}},
@@ -3893,7 +3893,7 @@ async def _disconnect_adapter(
         result = disconnect_method()
         if inspect.isawaitable(result):
             await result
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         logger.warning(
             "Adapter disconnect failed",
             extra={
@@ -3953,7 +3953,7 @@ async def _run_discord_listener_with_retries(
             backoff_seconds = 2
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             if _is_terminal_discord_runtime_error(exc):
                 _DISCORD_AUTH_BLOCKED_ACCOUNTS.add(account_id)
                 _DISCORD_AUTH_BLOCKED_REASONS[account_id] = str(exc)
@@ -4009,7 +4009,7 @@ async def _run_discord_bot_service_listener(service: Service, source: DiscordSig
             backoff_seconds = 2
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             if _is_terminal_discord_runtime_error(exc):
                 _block_discord_service(service_id, exc)
                 logger.warning(
@@ -4166,7 +4166,7 @@ async def _reconnect_discord_bot_source(
             "Reconnected Discord bot %s",
             service.name,
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         if _is_terminal_discord_runtime_error(exc):
             _block_discord_service(service_id, exc)
             logger.warning(
@@ -4409,7 +4409,7 @@ async def _sync_discord_bot_services(
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             # One misconfigured service (e.g. missing allowlist) must not
             # starve its siblings for the rest of the tick.
             logger.warning(
@@ -4467,7 +4467,7 @@ async def sync_services_loop(
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Service sync iteration failed",
                 extra={"data": {"error": str(exc)}},
@@ -4549,7 +4549,7 @@ async def _poll_adapter_balance(
                 if get_equity is not None
                 else float(equity)
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Loss breaker equity read failed; skipping breaker observation "
                 "this poll (the entry gate still fails closed)",
@@ -4599,7 +4599,7 @@ async def _poll_adapter_balance(
         raise
     except CTraderAuthTerminalError as exc:
         await _handle_terminal_balance_error(adapters, account_id, adapter, exc)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         if _is_ctrader_pending_deferred_error(exc):
             logger.debug(
                 "Skipping cTrader balance snapshot while request is pending",
@@ -4705,7 +4705,7 @@ async def _backfill_commissions_once(adapters: dict[str, BaseLiveAdapter]) -> No
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Commission backfill failed; commissions stay unknown until the next pass",
                 extra={
@@ -5110,7 +5110,7 @@ async def _enforce_stopped_deployments(
             await asyncio.to_thread(
                 clear_live_deployment_stopped_enforced, deployment_id
             )
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
             logger.warning(
                 "Could not clear a stale STOPPED enforcement stamp",
                 extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
@@ -5183,7 +5183,7 @@ async def _enforce_stopped_deployments(
             )
         except NotImplementedError:
             cancelled = None
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             # Still flatten. The cancel failing says nothing about whether the
             # positions can be closed - the Alpaca flatten cancels its own
             # per-symbol orders - and leaving exposure open to protect a
@@ -5239,7 +5239,7 @@ async def _enforce_stopped_deployments(
             )
         except NotImplementedError:
             flattened = None
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.error(
                 "Failed to flatten positions for stopped deployment",
                 extra={
@@ -5289,7 +5289,7 @@ async def _enforce_stopped_deployments(
         except NotImplementedError:
             orphaned = None
             orphan_sweep_unsupported = True
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.error(
                 "Failed to sweep protections orphaned by the flatten; the account "
                 "is flat but a resting protection could still trigger",
@@ -5392,7 +5392,7 @@ async def _enforce_stopped_deployments(
             stamped = await asyncio.to_thread(
                 mark_live_deployment_stopped_enforced, deployment_id
             )
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
             logger.warning(
                 "Could not record STOPPED enforcement for a deployment; retrying next tick",
                 extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
@@ -5455,7 +5455,7 @@ async def _load_db_accounts_and_deployments(
                 exc,
                 extra={"data": {"deployment_id": str(deployment.id)}},
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             # Anything else reading the deployment's trailing mode can raise. It
             # must not cost the whole deployment list its sync tick: the
             # signal-time gates still refuse every signal this deployment makes,
@@ -5611,7 +5611,7 @@ async def _ensure_adapter_for_active_account(
 
     try:
         await adapter.connect()
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         if _is_terminal_ctrader_runtime_error(exc):
             _block_ctrader_account(account_id, exc)
             active_adapters.pop(account_id, None)
@@ -5798,7 +5798,7 @@ async def sync_deployments_loop(
         enforced_stopped_deployments = await asyncio.to_thread(
             list_stopped_enforced_deployment_ids
         )
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
         # Fail toward re-enforcing rather than toward skipping it: an empty
         # ledger repeats work, a wrong one would leave a stopped deployment with
         # open positions.
@@ -5946,7 +5946,7 @@ async def sync_deployments_loop(
             )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Deployment sync iteration failed",
                 extra={"data": {"error": str(exc)}},
@@ -6036,7 +6036,7 @@ async def run_daemon(
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.exception("Live daemon crashed")
         with contextlib.suppress(Exception):
             capture_exception(

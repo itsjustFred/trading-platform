@@ -108,7 +108,7 @@ def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:
     try:
         broker = getattr(adapter, "broker_name", "")
         can_amend = getattr(adapter, "supports_stop_amendment", False) is True
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return live_supported_trailing_modes(None, supports_stop_amendment=False)
     return live_supported_trailing_modes(broker, supports_stop_amendment=can_amend)
 
@@ -126,7 +126,7 @@ def adapter_live_trailing_timeframes(adapter: Any) -> frozenset[str]:
         serves = getattr(adapter, "supports_market_data_timeframe", None)
         if callable(serves):
             timeframes = frozenset(item for item in timeframes if serves(item))
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return frozenset()
     return timeframes
 
@@ -293,7 +293,7 @@ class LiveTrailingStopManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 self._surface(
                     "Live trailing-stop pass failed for account; broker-side stops are unchanged",
                     exc,
@@ -404,7 +404,7 @@ class LiveTrailingStopManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 needs_retry |= self._record_failure(key, entry, exc, context, moment)
         return needs_retry
 
@@ -454,7 +454,7 @@ class LiveTrailingStopManager:
             stops = list(await adapter.list_protective_stops())
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return None, self._record_outage(outage, exc, account_context, moment)
         self._resume(outage, account_context)
         return stops, False
@@ -873,7 +873,7 @@ async def run_trailing_stops_loop(
             await manager.run_once(eligible_adapters(), current_deployments())
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             LiveTrailingStopManager._surface(
                 "Live trailing-stop tick failed", exc, {"phase": "tick"}
             )
