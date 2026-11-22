@@ -4,13 +4,17 @@ Status: credential-gated as of 2026-07-13.
 
 ## Preconditions
 
-- `.accounts.env` exists and remains gitignored.
+- `.accounts.env` exists and remains gitignored. Entry points that need a different file take it
+  as an explicit argument (preflight's `--accounts-env`, the daemon's `accounts_env` parameter);
+  there is no environment override, so every reader resolves the same path.
 - Alpaca account blocks `ACC1..3` (Nitro, RamJet, RocketFuel) contain paper endpoints only; IDs werden aus `.accounts.env` aufgeloest, nicht hier dokumentiert.
 - Discord bot tokens and channel IDs are set for Nitro, RamJet, and RocketFuel.
 - cTrader credentials are demo credentials if the cTrader smoke is run.
 - Trailing stops: live support is per broker (see "Live Trailing Stops" below). Alpaca executes
   `none` and `percent`; cTrader executes `none` only. Any other combination is rejected when the
-  deployment is validated and again at signal time, before anything reaches the broker.
+  deployment is validated and again at signal time, before anything reaches the broker — including
+  a mode that only comes from the bot's own config default, which is read from the processor the
+  deployment runs.
 
 ## Live Trailing Stops
 
@@ -75,13 +79,21 @@ results stop predicting live behaviour:
 - Deployment validation: `LiveDeploymentConfig` rejects a `trailing_mode` override no live broker
   executes; `create_live_deployment`, `update_live_deployment_account` (re-point) and the YAML
   parser reject one the deployment's account broker does not execute.
+- Deployment validation, bot default: the mode is a setting of the *bot*
+  (`signal_bots/<bot>/config.yaml`) and the processor emits it with every signal, so a default that
+  the deployment's broker cannot execute is just as fatal. Those three stages build the processor
+  the deployment actually runs (bot config merged with the deployment's
+  `signal_processor_config`, exactly as the daemon builds it) and ask it for the mode
+  (`shared.trailing.validate_live_deployment_trailing_mode`). A deployment that sets
+  the override explicitly is covered by the check above and is not built twice.
 - Signal time: the signal-processor gate and the order-preparation gate both check the mode
   against the adapter that would submit the order (broker table and the adapter's own
   `supports_stop_amendment` flag). A refused signal is not traded; a requested trail is never
   dropped silently.
-- Stored rows: a stored deployment whose trailing override no live broker executes still loads
-  (so it stays listed and can be stopped); the daemon logs an error for it at load and every
-  signal it produces is refused before it reaches the broker.
+- Stored rows: a stored deployment whose trailing override no live broker executes, or whose
+  processor's own default one does not, still loads (so it stays listed and can be stopped); the
+  daemon logs an error for it at load and every signal it produces is refused before it reaches
+  the broker.
 
 **How `percent` is executed (Alpaca)**
 
@@ -102,10 +114,9 @@ results stop predicting live behaviour:
   a session late versus replay. `4h`/`1w` are not served by the adapter at all. Per #150 such an
   entry is refused, not traded untrailed: a `percent` entry on an untrailable timeframe is rejected
   at signal time (processor gate and order-preparation gate), and a deployment that sets
-  `trailing_mode: percent` in `signal_processor_config` is rejected at API create and YAML parse. A
-  deployment whose trailing mode only comes from the signal processor's own default cannot be
-  checked before a signal exists; it is refused at its first entry. Session-aligned daily trailing
-  is a follow-up.
+  `trailing_mode: percent` in `signal_processor_config` is rejected at API create and YAML parse, and
+  so is a `percent` mode that only comes from the bot's own config default. Session-aligned daily
+  trailing is a follow-up.
 - Amendment: the protective stop order is replaced in place (`PATCH /v2/orders/{id}`). The
   previous stop keeps working until the replacement is accepted and stays if it is refused; the
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
@@ -155,7 +166,7 @@ results stop predicting live behaviour:
   failure on every pass and nothing is amended.
 - Real-money accounts are never amended: the loop only receives connected demo/paper adapters,
   the same hard block that applies to orders.
-**Verified on Alpaca paper (2026-11-16)**
+**Verified on Alpaca paper (2026-11-16, parts re-checked 2026-11-20)**
 
 Probe on a paper account (endpoint host checked as `paper-api.alpaca.markets`): 1 share of `F`
 as a market bracket entry (stop 3 % below, take profit 5 % above), then listings, a replace and a
@@ -166,12 +177,82 @@ clean-up.
   any open listing.** `AlpacaLiveAdapter.list_protective_stops` therefore also reads filled
   parents of symbols with an open position from a `status=all`, `nested=true` listing and takes
   their `held` stop legs (fixed in this PR; before it a real bracket position reported "no stop").
+- The same leg, on the same account and shape, is what the STOPPED sweeps have to cancel: the
+  flatten (`close_all_positions`) and the orphan-protection sweep (`cancel_orphaned_protections`)
+  now read the identical `status=all`, `nested=true` listing (the flatten for the position's
+  symbol, the orphan sweep account-wide), a leg in `pending_cancel` counts as resting, and a
+  refused cancel is excused only for an order that is no longer resting *and* left without
+  executing (#245; before it the flatten returned
+  `orders-still-working ... NO-STOP-RESTORED` on every bracket position and an orphaned stop leg
+  could survive a stop). Cancelling one leg cancels the other at the broker, so the second cancel
+  of a pair is refused for an order the broker has already removed - that is the OCO, not a
+  dropped cancel.
+- The `status=all` listing is newest-500-rows at a time, and a mature account fills that page
+  with terminal orders, so a full page pages back through the history (bounded at 20 pages)
+  instead of failing: an account trading one bracket a day reaches 500 orders within two
+  years, and a flatten that failed on its own order book would leave the position open. A 20th
+  full page fails too: exactly 10,000 orders cannot be told apart from a longer history. The page cursor goes past the oldest row it saw by a
+  microsecond, so no order at the boundary is skipped. (`status=open` still refuses a full
+  page: 500 *working* orders means orders the sweep cannot see.)
+- The orphan sweep's leg lookup is account-wide, bounded by the same 20-page budget: a bracket's
+  take profit names the symbol a `held` stop leg rests on, but the OTO entry this platform
+  submits for an unbounded take profit has a stop leg and no take-profit sibling to derive the
+  symbol from.
+- A stop that filled while its leg was being cancelled ends the flatten with the position already
+  flat, and restoring a stop then would create the orphan these sweeps exist to remove, so the
+  restore re-reads the position first and skips itself on a flat one. The same read sizes and
+  sides the stop it restores: the leg that fills on its way out leaves a smaller position than
+  the flatten started from, and a stop sized from the old quantity oversells it. A position the
+  broker will not report is not sized either - the restore refuses and the sweep reports the
+  naked position, rather than placing an order for a quantity nobody read.
+- The orphan sweep re-reads the working book after its cancels, as the flatten does, and reports
+  anything it cancelled that is still resting as a failure so the sweep is incomplete: Alpaca
+  keeps a cancel it accepted listed as `pending_cancel` until it settles, and a leg that is
+  still listed can still fill. A verification it cannot make is a failure too. (An accepted
+  cancel that left the leg resting is *not* reported as `pending_cancel` here, unlike the
+  entry-cancel sweep: the daemon gates the STOPPED stamp on this sweep being `complete`, and
+  `pending_cancel` does not make an outcome incomplete, so it would be read as a clean sweep.)
+- That verification is scoped to the symbols the sweep cancelled, and the scope is those
+  symbols however many cancels it took to clear them - both legs of one orphaned bracket, or two
+  brackets on one symbol, do not widen it, because the daemon runs this sweep every sync tick
+  and retries while it is incomplete, so two 20-page nested scans per pass is what turns a long
+  order history into a rate limit. Only an id whose symbol could not be resolved falls back to
+  account-wide, because that id names no bound.
+- The flatten places a held leg by the parent it rests under, in both its cancel list and its
+  cancel verification: a leg that arrives without a symbol of its own is still on the symbol
+  being flattened. Read as "another symbol" it survives the cancel, its stop keeps reserving the
+  position's quantity, and the close is then refused for that reservation - a flatten that cannot
+  finish. A leg whose parent names another symbol is still left out.
+- A stop is not restored onto a working book nobody could re-read. That re-read is what proves
+  no stop still works, and it is also the part that can fail now that the held-leg lookup is
+  paged; restoring anyway places a second stop beside whatever the broker kept, and two stops
+  reduce a position twice - the extra one an orphan the moment the first fills. The position is
+  then unprotected until the next enforcement retry, which the sweep reports.
+- The excusal is settled by one read of the order by id, not by re-listing the working book: a
+  terminal state already proves the order is not resting, and the book is the page-limited
+  nested history - up to 20 requests of 500 rows - so a sweep with several refused cancels on a
+  mature account is what turns into a rate limit, and a rate limit fails the sweep closed. A
+  cancelled order that partly filled does not excuse its refusal (it executed), and neither
+  does one whose filled quantity cannot be read. Alpaca has no `done` order status; its
+  end-of-day state is `done_for_day`, which resumes the next session and is not an excusal.
+- Paper check of #245 (2026-11-20, `ACC1`, endpoint host read as
+  `https://paper-api.alpaca.markets`, 1 share of `F` as a resting limit bracket, nothing left
+  behind after the run). The filled-bracket shape could **not** be produced in that session: the
+  equity market was closed until the next Monday 09:30 ET, and the broker refuses both `bracket
+  orders do not support extended hours trading` (40310000) and crypto brackets (`crypto orders
+  not allowed for advanced order_class: otoco`). Verified live instead: the `status=all,
+  nested=true` request (scoped by `symbols`, and account-wide) is accepted and parsed against real
+  alpaca-py objects, a `held` leg under a *not yet filled* parent is correctly not treated as a
+  protection of a position, the orphan sweep cancelled a resting bracket parent on a flat symbol
+  and left nothing behind, and the OCO behaviour the excusal is built on: cancelling the
+  take-profit leg takes the stop leg with it, and both then read back by id as `canceled`. The
+  run left no working order and no position behind. The flatten and the stop restore on the
+  recorded (filled-parent) shape are pinned by `tests/test_alpaca_adapter.py`, which reproduces
+  it. Re-run the sweep check at the next regular session to confirm on the live shape
+  (tracked in #322).
 - `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
-- Not covered by this PR: `close_all_positions` on a bracket with a `held` stop leg returned
-  `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
-  cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
 ## Strategy Promotion Gate (#165)
 
@@ -264,13 +345,55 @@ reuses its hashing and atomic-write helpers. A missing, unreadable or malformed
 ledger, a missing strategy file or unreadable `STRATEGY_META`, an unknown
 processor: all mean `experimental`, and the deployment is refused on real money.
 
+### The evidence files are re-hashed on every check (#260)
+
+A promotion also records the **path and SHA256 of each of the three evidence
+files**: the optimization result, the paper-trading report and the parity
+report. They are re-opened and re-hashed every time the promotion is checked,
+so a result or a report edited after the promotion -- or deleted -- makes the
+code `experimental` again, exactly like a changed strategy file. Without that,
+the verdict could stand on a file nobody had looked at since the promotion.
+
+- An evidence file inside the repository is recorded as a repository-relative
+  POSIX path, so the ledger stays portable across checkouts.
+- An evidence file outside the repository (a data directory, a machine-local
+  report) is recorded absolutely, and only verifies where that file still
+  exists: a promotion is then in force only on the machine that recorded it. That
+  is the safest reading available -- the alternative would be a path nothing can
+  resolve elsewhere, recorded as if it could.
+- The optimizer writes its result to `DATA_DIR/optimizations` (git-ignored, so
+  `<repo>/data/optimizations` while `DATA_DIR` is unset), so a machine that trades
+  real money needs that data directory: without the recorded files the promotion
+  is refused there rather than waved through. `runner/portfolio_optimizer.py`
+  still writes its own hardcoded `<repo>/data/optimizations` and ignores a
+  configured `DATA_DIR`, so check where the tool that produced the result put it
+  -- the recorded path is the one every check re-hashes.
+- Ledgers written before #260 record the file *names* only. Such a record cannot
+  be re-verified, so it is refused until the promotion is recorded again with the
+  current CLI (one command, the same evidence): the new record replaces the old
+  one for the same parameter set, and records of other parameter sets are kept.
+  A promotion recorded this way is what the ledger holds from then on.
+- Re-recording needs the evidence files themselves, so an evidence file that was
+  cleaned up (an old `DATA_DIR/optimizations` run, a scratch paper report) has no
+  recovery shortcut: re-run what produced it -- the optimization for the
+  out-of-sample part, the paper run for the paper report, the parity harness for
+  the parity report -- and record the promotion again with the new files. The
+  command exits non-zero naming the missing file, and writes nothing, so a
+  half-re-recorded promotion is not possible.
+- Before deploying this change, look for `*.promoted.json` ledgers (they sit next
+  to the promoted file) and re-record every one of them: each pre-#260 ledger
+  drops its deployment to `experimental` on the first check after the upgrade and
+  the daemon then refuses its entry orders until it is re-recorded. Check the
+  evidence files still exist first; the runbook of an upgrade that must not stop
+  trading is to re-record and only then restart the daemon.
+
 ### Recording a promotion (CLI only)
 
 ```bash
 uv run python -m runner.cli promote \
     --strategy example_sma \
     --promoted-by "Jane Doe" \
-    --optimization-result optimizations/opt-123.json \
+    --optimization-result data/optimizations/opt-123.json \
     --paper-account-id 10105152 --paper-broker ctrader \
     --paper-start 2026-08-01 --paper-end 2026-10-15 --paper-trades 42 \
     --paper-report docs/reports/paper_example_sma.csv \
@@ -279,12 +402,28 @@ uv run python -m runner.cli promote \
     --parity-report docs/reports/parity_example_sma.json
 ```
 
+The paths are the ones this repository uses: `data/optimizations` is
+`DATA_DIR/optimizations` with `DATA_DIR` unset (the default) -- pass the path the
+optimizer actually wrote wherever `DATA_DIR` points.
+
+An evidence file no other checkout can see makes a promotion that is not
+portable: the ledger has to be committed and its evidence files have to exist
+where the ledger is in force. This repository ignores every `*.csv`, so the
+`--paper-report` above is git-ignored and a promotion recorded with it would be
+refused on the next clone. Such a report belongs outside the repository (recorded
+absolutely, in force on that machine only) or as a copy that git tracks.
+
 For a signal bot use `--signal-processor ramjet` and pass the deployment's
 `signal_processor_config` as `--params '{...}'` (`--params` is refused for a
 strategy). The out-of-sample evidence is read from the result file, not typed
-in. Both report files must exist; their SHA256 is recorded. Every argument is
-mandatory, and the command exits non-zero without writing anything if any
-evidence is missing or below a threshold.
+in. All three files must exist; their path and SHA256 are recorded and re-hashed
+on every check. Every argument is mandatory, and the command exits non-zero
+without writing anything if any evidence is missing, below a threshold, or
+cannot be named for the ledger.
+
+Re-record a promotion that was made before #260 (same command, same evidence)
+to bind the evidence files; see "The evidence files are re-hashed on every
+check" above.
 
 ### Enforcement points (fail closed)
 
@@ -318,6 +457,30 @@ by hand, through `PUT /api/live/deployments/{id}/status`, which re-verifies the
 account against the broker and still refuses a non-demo one. The dry run reports
 the same: a preview never shows `ACTIVE` rows the deploy would not get.
 
+## Broker Position Quantity (#263)
+
+Every entry order reads the broker's open positions twice: as a count for
+`max_positions` and as the risk-at-stake estimate for `max_total_exposure`
+(`live_runner.daemon._broker_exposure_estimate`). A position row the platform
+cannot read a quantity from — a value that is not a number, `nan`/`inf`, a
+boolean, a missing or `None` `qty`, or Alpaca's `qty_unparseable` marker — used
+to be counted as zero, which reads as "the account is flat". It now fails
+closed, because sizing an entry against an unknown book could open a position
+on top of a cap that is already full.
+
+- Refusal: `UnreadableBrokerPositionQtyError` from `prepare_order_with_risk`, so
+  the entry takes the same skip-and-log path every other entry refusal does and
+  nothing reaches the broker. Exit-only orders are unaffected: they size
+  against the deployment's own ledger, not the count.
+- Alert: ERROR `ALERT: broker position quantity is unreadable; ...`
+  (`alert=broker_position_qty_unreadable`, with account, deployment, signal
+  symbol, the row's symbol, the raw quantity and its row index) and a Sentry
+  event. There is no automatic retry: each new signal of that deployment refuses
+  the same way while the broker reports an unreadable row.
+- Operator action: read the position on the broker, reconcile the ledgers if
+  the quantity is real, and pause the deployment if the broker keeps reporting
+  a row without a usable quantity.
+
 ## Provisioning and Rotation
 
 Provision the deployment file from `live_deployments.example.yaml` into the
@@ -340,6 +503,10 @@ must still be rotated when an account is retired or reassigned.
 uv sync --all-extras
 uv run python -m live_runner.preflight --config live_deployments.yaml --accounts-env .accounts.env
 ```
+
+The test suite never reads this file: `tests/conftest.py` points every default at a sandbox path and
+fails the run if anything opens the real one, so a local run and CI resolve the same credentials
+(none). A test that needs credentials writes its own under `tmp_path`.
 
 The daemon trades the ACTIVE rows of the `live_deployments` table, not the YAML. Add `--check-db`
 (read-only; `--db-path` overrides `DATABASE_URL` / `DATA_DIR/backtests.db` and implies
@@ -435,6 +602,9 @@ The cTrader smoke registers the demo account in `live_accounts` if it is not the
 database), because its parent deployment row has a foreign key to it. An account that already
 exists is left untouched.
 
+The smoke places its orders through `submit_order_with_risk`, so it is refused like any other entry
+while its account is halted (see "Kill Switch" below). That is deliberate: a smoke is still an order.
+
 ## Demo Daemon
 
 Only run after the paper smoke succeeds.
@@ -450,6 +620,117 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 > NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+## Kill Switch (#300)
+
+One operator action halts trading. It is written to the `live_kill_switch` table of the live
+database, so it survives a restart, a redeploy and the daemon being down altogether: the
+daemon reads it again on its first tick after starting.
+
+| Mode | New entries | Working orders | Open positions |
+|------|-------------|----------------|----------------|
+| `entries` | refused | left alone | left alone |
+| `orders` | refused | cancelled | left alone |
+| `flatten` | refused | cancelled | closed, then the protections the flatten orphaned are swept |
+
+Two checkpoints, both fail closed:
+
+- **Before every entry.** `prepare_order_with_risk`, the single chokepoint every entry order of
+  every deployment (Discord and internal alike) passes through. It runs *after* the exit branch
+  there, so a halt never blocks closing a position - trapping an operator in open exposure is
+  the opposite of what the feature is for. It also runs before any broker state is read, so a
+  halted account costs no round-trip.
+- **On every tick.** The deployment-sync loop, so a halt written while nothing was running is
+  enforced by the first tick after a restart. A completed sweep is repeated every
+  `KILL_SWITCH_SWEEP_INTERVAL_SECONDS` (30 s) while the halt stands, because refusing entries
+  stops the daemon opening risk, not a human at the broker.
+
+Fail closed means the cheap failure: a halt state that cannot be read, or a stored mode this
+build cannot interpret, refuses **entries** and sweeps **nothing**. An empty read is
+indistinguishable from "nothing is halted", which is the one answer a kill switch must never
+produce by accident. Nothing is ever liquidated on a database error.
+
+### Scopes
+
+One halt per scope: the reserved `global` scope, plus one scope per live account. The strictest
+halt wins, so a per-account write may only add restriction, never lift a platform-wide one. A
+scope that names no live account is refused - a typo'd halt would look armed while halting
+nothing. `accounts` lists the scopes that exist.
+
+A scope is cleared by stamping `cleared_at` rather than deleting the row, so "who halted this
+account, when, and who lifted it" stays answerable after the incident. A standing halt may only
+be made stricter: re-writing a halted scope with a weaker mode is refused, because a step-down
+from `flatten` to `entries` would stop the sweeps behind a row that still reads as halted. Lift
+the halt instead - that is an attributed action, and the sweep ledger then starts clean.
+
+### CLI
+
+```bash
+uv run python -m scripts.live_kill_switch status
+uv run python -m scripts.live_kill_switch accounts
+uv run python -m scripts.live_kill_switch halt --scope global --mode flatten --reason "incident 42"
+uv run python -m scripts.live_kill_switch halt --scope ACC1 --mode orders --actor "Jane Doe"
+uv run python -m scripts.live_kill_switch resume --scope global
+```
+
+`--help` answers without touching the database, and importing the module starts nothing: the
+daemon is never started from here. `status` and `accounts` are read-only. The script carries the
+import-origin guard the other data-mutating scripts carry, so it must be run as
+`python -m scripts.live_kill_switch` from the repository root - a direct `python
+scripts/live_kill_switch.py` is refused rather than halting trading against another tree's
+database.
+
+### Viewer
+
+| Endpoint | Effect |
+|----------|--------|
+| `GET /api/live/kill-switch` | the state the daemon enforces, plus every scope's mode, since, by and reason |
+| `POST /api/live/kill-switch/halt` | halt one scope; `confirmed_scope` required for `orders` and `flatten` |
+| `POST /api/live/kill-switch/resume` | lift the halt on one scope; `confirmed_scope` required |
+
+`entries` is deliberately unconfirmed: it refuses new entries and can cost nothing, so it stays
+one click in an incident. The modes that move money, and resuming trading, are confirmed on the
+server - the API is directly callable, so a dialog in the UI constrains nothing but the UI.
+Every attempt, refused ones included, is attributed in `live_control_audit`
+(`GET /api/live/audit`, or `X-Operator` for the claimant).
+
+### What a halt does not do
+
+- It does not disconnect the adapter. A halted account that still needs a sweep keeps its
+  adapter connected for the sweep - the same retention STOPPED enforcement uses. Only the
+  *deployment execution* listeners are gated on the runnable set, so retention never grants
+  trading permission; a Discord connection for an ACTIVE deployment can still be listening, and
+  what stops its orders is the entry gate, not a missing listener.
+- It does not stop the live trailing-stop loop (#167). A `flatten` sweep cancels what the flatten
+  orphaned; an `entries` halt leaves every working order exactly where it is.
+- It does not replace STOPPED. A STOPPED deployment is a deployment-level stop enforced once per
+  transition; the kill switch is an account- or platform-level halt that stays in force until it
+  is lifted.
+- It is not a guarantee about the broker. An account whose halt cannot be enforced (no adapter
+  can be connected, the broker refuses a cancel, or a cancel is still settling in
+  `pending_cancel` - such an order can still fill in a cancel/fill race) is reported as `unmet`
+  or `without_adapter` in an ERROR every tick, and its entries are still refused. A halt that
+  could not be enforced says so rather than looking clean.
+- It does not cover manual order paths that bypass the daemon's entry gate.
+  `live_runner/test_signal_trigger.py --live` calls `adapter.submit_order` directly for
+  slippage-pipeline testing, so the kill switch does not see it. `scripts/live_smoke.py`
+  is not gated either: only some of its checks go through `submit_order_with_risk`,
+  while its cTrader order worker calls `adapter.submit_order` directly and its Alpaca
+  round-trip check submits `MarketOrderRequest`s straight to the broker client (the
+  smoke buy *and* its close). Do not run either `--live` tool against a halted
+  account.
+
+### Verifying
+
+```bash
+uv run python -m scripts.live_kill_switch status        # what is in force right now
+curl -s localhost:5556/api/live/kill-switch | jq .      # same state, from the viewer
+curl -s "localhost:5556/api/live/audit?limit=5" | jq .   # who set or lifted what
+```
+
+In the daemon log: `Enforced a halted account: orders cancelled and positions flattened` for a
+completed sweep, `Halt not fully enforced on this account` for one that fell short, and `Entry
+refused by the kill switch` at the entry gate.
 
 ## Market-data symbol classification (Alpaca, #122)
 
@@ -469,6 +750,25 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 - `live_executions.timestamp` drives PnL ordering and is never invented (#135). A fill takes the stream event's own timestamp, then the order's `filled_at`, then its `updated_at`; a stamp that carries no time of day (a bare date such as `2026-11-03`) is refused rather than read as midnight. When none parses, no row is stored: the stream path logs the quantity it dropped (`filled_qty`, `broker_cumulative_filled_qty`) and the reconciled path logs `missing_filled_qty`, and both say the retry is the next adapter connect, because Alpaca reconciliation runs on `connect()` only - there is no periodic pass. Until then the local filled quantity understates the broker's, so exit sizing and duplicate-order protection size against a flat position.
 - Every PnL reader treats a `sent_bad`/`absent`/`derived_unavailable` (or non-positive) price as unknown: API rows carry `actual_price: null` and `slippage: null`, and live stats report `total_pnl: null`, `pnl_complete: false` and `price_unknown_count`; the frontend shows "incomplete" instead of a number.
 
+## Signal Bot Health Check (#158)
+
+The signal bot health check stays a standalone script plus scheduler job —
+there is deliberately no `runner.cli` subcommand for it.
+
+- Run it manually (no flags; JSON on stdout, exit code `0` = ok, `1` = error):
+
+  ```bash
+  uv run python -m signal_bots.health_check
+  ```
+
+- Schedule it via the viewer **Services** page ("+ Add Scheduled Job", job type
+  `signal_bot_health_check`, cron in UTC) or `POST /api/services` with
+  `type: "scheduled_job"`, `status: "running"`, and
+  `config: {"cron": "...", "job_type": "signal_bot_health_check"}`. The
+  scheduler runs inside `live_runner.daemon`; results land as background task
+  records visible in the viewer. Details: `docs/signal_bots.md` ("Health-Check
+  Status").
+
 ## Commission sign migration (cTrader, #205)
 
-`live_executions.commission` is a positive cost for every broker. The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge, which is indistinguishable from a new-convention rebate and is never converted. Roll out as stop, deploy, start; do not run old and new builds side by side.
+`live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.

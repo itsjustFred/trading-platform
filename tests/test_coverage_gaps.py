@@ -450,8 +450,10 @@ class TestSegmentCoverageWeekends:
         )
 
     def test_hourly_segment_with_weekend_gap_passes(self, tmp_path):
-        # Fri 22:00 -> Mon 00:00 UTC gap is weekend, not missing data.
+        # FX reopens Sunday 22:00 UTC (17:00 ET); the Fri->Sun closure is the
+        # only expected gap. Sunday-evening bars are real FX data (#133).
         stamps = list(pd.date_range("2024-01-05T00:00", "2024-01-05T22:00", freq="1h", tz="UTC"))
+        stamps += list(pd.date_range("2024-01-07T22:00", "2024-01-07T23:00", freq="1h", tz="UTC"))
         stamps += list(pd.date_range("2024-01-08T00:00", "2024-01-08T10:00", freq="1h", tz="UTC"))
         _write_bars(
             tmp_path / "ohlcv" / "dukascopy" / "forex" / "EURUSD" / "1h.parquet",
