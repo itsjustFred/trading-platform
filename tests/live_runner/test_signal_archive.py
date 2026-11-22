@@ -916,7 +916,16 @@ def test_claim_and_submit_success_records_traded(
         timestamp=datetime.now(timezone.utc),
         metadata=dict(normalized.metadata),
     )
-    prepared_signal = SimpleNamespace(symbol="AAPL", action="buy")
+    prepared_signal = SimpleNamespace(
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=190.5,
+        metadata={
+            "entry_price": 190.5,
+            "stop_loss": 185.0,
+            "take_profit": 200.0,
+        },
+    )
 
     async def _prepare_order(_adapter, _deployment, _signal):
         return prepared_signal, 1.0
@@ -924,6 +933,34 @@ def test_claim_and_submit_success_records_traded(
     class _Adapter:
         async def submit_order(self, _signal, qty=None):
             return "ord-42"
+
+        async def get_quote(self, symbol):
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=190.5,
+                ask=190.5,
+                timestamp=datetime.now(timezone.utc),
+                source="test",
+            )
+
+        async def get_pip_value(self, symbol):
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0,
+                units_per_qty=1.0,
+                conversion_rate=1.0,
+                quote_asset="USD",
+                account_asset="USD",
+                source="test",
+            )
+
+        async def get_equity(self):
+            return 100_000.0
+
+        async def get_used_margin(self):
+            return 0.0
 
     monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
     monkeypatch.setattr(

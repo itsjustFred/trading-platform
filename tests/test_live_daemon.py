@@ -922,6 +922,9 @@ class _SignalSubmittingAdapter:
     async def get_balance(self):
         return 100_000.0, 100_000.0
 
+    async def get_equity(self):
+        return 100_000.0
+
     async def get_positions(self):
         return []
 
@@ -1558,12 +1561,18 @@ def test_balance_polling_fans_out_across_accounts(monkeypatch) -> None:
             completions.append("slow")
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
     class _FastAdapter:
         _connected = True
 
         async def get_balance(self):
             completions.append("fast")
             return 100_000.0, 100_000.0
+
+        async def get_equity(self):
+            return 100_000.0
 
     monkeypatch.setattr(daemon_module, "save_live_balance", lambda _record: True)
 

@@ -542,6 +542,9 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
 
@@ -634,6 +637,9 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
 
@@ -720,6 +726,9 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
 
         async def get_balance(self):
             return 100_000.0, 100_000.0
+
+        async def get_equity(self):
+            return 100_000.0
 
         async def get_positions(self):
             return []
@@ -1983,6 +1992,9 @@ def test_dispatch_discards_stale_signals() -> None:
 
         async def get_balance(self):
             return 100_000.0, 100_000.0
+
+        async def get_equity(self):
+            return 100_000.0
 
         async def get_positions(self):
             return []
@@ -4852,6 +4864,9 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
 
         async def get_balance(self):
             return 100_000.0, 100_000.0
+
+        async def get_equity(self):
+            return 100_000.0
 
         async def get_positions(self):
             return []
