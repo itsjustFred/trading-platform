@@ -762,11 +762,19 @@ def test_claim_and_submit_success_records_traded(
     async def _prepare_order(_adapter, _deployment, _signal):
         return prepared_signal, 1.0
 
+    async def _caps_passthrough(_adapter, _deployment, _signal, *, qty, risk_config):
+        # The caps have their own suite (test_live_pre_submit_caps.py); this
+        # test pins the archive record, so the check is stubbed to a pass —
+        # the SimpleNamespace signal/adapter doubles cannot satisfy its
+        # broker reads.
+        return qty
+
     class _Adapter:
         async def submit_order(self, _signal, qty=None):
             return "ord-42"
 
     monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
+    monkeypatch.setattr(daemon, "enforce_pre_submit_caps", _caps_passthrough)
     monkeypatch.setattr(
         daemon, "claim_live_deployment_submission", lambda *_a, **_k: True
     )
