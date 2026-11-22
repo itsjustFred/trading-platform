@@ -181,8 +181,9 @@ class TradeEngine:
         self.symbol = symbol
         # #130: fill-price slippage model, resolved once per engine. The
         # adapter supplies the instrument's asset class (from the OHLCV
-        # path); direct engine use leaves it "" and records an explicit
-        # ``none`` model — never a silent gross default.
+        # path); direct engine use leaves it "" and the auto resolution
+        # refuses unless the run declares slippage explicitly — never a
+        # silent gross default.
         self._slippage_asset_class = str(asset_class or "")
         self.slippage_model = resolve_slippage_model(
             config.parameters, asset_class=self._slippage_asset_class

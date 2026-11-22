@@ -27,9 +27,12 @@ from runner.slippage import (
 
 
 class TestResolveSlippageModel:
-    def test_unclassified_asset_class_defaults_to_none(self) -> None:
-        """Direct engine use (no asset class) records an explicit none."""
-        model = resolve_slippage_model({}, asset_class="")
+    def test_unclassified_asset_class_refuses_under_auto(self) -> None:
+        """Direct engine use (no asset class) fails closed unless the run
+        declares slippage explicitly (maintainer decision 2026-11-22)."""
+        with pytest.raises(ValueError, match="asset class"):
+            resolve_slippage_model({}, asset_class="")
+        model = resolve_slippage_model({"slippage": "none"}, asset_class="")
         assert isinstance(model, ZeroSlippage)
         assert model.describe()["model"] == "none"
 
@@ -127,24 +130,35 @@ class TestResolveSlippageModel:
         with pytest.raises(ValueError):
             resolve_slippage_model({"slippage": "spread"}, asset_class="options")
 
-    def test_unmapped_class_auto_records_none_and_warns(self, caplog) -> None:
-        import logging
+    def test_unmapped_class_auto_refuses(self) -> None:
+        """An unmapped asset class refuses the run under auto resolution —
+        gross fills are never a silent default (fail closed like #84)."""
+        with pytest.raises(ValueError, match="options"):
+            resolve_slippage_model({}, asset_class="options")
+        with pytest.raises(ValueError, match="options"):
+            resolve_slippage_model({"slippage": "auto"}, asset_class="options")
 
-        with caplog.at_level(logging.WARNING, logger="runner.slippage"):
-            model = resolve_slippage_model({}, asset_class="options")
-        assert isinstance(model, ZeroSlippage)
-        assert model.describe()["reason"] == "unclassified_asset_class"
-        assert any("options" in record.message for record in caplog.records)
+    def test_unclassified_auto_refuses(self) -> None:
+        with pytest.raises(ValueError, match="asset class"):
+            resolve_slippage_model({}, asset_class="")
 
-    def test_unclassified_auto_records_none_and_warns(self, caplog) -> None:
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger="runner.slippage"):
-            model = resolve_slippage_model({}, asset_class="")
-        assert isinstance(model, ZeroSlippage)
-        assert any(
-            "asset class" in record.message for record in caplog.records
+    def test_unmapped_class_explicit_slippage_is_allowed(self) -> None:
+        """Every explicit declaration bypasses the auto refusal."""
+        none_model = resolve_slippage_model(
+            {"slippage": "none"}, asset_class="options"
         )
+        assert isinstance(none_model, ZeroSlippage)
+        assert none_model.describe()["reason"] == "explicit_opt_out"
+        bps_model = resolve_slippage_model(
+            {"slippage": "bps", "slippage_bps": 4.0}, asset_class="options"
+        )
+        assert isinstance(bps_model, FixedBpsSlippage)
+        assert bps_model.bps == pytest.approx(4.0)
+        spread_model = resolve_slippage_model(
+            {"slippage": "spread", "slippage_bps": 4.0}, asset_class="options"
+        )
+        assert isinstance(spread_model, BarSpreadSlippage)
+        assert spread_model.default_bps == pytest.approx(4.0)
 
     def test_external_spread_params_degrade_auto_to_fixed_bps(self) -> None:
         """spread_price_col already prices the spread — the auto model must

@@ -246,6 +246,7 @@ def test_live_trail_matches_the_replay_adapter_on_the_same_price_series(live: _L
     frame["volume"] = 1000
     replay = SignalReplayAdapter(
         fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
         risk_config=RiskConfig(
             max_risk_per_trade=0.01,
             max_total_exposure=0.05,

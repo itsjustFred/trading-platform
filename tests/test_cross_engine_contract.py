@@ -200,7 +200,7 @@ def generate_signals(df, params):
         """D4: the fill-convention switch is load-bearing — a typo must fail
         loudly instead of silently falling through to close-fill."""
         with pytest.raises(ValueError, match="signal_exit_fill"):
-            BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+            BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
                 strategy_name="contract",
                 symbols=["CEC"],
                 timeframe="1h",
@@ -211,7 +211,7 @@ def generate_signals(df, params):
             )
 
     def test_signal_exit_fill_normalizes_case(self, tmp_path: Path):
-        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
             strategy_name="contract",
             symbols=["CEC"],
             timeframe="1h",
@@ -721,7 +721,7 @@ class TestExitLevelGapped:
             initial_capital=100_000.0,
             modeling_resolution="main_timeframe",
             data_dir=str(tmp_path),
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = NativeAdapter().run(config, strategy_path)
 
@@ -821,7 +821,7 @@ class TestNativeWarmupLoad:
     def test_warmup_start_extends_loaded_window(self, tmp_path: Path):
         _write_ohlcv(tmp_path, "CEC", _frame())
         strategy_path = _write_strategy(tmp_path, "contract_warmup_load", _strategy_text())
-        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+        config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
             strategy_name="contract",
             symbols=["CEC"],
             timeframe="1h",
@@ -889,7 +889,7 @@ class TestSharedEquity:
             initial_capital=100_000.0,
             modeling_resolution="main_timeframe",
             data_dir=str(tmp_path),
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = VectorbtAdapter().run(config, strategy_path)
         assert len(result.trades) == 2
@@ -922,7 +922,7 @@ class TestSharedEquity:
             initial_capital=100_000.0,
             modeling_resolution="main_timeframe",
             data_dir=str(tmp_path),
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = NativeAdapter().run(config, strategy_path)
         assert len(result.trades) == 2

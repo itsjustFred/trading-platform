@@ -607,7 +607,9 @@ def _add_slippage_flags(parser: argparse.ArgumentParser) -> None:
             "Slippage model applied to fill prices: 'none'/'zero' is the "
             "explicit parity opt-out, 'spread' uses bar bid/ask data with a "
             "bps fallback, 'bps' is a fixed-bps model (needs "
-            "--slippage-bps), 'auto' picks per asset class. Default: auto."
+            "--slippage-bps), 'auto' picks per asset class and REFUSES "
+            "when the class cannot be mapped (fail closed like fees). "
+            "Default: auto."
         ),
     )
     parser.add_argument(

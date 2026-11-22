@@ -16,7 +16,7 @@ _NON_IDEMPOTENT_STEPS = 25602
 
 def _engine(params=None, **config_overrides):
     # #84: explicit no-cost declaration for engine fixtures.
-    merged_params = {"fees": "zero"}
+    merged_params = {"fees": "zero", "slippage": "none"}
     merged_params.update(params or {})
     config = {
         "strategy_name": "test",
@@ -1222,7 +1222,7 @@ def test_market_long_pays_spread_short_hits_bid():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
-            parameters={"fees": "zero", "spread_price_col": "spread_price"},
+            parameters={"fees": "zero", "slippage": "none", "spread_price_col": "spread_price"},
         ),
         symbol="T",
     )
@@ -1245,7 +1245,7 @@ def test_signal_exit_fill_open_uses_bar_open():
             end_date="2024-01-02",
             initial_capital=100_000.0,
             signal_exit_fill="open",
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         ),
         symbol="T",
     )
@@ -1266,7 +1266,7 @@ def test_signal_exit_fill_close_is_default():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         ),
         symbol="T",
     )
@@ -1293,7 +1293,7 @@ def test_signal_exit_fill_open_short_pays_spread():
             end_date="2024-01-02",
             initial_capital=100_000.0,
             signal_exit_fill="open",
-            parameters={"fees": "zero", "spread_price_col": "spread_price"},
+            parameters={"fees": "zero", "slippage": "none", "spread_price_col": "spread_price"},
         ),
         symbol="T",
     )
@@ -1340,7 +1340,7 @@ def test_warmup_bars_feed_indicators_but_create_no_trades():
             end_date="2024-01-01 00:03",
             initial_capital=100_000.0,
             warmup_start="2024-01-01 00:00",
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         ),
         symbol="T",
     )
@@ -1385,7 +1385,7 @@ def test_short_stop_uses_ask_high_when_enabled():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
-            parameters={"fees": "zero", "ask_ohlc": True},
+            parameters={"fees": "zero", "slippage": "none", "ask_ohlc": True},
         ),
         symbol="T",
     )
@@ -1404,7 +1404,7 @@ def test_short_stop_stays_bid_based_by_default():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         ),
         symbol="T",
     )
@@ -1495,7 +1495,7 @@ def test_short_stop_fill_adds_spread():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
-            parameters={"fees": "zero", "spread_price_col": "spread_price"},
+            parameters={"fees": "zero", "slippage": "none", "spread_price_col": "spread_price"},
         ),
         symbol="T",
     )
@@ -1518,7 +1518,11 @@ def test_explicit_fees_reduce_net_pnl():
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_capital=100_000.0,
-            parameters={"fee_rate": 0.01, "fee_flat_per_trade": 3.0},
+            parameters={
+                "fee_rate": 0.01,
+                "fee_flat_per_trade": 3.0,
+                "slippage": "none",
+            },
         ),
         symbol="T",
     )

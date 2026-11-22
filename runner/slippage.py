@@ -16,23 +16,22 @@ Every run records the resolved model in ``meta.data["slippage"]`` — the
 recording is mandatory even when the resolved model is ``none``.
 
 Asset classes that cannot be classified (direct engine use in tests and
-tools, data outside the ``ohlcv/{source}/{asset_class}/...`` layout)
-resolve to :class:`ZeroSlippage`, record ``reason=unclassified_asset_class``
-in ``describe()`` and emit a WARNING: adapters always classify from the
-parquet path, so an unclassified ``none`` is a deliberate, auditable gross
-run rather than a silent default.
+tools, data outside the ``ohlcv/{source}/{asset_class}/...`` layout) or
+that map to no slippage model REFUSE the run under the default ``auto``
+resolution — fail closed like fees (#84, maintainer decision 2026-11-22).
+A deliberate gross run must say so explicitly: ``slippage="none"`` (the
+parity opt-out) records ``ZeroSlippage`` with
+``reason=explicit_opt_out``; an explicit cost comes from ``'bps'``,
+``'spread'`` or ``slippage_bps``.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import pandas as pd
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "BarSpreadSlippage",
@@ -224,7 +223,7 @@ def _bar_spread_units(bar: Any) -> float | None:
 
 @dataclass(frozen=True)
 class ZeroSlippage:
-    """Explicit no-slippage declaration (parity opt-out or unclassified)."""
+    """Explicit no-slippage declaration (the ``none`` parity opt-out)."""
 
     asset_class: str = ""
     reason: str = "explicit_opt_out"
@@ -406,12 +405,12 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
             "the auto fallback."
         )
     if not ac:
-        logger.warning(
-            "slippage auto: the asset class could not be determined; fills "
-            "run gross and the run records slippage='none' "
-            "(reason=unclassified_asset_class)."
+        raise ValueError(
+            "slippage: the asset class could not be determined, so no "
+            "per-class cost model applies. Refusing to run gross — pass an "
+            "explicit slippage: 'none' for a deliberate parity run, or "
+            "'bps'/'spread'/slippage_bps for a costed run."
         )
-        return ZeroSlippage(asset_class="", reason="unclassified_asset_class")
     if ac in _CRYPTO_ASSET_CLASSES or ac in _EQUITY_ASSET_CLASSES:
         bps = _class_default_bps(ac, params)
         return FixedBpsSlippage(bps=bps, asset_class=ac)
@@ -422,16 +421,18 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
         if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
             return FixedBpsSlippage(bps=bps, asset_class=ac)
         return BarSpreadSlippage(default_bps=bps, asset_class=ac)
-    # Recognized-but-unmapped class: still record an explicit none rather
-    # than inventing a cost the decision did not specify — but say so,
-    # because gross fills are the opposite of the fee convention (#84).
-    logger.warning(
-        "slippage auto: asset_class=%r is not mapped to a slippage model; "
-        "fills run gross and the run records slippage='none' "
-        "(reason=unclassified_asset_class).",
-        ac,
+    # Recognized-but-unmapped class: no per-class cost exists, so the run
+    # refuses rather than silently filling gross (maintainer decision
+    # 2026-11-22, fail closed like fees #84). An explicit declaration —
+    # ``slippage='none'`` for a deliberate parity run, or ``'bps'`` /
+    # ``'spread'`` / ``slippage_bps`` for a costed run — never reaches
+    # this point.
+    raise ValueError(
+        f"slippage: asset_class={ac!r} is not mapped to a slippage model. "
+        "Refusing to run gross — pass an explicit slippage: 'none' for a "
+        "deliberate parity run, or 'bps'/'spread'/slippage_bps for a "
+        "costed run."
     )
-    return ZeroSlippage(asset_class=ac, reason="unclassified_asset_class")
 
 
 def _spread_fallback_bps(

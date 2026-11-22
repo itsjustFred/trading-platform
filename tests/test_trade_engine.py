@@ -112,7 +112,7 @@ def test_trade_engine_market_entry_and_signal_exit_price_model():
         end_date="2024-01-31",
         initial_capital=100_000,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -163,7 +163,7 @@ def test_sizing_only_stop_survives_fill_and_is_used_for_risk_metadata():
         end_date="2024-01-01",
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
@@ -196,7 +196,7 @@ def test_sizing_only_stop_equal_to_fill_is_skipped():
         end_date="2024-01-01",
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
@@ -230,7 +230,7 @@ def test_trade_engine_stop_uses_bar_low_and_risk_sizing_1pct():
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -275,7 +275,7 @@ def test_trade_engine_accepts_sl_price_alias_for_native_stops_and_risk_sizing():
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -320,7 +320,7 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
         risk_per_trade_pct=0.01,
         max_leverage=10.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -357,7 +357,7 @@ def test_stop_distance_only_order_gets_fill_anchored_live_stop():
         end_date="2024-01-31",
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
@@ -409,7 +409,7 @@ def test_trade_engine_configured_same_bar_take_profit_priority_falls_back_to_sto
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero", "same_bar_order": "take_profit_first"},
+        parameters={"fees": "zero", "slippage": "none", "same_bar_order": "take_profit_first"},
     )
 
     engine = TradeEngine(cfg, symbol="TEST")
@@ -482,7 +482,7 @@ def test_example_sma_native_vs_vectorbt_smoke_on_local_data():
         # OHLCV root above: the suite's DATA_DIR by default, or the directory
         # an exported TP_TEST_OHLCV_DIR names its shards from.
         data_dir=str(ohlcv_root.parent),
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     native_result = NativeAdapter().run(cfg, str(strategy_path))
@@ -516,7 +516,7 @@ class TestIssueC2ExposureMath:
                 end_date="2024-01-02",
                 initial_capital=100_000.0,
                 risk_per_trade_pct=0.01,
-                parameters={"fees": "zero"},
+                parameters={"fees": "zero", "slippage": "none"},
             ),
             symbol="X",
         )
@@ -680,7 +680,7 @@ def _wide_bar_run(strategy_name: str, *, stop=None, take_profit=None, exit_index
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
     return TradeEngine(cfg, symbol="TEST").run(data, strategy_fn)
 
@@ -786,7 +786,7 @@ def _excursion_run(take_profit=None, stop=None, direction="LONG", tps=None, hi=1
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
     return TradeEngine(cfg, symbol="TEST").run(data, strategy_fn).trades[0]
 
@@ -979,7 +979,7 @@ def _ladder_config() -> BacktestConfig:
         risk_per_trade_pct=0.01,
         max_leverage=3.0,
         modeling_resolution="main_timeframe",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
 
@@ -1077,7 +1077,7 @@ def test_a_partial_take_profit_fill_is_followed_by_a_stop_on_the_remainder():
         # A lower timeframe is requested, so the same-bar ambiguity is resolved
         # by the intrabar chronology instead of the stop-first tie-break.
         modeling_resolution="15m",
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
     result = TradeEngine(cfg, symbol="TEST", intrabar_data=intrabar).run(
