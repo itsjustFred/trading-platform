@@ -289,7 +289,7 @@ def strategy_target(
         )
     try:
         meta = load_strategy_meta(path, root)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         raise PromotionTargetError(f"STRATEGY_META of '{name}' is unreadable: {exc}") from exc
     defaults = meta.get("parameters", {}) if isinstance(meta, Mapping) else None
     if not meta or not isinstance(defaults, Mapping):
