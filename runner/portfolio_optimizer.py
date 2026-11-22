@@ -23,6 +23,7 @@ import optuna
 import pandas as pd
 
 from shared.atomic_io import write_text_atomically
+from shared.constants import OPTIMIZATIONS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -653,9 +654,6 @@ def _build_optimization_result(
         if oos_equity_curve:
             result["oos_equity_curve"] = oos_equity_curve
     return result, output_path
-
-
-OPTIMIZATIONS_DIR = Path(__file__).resolve().parent.parent / "data" / "optimizations"
 
 
 def _explicit_boundary(value: str, *, is_end: bool = False) -> float:

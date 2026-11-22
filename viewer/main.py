@@ -17,7 +17,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -13333,7 +13333,8 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         )
 
     # Promotion gate (#165), before the dry-run return on purpose: a plan that
-    # could not be deployed must not be presented as deployable.
+    # could not be deployed must not be presented as deployable. Its verdict does
+    # not depend on the status, so the pause below is free to change it afterwards.
     demo_flags: dict[str, bool | None] = {}
     for deployment in plan:
         if deployment.account_id not in demo_flags:
@@ -13342,11 +13343,16 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
             )
         _require_promotion_gate(deployment, demo_flag=demo_flags[deployment.account_id])
 
+    # #261, and before the dry-run return on purpose as well: a preview showing
+    # ACTIVE rows would advertise a deploy the account cannot have.
+    plan, paused_as_real_money = _pause_non_demo_deployments(plan, demo_flags)
+
     if payload.dry_run:
         return {
             "status": "planned",
             "dry_run": True,
             "deployments": [_serialize_live_deployment_payload(item) for item in plan],
+            "paused_as_real_money": paused_as_real_money,
         }
 
     created: list[dict[str, Any]] = []
@@ -13360,18 +13366,82 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         "status": "created",
         "dry_run": False,
         "deployments": created,
+        "paused_as_real_money": paused_as_real_money,
     }
+
+
+#: Why a top-N deployment was created PAUSED instead of ACTIVE (#261). Two texts
+#: because they ask different things of the operator: a broker-reported live
+#: account is a decision to accept, an unanswered question is a check to make.
+_PAUSE_REASON_LIVE = "the broker reports this account as live (non-demo)"
+_PAUSE_REASON_UNKNOWN = "the broker could not assert that this account is demo"
+
+
+def _pause_non_demo_deployments(
+    plan: Sequence[LiveDeploymentConfig],
+    demo_flags: Mapping[str, bool | None],
+) -> tuple[list[LiveDeploymentConfig], list[dict[str, Any]]]:
+    """Create the non-demo rows of a top-N plan PAUSED instead of ACTIVE (#261).
+
+    A bulk deploy is a one-shot action: it arms what it creates without the fresh
+    broker re-verification the single-deployment activate path performs, so
+    `activate` used to be the only route that could put an armed deployment on an
+    account the broker does not report as demo. Only the daemon's demo-only block
+    then stood between those rows and real money, and a single safeguard must not
+    be what protects a live account. A maintainer activates the rows by hand
+    instead, through the status endpoint, which re-verifies the account first.
+
+    The account classification is the shared one: :func:`is_real_money` over the
+    broker-reported flag, the same verdict the daemon's demo-only guard reaches
+    for its adapter. An account the broker did not assert as demo - including one
+    it could not answer for - is real money here too, so it fails closed. Demo
+    accounts keep the ACTIVE status they were given, and a row that was requested
+    PAUSED is never touched.
+
+    Returns the plan as it will be created, and one entry per deployment paused
+    here naming it and the reason, for the response and the log below.
+    """
+    deployments: list[LiveDeploymentConfig] = []
+    paused: list[dict[str, Any]] = []
+    labels: list[str] = []
+    for deployment in plan:
+        demo_flag = demo_flags.get(deployment.account_id)
+        if deployment.status == "ACTIVE" and is_real_money(demo_flag):
+            reason = _PAUSE_REASON_LIVE if demo_flag is False else _PAUSE_REASON_UNKNOWN
+            strategy_name = deployment.strategy_name
+            account_id = str(deployment.account_id)
+            paused.append(
+                {
+                    "strategy_name": strategy_name,
+                    "account_id": account_id,
+                    "reason": reason,
+                }
+            )
+            labels.append(f"'{strategy_name}' on account '{account_id}' ({reason})")
+            deployment = deployment.model_copy(update={"status": "PAUSED"})
+        deployments.append(deployment)
+    if paused:
+        logger.warning(
+            "cTrader top-N deploy created %d deployment(s) PAUSED instead of "
+            "ACTIVE, because a non-demo account is never armed by a bulk deploy "
+            "(#261): %s. Activate them by hand once reviewed.",
+            len(paused),
+            "; ".join(labels),
+            extra={"data": {"paused": paused}},
+        )
+    return deployments, paused
 
 
 async def _broker_reported_demo_flag(account_id: str) -> bool | None:
     """What broker discovery says about ``account_id``: demo, not demo, or unknown.
 
     The promotion gate's real-money verdict for deployment create and the
-    cTrader top-N deploy (#165). It asks broker discovery directly, bypassing the
-    30 s discovery cache, so a broker that reclassifies the account is seen at
-    once, as activation's re-verification sees it. It never reads the stored
-    account row. ``None`` means discovery failed, did not return the account, or
-    did not assert the flag; the gate treats that as real money.
+    cTrader top-N deploy (#165), and the account classification that decides
+    whether that deploy may arm its rows (#261). It asks broker discovery
+    directly, bypassing the 30 s discovery cache, so a broker that reclassifies
+    the account is seen at once, as activation's re-verification sees it. It never
+    reads the stored account row. ``None`` means discovery failed, did not return
+    the account, or did not assert the flag; the gate treats that as real money.
     """
     try:
         discovered = await asyncio.to_thread(

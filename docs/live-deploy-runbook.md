@@ -270,11 +270,11 @@ additional layer under it, not a replacement. Today a promoted strategy on a
 real-money account therefore still cannot trade: preflight passes the gate,
 but the daemon will not keep a non-demo adapter. The viewer's activate path
 re-verifies the account against broker discovery and will not arm the
-deployment. The cTrader top-N deploy with `activate` is different: it creates
-the deployments `ACTIVE` directly, without that re-verification, on any account
-the gate passes. Only the daemon's demo-only block stops their orders. Refusing
-`activate` on a non-demo account there is a maintainer decision, not yet made.
-Lifting the demo-only block is a separate, deliberate step.
+deployment. The cTrader top-N deploy creates its deployments directly, without
+that re-verification, so it never arms a non-demo account either (#261): the
+rows are created `PAUSED` and a maintainer activates them by hand, which is the
+path that re-verifies - and, like every path, only arms an account the broker
+reports as demo. Lifting the demo-only block is a separate, deliberate step.
 
 ### Required evidence and thresholds
 
@@ -443,6 +443,20 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+### The cTrader top-N deploy never arms a non-demo account (#261)
+
+That endpoint creates its rows in one shot, with no per-deployment
+re-verification of the account; `activate` therefore used to be the only route
+that put an armed deployment on an account the broker does not report as demo.
+With `activate` on a broker-reported demo account the behaviour is unchanged:
+the rows are created `ACTIVE`. On any other account - a reported live account, or
+one the broker could not assert as demo, which fails closed - the rows are
+created `PAUSED` instead, and the response's `paused_as_real_money` plus a
+`WARNING` in the viewer log name each one and say why. The owner activates them
+by hand, through `PUT /api/live/deployments/{id}/status`, which re-verifies the
+account against the broker and still refuses a non-demo one. The dry run reports
+the same: a preview never shows `ACTIVE` rows the deploy would not get.
+
 ## Broker Position Quantity (#263)
 
 Every entry order reads the broker's open positions twice: as a count for
@@ -606,6 +620,43 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 > NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+### ACTIVE deployments nothing can trade (#242)
+
+The daemon's only signal path is Discord. A deployment whose `signal_source` is `internal` (the default)
+with status `ACTIVE` has no live strategy runner behind it: it still gets a broker adapter and an execution
+listener, so the dashboard and the listener log make it look live, but it will never place an order. The same
+holds for any stored `signal_source` that is neither `internal` nor `discord`.
+
+The deployment-sync loop alerts this at ERROR, carrying `alert: "untradeable_active_deployment"` and
+`untradeable_reason` in the log `data`, with the id, account and signal source of each affected deployment.
+Where Sentry is configured (a DSN: `initialize_sentry` is a no-op without one), its `LoggingIntegration`
+sends ERROR as an event, so the alert reaches Sentry too — as a field of the record's `data` (an extra on the
+event), not as a Sentry tag, so filter it on `untradeable_reason`/`alert` as event data.
+
+It is not repeated on every tick of the (permanent) sync loop: the first tick of every daemon start reports
+each affected row, and a row is reported again only when its status or signal source changes, so restarting
+or repointing is what you see again. The daemon does not block or stop: the operator stops the row or moves
+it to a Discord signal source.
+
+Both preflights warn for these rows using the same definition
+(`live_runner.deployment_policy.untradeable_signal_source_reason`), so a clean preflight no longer hides
+them, but they see different things:
+
+- **yaml preflight** (`live_runner/preflight.py`): warns for every ACTIVE non-Discord deployment in the
+  `live_deployments.yaml` it validates.
+- **`--check-db` preflight** (`live_runner/preflight_db.py`): reads the ACTIVE rows out of SQLite instead.
+  It warns for an untradeable row whose YAML twin is *tradeable* (Discord) or absent, because the YAML
+  side is then quiet about it; when the twin is itself untradeable the YAML check has already reported
+  the pair and a second warning for the same row would only double-count. A stored `signal_source` outside
+  `KNOWN_SIGNAL_SOURCES` (`internal` plus everything the daemon can trade) still fails this preflight (exit
+  1) rather than warning, because nothing routes the row as configured. Adding a source to the daemon's
+  tradeable set does not make it storable: `LiveDeploymentConfig.signal_source` is a Literal over
+  `internal`/`discord` and the DB read coerces anything else to `internal`, so a new source is a
+  model-and-migration change (`live_runner/deployment_policy.py` says so where the set is defined).
+
+A live strategy runner is a separate decision; until one exists, every `ACTIVE` `internal` row is untradeable by
+design, not by accident.
 
 ## Kill Switch (#300)
 
