@@ -154,7 +154,10 @@ Implementation:
   rule below denominates is **realized cash** — `initial_capital` plus the net
   PnL of closed trade legs. The mark-to-market equity that feeds the equity
   curve is never a sizing input: an open position's paper profit is not
-  spendable and an unrealized drawdown is not a realized loss. Native holds it
+  spendable and an unrealized drawdown is not a realized loss. The one
+  documented exception is the native free-margin leverage check (#347),
+  which reads mark-to-market equity and used margin by design (MT5-style
+  margin) — see `docs/sizing-semantics.md`. Native holds it
   in `TradeEngine._sizing_equity` (decision record D2,
   `docs/cleanup-16d1-money-path-semantics.md`); vectorbt accumulates it inline
   and records it as `trade.meta["risk_math"]["equity_at_entry"]`; pynecore walks

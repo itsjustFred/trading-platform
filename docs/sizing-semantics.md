@@ -20,7 +20,10 @@ positions to market for sizing (decision record D9).
 All exposure fractions are validated as finite values in the inclusive range
 `0 < value <= 1`. `max_leverage` is a separate multiple of equity and is not a
 fraction-valued exposure field: it is the broker maximum leverage for the
-account/asset, and an unset value means an unknown maximum → 1x (#347).
+account/asset. An unset value means an unknown maximum, and the fallback is
+per engine: native clamps to 1x (#347), while the vectorbt and pynecore
+adapters resolve it through `runner.engines._shared.resolve_max_leverage`
+to 2.0x.
 
 | Name | Layer | Meaning (Decision Record, verbatim) |
 |---|---|---|

@@ -389,7 +389,9 @@ class TradeEngine:
         The per-position exposure cap stays a sizing rule on realized cash
         (D2). The leverage/margin check is MT5-style free margin: when it is
         the binding constraint the quantity is clamped down and floored to
-        ``lot_step`` — never refused. ``cap_by_leverage=False`` is the
+        ``lot_step`` — to zero when no free margin remains, in which case
+        the order is skipped (logged), never refused.
+        ``cap_by_leverage=False`` is the
         fixed-risk ``cap_fixed_risk_by_leverage=false`` opt-out.
         """
         exposure_qty_cap = (
@@ -575,6 +577,16 @@ class TradeEngine:
             stop_distance=stop_distance,
         )
         if qty <= 0:
+            # #347: a zero size is usually the free-margin leverage clamp
+            # (no free margin remains) — log the skip like the fill-time
+            # skips instead of dropping the order silently.
+            logger.warning(
+                "Skipping %s %s order at %s: sized quantity %.6g <= 0",
+                self.symbol,
+                direction,
+                self._to_iso(row["timestamp"]),
+                qty,
+            )
             return
 
         created_time = self._to_iso(row["timestamp"])

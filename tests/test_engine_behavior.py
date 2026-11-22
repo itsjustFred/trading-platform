@@ -16,6 +16,7 @@ Covers Cleanup 16-D1 findings on ``runner/engine.py``:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -779,6 +780,32 @@ class TestFreeMarginLeverageCap:
             direction="LONG",
         )
         assert qty == 0.0
+
+    def test_zero_free_margin_skip_is_logged(
+        self, tmp_path: Path, caplog
+    ):
+        """A clamp to zero (no free margin) must not drop the order
+        silently — it is skipped with a warning like the fill-time skips."""
+        engine = self._engine(tmp_path, max_leverage=1.0)
+        # At 1x the whole notional is margin: 1000 * 100 / 1 = 100k = equity,
+        # so free margin is exactly zero for the next order.
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        row = pd.Series(
+            {
+                "close": 100.0,
+                "timestamp": pd.Timestamp("2024-01-02T00:00:00Z"),
+                "stop_loss": 99.0,
+                "stop_distance": 1.0,
+            }
+        )
+        with caplog.at_level(logging.WARNING):
+            engine._create_order(row, 1, "LONG")
+        assert engine.pending_orders == []
+        assert any(
+            "Skipping" in record.getMessage()
+            and "sized quantity" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
 
     def test_unknown_broker_maximum_means_1x(self, tmp_path: Path):
         engine = self._engine(tmp_path)

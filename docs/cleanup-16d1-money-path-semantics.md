@@ -40,7 +40,10 @@ denominator
 multi-symbol shared-equity replay (`replay_shared_equity`) divides the
 quantity by — that replay accumulates realized PnL only, so a mark-to-market
 `equity_at_entry` would rescale a realized-cash quantity by a reporting
-denominator. Each order carries the basis its own quantity was computed from,
+denominator. The one exception is the #347 free-margin leverage check,
+which reads mark-to-market equity and used margin by design (MT5-style
+margin) — it is a clamp on the sized quantity, not a sizing basis. Each
+order carries the basis its own quantity was computed from,
 so the recorded figure is the fill-time basis for an order that is re-sized at
 fill and the creation-time basis for the fallback-sized MARKET order that
 keeps its creation quantity under the D4 exception.
