@@ -24,6 +24,7 @@ with different semantics. It does not unify the three execution-timing models
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -41,6 +42,15 @@ __all__ = [
     "ohlcv_path_metadata",
     "normalize_intrabar_resolution",
     "resolve_intrabar_timeframe",
+    "normalize_exit_order_type",
+    "exit_order_type_is_present",
+    "usable_exit_price",
+    "exit_level_disposition",
+    "EXIT_LEVEL_IN_RANGE",
+    "EXIT_LEVEL_GAPPED",
+    "EXIT_LEVEL_UNREACHABLE",
+    "EXIT_ORDER_TYPE_MARKET",
+    "EXIT_ORDER_TYPE_LEVEL",
     "EngineStatsKeys",
     "TIMEFRAME_ORDER",
     "ONE_LOWER_SPELLINGS",
@@ -125,6 +135,139 @@ def resolve_intrabar_timeframe(base_timeframe: str, intrabar_resolution: str | N
     if target_index >= base_index:
         return None
     return normalized
+
+
+# ─── Explicit exit order type ───────────────────────────────────────────────
+
+#: ``exit_order_type`` spellings for signal exits. ``"market"`` fills at the
+#: signal-exit convention price (see ``signal_exit_fill``); ``"level"`` fills
+#: at the strategy's ``exit_price``.
+EXIT_ORDER_TYPE_MARKET = "market"
+EXIT_ORDER_TYPE_LEVEL = "level"
+
+
+def normalize_exit_order_type(value: Any) -> str | None:
+    """Canonical ``exit_order_type`` for one exit signal, or ``None``.
+
+    Only the exact spellings ``market``/``level`` (case-insensitive, stripped)
+    are recognized. A missing/NA cell AND an unrecognized spelling both yield
+    ``None`` — callers distinguish them with :func:`exit_order_type_is_present`
+    to warn on typos while still applying the documented legacy fallback.
+    """
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    if text in {EXIT_ORDER_TYPE_MARKET, EXIT_ORDER_TYPE_LEVEL}:
+        return text
+    return None
+
+
+def exit_order_type_is_present(value: Any) -> bool:
+    """True when the raw cell carries a non-empty value (recognized or not)."""
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        return True
+    return str(value).strip() != ""
+
+
+def usable_exit_price(value: Any) -> float | None:
+    """A positive finite ``exit_price``, or ``None`` when unusable."""
+    if value is None:
+        return None
+    try:
+        if bool(pd.isna(value)):
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+#: ``exit_level_disposition`` outcomes for a level exit against the exit
+#: bar's traded range (see :func:`exit_level_disposition`).
+EXIT_LEVEL_IN_RANGE = "in_range"
+EXIT_LEVEL_GAPPED = "gapped"
+EXIT_LEVEL_UNREACHABLE = "unreachable"
+
+
+def exit_level_disposition(
+    *,
+    direction: str,
+    level: float,
+    high: Any,
+    low: Any,
+) -> str:
+    """Classify a ``level`` exit against the exit bar's traded range.
+
+    A ``level`` exit is a resting limit order priced at ``level``. Against
+    the bar's traded ``[low, high]`` range (the ASK range for a SHORT exit
+    when ask-side data is enabled — callers supply the relevant extremes):
+
+    - :data:`EXIT_LEVEL_IN_RANGE` — ``low <= level <= high``: the bar traded
+      through the level, so the resting order fills AT the level.
+    - :data:`EXIT_LEVEL_GAPPED` — the level sits beyond the bar on the
+      *marketable* side (below ``low`` for a LONG exit, above ``high`` for a
+      SHORT exit): the order was immediately marketable, so under the
+      gap-through-level convention it fills at the bar's OPEN — never at a
+      price worse than the open for the strategy, and flagged
+      ``meta["exit_level_gapped"]``.
+    - :data:`EXIT_LEVEL_UNREACHABLE` — the level sits beyond the bar on the
+      *untraded* side (above ``high`` for a LONG exit, below ``low`` for a
+      SHORT exit): the order could never have filled. Callers fall back to
+      the market fill, warn once and flag the trade
+      ``meta["exit_level_unreachable"]`` — filling at the level anyway
+      would book a fantasy price.
+
+    Missing, non-finite or inverted (``low > high``) bar extremes fail
+    closed (``unreachable``).
+
+    ``level`` has limit-order semantics: an untraded-side level is
+    "unreachable" and callers fall back to the market fill. A strategy
+    whose ``exit_price`` is really a *stop* (e.g. a sell stop above the
+    whole bar after a gap down) should use the ``stop_loss`` legs
+    instead. Protective stop/TP legs fill AT their level whenever the
+    bar trades through them — including a gap-through bar, which still
+    fills at the level today (gap → open for protective exits is the
+    still-open #208 work, not current behaviour). That per-bar
+    trigger/fill-at-level behaviour is what a ``level`` exit — which
+    only exists on its signal bar and deliberately does not reproduce
+    it — cannot express.
+    ``direction`` must be exactly ``"LONG"`` or ``"SHORT"`` — an unknown
+    direction would invert the classification, so it raises ``ValueError``
+    like :func:`resolve_same_bar_exit`.
+    """
+    if direction not in ("LONG", "SHORT"):
+        raise ValueError(f"direction must be 'LONG' or 'SHORT', got {direction!r}")
+    try:
+        hi = float(high)
+        lo = float(low)
+    except (TypeError, ValueError, OverflowError):
+        return EXIT_LEVEL_UNREACHABLE
+    if not (math.isfinite(hi) and math.isfinite(lo)):
+        return EXIT_LEVEL_UNREACHABLE
+    if lo > hi:
+        # An inverted range is not a traded range at all: fail closed.
+        return EXIT_LEVEL_UNREACHABLE
+    if lo <= level <= hi:
+        return EXIT_LEVEL_IN_RANGE
+    marketable = (direction == "LONG" and level < lo) or (
+        direction == "SHORT" and level > hi
+    )
+    return EXIT_LEVEL_GAPPED if marketable else EXIT_LEVEL_UNREACHABLE
 
 
 # ─── Date filter convention (F9) ────────────────────────────────────────────

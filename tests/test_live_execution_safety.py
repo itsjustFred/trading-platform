@@ -14,6 +14,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1044,6 +1045,225 @@ def test_submit_order_with_risk_rejects_zero_size_when_budget_exhausted():
     with pytest.raises(ValueError, match="zero-size"):
         asyncio.run(submit_order_with_risk(adapter, deployment, _live_signal(deployment)))
 
+    assert adapter.submitted_signal is None
+
+
+@pytest.fixture
+def live_runner_logs(caplog):
+    """Capture ``live-runner`` records: that logger does not propagate (#263 alert)."""
+    target = logging.getLogger("trading.live-runner")
+    target.addHandler(caplog.handler)
+    caplog.set_level(logging.DEBUG, logger="trading.live-runner")
+    try:
+        yield caplog
+    finally:
+        target.removeHandler(caplog.handler)
+
+
+# ── #263: a broker quantity that cannot be read is never "no position" ────────
+#
+# `_count_open_broker_positions` is the broker-truth half of the entry gates: it
+# feeds max_positions and the risk-at-stake exposure estimate. It used to coerce
+# an unreadable `qty` to 0.0, so a position the broker described badly read as
+# "flat" and the next signal was sized as if the account were empty - a new
+# position on top of a cap that may already be full. Every unreadable quantity
+# now stops the count and refuses the entry.
+
+
+def test_count_open_broker_positions_ignores_readable_flat_rows():
+    """A *readable* zero is a position that is not open; it is not an error."""
+    from live_runner.daemon import _count_open_broker_positions
+
+    assert _count_open_broker_positions([]) == 0
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": 0.0}]) == 0
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": "0"}]) == 0
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": -0.0}]) == 0
+
+
+@pytest.mark.parametrize(
+    "qty",
+    [
+        None,
+        "abc",
+        "",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        Decimal("sNaN"),
+        10**400,
+    ],
+)
+def test_count_open_broker_positions_fails_closed_on_an_unreadable_qty(qty):
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError, match="refusing to read the account"):
+        _count_open_broker_positions([{"symbol": "AAPL", "qty": qty}])
+
+
+def test_count_open_broker_positions_fails_closed_when_the_qty_key_is_absent():
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError, match="states no qty"):
+        _count_open_broker_positions([{"symbol": "AAPL"}])
+
+
+def test_count_open_broker_positions_fails_closed_on_alpacas_unparseable_marker():
+    """Alpaca marks a row whose REST qty string it could not parse, keeping the
+    coerced 0.0 as the displayed qty: only the marker says it is not flat."""
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError, match="unparseable qty"):
+        _count_open_broker_positions(
+            [{"symbol": "AAPL", "qty": 0.0, "qty_unparseable": True, "qty_raw": "n/a"}]
+        )
+
+
+@pytest.mark.parametrize("qty", ["10", "0.5", "-3.5", 2.0, "  7  "])
+def test_count_open_broker_positions_accepts_string_quantities(qty):
+    """A quantity the broker sent as a string is a quantity, not an error."""
+    from live_runner.daemon import _count_open_broker_positions
+
+    assert _count_open_broker_positions([{"symbol": "AAPL", "qty": qty}]) == 1
+
+
+def test_count_open_broker_positions_counts_string_quantities_in_a_mixed_book():
+    """A readable "0" is a flat row; the other two rows are open positions."""
+    from live_runner.daemon import _count_open_broker_positions
+
+    positions = [
+        {"symbol": "AAPL", "qty": "10"},
+        {"symbol": "MSFT", "qty": "0"},
+        {"symbol": "TSLA", "qty": "-3.5"},
+    ]
+
+    assert _count_open_broker_positions(positions) == 2
+
+
+def test_count_open_broker_positions_names_the_symbol_and_row_of_the_bad_quantity():
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, _count_open_broker_positions
+
+    with pytest.raises(UnreadableBrokerPositionQtyError) as excinfo:
+        _count_open_broker_positions(
+            [
+                {"symbol": "AAPL", "qty": 1.0},
+                {"symbol": "MSFT", "qty": float("nan")},
+            ]
+        )
+
+    assert excinfo.value.symbol == "MSFT"
+    assert excinfo.value.row_index == 1
+    assert excinfo.value.log_data() == {
+        "position_symbol": "MSFT",
+        "position_qty_raw": "nan",
+        "position_row_index": 1,
+    }
+
+
+def test_submit_order_with_risk_refuses_an_entry_when_a_broker_qty_is_unreadable():
+    """The dependent decision is skipped, not taken: nothing reaches the broker."""
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, submit_order_with_risk
+
+    # max_positions is already full, so an entry is refused anyway: this pins
+    # that the unreadable row refuses it first and not as "one open position".
+    deployment = _deployment(max_positions=1)
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": "abc"}])
+    signal = _live_signal(deployment)
+
+    # One throwing invocation inside the block, so the assertion cannot pass on
+    # a failure to build the signal.
+    with pytest.raises(UnreadableBrokerPositionQtyError):
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is None
+    assert adapter.submitted_qty is None
+
+
+def test_submit_order_with_risk_refuses_an_entry_when_a_broker_qty_is_missing():
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, submit_order_with_risk
+
+    deployment = _deployment(max_positions=5)
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL"}])
+    signal = _live_signal(deployment)
+
+    with pytest.raises(UnreadableBrokerPositionQtyError):
+        asyncio.run(submit_order_with_risk(adapter, deployment, signal))
+
+    assert adapter.submitted_signal is None
+
+
+def test_the_dispatcher_skips_and_logs_an_entry_when_a_broker_qty_is_unreadable(
+    live_runner_logs,
+):
+    """The dispatcher's own handling: no submission, one warning, no crash.
+
+    The refusal happens inside ``prepare_order_with_risk``, so this runs the real
+    path and pins only what the caller does with it.
+    """
+    from live_runner.daemon import _prepare_claim_and_submit_signal
+    from risk.models import TradeSignal
+
+    deployment = _deployment()
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": "abc"}])
+    normalized_signal = TradeSignal(
+        action="buy",
+        symbol="EURUSD",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={},
+    )
+
+    asyncio.run(
+        _prepare_claim_and_submit_signal(
+            "acc-1",
+            adapter,
+            deployment,
+            normalized_signal,
+            _live_signal(deployment),
+            is_exit=False,
+        )
+    )
+
+    assert adapter.submitted_signal is None
+    refusals = [
+        record
+        for record in live_runner_logs.records
+        if record.levelno == logging.WARNING
+        and "refused before submission" in record.getMessage()
+    ]
+    assert len(refusals) == 1, [r.getMessage() for r in live_runner_logs.records]
+    assert refusals[0].data["deployment_id"] == str(deployment.id)
+
+
+def test_an_unreadable_broker_qty_alerts_an_operator_and_skips_the_entry(live_runner_logs):
+    from live_runner.daemon import UnreadableBrokerPositionQtyError, prepare_order_with_risk
+
+    deployment = _deployment(max_positions=5)
+    adapter = _PositionsAdapter(positions=[{"symbol": "AAPL", "qty": float("inf")}])
+    signal = _live_signal(deployment)
+
+    with pytest.raises(UnreadableBrokerPositionQtyError):
+        asyncio.run(prepare_order_with_risk(adapter, deployment, signal))
+
+    alerts = [
+        record
+        for record in live_runner_logs.records
+        if record.levelno == logging.ERROR
+        and getattr(record, "data", {}).get("alert") == "broker_position_qty_unreadable"
+    ]
+    assert len(alerts) == 1, [r.getMessage() for r in live_runner_logs.records]
+    assert "refusing the entry" in alerts[0].getMessage()
+    alert_data = alerts[0].data
+    # The deployment and the entry signal at stake ...
+    assert alert_data["account_id"] == deployment.account_id
+    assert alert_data["deployment_id"] == str(deployment.id)
+    assert alert_data["signal_symbol"] == "EURUSD"
+    # ... and the row that could not be read, named with its raw value.
+    assert alert_data["position_symbol"] == "AAPL"
+    assert alert_data["position_qty_raw"] == "inf"
+    assert alert_data["position_row_index"] == 0
     assert adapter.submitted_signal is None
 
 

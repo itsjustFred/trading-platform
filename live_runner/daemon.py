@@ -36,6 +36,7 @@ from live_runner.credential_env import (
     discord_bot_env_canonical_name,
     discord_bot_env_key,
     load_accounts_env_values,
+    resolve_accounts_env_path,
     resolve_env_value,
 )
 from live_runner.ctrader_adapter import CTraderAuthTerminalError, CTraderLiveAdapter
@@ -63,12 +64,27 @@ from live_runner.exit_signals import (
     round_exit_qty_down,
     usable_qty_tolerance,
 )
+from live_runner.kill_switch import (
+    PENDING_CANCEL_ESCALATION_PASSES,
+    KillSwitchMode,
+    KillSwitchState,
+    LiveHaltError,
+    enforce_live_kill_switch,
+    read_kill_switch_state,
+    refuse_entry_while_halted,
+)
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
     is_real_money,
 )
 from live_runner.service_discovery import discover_discord_bots_from_env
+from live_runner.signal_archive import (
+    SignalDecisionRecorder,
+    get_signal_archive,
+    market_features_from_frame,
+    record_signal_decision,
+)
 from live_runner.signal_sources import (
     DiscordSignalSource,
     signal_is_fresh,
@@ -101,6 +117,7 @@ from shared.database import (
     claim_live_deployment_submission,
     clear_live_deployment_stopped_enforced,
     create_service,
+    flag_live_ledger_reconciliation,
     get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
@@ -130,8 +147,9 @@ from shared.models import (
 )
 from shared.sentry import capture_exception, initialize_sentry
 from shared.trailing import (
+    ANY_BROKER,
     TRAILING_SL_CONFIG_METADATA_KEY,
-    validate_live_deployment_trailing_override,
+    validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
 from signal_bots.registry import get_signal_processor
@@ -146,10 +164,10 @@ DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
 BALANCE_POLL_INTERVAL_SECONDS = 60
 DEPLOYMENT_POLL_INTERVAL_SECONDS = 10
 # A broker-side ``pending_cancel`` order normally settles within seconds. A STOPPED
-# deployment stays unstamped while one is listed (it could still fill); after this many
-# consecutive enforcement passes (~1 minute at the poll interval) the WARNING becomes an
-# ERROR so a stuck cancel reaches an operator.
-PENDING_CANCEL_ESCALATION_PASSES = 6
+# deployment stays unstamped while one is listed (it could still fill); after
+# PENDING_CANCEL_ESCALATION_PASSES consecutive enforcement passes (~1 minute at the
+# poll interval) the WARNING becomes an ERROR so a stuck cancel reaches an operator.
+# The kill switch's sweep applies the same rule to its own per-account counter.
 _PENDING_CANCEL_PASSES: dict[str, int] = {}
 SERVICE_SYNC_INTERVAL_SECONDS = 60
 _DISCORD_AUTH_BLOCKED_ACCOUNTS: set[str] = set()
@@ -304,6 +322,16 @@ def _raw_bool_text(value: object) -> str | None:
     return str(value)
 
 
+def _accounts_env_file(accounts_env: Path | str | None) -> Path:
+    """Resolve a named-or-default accounts env file at call time.
+
+    The three loops below used to freeze ``accounts_env: Path = DEFAULT_ACCOUNTS_ENV`` in their
+    signatures, which bound the path at import time and ignored every later redirect of the module
+    constant. Resolving here keeps the default honest.
+    """
+    return resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
+
+
 def _load_accounts_env_values(accounts_env: Path) -> dict[str, str]:
     return load_accounts_env_values(accounts_env)
 
@@ -312,8 +340,12 @@ def _accounts_env_mtime(accounts_env: Path) -> int | None:
     return accounts_env_mtime(accounts_env)
 
 
-def _discover_and_register_discord_services(*, log_summary: bool = True) -> list[Service]:
-    discovered = discover_discord_bots_from_env()
+def _discover_and_register_discord_services(
+    accounts_env: Path | str | None = None, *, log_summary: bool = True
+) -> list[Service]:
+    # The same file the rest of the daemon resolved: discovery that read the module default instead
+    # would discover bots from a file the operator redirected away from.
+    discovered = discover_discord_bots_from_env(accounts_env)
     discovered_names = [str(item.get("name") or "").strip().upper() for item in discovered]
     if log_summary:
         if discovered_names:
@@ -588,11 +620,8 @@ def _deployment_wait_for_candle_close(
 
 
 def _deployment_signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = deployment.signal_config or {}
-    configured_tf = str(configured.get("timeframe") or deployment.timeframe).strip()
-    if configured_tf:
-        return configured_tf
-    return deployment.timeframe
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 def _deployment_has_discord_channel(deployment: LiveDeploymentConfig) -> bool:
@@ -823,6 +852,7 @@ def _apply_signal_processor(
     deployment: LiveDeploymentConfig,
     *,
     adapter: BaseLiveAdapter | None = None,
+    decision: SignalDecisionRecorder | None = None,
 ) -> TradeSignal:
     processor_name = _deployment_signal_processor_name(deployment)
     if not processor_name:
@@ -837,6 +867,17 @@ def _apply_signal_processor(
     processor = get_signal_processor(processor_name, processor_config)
     timeframe = _deployment_signal_timeframe(deployment)
     market_data = _build_processor_market_data(signal, timeframe=timeframe)
+    if decision is not None:
+        # Issue #308: when the signal carries an OHLCV frame
+        # (``signal.metadata["market_data"]``), record the cheap signal-time
+        # features it supports. Production Discord signals do not carry one
+        # today — market features are computed offline from historical OHLCV
+        # by ``message_created_at`` instead. Best effort: a feature failure
+        # must never change the trading decision.
+        try:
+            decision.set_features(market_features_from_frame(market_data))
+        except Exception:
+            logger.debug("Signal archive market features failed", exc_info=True)
     raw_signal = {
         "symbol": signal.symbol,
         "action": signal.action,
@@ -871,6 +912,23 @@ def _apply_signal_processor(
             f"signal processor '{processor_name}'"
         ),
     )
+    if decision is not None:
+        processed_metadata = processed.metadata or {}
+        trailing_config = processed_metadata.get(TRAILING_SL_CONFIG_METADATA_KEY)
+        decision.set_features(
+            {
+                "processor_atr": processed_metadata.get("atr"),
+                "supertrend_green_at_entry": processed_metadata.get(
+                    "supertrend_green_at_entry"
+                ),
+                "slippage_vs_signal": processed_metadata.get("slippage_vs_signal"),
+                "trailing_mode": (
+                    trailing_config.get("mode")
+                    if isinstance(trailing_config, Mapping)
+                    else None
+                ),
+            }
+        )
     metadata = dict(signal.metadata or {})
     metadata.update(dict(processed.metadata or {}))
     metadata["signal_processor"] = processor_name
@@ -1558,7 +1616,7 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
-def _alert_ledger_mismatch(
+async def _alert_ledger_mismatch(
     deployment: LiveDeploymentConfig,
     symbol: str,
     exc: LedgerMismatchError,
@@ -1572,7 +1630,25 @@ def _alert_ledger_mismatch(
     The residual risk is stated in the alert: on a netted account, a broker-side
     close made for another deployment lowers the broker position, and the cap
     then closes part of that deployment's share.
+
+    A mismatch means a close the ledgers never saw happened - a flatten or a
+    manual close no adapter could attribute (#144 decision). The ERROR alert is
+    the surface; the durable ``ledger_reconciliation_required`` audit flag is
+    what an operator and the periodic broker reconciliation (#330) act on.
     """
+    await asyncio.to_thread(
+        flag_live_ledger_reconciliation,
+        account_id=deployment.account_id,
+        symbol=symbol,
+        cause="exit_ledger_mismatch",
+        detail={
+            "deployment_id": str(deployment.id),
+            "own_ledger_qty": float(own_qty),
+            "exit_qty_before_step": float(exit_qty),
+            "reason": str(exc),
+            **exc.log_data(),
+        },
+    )
     logger.error(
         "ALERT: deployment ledgers do not match the broker position; submitting "
         "the exit capped at the broker position. If another deployment's "
@@ -1698,7 +1774,7 @@ async def prepare_exit_intent_order(
             tolerance=tolerance,
         )
     except LedgerMismatchError as exc:
-        _alert_ledger_mismatch(
+        await _alert_ledger_mismatch(
             deployment, signal.symbol, exc, own_qty=ledger_qty, exit_qty=target_qty
         )
     else:
@@ -1706,7 +1782,7 @@ async def prepare_exit_intent_order(
             # Offsetting ledgers of other deployments hide the overhang from
             # the total, or other working exits leave less than this
             # deployment's share; either way the own quantity exceeds the cap.
-            _alert_ledger_mismatch(
+            await _alert_ledger_mismatch(
                 deployment,
                 signal.symbol,
                 LedgerMismatchError(
@@ -1788,14 +1864,97 @@ async def prepare_exit_intent_order(
     return prepared, float(target_qty)
 
 
+class UnreadableBrokerPositionQtyError(ValueError):
+    """A broker position row whose quantity cannot be read (#263).
+
+    The open-position count gates entries: it drives ``max_positions`` and the
+    risk-at-stake exposure estimate. A row that does not state a finite
+    quantity says nothing about whether the account is flat, so the count has to
+    refuse instead of defaulting it to zero - reading it as "no position"
+    would open a new one on top of a cap that may already be full.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        symbol: str = "",
+        qty: object = None,
+        row_index: int = -1,
+    ) -> None:
+        super().__init__(message)
+        self.symbol = symbol
+        self.qty = qty
+        self.row_index = row_index
+
+    def log_data(self) -> dict[str, object]:
+        """Structured fields for the operator alert (the raw value stringified)."""
+        return {
+            "position_symbol": self.symbol,
+            "position_qty_raw": str(self.qty),
+            "position_row_index": self.row_index,
+        }
+
+
+def _broker_position_qty(position: Mapping[str, object], row_index: int) -> float:
+    """The quantity one broker position row states; a bad value raises (#263).
+
+    ``0.0``/``"0"`` is a *readable* flat row and is fine. Anything else that is
+    not a finite number - a value that cannot be parsed at all, ``nan``/``inf``,
+    a boolean, or a missing/``None`` quantity - raises
+    :class:`UnreadableBrokerPositionQtyError`: the row does not say what it is
+    worth, and "no position" is a guess this path may not make. The exit path
+    already reads a broker quantity the same way
+    (:func:`live_runner.exit_signals.broker_position_qty`).
+
+    Alpaca's adapter marks a row whose REST quantity string it could not parse
+    with ``qty_unparseable`` (its displayed ``qty`` stays the coerced ``0.0``),
+    which is the only thing that tells an unreadable row from a flat one -
+    ``live_runner.trailing_stops`` and the adapter's own flatten path already
+    read that marker, and so does this one.
+    """
+    symbol = str(position.get("symbol") or "").strip().upper()
+
+    def _unreadable(detail: str, raw: object) -> UnreadableBrokerPositionQtyError:
+        return UnreadableBrokerPositionQtyError(
+            f"Broker position for {symbol!r} {detail}; refusing to read the account "
+            "as flat",
+            symbol=symbol,
+            qty=raw,
+            row_index=row_index,
+        )
+
+    if position.get("qty_unparseable"):
+        raw = position.get("qty_raw")
+        raise _unreadable(f"has an unparseable qty ({raw!r})", raw)
+    raw = position.get("qty")
+    if raw is None:
+        raise _unreadable("states no qty", raw)
+    if isinstance(raw, bool):
+        raise _unreadable(f"has a boolean qty ({raw!r})", raw)
+    try:
+        qty = float(raw)
+    # ArithmeticError covers OverflowError and the decimal library's
+    # DecimalException: `float()` raises those rather than a TypeError or
+    # ValueError for an int too large for a float and a Decimal it cannot parse.
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise _unreadable(f"has an unparseable qty ({raw!r})", raw) from exc
+    if not math.isfinite(qty):
+        raise _unreadable(f"has a non-finite qty ({raw!r})", raw)
+    return qty
+
+
 def _count_open_broker_positions(positions: Iterable[Mapping[str, object]]) -> int:
+    """Count the broker positions that carry an open quantity (#263).
+
+    The count feeds the entry gates, so a row this cannot read must stop the
+    count rather than drop out of it: :class:`UnreadableBrokerPositionQtyError`
+    propagates and the caller refuses the entry (see
+    :func:`prepare_order_with_risk`).
+    """
     open_positions_count = 0
-    for position in positions:
-        try:
-            position_qty = float(position.get("qty") or 0.0)
-        except (TypeError, ValueError):
-            position_qty = 0.0
-        if abs(position_qty) > 0:
+    for row_index, position in enumerate(positions):
+        if abs(_broker_position_qty(position, row_index)) > 0:
             open_positions_count += 1
     return open_positions_count
 
@@ -1813,6 +1972,10 @@ async def _broker_exposure_estimate(
     worst-case open risk is ``count * max_risk_per_trade``. The estimate is
     clamped to ``max_total_exposure``: position rows fetched between snapshots
     must not fabricate budget overflow beyond the configured cap.
+
+    Raises :class:`UnreadableBrokerPositionQtyError` when a position row
+    states no readable quantity (#263): an unknown row must not be read as
+    flat, so the caller cannot size an entry against it.
     """
     open_positions_count: int | None = None
     broker_exposure = 0.0
@@ -1866,6 +2029,10 @@ async def prepare_order_with_risk(
     ``None`` (production) the adapter's :meth:`get_pip_value` supplies it from
     broker data, and an entry whose pip value cannot be determined is refused.
     A ``pip_value`` in signal metadata is never read.
+
+    Raises :class:`UnreadableBrokerPositionQtyError` (after an operator alert)
+    when a broker position row states no readable quantity (#263): the entry
+    is refused rather than sized as if the account were flat.
     """
     metadata = dict(signal.metadata or {})
     if is_exit_order(signal.action, metadata):
@@ -1883,6 +2050,17 @@ async def prepare_order_with_risk(
             signal,
             instruction=None if is_exit_intent(metadata) else FULL_EXIT,
         )
+    # Kill switch (#300). The persisted halt is checked at the last chokepoint
+    # every entry order passes through, and it is checked *after* the exit branch
+    # above: closing a position must never be blocked by a halt, or the feature
+    # would trap an operator in the exposure it exists to stop adding to. It runs
+    # before any broker state is read, so a halted account costs no round-trip and
+    # an unreadable halt state refuses the entry instead of trading on a guess.
+    await refuse_entry_while_halted(
+        deployment.account_id,
+        deployment_id=str(deployment.id),
+        symbol=signal.symbol,
+    )
     # #150 fail closed at the last chokepoint before the broker: an entry
     # signal carrying a trailing config this adapter cannot execute (#167:
     # per-broker table + the adapter's stop-amendment capability) is refused —
@@ -1912,9 +2090,32 @@ async def prepare_order_with_risk(
     )
     # Feed broker truth into sizing so max_positions / max_total_exposure actually
     # bind. Without this, every signal is sized as if the account were flat.
-    open_positions_count, broker_exposure = await _broker_exposure_estimate(
-        adapter, deployment
-    )
+    try:
+        open_positions_count, broker_exposure = await _broker_exposure_estimate(
+            adapter, deployment
+        )
+    except UnreadableBrokerPositionQtyError as exc:
+        # #263 fail closed on the money path: a broker position whose quantity
+        # cannot be read is not "no position". Taking the entry decision anyway
+        # would size it as though the account were flat, so max_positions and
+        # max_total_exposure would not bind and a new position could open on top
+        # of a cap that is already full. Nothing is submitted and an operator
+        # has to look (ERROR is a Sentry event).
+        logger.error(
+            "ALERT: broker position quantity is unreadable; refusing the entry "
+            "signal because the open-position count cannot be trusted",
+            extra={
+                "data": {
+                    "alert": "broker_position_qty_unreadable",
+                    "account_id": deployment.account_id,
+                    "deployment_id": str(deployment.id),
+                    "signal_symbol": signal.symbol,
+                    "reason": str(exc),
+                    **exc.log_data(),
+                }
+            },
+        )
+        raise
     resolved_balance = await _resolve_account_balance(adapter, account_balance)
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
@@ -2090,6 +2291,15 @@ async def submit_order_with_risk(
         account_balance=account_balance,
         pip_value=pip_value,
     )
+    # The same last-moment halt gate the leased submission path runs: this
+    # caller has no claim to protect, but a halt written while the order was
+    # being sized must still stop it. Entries only - an exit is never blocked.
+    if not is_exit_order(signal.action, signal.metadata or {}):
+        await refuse_entry_while_halted(
+            deployment.account_id,
+            deployment_id=str(deployment.id),
+            symbol=signal.symbol,
+        )
     return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
@@ -2474,6 +2684,7 @@ async def _prepare_discord_signal_for_submission(
     signal_timeframe: str,
     wait_enabled: bool,
     adapter: BaseLiveAdapter | None = None,
+    decision: SignalDecisionRecorder | None = None,
 ) -> TradeSignal | None:
     """Apply the pre-wait gates and, when enabled, the candle-close wait.
 
@@ -2500,6 +2711,8 @@ async def _prepare_discord_signal_for_submission(
                 }
             },
         )
+        if decision is not None:
+            decision.refused("stale_signal", detail=signal_timeframe)
         return None
     normalized_signal = TradeSignal(
         action=trade_signal.action,
@@ -2528,7 +2741,7 @@ async def _prepare_discord_signal_for_submission(
             # closes what exists; Nitro's BUY-only processor would refuse every
             # close on a Nitro deployment (#121).
             normalized_signal = _apply_signal_processor(
-                normalized_signal, deployment, adapter=adapter
+                normalized_signal, deployment, adapter=adapter, decision=decision
             )
     except ValueError as exc:
         logger.warning(
@@ -2542,6 +2755,8 @@ async def _prepare_discord_signal_for_submission(
                 }
             },
         )
+        if decision is not None:
+            decision.refused("signal_gate_rejected", detail=str(exc))
         return None
     if wait_enabled:
         try:
@@ -2567,6 +2782,8 @@ async def _prepare_discord_signal_for_submission(
                     }
                 },
             )
+            if decision is not None:
+                decision.refused("candle_close_wait_refused", detail=str(exc))
             return None
 
     # Re-check after the candle-close wait: the wait can span minutes, and the
@@ -2585,6 +2802,8 @@ async def _prepare_discord_signal_for_submission(
                 }
             },
         )
+        if decision is not None:
+            decision.refused("deployment_inactive_after_wait")
         return None
     if not signal_is_fresh(normalized_signal, signal_timeframe):
         log_aged = logger.warning if is_exit_intent(normalized_signal.metadata) else logger.info
@@ -2598,6 +2817,8 @@ async def _prepare_discord_signal_for_submission(
                 }
             },
         )
+        if decision is not None:
+            decision.refused("signal_aged_out_during_wait")
         return None
     return normalized_signal
 
@@ -2611,47 +2832,78 @@ async def _submit_normalized_discord_signal(
     signal_timeframe: str,
     wait_enabled: bool,
 ) -> None:
-    prepared = await _prepare_discord_signal_for_submission(
-        account_id,
-        deployment,
-        trade_signal,
-        signal_timeframe=signal_timeframe,
-        wait_enabled=wait_enabled,
-        adapter=adapter,
+    # Issue #308: one archive decision record per (signal, deployment). The
+    # recorder is created here — the one place that knows all three — and
+    # threaded explicitly; every terminal path below records exactly once.
+    decision = SignalDecisionRecorder(
+        trade_signal=trade_signal,
+        account_id=account_id,
+        deployment=deployment,
     )
-    if prepared is None:
-        return
-    normalized_signal = prepared
-
     try:
-        live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
-    except ValueError:
-        # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
-        # deployment without dropping the listener loop or sibling deployments.
-        logger.exception(
-            "Invalid deployment boolean config; skipping deployment",
-            extra={
-                "data": {
-                    "account_id": account_id,
-                    "deployment_id": str(deployment.id),
-                    "symbol": trade_signal.symbol,
-                }
-            },
+        prepared = await _prepare_discord_signal_for_submission(
+            account_id,
+            deployment,
+            trade_signal,
+            signal_timeframe=signal_timeframe,
+            wait_enabled=wait_enabled,
+            adapter=adapter,
+            decision=decision,
         )
-        return
+        if prepared is None:
+            return
+        normalized_signal = prepared
 
-    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
-    if is_exit:
-        # Exits of every deployment on this account and symbol go one after the
-        # other, from sizing to the persisted order (see ``_exit_lock``).
-        async with _exit_lock(account_id, live_signal.symbol):
-            await _prepare_claim_and_submit_signal(
-                account_id, adapter, deployment, normalized_signal, live_signal, is_exit=True
+        try:
+            live_signal = _trade_signal_to_live_signal(normalized_signal, deployment)
+        except ValueError as exc:
+            # Strict-boolean config errors (e.g. typo'd allow_short) must skip this
+            # deployment without dropping the listener loop or sibling deployments.
+            logger.exception(
+                "Invalid deployment boolean config; skipping deployment",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                    }
+                },
             )
-        return
-    await _prepare_claim_and_submit_signal(
-        account_id, adapter, deployment, normalized_signal, live_signal, is_exit=False
-    )
+            decision.refused("invalid_signal_config", detail=str(exc))
+            return
+
+        is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+        if is_exit:
+            # Exits of every deployment on this account and symbol go one after the
+            # other, from sizing to the persisted order (see ``_exit_lock``).
+            async with _exit_lock(account_id, live_signal.symbol):
+                await _prepare_claim_and_submit_signal(
+                    account_id,
+                    adapter,
+                    deployment,
+                    normalized_signal,
+                    live_signal,
+                    is_exit=True,
+                    decision=decision,
+                )
+            return
+        await _prepare_claim_and_submit_signal(
+            account_id,
+            adapter,
+            deployment,
+            normalized_signal,
+            live_signal,
+            is_exit=False,
+            decision=decision,
+        )
+    except Exception as exc:
+        # Issue #308: an unexpected failure must still leave a decision
+        # record — "one per (signal, deployment)" is only true if the escape
+        # path records too. The exception is re-raised unchanged.
+        decision.unknown(
+            "unhandled_error", detail=f"{type(exc).__name__}: {exc}"
+        )
+        raise
 
 
 async def _prepare_claim_and_submit_signal(
@@ -2662,6 +2914,7 @@ async def _prepare_claim_and_submit_signal(
     live_signal: LiveSignal,
     *,
     is_exit: bool,
+    decision: SignalDecisionRecorder | None = None,
 ) -> None:
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
@@ -2688,9 +2941,13 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        if decision is not None:
+            decision.ignored("nothing_to_exit", detail=str(exc))
         return
     except ExitBelowStepError as exc:
         _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
+        if decision is not None:
+            decision.ignored("exit_below_step", detail=str(exc))
         return
     except ExitInFlightError as exc:
         # An error, not a skipped signal: nothing was sent and this deployment's
@@ -2706,6 +2963,27 @@ async def _prepare_claim_and_submit_signal(
                     "account_id": account_id,
                     "deployment_id": str(deployment.id),
                     "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        if decision is not None:
+            decision.refused("exit_in_flight", detail=str(exc))
+        return
+    except LiveHaltError as exc:
+        # The kill switch (#300) refused this entry. Nothing was sent, which is
+        # the halt working; reported as its own reason rather than as a generic
+        # refusal, so an operator sees the halt they just set instead of hunting
+        # for a validation error.
+        logger.warning(
+            "Entry refused by the kill switch; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "halt_mode": exc.mode.value if exc.mode is not None else None,
+                    "halt_state_unreadable": exc.state_unreadable,
                     "reason": str(exc),
                 }
             },
@@ -2728,6 +3006,8 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
+            if decision is not None:
+                decision.refused("exit_pre_submission_error", detail=str(exc))
             return
         logger.warning(
             "Discord signal refused before submission; nothing was sent to the broker",
@@ -2740,7 +3020,40 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        if decision is not None:
+            decision.refused("pre_submission_error", detail=str(exc))
         return
+
+    # Kill switch (#300), read again at the last moment before the broker sees
+    # anything. The gate in `prepare_order_with_risk` ran before the broker
+    # reads, so an operator who halted the account while this entry was being
+    # sized must not have the order land anyway - that window is exactly when the
+    # halt is being used. Nothing has been claimed at this point, so a refusal
+    # costs no submission lease. Exits skip it for the same reason they skip the
+    # gate in `prepare_order_with_risk`: a halt must never trap an open position.
+    if not is_exit:
+        try:
+            await refuse_entry_while_halted(
+                account_id,
+                deployment_id=str(deployment.id),
+                symbol=live_signal.symbol,
+            )
+        except LiveHaltError as exc:
+            logger.warning(
+                "Entry refused by the kill switch at the submission gate; nothing was "
+                "sent to the broker and the submission lease was never claimed",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "halt_mode": exc.mode.value if exc.mode is not None else None,
+                        "halt_state_unreadable": exc.state_unreadable,
+                        "reason": str(exc),
+                    }
+                },
+            )
+            return
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
@@ -2766,7 +3079,46 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        if decision is not None:
+            decision.refused("submission_claim_failed")
         return
+
+    # The claim itself awaited the database, so a halt written while it ran is
+    # still unseen by the gate above. Read the halt one last time now that the
+    # lease is held: a refusal releases the lease (the order never reached the
+    # broker, so nothing is in flight) and this is the last checkpoint before
+    # `adapter.submit_order`. Exits skip it for the same reason as above.
+    if not is_exit:
+        try:
+            await refuse_entry_while_halted(
+                account_id,
+                deployment_id=str(deployment.id),
+                symbol=live_signal.symbol,
+            )
+        except LiveHaltError as exc:
+            try:
+                await asyncio.to_thread(
+                    release_live_deployment_submission, claim_token
+                )
+            except Exception:
+                # The lease expires on its own; never let the cleanup turn a
+                # handled refusal into an exception that aborts the fan-out.
+                logger.exception("Could not release the submission lease")
+            logger.warning(
+                "Entry refused by the kill switch after the submission claim; "
+                "released the lease and nothing was sent to the broker",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "halt_mode": exc.mode.value if exc.mode is not None else None,
+                        "halt_state_unreadable": exc.state_unreadable,
+                        "reason": str(exc),
+                    }
+                },
+            )
+            return
 
     renew_task = asyncio.create_task(
         _renew_submission_claim_until_cancelled(claim_token),
@@ -2797,6 +3149,8 @@ async def _prepare_claim_and_submit_signal(
                     _log_exit_below_step(
                         account_id, deployment, prepared_signal.symbol, exc
                     )
+                    if decision is not None:
+                        decision.ignored("exit_below_step", detail=str(exc))
                     return
                 # A refused exit leaves the position open (#121): error, so an
                 # operator sees it. A refused entry opened nothing: warning.
@@ -2820,6 +3174,13 @@ async def _prepare_claim_and_submit_signal(
                         }
                     },
                 )
+                if decision is not None:
+                    decision.refused(
+                        "broker_refused_pre_request"
+                        if not is_exit
+                        else "exit_refused_pre_request",
+                        detail=str(exc),
+                    )
                 return
             # **Do not release the lease.** The broker may have accepted the
             # order and only the response was lost; releasing would let the next
@@ -2841,6 +3202,10 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
+            if decision is not None:
+                decision.unknown(
+                    "broker_submit_outcome_unknown", detail=str(exc)
+                )
             return
     finally:
         renew_task.cancel()
@@ -2871,6 +3236,13 @@ async def _prepare_claim_and_submit_signal(
             }
         },
     )
+    if decision is not None:
+        decision.traded(
+            detail=str(broker_order_id) if broker_order_id is not None else None,
+            broker_order_id=(
+                str(broker_order_id) if broker_order_id is not None else None
+            ),
+        )
 
 
 def _deployment_accepts_signal_author(
@@ -3087,6 +3459,13 @@ async def _dispatch_discord_trade_signal(
     account_broker_login = _live_account_broker_login(account_id)
     for deployment in deployments_for_channel:
         if not _deployment_is_currently_active(deployment):
+            record_signal_decision(
+                trade_signal,
+                account_id=account_id,
+                deployment=deployment,
+                outcome="refused",
+                reason="deployment_not_active",
+            )
             continue
         if not _deployment_matches_stockkit_route(
             deployment,
@@ -3094,8 +3473,22 @@ async def _dispatch_discord_trade_signal(
             account_broker_login=account_broker_login,
             accounts_env_values=accounts_env_values,
         ):
+            record_signal_decision(
+                trade_signal,
+                account_id=account_id,
+                deployment=deployment,
+                outcome="refused",
+                reason="stockkit_route_mismatch",
+            )
             continue
         if not _deployment_covers_discord_symbol(deployment, trade_signal.symbol):
+            record_signal_decision(
+                trade_signal,
+                account_id=account_id,
+                deployment=deployment,
+                outcome="refused",
+                reason="symbol_not_covered",
+            )
             continue
         if not _deployment_accepts_signal_author(
             deployment, signal_author_id, accounts_env_values=accounts_env_values
@@ -3110,11 +3503,19 @@ async def _dispatch_discord_trade_signal(
                     }
                 },
             )
+            record_signal_decision(
+                trade_signal,
+                account_id=account_id,
+                deployment=deployment,
+                outcome="refused",
+                reason="author_not_allowed",
+                detail=signal_author_id or None,
+            )
             continue
 
         try:
             wait_enabled = _deployment_wait_for_candle_close(deployment, accounts_env_values)
-        except ValueError:
+        except ValueError as exc:
             # A typo'd boolean must skip the deployment, not kill the listener
             # loop or other deployments on the same account. It also must not
             # default into immediate market orders.
@@ -3126,6 +3527,14 @@ async def _dispatch_discord_trade_signal(
                         "strategy_name": deployment.strategy_name,
                     }
                 },
+            )
+            record_signal_decision(
+                trade_signal,
+                account_id=account_id,
+                deployment=deployment,
+                outcome="refused",
+                reason="invalid_deployment_config",
+                detail=str(exc),
             )
             return
 
@@ -3248,6 +3657,7 @@ async def _run_discord_signal_listener_for_account(
         # actually use. Resolved, never created - a deployment with no matching
         # service row simply gets no observability, which is the safe direction.
         service_id=_service_id_for_discord_deployment(primary_deployment),
+        account_id=account_id,
     )
     await source.connect()
     try:
@@ -3258,6 +3668,14 @@ async def _run_discord_signal_listener_for_account(
                 logger.debug(
                     "Skipping discord signal from unmapped channel",
                     extra={"data": {"account_id": account_id, "channel_id": channel_id}},
+                )
+                record_signal_decision(
+                    trade_signal,
+                    account_id=account_id,
+                    deployment=None,
+                    outcome="refused",
+                    reason="unmapped_channel",
+                    detail=channel_id or None,
                 )
                 continue
 
@@ -3326,7 +3744,7 @@ def _create_adapter_for_account(
                 account_id=account_identifier,
                 demo=demo,
                 account_config_id=account.id,
-                accounts_env_path=accounts_env_path or DEFAULT_ACCOUNTS_ENV,
+                accounts_env_path=_accounts_env_file(accounts_env_path or None),
                 connect_max_attempts=1,
             )
         except Exception as exc:
@@ -3906,9 +4324,10 @@ async def sync_services_loop(
     active_discord_bot_tasks: dict[str, asyncio.Task[None]],
     scheduler: ServiceScheduler,
     *,
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
     interval_seconds: int = SERVICE_SYNC_INTERVAL_SECONDS,
 ) -> None:
+    accounts_env = _accounts_env_file(accounts_env)
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
     while True:
@@ -3917,7 +4336,9 @@ async def sync_services_loop(
             if current_mtime != accounts_env_mtime:
                 accounts_env_values = _load_accounts_env_values(accounts_env)
                 accounts_env_mtime = current_mtime
-                await asyncio.to_thread(_discover_and_register_discord_services, log_summary=False)
+                await asyncio.to_thread(
+                    _discover_and_register_discord_services, accounts_env, log_summary=False
+                )
                 if _DISCORD_SERVICE_AUTH_BLOCKED_IDS:
                     logger.info(
                         "Credentials changed; clearing blocked Discord bot services",
@@ -4358,6 +4779,48 @@ def _log_deployment_status_observations(
         )
 
 
+#: Halt modes that can only be enforced through an adapter (see
+#: :func:`_accounts_needing_halt_enforcement`).
+_HALT_MODES_NEEDING_AN_ADAPTER = frozenset(
+    {KillSwitchMode.ORDERS, KillSwitchMode.FLATTEN}
+)
+
+
+def _accounts_needing_halt_enforcement(
+    halt_state: KillSwitchState,
+    deployments: list[LiveDeploymentConfig],
+    registered_account_ids: Iterable[str] = (),
+) -> set[str]:
+    """Accounts whose halt needs a connected adapter to be enforced.
+
+    The mirror image of :func:`_account_ids_needing_stopped_enforcement`. A mode
+    that has to touch the broker (``orders``, ``flatten``) can only run through an
+    adapter, and an account whose deployments are all PAUSED or STOPPED is
+    otherwise never connected - so its halt would be reported as unenforceable on
+    every tick while its positions stayed open, which is the STOPPED machinery's
+    own lesson.
+
+    Registered accounts are candidates as well as deployed ones, so a halt on (or
+    a global halt over) an account with no deployment row is still enforced
+    rather than silently skipped: the account is registered, the operator halted
+    it, and their broker-side position is the thing being halted.
+
+    Retention is never permission: the accounts returned here are added to the
+    retained set so an adapter exists for the sweep, and only the runnable set
+    gets listener tasks, so this cannot make an account tradeable. An unreadable
+    halt state answers ``entries`` - which needs no adapter - so a broken read
+    connects nothing extra and still refuses every entry.
+    """
+    candidates = {deployment.account_id for deployment in deployments} | {
+        str(account_id) for account_id in registered_account_ids
+    }
+    return {
+        account_id
+        for account_id in candidates
+        if halt_state.mode_for_account(account_id) in _HALT_MODES_NEEDING_AN_ADAPTER
+    }
+
+
 def _account_ids_needing_stopped_enforcement(
     deployments: list[LiveDeploymentConfig],
     already_enforced: set[str],
@@ -4793,16 +5256,33 @@ async def _load_db_accounts_and_deployments(
     accounts, deployments = await asyncio.gather(accounts_task, deployments_task)
     # #150: a stored deployment whose trailing override live cannot run is still
     # loaded (so it stays listed, stoppable and enforceable), but every signal
-    # it produces is refused by the live gates. Say so loudly at load time.
+    # it produces is refused by the live gates. Say so loudly at load time. The
+    # same holds for a mode that only comes from the bot's own config default:
+    # it is not visible in the deployment's config, so the processor that would
+    # emit it is built here and asked (its config file is a few KB).
+    account_brokers = {account.id: account.broker for account in accounts}
     for deployment in deployments:
         try:
-            validate_live_deployment_trailing_override(
-                deployment.signal_config,
+            validate_live_deployment_trailing_mode(
+                deployment,
                 context=f"live deployment '{deployment.strategy_name}' ({deployment.id})",
+                broker=account_brokers.get(deployment.account_id, ANY_BROKER),
+                timeframe=_deployment_signal_timeframe(deployment),
             )
         except ValueError as exc:
             logger.error(
                 "Stored live deployment has an unsupported trailing mode; its entry "
+                "signals will be refused: %s",
+                exc,
+                extra={"data": {"deployment_id": str(deployment.id)}},
+            )
+        except Exception as exc:
+            # Anything else reading the deployment's trailing mode can raise. It
+            # must not cost the whole deployment list its sync tick: the
+            # signal-time gates still refuse every signal this deployment makes,
+            # so a stored row is surfaced here and traded nowhere.
+            logger.error(
+                "Stored live deployment's trailing mode could not be checked; its entry "
                 "signals will be refused: %s",
                 exc,
                 extra={"data": {"deployment_id": str(deployment.id)}},
@@ -5118,10 +5598,11 @@ async def sync_deployments_loop(
     active_tasks: dict[str, asyncio.Task[None]],
     active_discord_tasks: dict[str, asyncio.Task[None]],
     *,
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
     deployment_snapshot: list[LiveDeploymentConfig] | None = None,
 ) -> None:
+    accounts_env = _accounts_env_file(accounts_env)
     known_deployment_statuses: dict[str, str] = {}
     # #242: what this process has already alerted about, keyed by deployment id, so
     # an untradeable ACTIVE row is reported on the first tick of every start and
@@ -5146,6 +5627,12 @@ async def sync_deployments_loop(
         )
     accounts_env_values = _load_accounts_env_values(accounts_env)
     accounts_env_mtime = _accounts_env_mtime(accounts_env)
+    # One halt state for the process, refreshed in place once per tick (#300). The
+    # halts are re-read every time - that is what makes a halt written while
+    # nothing was running, or across a restart, take effect - while the sweep
+    # ledger it carries (which account was already swept in which mode) has to
+    # outlive a tick, or a flat account would be re-flattened every 10 s.
+    halt_state = read_kill_switch_state()
     while True:
         try:
             # Read credential file directly without repeatedly mutating process env.
@@ -5156,6 +5643,11 @@ async def sync_deployments_loop(
                 # cTrader blocks are cleared below only for accounts whose
                 # selected credential signature actually changed.
                 _clear_discord_auth_blocked_accounts()
+            # The halt is read first, before any adapter work: it decides which
+            # accounts need one (a mode that has to touch the broker) and the
+            # entry gate asks for it on every order. Never raises - an
+            # unreadable state answers 'halted in entries mode'.
+            await asyncio.to_thread(halt_state.refresh)
             accounts, deployments = await _load_db_accounts_and_deployments()
             # #242: an ACTIVE row nothing can trade gets a broker adapter and an
             # execution listener, so it looks live in the log and the dashboard.
@@ -5207,7 +5699,15 @@ async def sync_deployments_loop(
                 deployments,
                 enforced_stopped_deployments,
             ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
-            retained_account_ids = runnable_account_ids | enforcement_account_ids
+            # A halt in a mode that has to touch the broker needs an adapter for
+            # the same reason (#300). Retention only: the runnable set below is
+            # what may trade.
+            halt_enforcement_account_ids = _accounts_needing_halt_enforcement(
+                halt_state, deployments, (account.id for account in accounts)
+            ) - _CTRADER_AUTH_BLOCKED_ACCOUNTS
+            retained_account_ids = (
+                runnable_account_ids | enforcement_account_ids | halt_enforcement_account_ids
+            )
 
             # B2: disconnect against retained (blocked-excluded) ids — a
             # blocked account must never keep a live adapter via either path.
@@ -5237,6 +5737,22 @@ async def sync_deployments_loop(
                 already_enforced=enforced_stopped_deployments,
                 account_lookup=account_lookup,
             )
+            # The kill switch (#300), enforced on the same tick it is read. This
+            # is the second of its two checkpoints: the entry gate refuses new
+            # entries, and this makes the modes that have to touch the broker
+            # actually touch it - a halt written while the daemon was down is
+            # enforced by the first tick after it starts. Same account set the
+            # STOPPED sweep above just used, plus every connected adapter.
+            kill_switch_report = await enforce_live_kill_switch(
+                active_adapters,
+                halt_enforcement_account_ids | retained_account_ids | set(active_adapters),
+                state=halt_state,
+            )
+            if kill_switch_report.modes:
+                logger.warning(
+                    "Kill switch state enforced",
+                    extra={"data": {"report": kill_switch_report.describe()}},
+                )
             _cancel_inactive_discord_tasks(active_discord_tasks, active_discord_account_ids)
             _start_missing_discord_tasks(
                 active_adapters,
@@ -5257,8 +5773,9 @@ async def sync_deployments_loop(
 
 async def run_daemon(
     *,
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
 ) -> None:
+    accounts_env = _accounts_env_file(accounts_env)
     logger.info(
         "Starting live daemon",
         extra={"data": {"accounts_env": str(accounts_env)}},
@@ -5270,7 +5787,7 @@ async def run_daemon(
     active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
     scheduler = ServiceScheduler()
 
-    await asyncio.to_thread(_discover_and_register_discord_services, log_summary=True)
+    await asyncio.to_thread(_discover_and_register_discord_services, accounts_env, log_summary=True)
     await asyncio.to_thread(_recover_failed_services)
     await scheduler.start()
 
@@ -5363,6 +5880,11 @@ async def run_daemon(
         for source in list(active_discord_bots.values()):
             with contextlib.suppress(Exception):
                 await source.disconnect(failed=False)
+        # #308: flush the raw-signal archive last — records still queued by
+        # the just-cancelled listeners must reach disk before exit. Off the
+        # event loop: close() joins the writer thread.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(get_signal_archive().close, timeout=5.0)
         with contextlib.suppress(Exception):
             await scheduler.stop()
         logger.info(

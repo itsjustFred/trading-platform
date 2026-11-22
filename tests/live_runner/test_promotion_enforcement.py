@@ -26,6 +26,7 @@ from live_runner.preflight import run_live_preflight
 from runner.promotion_gate import StrategyNotPromotedError
 from shared.models import LiveAccountConfig, LiveSignal
 from tests.test_promotion_gate import (
+    EVIDENCE_SUBDIR,
     STRATEGY_NAME,
     make_signal_bots_root,
     promote_ramjet_bot,
@@ -253,6 +254,19 @@ def test_daemon_refuses_a_promoted_strategy_after_a_file_change(strategies_dir: 
     path.write_bytes(path.read_bytes() + b"\n")
     adapter = _Adapter(demo=False)
     with pytest.raises(StrategyNotPromotedError, match="changed"):
+        _submit(adapter)
+
+
+def test_daemon_refuses_a_promoted_strategy_after_an_evidence_change(
+    strategies_dir: Path, tmp_path: Path
+) -> None:
+    """The re-check opens the evidence files, so every enforcement point inherits it (#260)."""
+    evidence_dir = tmp_path / EVIDENCE_SUBDIR
+    promote_strategy_file(strategies_dir, evidence_dir=evidence_dir)
+    result = evidence_dir / "opt-1.json"
+    result.write_text(result.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    adapter = _Adapter(demo=False)
+    with pytest.raises(StrategyNotPromotedError, match="changed after the promotion"):
         _submit(adapter)
 
 
