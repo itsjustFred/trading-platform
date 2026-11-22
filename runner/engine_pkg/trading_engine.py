@@ -515,8 +515,12 @@ class TradeEngine:
         shares = min(shares, exposure_qty_cap)
         if cap_by_leverage:
             leverage_cap = self._free_margin_quantity_cap(float(entry_price))
-            if lot_step > 0 and leverage_cap < shares:
-                leverage_cap = math.floor(leverage_cap / lot_step + 1e-12) * lot_step
+            if lot_step > 0 and 0 < leverage_cap < shares:
+                # The shared grid floor (#365/#278), not a private
+                # ``floor(x / step + 1e-12)``: the risk-engine path never
+                # re-floors its result, so an off-grid float or a one-step-low
+                # size would reach the order.
+                leverage_cap = _floor_to_lot_grid(leverage_cap, lot_step)
             shares = min(shares, leverage_cap)
         return max(shares, 0.0)
 

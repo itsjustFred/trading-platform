@@ -942,6 +942,49 @@ class TestFreeMarginLeverageCap:
         )
         assert qty == pytest.approx(920.0)
 
+    def test_leverage_clamp_floors_with_the_shared_lot_grid(
+        self, tmp_path: Path
+    ):
+        """The free-margin clamp must floor through ``shared.lot_grid``
+        (#365/#278), not a private ``floor(x / step + eps)``: an exact
+        3-step cap on a 0.1 grid is ``0.3``, not ``0.30000000000000004`` —
+        and the risk-engine path never re-floors, so a private floor's
+        off-grid float would reach the order."""
+        # Balance 30 at 1x with no open position: free margin = 30, so the
+        # leverage cap is exactly 30 * 1 / 100 = 0.3 — three 0.1 steps.
+        risk_engine = self._engine(
+            tmp_path,
+            initial_capital=30.0,
+            max_leverage=1.0,
+            parameters={"lot_step": 0.1},
+        )
+        # 1% of 30 = 0.3 risk over a ~0.1 stop distance → ~3 shares pre-cap.
+        qty = risk_engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.3
+
+        fixed_risk = self._engine(
+            tmp_path,
+            initial_capital=30.0,
+            max_leverage=1.0,
+            parameters={
+                "fixed_risk_amount": 30.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+                "lot_step": 0.1,
+            },
+        )
+        # 30 / ~0.1 ≈ 300 shares pre-cap; the same 0.3 leverage cap binds.
+        qty = fixed_risk._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.3
+
     def test_exposure_cap_stays_on_realized_cash(self, tmp_path: Path):
         engine = self._engine(
             tmp_path, max_leverage=10.0, max_position_exposure_pct=0.4

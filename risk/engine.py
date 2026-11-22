@@ -155,7 +155,7 @@ class RiskEngine:
         return parsed
 
     @staticmethod
-    def _caller_notional_limit(value: object) -> float:
+    def _caller_notional_limit(value: Any) -> float:
         """Caller-specific notional ceiling (fraction of balance).
 
         ``math.inf`` is the documented "uncapped" value: engines that apply
