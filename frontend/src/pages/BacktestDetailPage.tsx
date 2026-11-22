@@ -294,14 +294,22 @@ export function BacktestDetailPage() {
   const totalPnlFromStats =
     typeof stats?.net_profit === "number"
       ? stats.net_profit
-      : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
+      : stats?.net_profit === null
+        ? // The producer declared the figure unmeasurable; summing an empty
+          // trade page would publish that absence as a measured $0.
+          null
+        : trades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
   // Fallback only when the stats payload omits the average: net profit over
-  // the reported trade count, else 0 when neither is usable.
+  // the reported trade count, else 0 when neither is usable. An explicit null
+  // is the producer saying "unmeasured" - deriving a number from it would
+  // publish the absence as a measurement.
   const canDeriveAvgPnl =
     typeof stats?.total_trades === "number" && stats.total_trades > 0;
-  let avgPnlFromStats = 0;
+  let avgPnlFromStats: number | null = 0;
   if (typeof stats?.avg_trade_pnl === "number") {
     avgPnlFromStats = stats.avg_trade_pnl;
+  } else if (stats?.avg_trade_pnl === null || totalPnlFromStats == null) {
+    avgPnlFromStats = null;
   } else if (canDeriveAvgPnl) {
     avgPnlFromStats = totalPnlFromStats / (stats?.total_trades as number);
   }
@@ -709,7 +717,7 @@ export function BacktestDetailPage() {
             value={stats.max_drawdown_pct}
             format="percent"
             percentScale={requireMetricScale("backtest_stats", "max_drawdown_pct")}
-            color="#f85149"
+            color={stats.max_drawdown_pct == null ? undefined : "#f85149"}
           />
           <StatCard
             label="Win Rate (higher = better)"
@@ -929,13 +937,33 @@ export function BacktestDetailPage() {
           />
           <SummaryItem
             label="Total P&L"
-            value={`$${tradeStats.totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
-            color={tradeStats.totalPnl >= 0 ? "#3fb950" : "#f85149"}
+            value={
+              tradeStats.totalPnl != null
+                ? `$${tradeStats.totalPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+                : "—"
+            }
+            color={
+              tradeStats.totalPnl == null
+                ? undefined
+                : tradeStats.totalPnl >= 0
+                  ? "#3fb950"
+                  : "#f85149"
+            }
           />
           <SummaryItem
             label="Avg P&L"
-            value={`$${tradeStats.avgPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`}
-            color={tradeStats.avgPnl >= 0 ? "#3fb950" : "#f85149"}
+            value={
+              tradeStats.avgPnl != null
+                ? `$${tradeStats.avgPnl.toLocaleString("en-US", { maximumFractionDigits: 2 })}`
+                : "—"
+            }
+            color={
+              tradeStats.avgPnl == null
+                ? undefined
+                : tradeStats.avgPnl >= 0
+                  ? "#3fb950"
+                  : "#f85149"
+            }
           />
           <SummaryItem
             label="Best Trade"

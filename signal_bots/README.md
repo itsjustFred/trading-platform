@@ -26,6 +26,17 @@ Die zentrale Registry liegt in `signal_bots/registry.py`.
 
 `get_signal_processor(name, config)` liefert die passende Instanz.
 
+## Health-Check (#158)
+
+Der Health-Check bleibt ein Standalone-Skript plus Scheduler-Job — bewusst
+kein `runner.cli`-Subcommand.
+
+- Manuell: `python -m signal_bots.health_check` (keine Flags; JSON auf stdout,
+  Exit-Code `0` = ok, `1` = Fehler).
+- Geplant: Viewer → Services → „+ Add Scheduled Job" mit Job Type
+  `signal_bot_health_check` und Cron (UTC). Der Scheduler läuft im
+  `live_runner.daemon`; Details in `docs/signal_bots.md`.
+
 ## Risk-Engine Integration
 
 1. Signal-Processor berechnet `entry_price`, `stop_loss`, `take_profit`.
