@@ -125,3 +125,8 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | account equity read in the loss-breaker entry gate | money-decision | raises `LossBreakerBreachError`, entry refused |
 | `loss_breaker.py` | breach-latch write, state read, deployment pip-value/quote/flows reads | money-decision | unmeasurable loss = entries refused |
 | `loss_breaker.py` | untrusted-fill listing for the alert, observation wrapper | loop-survival | alert/observation only |
+| `ctrader_adapter.py` | `get_max_leverage` tier/account legs | money-decision | degrades to `None` → the caps' fail-closed 1x ceiling |
+| `ctrader_adapter.py` | `_account_leverage_cents` trader read | money-decision | same 1x degradation |
+| `pre_submit_caps.py` | `_safe_max_leverage` adapter read | money-decision | same 1x degradation |
+| `pre_submit_caps.py` | broker-facts gather (quote/pip/balance/leverage) | money-decision | cancels siblings, refuses the order |
+| `pre_submit_caps.py` | `_record_cap_audit` audit write | loop-survival | observational; the cap decision stands |

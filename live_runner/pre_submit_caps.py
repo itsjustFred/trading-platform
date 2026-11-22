@@ -317,7 +317,7 @@ async def _record_cap_audit(
             succeeded=succeeded,
             detail=dict(data),
         )
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # except-kind: loop-survival  # pragma: no cover - defensive
         logger.error(
             "Could not write the pre-submit cap audit record; the decision stands",
             extra={"data": {"error": repr(exc)}},
@@ -336,7 +336,7 @@ async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | N
     """
     try:
         value = await adapter.get_max_leverage(symbol)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         logger.debug(
             "Max leverage lookup raised; treating it as unknown (1x)",
             extra={"data": {"symbol": symbol, "error": repr(exc)}},
@@ -466,7 +466,7 @@ async def enforce_pre_submit_caps(
             asyncio.gather(quote_task, pip_task, balance_task, leverage_task),
             timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # gather propagates the first failure but leaves the sibling reads
         # running; cancel them so a hung broker call cannot outlive the
         # refusal (wait_for already cancelled them on a timeout). The

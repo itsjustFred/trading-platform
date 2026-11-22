@@ -3217,7 +3217,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
             candidates = [cents for cents in (tier_cents, account_cents) if cents is not None]
             return min(candidates) / 100.0 if candidates else None
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "cTrader max leverage lookup failed; treating it as unknown (1x)",
                 extra={"data": {"symbol": symbol, "error": repr(exc)}},
@@ -3237,7 +3237,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         try:
             trader = await self._fetch_trader()
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "cTrader trader leverage lookup failed; using the symbol tiers only",
                 extra={"data": {"error": repr(exc)}},
