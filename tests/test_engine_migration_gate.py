@@ -224,8 +224,9 @@ class TestTradeSignaturePrecision:
     """The gate must not call representation rounding a trade difference.
 
     The vectorbt adapter persists prices at 6dp, quantities at 4dp and money
-    at 2dp while native stores unrounded floats; signatures compare at that
-    stored precision so equivalent fills still report ``identical``.
+    at 2dp while native stores unrounded floats; pairs compare at one stored
+    unit of tolerance so equivalent fills still report ``identical`` and a
+    real divergence is reported as a self-explaining per-field diff.
     """
 
     def test_stored_precision_rounding_still_reports_identical(self):
@@ -245,6 +246,8 @@ class TestTradeSignaturePrecision:
                 )
             ],
         )
+        # The real vectorbt adapter leaves exit-leg ``reason`` as None —
+        # an unlabelled leg must not diff against native's "signal".
         vectorbt_trade = _trade(
             entry_price=100.123457,
             quantity=3.1416,
@@ -257,7 +260,7 @@ class TestTradeSignaturePrecision:
                     price=101.987654,
                     quantity=3.1416,
                     pnl=12.35,
-                    reason="signal",
+                    reason=None,
                 )
             ],
         )
@@ -266,17 +269,82 @@ class TestTradeSignaturePrecision:
             SimpleNamespace(trades=[vectorbt_trade]),
         )
         assert diff["trades_identical"] is True
+        assert diff["matched_pairs"] == 1
+        assert diff["field_diffs"] == []
         assert diff["only_in_native_count"] == 0
         assert diff["only_in_vectorbt_count"] == 0
 
+    def test_qty_straddle_within_one_stored_unit_reports_identical(self):
+        """A 1e-4 quantity straddle (rounding boundary) is not a difference."""
+        native_trade = _trade(quantity=151.38114999, pnl=10.004, net_pnl=9.504)
+        vectorbt_trade = _trade(quantity=151.3812, pnl=10.0, net_pnl=9.5)
+        diff = gate._diff_trades(
+            SimpleNamespace(trades=[native_trade]),
+            SimpleNamespace(trades=[vectorbt_trade]),
+        )
+        assert diff["trades_identical"] is True
+        assert diff["field_diffs"] == []
+
     def test_real_fill_difference_still_diffs(self):
         native_trade = _trade(quantity=3.1416)
-        vectorbt_trade = _trade(quantity=3.1417)
+        vectorbt_trade = _trade(quantity=3.15)
         diff = gate._diff_trades(
             SimpleNamespace(trades=[native_trade]),
             SimpleNamespace(trades=[vectorbt_trade]),
         )
         assert diff["trades_identical"] is False
+        assert diff["matched_pairs"] == 1
+        assert diff["only_in_native_count"] == 0
+        assert diff["only_in_vectorbt_count"] == 0
+        # The diff must explain itself: which field, on which trade, both values.
+        assert diff["field_diffs_count"] == 1
+        entry = diff["field_diffs"][0]
+        assert entry["field"] == "quantity"
+        assert entry["trade"]["symbol"] == "GSYN"
+        assert entry["native"] == pytest.approx(3.1416)
+        assert entry["vectorbt"] == pytest.approx(3.15)
+
+    def test_label_only_difference_still_diffs_when_both_sides_label(self):
+        """Two different non-empty exit reasons are a real label diff."""
+        native_trade = _trade(
+            exits=[
+                SimpleNamespace(
+                    time="2024-01-11T10:00:00+00:00",
+                    price=101.0,
+                    quantity=10.0,
+                    pnl=10.0,
+                    reason="stop_loss",
+                )
+            ]
+        )
+        vectorbt_trade = _trade(
+            exits=[
+                SimpleNamespace(
+                    time="2024-01-11T10:00:00+00:00",
+                    price=101.0,
+                    quantity=10.0,
+                    pnl=10.0,
+                    reason="signal",
+                )
+            ]
+        )
+        diff = gate._diff_trades(
+            SimpleNamespace(trades=[native_trade]),
+            SimpleNamespace(trades=[vectorbt_trade]),
+        )
+        assert diff["trades_identical"] is False
+        fields = {d["field"] for d in diff["field_diffs"]}
+        assert "exits[0].reason" in fields
+
+    def test_unpaired_trades_land_in_only_in_lists(self):
+        native_trade = _trade()
+        other_entry = _trade(entry_time="2024-02-01T10:00:00+00:00")
+        diff = gate._diff_trades(
+            SimpleNamespace(trades=[native_trade]),
+            SimpleNamespace(trades=[other_entry]),
+        )
+        assert diff["trades_identical"] is False
+        assert diff["matched_pairs"] == 0
         assert diff["only_in_native_count"] == 1
         assert diff["only_in_vectorbt_count"] == 1
 

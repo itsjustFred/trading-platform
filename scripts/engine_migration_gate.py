@@ -360,46 +360,111 @@ def _norm_time(value: Any) -> str:
         return str(value)
 
 
-#: Signature precision = the coarsest precision either engine stores. The
-#: vectorbt adapter persists prices at 6dp, quantities at 4dp and money at
-#: 2dp (``vectorbt_adapter.py`` Trade construction) while native stores
-#: unrounded values; comparing at the stored precision keeps pure
-#: representation rounding from reading as a trade difference while any
-#: real fill/size/PnL divergence still diffs.
-_SIG_PRICE_DP = 6
-_SIG_QTY_DP = 4
-_SIG_MONEY_DP = 2
+#: Comparison tolerance = ONE STORED UNIT of the coarsest precision either
+#: engine persists. The vectorbt adapter stores prices at 6dp, quantities at
+#: 4dp and money at 2dp (``vectorbt_adapter.py`` Trade construction) while
+#: native keeps unrounded floats, so a value sitting on a rounding boundary
+#: (e.g. qty 151.3811 vs 151.3812) must not read as a trade difference —
+#: but any divergence larger than one stored unit still diffs.
+_SIG_TOL_PRICE = 1e-6
+_SIG_TOL_QTY = 1e-4
+_SIG_TOL_MONEY = 0.01
+
+#: Cap on per-field diff entries so a fully-divergent run cannot emit an
+#: unbounded report; the true count is always reported alongside.
+_MAX_FIELD_DIFFS = 100
 
 
-def _trade_signature(trade: Any) -> tuple:
-    """Stable comparable signature for one trade at stored precision."""
+def _within_stored_precision(a: Any, b: Any, tolerance: float) -> bool:
+    """True when ``a`` and ``b`` agree to within one stored unit.
 
-    def rnd(value: Any, digits: int) -> Any:
-        number = _f(value)
-        return round(number, digits) if number is not None else value
+    The bound carries a small relative headroom: two floats that differ by
+    exactly one stored unit can land a hair above it in binary
+    (``194.9428 - 194.9427`` is ``1.0000000000287557e-04``), which is
+    representation noise, not a real divergence.
+    """
+    fa, fb = _f(a), _f(b)
+    if fa is not None and fb is not None:
+        return abs(fa - fb) <= tolerance * (1 + 1e-9) + 1e-12
+    return a == b
 
-    exits = tuple(
-        (
-            _norm_time(exit_.time),
-            rnd(exit_.price, _SIG_PRICE_DP),
-            rnd(exit_.quantity, _SIG_QTY_DP),
-            rnd(exit_.pnl, _SIG_MONEY_DP),
-            exit_.reason,
+
+def _label_equal(a: Any, b: Any) -> bool:
+    """Exit-leg labels: ``None`` means *unlabelled*, not a different reason.
+
+    The vectorbt adapter does not label individual exit legs (``reason`` is
+    ``None``) while native writes e.g. ``"signal"`` — a label-presence
+    difference is not a money difference. Two different non-empty labels
+    still diff.
+    """
+    if a is None or b is None:
+        return True
+    return a == b
+
+
+def _trade_field_diffs(native: Any, vectorbt: Any) -> list[dict[str, Any]]:
+    """Per-field differences between one paired native/vectorbt trade.
+
+    Every entry names the field, both stored values and is self-explaining —
+    the #318 requirement that each reported difference can be explained.
+    """
+    diffs: list[dict[str, Any]] = []
+
+    def add(field: str, a: Any, b: Any) -> None:
+        diffs.append(
+            {
+                "field": field,
+                "native": _jsonable(a),
+                "vectorbt": _jsonable(b),
+            }
         )
-        for exit_ in trade.exits
-    )
-    return (
-        trade.symbol,
-        trade.direction,
-        _norm_time(trade.entry_time),
-        rnd(trade.entry_price, _SIG_PRICE_DP),
-        rnd(trade.quantity, _SIG_QTY_DP),
-        exits,
-        rnd(trade.pnl, _SIG_MONEY_DP),
-        rnd(trade.fees, _SIG_MONEY_DP),
-        rnd(trade.net_pnl, _SIG_MONEY_DP),
-        trade.exit_reason,
-    )
+
+    for name, tolerance in (
+        ("entry_price", _SIG_TOL_PRICE),
+        ("quantity", _SIG_TOL_QTY),
+        ("pnl", _SIG_TOL_MONEY),
+        ("fees", _SIG_TOL_MONEY),
+        ("net_pnl", _SIG_TOL_MONEY),
+    ):
+        a_value = getattr(native, name, None)
+        b_value = getattr(vectorbt, name, None)
+        if not _within_stored_precision(a_value, b_value, tolerance):
+            add(name, a_value, b_value)
+
+    a_reason = getattr(native, "exit_reason", None)
+    b_reason = getattr(vectorbt, "exit_reason", None)
+    if not _label_equal(a_reason, b_reason):
+        add("exit_reason", a_reason, b_reason)
+
+    native_exits = list(getattr(native, "exits", None) or [])
+    vectorbt_exits = list(getattr(vectorbt, "exits", None) or [])
+    if len(native_exits) != len(vectorbt_exits):
+        add("exits.count", len(native_exits), len(vectorbt_exits))
+    else:
+        for index, (a_exit, b_exit) in enumerate(zip(native_exits, vectorbt_exits)):
+            prefix = f"exits[{index}]"
+            a_time = _norm_time(getattr(a_exit, "time", None))
+            b_time = _norm_time(getattr(b_exit, "time", None))
+            if a_time != b_time:
+                add(
+                    f"{prefix}.time",
+                    getattr(a_exit, "time", None),
+                    getattr(b_exit, "time", None),
+                )
+            for name, tolerance in (
+                ("price", _SIG_TOL_PRICE),
+                ("quantity", _SIG_TOL_QTY),
+                ("pnl", _SIG_TOL_MONEY),
+            ):
+                a_value = getattr(a_exit, name, None)
+                b_value = getattr(b_exit, name, None)
+                if not _within_stored_precision(a_value, b_value, tolerance):
+                    add(f"{prefix}.{name}", a_value, b_value)
+            a_leg_reason = getattr(a_exit, "reason", None)
+            b_leg_reason = getattr(b_exit, "reason", None)
+            if not _label_equal(a_leg_reason, b_leg_reason):
+                add(f"{prefix}.reason", a_leg_reason, b_leg_reason)
+    return diffs
 
 
 def _signature_example(trade: Any) -> dict[str, Any]:
@@ -415,8 +480,23 @@ def _signature_example(trade: Any) -> dict[str, Any]:
     }
 
 
+def _pair_key(trade: Any) -> tuple:
+    """Identity used to pair one native trade with its vectorbt counterpart."""
+    return (
+        trade.symbol,
+        trade.direction,
+        _norm_time(trade.entry_time),
+    )
+
+
 def _diff_trades(native_result: Any, vectorbt_result: Any) -> dict[str, Any]:
-    """Multiset diff of the two engines' trade lists (order-insensitive)."""
+    """Paired diff of the two engines' trade lists.
+
+    Trades pair by ``(symbol, direction, entry_time)``; each pair is compared
+    field-by-field at one-stored-unit tolerance and every divergence is
+    reported as a self-explaining ``{"field", "native", "vectorbt"}`` entry.
+    Trades that cannot be paired at all land in ``only_in_*`` as before.
+    """
     native_trades = sorted(
         native_result.trades, key=lambda t: (_norm_time(t.entry_time), t.symbol)
     )
@@ -424,29 +504,48 @@ def _diff_trades(native_result: Any, vectorbt_result: Any) -> dict[str, Any]:
         vectorbt_result.trades, key=lambda t: (_norm_time(t.entry_time), t.symbol)
     )
 
-    native_sigs = [_trade_signature(t) for t in native_trades]
-    vectorbt_sigs = [_trade_signature(t) for t in vectorbt_trades]
+    # Bucket vectorbt trades by pair key; each native trade claims the
+    # same-key candidate with the fewest field differences.
+    vbt_by_key: dict[tuple, list[Any]] = {}
+    for trade in vectorbt_trades:
+        vbt_by_key.setdefault(_pair_key(trade), []).append(trade)
 
-    remaining = list(vectorbt_sigs)
     matched = 0
     unmatched_native: list[Any] = []
-    for sig, trade in zip(native_sigs, native_trades):
-        if sig in remaining:
-            remaining.remove(sig)
-            matched += 1
-        else:
+    field_diffs: list[dict[str, Any]] = []
+    for trade in native_trades:
+        candidates = vbt_by_key.get(_pair_key(trade)) or []
+        if not candidates:
             unmatched_native.append(trade)
-    unmatched_vectorbt_sigs = remaining
-
-    # Map unmatched vectorbt signatures back to trades for readable examples.
-    vbt_by_sig: dict[tuple, list[Any]] = {}
-    for sig, trade in zip(vectorbt_sigs, vectorbt_trades):
-        vbt_by_sig.setdefault(sig, []).append(trade)
+            continue
+        best_index = min(
+            range(len(candidates)),
+            key=lambda i: len(_trade_field_diffs(trade, candidates[i])),
+        )
+        candidate = candidates.pop(best_index)
+        matched += 1
+        for diff in _trade_field_diffs(trade, candidate):
+            field_diffs.append(
+                {
+                    "trade": {
+                        "symbol": trade.symbol,
+                        "direction": trade.direction,
+                        "entry_time": str(trade.entry_time),
+                    },
+                    **diff,
+                }
+            )
     unmatched_vectorbt = [
-        vbt_by_sig[sig].pop(0) for sig in unmatched_vectorbt_sigs if vbt_by_sig.get(sig)
+        trade for trades in vbt_by_key.values() for trade in trades
     ]
+    unmatched_vectorbt.sort(
+        key=lambda t: (_norm_time(t.entry_time), t.symbol)
+    )
 
-    identical = matched == len(native_sigs) == len(vectorbt_sigs)
+    identical = (
+        matched == len(native_trades) == len(vectorbt_trades)
+        and not field_diffs
+    )
     return {
         "trades_identical": identical,
         "trade_count": {
@@ -454,7 +553,10 @@ def _diff_trades(native_result: Any, vectorbt_result: Any) -> dict[str, Any]:
             "vectorbt": len(vectorbt_trades),
             "delta": len(vectorbt_trades) - len(native_trades),
         },
-        "exact_signature_matches": matched,
+        "matched_pairs": matched,
+        "field_diffs": field_diffs[:_MAX_FIELD_DIFFS],
+        "field_diffs_count": len(field_diffs),
+        "field_diffs_truncated": len(field_diffs) > _MAX_FIELD_DIFFS,
         "only_in_native": [_signature_example(t) for t in unmatched_native[:5]],
         "only_in_native_count": len(unmatched_native),
         "only_in_vectorbt": [
