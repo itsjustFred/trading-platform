@@ -65,6 +65,13 @@ class RebalanceRecord:
     weights: dict[str, float]  # every sleeve column; ineligible sleeves are 0.0
     n_eligible: int
     carried: bool = False  # weights carried from the previous rebalance
+    # The solver could not estimate and the previous weights were reused
+    # (renormalised over the still-eligible sleeves), or - with no previous
+    # weights - replaced by 1/N over the eligible set.
+    fallback_equal_weight: bool = False
+    # Nothing was eligible: the whole risk budget sits in cash (all weights
+    # 0.0) rather than staying with a sleeve the filter just rejected.
+    cash: bool = False
 
 
 @dataclass
@@ -163,12 +170,26 @@ def _weights_for_objective(
     previous: dict[str, float] | None,
     columns: list[str],
     config: AllocationConfig,
-) -> tuple[dict[str, float] | None, bool]:
-    """Weights over ALL columns for one rebalance, plus the carried flag."""
+) -> tuple[dict[str, float] | None, bool, bool, bool]:
+    """``(weights over ALL columns, carried, fallback_equal_weight, cash)``.
+
+    * No eligible sleeves -> all-zero weights (cash), never the previous
+      allocation: carrying weights would keep risk on a sleeve the filter
+      just rejected (e.g. as ruined) for a whole month.
+    * Solver failure -> carry ONLY the previous weights of still-eligible
+      sleeves, renormalised; when there is nothing eligible to carry (or no
+      previous weights), fall back to 1/N over the eligible set and flag it
+      ``fallback_equal_weight`` - it is not a carry.
+    """
+    zero = {col: 0.0 for col in columns}
     if not eligible_ids:
-        if previous is None:
-            return None, False
-        return dict(previous), True
+        return dict(zero), False, False, True
+
+    def _spread(solved: np.ndarray) -> dict[str, float]:
+        weights = dict(zero)
+        for sleeve_id, weight in zip(eligible_ids, solved, strict=True):
+            weights[sleeve_id] = float(weight)
+        return weights
 
     solved = solve_weights(
         objective,
@@ -176,25 +197,32 @@ def _weights_for_objective(
         estimation_window,
         min_window_observations=config.min_window_observations,
     )
-    carried = False
     if solved is None:
         if previous is not None:
-            return dict(previous), True
-        # First rebalance and the objective cannot estimate yet: fall back to
-        # 1/N over the eligible set rather than emit nothing.
+            kept = {
+                sleeve_id: float(previous.get(sleeve_id, 0.0))
+                for sleeve_id in eligible_ids
+            }
+            kept = {sid: w for sid, w in kept.items() if w > 0.0}
+            total = sum(kept.values())
+            if total > 0.0:
+                weights = dict(zero)
+                for sleeve_id, weight in kept.items():
+                    weights[sleeve_id] = weight / total
+                return weights, True, False, False
+        # Nothing eligible to carry (first rebalance, or the previous weights
+        # sat entirely on now-ineligible sleeves): fall back to 1/N over the
+        # eligible set rather than emit nothing.
         solved = solve_weights(
             "equal_weight",
             eligible_ids,
             estimation_window,
             min_window_observations=config.min_window_observations,
         )
-        carried = True
-    if solved is None:
-        return None, False
-    weights = {col: 0.0 for col in columns}
-    for sleeve_id, weight in zip(eligible_ids, solved, strict=True):
-        weights[sleeve_id] = float(weight)
-    return weights, carried
+        if solved is None:
+            return None, False, False, False
+        return _spread(solved), False, True, False
+    return _spread(solved), False, False, False
 
 
 def walk_forward_allocation(
@@ -255,7 +283,7 @@ def walk_forward_allocation(
         segment_frame = frame.loc[segment_index, columns]
 
         for objective in run_objectives:
-            weights, carried = _weights_for_objective(
+            weights, carried, fallback_equal_weight, cash = _weights_for_objective(
                 objective,
                 eligible_ids,
                 estimation_window,
@@ -277,6 +305,8 @@ def walk_forward_allocation(
                     weights=dict(weights),
                     n_eligible=len(eligible_ids),
                     carried=carried,
+                    fallback_equal_weight=fallback_equal_weight,
+                    cash=cash,
                 )
             )
 
@@ -298,10 +328,16 @@ def walk_forward_allocation(
             "metrics": curve_metrics(returns_map[objective]),
             "n_rebalances": len(records),
             "carried_rebalances": sum(1 for r in records if r.carried),
+            "fallback_equal_weight_rebalances": sum(
+                1 for r in records if r.fallback_equal_weight
+            ),
+            "cash_rebalances": sum(1 for r in records if r.cash),
             "avg_turnover": _turnover(records, columns),
             "weights_history": [
                 {"date": r.date, "n_eligible": r.n_eligible, "carried": r.carried,
-                 "weights": {k: v for k, v in r.weights.items() if v != 0.0}}
+                 "fallback_equal_weight": r.fallback_equal_weight,
+                 "cash": r.cash,
+                 "weights": {k: v for k, v in r.weights.items() if v > 0.0}}
                 for r in records
             ],
         }
@@ -330,6 +366,25 @@ def walk_forward_allocation(
             if basis == "full_sample"
         }
     )
+    matrix_sleeves = sorted(
+        sleeve_id
+        for sleeve_id, meta in sleeve_returns.metadata.items()
+        if meta.source == "matrix"
+    )
+    if matrix_sleeves:
+        notes.append(
+            "matrix sleeves ("
+            + ", ".join(matrix_sleeves)
+            + ") are full-window backtest curves and are NOT verified "
+            "out-of-sample by this module; OOS-ness is the caller's "
+            "assertion (--matrix-is-oos at the CLI)"
+        )
+    if cfg.eligibility.allow_full_sample_trade_counts:
+        notes.append(
+            "allow_full_sample_trade_counts is ON: total_trades-only sleeves "
+            "are admitted at point-in-time rebalances on a full-sample "
+            "(future-inclusive) trade count"
+        )
     if full_sample_trades:
         notes.append(
             "trade counts for "
@@ -350,6 +405,9 @@ def walk_forward_allocation(
                 "min_trades": cfg.eligibility.min_trades,
                 "ruin_equity_floor": cfg.eligibility.ruin_equity_floor,
                 "min_coverage": cfg.eligibility.min_coverage,
+                "allow_full_sample_trade_counts": (
+                    cfg.eligibility.allow_full_sample_trade_counts
+                ),
             },
         },
         "baselines": list(BASELINE_OBJECTIVES),
@@ -357,6 +415,10 @@ def walk_forward_allocation(
         "rebalance_dates": [d.date().isoformat() for d in rebalance_dates],
         "skipped_rebalances": skipped_rebalances,
         "sleeves": {
+            "sources": {
+                sleeve_id: meta.source
+                for sleeve_id, meta in sleeve_returns.metadata.items()
+            },
             "eligible_union": union_eligible,
             "rejected_union": {
                 key: sorted(value) for key, value in union_rejected.items()

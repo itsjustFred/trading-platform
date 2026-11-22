@@ -9,12 +9,18 @@ default.
 were eligible at time t" using only data strictly before t (the report's
 selection-look-ahead pitfall). Trade counts come from two bases:
 
-* ``trade_periods`` (walk-forward payloads): only periods whose END is at or
-  before ``as_of`` are counted, so no future trades leak into the decision.
+* ``trade_periods`` (walk-forward payloads): only periods whose END is
+  strictly before ``as_of`` are counted, so no future trades leak into the
+  decision — a period ending ON the rebalance day is excluded, matching the
+  exclusive observation cutoff.
 * ``total_trades`` (matrix runs, single-window counts): this is a
-  full-sample figure. When ``as_of`` is set it is still used — there is no
-  per-period timing to do better with — and the result records
-  ``trade_count_basis="full_sample"`` so the report can disclose it.
+  full-sample figure. Under ``as_of`` it is REJECTED with
+  ``trades_unknown_as_of`` by default — a count that includes trades after
+  the decision date is future evidence, and "every check fails closed" means
+  missing point-in-time evidence cannot admit a sleeve. Callers that
+  deliberately accept the approximation opt in with
+  ``allow_full_sample_trade_counts=True``; the basis stays recorded as
+  ``full_sample`` so the report discloses it.
 """
 from __future__ import annotations
 
@@ -37,6 +43,11 @@ class EligibilityConfig:
     min_trades: int = 100
     ruin_equity_floor: float = 0.01  # min running equity ratio <= floor => ruined
     min_coverage: float = 0.0  # optional: fraction of calendar days observed
+    # ``total_trades``-only sleeves have no per-period timing, so under
+    # ``as_of`` their count is a full-sample (future-inclusive) figure. The
+    # default rejects them point-in-time; opting in keeps the count and the
+    # ``full_sample`` basis disclosure.
+    allow_full_sample_trade_counts: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,19 +94,33 @@ def _period_end_ts(period: TradePeriod) -> pd.Timestamp | None:
 
 
 def _trades_before(
-    meta: SleeveMetadata, as_of: pd.Timestamp | None
+    meta: SleeveMetadata,
+    as_of: pd.Timestamp | None,
+    *,
+    allow_full_sample: bool = False,
 ) -> tuple[int | None, str]:
-    """Trade count usable at ``as_of`` and the basis it came from."""
+    """Trade count usable at ``as_of`` and the basis it came from.
+
+    Returns ``(None, "full_sample")`` for a ``total_trades``-only sleeve under
+    ``as_of`` when the caller has not opted into full-sample counts: the
+    figure includes trades after the decision date, so point-in-time
+    eligibility must treat it as unknown rather than count it.
+    """
     if meta.trade_periods:
         if as_of is None:
             return sum(p.trades for p in meta.trade_periods), "periods"
         counted = 0
         for period in meta.trade_periods:
             end = _period_end_ts(period)
-            if end is not None and end <= as_of:
+            # Strictly before as_of, like the observation cutoff: a period
+            # ending ON the rebalance day contains trades the decision could
+            # not have seen.
+            if end is not None and end < as_of:
                 counted += int(period.trades)
         return counted, "periods"
     if meta.total_trades is not None:
+        if as_of is not None and not allow_full_sample:
+            return None, "full_sample"
         return int(meta.total_trades), "full_sample"
     return None, "none"
 
@@ -134,13 +159,21 @@ def _check_sleeve(
 
     basis = "none"
     if config.min_trades > 0:
-        count, basis = _trades_before(meta, as_of)
+        count, basis = _trades_before(
+            meta, as_of, allow_full_sample=config.allow_full_sample_trade_counts
+        )
         if count is None:
-            reasons.append("trades_unknown")
+            reasons.append(
+                "trades_unknown_as_of"
+                if basis == "full_sample" and as_of is not None
+                else "trades_unknown"
+            )
         elif count < config.min_trades:
             reasons.append("insufficient_trades")
     elif meta.trade_periods or meta.total_trades is not None:
-        _, basis = _trades_before(meta, as_of)
+        _, basis = _trades_before(
+            meta, as_of, allow_full_sample=config.allow_full_sample_trade_counts
+        )
     return reasons, basis
 
 

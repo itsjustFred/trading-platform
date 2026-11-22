@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--matrix-csv", type=Path, default=None,
                         help="matrix_daily_equity.csv path")
+    parser.add_argument("--matrix-is-oos", action="store_true",
+                        help="acknowledge that the matrix curves are "
+                             "out-of-sample for the strategies involved "
+                             "(required with --matrix-csv: matrix rows are "
+                             "full-window backtests and cannot be verified)")
     parser.add_argument("--matrix-summary", type=Path, default=None,
                         help="matrix_summary.json for per-run trade counts")
     parser.add_argument("--walkforward", type=Path, action="append", default=[],
@@ -47,12 +52,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-history-days", type=int, default=504)
     parser.add_argument("--min-trades", type=int, default=100)
     parser.add_argument("--ruin-equity-floor", type=float, default=0.01)
+    parser.add_argument("--allow-full-sample-trade-counts", action="store_true",
+                        help="admit total_trades-only sleeves at "
+                             "point-in-time rebalances on a full-sample "
+                             "(future-inclusive) trade count; off by default "
+                             "because it is lookahead")
     parser.add_argument("--objective", action="append", default=[],
                         help="objective to report; baselines are always included")
     args = parser.parse_args(argv)
 
     if args.matrix_csv is None and not args.walkforward:
         parser.error("provide --matrix-csv and/or --walkforward")
+    if args.matrix_csv is not None and not args.matrix_is_oos:
+        parser.error(
+            "--matrix-csv holds full-window backtest curves that cannot be "
+            "verified out-of-sample; pass --matrix-is-oos to assert they are"
+        )
 
     sleeve_returns = load_sleeve_returns(
         matrix_csv=args.matrix_csv,
@@ -66,11 +81,17 @@ def main(argv: list[str] | None = None) -> int:
             min_history_days=args.min_history_days,
             min_trades=args.min_trades,
             ruin_equity_floor=args.ruin_equity_floor,
+            allow_full_sample_trade_counts=args.allow_full_sample_trade_counts,
         ),
     )
     result = walk_forward_allocation(sleeve_returns, config)
 
     payload = dict(result.report)
+    payload["inputs"] = {
+        "matrix_csv": str(args.matrix_csv) if args.matrix_csv else None,
+        "matrix_is_oos_acknowledged": bool(args.matrix_is_oos),
+        "walkforward": [str(p) for p in args.walkforward],
+    }
     payload["sleeves_loaded"] = {
         sleeve_id: {
             "strategy": meta.strategy,

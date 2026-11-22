@@ -2,8 +2,11 @@
 
 A *sleeve* is one strategy × asset × timeframe run at a fixed base risk. The
 allocator consumes **out-of-sample daily returns only**: matrix daily-equity
-rows and walk-forward ``oos_equity_curve`` segments. In-sample curves never
-enter this module — there is no code path that reads them.
+rows and walk-forward ``oos_equity_curve`` segments. Walk-forward payloads
+carry OOS data by construction (only ``oos_equity_curve`` is read). Matrix
+rows are full-window backtest curves — this module cannot verify they are
+out-of-sample, so callers must assert it (``--matrix-is-oos`` at the CLI)
+and the report discloses matrix sleeves as unverified.
 
 Calendar contract
 -----------------
@@ -330,9 +333,10 @@ def _oos_fold_returns(curve: Any) -> pd.Series:
     """Daily close-to-close returns inside ONE out-of-sample fold.
 
     Mirrors ``runner.walkforward._daily_close_series``: last observation per UTC
-    day, then returns between consecutive observed days only. The first point
-    anchors the fold — it produces no return, and equity is never chained
-    across folds (each fold restarts at its own capital).
+    day, then returns between consecutive observed days only. The first raw
+    equity point anchors the fold — the first observed day's return is measured
+    against it (the fold's starting mark), and equity is never chained across
+    folds (each fold restarts at its own capital).
     """
     if not isinstance(curve, list):
         return pd.Series(dtype=float)
@@ -356,7 +360,14 @@ def _oos_fold_returns(curve: Any) -> pd.Series:
     if len(daily) < 2:
         return pd.Series(dtype=float)
     returns = daily / daily.shift(1) - 1.0
-    return returns.iloc[1:].dropna().astype(float)
+    # The first raw equity point anchors the fold (it is the fold's starting
+    # mark, typically the test-window capital): the FIRST observed day's
+    # return is close(day 1) / anchor - 1, not dropped. Without this every
+    # fold silently loses its first day of OOS performance.
+    anchor_equity = float(series.iloc[0])
+    if math.isfinite(anchor_equity) and anchor_equity > 0:
+        returns.iloc[0] = float(daily.iloc[0]) / anchor_equity - 1.0
+    return returns.dropna().astype(float)
 
 
 def _trade_count(stats: Any) -> int | None:
