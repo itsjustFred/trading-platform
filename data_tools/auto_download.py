@@ -1216,7 +1216,7 @@ def has_sufficient_segment_coverage(
         if len(stamps) / expected < min_density:
             return False
         limit_minutes = step_minutes * max_gap_multiplier
-        for prev, cur in zip(stamps, stamps[1:]):
+        for prev, cur in pairwise(stamps):
             gap_trading_minutes = _session_trading_minutes_between(
                 prev, cur, session_window, holidays
             )
@@ -1348,7 +1348,7 @@ def _calendar_segment_coverage_passes(
         # minutes: scaling 1440 minutes by the multiplier would let ~11 NYSE
         # sessions go missing before failing. A gap spanning more than
         # ``max_gap_multiplier`` bar slots fails, matching the intraday rule.
-        for prev, cur in zip(valid, valid[1:]):
+        for prev, cur in pairwise(valid):
             prev_day = calendar.daily_bar_date(prev)
             cur_day = calendar.daily_bar_date(cur)
             if prev_day is None or cur_day is None:
@@ -1375,7 +1375,7 @@ def _calendar_segment_coverage_passes(
     if len(present) / expected < min_density:
         return False
     limit_minutes = step_minutes * max_gap_multiplier
-    for prev, cur in zip(present, present[1:]):
+    for prev, cur in pairwise(present):
         gap_trading_minutes = _interval_overlap_minutes(prev, cur, intervals, opens)
         if gap_trading_minutes > limit_minutes:
             return False
