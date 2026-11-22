@@ -42,8 +42,7 @@ def _deterministic_ohlcv() -> pd.DataFrame:
                 price += 0.5
                 closes.append(price)
         else:
-            for _ in range(40):
-                closes.append(price)
+            closes.extend(price for _ in range(40))
     for _ in range(60):
         price -= 0.5
         closes.append(price)
@@ -127,7 +126,9 @@ def test_native_and_vectorbt_agree_exactly_on_bundled_fixture(parity_data_dir):
         f"vectorbt produced {len(vectorbt.trades)}"
     )
 
-    for index, (native_trade, vectorbt_trade) in enumerate(zip(native.trades, vectorbt.trades)):
+    for index, (native_trade, vectorbt_trade) in enumerate(
+        zip(native.trades, vectorbt.trades, strict=True)
+    ):
         assert pd.Timestamp(native_trade.entry_time) == pd.Timestamp(vectorbt_trade.entry_time), (
             f"Trade {index}: entry time diverges between engines"
         )

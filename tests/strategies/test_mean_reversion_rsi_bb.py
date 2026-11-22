@@ -39,8 +39,8 @@ def _gap_frame(rows: int = 80) -> pd.DataFrame:
     # Gap down of -5 at bar 65 (after close 65-1), gap up of +5 at bar 70.
     opens[65] = closes[64] - 5.0
     opens[70] = closes[69] + 5.0
-    highs = [max(o, c) + 0.5 for o, c in zip(opens, closes)]
-    lows = [min(o, c) - 0.5 for o, c in zip(opens, closes)]
+    highs = [max(o, c) + 0.5 for o, c in zip(opens, closes, strict=True)]
+    lows = [min(o, c) - 0.5 for o, c in zip(opens, closes, strict=True)]
     timestamps = pd.date_range("2023-01-02", periods=rows, freq="B", tz="UTC")
     return pd.DataFrame(
         {

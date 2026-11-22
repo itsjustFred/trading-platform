@@ -950,7 +950,7 @@ def test_exit_only_orders_are_not_gated(monkeypatch):
     )
     signal = _signal(deployment, {"exit_only": True}, action="sell")
 
-    prepared, qty = _prepare(adapter, deployment, signal)
+    _prepared, qty = _prepare(adapter, deployment, signal)
 
     assert qty == pytest.approx(4.0)
     assert adapter.quote_calls == []

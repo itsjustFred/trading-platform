@@ -609,9 +609,14 @@ def _equity_curve_in_time_order(equity_curve: list[EquityPoint]) -> list[EquityP
         return list(equity_curve)
     if timestamps.isna().any():
         return list(equity_curve)
+    # One timestamp per equity point by construction (``timestamps`` is read off
+    # ``equity_curve``), so ``strict=True`` turns them getting out of step into an
+    # error instead of silently pairing points with the wrong timestamps.
     return [
         point
-        for _timestamp, point in sorted(zip(timestamps, equity_curve), key=lambda pair: pair[0])
+        for _timestamp, point in sorted(
+            zip(timestamps, equity_curve, strict=True), key=lambda pair: pair[0]
+        )
     ]
 
 
@@ -1281,7 +1286,7 @@ def daily_returns_moments(
     if not (math.isfinite(skew) and math.isfinite(kurtosis)):
         return None
     return {
-        "count": int(len(returns)),
+        "count": len(returns),
         "sharpe_per_obs": float(returns.mean()) / std_r,
         "skew": skew,
         "kurtosis": kurtosis,
