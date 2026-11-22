@@ -13,6 +13,12 @@ implementation remains the reference and is used whenever
   (``numba.core.errors.NumbaError``; the kernel is marked failed for the
   rest of the process and the Python path takes over, logged at WARNING).
 
+Array arguments are coerced to ``float64`` C-contiguous arrays before the
+compiled kernel sees them, so every kernel compiles exactly one signature:
+object-dtype arrays (e.g. from pandas nullable dtypes) would otherwise
+raise a per-signature ``TypingError`` that disabled the kernel for the
+whole process, and int/float32 inputs would each pay their own compile.
+
 Both the ``import numba`` (~0.5 s) and the per-signature compilation
 (0.1-0.8 s, paid once per kernel thanks to ``cache=True``) are deferred to
 the first kernel call: :func:`compile_kernel` only wraps the Python
@@ -37,6 +43,8 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Callable
+
+import numpy as np
 
 _log = logging.getLogger(__name__)
 
@@ -125,6 +133,23 @@ def _disabled() -> bool:
     return os.environ.get(_DISABLE_ENV) == "1"
 
 
+def _float64_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Coerce array arguments to float64 for the compiled kernel only.
+
+    The kernels are written for float64; giving numba one dtype keeps a
+    single compiled signature per kernel and stops a per-signature
+    ``TypingError`` (object arrays) from disabling the kernel process-wide.
+    The Python reference kernel still receives the caller's original
+    arrays, so its behaviour is unchanged.
+    """
+    return tuple(
+        np.ascontiguousarray(arg, dtype=np.float64)
+        if isinstance(arg, np.ndarray)
+        else arg
+        for arg in args
+    )
+
+
 def call(
     py_kernel: Callable,
     nb_kernel: Callable | None,
@@ -145,7 +170,7 @@ def call(
     if nb_kernel is None or _disabled() or name in _failed:
         return py_kernel(*args)
     try:
-        return nb_kernel(*args)
+        return nb_kernel(*_float64_args(args))
     except _NumbaUnavailable:
         return py_kernel(*args)
     except Exception as exc:

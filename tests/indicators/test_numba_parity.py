@@ -317,6 +317,38 @@ class TestDispatch:
         assert "_custom_swings_tr_kernel_py" in _numba._failed
         _numba._failed.discard("_custom_swings_tr_kernel_py")
 
+    def test_object_dtype_input_does_not_disable_kernel(
+        self, monkeypatch
+    ):
+        """Object-dtype arrays (pandas nullable ``Float64``/object columns)
+        are coerced to float64 for the numba dispatch: they compile the one
+        float64 signature instead of raising a per-signature TypingError
+        that used to disable the kernel for the whole process."""
+        calls = {"nb": 0}
+        real_nb = core._supertrend_ta_kernel_nb
+
+        def nb_spy(*args):
+            calls["nb"] += 1
+            return real_nb(*args)
+
+        monkeypatch.delenv("TP_DISABLE_NUMBA", raising=False)
+        monkeypatch.setattr(core, "_supertrend_ta_kernel_nb", nb_spy)
+        _numba._failed.discard("_supertrend_ta_kernel_py")
+        src, close, atr = _ohlc_arrays(100, 37)
+
+        def as_object(a):
+            return a.astype(object)
+
+        out_object = core._supertrend_ta(
+            as_object(src), as_object(close), as_object(atr), 3.0
+        )
+        out_float = core._supertrend_ta(src, close, atr, 3.0)
+        assert calls["nb"] == 2
+        assert "_supertrend_ta_kernel_py" not in _numba._failed
+        for a, e in zip(out_object[:3], out_float[:3], strict=True):
+            _assert_bit_identical(a, e)
+        assert out_object[3] == out_float[3]
+
     def test_input_error_on_both_paths_is_not_marked_failed(
         self, monkeypatch
     ):
