@@ -111,7 +111,8 @@ def _equity_from_returns(returns: pd.Series) -> pd.Series:
 def _return_periods_per_year(returns: pd.Series) -> float:
     """Measured observation density: return observations per calendar year.
 
-    Mirrors ``runner.stats._return_periods_per_year`` (#349): a
+    Mirrors the ``runner.stats`` convention landing with #349 (pending
+    merge — the function does not exist on main yet): a
     calendar-filled curve observes ~365.25 rows a year, a business-day
     curve ~261, so annualising at a fixed sqrt(252) understates both
     Sharpe and the ``ann_return``/``ann_volatility`` figures. The span is
@@ -288,13 +289,38 @@ def walk_forward_allocation(
             sleeve_returns, cfg.eligibility, as_of=rebalance_day
         )
         eligible_ids = list(eligibility.eligible)
+        # Estimation-window coverage is part of eligibility at each
+        # rebalance: a sleeve whose last observation predates the window
+        # (e.g. a strategy that stopped trading) must not soak up budget.
+        # equal_weight would otherwise hand it 1/N that earns nothing while
+        # inverse_vol gives it 0 and redistributes — the baselines would
+        # see different universes.
+        rejected_log = {
+            key: list(value) for key, value in eligibility.rejected.items()
+        }
+        if cfg.min_window_observations > 0:
+            short_window = [
+                sleeve_id
+                for sleeve_id in eligible_ids
+                if int(estimation_window[sleeve_id].count())
+                < cfg.min_window_observations
+            ]
+            if short_window:
+                short_set = set(short_window)
+                eligible_ids = [
+                    sleeve_id
+                    for sleeve_id in eligible_ids
+                    if sleeve_id not in short_set
+                ]
+                for sleeve_id in short_window:
+                    rejected_log.setdefault(sleeve_id, []).append(
+                        "insufficient_window_observations"
+                    )
         eligibility_log.append(
             {
                 "date": rebalance_day.date().isoformat(),
                 "eligible": eligible_ids,
-                "rejected": {
-                    key: list(value) for key, value in eligibility.rejected.items()
-                },
+                "rejected": rejected_log,
                 "trade_count_basis": dict(eligibility.trade_count_basis),
             }
         )

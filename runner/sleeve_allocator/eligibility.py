@@ -107,17 +107,21 @@ def _trades_before(
     eligibility must treat it as unknown rather than count it.
     """
     if meta.trade_periods:
-        if as_of is None:
-            return sum(p.trades for p in meta.trade_periods), "periods"
-        counted = 0
+        relevant = []
         for period in meta.trade_periods:
-            end = _period_end_ts(period)
-            # Strictly before as_of, like the observation cutoff: a period
-            # ending ON the rebalance day contains trades the decision could
-            # not have seen.
-            if end is not None and end < as_of:
-                counted += int(period.trades)
-        return counted, "periods"
+            if as_of is not None:
+                end = _period_end_ts(period)
+                # Strictly before as_of, like the observation cutoff: a
+                # period ending ON the rebalance day contains trades the
+                # decision could not have seen.
+                if end is None or end >= as_of:
+                    continue
+            relevant.append(period)
+        # A period whose payload reported no trade count is unknown
+        # evidence, not zero trades: fail closed like trades_unknown.
+        if any(period.trades is None for period in relevant):
+            return None, "periods"
+        return sum(int(period.trades) for period in relevant), "periods"
     if meta.total_trades is not None:
         if as_of is not None and not allow_full_sample:
             return None, "full_sample"

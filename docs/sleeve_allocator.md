@@ -39,8 +39,11 @@ lands on Monday instead of being dropped. Business days a sleeve did not
 observe stay `NaN` — never zero-filled (the #229 failure mode). Applying
 weights treats an unobserved sleeve-day as flat; estimation statistics stay
 pairwise-complete. Non-weekend gaps (holidays, feed outages) are NOT
-compounded: returns before and after the gap are adjacent one-day moves,
-since alignment cannot distinguish a gap from a trading halt.
+compounded into a single return: walk-forward fold returns leave the first
+day after a gap unobserved when the gap contains a weekday that was not a
+US equity holiday (mirroring `runner.walkforward`), so a multi-day move is
+never booked as a one-day return. Matrix `daily_return` values are taken
+per observation as recorded.
 
 ## Eligibility
 
@@ -64,6 +67,11 @@ The rebalance labelled "month-end day d" is decided on data strictly before
 `d` — effectively the close of `d−1` — and its weights earn `d`'s return.
 At rebalance `t`, weights are estimated on the trailing `lookback_days`
 (default 252) business days before `t` and applied until the next rebalance.
+Eligibility at `t` additionally requires at least `min_window_observations`
+(default 30) non-NaN returns inside that estimation window — a sleeve whose
+series ended before the window (e.g. a strategy that stopped trading) is
+rejected with `insufficient_window_observations`, so `equal_weight` and
+`inverse_vol` always see the same universe.
 
 Weight semantics within a segment: weights are a CONSTANT daily mix — the
 portfolio is notionally rebalanced back to target every day (daily
@@ -99,6 +107,7 @@ python -m runner.sleeve_allocator \
     --matrix-is-oos \
     --matrix-summary data/backtest_matrix/matrix_summary.json \
     --walkforward data/walkforward_results/wf_xxx.json \
+    --allow-full-sample-trade-counts \
     --output data/portfolios/sleeve_allocation_report.json
 ```
 

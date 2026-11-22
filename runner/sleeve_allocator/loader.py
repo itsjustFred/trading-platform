@@ -34,6 +34,8 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 import pandas as pd
 
+from data_tools.auto_download import is_us_equity_holiday
+
 __all__ = [
     "SleeveMetadata",
     "SleeveReturns",
@@ -47,11 +49,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TradePeriod:
-    """An out-of-sample window known to have produced ``trades`` trades."""
+    """An out-of-sample window and the trades observed in it.
+
+    ``trades=None`` means the payload did not report a count for the
+    period — unknown evidence, not zero trades.
+    """
 
     start: str
     end: str
-    trades: int
+    trades: int | None
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,21 @@ def _compound(values: list[float]) -> float:
     return growth - 1.0
 
 
+def _gap_is_only_weekend_or_holiday(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    """True when every calendar day strictly inside ``(start, end)`` is a
+    weekend day or a US equity holiday — the market could not have traded,
+    so a close-to-close move across the gap is still one trading move.
+    Mirrors ``runner.walkforward._gap_contains_only_weekend``.
+    """
+    cursor = start.normalize() + pd.Timedelta(days=1)
+    end_day = end.normalize()
+    while cursor < end_day:
+        if cursor.weekday() < 5 and not is_us_equity_holiday(cursor):
+            return False
+        cursor += pd.Timedelta(days=1)
+    return True
+
+
 def _to_business_day_series(series: pd.Series) -> pd.Series:
     """Map calendar-day returns onto business days, compounding collisions.
 
@@ -165,10 +186,12 @@ def align_sleeve_returns(
     daily simple returns. ``metadata`` optionally supplies provenance;
     missing entries get a metadata record derived from the sleeve id.
     Business days with no observation for ANY sleeve are dropped from the
-    calendar; per-sleeve gaps stay ``NaN`` — including non-weekend gaps
-    (holidays, feed outages): alignment cannot distinguish them from
-    trading halts, so a two-week gap contributes its adjacent observed
-    returns as ordinary one-day moves rather than a multi-day return.
+    calendar; per-sleeve gaps stay ``NaN``. Walk-forward fold returns are
+    produced upstream by ``_oos_fold_returns``, which leaves the first day
+    after a gap unobserved when the gap contains a weekday that was not a
+    US equity holiday (mirroring ``runner.walkforward``): a multi-day move
+    is never booked as a one-day return. Matrix ``daily_return`` values
+    are taken per observation as recorded.
     """
     if not returns:
         return SleeveReturns(returns=pd.DataFrame(), metadata={})
@@ -382,6 +405,18 @@ def _oos_fold_returns(curve: Any) -> pd.Series:
     if len(daily) < 2:
         return pd.Series(dtype=float)
     returns = daily / daily.shift(1) - 1.0
+    # A gap containing a weekday that was not a US equity holiday means
+    # observations are missing on days the market was open: the
+    # close-to-close move spans several days and must not be booked as a
+    # one-day return. runner.walkforward skips such pairs when aggregating
+    # OOS metrics; here the post-gap day stays unobserved instead.
+    observed_days = daily.index
+    for position in range(1, len(observed_days)):
+        gap_days = (observed_days[position] - observed_days[position - 1]).days
+        if gap_days > 1 and not _gap_is_only_weekend_or_holiday(
+            observed_days[position - 1], observed_days[position]
+        ):
+            returns.iloc[position] = np.nan
     # The first raw equity point anchors the fold (it is the fold's starting
     # mark, typically the test-window capital): the FIRST observed day's
     # return is close(day 1) / anchor - 1, not dropped. Without this every
@@ -401,7 +436,10 @@ def _trade_count(stats: Any) -> int | None:
 
 def _load_walkforward_file(path: Path) -> dict[str, Any] | None:
     """Return sleeve info for one walk-forward payload, or None."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"walk-forward result {path} is unreadable: {exc}") from exc
     folds = payload.get("folds")
     if not isinstance(folds, list) or not folds:
         return None
@@ -424,6 +462,7 @@ def _load_walkforward_file(path: Path) -> dict[str, Any] | None:
     trade_periods: list[TradePeriod] = []
     total_trades = 0
     trades_seen = False
+    trades_missing = False
     for fold in folds:
         if not isinstance(fold, dict):
             continue
@@ -435,10 +474,12 @@ def _load_walkforward_file(path: Path) -> dict[str, Any] | None:
         if trades is not None:
             trades_seen = True
             total_trades += trades
+        else:
+            trades_missing = True
         start = str(fold.get("test_start") or returns.index[0].date().isoformat())
         end = str(fold.get("test_end") or returns.index[-1].date().isoformat())
         trade_periods.append(
-            TradePeriod(start=start, end=end, trades=trades or 0)
+            TradePeriod(start=start, end=end, trades=trades)
         )
     if not series_parts:
         return None
@@ -453,7 +494,9 @@ def _load_walkforward_file(path: Path) -> dict[str, Any] | None:
         "source": "walkforward",
         "source_path": str(path),
         "series": combined,
-        "total_trades": total_trades if trades_seen else None,
+        "total_trades": (
+            total_trades if trades_seen and not trades_missing else None
+        ),
         "trade_periods": tuple(trade_periods),
     }
     return info

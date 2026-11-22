@@ -141,11 +141,17 @@ def test_alignment_uses_union_business_calendar_with_nan_for_missing():
     assert monday == pytest.approx((1.002**3) - 1.0)
 
 
-def test_loader_drops_rows_that_are_all_nan():
+def test_loader_unobserved_sleeve_days_stay_nan():
+    # A business day one sleeve did not observe stays NaN on the shared
+    # calendar — missing data, never zero-filled.
     index = pd.bdate_range("2024-01-01", periods=5)
-    series = pd.Series([0.01] * 5, index=index)
-    result = align_sleeve_returns({"a|X|1d": series})
+    sparse = pd.Series([0.01, np.nan, 0.02, np.nan, 0.03], index=index)
+    full = pd.Series([0.005] * 5, index=index)
+    result = align_sleeve_returns({"a|X|1d": sparse, "b|Y|1d": full})
+    out = result.returns["a|X|1d"]
     assert len(result.returns) == 5
+    assert np.isnan(out.iloc[1]) and np.isnan(out.iloc[3])
+    assert out.iloc[0] == pytest.approx(0.01)
 
 
 def test_matrix_csv_loader_builds_sleeves_and_metadata(tmp_path):
@@ -715,6 +721,7 @@ def test_chained_returns_match_hand_computation_with_nan_day():
     )
     cfg = AllocationConfig(
         lookback_days=20,
+        min_window_observations=10,
         objectives=("equal_weight",),
         eligibility=EligibilityConfig(min_history_days=0, min_trades=0),
     )
@@ -1337,3 +1344,187 @@ def test_matrix_summary_unreadable_logs_warning(tmp_path, caplog):
         result = load_sleeve_returns(matrix_csv=csv_path, matrix_summary=bad)
     assert any("unreadable" in r.message for r in caplog.records)
     assert result.metadata["sma|EURUSD|1h"].total_trades is None
+
+
+def test_oos_fold_returns_leaves_post_gap_day_unobserved():
+    """A gap containing a trading weekday must not fold a multi-day move
+    into a one-day return: the first post-gap day stays unobserved,
+    mirroring runner.walkforward's OOS aggregation."""
+    curve = [
+        # Thu -> Fri: consecutive trading days, ordinary one-day move.
+        {"time": "2024-01-04T16:00:00Z", "equity": 100000.0},
+        {"time": "2024-01-05T16:00:00Z", "equity": 101000.0},
+        # Fri -> Tue: Monday 2024-01-08 was a trading day with no
+        # observation, so the Tue "return" spans four calendar days.
+        {"time": "2024-01-09T16:00:00Z", "equity": 103000.0},
+        # Tue -> Fri: Wednesday/Thursday were trading days -> masked too.
+        {"time": "2024-01-12T16:00:00Z", "equity": 104000.0},
+        # Fri -> Mon across a pure weekend: still one trading move.
+        {"time": "2024-01-15T16:00:00Z", "equity": 105000.0},
+        # Jan -> Jul: a long trading-day gap -> masked.
+        {"time": "2024-07-03T16:00:00Z", "equity": 106000.0},
+        # Wed Jul 3 -> Fri Jul 5 2024: Thursday was a US equity holiday,
+        # so the gap is weekend/holiday only and the move is kept.
+        {"time": "2024-07-05T16:00:00Z", "equity": 107000.0},
+    ]
+    returns = _oos_fold_returns(curve)
+    tz = "UTC"
+    # Every gap containing a trading weekday is dropped entirely.
+    for masked in ("2024-01-09", "2024-01-12", "2024-07-03"):
+        assert pd.Timestamp(masked, tz=tz) not in returns.index
+    # Weekend-only and holiday-only gaps keep their close-to-close move.
+    assert returns.loc[pd.Timestamp("2024-01-15", tz=tz)] == pytest.approx(
+        105000 / 104000 - 1.0
+    )
+    assert returns.loc[pd.Timestamp("2024-07-05", tz=tz)] == pytest.approx(
+        107000 / 106000 - 1.0
+    )
+    # Sanity: the ordinary move before the gap is untouched.
+    assert returns.loc[pd.Timestamp("2024-01-05", tz=tz)] == pytest.approx(0.01)
+
+
+def test_harness_filters_sleeves_without_window_observations():
+    """A sleeve eligible on history/trades but with (almost) no observations
+    inside the estimation window is excluded at that rebalance, so
+    equal_weight and inverse_vol always see the same universe."""
+    df = _synthetic_returns(n_days=800)
+    dead_col = "dead|X|1d"
+    rng = np.random.default_rng(11)
+    df[dead_col] = np.where(
+        df.index < df.index[400],
+        rng.normal(0.001, 0.002, len(df)),
+        np.nan,
+    )
+    sr = _synthetic_sleeve_returns(df)
+
+    cfg = AllocationConfig(
+        lookback_days=252,
+        min_window_observations=30,
+        objectives=("equal_weight", "inverse_vol"),
+        eligibility=EligibilityConfig(min_history_days=0, min_trades=0),
+    )
+    result = walk_forward_allocation(sr, cfg)
+
+    dead_active = [
+        r for r in result.rebalances["equal_weight"]
+        if r.weights.get(dead_col, 0.0) > 0.0
+    ]
+    dead_filtered = [
+        r
+        for r in result.rebalances["equal_weight"]
+        if dead_col in r.weights and r.weights[dead_col] == 0.0
+    ]
+    assert dead_active, "expected early rebalances where the dead sleeve traded"
+    assert dead_filtered, "expected late rebalances where it is window-filtered"
+    # Both objectives see the same universe: inverse_vol holds the sleeve
+    # while it is window-eligible and drops it exactly when equal_weight does.
+    inv_by_date = {r.date: r for r in result.rebalances["inverse_vol"]}
+    for rec in dead_active:
+        assert inv_by_date[rec.date].weights.get(dead_col, 0.0) > 0.0
+    for rec in dead_filtered:
+        assert inv_by_date[rec.date].weights.get(dead_col, 0.0) == 0.0
+    assert "insufficient_window_observations" in result.report["sleeves"][
+        "rejected_union"
+    ].get(dead_col, [])
+
+
+def test_cli_flags_reach_harness_config(tmp_path):
+    """CLI flags must land in the report's config echo: --lookback-days and
+    --min-trades were mutation survivors that changed nothing observable."""
+    import csv as csv_mod
+
+    from runner.sleeve_allocator.cli import main
+
+    csv_path = tmp_path / "matrix_daily_equity.csv"
+    days = pd.bdate_range("2024-01-01", periods=45)
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv_mod.DictWriter(
+            fh,
+            fieldnames=[
+                "strategy", "symbol", "timeframe", "run_id", "time",
+                "equity", "daily_return",
+            ],
+        )
+        writer.writeheader()
+        for i, day in enumerate(days):
+            writer.writerow(
+                {
+                    "strategy": "sma", "symbol": "EURUSD", "timeframe": "1h",
+                    "run_id": "r1", "time": day.isoformat(),
+                    "equity": 100000 * (1.0005**i), "daily_return": 0.0005,
+                }
+            )
+    out = tmp_path / "report.json"
+    rc = main(
+        [
+            "--matrix-csv", str(csv_path),
+            "--matrix-is-oos",
+            "--output", str(out),
+            "--lookback-days", "10",
+            "--min-history-days", "0",
+            "--min-trades", "7",
+            "--ruin-equity-floor", "0.05",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    config = payload["config"]
+    assert config["lookback_days"] == 10
+    elig = config["eligibility"]
+    assert elig["min_history_days"] == 0
+    assert elig["min_trades"] == 7
+    assert elig["ruin_equity_floor"] == pytest.approx(0.05)
+    for name in ("equal_weight", "inverse_vol"):
+        obj = payload["objectives"][name]
+        assert obj["n_rebalances"] >= 1
+        assert "cash_rebalances" in obj
+
+
+def test_trade_count_basis_disclosed_when_min_trades_zero():
+    """With min_trades=0 the trade-count check is skipped but the basis is
+    still recorded, so the report can disclose full-sample counting."""
+    df = _synthetic_returns(n_days=100)
+    sr = align_sleeve_returns(
+        {c: df[c] for c in df.columns},
+        metadata={c: _meta(c, total_trades=500) for c in df.columns},
+    )
+    result = filter_eligible_sleeves(
+        sr, EligibilityConfig(min_history_days=0, min_trades=0)
+    )
+    assert result.rejected == {}
+    assert result.trade_count_basis["sma|EURUSD|1h"] == "full_sample"
+
+
+def test_walkforward_fold_without_trade_stats_is_unknown_not_zero(tmp_path):
+    """A fold whose oos_stats reports no total_trades must surface as
+    trades_unknown, not as a zero-trade period reading
+    insufficient_trades."""
+    payload = {
+        "mode": "strategy", "strategy": "x.py", "symbols": ["EURUSD"],
+        "timeframe": "1h",
+        "folds": [{
+            "fold": 1, "test_start": "2023-01-02", "test_end": "2023-06-30",
+            "oos_stats": {},
+            "oos_equity_curve": [
+                {"time": "2023-01-02T00:00:00Z", "equity": 100000.0},
+                {"time": "2023-06-30T00:00:00Z", "equity": 101000.0},
+            ],
+        }],
+    }
+    path = tmp_path / "wf_nostats.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    result = load_sleeve_returns(walkforward_paths=[path])
+    meta = result.metadata["x|EURUSD|1h"]
+    assert meta.trade_periods[0].trades is None
+    assert meta.total_trades is None
+
+    cfg = EligibilityConfig(min_history_days=0, min_trades=1)
+    verdict = filter_eligible_sleeves(result, cfg)
+    assert "trades_unknown" in verdict.rejected["x|EURUSD|1h"]
+
+
+def test_walkforward_loader_malformed_json_names_the_file(tmp_path):
+    bad = tmp_path / "wf_broken.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="wf_broken.json"):
+        load_sleeve_returns(walkforward_paths=[bad])

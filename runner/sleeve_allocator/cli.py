@@ -7,7 +7,9 @@ the 1/N and inverse-vol baselines) as JSON.
 Example:
     python -m runner.sleeve_allocator \
         --matrix-csv data/backtest_matrix/matrix_daily_equity.csv \
+        --matrix-is-oos \
         --walkforward data/walkforward_results/wf_xxx.json \
+        --allow-full-sample-trade-counts \
         --output data/portfolios/sleeve_allocation_report.json
 """
 from __future__ import annotations
