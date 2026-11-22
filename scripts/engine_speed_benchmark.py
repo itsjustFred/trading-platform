@@ -97,7 +97,7 @@ def _default_param_grid(
     cells: list[dict[str, Any]] = []
     for combo in itertools.product(*(multipliers for _ in names)):
         cell: dict[str, Any] = {}
-        for name, multiplier in zip(names, combo):
+        for name, multiplier in zip(names, combo, strict=True):
             cell[name] = numeric[name] * multiplier
         cells.append(cell)
         if len(cells) >= max_cells:
@@ -193,16 +193,16 @@ def _timed_cells(
                 data_dir=data_dir,
                 parameters={**base_parameters, **cell_params},
             )
-            for engine_name in ENGINES:
-                rows.append(
-                    {
-                        "repeat": repeat,
-                        "cell": cell_index,
-                        "params": cell_params,
-                        "engine": engine_name,
-                        **_time_run(adapters[engine_name], config, strategy_path),
-                    }
-                )
+            rows.extend(
+                {
+                    "repeat": repeat,
+                    "cell": cell_index,
+                    "params": cell_params,
+                    "engine": engine_name,
+                    **_time_run(adapters[engine_name], config, strategy_path),
+                }
+                for engine_name in ENGINES
+            )
     return rows
 
 
