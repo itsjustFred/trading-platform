@@ -351,6 +351,56 @@ def atr(
     )
 
 
+@dataclass(frozen=True)
+class BollingerBands:
+    """Bollinger Bands: ``mid`` is the SMA, ``upper``/``lower`` are
+    ``mid +/- std_mult * std`` with the population-window sample std
+    (pandas ``rolling.std``, ddof=1)."""
+
+    mid: pd.Series
+    upper: pd.Series
+    lower: pd.Series
+
+
+def bbands(
+    close: pd.Series, window: int, *, std_mult: float
+) -> BollingerBands:
+    """Bollinger Bands over ``close``; all three legs are NaN during warm-up."""
+    window = max(1, int(window))
+    values = _as_float_series(close, close.name)
+    mid = sma(values, window)
+    std = values.rolling(window, min_periods=window).std()
+    return BollingerBands(
+        mid=mid,
+        upper=mid + float(std_mult) * std,
+        lower=mid - float(std_mult) * std,
+    )
+
+
+@dataclass(frozen=True)
+class MacdResult:
+    """MACD: ``macd`` is the fast/slow EMA spread, ``signal`` its EMA and
+    ``histogram`` their difference. EMA legs seed at the first observation
+    (``ewm(span, adjust=False)`` semantics, emit-from-bar-0) — the chart
+    convention, not a trading signal."""
+
+    macd: pd.Series
+    signal: pd.Series
+    histogram: pd.Series
+
+
+def macd(
+    close: pd.Series, fast: int, slow: int, signal: int
+) -> MacdResult:
+    """MACD(fast, slow, signal) with first-seeded EMA legs."""
+    values = _as_float_series(close, close.name)
+    line = ema(values, fast, seed="first", min_periods=0) - ema(
+        values, slow, seed="first", min_periods=0
+    )
+    sig = ema(line, signal, seed="first", min_periods=0)
+    return MacdResult(macd=line, signal=sig, histogram=line - sig)
+
+
 def rsi(
     close: pd.Series,
     period: int,
@@ -534,9 +584,14 @@ def _ta_next_bands(
 def _ta_trend_step(
     prev_trend: float, close_i: float, lower_i: float, upper_i: float
 ) -> float:
-    """One RamJet/pandas_ta direction step (fail-closed pre-warm-up)."""
+    """One RamJet/pandas_ta direction step (fail-closed pre-warm-up).
+
+    A NaN operand makes every legacy bool comparison ``False`` — the
+    direction reads bearish for that bar *and* seeds the next step, so
+    the NaN case returns ``-1.0`` rather than carrying ``prev_trend``.
+    """
     if np.isnan(close_i) or np.isnan(lower_i) or np.isnan(upper_i):
-        return prev_trend
+        return -1.0
     if prev_trend > 0:
         return 1.0 if close_i > lower_i else -1.0
     return 1.0 if close_i >= upper_i else -1.0

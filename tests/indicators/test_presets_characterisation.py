@@ -177,13 +177,14 @@ def _generated_signals(indicator_name: str, window: int):
     ["gold_momentum", "cross_asset_momentum", "sector_rotation"],
 )
 def test_atr_qc_wilder_matches_strategy_copies(strategy, ohlcv):
+    """P1: the strategies now call the preset directly; pin the wiring."""
     module = _load_strategy(
         f"strategies/{strategy}/{strategy}.py", f"char_{strategy}"
     )
+    _, _, indicators, _ = module.generate_signals(ohlcv, {})
     high, low, close = _ohlc(ohlcv)
-    legacy = module._wilder_atr(high, low, close, 14)
     preset = presets.atr_qc_wilder(high, low, close, 14)
-    _assert_series_equal(preset, legacy, exact=True)
+    _assert_series_equal(preset, indicators["ATR"], exact=True)
 
 
 def test_atr_qc_wilder_matches_trend_following(ohlcv):
@@ -290,6 +291,20 @@ def test_atr_sma_tr_matches_ema_crossover(ohlcv):
 # ── ATR/EMA: EMA-span variant (live bots) ──────────────────────────────
 
 
+def _legacy_ema_span_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    """Frozen copy of the pre-P1 ``_calculate_atr`` TR+``ewm(span)`` body
+    shared by RamJet and RocketFuel."""
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift(1)).abs(),
+            (df["low"] - df["close"].shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+
 def test_atr_ema_span_matches_ramjet(ohlcv):
     from signal_bots.ramjet.processor import RamJetSignalProcessor
 
@@ -298,6 +313,9 @@ def test_atr_ema_span_matches_ramjet(ohlcv):
     high, low, close = _ohlc(frame)
     preset = presets.atr_ema_span(high, low, close, 14)
     _assert_series_equal(preset, legacy, exact=True)
+    _assert_series_equal(
+        legacy, _legacy_ema_span_atr(frame, 14), exact=True
+    )
 
 
 def test_atr_ema_span_matches_rocketfuel(ohlcv):
@@ -308,6 +326,9 @@ def test_atr_ema_span_matches_rocketfuel(ohlcv):
     high, low, close = _ohlc(ohlcv)
     preset = presets.atr_ema_span(high, low, close, 14)
     _assert_series_equal(preset, legacy, exact=True)
+    _assert_series_equal(
+        legacy, _legacy_ema_span_atr(frame, 14), exact=True
+    )
 
 
 # ── RMA/EMA on arbitrary series ────────────────────────────────────────
@@ -357,13 +378,27 @@ def test_ema_first_seed_matches_codegen_vectorbt(ohlcv):
 
 
 def test_rsi_wilder_matches_gold_momentum(ohlcv):
+    """P1: gold_momentum calls the preset directly; pin the wiring."""
     module = _load_strategy(
         "strategies/gold_momentum/gold_momentum.py", "char_gm"
     )
+    _, _, indicators, _ = module.generate_signals(ohlcv, {})
     close = _series(ohlcv, "close")
     _assert_series_equal(
         presets.rsi_wilder(close, 14),
-        module._wilder_rsi(close, 14),
+        indicators["RSI"],
+        exact=True,
+    )
+    # The MACD legs moved to ``ema_first_seed`` in the same swap.
+    for label, span in (("EMA_Fast", 12), ("EMA_Slow", 26)):
+        _assert_series_equal(
+            presets.ema_first_seed(close, span),
+            indicators[label],
+            exact=True,
+        )
+    _assert_series_equal(
+        presets.ema_first_seed(indicators["MACD_Line"], 9),
+        indicators["MACD_Signal"],
         exact=True,
     )
 
@@ -394,30 +429,96 @@ def test_rsi_wilder_fill50_matches_codegen_vectorbt(ohlcv):
 # ── Supertrend variants ────────────────────────────────────────────────
 
 
-def test_supertrend_ramjet_matches_fallback(ohlcv):
-    # RamJet branches on `hasattr(frame, "ta")`: the characterised preset
-    # reproduces the hand-written fallback, which only runs when the
-    # undeclared pandas_ta is absent (it is absent in every supported
-    # environment — it is in no dependency file).
-    if importlib.util.find_spec("pandas_ta") is not None:
-        pytest.skip(
-            "pandas_ta is installed: RamJet takes the library branch, "
-            "which this preset does not characterise"
+def _legacy_ramjet_supertrend_reference(
+    df: pd.DataFrame, period: int, multiplier: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frozen copy of the pre-P1 ``_calculate_supertrend`` fallback loop.
+
+    P1 deleted the hand-written recursion (and the unreachable pandas_ta
+    branch); this reference keeps the bit-exactness claim checkable after
+    the swap instead of only having been true at P0 time.
+    """
+    frame = df.copy()
+    hl2 = (frame["high"] + frame["low"]) / 2
+    frame["h_l_st"] = frame["high"] - frame["low"]
+    frame["h_pc_st"] = (frame["high"] - frame["close"].shift(1)).abs()
+    frame["l_pc_st"] = (frame["low"] - frame["close"].shift(1)).abs()
+    frame["tr_st"] = frame[["h_l_st", "h_pc_st", "l_pc_st"]].max(axis=1)
+    frame["tr_st"] = frame["tr_st"].fillna(frame["h_l_st"])
+    frame["atr_st"] = frame["tr_st"].ewm(alpha=1 / period, adjust=False).mean()
+    basic_upper = (hl2 + (multiplier * frame["atr_st"])).to_numpy()
+    basic_lower = (hl2 - (multiplier * frame["atr_st"])).to_numpy()
+    close = frame["close"].to_numpy()
+    n_rows = len(frame)
+    final_upper = np.full(n_rows, np.nan)
+    final_lower = np.full(n_rows, np.nan)
+    supertrend = np.zeros(n_rows, dtype=bool)
+    first_valid_idx = 0
+    for i in range(n_rows):
+        if not np.isnan(basic_upper[i]):
+            first_valid_idx = i
+            break
+    if n_rows > first_valid_idx:
+        final_upper[first_valid_idx] = basic_upper[first_valid_idx]
+        final_lower[first_valid_idx] = basic_lower[first_valid_idx]
+        supertrend[first_valid_idx] = bool(
+            close[first_valid_idx] >= final_lower[first_valid_idx]
         )
+    for i in range(first_valid_idx + 1, n_rows):
+        if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
+        else:
+            final_upper[i] = final_upper[i - 1]
+        if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
+        prev_st = supertrend[i - 1]
+        if prev_st:
+            supertrend[i] = close[i] > final_lower[i]
+        else:
+            supertrend[i] = close[i] >= final_upper[i]
+    warmup_bars = max(int(period), 1)
+    ready = np.arange(n_rows) >= first_valid_idx + warmup_bars
+    return supertrend, ready
+
+
+@pytest.mark.parametrize("with_nan_close", [False, True])
+def test_supertrend_ramjet_matches_legacy_reference(ohlcv, with_nan_close):
+    """P1: the processor and the preset are bit-identical to the deleted
+    fallback, including on interior NaN closes (``with_nan_close`` bypasses
+    ``_prepare_market_data``'s row dropping on purpose)."""
     from signal_bots.ramjet.processor import RamJetSignalProcessor
 
     frame = RamJetSignalProcessor._prepare_market_data(ohlcv)
-    legacy = RamJetSignalProcessor._calculate_supertrend(frame, 10, 3.0)
+    if with_nan_close:
+        frame = frame.copy()
+        frame.loc[frame.index[50], "close"] = np.nan
+        frame.loc[frame.index[120], "close"] = np.nan
+    expected_st, expected_ready = _legacy_ramjet_supertrend_reference(
+        frame, 10, 3.0
+    )
+    computed = RamJetSignalProcessor._calculate_supertrend(frame, 10, 3.0)
+    _assert_series_equal(
+        computed["supertrend"].astype(float),
+        pd.Series(expected_st.astype(float), index=frame.index),
+        exact=True,
+    )
+    _assert_series_equal(
+        computed["supertrend_ready"].astype(float),
+        pd.Series(expected_ready.astype(float), index=frame.index),
+        exact=True,
+    )
     high, low, close = _ohlc(frame)
     result = presets.supertrend_ramjet(high, low, close, 10, 3.0)
     _assert_series_equal(
         (result.trend == 1).astype(float),
-        legacy["supertrend"].astype(float),
+        computed["supertrend"].astype(float),
         exact=True,
     )
     _assert_series_equal(
         result.ready.astype(float),
-        legacy["supertrend_ready"].astype(float),
+        computed["supertrend_ready"].astype(float),
         exact=True,
     )
 

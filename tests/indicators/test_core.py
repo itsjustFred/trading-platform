@@ -342,6 +342,20 @@ class TestSupertrend:
         assert result.upper_band.isna().all()
         assert result.lower_band.isna().all()
 
+    def test_ta_rule_nan_close_reads_bearish(self):
+        """Legacy parity: ``NaN > x``/``NaN >= x`` are both False, so a NaN
+        close forces the bearish direction for that bar (P1 swap evidence)."""
+        high, low, close = _ohlc(30, seed=5)
+        close = close.copy()
+        close.iloc[10] = np.nan
+        result = supertrend(
+            high, low, close, 5, 2.0,
+            atr_smoothing="wilder", atr_seed="first", rule="ta",
+            atr_first_bar="hl", atr_min_periods=0,
+        )
+        assert result.trend.iloc[10] == -1.0
+        assert bool(result.ready.iloc[10])
+
     def test_supplied_atr_must_be_index_aligned(self):
         high, low, close = _ohlc(20, seed=4)
         bad_atr = pd.Series(1.0, index=close.index[:-1])
