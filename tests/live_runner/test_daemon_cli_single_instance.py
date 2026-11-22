@@ -160,7 +160,7 @@ class TestSingleInstanceGuard:
         class _DiscoveryReached(RuntimeError):
             pass
 
-        def _stop_at_discovery(**_kwargs: Any) -> list[Any]:
+        def _stop_at_discovery(*_args: Any, **_kwargs: Any) -> list[Any]:
             raise _DiscoveryReached("discovery reached")
 
         monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _stop_at_discovery)
@@ -204,7 +204,7 @@ class TestSingleInstanceGuard:
             def shutdown(self, *, wait: bool) -> None:
                 raise _JoinInterrupted("interrupted mid-join")
 
-        def _stop_at_discovery(**_kwargs: Any) -> list[Any]:
+        def _stop_at_discovery(*_args: Any, **_kwargs: Any) -> list[Any]:
             raise RuntimeError("discovery reached")
 
         monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _stop_at_discovery)
@@ -252,7 +252,7 @@ class TestSingleInstanceGuard:
         daemon_loop: list[asyncio.AbstractEventLoop] = []
         daemon_task: list[asyncio.Task[None]] = []
 
-        def _blocking_discovery(**_kwargs: Any) -> list[Any]:
+        def _blocking_discovery(*_args: Any, **_kwargs: Any) -> list[Any]:
             started.set()
             assert unblock.wait(10), "the test never unblocked the startup discovery"
             return []
