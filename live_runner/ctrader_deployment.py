@@ -22,7 +22,9 @@ def _metric(row: dict[str, Any], key: str, default: float = 0.0) -> float:
 # old-vs-new scale difference is ~sqrt(365/252) either way, so rescaling
 # legacy Sharpes onto the new basis keeps identical performance ranked
 # identically regardless of when the row was computed (#349 review,
-# maintainer Q2 option a).
+# maintainer Q2 option a). Approximate: dropping weekend zeros shifts
+# per-day Sharpe by ~sqrt(7/5) and holidays move it further — fine for
+# ranking, not for reporting.
 _LEGACY_SHARPE_RESCALE = math.sqrt(365.25 / 252.0)
 
 

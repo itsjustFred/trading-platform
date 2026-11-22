@@ -10,6 +10,7 @@ from scripts.regenerate_qc_risk_parity_artifact import DEFAULT_OUTPUT as QC_RISK
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 from validation.importers.mt5_xlsx import MT5XLSXImporter
 from validation.statistics.cross_platform import (
+    _platform_realized_sharpe_ratio,
     _reference_sharpe_ratio,
     build_comparison_matrix,
 )
@@ -100,7 +101,13 @@ def test_cross_platform_matrix_recomputes_sharpe_with_reference_risk_free_rate(t
             strategies=["intraday_volatility_breakout"],
             initial_capital=100000.0,
         ),
-        trades=[],
+        trades=[
+            _mt5_trade(f"2024-01-{day}", 400.0)
+            for day in [
+                "02", "03", "04", "05", "08", "09", "10", "11", "12",
+                "15", "16", "17", "18", "19", "22",
+            ]
+        ],
         equity_curve=equity,
         stats={"sharpe_ratio": -1.0},
     )
@@ -380,6 +387,102 @@ def test_reference_sharpe_uses_platform_formula_on_imported_curve():
         ],
     )
     assert exit_only_stats["sharpe_ratio"] == pytest.approx(sharpe, abs=1e-4)
+
+
+def test_parity_sharpe_compares_realized_curves_on_identical_trade_lists(tmp_path):
+    """#349 review: the platform side of the MT5 parity row must run the
+    same formula on the same curve SHAPE as the reference — a
+    realized-exit calendar-filled curve rebuilt from its own trade list,
+    not the mark-to-market equity curve. Identical trade lists give
+    identical Sharpes; the MTM value stays visible as sharpe_ratio_mtm."""
+    trades = [
+        _mt5_trade(f"2024-01-{day:02d}", pnl)
+        for day, pnl in [
+            (2, 500.0), (3, -200.0), (4, 300.0), (5, 400.0),
+            (8, -100.0), (9, 600.0), (10, 200.0), (11, -50.0),
+            (12, 350.0), (15, 250.0),
+        ]
+    ]
+    platform_result = BacktestResult(
+        meta=BacktestMeta(
+            id="intraday_volatility_breakout_eurusd_h1",
+            created_at="2026-07-09T00:00:00+00:00",
+            engine="native",
+            strategies=["intraday_volatility_breakout"],
+            initial_capital=100_000.0,
+            data={"symbols": ["EURUSD"], "source": "dukascopy"},
+        ),
+        trades=trades,
+        equity_curve=[],
+        stats={"sharpe_ratio": 9.99},
+    )
+    platform_path = tmp_path / "intraday_volatility_breakout_eurusd_h1.json"
+    platform_result.save(platform_path)
+
+    reference = _mt5_like_reference(trades)
+    context = {
+        "symbols": ["EURUSD"],
+        "data_source": "dukascopy",
+        "asset_class": "fx",
+        "data_dir": None,
+    }
+
+    reference_sharpe = _reference_sharpe_ratio(reference, **context)
+    platform_sharpe = _platform_realized_sharpe_ratio(platform_path, context)
+
+    assert reference_sharpe is not None
+    assert platform_sharpe == pytest.approx(reference_sharpe, rel=1e-9)
+    # The stored/MTM Sharpe is not the comparison value.
+    assert platform_sharpe != pytest.approx(9.99)
+
+
+def test_mt5_row_keeps_platform_mtm_sharpe_as_a_separate_field(tmp_path):
+    """The audit row keeps the platform's canonical mark-to-market Sharpe
+    under ``sharpe_ratio_mtm`` while ``sharpe_ratio`` carries the
+    like-for-like realized-exit recomputation."""
+    trades = [
+        _mt5_trade(f"2024-01-{day}", 250.0)
+        for day in ["02", "03", "04", "05", "08", "09", "10", "11", "12"]
+    ]
+    platform_result = BacktestResult(
+        meta=BacktestMeta(
+            id="intraday_volatility_breakout_sp500_m1",
+            created_at="2026-07-09T00:00:00+00:00",
+            engine="native",
+            strategies=["intraday_volatility_breakout"],
+            initial_capital=100_000.0,
+            data={"symbols": ["SP500"], "source": "dukascopy"},
+        ),
+        trades=trades,
+        equity_curve=[
+            EquityPoint(time=f"2024-01-{day}T23:59:59+00:00", equity=100_000.0 + i * 300.0)
+            for i, day in enumerate(
+                ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+            )
+        ],
+        stats={"sharpe_ratio": 1.5},
+    )
+    platform_path = tmp_path / "intraday_volatility_breakout_sp500_m1.json"
+    platform_result.save(platform_path)
+
+    from validation.statistics.cross_platform import _build_mt5_row
+    from validation.statistics.cross_platform import MT5ComparisonCase
+
+    row = _build_mt5_row(
+        MT5ComparisonCase(
+            case_id="intraday_volatility_breakout_sp500_m1",
+            reference_path=PROJECT_ROOT
+            / "strategy-comparisons/intraday_volatility_breakout/SP500_M1.xlsx",
+            platform_path=platform_path,
+            broker_clock="dukascopy_mt5_index",
+        )
+    )
+
+    platform = row["platform"]
+    assert platform["sharpe_ratio"] is not None
+    assert platform["sharpe_ratio_mtm"] is not None
+    assert platform["sharpe_ratio"] != pytest.approx(platform["sharpe_ratio_mtm"])
+    assert any("sharpe_ratio_mtm" in note for note in row["notes"])
 
 
 def test_reference_sharpe_fails_closed_without_enough_exits():

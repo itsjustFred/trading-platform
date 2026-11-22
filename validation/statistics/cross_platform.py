@@ -132,8 +132,18 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
     # trade list cannot support an equity curve — fail closed, never fall
     # back to the printed ratio).
     reference_stats["sharpe_ratio_reported"] = reference_stats.get("sharpe_ratio")
+    platform_context = _platform_return_context(case.platform_path)
     reference_stats["sharpe_ratio"] = _reference_sharpe_ratio(
-        reference, **_platform_return_context(case.platform_path)
+        reference, **platform_context
+    )
+    # Sharpe parity compares realized-exit curves on BOTH sides: the
+    # platform artifact's canonical Sharpe is mark-to-market, so it is kept
+    # for audit as ``sharpe_ratio_mtm`` while ``sharpe_ratio`` becomes the
+    # same-formula recomputation on a realized-exit curve rebuilt from the
+    # platform trade list — like for like with the imported MT5 curve.
+    platform_stats["sharpe_ratio_mtm"] = platform_stats.get("sharpe_ratio")
+    platform_stats["sharpe_ratio"] = _platform_realized_sharpe_ratio(
+        case.platform_path, platform_context
     )
     row = _row_payload(
         case_id=case.case_id,
@@ -159,9 +169,11 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
             (
                 "Sharpe parity applies the platform's trading-day filtering "
                 "and asset-class annualisation (252 equities/FX/CFDs, 365 "
-                "crypto) to both equity curves; the MT5 printed Sharpe-Ratio "
-                "is reported as sharpe_ratio_reported and is not the "
-                "comparison basis."
+                "crypto) to realized-exit equity curves rebuilt from BOTH "
+                "trade lists, so the inputs are like for like; the platform's "
+                "mark-to-market Sharpe is kept as sharpe_ratio_mtm and the "
+                "MT5 printed Sharpe-Ratio as sharpe_ratio_reported — neither "
+                "is the comparison basis."
             ),
         ],
     )
@@ -210,9 +222,61 @@ def _platform_return_context(platform_path: Path) -> dict[str, Any]:
 
 
 def _reference_sharpe_ratio(reference: Any, **context: Any) -> float | None:
-    """Platform Sharpe formula applied to the imported MT5 equity curve.
+    """Platform Sharpe formula applied to the imported MT5 trade list."""
+    from validation.reference import resolve_initial_capital
 
-    The MT5 XLSX report carries no equity graph, so the curve is rebuilt
+    return _realized_exit_sharpe_ratio(
+        reference.trades,
+        initial_capital=resolve_initial_capital(reference),
+        fallback_symbols=[getattr(reference, "symbol", "") or ""],
+        **context,
+    )
+
+
+def _platform_realized_sharpe_ratio(
+    platform_path: Path, context: dict[str, Any]
+) -> float | None:
+    """Platform Sharpe formula on a realized-exit curve from the artifact's
+    own trade list — the same curve shape ``_reference_sharpe_ratio`` builds
+    for the MT5 side, so identical trade lists give identical Sharpes."""
+    try:
+        payload = json.loads(platform_path.read_text(encoding="utf-8"))
+        result = BacktestResult.from_dict(payload)
+    except Exception:
+        return None
+    meta_data = getattr(result.meta, "data", None) or {}
+    fallback_symbols = (
+        [str(symbol) for symbol in meta_data.get("symbols") or []]
+        if isinstance(meta_data, dict)
+        else []
+    )
+    initial_capital = getattr(result.meta, "initial_capital", 0.0)
+    if not (
+        isinstance(initial_capital, (int, float))
+        and math.isfinite(initial_capital)
+        and initial_capital > 0
+    ):
+        initial_capital = 100_000.0
+    return _realized_exit_sharpe_ratio(
+        result.trades,
+        initial_capital=float(initial_capital),
+        fallback_symbols=fallback_symbols,
+        **context,
+    )
+
+
+def _realized_exit_sharpe_ratio(
+    trades: list[Any],
+    *,
+    initial_capital: float,
+    fallback_symbols: list[str] | None = None,
+    **context: Any,
+) -> float | None:
+    """Platform Sharpe formula applied to a trade list's realized exits.
+
+    Neither side of the parity check carries a like-for-like equity graph
+    (the MT5 XLSX report has none at all, and the platform artifact's curve
+    is mark-to-market), so the curve is rebuilt
     from the trade list: initial capital plus cumulative net PnL booked at
     each position's last exit — the same realized-equity evidence the trade
     list is the primary carrier of. ``compute_stats`` then applies the
@@ -235,11 +299,9 @@ def _reference_sharpe_ratio(reference: Any, **context: Any) -> float | None:
     """
     from runner.stats import compute_stats
     from shared.models import EquityPoint
-    from validation.reference import resolve_initial_capital
 
-    initial_capital = resolve_initial_capital(reference)
     exits: list[tuple[pd.Timestamp, float]] = []
-    for trade in reference.trades:
+    for trade in trades:
         if not trade.exits:
             continue
         exit_ts = pd.to_datetime(str(trade.exits[-1].time), utc=True, errors="coerce")
@@ -257,7 +319,7 @@ def _reference_sharpe_ratio(reference: Any, **context: Any) -> float | None:
     exits.sort(key=lambda item: item[0])
 
     start_candidates = []
-    for trade in reference.trades:
+    for trade in trades:
         entry_ts = pd.to_datetime(str(trade.entry_time), utc=True, errors="coerce")
         if not pd.isna(entry_ts):
             start_candidates.append(pd.Timestamp(entry_ts))
@@ -289,9 +351,7 @@ def _reference_sharpe_ratio(reference: Any, **context: Any) -> float | None:
         )
         day += timedelta(days=1)
 
-    symbols = context.get("symbols") or [
-        getattr(reference, "symbol", "") or ""
-    ]
+    symbols = context.get("symbols") or list(fallback_symbols or [])
     stats = compute_stats(
         [],
         initial_capital=initial_capital,

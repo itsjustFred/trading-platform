@@ -556,7 +556,7 @@ class TestTradingDaySharpeConvention:
         equity = 100_000.0 * np.cumprod(1 + returns)
         return [
             EquityPoint(time=ts.isoformat(), equity=float(eq))
-            for ts, eq in zip(bdays, equity)
+            for ts, eq in zip(bdays, equity, strict=True)
         ], returns
 
     @staticmethod
@@ -653,7 +653,7 @@ class TestTradingDaySharpeConvention:
         equity = 100_000.0 * np.cumprod(1 + returns)
         curve = [
             EquityPoint(time=ts.isoformat(), equity=float(eq))
-            for ts, eq in zip(days, equity)
+            for ts, eq in zip(days, equity, strict=True)
         ]
 
         stats = compute_stats([], equity_curve=curve, symbols=["BTCUSD"])
@@ -738,6 +738,114 @@ class TestTradingDaySharpeConvention:
         )
 
         assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
+
+    def test_fx_sunday_session_pnl_folds_into_monday_not_deleted(self):
+        """An FX book's Sunday-evening UTC session carries real P&L but is
+        not a labelled trading day (FX daily bars are NY-close Mon-Fri).
+        Filtering returns would delete it; filtering equity levels folds it
+        into the next trading day's return, so the series still compounds
+        to the run's total return."""
+        # 2024-01-05 is a Friday, 2024-01-07 a Sunday. FX opens Sunday
+        # 17:00 ET (= 22:00 UTC in January), so the Sunday-night UTC stamp
+        # below is inside the trading week but outside every Mon-Fri bar.
+        curve = [
+            EquityPoint(time="2024-01-05T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-05T21:00:00+00:00", equity=100_200.0),
+            EquityPoint(time="2024-01-07T23:00:00+00:00", equity=100_600.0),
+            EquityPoint(time="2024-01-08T21:00:00+00:00", equity=101_200.0),
+            EquityPoint(time="2024-01-09T21:00:00+00:00", equity=100_800.0),
+        ]
+
+        periods, trading_dates = _resolve_return_convention(
+            equity_curve=curve,
+            symbols=["EURUSD"],
+            data_source=None,
+            asset_class="fx",
+            data_dir=None,
+        )
+        assert periods == pytest.approx(252.0)
+        series = _daily_returns_series_from_equity_curve(
+            curve, trading_dates=trading_dates
+        )
+
+        assert series is not None
+        assert all(
+            ts.date() != __import__("datetime").date(2024, 1, 7)
+            for ts in series.index
+        )
+        assert float(series.iloc[0]) == pytest.approx(0.002)
+        # Monday's return spans Friday's close -> Monday's close and so
+        # includes the Sunday session's +0.4%.
+        assert float(series.iloc[1]) == pytest.approx(
+            101_200.0 / 100_200.0 - 1.0
+        )
+        compounded = math.prod(1.0 + float(value) for value in series) - 1.0
+        assert compounded == pytest.approx(100_800.0 / 100_000.0 - 1.0)
+
+    def test_curve_ending_mid_session_keeps_the_final_day(self):
+        """A curve whose last bar has not closed yet still carries that
+        day's P&L: the venue calendar only labels CLOSED daily bars, so the
+        last observed day must be kept explicitly."""
+        curve = [
+            EquityPoint(time="2024-01-08T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-08T21:00:00+00:00", equity=100_100.0),
+            EquityPoint(time="2024-01-09T21:00:00+00:00", equity=100_300.0),
+            EquityPoint(time="2024-01-10T12:00:00+00:00", equity=100_450.0),
+        ]
+
+        _periods, trading_dates = _resolve_return_convention(
+            equity_curve=curve,
+            symbols=["EURUSD"],
+            data_source=None,
+            asset_class="fx",
+            data_dir=None,
+        )
+        # Wednesday 2024-01-10's 17:00 ET bar boundary (22:00 UTC) is after
+        # the last stamp, so the calendar does not label the day.
+        assert __import__("datetime").date(2024, 1, 10) not in trading_dates
+
+        series = _daily_returns_series_from_equity_curve(
+            curve, trading_dates=trading_dates
+        )
+
+        assert series is not None
+        assert series.index[-1].date() == __import__("datetime").date(2024, 1, 10)
+        assert float(series.iloc[-1]) == pytest.approx(
+            100_450.0 / 100_300.0 - 1.0
+        )
+        compounded = math.prod(1.0 + float(value) for value in series) - 1.0
+        assert compounded == pytest.approx(100_450.0 / 100_000.0 - 1.0)
+
+    def test_unknown_venue_weekend_pnl_folds_into_monday(self):
+        """The Monday-Friday fallback for unresolvable venues must not
+        delete real weekend P&L either: it folds into Monday's return."""
+        curve = [
+            EquityPoint(time="2024-01-05T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-05T23:00:00+00:00", equity=100_100.0),
+            EquityPoint(time="2024-01-07T12:00:00+00:00", equity=100_300.0),
+            EquityPoint(time="2024-01-08T23:00:00+00:00", equity=100_500.0),
+        ]
+
+        periods, trading_dates = _resolve_return_convention(
+            equity_curve=curve,
+            symbols=["NOTASYMBOL"],
+            data_source=None,
+            asset_class=None,
+            data_dir=None,
+        )
+        assert periods == pytest.approx(252.0)
+        assert __import__("datetime").date(2024, 1, 7) not in trading_dates
+
+        series = _daily_returns_series_from_equity_curve(
+            curve, trading_dates=trading_dates
+        )
+
+        assert series is not None
+        assert float(series.iloc[1]) == pytest.approx(
+            100_500.0 / 100_100.0 - 1.0
+        )
+        compounded = math.prod(1.0 + float(value) for value in series) - 1.0
+        assert compounded == pytest.approx(100_500.0 / 100_000.0 - 1.0)
 
     def test_too_few_returns_publish_undefined_ratios_as_null(self):
         """A metric named in `undefined_metrics` must publish null, not the

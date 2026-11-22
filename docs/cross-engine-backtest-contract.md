@@ -424,15 +424,15 @@ venue cannot be resolved falls back to the Monday–Friday grid. The ratio is
 annualised at 252 for equities/FX/CFDs and 365 for an all-crypto (24/7)
 book, published as `equity_return_periods_per_year`. Cross-platform parity
 (the MT5 audit matrix in `validation/statistics/cross_platform.py`) applies
-this identical formula to both equity curves — the platform artifact's own
-venue context is forwarded to the imported MT5 curve's recomputation —
-the imported curve is rebuilt with the same calendar-filled daily shape
-from the trade list — rather than comparing against MT5's printed
+this identical formula to realized-exit equity curves rebuilt from BOTH
+trade lists — initial capital plus cumulative net PnL booked at each
+position's last exit, calendar-filled to the production daily shape —
+rather than comparing against MT5's printed
 Sharpe-Ratio, which uses MT5's own convention; the printed value is kept
-as `sharpe_ratio_reported`. The platform curve is
-mark-to-market while the imported curve is realized-only (PnL booked on
-exit days), so parity Sharpes are approximately — not exactly — equal; the
-trade list remains the primary parity evidence.
+as `sharpe_ratio_reported`, and the platform artifact's mark-to-market
+Sharpe is kept as `sharpe_ratio_mtm`. Because both sides now run the same
+formula on the same curve shape, identical trade lists give identical
+parity Sharpes; the trade list remains the primary parity evidence.
 
 ## 7. `total_bars`
 

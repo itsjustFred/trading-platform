@@ -444,7 +444,8 @@ def _ohlcv_asset_class_for(
     ``""`` means a path resolved but carries no class; any other value is
     the ``ohlcv/{source}/{asset_class}/...`` layout's class segment. The
     lookup walks the data tree, so it is cached — optimizer loops call this
-    once per trial per symbol.
+    once per trial per symbol. The cache is process-local: OHLCV downloaded
+    while a long-lived viewer/daemon process runs is not seen until restart.
     """
     from runner.engines.contract import ohlcv_path_metadata, select_ohlcv_path
 
@@ -823,8 +824,10 @@ def _resolve_return_convention(
 
     trading_dates: set[dt.date] = set()
     entries = normalized_symbols or [""]
-    for symbol, calendar in zip(
-        entries, calendars + [None] * (len(entries) - len(calendars))
+    for _symbol, calendar in zip(
+        entries,
+        calendars + [None] * (len(entries) - len(calendars)),
+        strict=True,
     ):
         if calendar is not None and calendar.covers_window(first_ts, last_ts):
             trading_dates.update(calendar.daily_bar_dates(first_ts, last_ts))
