@@ -1480,6 +1480,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     )
                     if earliest is not None:
                         self._earliest_crypto_fill_at = earliest
+                if earliest is None:
+                    # Candidates are crypto-only (filtered above), so a completed scan that
+                    # found no crypto fill at all while crypto executions await a commission
+                    # means the broker account or symbol mapping is likely wrong. ``None`` is
+                    # deliberately not cached, so every pass re-pages the history until a fill
+                    # appears - warn so the anomaly is visible instead of silent request spend.
+                    logger.warning(
+                        "Alpaca commission backfill: the FILL-history scan found no crypto "
+                        "fills, yet %s crypto execution(s) await a commission; each pass "
+                        "rescans the history - check the account and symbol mapping",
+                        len(candidates),
+                        extra={"data": {"account_id": self.account_id}},
+                    )
                 # ``<=``: the FILL listing is ``(fill_start, now]``, exclusive of the bound,
                 # so a crypto fill exactly at ``fill_start`` is never fetched - it opens the
                 # window like any earlier one.

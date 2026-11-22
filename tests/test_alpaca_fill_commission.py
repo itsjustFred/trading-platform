@@ -1779,6 +1779,43 @@ def test_backfill_warns_that_usd_fees_are_matched_by_count_only(db, live_runner_
         for record in live_runner_logs.records
     ), "pricing USD fees by entry count must warn about the accepted residual"
 
+    # Plans are only built for executions whose commission is still NULL, so once priced the
+    # pair is not re-planned and the warning must not repeat on every hourly pass.
+    warned = sum(
+        1
+        for record in live_runner_logs.records
+        if "count only" in record.getMessage() and "misattribute" in record.getMessage()
+    )
+    assert _backfill(client) == 0
+    assert (
+        sum(
+            1
+            for record in live_runner_logs.records
+            if "count only" in record.getMessage()
+            and "misattribute" in record.getMessage()
+        )
+        == warned
+    ), "an already-priced batch must not warn again on the next pass"
+
+
+def test_backfill_warns_when_the_fill_scan_finds_no_crypto_fills(db, live_runner_logs):
+    """Local crypto executions awaiting a commission while the broker's FILL history holds no
+    crypto fill at all is an anomaly (wrong account or symbol mapping). ``None`` is not cached,
+    so every pass would silently re-page the whole history - the pass must say so."""
+    _crypto_fill(db, action="buy", label="scan-none")
+    client = FakeActivitiesClient(
+        fills=[_fill_activity(order_id=_order_id("equity"), side="buy", qty="1", price="100",
+                              at=FILL_AT, symbol="AAPL")],
+        cfees=[_cfee(qty="-0.00125")],
+    )
+
+    _backfill(client)
+
+    assert any(
+        "found no crypto fills" in record.getMessage()
+        for record in live_runner_logs.records
+    ), "a completed empty crypto-fill scan with candidates present must warn"
+
 
 # ── has_earlier_crypto_fill / earliest_crypto_fill_at: fail-closed branches pinned ──────────
 
@@ -3190,17 +3227,25 @@ def test_group_problem_refuses_a_broken_pair_that_carries_no_reason():
     to the allocator with no fills and left its commissions unbackfilled instead
     of reported. Pin the fail-closed branch so that state cannot come back.
     """
-    from live_runner.alpaca_fees import _FeeIndex, _group_problem, _Inputs
+    from live_runner.alpaca_fees import (
+        _FeeBatch,
+        _FeeBatches,
+        _group_problem,
+        _Inputs,
+    )
 
     inputs = _Inputs(
         fills_by_order={},
         fills_by_pair={},
         rows_by_order={},
-        fees=_FeeIndex(),
+        fees=_FeeBatches(batches=[]),
         broken_pairs={"BTC/USD": None},
+        sell_pairs={},
     )
 
-    problem, fills = _group_problem(inputs, "BTC/USD", date.fromisoformat(TRADE_DAY))
+    problem, fills = _group_problem(
+        inputs, "BTC/USD", _FeeBatch(end=NOW, open_start=False), None, []
+    )
 
     assert problem is not None and "BTC/USD" in problem
     assert fills == []
@@ -3213,17 +3258,25 @@ def test_group_problem_reports_a_stored_broken_pair_reason():
     through to the fill checks and the allocator, with its commissions either
     mis-allocated or silently skipped.
     """
-    from live_runner.alpaca_fees import _FeeIndex, _group_problem, _Inputs
+    from live_runner.alpaca_fees import (
+        _FeeBatch,
+        _FeeBatches,
+        _group_problem,
+        _Inputs,
+    )
 
     inputs = _Inputs(
         fills_by_order={},
         fills_by_pair={},
         rows_by_order={},
-        fees=_FeeIndex(),
+        fees=_FeeBatches(batches=[]),
         broken_pairs={"BTC/USD": "an unreadable FILL activity"},
+        sell_pairs={},
     )
 
-    problem, fills = _group_problem(inputs, "BTC/USD", date.fromisoformat(TRADE_DAY))
+    problem, fills = _group_problem(
+        inputs, "BTC/USD", _FeeBatch(end=NOW, open_start=False), None, []
+    )
 
     assert problem == "an unreadable FILL activity"
     assert fills == []

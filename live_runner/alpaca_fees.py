@@ -292,7 +292,7 @@ def has_earlier_crypto_fill(
     scan = earliest_crypto_fill_at(
         client, until=before + ACTIVITY_WINDOW_OVERLAP, page_size=page_size
     )
-    if scan is CRYPTO_FILL_SCAN_UNKNOWN:
+    if isinstance(scan, _CryptoFillScanUnknown):
         return True
     return scan is not None and scan < before
 
@@ -574,13 +574,13 @@ def fee_fill_window_start(
         start = previous
         if end >= low and (start is None or start < high):
             relevant = True
-            if index > 0:
+            if index > 0 and start is not None:
                 starts.append(start)
         previous = end
     if not relevant:
         return None
     # The open first batch fails closed whenever it is relevant, so it never widens the fetch.
-    return min([low] + starts)
+    return min([low, *starts])
 
 
 @dataclass(frozen=True)
@@ -705,9 +705,14 @@ def _asset_entries_match(batch: _FeeBatch, pair: str, buys: list[BrokerFill]) ->
     prices = batch.asset_prices.get(pair, [])
     if batch.asset_entries.get(pair, 0) != len(buys) or len(prices) != len(buys):
         return False
-    if any(price is None for price in prices):
+    buy_prices = [_price_cents(fill.price) for fill in buys]
+    if any(price is None for price in prices) or any(
+        price is None for price in buy_prices
+    ):
         return False
-    return sorted(prices) == sorted(_price_cents(fill.price) for fill in buys)
+    return sorted(p for p in prices if p is not None) == sorted(
+        p for p in buy_prices if p is not None
+    )
 
 
 def _usd_entries_match(
