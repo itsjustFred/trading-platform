@@ -81,18 +81,24 @@ documented here.
   the aggregate `max_total_exposure` ceiling — which clamps the declared
   amount to the remaining exposure budget — apply, with their own
   configurable limits (`fixed_risk_max_positions`,
-  `fixed_risk_max_total_exposure`; `None` keeps the 5 / 5% defaults). Open
+  `fixed_risk_max_total_exposure`). `None` on either field means UNCAPPED —
+  the parity-safe default while the #279 aggregate-cap question is open,
+  because the MT5 EA the protocol mirrors applies neither cap; setting a
+  field opts that one cap back in. `fixed_risk_amount = 0` is the #170
+  "off" idiom: the order falls through to pct sizing like an absent key,
+  while NaN/inf/negative amounts raise `ValueError`. Open
   risk is measured in account currency: each position contributes
   `|entry - stop| * qty * (tick_value / tick_size)`, and positions sized on
   an explicit `stop_distance` carry their declared per-unit risk instead of
-  being re-measured against `|entry - stop|`. The accepted quantity is
+  being re-measured against `|entry - stop|` — except once the stop has
+  trailed off its sizing value (breakeven/locked profit), where the smaller
+  of the declared per-unit risk and the current `|entry - stop|` counts.
+  The accepted quantity is
   recomputed in the legacy MT5 order `(risk / distance) *
   (tick_size / tick_value)` so unclamped sizes are bit-identical to the
   pre-#279 formula; the per-position notional cap and the free-margin
-  leverage clamp are unchanged. A configured `fixed_risk_amount` that is
-  NaN/inf/non-positive raises `ValueError` rather than falling through to
-  pct sizing. For the shared-equity replay, an unclamped fixed-risk
-  quantity stays absolute-$ while a clamp-bound one is marked
+  leverage clamp are unchanged. For the shared-equity replay, an unclamped
+  fixed-risk quantity stays absolute-$ while a clamp-bound one is marked
   equity-proportional and re-scaled.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to

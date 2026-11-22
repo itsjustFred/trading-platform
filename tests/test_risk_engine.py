@@ -254,6 +254,118 @@ def test_calculate_position_size_stop_distance_override_rejects_bad_values(value
         )
 
 
+def test_calculate_position_size_max_positions_override_uncapped():
+    """``max_positions=math.inf`` is the documented uncapped value: a
+    protocol whose reference applies no position cap (the MT5-parity
+    fixed-risk path, #279) routes through the engine without the cap
+    binding, and the decision records ``"uncapped"``."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=1)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(current_positions=99),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        max_positions=math.inf,
+    )
+
+    assert sized.position_size == pytest.approx(250.0)
+    assert sized.decision.accepted is True
+    assert sized.decision.metadata["max_positions"] == "uncapped"
+
+
+def test_calculate_position_size_max_positions_override_finite_binds():
+    """A finite caller cap replaces the config one — stricter OR looser —
+    and is what the rejection/metadata reports."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(current_positions=3),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        max_positions=3,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision.rejection_reason == "max_positions"
+    assert sized.decision.metadata["max_positions"] == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, math.nan, math.inf * -1])
+def test_calculate_position_size_max_positions_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="max_positions"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            max_positions=value,
+        )
+
+
+def test_calculate_position_size_max_total_exposure_override_uncapped():
+    """``max_total_exposure=math.inf`` lifts the aggregate ceiling for the
+    call — the override path then sizes the full declared amount however
+    much risk is already open."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.90,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=500.0,
+        max_total_exposure=math.inf,
+    )
+
+    assert sized.risk_amount == pytest.approx(500.0)
+    assert sized.position_size == pytest.approx(250.0)
+    assert sized.decision.metadata["max_total_exposure"] == "uncapped"
+
+
+def test_calculate_position_size_max_total_exposure_override_finite_binds():
+    """A finite caller ceiling replaces the config one — here stricter than
+    the 5% config, it clamps the declared override to the remaining budget."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=100_000.0,
+        pip_value=1.0,
+        current_exposure=0.01,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=5_000.0,
+        max_total_exposure=0.02,
+    )
+
+    # Budget: 2% - 1% = 1% of 100k = $1,000 of the declared $5,000.
+    assert sized.risk_amount == pytest.approx(1_000.0)
+    assert sized.position_size == pytest.approx(500.0)
+    assert sized.decision.metadata["max_total_exposure"] == 0.02
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, math.nan, math.inf * -1])
+def test_calculate_position_size_max_total_exposure_override_rejects_bad_values(value):
+    with pytest.raises(ValueError, match="max_total_exposure"):
+        RiskEngine().calculate_position_size(
+            signal=_override_signal(),
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+            max_total_exposure=value,
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

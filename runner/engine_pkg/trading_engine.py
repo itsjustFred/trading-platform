@@ -140,11 +140,12 @@ class TradeEngine:
                 max_positions=TRADE_ENGINE_MAX_POSITIONS,
             )
         )
-        # #279: the fixed-risk protocol gets its own engine instance so its
-        # aggregate-exposure and position limits can be configured
-        # independently (``fixed_risk_max_total_exposure`` /
-        # ``fixed_risk_max_positions``); ``None`` keeps the same defaults the
-        # pct path uses.
+        # #279: the fixed-risk protocol gets its own engine instance. Its
+        # config limits only apply when the corresponding
+        # ``fixed_risk_max_*`` field is set; ``None`` is expressed per call
+        # as ``math.inf`` (uncapped, the MT5-parity default while #279 Q1
+        # is unanswered), so the config values below are just the
+        # documented fallback.
         self._fixed_risk_engine = RiskEngine(
             risk_config(
                 total_exposure=(
@@ -335,8 +336,36 @@ class TradeEngine:
         for position in self.positions:
             per_unit = (position.meta or {}).get("sizing_risk_per_unit")
             if per_unit is not None:
+                declared_per_unit = float(per_unit)
+                current_per_unit = declared_per_unit
+                # A trailing stop moves real open risk below the declared
+                # distance (breakeven or locked profit): once the stop has
+                # moved off its sizing value, count the smaller of the
+                # declared per-unit risk and the current ``|entry - stop|``
+                # measured in the same account-currency units (the
+                # fixed-risk pip factor). An unmoved stop keeps the declared
+                # value — re-measuring ``|entry - stop|`` there is exactly
+                # the drift the declared figure exists to prevent (#279 B1).
+                sizing_stop = (position.meta or {}).get("sizing_stop_loss")
+                current_stop = position.stop_loss
+                if (
+                    current_stop is not None
+                    and sizing_stop is not None
+                    and float(current_stop) != float(sizing_stop)
+                ):
+                    params = self.config.parameters
+                    pip_factor = float(
+                        params.get("tick_value", 1.0) or 1.0
+                    ) / float(params.get("tick_size", 1.0) or 1.0)
+                    current_per_unit = min(
+                        declared_per_unit,
+                        abs(
+                            float(position.entry_price) - float(current_stop)
+                        )
+                        * pip_factor,
+                    )
                 risk_exposure += (
-                    float(position.remaining_qty) * float(per_unit)
+                    float(position.remaining_qty) * current_per_unit
                 ) / float(self._sizing_equity)
                 continue
             stop_loss = position.stop_loss
@@ -490,6 +519,11 @@ class TradeEngine:
         if fixed_risk_amount is None or stop_loss_price is None:
             return None
         risk_amount = float(fixed_risk_amount)
+        if risk_amount == 0:
+            # ``0.0`` is the documented "off" idiom for fixed-risk sizing
+            # (#170 on main): like an absent key the order falls through to
+            # pct sizing — it does not raise and does not size off zero.
+            return None
         if not (math.isfinite(risk_amount) and risk_amount > 0):
             # A configured fixed-risk amount that is NaN/inf/non-positive is
             # a config bug, not "unset" — silently falling through to the
@@ -633,6 +667,22 @@ class TradeEngine:
                     float(stop_distance)
                     if stop_distance is not None and stop_distance > 0
                     else None
+                ),
+                # #279 Q1 (no maintainer answer yet; parity-first per the
+                # #262 decision): the MT5 EA the fixed-risk protocol mirrors
+                # applies neither an aggregate exposure ceiling nor a
+                # position-count cap, so ``None`` on the BacktestConfig
+                # fields means UNCAPPED here — setting a field opts that
+                # one cap back in.
+                max_positions=(
+                    int(self.config.fixed_risk_max_positions)
+                    if self.config.fixed_risk_max_positions is not None
+                    else math.inf
+                ),
+                max_total_exposure=(
+                    float(self.config.fixed_risk_max_total_exposure)
+                    if self.config.fixed_risk_max_total_exposure is not None
+                    else math.inf
                 ),
             )
             self._last_sizing = sized_order

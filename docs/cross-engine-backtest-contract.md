@@ -203,14 +203,19 @@ Implementation:
   the declared amount is the per-trade risk and is clamped to the remaining
   exposure budget. Aggregate exposure is accounted in account currency
   (`|entry - stop| * qty * tick_value / tick_size`, or the declared
-  per-unit risk when the strategy sized on `stop_distance`), and both caps
-  are configurable for this protocol via `fixed_risk_max_positions` /
-  `fixed_risk_max_total_exposure` (defaults: the shared 5 / 5%). The
+  per-unit risk when the strategy sized on `stop_distance`; a trailed
+  stop — breakeven/locked profit — counts the smaller of the declared
+  per-unit risk and the current `|entry - stop|`). Both caps are
+  configurable for this protocol via `fixed_risk_max_positions` /
+  `fixed_risk_max_total_exposure`; `None` means UNCAPPED (the parity-safe
+  default while the #279 aggregate-cap question is open — the MT5 EA
+  applies neither), and setting a field opts that cap back in. A
+  `fixed_risk_amount` of `0` is the "off" idiom (#170) and falls through
+  to pct sizing; a non-finite or non-positive nonzero value raises. The
   accepted size is recomputed in the MT5 order
-  `(risk / distance) * (tick_size / tick_value)`; a configured
-  `fixed_risk_amount` that is non-finite or non-positive raises instead of
-  silently using pct sizing. The result is still capped by `max_leverage`
-  (free margin, #347) unless `cap_fixed_risk_by_leverage = false`.
+  `(risk / distance) * (tick_size / tick_value)`; the result is still
+  capped by `max_leverage` (free margin, #347) unless
+  `cap_fixed_risk_by_leverage = false`.
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop

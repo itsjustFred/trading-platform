@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import Any
 from dataclasses import dataclass
 
 from risk.config import RiskConfig
@@ -142,7 +143,7 @@ class RiskEngine:
         )
 
     @staticmethod
-    def _finite_number(value: object, field_name: str) -> float:
+    def _finite_number(value: Any, field_name: str) -> float:
         if isinstance(value, bool):
             raise ValueError(f"{field_name} must be numeric")
         try:
@@ -154,23 +155,55 @@ class RiskEngine:
         return parsed
 
     @staticmethod
-    def _caller_notional_limit(value: object) -> float:
+    def _caller_fraction_limit(value: Any, field_name: str) -> float:
+        """Caller ceiling as a fraction of balance; ``math.inf`` = uncapped.
+
+        ``inf`` is not JSON-safe, so decision metadata records it as
+        ``"uncapped"``.
+        """
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be numeric")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field_name} must be numeric") from exc
+        if math.isnan(parsed) or parsed == float("-inf") or parsed <= 0:
+            raise ValueError(f"{field_name} must be > 0")
+        return parsed
+
+    @staticmethod
+    def _caller_notional_limit(value: Any) -> float:
         """Caller-specific notional ceiling (fraction of balance).
 
         ``math.inf`` is the documented "uncapped" value: engines that apply
         their own post-size caps (the native engine's free-margin leverage
-        clamp, #347) pass it so no engine-level ceiling binds. Decision
-        metadata records it as ``"uncapped"`` — ``inf`` is not JSON-safe.
+        clamp, #347) pass it so no engine-level ceiling binds.
+        """
+        return RiskEngine._caller_fraction_limit(
+            value, "max_notional_per_trade"
+        )
+
+    @staticmethod
+    def _caller_position_limit(value: Any) -> int | None:
+        """Caller-specific concurrent-position ceiling.
+
+        ``math.inf`` is the documented "uncapped" value (returned as
+        ``None``): protocols whose reference implementation applies no
+        position cap pass it. Finite values must be positive integers.
         """
         if isinstance(value, bool):
-            raise ValueError("max_notional_per_trade must be numeric")
+            raise ValueError("max_positions must be an integer")
         try:
-            parsed = float(value)
+            numeric = float(value)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("max_notional_per_trade must be numeric") from exc
-        if math.isnan(parsed) or parsed == float("-inf") or parsed <= 0:
-            raise ValueError("max_notional_per_trade must be > 0")
-        return parsed
+            raise ValueError("max_positions must be an integer") from exc
+        if math.isnan(numeric) or numeric == float("-inf") or numeric <= 0:
+            raise ValueError("max_positions must be > 0")
+        if math.isinf(numeric):
+            return None
+        if not numeric.is_integer():
+            raise ValueError("max_positions must be an integer")
+        return int(numeric)
 
     def calculate_position_size(
         self,
@@ -184,6 +217,8 @@ class RiskEngine:
         max_notional_per_trade: float | None = None,
         risk_amount_override: float | None = None,
         stop_distance_override: float | None = None,
+        max_positions: int | float | None = None,
+        max_total_exposure: float | None = None,
     ) -> SizedOrder:
         """Size one signal against the configured risk limits.
 
@@ -214,6 +249,14 @@ class RiskEngine:
           ``|entry_price - stop_loss|``. ``max_positions``,
           ``max_total_exposure`` rejection and every input validation apply
           identically on both paths.
+        - ``max_positions``: optional caller-specific concurrent-position
+          ceiling (``None`` → ``config.max_positions``). ``math.inf`` means
+          explicitly uncapped — for protocols whose reference implementation
+          applies no position cap (the MT5-parity fixed-risk path, #279).
+        - ``max_total_exposure``: optional caller-specific aggregate open-risk
+          ceiling as a fraction of balance (``None`` →
+          ``config.max_total_exposure``). ``math.inf`` means explicitly
+          uncapped, same contract as ``max_notional_per_trade``.
 
         The returned ``SizedOrder.position_size`` is in account-currency units
         of the traded symbol (shares/lots); it is the only quantity in that
@@ -232,6 +275,30 @@ class RiskEngine:
             if max_notional_per_trade is None
             else self._caller_notional_limit(max_notional_per_trade)
         )
+        # Caller-specific cap overrides (#279): ``None`` keeps the config
+        # limit; ``math.inf`` is the documented uncapped value so a protocol
+        # whose reference applies no such cap (MT5-parity fixed-risk) can
+        # route through the engine without the cap binding.
+        position_limit = (
+            self.config.max_positions
+            if max_positions is None
+            else self._caller_position_limit(max_positions)
+        )
+        exposure_limit = (
+            self.config.max_total_exposure
+            if max_total_exposure is None
+            else self._caller_fraction_limit(
+                max_total_exposure, "max_total_exposure"
+            )
+        )
+        limit_metadata: dict[str, object] = {
+            "max_positions": (
+                "uncapped" if position_limit is None else position_limit
+            ),
+            "max_total_exposure": (
+                "uncapped" if math.isinf(exposure_limit) else exposure_limit
+            ),
+        }
         exposure = self._finite_number(current_exposure, "current_exposure")
         if exposure < 0:
             raise ValueError("current_exposure must be >= 0")
@@ -258,7 +325,7 @@ class RiskEngine:
         else:
             reject_missing_stop = RiskConfig._bool(reject_missing_stop, "reject_missing_stop")
 
-        if current_positions >= self.config.max_positions:
+        if position_limit is not None and current_positions >= position_limit:
             return self._sized_order(
                 signal=signal,
                 position_size=0.0,
@@ -275,11 +342,14 @@ class RiskEngine:
                     risk_distance=None,
                     stop_price_used=signal.stop_loss,
                     rejection_reason="max_positions",
-                    metadata={"current_positions": current_positions},
+                    metadata={
+                        **limit_metadata,
+                        "current_positions": current_positions,
+                    },
                 ),
             )
 
-        remaining_exposure = max(0.0, self.config.max_total_exposure - exposure)
+        remaining_exposure = max(0.0, exposure_limit - exposure)
         override_amount: float | None = None
         if risk_amount_override is None:
             risk_percent = min(self.config.max_risk_per_trade, remaining_exposure)
@@ -313,7 +383,7 @@ class RiskEngine:
                     risk_distance=None,
                     stop_price_used=signal.stop_loss,
                     rejection_reason="max_total_exposure",
-                    metadata={"current_exposure": exposure},
+                    metadata={**limit_metadata, "current_exposure": exposure},
                 ),
             )
 
@@ -346,6 +416,7 @@ class RiskEngine:
                     stop_price_used=None,
                     rejection_reason="missing_stop",
                     metadata={
+                        **limit_metadata,
                         "current_exposure": exposure,
                         "stop_source": "missing",
                         "fallback_stop_allowed": False,
@@ -370,9 +441,10 @@ class RiskEngine:
             signal.metadata["resolved_stop_loss"] = stop_loss
         enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
         if enforce_stop_direction and not self._stop_matches_direction(signal, stop_loss):
-            risk_distance: float | None = abs(signal.entry_price - stop_loss)
-            if risk_distance <= 0 or not math.isfinite(risk_distance):
-                risk_distance = None
+            distance = abs(signal.entry_price - stop_loss)
+            risk_distance: float | None = (
+                distance if distance > 0 and math.isfinite(distance) else None
+            )
             return self._sized_order(
                 signal=signal,
                 position_size=0.0,
@@ -390,6 +462,7 @@ class RiskEngine:
                     stop_price_used=stop_loss,
                     rejection_reason="bad_stop_direction",
                     metadata={
+                        **limit_metadata,
                         "current_exposure": exposure,
                         "enforce_stop_direction": enforce_stop_direction,
                         "stop_source": stop_source,
@@ -454,6 +527,7 @@ class RiskEngine:
                 risk_distance=risk_distance,
                 stop_price_used=stop_loss,
                 metadata={
+                    **limit_metadata,
                     "current_exposure": exposure,
                     "pip_value": pip,
                     "stop_source": stop_source,
