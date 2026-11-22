@@ -1082,6 +1082,29 @@ def test_list_protective_stops_isolates_a_malformed_candidate() -> None:
     assert [stop.order_id for stop in stops] == ["ok-1"]
 
 
+def test_list_protective_stops_drops_a_symbol_with_an_unreadable_candidate() -> None:
+    # A malformed stop on a symbol that also has a readable one is ambiguous:
+    # listing only the readable stop would let trailing amend it while the
+    # malformed one stays put. The whole symbol must list zero stops so the
+    # trailing path fails closed.
+    client = _FakeTradingClient(
+        positions=[_FakePosition("AAPL", 10.0)],
+        orders=[
+            _FakeOrder(
+                "bad-1", "AAPL", "sell", order_type="stop", stop_price="junk"
+            ),
+            _FakeOrder(
+                "ok-1", "AAPL", "sell", order_type="stop", stop_price=190.0
+            ),
+        ],
+    )
+    adapter = _adapter(client)
+
+    stops = asyncio.run(adapter.list_protective_stops())
+
+    assert stops == []
+
+
 def test_best_stop_price_skips_an_unreadable_stop_price() -> None:
     adapter = _adapter(_FakeTradingClient())
     bad = SimpleNamespace(id="bad-1", symbol="AAPL", stop_price="junk")

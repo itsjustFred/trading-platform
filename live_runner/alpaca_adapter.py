@@ -264,7 +264,10 @@ def _stop_candidates(order: Any) -> Iterator[Any]:
 
 
 def _protective_stop_of(
-    candidate: Any, parent: Any, reducing_sides: Mapping[str, str]
+    candidate: Any,
+    parent: Any,
+    reducing_sides: Mapping[str, str],
+    unreadable_symbols: set[str] | None = None,
 ) -> ProtectiveStop | None:
     symbol = _order_symbol(candidate) or _order_symbol(parent)
     if not symbol or reducing_sides.get(symbol) != _order_side(candidate):
@@ -276,9 +279,11 @@ def _protective_stop_of(
         stop_price = parse_optional(_order_attr(candidate, "stop_price", None))
     except ValueError:
         # One malformed candidate must not take down the whole account's
-        # protective-stop listing: skipping it leaves the symbol with zero
-        # listed stops, and the trailing path refuses to amend on anything
-        # but exactly one — the position keeps its broker-side stop.
+        # protective-stop listing, but it must not be silently ignored either:
+        # the caller drops every stop on the symbol so the trailing path sees
+        # zero listed stops and refuses to amend — fail closed per symbol.
+        if unreadable_symbols is not None:
+            unreadable_symbols.add(symbol)
         logger.warning(
             "Skipping a protective-stop candidate with an unreadable stop_price",
             extra={
@@ -2528,12 +2533,20 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         orders = await self._list_open_orders(client)
         orders.extend(await self._list_filled_parents_with_held_legs(client, set(reducing_sides)))
         stops: dict[str, ProtectiveStop] = {}
+        unreadable_symbols: set[str] = set()
         for order in orders:
             for candidate in _stop_candidates(order):
-                stop = _protective_stop_of(candidate, order, reducing_sides)
+                stop = _protective_stop_of(
+                    candidate, order, reducing_sides, unreadable_symbols
+                )
                 if stop is not None:
                     stops[stop.order_id] = stop
-        return list(stops.values())
+        # A symbol with an unreadable stop candidate is ambiguous: listing its
+        # readable stops would let trailing amend one while the malformed one
+        # stays put. Zero listed stops is the fail-closed answer.
+        return [
+            stop for stop in stops.values() if stop.symbol not in unreadable_symbols
+        ]
 
     async def _list_filled_parents_with_held_legs(
         self, client: Any, symbols: set[str]
