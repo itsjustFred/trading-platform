@@ -792,8 +792,10 @@ def _realized_max_drawdown_pct(trades: list[Trade], initial_capital: float) -> f
     ordered = sorted(
         trades,
         key=lambda t: (
+            # ``last_exit_time`` raises on an exit-less trade (#123); those
+            # sort last, after every exited trade.
             pd.to_datetime(t.last_exit_time, utc=True, format="mixed", errors="coerce")
-            if t.last_exit_time
+            if t.exits
             else pd.Timestamp.max.tz_localize("UTC"),
             t.id,
         ),
