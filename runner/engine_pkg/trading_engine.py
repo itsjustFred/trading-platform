@@ -371,7 +371,10 @@ class TradeEngine:
         fits in free margin, i.e. ``notional <= free_margin * max_leverage``.
         """
         free_margin = self._free_margin(entry_price)
-        if free_margin <= 0:
+        # Fail closed: a NaN free margin (e.g. a NaN mark on an open position)
+        # must not silently lift the leverage ceiling — ``nan <= 0`` is False
+        # and ``min(qty, nan)`` returns ``qty``.
+        if not math.isfinite(free_margin) or free_margin <= 0:
             return 0.0
         return free_margin * self._max_leverage / entry_price
 
@@ -768,6 +771,17 @@ class TradeEngine:
                     # fill-time ledger, so that is now the basis to record.
                     order._sizing_equity = float(self._sizing_equity)
                     if order.quantity <= 0:
+                        # Usually the free-margin leverage clamp (no free
+                        # margin remains) — log like the creation skip
+                        # instead of dropping the fill silently.
+                        logger.warning(
+                            "Skipping %s %s order at %s: fill-time sized "
+                            "quantity %.6g <= 0",
+                            order.symbol,
+                            order.direction,
+                            fill_time,
+                            order.quantity,
+                        )
                         continue
                 if order.order_type == OrderType.MARKET:
                     sizing_stop = order.stop_loss
@@ -818,6 +832,17 @@ class TradeEngine:
                         # fill-time basis is the one to record.
                         order._sizing_equity = float(self._sizing_equity)
                         if order.quantity <= 0:
+                            # Usually the free-margin leverage clamp (no free
+                            # margin remains) — log like the creation skip
+                            # instead of dropping the fill silently.
+                            logger.warning(
+                                "Skipping %s %s order at %s: fill-time sized "
+                                "quantity %.6g <= 0",
+                                order.symbol,
+                                order.direction,
+                                fill_time,
+                                order.quantity,
+                            )
                             continue
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
                 # on the wrong side of the entry (LONG stop >= entry, SHORT

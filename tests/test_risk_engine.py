@@ -262,7 +262,7 @@ def test_calculate_position_size_math_inf_notional_is_documented_uncapped():
     assert sized.decision.metadata["capped_by_notional"] is False
     assert sized.decision.metadata["max_notional_per_trade"] == "uncapped"
 
-    for bad in (math.nan, math.inf * -1, 0.0, -1.0):
+    for bad in (math.nan, math.inf * -1, 0.0, -1.0, True, False):
         with pytest.raises(ValueError, match="max_notional_per_trade"):
             engine.calculate_position_size(
                 signal=signal,

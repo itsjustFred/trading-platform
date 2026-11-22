@@ -807,6 +807,90 @@ class TestFreeMarginLeverageCap:
             for record in caplog.records
         ), [record.getMessage() for record in caplog.records]
 
+    def _fill_row(self) -> pd.Series:
+        return pd.Series(
+            {
+                "timestamp": pd.Timestamp("2024-01-02T00:00:00Z"),
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "close": 100.0,
+                "volume": 1000.0,
+            }
+        )
+
+    def test_fill_time_limit_zero_size_skip_is_logged(
+        self, tmp_path: Path, caplog
+    ):
+        """A pending LIMIT sized >0 at creation but clamped to zero at fill
+        (free margin ran out) must not be dropped silently."""
+        from runner.engine import Order, OrderType
+
+        engine = self._engine(tmp_path, max_leverage=1.0)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty > 0, "sized while free margin remains"
+        engine.pending_orders.append(
+            Order(
+                symbol="PROBE",
+                direction="LONG",
+                order_type=OrderType.LIMIT,
+                created_index=0,
+                created_time="2024-01-01T00:00:00+00:00",
+                quantity=qty,
+                limit_price=100.0,
+                stop_loss=99.0,
+            )
+        )
+        # Consume all margin before the fill: at 1x, 1000 * 100 = 100k of
+        # margin against 100k equity leaves free margin at zero.
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        with caplog.at_level(logging.WARNING):
+            engine._fill_pending_orders(self._fill_row(), 1)
+        assert engine.pending_orders == [], "the zero-size fill is cancelled"
+        assert not engine.positions[1:], "no second position opens"
+        assert any(
+            "fill-time sized quantity" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    def test_fill_time_market_zero_size_skip_is_logged(
+        self, tmp_path: Path, caplog
+    ):
+        """Same for a MARKET order re-sized at fill from its sizing stop."""
+        from runner.engine import Order, OrderType
+
+        engine = self._engine(tmp_path, max_leverage=1.0)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty > 0
+        engine.pending_orders.append(
+            Order(
+                symbol="PROBE",
+                direction="LONG",
+                order_type=OrderType.MARKET,
+                created_index=0,
+                created_time="2024-01-01T00:00:00+00:00",
+                quantity=qty,
+                stop_loss=99.0,
+            )
+        )
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        with caplog.at_level(logging.WARNING):
+            engine._fill_pending_orders(self._fill_row(), 1)
+        assert engine.pending_orders == []
+        assert len(engine.positions) == 1, "only the margin-consuming position"
+        assert any(
+            "fill-time sized quantity" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
     def test_unknown_broker_maximum_means_1x(self, tmp_path: Path):
         engine = self._engine(tmp_path)
         assert engine._max_leverage == 1.0
@@ -862,13 +946,16 @@ class TestFreeMarginLeverageCap:
         engine = self._engine(
             tmp_path, max_leverage=10.0, max_position_exposure_pct=0.4
         )
-        self._open_position(engine, entry_price=100.0, qty=100.0)
-        # The per-position exposure cap is a sizing rule on realized cash:
-        # 0.4 * 100k / 100 = 400 shares, untouched by free margin (which at
-        # 10x would allow ~9,900).
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # Mark the open position at 110: reporting equity reads 110k while
+        # realized sizing cash stays 100k. The per-position exposure cap is
+        # a sizing rule on realized cash (D2): 0.4 * 100k / 100 = 400
+        # shares — sizing it off ``self.equity`` would wrongly give 440.
+        # (At 10x free margin allows ~9,000, so the exposure cap binds.)
+        engine.equity = 110_000.0
         qty = engine._calculate_position_size(
             entry_price=100.0,
-            stop_loss_price=99.9,
+            stop_loss_price=99.0,
             direction="LONG",
         )
         assert qty == pytest.approx(400.0)

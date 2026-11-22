@@ -185,11 +185,14 @@ Implementation:
   vectorbt records the decision in `trade.meta["risk_math"]`
   (`sizing_mode`, `risk_target_usd`, `stop_distance`, `required_notional`,
   `final_notional`, `capped_by_max_position`, `capped_by_max_leverage`).
-  **Leverage-cap basis divergence (#347):** vectorbt/pynecore hold at most
-  one position, so their free margin always equals equity and their
-  `equity × max_leverage` cap already *is* the MT5 rule. The native engine
-  sizes against **free margin** — mark-to-market equity minus the margin
-  open positions already use — and clamps the quantity (floored to
+  **Leverage-cap basis divergence (#347):** vectorbt holds at most one
+  position, so its free margin always equals equity and its
+  `equity × max_leverage` cap already *is* the MT5 rule. PyneCore keeps
+  overlapping trades (`open_ledger`) and caps
+  `equity × max_leverage − open_notional` on *realized* equity — a
+  different rule; it is frozen and slated for deletion (#318). The native
+  engine sizes against **free margin** — mark-to-market equity minus the
+  margin open positions already use — and clamps the quantity (floored to
   `lot_step` when the leverage cap binds) instead of refusing; an unknown
   broker maximum means 1x.
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
@@ -213,7 +216,10 @@ Implementation:
   runs skip the replay (identity). PyneCore performs the equivalent merged
   sizing pass after parsing all symbols: entries are processed in timestamp
   order against one realized-equity ledger, and the aggregate open notional
-  is capped by shared `max_leverage`.
+  is capped by shared `max_leverage`. **#347 exception:** a trade whose
+  quantity was clamped by the free-margin leverage rule is rescaled by
+  `shared_equity / equity_at_entry` like every other trade — an
+  approximation that is not flagged in the trade meta.
 
 ## 5. Execution-timing models (documented divergence)
 
