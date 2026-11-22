@@ -416,8 +416,9 @@ def resolve_protective_exit(
     that opens beyond a protective level exits on that level at the open and
     beats any later same-bar touch of the other level (a favourable gap
     through the target is a target exit even when the bar later trades
-    through the stop). Order, mirroring native ``TradeEngine._check_stops``:
-    gap through the stop, gap through the target, then the range-based
+    through the stop). Order — the order #208 ports to native
+    ``TradeEngine._check_stops`` (which has no gap check on main yet): gap
+    through the stop, gap through the target, then the range-based
     :func:`resolve_same_bar_exit` (stop-first tie-break).
 
     ``bar_open`` is the open on the side the exits trigger on (the ask open

@@ -448,6 +448,22 @@ def test_a_gap_past_the_stop_beats_a_later_same_bar_tp1_touch(monkeypatch) -> No
     assert trade.meta["supertrend_flip"]["tp1_time"] is None
 
 
+def test_a_gap_through_tp1_beats_a_later_same_bar_stop_touch(monkeypatch) -> None:
+    """The other half of gap-beats-same-bar: the bar opens ABOVE TP1 (111 >
+    110) and later trades down through the stop (low 94 < 95). The open is the
+    bar's first event, so TP1 fills at 111 and the remainder survives — a
+    regression to plain ``resolve_same_bar_exit`` would stop the whole
+    position out at 95 instead."""
+    gap_tp1_then_stop = (111.0, 112.0, 94.0, 105.0)
+    frame = _frame([ENTRY_BAR, gap_tp1_then_stop, _flat(), _flat()])
+    _stub_supertrend(monkeypatch, "rrrr")
+    trade = _run(frame).trades[0]
+
+    assert [leg.reason for leg in trade.exits] == ["tp1", "end_of_data"]
+    assert trade.exits[0].price == 111.0
+    assert trade.exits[0].time == _times(frame, 1)
+
+
 def test_an_open_exactly_at_the_level_fills_at_that_price(monkeypatch) -> None:
     """Open == stop counts as a gap, but the fill price is identical either
     way: the level."""

@@ -112,7 +112,10 @@ under `TZ=America/New_York`.
 Decision Record (Cleanup 16-A):
 
 - Same-bar SL/TP priority is **stop-first everywhere when intrabar data is
-  unavailable**;
+  unavailable** — with one qualifier: a bar that *opens* beyond a level is not
+  a same-bar ambiguity at all. The open is the bar's first event, so a gap
+  through a level fills at the open and is checked before the stop-first
+  tie-break (`resolve_protective_exit`, owner decision 2026-11-13, #287).
 - with intrabar data enabled and available, the **actual chronological event**
   is used;
 - if intrabar data is missing, fall back to stop-first **and flag the
@@ -208,8 +211,9 @@ behavior**, not a bug to be fixed by silently changing one engine:
 **`supertrend_flip` exit (signal-replay, #168).** The flip leg is a signal exit
 decided at the close of the first red bar after activation and filled at the
 OPEN of the next bar, so a flip on the last bar closes as `end_of_data` at that
-bar's close. This is the only replay exit that is not a level and not a
-same-bar-close fill. The run-level `signal_exit_fill` stays `close` for replay
+bar's close. This is the only replay *signal* exit that is not a level fill and
+not a same-bar-close fill (the level exits themselves can fill at the open on a
+gap — see the §1 gap rule below). The run-level `signal_exit_fill` stays `close` for replay
 (the replay has no `open` model); each flip trade records
 `meta["supertrend_flip"]["flip_exit_fill"] = "next_bar_open"`.
 
