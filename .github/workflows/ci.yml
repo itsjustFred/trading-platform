@@ -14,6 +14,12 @@ jobs:
     name: Python ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      # pytest-randomly ships in the dev extra for the weekly randomised-tests
+      # workflow; every pytest run in this job (tests, strategy tests, the gate
+      # harness) stays in declared order so a failure reproduces from the
+      # checkout alone (#293).
+      PYTEST_ADDOPTS: "-p no:randomly"
     strategy:
       fail-fast: false
       matrix:

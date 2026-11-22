@@ -15,6 +15,8 @@ Do NOT weaken, remove, bypass or rewrite a test just to achieve a passing result
 
 The suite never touches the repo's `data/`: `tests/conftest.py` forces `DATA_DIR`/`TRADING_DATA_DIR` to a per-process temp dir and fails the session if the repo `data/` changed. Tests must write under `tmp_path` or `DATA_DIR`, never a hardcoded `data/`. The guard watches only the time between session start and finish, and it cannot tell which process changed `data/`: stop a running viewer/daemon in the checkout, or run the suite from a separate checkout. Because `DATA_DIR` is now a throwaway directory, local dataset-backed strategy tests need an explicit read-only opt-in: `TP_TEST_OHLCV_DIR=/path/to/ohlcv` (otherwise they skip with a message naming this variable).
 
+Test order is deliberately fixed in `ci` (`PYTEST_ADDOPTS=-p no:randomly`). `pytest-randomly` is installed with the dev extra and runs weekly in the `randomised-tests` workflow to catch order-dependent tests; its header prints `Using --randomly-seed=N` - reproduce a failure with `uv run pytest -p randomly --randomly-seed=N` (or dispatch the workflow with the `seed` input). Locally the plugin is active by default once the dev extra is synced; add `-p no:randomly` for a declared-order run.
+
 ## Issues
 
 When creating an issue, give the appropriate labels. If things are unclear, give the `needs-decision` label. This signals that a maintainer needs to look at the issue and decide on unclear points, like open questions.
