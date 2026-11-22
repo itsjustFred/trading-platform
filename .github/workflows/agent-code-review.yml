@@ -18,18 +18,19 @@ name: Agent Code Review
 #   token or secret, and the run fails if HEAD moved or the tree is dirty.
 # - This workflow file itself is not pinned: on pull_request GitHub runs the
 #   PR's copy. Accepted, since only collaborators with write access can open
-#   same-repo PRs. Fork PRs are skipped.
+#   same-repo PRs. Fork PRs and drafts are skipped - a draft is reviewed when
+#   it is marked ready for review (`ready_for_review` is a trigger type).
 #
 # A run that failed for a transient reason (e.g. a model rate limit) is
 # restarted with "Re-run jobs" on the run page or `gh run rerun <run-id>`.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
-#   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
+#   REVIEW_MODEL    opencode model, provider/model (default: opencode/deepseek-v4.1-flash-free)
 #   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: agent-code-review-${{ github.event.pull_request.number }}
@@ -37,7 +38,7 @@ concurrency:
 
 env:
   OPENCODE_VERSION: "2.2.7"
-  MODEL: ${{ vars.REVIEW_MODEL || 'opencode/inkling-2-small-free' }}
+  MODEL: ${{ vars.REVIEW_MODEL || 'opencode/deepseek-v4.1-flash-free' }}
   VARIANT: ${{ vars.REVIEW_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
 
@@ -47,6 +48,10 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Drafts are not reviewed: the run resumes when the PR is marked ready for
+    # review, one of the pull_request types above. A skipped resolve skips
+    # every job that needs its outputs, so no quota is spent on a draft.
+    if: ${{ github.event.pull_request.draft == false }}
     # Reads only the event payload; needs no token scope.
     permissions: {}
     outputs:
