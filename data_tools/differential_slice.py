@@ -373,7 +373,7 @@ def validate_slice_frame(frame: pd.DataFrame, *, source: str = "slice") -> None:
     prices = frame.loc[:, ["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
     finite = np.isfinite(prices.to_numpy(dtype=float))
     if not bool(finite.all()):
-        counts = {column: int(n) for column, n in zip(prices.columns, (~finite).sum(axis=0))}
+        counts = {column: int(n) for column, n in zip(prices.columns, (~finite).sum(axis=0), strict=True)}
         raise SliceValidationError(f"{source}: non-finite OHLC values: {counts}")
     if not bool((prices > 0).all().all()):
         raise SliceValidationError(f"{source}: non-positive prices are not valid quotes")
