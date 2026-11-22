@@ -144,3 +144,16 @@ def test_exposure_limit_reduces_position_size() -> None:
     assert reduced.risk_percent < baseline.risk_percent
     assert reduced.position_size < baseline.position_size
     assert reduced.position_size > 0.0
+
+
+@pytest.mark.parametrize("value", [0, -1, 0.5])
+def test_rocketfuel_rejects_non_positive_atr_period(value) -> None:
+    with pytest.raises(ValueError, match="atr_period"):
+        RocketFuelSignalProcessor(
+            {
+                "rocket_fuel": {
+                    "atr_period": value,
+                    "variant": "longsonly",
+                }
+            }
+        )

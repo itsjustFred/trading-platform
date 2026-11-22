@@ -676,7 +676,7 @@ def test_every_agent_workflow_is_a_standalone_per_push_workflow() -> None:
         # One agent job that produces a comment, and (for the one workflow that reports it)
         # one job that posts it and sets the status. The chain's shape - a post job that
         # dispatched the next stage - is gone; what is left is a poster.
-        job_name, agent = _agent_job(data)
+        job_name, _agent = _agent_job(data)
         assert set(jobs) >= {"resolve", job_name, "post"}, f"{name}: jobs are {list(jobs)}"
         concurrency = data["concurrency"]
         group = str(concurrency["group"])

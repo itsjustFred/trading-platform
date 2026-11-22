@@ -30,12 +30,12 @@ def validate_live_account_routes(accounts: Sequence[LiveAccountConfig]) -> None:
         identifier = ctrader_account_identifier(account)
         try:
             numeric_identifier = int(identifier)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"cTrader account '{account_id}' has no numeric broker "
                 f"identifier (ctid/broker_login resolved to {identifier!r}); "
                 "set a numeric ctid."
-            )
+            ) from exc
         if numeric_identifier <= 0:
             raise ValueError(
                 f"cTrader account '{account_id}' has a non-positive broker "

@@ -44,6 +44,21 @@ class TestResolveFeeModel:
         with pytest.raises(ValueError, match="fee_for_trade"):
             resolve_fee_model({"fee_model": object()})
 
+    def test_round_trip_only_model_rejected(self) -> None:
+        """A model that cannot price a single leg is rejected, not half-used.
+
+        An engine holding already-paid legs out of spendable cash
+        (``TradeEngine._refresh_sizing_equity``) needs per-leg prices; a
+        model without them must fail closed instead of mis-accounting.
+        """
+
+        class RoundTripOnly:
+            def fee_for_trade(self, entry_price, exit_price, quantity):
+                return 1.0
+
+        with pytest.raises(ValueError, match="entry_fee"):
+            resolve_fee_model({"fee_model": RoundTripOnly()})
+
     def test_fees_zero_conflicts_with_rate(self) -> None:
         # resolve itself accepts the keys (rate wins by precedence); the CLI
         # rejects the ambiguous combination — here rate keys take precedence.
@@ -63,6 +78,26 @@ class TestNotionalFeeModel:
     def test_uses_absolute_values(self) -> None:
         model = NotionalFeeModel(rate=0.001)
         assert model.fee_for_trade(-100.0, 101.0, -10.0) == pytest.approx(2.01)
+
+    def test_legs_add_up_to_the_round_trip(self) -> None:
+        """The contract engines rely on: ``fee_for_trade == entry + exit``.
+
+        ``entry_fee`` carries the per-trade surcharge (the trade, and its
+        surcharge, exists from the moment it is opened); ``exit_fee`` does not.
+        """
+        model = NotionalFeeModel(rate=0.001, flat_per_trade=2.0)
+        # entry leg 0.001 * 100 * 10 + 2.0 surcharge = 3.0
+        assert model.entry_fee(100.0, 10.0) == pytest.approx(3.0)
+        # exit leg 0.001 * 101 * 10 = 1.01 (no second surcharge)
+        assert model.exit_fee(101.0, 10.0) == pytest.approx(1.01)
+        assert (
+            model.entry_fee(100.0, 10.0) + model.exit_fee(101.0, 10.0)
+            == pytest.approx(model.fee_for_trade(100.0, 101.0, 10.0))
+        )
+
+    def test_zero_model_prices_every_leg_at_zero(self) -> None:
+        assert ZeroFeeModel().entry_fee(100.0, 10.0) == 0.0
+        assert ZeroFeeModel().exit_fee(101.0, 10.0) == 0.0
 
 
 class TestEngineHardError:

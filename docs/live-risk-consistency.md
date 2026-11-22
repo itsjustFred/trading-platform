@@ -1,20 +1,20 @@
-# Live Risk Konsistenz
+# Live Risk Consistency
 
 ## Problem
 
-Die Position-Sizing-Logik baut in Backtest und Live auf derselben `RiskEngine` auf.
-Live gibt es genau **einen** Sizing-Einstieg (#125):
-`live_runner.daemon.size_live_signal_for_submission()`. Der frühere zweite
-Einstieg `risk.live.size_live_signal()` hatte keinen Produktions-Aufrufer und ist
-entfernt.
+Position sizing in backtests and in live trading is built on the same `RiskEngine`.
+Live has exactly **one** sizing entry point (#125):
+`live_runner.daemon.size_live_signal_for_submission()`. The second entry point that
+used to exist, `risk.live.size_live_signal()`, had no production caller and has been
+removed.
 
-| Modul | Zweck | Unterschiede |
-|-------|-------|--------------|
-| `risk/engine.py` | Backtest-Risk-Engine | Vollständige RiskEngine-Klasse mit konfigurierbarem RiskConfig |
-| `risk/live.py` | Live-Levels und Gate-Regeln | `resolve_live_levels()` (einziger Entry/SL/TP-Resolver), `entry_gate_settings()`, `entry_deviation_sl_fraction()`; kein Sizing |
-| `live_runner/daemon.py` | Live-Sizing und -Submission | `size_live_signal_for_submission()` (einziger Live-Sizing-Einstieg) / `prepare_order_with_risk()`: Sizing mit Deployment-`RiskConfig` über `RiskEngine`, Levels aus `resolve_live_levels()`, Entry-Deviation-Gate |
+| Module | Purpose | Differences |
+|--------|---------|-------------|
+| `risk/engine.py` | Backtest risk engine | Complete `RiskEngine` class with a configurable `RiskConfig` |
+| `risk/live.py` | Live levels and gate rules | `resolve_live_levels()` (the only entry/SL/TP resolver), `entry_gate_settings()`, `entry_deviation_sl_fraction()`; no sizing |
+| `live_runner/daemon.py` | Live sizing and submission | `size_live_signal_for_submission()` (the only live sizing entry point) / `prepare_order_with_risk()`: sizing with the deployment's `RiskConfig` through `RiskEngine`, levels from `resolve_live_levels()`, entry-deviation gate |
 
-## Kritische Unterschiede
+## Critical Differences
 
 ### 1. Stop-Direction Enforcement
 
@@ -22,303 +22,335 @@ entfernt.
 ```python
 enforce_stop_direction = bool(signal.metadata.get("enforce_stop_direction", False))
 ```
-Standard: `False` (nicht erzwungen)
+Default: `False` (not enforced)
 
 **Live (`live_runner/daemon.py`, `size_live_signal_for_submission`):**
 ```python
 "enforce_stop_direction": True,  # hardcoded
 ```
-Live erzwingt immer, dass Stop-Loss in die richtige Richtung zeigt.
+Live always enforces that the stop loss points in the right direction.
 
 ### 2. RiskConfig Defaults
 
-Beide Pfade verwenden dieselben Defaults aus `RiskConfig`:
+Both paths use the same defaults from `RiskConfig`:
 - `max_risk_per_trade: 0.01` (1%)
 - `max_total_exposure: 0.05` (5%)
 - `max_positions: 5`
 - `default_sl_atr_multiplier: 2.0`
 - `fallback_stop_pct: 0.02` (2%)
 
-### 3. Sizing-Formel
+### 3. Sizing Formula
 
-Beide Pfade verwenden dieselbe Formel:
+Both paths use the same formula:
 ```
 position_size = risk_amount / (risk_distance * pip_value)
 ```
 
-Dabei ist:
+Where:
 - `risk_amount = balance * risk_percent`
 - `risk_percent = min(max_risk_per_trade, max_total_exposure - current_exposure)`
 - `position_size = min(position_size, max_notional_per_trade * balance / (entry_price * pip_value))`
-  (Notional-Obergrenze, `max_notional_per_trade` als Bruchteil des Balances, Default 0.20).
-  Das Notional einer Position in Account-Währung ist `position_size * entry_price * pip_value`
-  (#146: ohne `* pip_value` war die Obergrenze für cTrader-FX 1000x zu locker).
-- `pip_value` ist der P&L **einer** `position_size`-Einheit pro Preisbewegung um 1.0, in
-  Account-Währung (nicht pro Pip). Aktien in USD auf einem USD-Konto: 1.0; cTrader EURUSD
-  auf einem USD-Konto: 1000 (eine qty = 0.01 Lot = 1.000 EUR).
+  (notional ceiling, `max_notional_per_trade` as a fraction of the balance, default 0.20).
+  The notional of one position in account currency is `position_size * entry_price * pip_value`
+  (#146: without `* pip_value` the ceiling was 1000x too loose for cTrader FX).
+- `pip_value` is the P&L of **one** `position_size` unit per price move of 1.0, in
+  account currency (not per pip). US equities in USD on a USD account: 1.0; cTrader EURUSD
+  on a USD account: 1000 (one qty = 0.01 lot = 1,000 EUR).
 
-## Einheiten-Contract (Cleanup 20-A)
+## Units Contract (Cleanup 20-A)
 
-Alle Risk-Limits sind Bruchteile des Account-Balance (fraction of balance):
+All risk limits are fractions of the account balance (fraction of balance):
 
-| Größe | Einheit |
-|-------|---------|
-| `max_risk_per_trade` | Bruchteil des Balances (max. Verlust pro Trade) |
-| `max_total_exposure` / `current_exposure` | Bruchteil des Balances (aggregates Open-Risk) |
-| `max_notional_per_trade` | Bruchteil des Balances (Notional-Obergrenze pro Position) |
-| `SizedOrder.position_size` / `qty` | Account-Währungseinheiten des Symbols (Shares/Lots) |
+| Quantity | Unit |
+|----------|------|
+| `max_risk_per_trade` | Fraction of the balance (maximum loss per trade) |
+| `max_total_exposure` / `current_exposure` | Fraction of the balance (aggregate open risk) |
+| `max_notional_per_trade` | Fraction of the balance (notional ceiling per position) |
+| `SizedOrder.position_size` / `qty` | Account-currency units of the symbol (shares/lots) |
 
-Vertrauensgrenze: Signal-Metadata ist **unvertrautes** Publisher-Payload. Sie darf
-nur Handels-Deskriptoren liefern (Entry-Price, Stop, Take-Profit, ATR, Timeframe).
-Nie aus Metadata gelesen werden: `qty`/`explicit_qty` (Mengen-Override),
-`max_risk_per_trade`, `max_total_exposure`, `max_positions`, `current_positions`,
-`current_exposure`, `pip_value` (#125: ein Payload-Pip-Value skalierte die Menge
-direkt) und `max_entry_deviation_sl_fraction`. Der Pip-Value kommt vom Broker
-(`adapter.get_pip_value()`, #146) oder von einem vertrauten Aufrufer; ein implizites
-1.0 gibt es im Live-Pfad nicht mehr.
-Risk-Policy kommt ausschliesslich aus Deployment-/Runtime-Config
-(`RiskConfig`), State (`current_positions`, `current_exposure`) aus dem
-Portfolio-/Broker-Source-of-Truth. Der früher `qty`/`explicit_qty`-Bypass um die
-komplette Risk-Engine ist entfernt; `size_live_signal_for_submission` size't
-jedes Live-Signal durch `RiskEngine`.
-State-Fail-Closed (#263): eine Broker-Position, deren `qty` nicht lesbar ist
-(nicht numerisch, `nan`/`inf`, fehlend oder Alpacas `qty_unparseable`-Marker),
-wird seit #263 nicht mehr als 0 gezählt - sonst hiesse das „Konto ist flat“ und
-der nächste Entry würde gegen ein leeres Buch sizen, obwohl `max_positions`
-oder `max_total_exposure` schon voll sind. Der Count wirft
-`UnreadableBrokerPositionQtyError`, der Entry wird verweigert (nichts geht an den
-Broker) und ein Operator bekommt einen ERROR-Alert. Exit-Orders sind nicht
-betroffen: sie sizen gegen das eigene Ledger der Deployment, nicht gegen den
-Count.
+Trust boundary: signal metadata is **untrusted** publisher payload. It may only supply
+trading descriptors (entry price, stop, take profit, ATR, timeframe). Never read from
+metadata: `qty`/`explicit_qty` (quantity override), `max_risk_per_trade`,
+`max_total_exposure`, `max_positions`, `current_positions`, `current_exposure`,
+`pip_value` (#125: a payload pip value scaled the quantity directly) and
+`max_entry_deviation_sl_fraction`. The pip value comes from the broker
+(`adapter.get_pip_value()`, #146) or from a trusted caller; there is no implicit 1.0 in
+the live path any more.
+Risk policy comes exclusively from deployment/runtime config (`RiskConfig`), state
+(`current_positions`, `current_exposure`) from the portfolio/broker source of truth. The
+former `qty`/`explicit_qty` bypass around the whole risk engine is removed;
+`size_live_signal_for_submission` sizes every live signal through `RiskEngine`.
+State fail-closed (#263): a broker position whose `qty` is unreadable (not numeric,
+`nan`/`inf`, missing, or Alpaca's `qty_unparseable` marker) is no longer counted as 0 -
+that would read as "the account is flat", and the next entry would be sized against an
+empty book although `max_positions` or `max_total_exposure` are already full. The count
+raises `UnreadableBrokerPositionQtyError`, the entry is refused (nothing goes to the
+broker) and an operator gets an ERROR alert. Exit orders are not affected: they size
+against the deployment's own ledger, not against the count.
 
-## Pip-Value aus dem Broker (#146)
+## Broker Pip Value (#146)
 
-`prepare_order_with_risk()` holt vor dem Sizing `adapter.get_pip_value(symbol)`
+`prepare_order_with_risk()` fetches `adapter.get_pip_value(symbol)` before sizing
 (`LivePipValue`: `value = units_per_qty * conversion_rate`):
 
-- **cTrader:** aus `ProtoOASymbol.lotSize` (in Cent der Basiswährung, EURUSD
-  10.000.000 = 100.000 EUR), also `units_per_qty = lotSize / 100 / 100`, und der
-  Umrechnung der Quote- in die Konto-Währung entlang der Broker-Kette
-  (`ProtoOASymbolsForConversionReq`) mit Live-Quotes. Pro Hop wird die Seite
-  genommen, die den Kurs **höher** macht (Ask beim Multiplizieren, Bid beim
-  Dividieren): ein höherer Pip-Value sized kleiner, der Spread kann den Verlust am
-  SL also nur unter das Budget drücken. Das gilt nur für den Umrechnungs-Quote zum
-  Sizing-Zeitpunkt: Cross-Währungs-Kurse können sich bis zum Stop bewegen, und der
-  Submit prüft nur die Symbol-Skala, nicht den Umrechnungskurs. Das SL-Budget ist
-  daher keine harte Verlustgrenze in Konto-Währung. Ein expliziter `pip_value`-Override
-  (`source="caller"`) trägt keine `units_per_qty`; cTrader verweigert ihn, weil die
-  Skala beim Submit nicht prüfbar wäre. Jede Nutzung des Overrides schreibt eine
-  Warnung ins Log (`Caller-supplied pip_value override in use`), da er den
-  Broker-Lookup samt Frische-Prüfung umgeht.
-  Der cTrader-Volumen-Divisor (`CTRADER_VOLUME_PER_BASE_UNIT = 100`) ist nur auf den
-  Demo-Symbolklassen geprüft, auf denen er verifiziert wurde (EURUSD/FX, XAUUSD,
-  US500); für andere Klassen ist er unverifiziert.
-  Nur ein vom Broker gesendetes `lotSize` zählt;
-  die statische Fallback-Tabelle (in Basis-Einheiten, für FX/XAU 100x unter den
-  Broker-Cent, #184) wird nie fürs Sizing benutzt. Ändert sich die Skala zwischen
-  Sizing und Submit (z. B. Reconnect mit fehlgeschlagenem Props-Fetch), verweigert
-  der Adapter die Order (`pip_value_units_per_qty`).
-- **Alpaca:** 1.0 (Shares/Coins in USD auf einem USD-Konto). Ein Nicht-USD-Konto oder
-  ein nicht in USD quotiertes Paar (`ETH/BTC`, `BTC/USDT`) wird abgelehnt.
+- **cTrader:** from `ProtoOASymbol.lotSize` (in cents of the base currency; EURUSD
+  10,000,000 = 100,000 EUR), i.e. `units_per_qty = lotSize / 100 / 100`, plus the
+  conversion of the quote currency into the account currency along the broker chain
+  (`ProtoOASymbolsForConversionReq`) with live quotes. Per hop the side that makes the
+  rate **higher** is taken (ask when multiplying, bid when dividing): a higher pip value
+  sizes smaller, so the spread can only push the loss at the SL below the budget. That
+  holds only for the conversion quote at sizing time: cross-currency rates can move until
+  the stop, and submission checks only the symbol scale, not the conversion rate. The SL
+  budget is therefore not a hard loss limit in account currency. An explicit
+  `pip_value` override (`source="caller"`) carries no `units_per_qty`; cTrader refuses it
+  because the scale would not be verifiable at submission. Every use of the override
+  writes a warning to the log (`Caller-supplied pip_value override in use`), since it
+  bypasses the broker lookup including its freshness check.
+  The cTrader volume divisor (`CTRADER_VOLUME_PER_BASE_UNIT = 100`) has only been
+  verified on the demo symbol classes it was verified on (EURUSD/FX, XAUUSD, US500); for
+  other classes it is unverified.
+  Only a broker-sent `lotSize` counts; the static fallback table (in base units, 100x
+  below the broker cents for FX/XAU, #184) is never used for sizing. If the scale changes
+  between sizing and submission (e.g. a reconnect with a failed props fetch), the adapter
+  refuses the order (`pip_value_units_per_qty`).
+- **Alpaca:** 1.0 (shares/coins in USD on a USD account). A non-USD account or a pair not
+  quoted in USD (`ETH/BTC`, `BTC/USDT`) is refused.
 
-Fail closed (Eintrag abgelehnt, Grund im Log `Pip value unavailable`): Adapter ohne
-`get_pip_value`, Fehler oder Timeout (`PIP_VALUE_FETCH_TIMEOUT_SECONDS`), Wert nicht
-endlich und positiv, `value != units_per_qty * conversion_rate`, ein Kurs ungleich 1
-ohne Quotes, oder ein Umrechnungs-Quote, der die Frische-Regel des Entry-Gates
-verletzt (fehlende/ungültige Zeit, Zukunft, älter als `max_entry_quote_age_seconds`).
-Exit-only-Orders brauchen keinen Pip-Value.
+Fail closed (entry refused, reason in the log `Pip value unavailable`): adapter without
+`get_pip_value`, error or timeout (`PIP_VALUE_FETCH_TIMEOUT_SECONDS` = 60 s,
+`live_runner/daemon.py:1223`), a value that is not finite and positive,
+`value != units_per_qty * conversion_rate`, a rate other than 1 without quotes, or a
+conversion quote that violates the entry gate's freshness rule (missing/invalid time,
+future, older than `max_entry_quote_age_seconds`). Exit-only orders need no pip value.
 
-Persistiert am Signal: `pip_value`, `pip_value_source`, `pip_value_units_per_qty`,
+Worst-case wait before an entry is submitted: the daemon bounds both broker fetches it
+makes on the entry path — 60 s for the pip value (`PIP_VALUE_FETCH_TIMEOUT_SECONDS`,
+`live_runner/daemon.py:1223`) and 20 s for the entry-gate quote
+(`ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS` = 20.0, `live_runner/daemon.py:1086`). Pip value and
+sizing run before the entry-deviation gate, so an entry that times out on both waits about
+80 s before it is refused. The cTrader quote timeout of 5 s
+(`quote_timeout_seconds = 5.0`, `live_runner/ctrader_adapter.py:849`) is an
+adapter-internal bound inside that 20 s.
+
+Persisted on the signal: `pip_value`, `pip_value_source`, `pip_value_units_per_qty`,
 `pip_value_conversion_rate`, `pip_value_quote_asset`, `pip_value_account_asset`,
 `pip_value_conversion_symbols`, `pip_value_conversion_quote_times`,
-`pip_value_conversion_quote_ages_seconds`. Payload-Werte unter diesen Namen werden
-immer überschrieben.
+`pip_value_conversion_quote_ages_seconds`. Payload values under these names are always
+overwritten.
 
-Folge der korrigierten Notional-Obergrenze: `RiskConfig` erlaubt
-`max_notional_per_trade <= 1` (keine Hebelwirkung). Auf einem 100-USD-Konto ist
-damit schon 0.01 Lot EURUSD (~1.100 USD Notional) über der Grenze, solche Einträge
-werden abgelehnt (unter `minVolume`).
+Consequence of the corrected notional cap: `RiskConfig` accepts
+`max_notional_per_trade <= 1` (no leverage; `risk/config.py:62-63`). On a 100-USD account
+0.01 lot EURUSD (~1,100 USD notional) is already above that cap, so such entries are
+refused (below `minVolume`).
+**Pending #240:** the maintainer decided on 2026-11-16 that leverage may be allowed up to
+the broker maximum per account and asset, with the entry size (risk at the stop) keeping
+the exposure sane. No PR implements it yet, so the 1× ceiling is a current validation
+limit and not a permanent design rule.
 
-## Einheitlicher Level-Resolver (#125)
+## Single Level Resolver (#125)
 
-`risk.live.resolve_live_levels()` ist die einzige Quelle für Entry, SL und TP
-eines Live-Signals. Der Daemon sized **und** submitted daraus, damit Menge und
-Broker-Levels nie auseinanderlaufen:
+`risk.live.resolve_live_levels()` is the only source for the entry, SL and TP of a live
+signal. The daemon sizes **and** submits from it, so quantity and broker levels can never
+drift apart:
 
-- **Entry:** Metadata `entry_price`, sonst `theoretical_price`. Der an den Adapter
-  übergebene Signal-`theoretical_price` wird auf diesen Entry gesetzt (cTrader
-  rechnet relative SL/TP-Distanzen davon).
-- **SL:** erster gesetzter Alias aus `stop_loss`, `sl_price`, `stop_price`,
-  `resolved_stop_loss`; fehlt er, setzt die RiskEngine den Fallback-Stop, und genau
-  dieser geht an den Broker. Ein Payload-`resolved_stop_loss` kann den gesizten
-  Stop nicht mehr überschreiben.
-- **TP:** erster gesetzter Alias aus `take_profit`, `tp_price`. Ein fehlender TP
-  ist kein Resolver-Fehler; ein fehlerhafter TP (nicht numerisch, Boolean, nicht
-  endlich, `<= 0`) wird abgelehnt. Die Submission-Regel C1 bleibt: ohne TP nur mit
-  explizitem `take_profit_policy="unbounded_exit_on_opposite_signal"`.
+- **Entry:** metadata `entry_price`, otherwise `theoretical_price`. The signal's
+  `theoretical_price` passed to the adapter is set to this entry (cTrader computes
+  relative SL/TP distances from it).
+- **SL:** first set alias of `stop_loss`, `sl_price`, `stop_price`,
+  `resolved_stop_loss`; if it is missing, the risk engine sets the fallback stop, and
+  exactly that one goes to the broker. A payload `resolved_stop_loss` can no longer
+  overwrite the sized stop.
+- **TP:** first set alias of `take_profit`, `tp_price`. A missing TP is not a resolver
+  error; a malformed TP (non-numeric, boolean, non-finite, `<= 0`) is refused. Submission
+  rule C1 stands: without a TP only with an explicit
+  `take_profit_policy="unbounded_exit_on_opposite_signal"`.
 
-## Entry-Deviation-Gate (#125)
+## Entry Deviation Gate (#125)
 
-Vor dem Market-Order-Submit vergleicht `prepare_order_with_risk()` den Entry mit
-dem aktuellen Broker-Quote (`adapter.get_quote()`): **Ask für Buys, Bid für Sells**.
+Before the market order is submitted, `prepare_order_with_risk()` compares the entry with
+the current broker quote (`adapter.get_quote()`): **ask for buys, bid for sells**.
 
 ```
 deviation = (entry - quote) / (entry - stop)
 ```
 
-als Bruchteil der SL-Distanz, mit Vorzeichen: positiv heißt **Richtung SL**,
-negativ **weg vom SL**. Abgelehnt wird (Regeln in dieser Prüfreihenfolge, der Name
-landet als `entry_gate_rejection_rule` im Log und in der Fehlermeldung). Zuerst
-muss der Quote **aktuell** sein: ein After-Hours-"Latest"-Quote kann Stunden alt
-sein, und kein Preis-Check darf auf ihm beruhen.
+as a fraction of the SL distance, with sign: positive means **toward the SL**, negative
+**away from the SL**. Refused (rules in this evaluation order; the name lands as
+`entry_gate_rejection_rule` in the log and in the error message). First the quote must be
+**current**: an after-hours "latest" quote can be hours old, and no price check may rest
+on it.
 
-| Regel | Bedingung |
-|-------|-----------|
-| `quote_time_missing` | Quote ohne Zeitstempel |
-| `quote_time_invalid` | Zeitstempel ist kein zeitzonen-behaftetes `datetime` |
-| `quote_time_in_future` | Zeitstempel mehr als 2 s (Clock-Skew-Toleranz, inklusiv) in der Zukunft |
-| `quote_stale` | Quote älter als `max_entry_quote_age_seconds` (genau am Limit ist erlaubt) |
-| `quote_at_or_beyond_stop_loss` | Buy: Ask `<=` SL. Sell: Bid `>=` SL |
-| `quote_at_or_beyond_take_profit` | nur mit TP. Buy: Ask `>=` TP. Sell: Bid `<=` TP |
-| `deviation_toward_stop_loss` | `deviation > max_entry_deviation_sl_fraction` (Setup evtl. ungültig) |
-| `deviation_away_from_stop_loss` | `-deviation > max_entry_deviation_sl_fraction` (Chasing: mit festem SL ist das echte Risiko größer als gesized) |
+| Rule | Condition |
+|------|-----------|
+| `quote_time_missing` | Quote without timestamp |
+| `quote_time_invalid` | Timestamp is not a timezone-aware `datetime` |
+| `quote_time_in_future` | Timestamp more than 2 s (clock-skew tolerance, inclusive) in the future |
+| `quote_stale` | Quote older than `max_entry_quote_age_seconds` (exactly at the limit is allowed) |
+| `quote_at_or_beyond_stop_loss` | Buy: ask `<=` SL. Sell: bid `>=` SL |
+| `quote_at_or_beyond_take_profit` | only with a TP. Buy: ask `>=` TP. Sell: bid `<=` TP |
+| `deviation_toward_stop_loss` | `deviation > max_entry_deviation_sl_fraction` (setup possibly invalid) |
+| `deviation_away_from_stop_loss` | `-deviation > max_entry_deviation_sl_fraction` (chasing: with a fixed SL the real risk is larger than what was sized) |
 
-Beide Grenzen kommen pro Deployment aus `settings`, nie aus Signal-Metadata, und
-werden von `risk.live.entry_gate_settings()` geprüft: beim Anlegen des Deployments
-(`shared.database.create_live_deployment` und der API-Endpoint, 400) und erneut
-beim Dispatch (fail-closed, vor dem Quote-Abruf):
+Both limits come per deployment from `settings`, never from signal metadata, and are
+validated by `risk.live.entry_gate_settings()`: when the deployment is created
+(`shared.database.create_live_deployment` and the API endpoint, 400) and again on dispatch
+(fail-closed, before the quote fetch):
 
-| Setting | Default | Gültig |
-|---------|---------|--------|
-| `max_entry_deviation_sl_fraction` | **0.25** | `0 <= x <= 1` (Bruchteil der SL-Distanz; `25` gemeint als 25 % ist ein Fehler; `0` lässt nur einen Quote exakt am Entry zu) |
-| `max_entry_quote_age_seconds` | **10** | endlich, `> 0` |
+| Setting | Default | Valid |
+|---------|---------|-------|
+| `max_entry_deviation_sl_fraction` | **0.25** | `0 <= x <= 1` (fraction of the SL distance; `25` meant as 25 % is an error; `0` allows only a quote exactly at the entry) |
+| `max_entry_quote_age_seconds` | **10** | finite, `> 0` |
 
-Der Quote-Abruf selbst ist im Daemon auf 20 s begrenzt
-(`ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS`); ein Timeout lehnt den Entry ab. Der Vergleich hat
-eine Toleranz von `1e-9`, damit Float-Rundung an der Grenze nicht entscheidet.
-Ohne TP (explizite Unbounded-Policy) entfällt nur die TP-Regel. Der Quote ist
-**nur Gate**, nie Sizing-Input: Menge und Levels bleiben die des Signals.
+The quote fetch itself is bounded in the daemon at 20 s
+(`ENTRY_QUOTE_FETCH_TIMEOUT_SECONDS`); a timeout refuses the entry. The comparison has a
+tolerance of `1e-9`, so float rounding at the boundary does not decide.
+Without a TP (explicit unbounded policy) only the TP rule drops out. The quote is a
+**gate only**, never a sizing input: quantity and levels stay those of the signal.
 
-Fail-closed: Adapter ohne Quote-Support, Fehler beim Abruf, Timeout, fehlende,
-nicht-positive, nicht-endliche, gekreuzte (Bid > Ask) oder nicht aktuelle Quotes lehnen den Entry
-ab und werden geloggt. Exit-only-Orders laufen nicht durch das Gate.
+Fail-closed: an adapter without quote support, a fetch error, a timeout, and missing,
+non-positive, non-finite, crossed (bid > ask) or non-current quotes refuse the entry and
+are logged. Exit-only orders do not go through the gate.
 
-Quellen: Alpaca `get_stock_latest_quote` (IEX-Feed, wie die Bars), Zeitstempel
-ist der des Quotes selbst, nie `now()`; cTrader abonniert kurz den Spot-Stream des
-Symbols, nimmt den ersten vollständigen Bid/Ask und meldet sich wieder ab (Timeout
-`quote_timeout_seconds`, Default 5 s). Zeitstempel ist die Broker-Zeit des
-Spot-Events, sonst die lokale Empfangszeit (`timestamp_source="receive"`; ein
-Spot-Event wird live gepusht, seine Empfangszeit begrenzt also sein Alter).
+Sources: Alpaca `get_stock_latest_quote` (IEX feed, like the bars), the timestamp is that
+of the quote itself, never `now()`; cTrader briefly subscribes to the symbol's spot
+stream, takes the first complete bid/ask and unsubscribes again (timeout
+`quote_timeout_seconds`, default 5 s). The timestamp is the broker time of the spot event,
+otherwise the local receive time (`timestamp_source="receive"`; a spot event is pushed
+live, so its receive time bounds its age).
 
-Persistiert wird auf der Signal-Metadata: `entry_quote_bid`, `entry_quote_ask`,
+Persisted on the signal metadata: `entry_quote_bid`, `entry_quote_ask`,
 `entry_quote_side`, `entry_quote_price`, `entry_quote_time` (ISO-8601),
 `entry_quote_time_source` (`broker` / `receive`), `entry_quote_age_seconds`,
-`max_entry_quote_age_seconds`, `entry_quote_source`, `entry_deviation_sl_fraction` (mit Vorzeichen),
-`entry_deviation_direction` (`toward_stop_loss` / `away_from_stop_loss` / `none`),
-`max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` bei
-akzeptierten Signalen; abgelehnte werden noch nicht persistiert, nur geloggt).
-Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt. Ein Schema für Quote-Snapshots (auch abgelehnter Signale) ist #134.
+`max_entry_quote_age_seconds`, `entry_quote_source`,
+`entry_deviation_sl_fraction` (with sign), `entry_deviation_direction`
+(`toward_stop_loss` / `away_from_stop_loss` / `none`),
+`max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` for accepted
+signals; refused ones are not persisted yet, only logged).
+On entries, payload values under these keys are overwritten; on exits (which run no gate)
+they are removed. A schema for quote snapshots (of refused signals too) is #134.
 
 ## Kill Switch (#300)
 
-Vor jedem Entry verweigert `prepare_order_with_risk()` den Order, wenn der Account
-gehalten ist (`live_runner.kill_switch.refuse_entry_while_halted`). Die Prüfung steht
-**nach** dem Exit-Zweig, blockiert also nie das Schließen einer Position, und
-**vor** jedem Broker-Zugriff: ein gehaltener Account kostet keinen Round-Trip.
+Before every entry `prepare_order_with_risk()` refuses the order when the account is
+halted (`live_runner.kill_switch.refuse_entry_while_halted`). The check sits **after** the
+exit branch, so it never blocks closing a position, and **before** any broker access: a
+halted account costs no round trip.
 
-Der Zustand liegt in `live_kill_switch` (eine Zeile pro Scope: `global` plus eine pro
-Live-Account) und wird bei jedem Entry und auf jedem Tick neu gelesen - kein
-Prozess-Cache, sonst würde ein Neustart den Halt aufheben. Der strengste Modus gewinnt
-(`entries` < `orders` < `flatten`); ein Account-Scope kann einen globalen Halt nie
-aufweichen.
+The state lives in `live_kill_switch` (one row per scope: `global` plus one per live
+account) and is re-read on every entry and on every tick - no process cache, or a restart
+would lift the halt. The strictest mode wins (`entries` < `orders` < `flatten`); an account
+scope can never soften a global halt.
 
-Fail closed heißt hier bewusst die billige Seite: ein unlesbarer Zustand oder ein nicht
-interpretierbarer Modus verwirft Entries und rührt den Broker nicht. Ein leerer Read ist
-nicht von "nichts ist gehalten" zu unterscheiden - die eine Antwort, die ein Kill Switch
-nie zufällig produzieren darf.
+Fail closed deliberately means the cheap side here: an unreadable state or a mode that
+cannot be interpreted refuses entries and does not touch the broker. An empty read cannot
+be told apart from "nothing is halted" - the one answer a kill switch must never produce
+by accident.
 
-Setzen, lift und lesen: `scripts/live_kill_switch.py` (CLI) und
-`/api/live/kill-switch` (Viewer); Betriebsdetails in `docs/live-deploy-runbook.md`.
+Set, lift and read: `scripts/live_kill_switch.py` (CLI) and `/api/live/kill-switch`
+(viewer); operating details in `docs/live-deploy-runbook.md`.
 
-## Commission-Vorzeichen (#184 Finding 14)
+## Commission Sign (#184 finding 14)
 
-`live_executions.commission` ist bei **allen** Brokern ein **nicht-negativer Kostenwert**
-(Gebühr = positiv, bekannt-null = `0.0`; #285). Net-PnL ist überall
-`gross - commission` (Viewer, `net_pnl`, Alpaca-CFEE-Backfill aus #143).
-Adapter normalisieren vor dem Speichern: cTrader meldet `ProtoOADeal.commission`
-als vorzeichenbehafteten Cashflow (Gebühr negativ) und wird über
-`base_adapter.commission_from_signed_cash_flow` negiert; Alpaca meldet keine Commission (bekannte Null `0.0` oder NULL, siehe #124) und
-backfillt CFEE als positive Kosten.
-Seit #285 ist der Wert schreibseitig abgesichert: `LiveExecution.commission` validiert
-über `shared.models.validate_commission_cost` (`mode="before"`; `bool` und numerische
-Strings werden ebenfalls abgelehnt) und wirft `ValidationError` bei negativem oder
-nicht-endlichem Wert; an der Persistierungsschwelle prüft
-`LiveExecutionModel.from_live_execution` erneut und wirft `ValueError`. Abgesichert ist
-nur dieser Funnel - ein direktes `LiveExecutionModel(...)` oder `session.add` validiert
-nicht. `commission_from_signed_cash_flow` ist die einzige zulässige Umrechnung der
-Vorzeichen-Konvention; ihr negatives Ergebnis (d. h. ein cTrader-Rebate) wird vom Adapter
-als `commission=NULL` („Gebühr unbekannt") plus ERROR-Log gespeichert, damit der Fill
-nicht verloren geht - die eigentliche Rebate-Darstellung ist eine offene
-Maintainer-Entscheidung. `apply_live_execution_commissions` (Alpaca-CFEE) lehnt negative
-Werte ebenfalls ab. Der Lese-Pfad (`LiveExecutionModel.to_live_execution`) baut ein
-`LiveExecution` und validiert damit erneut; er hat aktuell keine Produktions-Aufrufer -
-die Net-PnL-Reader konsumieren die rohen `live_executions`-Zeilen direkt.
-Bereits gespeicherte cTrader-Zeilen (vor dieser Änderung) trugen das rohe negative
-Vorzeichen; `init_db` wandelt sie einmalig per Migration
-(`_migrate_ctrader_commission_to_cost`, `abs` des gespeicherten Werts) in einen positiven
-Kostenwert um. Nur Konten mit Broker `ctrader` sind betroffen, NULL (unbekannt) und `0.0`
-bleiben. Die Migration ist in `schema_data_migrations` vermerkt und läuft genau einmal:
-seit #285 kann ohnehin kein negativer Wert mehr geschrieben werden, aber ein erneutes
-`abs` würde einen bereits konvertierten Wert unnötig anfassen. Ein vor der Änderung
-gespeicherter cTrader-Rebate (roh positiv)
-ist von einer neuen Gebühr nicht unterscheidbar und bleibt positiv.
-`commission_from_signed_cash_flow` lehnt nicht-endliche Werte mit `ValueError` ab
-(kein stilles `0.0`).
-Deploy-Hinweis: Daemon vor dem ersten Start des neuen Builds stoppen (siehe
-`docs/live-deploy-runbook.md`); ein alter Build, der nach dem Migrationsvermerk noch eine
-rohe negative Gebühr schreibt, wird nicht mehr umgewandelt.
+`live_executions.commission` is a **non-negative cost value** on **all** brokers (fee =
+positive, known-null = `0.0`; #285). Net P&L is
+`gross - commission` everywhere (viewer, `net_pnl`, Alpaca CFEE backfill from #143).
+Adapters normalize before storing: cTrader reports `ProtoOADeal.commission` as a signed
+cash flow (fee negative) and is negated via `base_adapter.commission_from_signed_cash_flow`; Alpaca reports
+no commission (known null `0.0` or NULL, see #124) and backfills CFEE as a positive cost.
+Since #285 the value is guarded on the write side: `LiveExecution.commission` validates
+through `shared.models.validate_commission_cost` (`mode="before"`; `bool` and numeric
+strings are refused too) and raises `ValidationError` on a negative or non-finite value;
+at the persistence threshold `LiveExecutionModel.from_live_execution` checks again and
+raises `ValueError`. Only this funnel is guarded - a direct `LiveExecutionModel(...)` or
+`session.add` does not validate. `commission_from_signed_cash_flow` is the only permitted
+conversion of the sign convention; its negative result (i.e. a cTrader rebate) is stored
+by the adapter as `commission=NULL` ("fee unknown") plus an ERROR log so the fill is not
+lost - how a rebate should actually be represented is an open maintainer decision.
+`apply_live_execution_commissions` (Alpaca CFEE) refuses negative values as well. The read
+path (`LiveExecutionModel.to_live_execution`) builds a `LiveExecution` and so validates
+again; it currently has no production callers - the net-P&L readers consume the raw
+`live_executions` rows directly.
+Already-stored cTrader rows (before this change) carried the raw negative sign; `init_db`
+converts them once via migration (`_migrate_ctrader_commission_to_cost`, `abs` of the
+stored value) into a positive cost. Only accounts with broker `ctrader` are affected;
+NULL (unknown) and `0.0` stay. The migration is recorded in `schema_data_migrations` and
+runs exactly once: since #285 no negative value can be written any more, but a second
+`abs` would needlessly touch an already converted value. A cTrader rebate stored before
+the change (raw positive) cannot be distinguished from a new fee and stays positive.
+`commission_from_signed_cash_flow` refuses non-finite values with `ValueError` (no silent
+`0.0`).
+Deployment note: stop the daemon before the first start of the new build (see
+`docs/live-deploy-runbook.md`); an old build that still writes a raw negative fee after
+the migration record is no longer converted.
 
-## Broker-Raster (Alpaca)
+## Broker Grid (Alpaca)
 
-Alpaca nimmt Bracket-/OTO-Entries nur in ganzen Stück und mit SL/TP auf dem
-Preisraster an (0.01 ab 1 USD, 0.0001 darunter). `AlpacaLiveAdapter` normalisiert
-jede Entry vor dem Persistieren: die risk-gesizte `qty` wird auf ganze Stück
-**abgerundet** (unter 1 Stück → abgelehnt), SL und TP werden **zum Entry hin**
-gerundet. Damit liegt das tatsächliche Risiko nie über dem gesizten Budget. Exit-only
-Orders (simple) bleiben unverändert.
+Alpaca accepts bracket/OTO entries only in whole shares and with SL/TP on the price grid
+(0.01 from 1 USD, 0.0001 below that). `AlpacaLiveAdapter` normalizes every entry before it
+is persisted: the risk-sized `qty` is rounded **down** to whole shares (below 1 share → refused),
+and SL and TP are rounded **toward the entry**. The actual risk therefore never exceeds the
+sized budget. Exit-only orders (simple) stay unchanged.
 
-Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
-Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,
-fehlende/ungültige SL/TP-Level, Extended-Hours-Brackets und Crypto-Symbole (Alpaca
-kennt keine Bracket-/OTO-Orders für Crypto).
+Refused before persistence in addition (ValueError, no signal row, no order): SL/TP on the
+wrong side of the entry, SL/TP within one tick of the entry, a missing/invalid SL/TP level,
+extended-hours brackets and crypto symbols (Alpaca has no bracket/OTO orders for crypto).
 
+Crypto consequence on main: every Alpaca crypto entry is refused before submission —
+`AlpacaLiveAdapter._normalize_bracket_entry` classifies the symbol and raises for
+`classify_alpaca_symbol(symbol) == "crypto"`
+(`live_runner/alpaca_adapter.py:1268-1273`). Even a plain (non-bracket) crypto entry as
+proposed in #241 would be refused today by the entry-deviation gate, because that gate
+needs a quote and `AlpacaLiveAdapter.get_quote` requests only
+`StockLatestQuoteRequest(feed="iex")` (`live_runner/alpaca_adapter.py:1751`) — there is no
+crypto quote path. Crypto bars themselves are available (`get_market_data` uses
+`CryptoBarsRequest`), so the blockers are order submission and the gate quote, not market
+data. **Pending #241** (BTC on Alpaca as a plain order plus a separately managed stop) has
+to change both.
 
-## Broker-Raster (cTrader)
+## Broker Grid (cTrader)
 
-cTrader bekommt SL/TP als relative Distanzen in 1/100000 des Preises. Das Raster ist
-`10 ** max(0, 5 - price_digits)` des Symbols. Beide Distanzen werden **zum Entry hin
-abgerundet** (`floor`), damit das tatsächliche Risiko nie über dem gesizten Budget
-liegt: ein Stop von 1,6 Ticks geht als 1 Tick raus. Ein Stop unter einem Tick wird
-abgelehnt (ValueError vor dem Senden), ein Take-Profit unter einem Tick wird als ein
-Tick gesendet (nie 0).
-## Implizite Divergenz
+cTrader receives SL/TP as relative distances in 1/100000 of the price. The grid is
+`10 ** max(0, 5 - price_digits)` of the symbol. Both distances are rounded **down toward
+the entry** (`floor`), so the actual risk never exceeds the sized budget: a stop of
+1.6 ticks goes out as 1 tick. A stop below one tick is refused (ValueError before
+sending); a take profit below one tick is sent as one tick (never 0).
 
-Der Unterschied bei `enforce_stop_direction` führt dazu, dass:
+## Implicit Divergence
 
-1. **Backtest**: Trades mit "falsch herum" gesetzten Stops werden akzeptiert und unterschiedlich gestartet
-2. **Live**: Solche Trades werden mit `position_size=0` abgelehnt
+The `enforce_stop_direction` difference means that:
 
-Das verhindert unrealistische P&L im Live-Trading, erzeugt aber Abweichungen zwischen Backtest und Realität.
+1. **Backtest**: a trade whose stop sits on the wrong side of the entry is accepted and
+   sized from the absolute `|entry − stop|` distance — the stop stays where the signal put
+   it. Nothing flips or drops it, so the backtest simulates a trade whose risk
+   characteristics differ from the signal's intent.
+2. **Live**: such a trade is refused with `position_size=0` (rejection reason
+   `bad_stop_direction`).
 
-## Empfehlung
+This prevents unrealistic P&L in live trading, but creates a divergence between backtest
+and reality: the same signal is traded in the backtest and refused live.
 
-Der aktuelle Ansatz ist beabsichtigt: Live-Trading soll strengere Validierung haben als Backtests. Die Dokumentation hierfür ist nun vorhanden.
+## Recommendation
+
+The current approach is intentional: live trading should validate more strictly than
+backtests. This documentation now exists for it.
 
 ## Tests
 
-Ein parametrierter Test in `tests/test_risk_consistency.py` sollte folgende Fälle abdecken:
+The three cases this file used to list as a wish list are pinned on main as follows:
 
-1. Identische Inputs → identische Outputs zwischen `RiskEngine.calculate_position_size`
-   und dem Live-Pfad `size_live_signal_for_submission`
-2. Strikter Stop-Direction Check wird im Live-Pfad erzwungen
-3. ATR-basierter Fallback wird in beiden Pfaden gleich berechnet
+| Case (former wish list) | Pinned by |
+|---|---|
+| Identical inputs → identical output between `RiskEngine.calculate_position_size` and the live path `size_live_signal_for_submission` | `tests/test_risk_consistency.py::test_risk_engine_and_live_size_match_for_valid_signals` (parametrized buy/sell) |
+| Both paths use the same `RiskConfig` defaults | `tests/test_risk_consistency.py::test_risk_engine_and_live_use_same_defaults` |
+| Strict stop-direction check enforced in the live path | `tests/test_risk_consistency.py::test_live_size_rejects_wrong_stop_direction`; the backtest side of the same divergence: `tests/test_risk_consistency.py::test_backtest_engine_allows_wrong_stop_direction` |
+| Fallback stop used for sizing (percent fallback, no ATR in metadata) | `tests/test_live_sizing_single_resolver.py::test_daemon_fallback_stop_is_submitted_and_used_for_sizing` and `tests/test_live_sizing_single_resolver.py::test_gate_measures_against_the_fallback_stop_sizing_used` |
+
+Not pinned as a backtest-vs-live parity case: an ATR-based fallback stop computed in both
+paths. The fallback itself is one shared `RiskEngine` function
+(`risk/engine.py::_fallback_stop_loss`: ATR × `default_sl_atr_multiplier`, otherwise
+`entry_price * fallback_stop_pct`) and is covered on the engine side by
+`tests/test_live_execution_safety.py::test_fallback_stop_is_below_entry_for_buys_and_above_for_sells`
+(ATR 1.5) and
+`tests/validation/test_risk_sizing.py::test_calculate_trade_risk_none_stop_fallback_uses_meta_atr`,
+but no test feeds a signal with ATR metadata through the live sizing entry point
+`size_live_signal_for_submission`.
