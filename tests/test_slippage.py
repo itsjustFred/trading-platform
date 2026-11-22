@@ -1435,6 +1435,9 @@ class TestViewerSlippageWiring:
             "timeframe": "1h",
             "capital": 100000.0,
             "auto_download": False,
+            # #361/#84: the replay adapter fails closed without an explicit
+            # fee declaration; these tests pin slippage, not fees.
+            "fees_zero": True,
             **slippage,
         }
         response = client.post("/api/backtests/run-signals", json=payload)

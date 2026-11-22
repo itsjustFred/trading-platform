@@ -1,5 +1,13 @@
 # Cross-Engine Backtest Contract
 
+> **Freeze notice (#318, 2026-11-21).** Per
+> `docs/adr/0001-native-single-strategy-engine.md`, `native` is the single
+> strategy engine going forward. `vectorbt`, `pynecore` and the LEAN *run*
+> path are frozen (bug fixes only, no new features) and scheduled for
+> removal; LEAN becomes import-only. This contract will shrink to native +
+> signal replay once they are gone. Selecting a frozen engine emits a
+> `DeprecationWarning`.
+
 Status: contract for the backtest engine adapters (`runner/engines/`), shared
 primitives in `runner/engines/contract.py`, conformance tests in
 `tests/test_engine_contract.py`.
@@ -274,7 +282,10 @@ Implementation:
   rule below denominates is **realized cash** — `initial_capital` plus the net
   PnL of closed trade legs. The mark-to-market equity that feeds the equity
   curve is never a sizing input: an open position's paper profit is not
-  spendable and an unrealized drawdown is not a realized loss. Native holds it
+  spendable and an unrealized drawdown is not a realized loss. The one
+  documented exception is the native free-margin leverage check (#347),
+  which reads mark-to-market equity and used margin by design (MT5-style
+  margin) — see `docs/sizing-semantics.md`. Native holds it
   in `TradeEngine._sizing_equity` (decision record D2,
   `docs/cleanup-16d1-money-path-semantics.md`); vectorbt accumulates it inline
   and records it as `trade.meta["risk_math"]["equity_at_entry"]`; pynecore walks
@@ -302,9 +313,19 @@ Implementation:
   vectorbt records the decision in `trade.meta["risk_math"]`
   (`sizing_mode`, `risk_target_usd`, `stop_distance`, `required_notional`,
   `final_notional`, `capped_by_max_position`, `capped_by_max_leverage`).
+  **Leverage-cap basis divergence (#347):** vectorbt holds at most one
+  position, so its free margin always equals equity and its
+  `equity × max_leverage` cap already *is* the MT5 rule. PyneCore keeps
+  overlapping trades (`open_ledger`) and caps
+  `equity × max_leverage − open_notional` on *realized* equity — a
+  different rule; it is frozen and slated for deletion (#318). The native
+  engine sizes against **free margin** — mark-to-market equity minus the
+  margin open positions already use — and clamps the quantity (floored to
+  `lot_step` when the leverage cap binds) instead of refusing; an unknown
+  broker maximum means 1x.
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
-  the result is still capped by `max_leverage` unless
+  the result is still capped by `max_leverage` (free margin, #347) unless
   `cap_fixed_risk_by_leverage = false`. With `lot_step > 0`, `max_lot` is
   floored to `lot_step` once, so an off-grid `max_lot` cannot yield an
   off-grid size; the documented exception is no grid at all — with
@@ -379,7 +400,10 @@ Implementation:
   runs skip the replay (identity). PyneCore performs the equivalent merged
   sizing pass after parsing all symbols: entries are processed in timestamp
   order against one realized-equity ledger, and the aggregate open notional
-  is capped by shared `max_leverage`.
+  is capped by shared `max_leverage`. **#347 exception:** a trade whose
+  quantity was clamped by the free-margin leverage rule is rescaled by
+  `shared_equity / equity_at_entry` like every other trade — an
+  approximation that is not flagged in the trade meta.
 
 ## 5. Execution-timing models (documented divergence)
 
@@ -452,6 +476,27 @@ specific stats (pynecore strategy stats) are merged **on top of** the
 canonical ones via `EngineStatsKeys.merge_over_canonical`; they may add keys
 but never remove or overwrite them — a same-named engine key loses the
 collision, so consumers always read the canonical value.
+
+**Sharpe/Sortino convention (#229).** The equity curve is resampled to one
+observation per calendar day (the production `attach_daily_equity` shape
+fills every day, flat days included), then the calendar-filled rows —
+weekend/holiday days the venue was closed, whose forward-filled equity can
+only produce a zero return — are dropped before the ratio is computed.
+Trading days come from the venue calendar resolved from the run's symbols,
+source and asset-class metadata (`shared.venue_calendar`); a symbol whose
+venue cannot be resolved falls back to the Monday–Friday grid. The ratio is
+annualised at 252 for equities/FX/CFDs and 365 for an all-crypto (24/7)
+book, published as `equity_return_periods_per_year`. Cross-platform parity
+(the MT5 audit matrix in `validation/statistics/cross_platform.py`) applies
+this identical formula to realized-exit equity curves rebuilt from BOTH
+trade lists — initial capital plus cumulative net PnL booked at each
+position's last exit, calendar-filled to the production daily shape —
+rather than comparing against MT5's printed
+Sharpe-Ratio, which uses MT5's own convention; the printed value is kept
+as `sharpe_ratio_reported`, and the platform artifact's mark-to-market
+Sharpe is kept as `sharpe_ratio_mtm`. Because both sides now run the same
+formula on the same curve shape, identical trade lists give identical
+parity Sharpes; the trade list remains the primary parity evidence.
 
 ## 7. `total_bars`
 

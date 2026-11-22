@@ -214,8 +214,8 @@ def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[
     reports it as an error.
 
     ``signal_source`` is on this list because the daemon gates Discord dispatch on the DB value
-    (``live_runner.daemon._active_discord_deployments_for_account`` and
-    ``_discord_active_account_ids``): a row that says ``discord`` on a deployment the YAML
+    (``live_runner.daemon._dispatchable_discord_deployments_for_account`` and
+    ``_discord_dispatchable_account_ids``): a row that says ``discord`` on a deployment the YAML
     configures as ``internal`` receives Discord signals, and the YAML-side check in
     ``live_runner.preflight._validate_deployments`` never sees the DB row.
     ``signal_source_id`` is on this list because it names the credential the daemon resolves that
