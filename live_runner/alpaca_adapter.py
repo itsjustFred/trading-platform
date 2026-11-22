@@ -2614,6 +2614,32 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     ids.add(order_id)
         return ids
 
+    async def _working_items_for_symbol(self, client: Any, symbol: str) -> list[Any]:
+        """Every working order and leg on ``symbol``, as objects not ids.
+
+        The same two listings ``_working_ids_for_symbol`` reconciles - the
+        ``status=open`` page (top-level orders, OCO legs) and the
+        ``status=all`` page of filled parents (a held bracket stop leg) -
+        kept as order objects so a caller can weigh side and class before
+        trusting a position read (#362). Terminal orders and items naming
+        another symbol are excluded; a leg with no symbol of its own counts
+        under its parent's.
+        """
+        orders = await self._list_open_orders(client, nested=True)
+        orders.extend(
+            await self._list_filled_parents_with_held_legs(client, {symbol})
+        )
+        items: list[Any] = []
+        for order in orders:
+            for item in (order, *_order_legs(order)):
+                item_symbol = _order_symbol(item) or _order_symbol(order)
+                if item_symbol != symbol:
+                    continue
+                if _order_status(item) in _TERMINAL_ORDER_STATUSES:
+                    continue
+                items.append(item)
+        return items
+
     def _load_exit_order_types(self) -> tuple[Any, Any, Any, Any, Any]:
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce
@@ -3083,6 +3109,15 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         exit is then refused, never half-done); a failure to re-place after a
         successful submit alerts CRITICAL and leaves the persisted marker for
         the next ``connect``.
+
+        The in-lock position re-read and ``submit_order`` are still two
+        separate broker calls: a fill landing between them (a working entry
+        filling, a leg racing a cancel) is the residual #362 race and cannot
+        be serialized away without broker-side atomicity. It is bounded on
+        purpose - refusals happen before any broker write, the persisted
+        marker replays on the next connect or terminal stream update, and
+        ``_maybe_clear_exit_marker_on_full_fill`` re-verifies the position
+        against the working book before spending that marker.
         """
         symbol = plan["symbol"]
         async with self._order_book_lock():
@@ -3214,6 +3249,62 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 )
             return order
 
+    async def _exit_marker_clear_is_safe(
+        self, client: Any, plan: Mapping[str, Any]
+    ) -> bool:
+        """Whether the ``exit_reprotection`` marker may be spent right now (#362).
+
+        A terminal+full exit order proves the exit finished, but the position
+        and the book it was planned against are stale the moment they were
+        read: a fill landing between the exit's fill and the marker clear -
+        a working entry adding shares, another exit still working - can
+        leave a position the spent marker was the only record for. The
+        marker is cleared only when the broker position still matches the
+        planned remainder AND no working order outside the just-placed
+        protection can still move it. Anything unreadable or unexpected
+        keeps the marker: the connect replay and the stream watchdog
+        re-verify later, which is the safe direction.
+        """
+        symbol = str(plan.get("symbol") or "")
+        side = str(plan.get("side") or "")
+        if side not in {"buy", "sell"}:
+            return False
+        expected = plan.get("reprotect_qty")
+        expected_qty = (
+            float(expected)
+            if isinstance(expected, (int, float))
+            and math.isfinite(float(expected))
+            else None
+        )
+        if expected_qty is None or expected_qty < 0:
+            return False
+        tolerance = self.position_qty_tolerance(symbol)
+        current = await self._symbol_position_qty(symbol)
+        if _is_flat(expected_qty):
+            # A full exit leaves nothing: any position still open - or one
+            # that reopened since - means the marker is not spent yet.
+            if current is not None:
+                return False
+        else:
+            if current is None:
+                return False
+            if (current > 0) != (side == "sell"):
+                return False
+            if abs(abs(current) - expected_qty) > tolerance:
+                return False
+        candidates = await self._exit_protection_candidates(client, symbol, side)
+        protected_ids = {
+            str(order_id)
+            for candidate in candidates
+            for order_id in (candidate.get("cancel_ids") or ())
+            if str(order_id or "")
+        }
+        for item in await self._working_items_for_symbol(client, symbol):
+            item_id = _control_order_id(_order_attr(item, "id"))
+            if item_id is None or item_id not in protected_ids:
+                return False
+        return True
+
     async def _maybe_clear_exit_marker_on_full_fill(
         self,
         client: Any,
@@ -3257,6 +3348,28 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             exit_qty
         ):
             return
+        # #362: terminal+full is proven, but a fill can still land between
+        # the exit's fill and this clear. Spend the marker only when the
+        # position still matches the planned remainder and no working order
+        # outside the just-placed protection can move it; anything else
+        # keeps the marker for the connect replay / stream watchdog.
+        try:
+            settled = await self._exit_marker_clear_is_safe(client, plan)
+        except Exception as exc:
+            logger.debug(
+                "Alpaca exit marker clear check failed for %s; the marker "
+                "stays pending: %r",
+                plan.get("symbol"),
+                exc,
+            )
+            return
+        if not settled:
+            logger.debug(
+                "Alpaca exit marker for %s stays pending: the position or "
+                "the working book changed since the exit filled",
+                plan.get("symbol"),
+            )
+            return
         await _clear_exit_reprotection_marker(
             signal_id,
             str(plan.get("symbol") or "?"),
@@ -3279,9 +3392,39 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 signal_id, symbol or "?", "unusable marker"
             )
             return
+        client = self._trading_client
         position_qty = await self._symbol_position_qty(symbol)
         if position_qty is None:
-            # Flat: the exit completed and nothing is left to protect.
+            # Flat: the exit completed and nothing is left to protect - but
+            # the position read and the marker clear are not atomic (#362):
+            # a fill landing in between (a working entry, a leg, another
+            # exit) can reopen the position with its marker already spent.
+            # Reconcile the book first: the marker is only cleared when no
+            # working order on the symbol can still move the position; with
+            # a flat book every working order counts, protection included -
+            # a reduce-side order that fires on a flat book opens the
+            # opposite position. Otherwise the marker stays pending and the
+            # next replay re-evaluates.
+            if client is None:
+                raise RuntimeError("Alpaca trading client is unavailable")
+            moving = await self._working_items_for_symbol(client, symbol)
+            if moving:
+                logger.info(
+                    "Alpaca exit re-protection marker for %s reads flat but "
+                    "%d order(s) still work on the symbol; keeping the "
+                    "marker - a fill landing before the clear could reopen "
+                    "the position",
+                    symbol,
+                    len(moving),
+                    extra={
+                        "data": {
+                            "signal_id": signal_id,
+                            "symbol": symbol,
+                            "working_orders": len(moving),
+                        }
+                    },
+                )
+                return
             await _clear_exit_reprotection_marker(
                 signal_id, symbol, "position flat"
             )
@@ -3300,7 +3443,6 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 signal_id, symbol, "side mismatch"
             )
             return
-        client = self._trading_client
         if client is None:
             raise RuntimeError("Alpaca trading client is unavailable")
         exit_terminal = await self._reprotect_exit_terminal(row, client)

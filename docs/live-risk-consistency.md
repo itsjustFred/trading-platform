@@ -247,7 +247,10 @@ neu (#145/#350) - ein persistierter `exit_reprotection`-Marker sichert die Wiede
 nach einem Crash, und Recovery füllt fehlende Stücke nach, sobald die Exit-Order terminal ist:
 der Watchdog läuft bei `connect()` und zusätzlich bei jedem terminalen Trade-Update der
 Exit-Order auf dem Stream (das Marker wird auch direkt nach dem Re-Place geräumt, wenn die
-Exit-Order bereits vollständig gefüllt ist).
+Exit-Order bereits vollständig gefüllt ist). Marker-Räumungen sind nie blind (#362): ein
+Flat-Read räumt nur bei ruhigem Orderbuch, und die Sofort-Räumung nach Voll-Fill prüft
+zuerst Position und offene Orders erneut - ein Fill, der zwischen Read und Räumen landet,
+findet den Marker noch vor und Replay wickelt ihn nach.
 
 Vor dem Persistieren werden zusätzlich abgelehnt (ValueError, kein Signal-Row, keine
 Order): SL/TP auf der falschen Seite des Entry, SL/TP innerhalb eines Ticks vom Entry,

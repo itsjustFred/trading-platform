@@ -2803,3 +2803,136 @@ def test_recover_exit_reprotections_clears_superseded_markers(monkeypatch) -> No
     asyncio.run(adapter._recover_exit_reprotections())
 
     assert superseded == [(adapter.account_id, "AAPL", "sig-new")]
+
+
+# ─── #362: position reads are reconciled against the working book ──────────
+
+
+def _flat_marker_row(**overrides) -> dict:
+    return _reprotect_row(
+        {"side": "sell", "stop_price": 190.0, "take_profit_price": 210.0},
+        broker_order_id="exit-1",
+        **overrides,
+    )
+
+
+def test_flat_marker_is_kept_while_an_order_can_still_move_the_position(
+    monkeypatch,
+) -> None:
+    """The position reads flat but a working entry can still fill.
+
+    The flat read and the marker clear are not atomic (#362): a fill landing
+    between them would reopen the position with its marker already spent.
+    The marker is only cleared once the working book is quiet.
+    """
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="entry-1",
+                symbol="AAPL",
+                side="buy",
+                order_type="limit",
+                qty=5.0,
+                limit_price=195.0,
+                status="new",
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(monkeypatch, [_flat_marker_row()])
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert client.submitted == []
+    assert cleared == []
+
+
+def test_flat_marker_is_cleared_once_the_book_is_quiet(monkeypatch) -> None:
+    """Flat position AND no working order on the symbol: the marker is spent."""
+    client = _FakeTradingClient(orders=[], positions=[])
+    adapter = _adapter(client)
+    _patch_pending_reprotections(monkeypatch, [_flat_marker_row()])
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert cleared == ["sig-1"]
+
+
+def test_full_fill_marker_is_kept_while_an_entry_can_still_fill(
+    monkeypatch,
+) -> None:
+    """The exit filled terminal+full, but a working entry can still grow
+    the position: the marker is the only record of the remainder's
+    protection, so it stays pending (#362)."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket()
+        + [
+            _FakeOrder(
+                id="entry-1",
+                symbol="AAPL",
+                side="buy",
+                order_type="limit",
+                qty=5.0,
+                limit_price=195.0,
+                status="new",
+            )
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    # The exit and the re-place went through; only the marker spend is held.
+    assert client.positions[0].qty == pytest.approx(6.0)
+    assert cleared == []
+
+
+def test_full_fill_marker_is_kept_when_the_position_outgrew_the_plan(
+    monkeypatch,
+) -> None:
+    """A fill already landed: the position no longer matches the planned
+    remainder, so terminal+full on the exit order is not enough to spend
+    the marker (#362)."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+    cleared = _patch_marker_clears(monkeypatch)
+    calls = {"n": 0}
+
+    async def _qty(symbol: str) -> float | None:
+        calls["n"] += 1
+        # Plan and the in-lock release check see 10; the marker-clear
+        # re-read sees the position an entry fill already grew to 16.
+        return 10.0 if calls["n"] <= 2 else 16.0
+
+    monkeypatch.setattr(adapter, "_symbol_position_qty", _qty)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    assert cleared == []
+
+
+def test_full_fill_marker_is_cleared_when_position_and_book_settle(
+    monkeypatch,
+) -> None:
+    """Terminal+full exit, remainder matches the plan, book quiet: spent."""
+    client = _FakeTradingClient(
+        orders=_filled_bracket(),
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+    adapter = _adapter(client)
+    _patched_signal_store(monkeypatch, [])
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter.submit_order(_partial_signal(4.0), qty=4.0))
+
+    assert len(cleared) == 1
