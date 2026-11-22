@@ -436,6 +436,20 @@ class BaseLiveAdapter(ABC):
         """
         return None
 
+    async def get_used_margin(self) -> float | None:
+        """Margin the broker already holds against open positions, account ccy.
+
+        The pre-submit leverage ceiling is MT5-style free margin — account
+        equity minus this figure, times the maximum leverage (#359, the live
+        half of the #347 backtest rule). ``None`` means it cannot be
+        determined; callers must treat that as unverifiable and refuse the
+        order (fail closed), never guess a lower figure — an understated used
+        margin would overstate free margin.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report used margin"
+        )
+
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
     # Status semantics built on top of these:

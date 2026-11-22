@@ -90,11 +90,13 @@ class _Broker(BaseLiveAdapter):
     pip_value: float = 1.0
     equity: float = 100_000.0
     max_leverage: float | None = None
+    used_margin: float | None = 0.0
     qty_step: float | None = None
     quote_error: Exception | None = None
     pip_error: Exception | None = None
     balance_error: Exception | None = None
     leverage_error: Exception | None = None
+    margin_error: Exception | None = None
     submitted: list[tuple[LiveSignal, float | None]] = field(default_factory=list)
 
     async def connect(self) -> None:
@@ -133,6 +135,11 @@ class _Broker(BaseLiveAdapter):
         if self.leverage_error is not None:
             raise self.leverage_error
         return self.max_leverage
+
+    async def get_used_margin(self) -> float | None:
+        if self.margin_error is not None:
+            raise self.margin_error
+        return self.used_margin
 
     def exit_qty_step(self, symbol: str) -> float:
         # Both real adapters name a step; 1e-9 is Alpaca's, effectively no floor.
@@ -508,6 +515,129 @@ def test_leverage_clamp_writes_an_audit_record(caplog):
     assert records[0]["succeeded"]
     assert records[0]["detail"]["qty_before_clamp"] == pytest.approx(247_000.0)
     assert records[0]["detail"]["qty_after_clamp"] == pytest.approx(200_000.0)
+
+
+# ── free-margin leverage ceiling (#359, the live half of #347) ────────────────
+
+
+def test_used_margin_reduces_the_leverage_ceiling():
+    # #347 rule: the ceiling is free margin (equity - used margin) times the
+    # broker maximum, not equity times the maximum. 100k equity, 60k used,
+    # 200x -> free margin 40k -> ceiling 8M -> 80_000 qty at price 100.
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0, used_margin=60_000.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    qty = _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=247_000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    assert qty == pytest.approx(80_000.0)
+
+
+def test_free_margin_clamp_writes_margin_figures_to_the_audit_record():
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0, used_margin=60_000.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=247_000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    records = [
+        row
+        for row in list_live_control_audit(limit=50)
+        if row["action"] == "pre_submit_leverage_clamp"
+        and row["target_id"] == str(deployment.id)
+    ]
+    assert records, "the clamp must leave an audit record"
+    detail = records[0]["detail"]
+    assert detail["used_margin"] == pytest.approx(60_000.0)
+    assert detail["free_margin"] == pytest.approx(40_000.0)
+    assert detail["leverage_ceiling"] == pytest.approx(8_000_000.0)
+
+
+def test_exhausted_free_margin_refuses_instead_of_clamping_to_zero():
+    # Used margin consumes the whole equity: free margin is zero, so no
+    # compliant quantity exists. Live refuses (the backtest skips the order)
+    # because there is no submission to skip — a refusal releases the lease.
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0, used_margin=100_000.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    with pytest.raises(PreSubmitCapViolation, match="broker_leverage_cap"):
+        _run(
+            enforce_pre_submit_caps(
+                broker,
+                deployment,
+                signal,
+                qty=247_000.0,
+                risk_config=_loose_risk_config(),
+            )
+        )
+
+
+def test_negative_free_margin_refuses():
+    # An over-margined account (used margin above equity) must not produce a
+    # negative ceiling that a comparison could slip past.
+    deployment = _deployment()
+    broker = _Broker(max_leverage=200.0, used_margin=120_000.0)
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    with pytest.raises(PreSubmitCapViolation, match="broker_leverage_cap"):
+        _run(
+            enforce_pre_submit_caps(
+                broker,
+                deployment,
+                signal,
+                qty=247_000.0,
+                risk_config=_loose_risk_config(),
+            )
+        )
+
+
+def test_unknown_used_margin_refuses_fail_closed():
+    # Unlike an unknown leverage (degrades to 1x), an unknown used margin
+    # cannot be clamped against safely: it would overstate free margin.
+    deployment = _deployment()
+    for broker in (
+        _Broker(used_margin=None),
+        _Broker(used_margin=-1.0),
+        _Broker(margin_error=RuntimeError("margin endpoint down")),
+    ):
+        with pytest.raises(PreSubmitCapViolation, match="broker_facts_unavailable"):
+            _run(
+                enforce_pre_submit_caps(
+                    broker,
+                    deployment,
+                    _signal(deployment),
+                    qty=200.0,
+                    risk_config=_risk_config(),
+                )
+            )
+
+
+def test_adapter_without_used_margin_refuses_fail_closed():
+    # An adapter that cannot report margin at all must not pass the
+    # free-margin check against a guessed ceiling.
+    class _NoMargin(_Broker):
+        get_used_margin = None  # type: ignore[assignment]
+
+    deployment = _deployment()
+    broker = _NoMargin()
+    with pytest.raises(PreSubmitCapViolation, match="broker_facts_unavailable"):
+        _run(
+            enforce_pre_submit_caps(
+                broker, deployment, _signal(deployment), qty=200.0,
+                risk_config=_risk_config(),
+            )
+        )
 
 
 # ── fail closed ───────────────────────────────────────────────────────────────

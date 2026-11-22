@@ -35,6 +35,21 @@ backstop against a broken size, not the platform's notional policy —
 sizing still caps order notional at ``max_notional_per_trade`` (default
 0.20, ``RiskConfig`` refuses values > 1) until #240 decides otherwise.
 
+The leverage ceiling is MT5-style **free margin** — the same rule the
+native engine applies since #355 (#359, the live half of #347): free
+margin is account equity minus the margin the broker already holds
+against open positions (``adapter.get_used_margin`` — cTrader sums the
+broker-reported ``ProtoOAPosition.usedMargin``, Alpaca reads
+``account.initial_margin``), and the notional ceiling is
+``free_margin * max_leverage``. Used margin that cannot be determined
+fails closed like every other broker fact: an understated figure would
+overstate free margin, so the order is refused rather than clamped
+against a guessed ceiling. When free margin is exhausted the clamp
+leaves less than one quantity step and the order is refused
+(``broker_leverage_cap``) — live has no "skip the order" the way the
+backtest engine does, so exhaustion surfaces as a refusal, not a silent
+drop.
+
 Any failure to verify (no quote, a stale or missing quote time, no pip value,
 unreadable balance, missing stop, invalid cap config) refuses the order.
 
@@ -346,6 +361,37 @@ async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | N
     return leverage
 
 
+async def _safe_used_margin(adapter: BaseLiveAdapter) -> float | None:
+    """The broker's used margin, or ``None`` when it cannot be determined.
+
+    Unlike the leverage lookup — where ``None`` degrades to a conservative
+    1x ceiling — ``None`` here refuses the order: an understated used margin
+    would overstate free margin and lift the leverage ceiling, the unsafe
+    direction. A missing ``get_used_margin`` (an adapter that cannot report
+    margin) lands here too and fails closed the same way.
+    """
+    try:
+        method = getattr(adapter, "get_used_margin", None)
+        if not callable(method):
+            return None
+        value = await method()
+    except Exception as exc:
+        logger.debug(
+            "Used-margin lookup raised; treating it as unknown (refuse)",
+            extra={"data": {"error": repr(exc)}},
+        )
+        return None
+    if value is None:
+        return None
+    try:
+        margin = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(margin) or margin < 0:
+        return None
+    return margin
+
+
 def _adapter_qty_step(adapter: BaseLiveAdapter, symbol: str) -> float | None:
     """The instrument's quantity step in qty units, when the adapter names one.
 
@@ -378,9 +424,10 @@ async def enforce_pre_submit_caps(
     ``risk_config`` is the deployment's :class:`RiskConfig` — the caller
     resolves it so this module never re-reads sizing policy.
 
-    Returns ``qty`` unchanged, or a smaller quantity clamped to the broker's
-    maximum leverage (#240: clamp, never refuse, when a correctly sized order
-    would need more leverage than the broker allows). Raises
+    Returns ``qty`` unchanged, or a smaller quantity clamped to what free
+    margin affords at the broker's maximum leverage (#240/#359: clamp,
+    never refuse, when a correctly sized order would need more leverage
+    than the broker allows). Raises
     :class:`PreSubmitCapViolation` (a ``ValueError``) on any refusal or any
     failure to verify. Exit orders return ``qty`` immediately.
     """
@@ -454,20 +501,32 @@ async def enforce_pre_submit_caps(
     pip_task = asyncio.create_task(adapter.get_pip_value(signal.symbol))
     balance_task = asyncio.create_task(adapter.get_balance())
     leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
+    margin_task = asyncio.create_task(_safe_used_margin(adapter))
     try:
-        quote, pip_value, (_balance, equity), max_leverage = await asyncio.wait_for(
-            asyncio.gather(quote_task, pip_task, balance_task, leverage_task),
-            timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+        quote, pip_value, (_balance, equity), max_leverage, used_margin = (
+            await asyncio.wait_for(
+                asyncio.gather(
+                    quote_task, pip_task, balance_task, leverage_task, margin_task
+                ),
+                timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+            )
         )
     except Exception as exc:
         # gather propagates the first failure but leaves the sibling reads
         # running; cancel them so a hung broker call cannot outlive the
         # refusal (wait_for already cancelled them on a timeout). The
-        # leverage read never raises — _safe_max_leverage degrades to None.
-        for task in (quote_task, pip_task, balance_task, leverage_task):
+        # leverage and margin reads never raise — they degrade to None.
+        for task in (
+            quote_task,
+            pip_task,
+            balance_task,
+            leverage_task,
+            margin_task,
+        ):
             task.cancel()
         await asyncio.gather(
-            quote_task, pip_task, balance_task, leverage_task, return_exceptions=True
+            quote_task, pip_task, balance_task, leverage_task, margin_task,
+            return_exceptions=True,
         )
         await _fail(
             "broker_facts_unavailable",
@@ -490,10 +549,24 @@ async def enforce_pre_submit_caps(
         await _fail(
             "broker_facts_unusable", f"account equity is not finite ({equity!r})"
         )
+    if used_margin is None:
+        # Fail closed like every other broker fact (#359): an understated
+        # used margin would overstate free margin and lift the leverage
+        # ceiling — the unsafe direction.
+        await _fail(
+            "broker_facts_unavailable",
+            "the broker's used margin could not be determined, so the "
+            "free-margin leverage ceiling cannot be verified",
+        )
 
     # The broker's maximum leverage for the account and asset (#240); an
     # undeterminable maximum fails closed to 1x — never a guessed ceiling.
     broker_leverage = max_leverage if max_leverage is not None else 1.0
+    # #359/#347: MT5-style free margin — equity minus the margin the broker
+    # already holds against open positions. May be negative on an
+    # over-margined account; the ceiling below then clamps to nothing and
+    # the order is refused, matching the backtest rule.
+    free_margin = equity_value - used_margin
     figures: dict[str, Any] = {
         **base_figures,
         "qty": qty_value,
@@ -504,6 +577,8 @@ async def enforce_pre_submit_caps(
         "quote_price": quote_price,
         "pip_value": pip,
         "account_equity": equity_value,
+        "used_margin": used_margin,
+        "free_margin": free_margin,
         "broker_max_leverage": max_leverage,
         "effective_max_leverage": broker_leverage,
     }
@@ -560,10 +635,12 @@ async def enforce_pre_submit_caps(
 
     # The platform imposes no notional ceiling below the broker maximum
     # (#240): an order that would need more leverage than the broker allows
-    # is clamped down to the broker maximum — floored to the instrument's
-    # quantity step — never refused. The remaining caps then run against the
+    # is clamped down to what FREE MARGIN affords — equity minus used
+    # margin, times the broker maximum (#359, the live half of the #347
+    # backtest rule) — floored to the instrument's quantity step, never
+    # refused for leverage alone. The remaining caps then run against the
     # clamped size.
-    leverage_ceiling = broker_leverage * equity_value
+    leverage_ceiling = broker_leverage * free_margin
     if notional > leverage_ceiling:
         max_qty_leverage = leverage_ceiling / (quote_price * pip)
         step = _adapter_qty_step(adapter, signal.symbol)
@@ -578,9 +655,9 @@ async def enforce_pre_submit_caps(
         if not math.isfinite(clamped_qty) or clamped_qty <= 0:
             await _fail(
                 "broker_leverage_cap",
-                f"the broker's maximum leverage {broker_leverage!r} allows less "
-                "than one quantity step of this order; nothing compliant can "
-                "be submitted",
+                f"free margin {free_margin!r} at leverage {broker_leverage!r} "
+                "allows less than one quantity step of this order; nothing "
+                "compliant can be submitted",
                 {
                     **figures,
                     "notional": notional,
@@ -600,6 +677,8 @@ async def enforce_pre_submit_caps(
             "notional_before_clamp": notional,
             "broker_max_leverage": max_leverage,
             "effective_max_leverage": broker_leverage,
+            "used_margin": used_margin,
+            "free_margin": free_margin,
             "leverage_ceiling": leverage_ceiling,
             "qty_step": step,
             # The broker maximum is an upper bound (cTrader's tiered leverage

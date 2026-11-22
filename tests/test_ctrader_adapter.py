@@ -1904,3 +1904,71 @@ def test_disconnect_clears_symbol_leverage_ids() -> None:
     adapter._symbol_leverage_ids["EURUSD"] = 42
     asyncio.run(adapter.disconnect())
     assert adapter._symbol_leverage_ids == {}
+
+
+# ── get_used_margin (#359) ────────────────────────────────────────────────────
+
+
+def _margin_adapter() -> CTraderLiveAdapter:
+    """A connected adapter with the position-status enum bound for the sum."""
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAPositionStatus = SimpleNamespace(POSITION_STATUS_OPEN=1)
+    return adapter
+
+
+def _stub_reconcile(adapter: CTraderLiveAdapter, positions: list[object]) -> None:
+    async def _fake_reconcile():
+        return SimpleNamespace(position=positions)
+
+    adapter._reconcile_state = _fake_reconcile
+
+
+def test_get_used_margin_sums_open_positions_in_account_currency() -> None:
+    adapter = _margin_adapter()
+    _stub_reconcile(
+        adapter,
+        [
+            # usedMargin is scaled by the position's own moneyDigits.
+            SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits=2),
+            SimpleNamespace(positionStatus=1, usedMargin=250_000, moneyDigits=2),
+            # Not OPEN: its margin is not held.
+            SimpleNamespace(positionStatus=2, usedMargin=9_999_999, moneyDigits=2),
+        ],
+    )
+    assert asyncio.run(adapter.get_used_margin()) == pytest.approx(12_500.0)
+
+
+def test_get_used_margin_returns_zero_with_no_open_positions() -> None:
+    adapter = _margin_adapter()
+    _stub_reconcile(adapter, [])
+    assert asyncio.run(adapter.get_used_margin()) == 0.0
+
+
+def test_get_used_margin_returns_none_when_a_position_margin_is_unreadable() -> None:
+    # A partial sum would understate used margin and overstate free margin.
+    adapter = _margin_adapter()
+    _stub_reconcile(
+        adapter,
+        [
+            SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits=2),
+            SimpleNamespace(positionStatus=1, usedMargin=None, moneyDigits=2),
+        ],
+    )
+    assert asyncio.run(adapter.get_used_margin()) is None
+
+
+def test_get_used_margin_returns_none_when_reconcile_fails() -> None:
+    adapter = _margin_adapter()
+
+    async def _fake_reconcile():
+        raise RuntimeError("reconcile failed")
+
+    adapter._reconcile_state = _fake_reconcile
+    assert asyncio.run(adapter.get_used_margin()) is None

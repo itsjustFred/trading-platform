@@ -3129,6 +3129,46 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             equity = _to_float(getattr(trader, "equity", balance)) / scale
         return balance, equity
 
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, summed in account currency (#359).
+
+        Sums the broker-reported ``ProtoOAPosition.usedMargin`` of every OPEN
+        position — cTrader has already applied each position's own leverage
+        (account leverage clamped by the symbol's volume tier), so no leverage
+        lookup is needed here. ``None`` when the reconcile or any open
+        position's margin figure is unreadable: a partial sum would understate
+        used margin and overstate the free margin the pre-submit caps judge
+        the order against.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            reconcile_res = await self._reconcile_state()
+            total = 0.0
+            for position in getattr(reconcile_res, "position", []) or []:
+                status = int(getattr(position, "positionStatus", 0) or 0)
+                if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                    continue
+                used = _optional_float(getattr(position, "usedMargin", None))
+                digits = getattr(position, "moneyDigits", None)
+                if used is None or used < 0 or digits is None:
+                    return None
+                try:
+                    digits_int = int(digits)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if digits_int < 0:
+                    return None
+                total += used / money_scale(digits_int)
+            return total
+        except Exception as exc:
+            logger.warning(
+                "cTrader used-margin lookup failed; treating it as unknown",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+
     @property
     def supports_cancel_orders(self) -> bool:
         return True

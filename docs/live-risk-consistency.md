@@ -224,7 +224,8 @@ Daemon-Pfad. `live_runner/test_signal_trigger.py:86` ist ein weiterer direkter
 Submit. Alles Operator-Werkzeuge für manuelle Tests, kein Daemon-Pfad; ein
 Fehler dort hat damit kein Cap-Backstop.
 **Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value,
-Balance und die maximale Hebel des Brokers für Account und Asset
+Balance, die benutzte Marge (`get_used_margin`, #359) und die maximale
+Hebel des Brokers für Account und Asset
 (`get_max_leverage`; cTrader über `ProtoOASymbol.leverageId` +
 `GetDynamicLeverageByID` — der Tier-Wert steht in Cents wie
 `leverageInCents`, 1:200 = 20000, und wird vor der Nutzung durch 100
@@ -258,14 +259,29 @@ Die Caps fügen **keine eigene Notional-Obergrenze unter dem Broker-Maximum
 hinzu** — die einzige Notional-Obergrenze dieses Moduls ist die maximale
 Hebel des Brokers für Account und Asset (#240, Entscheidung auf #329):
 braucht ein korrekt gesizter Order mehr Hebel als der Broker
-erlaubt, wird die Menge **auf das Broker-Maximum geklemmt** (abgerundet auf
+erlaubt, wird die Menge **auf die freie Marge geklemmt** (abgerundet auf
 den Lot-Step) statt abgelehnt — verbleibende Caps laufen gegen die geklemmte
-Größe. Eine unbekannte Broker-Hebel failt closed auf 1x. Die Klemme wird
+Größe. Die freie Marge ist MT5-Stil und entspricht der Backtest-Regel aus
+#355 (#359, die Live-Hälfte von #347): `equity − used_margin`, also das
+Account-Equity minus der Marge, die der Broker bereits für offene Positionen
+hält (`adapter.get_used_margin` — cTrader summiert das broker-gemeldete
+`ProtoOAPosition.usedMargin` über alle offenen Positionen, Alpaca liest
+`account.initial_margin` und fällt ohne ihn auf Σ |Market Value| /
+Effektiv-Hebel zurück); die Notional-Obergrenze ist
+`freie_Marge × Broker-Maximum`. Eine unbekannte Broker-Hebel failt closed
+auf 1x; eine **unbekannte Used Margin lehnt ab** (`broker_facts_unavailable`)
+— anders als bei der Hebel ist „niedriger ansetzen“ hier die unsichere
+Richtung, weil eine zu kleine Used Margin die freie Marge überschätzt. Ist
+die freie Marge aufgebraucht, bleibt nach der Klemme weniger als ein
+Lot-Step und der Order wird abgelehnt (`broker_leverage_cap`) — live gibt
+es kein stilles Überspringen wie im Backtest, die Verweigerung gibt das
+Submission-Lease frei. Die Klemme wird
 mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert (das Feld
 `broker_max_leverage_is_upper_bound` markiert die Obergrenzen-Eigenschaft;
+die Audit-Daten tragen `used_margin`, `free_margin` und `leverage_ceiling`;
 folgt auf die Klemme eine Verweigerung durch einen anderen Cap, entstehen
-bewusst zwei Audit-Zeilen — Klemme und Verweigerung); lässt das
-Broker-Maximum nicht einmal einen Lot-Step zu, wird abgelehnt
+bewusst zwei Audit-Zeilen — Klemme und Verweigerung); lässt die
+freie Marge nicht einmal einen Lot-Step zu, wird abgelehnt
 (`broker_leverage_cap`). Die Klemme ist damit ein Backstop gegen eine
 kaputte Größe, keine Platform-Notional-Policy: das Sizing deckelt den
 Notional pro Order weiterhin bei `max_notional_per_trade` (Default 0.20;
@@ -281,7 +297,7 @@ ab. Die Caps sind damit kein zweites Sizing, sondern ein hartes Backstop
 gegen kaputte Größen auf derselben Basis.
 
 Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
-Cap-Settings, Quote/Pip-Value/Balance nicht abrufbar oder unbrauchbar,
+Cap-Settings, Quote/Pip-Value/Balance/Used-Margin nicht abrufbar oder unbrauchbar,
 insbesondere eine Quote ohne verwertbare oder veraltete Broker-Zeit
 (`stale_quote`, gleiche Regel wie das Entry-Gate, `max_entry_quote_age_seconds`)
 (`broker_facts_unavailable` / `broker_facts_unusable` / `stale_quote` /
