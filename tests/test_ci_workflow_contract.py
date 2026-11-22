@@ -49,9 +49,21 @@ def test_ci_cancels_only_superseded_pr_runs() -> None:
     workflow = _workflow("ci.yml")
     concurrency = workflow.get("concurrency")
     assert isinstance(concurrency, dict), "ci.yml must declare a concurrency group"
-    assert "pull_request" in concurrency["group"], concurrency["group"]
-    cancel = concurrency["cancel-in-progress"]
-    assert "pull_request" in str(cancel), (
+
+    # GitHub keeps one running and one *pending* run per group: a shared
+    # non-PR group would let a newer main push silently drop a queued one, so
+    # the group must key PR runs on the PR number and give every other event
+    # a group unique to the run itself.
+    group = str(concurrency["group"])
+    assert "github.event.pull_request.number" in group, group
+    assert "github.run_id" in group, (
+        "non-PR events must group on the run id: keying them on the ref would "
+        "let one queued main push cancel another's pending run"
+    )
+    assert "github.ref" not in group, group
+
+    cancel = str(concurrency["cancel-in-progress"])
+    assert "pull_request" in cancel, (
         "cancel-in-progress must be scoped to PR runs: cancelling a queued "
         "main push would leave a merged commit with no verdict"
     )
@@ -62,8 +74,12 @@ def test_ci_uses_setup_uv_with_cache() -> None:
     uses = _uses_steps(workflow)
     setup_uv = [u for u in uses if u.startswith("astral-sh/setup-uv@")]
     assert setup_uv, "ci.yml must install uv via astral-sh/setup-uv"
-    # The action is pinned to a full release tag, not a floating major.
-    assert setup_uv[0].count("@") == 1 and "/" not in setup_uv[0].split("@", 1)[1]
+    # Sonar S7637: third-party actions are pinned to a full commit SHA, with
+    # the human-readable tag kept as a trailing comment in the workflow.
+    ref = setup_uv[0].split("@", 1)[1]
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+        f"setup-uv must be pinned to a full commit SHA, got {ref!r}"
+    )
 
     steps = [
         step
@@ -71,9 +87,11 @@ def test_ci_uses_setup_uv_with_cache() -> None:
         for step in job.get("steps") or []
         if step.get("uses", "").startswith("astral-sh/setup-uv@")
     ]
-    assert steps and steps[0].get("with", {}).get("enable-cache") is True, (
-        "the uv cache must be enabled explicitly: the default 'auto' silently "
-        "disables it on some event types"
+    assert steps, "ci.yml must configure the setup-uv step"
+    enable_cache = steps[0].get("with", {}).get("enable-cache")
+    assert enable_cache is True, (
+        "the uv cache must be enabled explicitly so `uv sync --frozen` does "
+        "not re-fetch the environment on every run"
     )
     # The old pip install must not come back next to the action.
     assert not any("pip install" in c and "uv==" in c for c in _run_commands(workflow))

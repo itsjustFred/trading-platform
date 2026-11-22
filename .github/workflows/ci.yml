@@ -10,10 +10,11 @@ permissions:
   contents: read
 
 concurrency:
-  # A push to a PR supersedes the run still in flight for that PR; main
-  # pushes and manual dispatches queue instead of cancelling, so every merged
-  # commit keeps its verdict (#297).
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # A push to a PR supersedes the run still in flight for that PR; every
+  # non-PR event gets a group keyed on its own run id, because GitHub keeps
+  # only one pending run per group and would otherwise drop a queued main
+  # push or dispatch. Every merged commit keeps its verdict (#297).
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -32,7 +33,7 @@ jobs:
           python-version: "3.12"
       # Same uv pin the pip install carried; setup-uv also restores the uv
       # cache, which is where `uv sync --frozen` spends its time (#297).
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.10.4"
           enable-cache: true
