@@ -243,8 +243,10 @@ def _daily_net_series(
 def _annualize_factor(trades: List[Trade]) -> float:
     """Daily annualization factor (#84).
 
-    Annualization contract shared with ``runner/stats.py``: daily-resampled
-    observations annualized with sqrt(252). The old trades-per-year factor
+    This module's convention: daily-resampled observations annualized with
+    sqrt(252). ``runner/stats.py`` no longer shares it — since #229 it
+    annualizes at the measured observation density (~365 for the
+    calendar-filled production curves). The old trades-per-year factor
     (A-L4) made the same strategy's Sharpe depend on trade count instead of
     calendar time.
     """
@@ -333,8 +335,9 @@ def compute_trade_statistics(
         realized_pnls, initial_capital=initial_capital
     )
 
-    # #84: ratio metrics run on the daily-resampled net series with the
-    # shared sqrt(252) annualization (same contract as runner/stats.py).
+    # #84: ratio metrics run on the daily-resampled net series with this
+    # module's sqrt(252) annualization (runner/stats.py uses measured
+    # density since #229 — the conventions intentionally differ).
     daily_series = _daily_net_series(trades, initial_capital=initial_capital)
     annualize = _annualize_factor(trades)
     ratio_observations = (

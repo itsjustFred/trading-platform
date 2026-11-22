@@ -157,8 +157,17 @@ def compute_stats(
             backtest_end=backtest_end,
         )
         daily_return_series = _daily_returns_series_from_equity_curve(equity_curve)
+        first_observation = None
+        try:
+            first_observation = pd.to_datetime(
+                equity_curve[0].time, utc=True, format="ISO8601"
+            )
+        except Exception:
+            first_observation = None
         periods_per_year = (
-            _return_periods_per_year(daily_return_series)
+            _return_periods_per_year(
+                daily_return_series, first_observation=first_observation
+            )
             if daily_return_series is not None
             else None
         )
@@ -309,6 +318,25 @@ def compute_stats(
     # ratio (≈ -1.0): there the final equity is known.
     total_pnl = _finite_or_undefined(total_pnl, "total_pnl", undefined_metrics)
     total_return = _finite_or_undefined(total_return, "total_return", undefined_metrics)
+
+    # A metric named in `undefined_metrics` must publish null, not the 0.0
+    # its local variable initialised to: ranking and the cross-platform
+    # parity check read the value, and a fabricated 0.0 is a measurement
+    # they cannot distinguish from an honest zero (#349 review).
+    # p_value keeps its pinned 1.0 default: "no evidence against the null"
+    # is a conservative publication, unlike a fabricated 0.0 ratio.
+    if "sharpe_ratio" in undefined_metrics:
+        sharpe_ratio = None
+    if "sortino_ratio" in undefined_metrics:
+        sortino_ratio = None
+    if "psr" in undefined_metrics:
+        psr = None
+    if "cagr" in undefined_metrics:
+        cagr = None
+    if "calmar_ratio" in undefined_metrics:
+        calmar_ratio = None
+    if "max_drawdown_pct" in undefined_metrics:
+        max_drawdown_pct = None
 
     return BacktestStats(
         total_trades=total_trades,
@@ -569,15 +597,25 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
     return raw_returns
 
 
-def _return_periods_per_year(returns: pd.Series) -> float | None:
+def _return_periods_per_year(
+    returns: pd.Series, *, first_observation: Any = None
+) -> float | None:
     """Measured observation density: return observations per year (#229).
 
     The daily return series only carries days the equity curve observed, so
     its own count over its own span IS the annualisation factor's missing
     input: ~250-260 for a Mon-Fri curve, ~365 for a 24/7 curve, ~52 for a
-    weekly one. The span is measured inclusive of both endpoint days
-    (``+ 1``), which keeps short dense series honest — three consecutive
-    daily returns measure 365.25, not 547.
+    weekly one. The span is anchored at the first *equity* observation
+    (``first_observation``, normalised to its day label), not the first
+    return: a curve whose opening days produce no return — a single
+    observation on the first day, or a sparse cadence — no longer has its
+    density inflated by measuring from the first return instead (three
+    weekly returns used to measure ~73/yr, not ~52).
+
+    The ``+1`` day is added only when the first equity day itself produced
+    a return (the daily-resample first-day rule): then ``n`` returns
+    occupy ``n`` day buckets. When the first return lands on a later day,
+    ``n`` returns span exactly ``last - first_equity`` days.
 
     Returns ``None`` when the density cannot be measured (fewer than two
     returns, or a non-datetime index); callers then fall back to
@@ -585,8 +623,14 @@ def _return_periods_per_year(returns: pd.Series) -> float | None:
     """
     if not isinstance(returns.index, pd.DatetimeIndex) or len(returns) < 2:
         return None
-    first, last = returns.index.min(), returns.index.max()
-    span_days = (last - first).total_seconds() / SECONDS_PER_DAY + 1.0
+    if first_observation is not None:
+        first = pd.Timestamp(first_observation).normalize()
+    else:
+        first = returns.index.min()
+    last = returns.index.max()
+    span_days = (last - first).total_seconds() / SECONDS_PER_DAY
+    if returns.index.min() <= first:
+        span_days += 1.0
     if span_days <= 0:
         return None
     return float(len(returns)) * DAYS_PER_YEAR / span_days

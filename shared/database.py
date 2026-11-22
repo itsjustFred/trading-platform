@@ -5472,6 +5472,9 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
         "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
+        # #349: lets ranking tell pre-#229 rows (fixed sqrt(252)
+        # annualisation, field absent) from measured-density rows.
+        "equity_return_periods_per_year": stats.get("equity_return_periods_per_year"),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
         "max_drawdown": _stat_number_or_undefined(stats, "max_drawdown_pct", 0.0),

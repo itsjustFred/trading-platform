@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from scripts.regenerate_mt5_parity_artifacts import COMPARISON_CASES
@@ -438,3 +439,97 @@ def test_regenerator_outputs_match_cross_platform_matrix_paths():
     }
     assert actual_mt5 == expected_mt5
     assert rows["risk_parity_quantconnect"] == QC_RISK_PARITY_OUTPUT.resolve()
+
+
+def test_reference_sharpe_fails_closed_when_exits_share_one_day():
+    """#349 review: exits all landing on the start day leave fewer than two
+    daily returns, so the rebuilt curve's Sharpe is undefined. It must
+    surface as None — not the fabricated 0.0 compute_stats used to publish
+    for a metric named in `undefined_metrics`."""
+    trades = [
+        _mt5_trade("2024-01-02", 100.0),
+        _mt5_trade("2024-01-02", -50.0),
+    ]
+    reference = _mt5_like_reference(trades)
+
+    assert _reference_sharpe_ratio(reference) is None
+
+
+def _expected_parity_sharpe(trades, pnl_by_day):
+    """Rebuild the calendar-filled curve _reference_sharpe_ratio uses and
+    return compute_stats' Sharpe — the same-formula expectation."""
+    from datetime import datetime, timedelta, timezone
+
+    from runner.stats import compute_stats
+    from shared.models import EquityPoint
+
+    start_candidates = []
+    for trade in trades:
+        entry_ts = pd.Timestamp(trade.entry_time)
+        start_candidates.append(entry_ts)
+    start = min(start_candidates)
+    last_day = max(
+        pd.Timestamp(t.exits[-1].time).date() for t in trades
+    )
+    equity = 100_000.0
+    points = [EquityPoint(time=start.isoformat(), equity=equity)]
+    day = start.date()
+    while day <= last_day:
+        equity += pnl_by_day.get(day.isoformat(), 0.0)
+        stamp = datetime.combine(day, datetime.max.time(), tzinfo=timezone.utc)
+        points.append(EquityPoint(time=stamp.isoformat(), equity=equity))
+        day += timedelta(days=1)
+    stats = compute_stats([], initial_capital=100_000.0, equity_curve=points)
+    return stats["sharpe_ratio"]
+
+
+def test_reference_sharpe_books_net_pnl_fallback_as_pnl_minus_fees():
+    """#349 mutation survivor: with net_pnl=None the curve must book
+    pnl - fees. A sign flip to pnl + fees moves every day's equity and
+    changes the Sharpe."""
+    trades = []
+    for day in ["02", "03", "04", "05", "08", "09", "10", "11"]:
+        trade = _mt5_trade(f"2024-01-{day}", 100.0)
+        trade.net_pnl = None
+        trade.fees = 30.0
+        trades.append(trade)
+    reference = _mt5_like_reference(trades)
+
+    sharpe = _reference_sharpe_ratio(reference)
+
+    pnl_by_day = {
+        f"2024-01-{day}": 70.0
+        for day in ["02", "03", "04", "05", "08", "09", "10", "11"]
+    }
+    expected = _expected_parity_sharpe(trades, pnl_by_day)
+    assert sharpe == pytest.approx(expected, abs=1e-4)
+
+
+def test_reference_sharpe_books_pnl_at_the_last_exit_for_partial_exits():
+    """#349 mutation survivor: a position with several exits books its whole
+    net_pnl on the LAST exit's day, not the first — booking early shifts the
+    equity path and the Sharpe."""
+    trade = Trade(
+        id=1,
+        symbol="EURUSD",
+        direction="LONG",
+        entry_time="2024-01-02T08:00:00Z",
+        entry_price=1.1,
+        quantity=2.0,
+        exits=[
+            TradeExit(time="2024-01-03T16:00:00Z", price=1.1, quantity=1.0, pnl=50.0),
+            TradeExit(time="2024-01-08T16:00:00Z", price=1.1, quantity=1.0, pnl=50.0),
+        ],
+        pnl=100.0,
+        net_pnl=100.0,
+    )
+    other = _mt5_trade("2024-01-05", -40.0)
+    trades = [trade, other]
+    reference = _mt5_like_reference(trades)
+
+    sharpe = _reference_sharpe_ratio(reference)
+
+    # Correct booking: +100 on Jan 8 (last exit), -40 on Jan 5.
+    pnl_by_day = {"2024-01-08": 100.0, "2024-01-05": -40.0}
+    expected = _expected_parity_sharpe(trades, pnl_by_day)
+    assert sharpe == pytest.approx(expected, abs=1e-4)

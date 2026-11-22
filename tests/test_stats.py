@@ -660,6 +660,62 @@ class TestObservedDayAnnualisation:
             mean / std * math.sqrt(periods), abs=1e-4
         )
 
+    def test_periods_per_year_spans_from_first_equity_observation(self):
+        """#349 review: the density span runs from the first *equity*
+        observation to the last return with no inclusive +1 — n returns
+        over n intervals is the cadence itself (~52/yr weekly), not the
+        inflated value a first-return/+1-day span produced."""
+        import pandas as pd
+
+        idx = pd.date_range("2024-01-01", periods=9, freq="7D", tz="UTC")
+        series = pd.Series([0.01 * i for i in range(1, 10)], index=idx)
+        first_equity = idx[0] - pd.Timedelta(days=7)
+
+        density = _return_periods_per_year(series, first_observation=first_equity)
+
+        # 9 weekly returns; the span runs from the first equity observation
+        # (one week before the first return) over 63 days — ~52/yr.
+        assert density == pytest.approx(9 * 365.25 / 63.0)
+        # Without the equity anchor the span starts at the first return and
+        # reads high — the inflation this parameter exists to remove.
+        assert _return_periods_per_year(series) == pytest.approx(
+            9 * 365.25 / ((idx[-1] - idx[0]).days + 1.0)
+        )
+
+    def test_friday_start_business_day_curve_reports_business_density(self):
+        """A curve whose first week holds only Friday still measures the
+        business-day density, not an inflated short-span value."""
+        import numpy as np
+        import pandas as pd
+
+        rng = np.random.default_rng(11)
+        bdays = pd.bdate_range("2024-01-05", periods=120, tz="UTC")  # starts Friday
+        returns = rng.normal(0.0008, 0.01, len(bdays))
+        equity = 100_000.0 * np.cumprod(1 + returns)
+        curve = [
+            EquityPoint(time=ts.isoformat(), equity=float(eq))
+            for ts, eq in zip(bdays, equity)
+        ]
+
+        stats = compute_stats([], equity_curve=curve)
+        periods = stats["equity_return_periods_per_year"]
+
+        assert 235.0 < periods < 270.0
+
+    def test_too_few_returns_publish_undefined_ratios_as_null(self):
+        """#349 review: a metric named in `undefined_metrics` must publish
+        null, not the 0.0 its local variable initialised to — a fabricated
+        0.0 reads as an honest measurement to ranking and parity checks."""
+        curve = [
+            EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
+            EquityPoint(time="2024-01-01T12:00:00+00:00", equity=100_100.0),
+        ]
+
+        stats = compute_stats([], equity_curve=curve)
+
+        assert stats["sharpe_ratio"] is None
+        assert "sharpe_ratio" in stats["undefined_metrics"]
+
 
 class TestMaxConsecutiveLosses:
     def test_no_losses(self):
@@ -776,7 +832,7 @@ class TestCalmarAndQsFallback:
         252 periods per year overstate Sharpe by ~sqrt(6.5), weekly bars
         understate it. A number that looks measured but rests on a guessed
         period is worse than no number, so the ratios are now declared
-        undefined (and not silently published as 0.0 without the flag).
+        undefined and published as null, not a fabricated 0.0 (#349 review).
 
         The p-value is a t-test on the raw observation returns and does not
         depend on the period, so it stays defined and equal to the daily one.
@@ -819,8 +875,8 @@ class TestCalmarAndQsFallback:
         assert "sharpe_ratio" not in daily_stats["undefined_metrics"]
         for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
             assert metric in unknown["undefined_metrics"], metric
-        assert unknown["sharpe_ratio"] == 0.0
-        assert unknown["sortino_ratio"] == 0.0
+        assert unknown["sharpe_ratio"] is None
+        assert unknown["sortino_ratio"] is None
         assert "p_value" not in unknown["undefined_metrics"]
         assert unknown["p_value"] == pytest.approx(daily_stats["p_value"], abs=1e-6)
 
@@ -960,8 +1016,8 @@ class TestWithoutQuantStats:
         )
         for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
             assert metric in stats["undefined_metrics"], metric
-        assert stats["sharpe_ratio"] == 0.0
-        assert stats["sortino_ratio"] == 0.0
+        assert stats["sharpe_ratio"] is None
+        assert stats["sortino_ratio"] is None
         assert "p_value" not in stats["undefined_metrics"]
 
     def test_fallback_declares_metrics_undefined_for_a_one_point_curve(self, monkeypatch):

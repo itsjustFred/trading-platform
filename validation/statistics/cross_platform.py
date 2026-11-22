@@ -27,6 +27,9 @@ from validation.importers.mt5_xlsx import MT5XLSXImporter
 
 AUDIT_METRICS = ("trade_count", "win_rate", "net_profit", "cagr", "sharpe_ratio")
 REFERENCE_RISK_FREE_RATE = 0.0
+# ~100 years of daily equity points is already degenerate for a parity
+# curve; anything longer means a corrupt timestamp, not a real strategy.
+_MAX_PARITY_CURVE_DAYS = 366 * 100
 
 
 @dataclass(frozen=True)
@@ -219,6 +222,11 @@ def _reference_sharpe_ratio(reference: Any) -> float | None:
     equity = float(initial_capital)
     day = start.date()
     last_day = exits[-1][0].date()
+    if (last_day - day).days > _MAX_PARITY_CURVE_DAYS:
+        # A corrupt far-future exit timestamp would otherwise make the
+        # per-day loop below unbounded; the curve is degenerate data, so
+        # fail closed like the other unusable-trade-list cases.
+        return None
     while day <= last_day:
         equity += pnl_by_day.get(day, 0.0)
         # End-of-day stamp: always after the day's own timestamps, so the

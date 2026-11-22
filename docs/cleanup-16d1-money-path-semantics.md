@@ -99,6 +99,10 @@ by falling through to the manual 252-period path on raw period returns in that
 case instead of staying at 0.0. The dead `_infer_periods_per_year` /
 `_annualize_total_return` helpers of the old fallback path are removed.
 
+> Update (#229): Sharpe/Sortino annualisation later moved to the measured
+> observation density; the sqrt(252) wording above records the D5 decision
+> as made, not the current contract.
+
 **Daily series includes the first trading day.** The daily equity build writes
 an inception point at the window start (00:00) and a close at
 `23:59:59.999999` of every day. Resampling to the *last* observation of each
