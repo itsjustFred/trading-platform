@@ -467,7 +467,7 @@ def assert_trades_match(
         f"{label}: trade count {len(engine)} != reference {len(ref)}\n"
         f"engine   : {brief(engine)}\nreference: {brief(ref)}"
     )
-    for k, (e, r) in enumerate(zip(engine, ref)):
+    for k, (e, r) in enumerate(zip(engine, ref, strict=True)):
         ctx = f"{label} trade #{k}\nengine   : {e}\nreference: {r}"
         assert e.side == r.side, ctx
         assert e.entry_ts == r.entry_ts, ctx
@@ -496,13 +496,13 @@ def assert_final_equity(result, ref: list[RefTrade], cfg: RefConfig, tol: Tol, l
 def make_frame(closes: list[float], *, start="2024-01-01", freq="B", wick=0.25) -> pd.DataFrame:
     """OHLC from closes: open = previous close, wicks beyond body. Quarter ticks keep
     every price exactly representable so rolling sums have no rounding noise."""
-    opens = [closes[0]] + closes[:-1]
+    opens = [closes[0], *closes[:-1]]
     frame = pd.DataFrame(
         {
             "timestamp": pd.date_range(start, periods=len(closes), freq=freq, tz="UTC"),
             "open": opens,
-            "high": [max(a, b) + wick for a, b in zip(opens, closes)],
-            "low": [min(a, b) - wick for a, b in zip(opens, closes)],
+            "high": [max(a, b) + wick for a, b in zip(opens, closes, strict=True)],
+            "low": [min(a, b) - wick for a, b in zip(opens, closes, strict=True)],
             "close": closes,
             "volume": [1000.0] * len(closes),
         }
@@ -837,7 +837,7 @@ DON_CFG = {"risk": 0.01, "position_pct": 0.5, "leverage": 1.0}
 
 
 def don_signals(frame: pd.DataFrame) -> Signals:
-    o, h, lo, c = lists(frame)
+    _o, h, lo, c = lists(frame)
     return ref_donchian_signals(h, lo, c)
 
 
@@ -1131,7 +1131,7 @@ WIDE_PARAMS = {**DON_PARAMS, "stop_atr": 15.0, "tp_atr": 60.0}
 
 def _wide_case(name, **cfg) -> Case:
     frame = make_frame(walk(seed=21, n=200, step=1.0))
-    o, h, lo, c = lists(frame)
+    _o, h, lo, c = lists(frame)
     sig = ref_donchian_signals(h, lo, c, stop_atr=15.0, tp_atr=60.0)
     return Case(name, frame, DONCHIAN_PATH, WIDE_PARAMS, sig, cfg, (), 2)
 
@@ -1330,7 +1330,7 @@ def _real_sma(**cfg) -> Case:
 
 def _real_don(**cfg) -> Case:
     frame = _real_frame()
-    o, h, lo, c = lists(frame)
+    _o, h, lo, c = lists(frame)
     params = {
         **DON_PARAMS,
         "entry_len": 20,

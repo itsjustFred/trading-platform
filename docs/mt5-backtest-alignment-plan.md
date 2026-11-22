@@ -241,8 +241,10 @@ Implementation tasks:
 - Revisit notional/leverage caps for MT5 mode:
   - In fixed-risk mode, do not apply the platform `max_position_pct` cap unless
     explicitly provided.
-  - Apply optional margin/leverage validation as diagnostics first, not as a
-    silent cap, until broker margin rules are confirmed.
+  - Margin/leverage validation is now confirmed and implemented MT5-style
+    (#347): the native engine judges an order's margin against free margin
+    (equity − used margin) and clamps to the broker maximum leverage
+    (unknown → 1x) instead of refusing.
 
 Tests to add/run:
 

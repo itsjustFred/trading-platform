@@ -151,3 +151,84 @@ def test_bounds_that_cross_within_tolerance_raise() -> None:
         solve_risk_parity_weights(
             cov, min_weight=0.5 + 1e-13, max_weight=0.5 - 1e-13
         )
+
+
+@pytest.mark.parametrize(
+    ("min_weight", "max_weight"),
+    [
+        (0.0, float("nan")),
+        (float("nan"), 0.6),
+        (0.0, float("inf")),
+        (float("-inf"), 0.6),
+    ],
+)
+def test_non_finite_bounds_are_refused_not_clamped(min_weight: float, max_weight: float) -> None:
+    """A NaN cap must not become "no cap" (max(0.0, nan) -> 0.0, min(1.0, nan) -> 1.0).
+
+    Fail closed with a clear error instead of solving with silently rewritten bounds.
+    """
+    cov = np.eye(3) * 0.01
+
+    with pytest.raises(ValueError, match="finite"):
+        solve_risk_parity_weights(cov, min_weight=min_weight, max_weight=max_weight)
+
+
+def test_non_finite_covariance_is_refused() -> None:
+    cov = np.eye(3) * 0.01
+    cov[1, 1] = np.nan
+
+    with pytest.raises(ValueError, match="finite"):
+        solve_risk_parity_weights(cov, min_weight=0.0, max_weight=0.6)
+
+
+def test_projection_refuses_non_finite_weights() -> None:
+    """Bisection on NaN never converges: the projection must refuse, not return NaN."""
+    values = np.array([0.5, np.nan, 0.5])
+
+    # Match the input guard's own message: without the guard the post-projection
+    # backstop also refuses, but with a different message, so a bare
+    # match="finite" would pass on the wrong check.
+    with pytest.raises(ValueError, match="finite before projection"):
+        _project_to_capped_simplex(values, lower=0.0, upper=1.0)
+
+
+def test_projection_refuses_a_result_that_does_not_sum_to_one() -> None:
+    """Output backstop: a projection that cannot reach sum 1 must refuse.
+
+    Bounds that cross (``lower > upper``) leave the capped simplex empty and
+    ``np.clip`` returns ``a_max`` everywhere, so the projection here returns
+    0.8 - weights that do not sum to 1. ``resolve_weight_bounds`` rejects such
+    bounds before any real caller gets here; this pins the last line of defence,
+    including the ``abs()`` that makes the check catch an undershoot as well as
+    an overshoot.
+    """
+    with pytest.raises(ValueError, match="summing to 1"):
+        _project_to_capped_simplex(np.array([0.5, 0.5]), lower=0.5, upper=0.4)
+
+
+def test_projection_refuses_non_finite_bounds() -> None:
+    """A NaN bound makes ``np.clip`` return NaN, and ``abs(nan - 1) > tol`` is False.
+
+    The sum-to-1 comparison alone cannot see a NaN projection, which is why the
+    finiteness half of the backstop stays even though callers validate bounds.
+    """
+    with pytest.raises(ValueError, match="summing to 1"):
+        _project_to_capped_simplex(np.array([0.5, 0.5]), lower=0.0, upper=float("nan"))
+
+
+@pytest.mark.parametrize("variance", [0.0, -1.0], ids=["zero", "negative"])
+def test_module_fallback_refuses_non_positive_variance(
+    monkeypatch: pytest.MonkeyPatch, variance: float
+) -> None:
+    """The runner's inverse-vol fallback must refuse what the script refuses.
+
+    ``1.0 / sqrt(0)`` is inf and ``sqrt(-1)`` is NaN, so flooring instead of
+    refusing returned inf/NaN weights (or a single asset pinned at
+    ``max_weight``) with no error. Both backends now share one policy, so the
+    same covariance cannot give one a refusal and the other a portfolio.
+    """
+    _force_solver_failure(monkeypatch)
+    cov = np.diag([variance, 1.0, 1.0])
+
+    with pytest.raises(ValueError, match="volatility"):
+        solve_risk_parity_weights(cov, min_weight=0.0, max_weight=0.6)

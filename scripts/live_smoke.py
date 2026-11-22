@@ -981,8 +981,12 @@ async def _alpaca_crypto_roundtrip(
     timeout_seconds: int,
 ) -> list[SmokeCheck]:
     checks: list[SmokeCheck] = []
-    for index in (1, 2, 3):
-        checks.append(
+    # An async list comprehension: the iterable handed to ``extend`` is a real
+    # list. A bare ``await`` inside a generator expression turns the genexp
+    # into an async generator, which is not iterable, so ``extend`` would raise
+    # TypeError and no roundtrip account would be checked at all.
+    checks.extend(
+        [
             await _run_alpaca_crypto_iteration(
                 env,
                 index=index,
@@ -990,7 +994,9 @@ async def _alpaca_crypto_roundtrip(
                 notional=notional,
                 timeout_seconds=timeout_seconds,
             )
-        )
+            for index in (1, 2, 3)
+        ]
+    )
     return checks
 
 
@@ -1030,6 +1036,11 @@ async def _ctrader_demo_roundtrip(
 
 
 class _DiscordSmokeAdapter:
+    # This fake never reaches a broker. The daemon treats an adapter that does
+    # not prove it is demo/paper as real money (`_adapter_is_demo`), and the
+    # promotion gate (#165) refuses entries there, so the fake says what it is.
+    demo = True
+
     def __init__(self) -> None:
         self.submitted_signal: Any | None = None
 
@@ -1048,6 +1059,30 @@ class _DiscordSmokeAdapter:
 
     async def get_positions(self) -> list[dict[str, Any]]:
         return []
+
+    async def get_quote(self, symbol: str) -> Any:
+        # #125 entry-deviation gate: quote at the replayed message price.
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=190.50,
+            ask=190.50,
+            timestamp=datetime.now(timezone.utc),
+            source="discord-smoke",
+        )
+
+    async def get_pip_value(self, symbol: str) -> Any:
+        # #146: the replayed AAPL entry is a USD share in a USD account.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0,
+            units_per_qty=1.0,
+            conversion_rate=1.0,
+            quote_asset="USD",
+            account_asset="USD",
+            source="discord-smoke",
+        )
 
 
 async def _discord_replay_smoke() -> list[SmokeCheck]:
@@ -1320,6 +1355,7 @@ async def _stockkit_market_context(
 def _stockkit_deployment_and_signal(
     env: Mapping[str, str],
     *,
+    accounts_env: Path,
     route: str,
     account_id: str,
     broker_login: str,
@@ -1332,7 +1368,6 @@ def _stockkit_deployment_and_signal(
 
     from live_runner.credential_env import discord_bot_env_key, load_accounts_env_values
     from live_runner.daemon import _trade_signal_to_live_signal
-    from live_runner.service_discovery import DEFAULT_ACCOUNTS_ENV
     from live_runner.signal_sources.discord_source import _parse_trade_signal_from_message
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from shared.models import LiveDeploymentConfig
@@ -1357,7 +1392,13 @@ def _stockkit_deployment_and_signal(
         signal_source_type="discord",
         signal_source="discord",
         signal_source_id=route.upper(),
-        signal_config={"service_name": route, "channel_id": str(message.channel.id)},
+        # Explicitly marked as StockKit (#121): an unknown route then fails closed
+        # instead of silently skipping the broker-account check.
+        signal_config={
+            "service_name": route,
+            "channel_id": str(message.channel.id),
+            "stockkit_route": route,
+        },
         settings={
             "max_risk_per_trade": 0.00004,
             "max_total_exposure": 0.00008,
@@ -1366,8 +1407,10 @@ def _stockkit_deployment_and_signal(
     )
     # Validate routing against the broker account number the smoke run actually
     # resolved credentials for, not the number the route expects - otherwise the
-    # check compares a value to itself and can never fail.
-    smoke_env = load_accounts_env_values(DEFAULT_ACCOUNTS_ENV)
+    # check compares a value to itself and can never fail. The accounts file is
+    # the one ``--accounts-env`` named: the run trades with its credentials, so
+    # the route table must come from the same file.
+    smoke_env = load_accounts_env_values(accounts_env)
     validate_stockkit_deployment_route(
         deployment,
         account_broker_login=broker_login,
@@ -1487,6 +1530,7 @@ async def _cancel_stockkit_buy_order(
 async def _alpaca_stockkit_e2e(
     env: Mapping[str, str],
     *,
+    accounts_env: Path,
     timeout_seconds: int,
 ) -> SmokeCheck:
     from live_runner.alpaca_adapter import AlpacaLiveAdapter
@@ -1516,6 +1560,7 @@ async def _alpaca_stockkit_e2e(
         details["market_data"] = stock_prices
         trade_signal, deployment, live_signal = _stockkit_deployment_and_signal(
             env,
+            accounts_env=accounts_env,
             route=route,
             account_id=account_id,
             broker_login=broker_login,
@@ -1630,7 +1675,7 @@ async def _live_stockkit_e2e(
     timeout_seconds: int,
 ) -> list[SmokeCheck]:
     results = await asyncio.gather(
-        _alpaca_stockkit_e2e(env, timeout_seconds=timeout_seconds),
+        _alpaca_stockkit_e2e(env, accounts_env=accounts_env, timeout_seconds=timeout_seconds),
         _ctrader_strategy_e2e(
             env,
             accounts_env=accounts_env,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from runner.stats import compute_stats
@@ -84,6 +85,150 @@ def test_viewer_stats_payload_legacy_artifact_reads_as_not_ruined() -> None:
 
     assert payload["ruined"] is False
     assert payload["ruin_time"] is None
+
+
+def _result_with_unreadable_endpoint(stats: dict) -> BacktestResult:
+    """A trade-less artifact whose stored curve ends on an unreadable point."""
+    result = _result_with_stats(stats)
+    result.equity_curve = [
+        EquityPoint(time="2021-01-04T00:00:00+00:00", equity=100_000.0),
+        EquityPoint(time="2021-01-05T00:00:00+00:00", equity=101_000.0),
+        EquityPoint(time="2021-01-06T00:00:00+00:00", equity=None),
+    ]
+    return result
+
+
+def test_viewer_stats_payload_renders_an_unreadable_endpoint_without_nan() -> None:
+    """The recompute path must not hand NaN to the JSON response.
+
+    `_canonical_stats_from_result` recomputes when an artifact lacks a canonical
+    key. The terminating equity point is unreadable, so `total_pnl` and
+    `max_drawdown_pct` come back null/undefined; copying them verbatim into the
+    payload puts NaN in the body, which `JSONResponse` refuses (`allow_nan=False`)
+    - the 500 this path exists to remove, one field later.
+    """
+    from viewer import core
+
+    payload = core._stats_payload_from_result(_result_with_unreadable_endpoint({}))
+
+    json.dumps(payload, allow_nan=False)
+    assert payload["ruined"] is True
+    # The producer named every endpoint-derived figure undefined; publishing
+    # them as 0.0 would read an unmeasured run as a measured flat one (#256).
+    for key in (
+        "net_profit",
+        "net_profit_pct",
+        "max_drawdown_pct",
+        "avg_trade_pnl",
+        "total_return",
+    ):
+        assert payload[key] is None, key
+
+
+def test_stats_endpoint_serves_an_unreadable_equity_artifact(
+    viewer_client, tmp_path
+) -> None:
+    """The artifact page must load, not 500, for the case #250 fixes."""
+    backtests_dir = tmp_path / "backtests"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _result_with_unreadable_endpoint({}).save(backtests_dir / "ruin-demo.trades.json")
+
+    resp = viewer_client.get("/api/backtest/ruin-demo/stats")
+
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["ruined"] is True
+    assert payload["net_profit"] is None
+    assert payload["max_drawdown_pct"] is None
+
+
+def test_viewer_stats_payload_survives_unusable_cached_figures() -> None:
+    """A cached artifact can carry NaN/inf or an out-of-range integer stat (#250).
+
+    `BacktestResult.to_json` calls `json.dumps` without `allow_nan=False`, so an
+    artifact written by the path this PR fixes really can store `NaN`; and
+    `json.loads` yields an arbitrary-precision int for `10**400`, which makes
+    `float()` raise `OverflowError`. Neither is a measurement, and the JSON
+    response refuses both, so the payload resolves them instead of copying them
+    through.
+    """
+    from viewer import core
+
+    for value in (float("nan"), float("inf"), 10**400):
+        payload = core._stats_payload_from_result(
+            _result_with_stats(
+                {
+                    "total_pnl": value,
+                    "sharpe_ratio": 1.0,
+                    "cagr": 0.1,
+                    "max_drawdown_pct": value,
+                }
+            )
+        )
+
+        json.dumps(payload, allow_nan=False)
+        assert payload["net_profit"] is None, value
+        assert payload["net_profit_pct"] is None, value
+        assert payload["max_drawdown_pct"] is None, value
+        assert payload["avg_trade_pnl"] is None, value
+        assert payload["total_return"] is None, value
+
+
+def test_viewer_stats_payload_keeps_measured_zeros() -> None:
+    """A stored 0.0 is a measurement; only `undefined_metrics` makes a figure null.
+
+    Legacy artifacts carry no `undefined_metrics` list at all, so every figure
+    they do carry keeps publishing its number - including honest zeroes.
+    """
+    from viewer import core
+
+    payload = core._stats_payload_from_result(
+        _result_with_stats(
+            {
+                "total_pnl": 0.0,
+                "total_return": 0.0,
+                "cagr": 0.0,
+                "max_drawdown_pct": 0.0,
+                "sharpe_ratio": 0.0,
+                "total_trades": 0,
+                "win_rate": 0.0,
+            }
+        )
+    )
+
+    assert payload["net_profit"] == 0.0
+    assert payload["net_profit_pct"] == 0.0
+    assert payload["max_drawdown_pct"] == 0.0
+    assert payload["avg_trade_pnl"] == 0.0
+    assert payload["total_return"] == 0.0
+
+
+def test_viewer_stats_payload_does_not_fall_back_for_a_declared_undefined_return() -> None:
+    """`total_return` named in `undefined_metrics` is null, not the net-figure guess.
+
+    The net/capital fallback exists for artifacts that never recorded the key;
+    substituting it for a metric the producer declared unmeasurable would
+    publish the absence as a computed number - the same lie as a 0.0 default.
+    """
+    from viewer import core
+
+    payload = core._stats_payload_from_result(
+        _result_with_stats(
+            {
+                "total_pnl": 500.0,
+                "total_return": None,
+                "cagr": 0.0,
+                "max_drawdown_pct": -0.1,
+                "sharpe_ratio": 1.0,
+                "total_trades": 0,
+                "win_rate": 0.0,
+                "undefined_metrics": ["total_return"],
+            }
+        )
+    )
+
+    assert payload["net_profit"] == 500.0
+    assert payload["total_return"] is None
 
 
 def test_ruined_backtest_is_never_selected_for_live_deployment() -> None:

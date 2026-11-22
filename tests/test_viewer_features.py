@@ -32,6 +32,16 @@ from shared.models import (
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _wait_for_viewer_task(viewer_app_module, task_id: str, *, timeout: float = 5.0):
+    """Join the task's worker thread instead of polling ``DATA_TASKS``."""
+    task = viewer_app_module.DATA_TASKS[task_id]
+    thread = task.get("thread")
+    assert isinstance(thread, threading.Thread), f"task {task_id} has no worker thread"
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), f"task {task_id} worker did not finish"
+    return viewer_app_module.DATA_TASKS[task_id]
+
+
 def test_get_dukascopy_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
@@ -1825,27 +1835,61 @@ def test_coalesced_cleanup_state_updates_are_serialized(tmp_path, monkeypatch):
         real_write(state)
 
     monkeypatch.setattr(viewer_app_module, "_write_coalesced_cleanup_state", blocking_write)
+
+    # Spy on the state lock itself: ``second_attempted`` must fire when the
+    # second thread *attempts* the acquire — proving it was actually blocked
+    # on the lock while the first writer held it, not merely scheduled late.
+    real_lock = viewer_app_module._COALESCED_CLEANUP_STATE_LOCK
+    second_attempted = threading.Event()
+
+    class _AcquireSpyLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "second-writer":
+                second_attempted.set()
+            return real_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            real_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.release()
+            return False
+
+    monkeypatch.setattr(
+        viewer_app_module, "_COALESCED_CLEANUP_STATE_LOCK", _AcquireSpyLock()
+    )
+
     first = threading.Thread(
         target=viewer_app_module._update_coalesced_cleanup_state,
         args=("cleanup-0001",),
         kwargs={"attempts": 1, "exhausted": False},
+        name="first-writer",
     )
-    second = threading.Thread(
-        target=viewer_app_module._update_coalesced_cleanup_state,
-        args=("cleanup-0002",),
-        kwargs={"attempts": 1, "exhausted": False},
-    )
+
+    def run_second():
+        viewer_app_module._update_coalesced_cleanup_state(
+            "cleanup-0002", attempts=1, exhausted=False
+        )
+
+    second = threading.Thread(target=run_second, name="second-writer")
     first.start()
     assert first_write_started.wait(timeout=2)
     second.start()
-    time.sleep(0.05)
+    assert second_attempted.wait(timeout=2)
     assert len(write_calls) == 1
     release_first_write.set()
     first.join(timeout=2)
     second.join(timeout=2)
+    assert not first.is_alive() and not second.is_alive()
 
     state = viewer_app_module._load_coalesced_cleanup_state()
     assert set(state) == {"cleanup-0001", "cleanup-0002"}
+    assert set(write_calls[0]) == {"cleanup-0001"}
+    assert set(write_calls[1]) == {"cleanup-0001", "cleanup-0002"}
 
 
 def test_coalesced_cleanup_failure_persists_retryable_marker(
@@ -3024,13 +3068,7 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
         total_items=1,
     )
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.1)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["status"] == "completed"
     assert Path(task["log_file"]).parent == tmp_path / "logs" / "tasks"
     assert task["pause_event"].is_set() is False
@@ -3044,10 +3082,6 @@ def test_start_data_task_writes_task_logs_and_refreshes_catalog(
     assert refresh_calls == ["refreshed"]
     assert any("stdout line" in line for line in routed_logs)
     assert any("stderr line" in line for line in routed_logs)
-    thread = task.get("thread")
-    if isinstance(thread, threading.Thread):
-        thread.join(timeout=5)
-        assert not thread.is_alive()
 
 
 def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp_path):
@@ -3105,13 +3139,7 @@ def test_optimization_run_starts_background_task(viewer_client, monkeypatch, tmp
     assert run_payload["task_id"] == run_payload["job_id"]
     job_id = run_payload["job_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[job_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[job_id]
+    task = _wait_for_viewer_task(viewer_app_module, job_id)
     assert task["status"] == "completed"
     assert task["kind"] == "optimization"
     assert task["optimization_id"] == "opt_base-demo_20260311_100000"
@@ -3223,13 +3251,7 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["kind"] == "backtest"
     assert task["status"] == "completed"
     assert task["progress"] == 100.0
@@ -3267,6 +3289,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
 
     replay_query_args: dict[str, object] = {}
     adapter_init_kwargs: dict[str, object] = {}
+    adapter_run_kwargs: dict[str, object] = {}
 
     monkeypatch.setattr(
         viewer_app_module,
@@ -3328,6 +3351,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             adapter_init_kwargs.update(kwargs)
 
         def run(self, **kwargs):
+            adapter_run_kwargs.update(kwargs)
             progress_callback = kwargs.get("progress_callback")
             if callable(progress_callback):
                 progress_callback(50.0, "halfway")
@@ -3361,6 +3385,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             "end_date": "2024-01-02",
             "timeframe": "1h",
             "auto_download": False,
+            "fees_zero": True,
         },
     )
 
@@ -3370,13 +3395,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert payload["status"] == "queued"
     task_id = payload["task_id"]
 
-    for _ in range(50):
-        task = viewer_app_module.DATA_TASKS[task_id]
-        if task["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.05)
-
-    task = viewer_app_module.DATA_TASKS[task_id]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
     assert task["kind"] == "backtest"
     assert task["status"] == "completed"
     assert task["result"]["backtest_id"] == "signal-replay-unit"
@@ -3387,6 +3406,15 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     assert replay_query_args["source"] == "discord"
     assert replay_query_args["limit"] == 20000
     assert adapter_init_kwargs["signal_processor_name"] == "ramjet"
+    # #361: the declared fee params reach the adapter — before the fix the
+    # adapter got none and run() died on the #84 fail-closed fee check.
+    assert adapter_init_kwargs["fee_params"] == {"fees": "zero"}
+    # ...and the cost model is recorded where the saved result and the task
+    # record can see it: run() metadata lands in BacktestMeta.parameters,
+    # restart_config keeps it for the task lifecycle.
+    assert adapter_run_kwargs["metadata"]["fee_params"] == {"fees": "zero"}
+    task_record = viewer_app_module.DATA_TASKS[task_id]
+    assert task_record["restart_config"]["fee_params"] == {"fees": "zero"}
 
 
 def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeypatch, tmp_path):
@@ -3421,6 +3449,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
             "start_date": "2026-02-23",
             "end_date": "2026-02-24",
             "auto_download": True,
+            "fees_zero": True,
         },
     )
 
@@ -3432,6 +3461,7 @@ def test_backtest_run_from_signals_csv_forwards_to_replay(viewer_client, monkeyp
     assert forwarded.timeframe == "1m"
     assert forwarded.signal_processor == "ramjet"
     assert forwarded.signal_source is None
+    assert forwarded.fees_zero is True
     assert len(forwarded.signals) == 2
     assert str(forwarded.signals[0].source).startswith("csv:")
 
@@ -3466,14 +3496,305 @@ def test_backtest_run_from_signals_csv_date_only_end_is_inclusive(viewer_client,
             "signal_processor": "ramjet",
             "start_date": "2026-02-23",
             "end_date": "2026-02-23",
+            "fees_zero": True,
         },
     )
 
     assert response.status_code == 202
     forwarded = captured["payload"]
     assert forwarded is not None
+    assert forwarded.fees_zero is True
     assert len(forwarded.signals) == 1
     assert forwarded.signals[0].symbol == "AAPL"
+
+
+def test_backtest_run_signals_requires_an_explicit_fee_declaration(viewer_client):
+    """#361/#84: without fee fields the request is a 400 at the boundary —
+    before the fix the task was accepted and died in the worker on the
+    adapter's fail-closed ``resolve_fee_model`` check."""
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "fee" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_signals_rejects_conflicting_fee_flags(viewer_client):
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T12:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fees_zero": True,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflict" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_from_signals_requires_an_explicit_fee_declaration(viewer_client):
+    """The discord-history branch forwards to run-signals, so the same
+    fail-closed fee check applies before any signal gathering."""
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "fee" in str(response.json()["detail"]).lower()
+
+
+def test_signal_replay_fee_params_map_cli_style_flags():
+    import viewer.main as viewer_app_module
+
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.001,
+        fee_flat_per_trade=2.0,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.001,
+        "fee_flat_per_trade": 2.0,
+    }
+
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.001,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.001
+    }
+
+    # fee_rate=0.0 is a declared (zero-rate) cost model, not "missing": the
+    # `is not None` check must keep it.
+    payload = viewer_app_module.BacktestRunSignalsRequest(
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        fee_rate=0.0,
+    )
+    assert viewer_app_module._validated_signal_replay_fee_params(payload) == {
+        "fee_rate": 0.0
+    }
+
+
+@pytest.mark.parametrize(
+    "fee_json",
+    [
+        '"fee_rate": -0.001',
+        '"fee_rate": NaN',
+        '"fee_rate": Infinity',
+        '"fee_flat_per_trade": -1.0',
+        '"fee_flat_per_trade": NaN',
+    ],
+)
+def test_backtest_run_signals_rejects_negative_or_nonfinite_fee_params(
+    viewer_client, fee_json
+):
+    """#361: ``resolve_fee_model`` clamps negatives to 0.0, so a negative or
+    NaN declaration would silently become a zero-cost run — and inf would
+    produce non-finite fees. The boundary rejects them with a 400 instead.
+    NaN/Infinity are sent as raw JSON: httpx's ``json=`` refuses to emit them,
+    but Python's ``json.loads`` (and so the API) accepts the literals."""
+    body = (
+        '{"signals": [{"timestamp": "2024-01-01T12:00:00Z", "symbol": "AAPL",'
+        ' "action": "buy", "entry_price": 100.0}],'
+        ' "start_date": "2024-01-01", "end_date": "2024-01-02", '
+        + fee_json
+        + "}"
+    )
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert "non-negative" in str(response.json()["detail"])
+
+
+def test_backtest_run_from_signals_discord_forwards_fee_fields(viewer_client, monkeypatch):
+    """The discord-history branch forwards the fee declaration to run-signals."""
+    import viewer.main as viewer_app_module
+
+    captured: dict[str, object] = {}
+
+    async def _fake_run_backtest_signals(payload):
+        captured["payload"] = payload
+        return {"task_id": "sigdisc1", "job_id": "sigdisc1", "status": "queued"}
+
+    monkeypatch.setattr(viewer_app_module, "run_backtest_signals", _fake_run_backtest_signals)
+
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fee_rate": 0.001,
+            "fee_flat_per_trade": 2.0,
+        },
+    )
+
+    assert response.status_code == 202
+    forwarded = captured["payload"]
+    assert forwarded.fee_rate == 0.001
+    assert forwarded.fee_flat_per_trade == 2.0
+    assert forwarded.fees_zero is False
+
+
+def test_backtest_run_from_signals_csv_forwards_fee_rate(viewer_client, monkeypatch, tmp_path):
+    """The csv branch forwards fee_rate/fee_flat_per_trade, not only fees_zero."""
+    import viewer.main as viewer_app_module
+
+    csv_path = tmp_path / "ohlcv" / "signals.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.write_text(
+        "\n".join(
+            [
+                "Symbol;Signal Price;Datum;Zeit;Signal Type",
+                "AAPL;173,79;2026-02-23;09:32:00-05:00;BUY",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run_backtest_signals(payload):
+        captured["payload"] = payload
+        return {"task_id": "sigcsv03", "job_id": "sigcsv03", "status": "queued"}
+
+    monkeypatch.setattr(viewer_app_module, "run_backtest_signals", _fake_run_backtest_signals)
+
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "csv",
+            "filepath": str(csv_path),
+            "start_date": "2026-02-23",
+            "end_date": "2026-02-24",
+            "fee_rate": 0.001,
+            "fee_flat_per_trade": 1.5,
+        },
+    )
+
+    assert response.status_code == 202
+    forwarded = captured["payload"]
+    assert forwarded.fee_rate == 0.001
+    assert forwarded.fee_flat_per_trade == 1.5
+    assert forwarded.fees_zero is False
+
+
+def test_backtest_run_from_signals_rejects_conflicting_fee_flags(viewer_client):
+    """fees_zero + fee_rate through run-from-signals is the same 400 conflict
+    the CLI enforces — the discord branch forwards before any signal gather."""
+    response = viewer_client.post(
+        "/api/backtests/run-from-signals",
+        json={
+            "signal_source": "discord-history",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            "fees_zero": True,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflict" in str(response.json()["detail"]).lower()
+
+
+def test_backtest_run_signals_real_adapter_records_fees(viewer_client, tmp_path):
+    """#361 regression guard with the REAL ``SignalReplayAdapter``: the stubbed
+    tests are exactly why the missing fee wiring went unnoticed, so this runs
+    a fee_rate replay end to end through the endpoint on a tiny OHLCV fixture
+    and asserts the task completes with non-zero fees in the saved result."""
+    import viewer.main as viewer_app_module
+
+    ohlcv_dir = tmp_path / "ohlcv" / "test_source" / "equities" / "AAPL"
+    ohlcv_dir.mkdir(parents=True)
+    periods = 72
+    base = 100.0
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2024-01-01T00:00:00Z", periods=periods, freq="1h", tz="UTC"
+            ),
+            "open": [base + i * 0.05 for i in range(periods)],
+            "high": [base + 0.4 + i * 0.05 for i in range(periods)],
+            "low": [base - 0.4 + i * 0.05 for i in range(periods)],
+            "close": [base + 0.2 + i * 0.05 for i in range(periods)],
+            "volume": [1000] * periods,
+        }
+    )
+    frame.to_parquet(ohlcv_dir / "1h.parquet", index=False)
+
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json={
+            "signals": [
+                {
+                    "timestamp": "2024-01-01T10:00:00Z",
+                    "symbol": "AAPL",
+                    "action": "buy",
+                    "entry_price": 100.0,
+                    "stop_loss": 95.0,
+                    "take_profit": 200.0,
+                    "timeframe": "1h",
+                }
+            ],
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-04",
+            "timeframe": "1h",
+            "auto_download": False,
+            "fee_rate": 0.001,
+        },
+    )
+
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    for _ in range(100):
+        task = viewer_app_module.DATA_TASKS[task_id]
+        if task["status"] in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    task = viewer_app_module.DATA_TASKS[task_id]
+    assert task["status"] == "completed", task.get("error")
+    output_path = Path(task["result"]["output_path"])
+    saved = json.loads(output_path.read_text(encoding="utf-8"))
+    # The declared cost model is recorded in the saved result's parameters...
+    assert saved["meta"]["parameters"]["fee_params"] == {"fee_rate": 0.001}
+    # ...and the run actually priced costs: not a silent zero-fee replay.
+    assert saved["trades"], "expected the replay to open a trade"
+    assert all((t.get("fees") or 0.0) > 0 for t in saved["trades"])
 
 
 def test_thread_bound_task_log_handler_emits_without_shadowing_handle(viewer_client, tmp_path):
@@ -3586,6 +3907,223 @@ def test_optimizations_list_and_detail_endpoints(viewer_client, tmp_path):
     ]
 
     detail_resp = viewer_client.get("/api/optimizations/opt_base-demo_20260311_100000")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json() == payload
+
+
+def test_optimizations_list_and_detail_with_three_way_split(viewer_client, tmp_path):
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": "opt_threeway_20260311_100000",
+        "file": "opt_threeway_20260311_100000.json",
+        "created_at": "2026-03-11T10:00:00+00:00",
+        "base_backtest_id": "base-demo",
+        "target_metric": "sharpe",
+        "n_trials": 25,
+        "train_split_pct": 0.6,
+        "validation_split_pct": 0.2,
+        "test_split_pct": 0.2,
+        "best_value": 1.2345,
+        "best_params": {"window": 10},
+        "effective_best_parameters": {"window": 10, "fixed": 3},
+        "symbols": ["SPY", "TLT", "GLD"],
+        "best_symbols": ["SPY", "TLT"],
+        "optimization_mode": "parameter",
+        "symbol_universes": [],
+        "train_period": {
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-05-31T23:59:59+00:00",
+        },
+        "test_period": {
+            "start": "2024-06-01T00:00:00+00:00",
+            "end": "2024-08-31T23:59:59+00:00",
+        },
+        "validation_period": {
+            "start": "2024-06-01T00:00:00+00:00",
+            "end": "2024-08-31T23:59:59+00:00",
+        },
+        "final_test_period": {
+            "start": "2024-09-01T00:00:00+00:00",
+            "end": "2024-11-30T23:59:59+00:00",
+        },
+        "train_stats": {"sharpe_ratio": 1.5},
+        "test_stats": {"sharpe_ratio": 1.2},
+        "validation_stats": {"sharpe_ratio": 1.2},
+        "final_test_stats": {"sharpe_ratio": 1.1},
+        "three_way": {
+            "segments": {
+                "train": {"start": "2024-01-01T00:00:00+00:00", "end": "2024-05-31T23:59:59+00:00"},
+                "validation": {
+                    "start": "2024-06-01T00:00:00+00:00",
+                    "end": "2024-08-31T23:59:59+00:00",
+                },
+                "test": {"start": "2024-09-01T00:00:00+00:00", "end": "2024-11-30T23:59:59+00:00"},
+                "embargo_train_val": {
+                    "start": "2024-05-31T23:59:59+00:00",
+                    "end": "2024-06-01T00:00:00+00:00",
+                },
+                "embargo_val_test": {
+                    "start": "2024-08-31T23:59:59+00:00",
+                    "end": "2024-09-01T00:00:00+00:00",
+                },
+            },
+            "winner": {
+                "trial_number": 5,
+                "train_metrics": {"sharpe_ratio": 1.5},
+                "validation_metrics": {"sharpe_ratio": 1.2},
+                "test_metrics": {"sharpe_ratio": 1.1},
+            },
+            "selection": {
+                "winner_trial_number": 5,
+                "score_source": "validation",
+                "target_metric": "sharpe_ratio",
+                "study_direction": "maximize",
+                "top_fraction": 0.1,
+                "top_set_size": 3,
+                "n_selectable_trials": 20,
+                "n_unselectable_trials": 5,
+                "tie_break": "trial_number",
+                "ranked_top_set": [
+                    {
+                        "rank": 1,
+                        "trial_number": 5,
+                        "validation_score": 1.2,
+                        "validation_metric_value": 1.2,
+                        "params": {"window": 10},
+                        "is_winner": True,
+                    }
+                ],
+            },
+            "test_distribution": {
+                "count": 3,
+                "share_profitable": 0.67,
+                "median_target_metric": 1.05,
+                "target_metric": "sharpe_ratio",
+                "spearman_validation_to_test": 0.5,
+                "ranked_by_test": [],
+                "note": "test never changes winner",
+            },
+            "overfitting": {
+                "passed": True,
+                "checks": {
+                    "degradation": {
+                        "value": 0.2,
+                        "threshold": 0.5,
+                        "passed": True,
+                        "computable": True,
+                    },
+                    "deflated_sharpe": {
+                        "value": 0.97,
+                        "threshold": 0.95,
+                        "passed": True,
+                        "computable": True,
+                    },
+                },
+                "thresholds": {
+                    "max_train_validation_degradation": 0.5,
+                    "min_deflated_sharpe": 0.95,
+                },
+                "reasons": [],
+                "degradation": 0.2,
+                "deflated_sharpe": 0.97,
+                "metric": "sharpe_ratio",
+                "train_metric_value": 1.5,
+                "validation_metric_value": 1.2,
+                "n_selectable_trials": 20,
+                "var_sharpe_per_obs": 0.01,
+                "note": "",
+            },
+        },
+        "top_trials": [
+            {"number": 5, "value": 1.2, "params": {"window": 10}, "symbols": ["SPY", "TLT"]}
+        ],
+    }
+    (optimizations_dir / "opt_threeway_20260311_100000.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    list_resp = viewer_client.get("/api/optimizations")
+    assert list_resp.status_code == 200
+    listed = list_resp.json()
+    assert len(listed) == 1
+    summary = listed[0]
+    # Check new three-way keys are present in summary
+    assert summary["validation_split_pct"] == 0.2
+    assert summary["test_split_pct"] == 0.2
+    assert summary["validation_period"] == payload["validation_period"]
+    assert summary["validation_stats"] == payload["validation_stats"]
+    assert summary["final_test_period"] == payload["final_test_period"]
+    assert summary["final_test_stats"] == payload["final_test_stats"]
+    # The list item stays small: the full three-way section is detail-only.
+    assert "three_way" not in summary
+    # Old keys still present
+    assert summary["train_split_pct"] == 0.6
+    assert summary["test_period"] == payload["test_period"]
+    assert summary["test_stats"] == payload["test_stats"]
+
+    detail_resp = viewer_client.get("/api/optimizations/opt_threeway_20260311_100000")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json() == payload
+
+
+def test_optimizations_list_and_detail_without_three_way_is_unchanged(viewer_client, tmp_path):
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "id": "opt_twoway_20260311_100000",
+        "file": "opt_twoway_20260311_100000.json",
+        "created_at": "2026-03-11T10:00:00+00:00",
+        "base_backtest_id": "base-demo",
+        "target_metric": "sharpe",
+        "n_trials": 25,
+        "train_split_pct": 0.7,
+        "best_value": 1.2345,
+        "best_params": {"window": 10},
+        "effective_best_parameters": {"window": 10, "fixed": 3},
+        "symbols": ["SPY", "TLT", "GLD"],
+        "best_symbols": ["SPY", "TLT"],
+        "optimization_mode": "risk_parity_universe",
+        "symbol_universes": [["SPY", "TLT"], ["SPY", "GLD"]],
+        "train_period": {
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-01-07T23:59:59+00:00",
+        },
+        "test_period": {
+            "start": "2024-01-08T00:00:00+00:00",
+            "end": "2024-01-10T23:59:59+00:00",
+        },
+        "train_stats": {"sharpe_ratio": 1.2345},
+        "test_stats": {"sharpe_ratio": 0.9876},
+        "top_trials": [
+            {"number": 0, "value": 1.2345, "params": {"window": 10}, "symbols": ["SPY", "TLT"]}
+        ],
+    }
+    (optimizations_dir / "opt_twoway_20260311_100000.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    list_resp = viewer_client.get("/api/optimizations")
+    assert list_resp.status_code == 200
+    listed = list_resp.json()
+    assert len(listed) == 1
+    summary = listed[0]
+    # Old keys present
+    assert summary["train_split_pct"] == 0.7
+    assert summary["test_period"] == payload["test_period"]
+    assert summary["test_stats"] == payload["test_stats"]
+    # New three-way keys NOT present
+    assert "validation_split_pct" not in summary
+    assert "test_split_pct" not in summary
+    assert "validation_period" not in summary
+    assert "validation_stats" not in summary
+    assert "final_test_period" not in summary
+    assert "final_test_stats" not in summary
+    assert "three_way" not in summary
+
+    detail_resp = viewer_client.get("/api/optimizations/opt_twoway_20260311_100000")
     assert detail_resp.status_code == 200
     assert detail_resp.json() == payload
 
@@ -7513,3 +8051,252 @@ def test_viewer_routes_without_response_model_keep_object_schema(path, method):
         f"{method.upper()} {path} lost its object schema: {schema}"
     )
     assert schema.get("additionalProperties") is True
+
+
+def _write_duplicate_portfolio_file(portfolios_dir, portfolio_id: str, created_at: str) -> None:
+    # Only the fields the duplicate fingerprint reads (components, capital).
+    component = {
+        "strategy_name": "Strategy A",
+        "symbol": "AAPL",
+        "timeframe": "1h",
+        "weight": 1.0,
+        "backtest_id": "",
+    }
+    payload = {
+        "id": portfolio_id,
+        "name": "Duplicate Portfolio",
+        "account_capital": 100000.0,
+        "created_at": created_at,
+        "components": [component],
+    }
+    (portfolios_dir / f"{portfolio_id}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _duplicate_group_fake(alive: set[str], created: dict[str, str]):
+    """Fake duplicate-group reader: one fingerprint, the newest live entry is kept.
+
+    ``alive`` and ``created`` are mutated by the test, so each call reflects the
+    group as it is at that moment.
+    """
+
+    def members() -> list[dict]:
+        ordered = sorted(alive, key=lambda item_id: created[item_id], reverse=True)
+        if len(ordered) < 2:
+            return []
+        return [
+            {
+                "id": item_id,
+                "name": "Duplicate",
+                "display_name": "Duplicate",
+                "created_at": created[item_id] + "T00:00:00Z",
+                "fingerprint": "fp1",
+                "kept_id": ordered[0],
+                "is_kept": item_id == ordered[0],
+            }
+            for item_id in ordered
+        ]
+
+    return members
+
+
+_GROUP_CREATED = {"a": "2026-01-03", "b": "2026-01-02", "c": "2026-01-01"}
+
+
+def test_deduplicate_portfolios_confirm_rechecks_each_id_before_delete(
+    viewer_client, monkeypatch, tmp_path
+):
+    """Confirm must not delete the last surviving member of a duplicate group.
+
+    Group A (newest, kept) / B / C. Phase 1 proposes B and C. While B is being
+    deleted, the kept entry A disappears (another tab or maintenance run). By
+    the time C is reached, C is alone, so it is no longer a duplicate and must
+    be skipped, not deleted.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    _write_duplicate_portfolio_file(portfolios_dir, "portfolio-a", "2026-01-03T00:00:00Z")
+    _write_duplicate_portfolio_file(portfolios_dir, "portfolio-b", "2026-01-02T00:00:00Z")
+    _write_duplicate_portfolio_file(portfolios_dir, "portfolio-c", "2026-01-01T00:00:00Z")
+
+    response = viewer_client.post("/api/portfolios/deduplicate")
+    assert response.status_code == 200
+    dry_run_payload = response.json()
+    assert dry_run_payload["kept_ids"] == ["portfolio-a"]
+    assert dry_run_payload["candidate_ids"] == ["portfolio-b", "portfolio-c"]
+
+    real_delete = viewer_app_module._delete_portfolio_with_artifacts
+    deleted: list[str] = []
+
+    def delete_and_remove_kept_on_first_call(portfolio_id):
+        if not deleted:
+            # Concurrent removal of the kept entry between snapshot and delete.
+            (portfolios_dir / "portfolio-a.json").unlink()
+        result = real_delete(portfolio_id)
+        deleted.append(portfolio_id)
+        return result
+
+    monkeypatch.setattr(
+        viewer_app_module, "_delete_portfolio_with_artifacts", delete_and_remove_kept_on_first_call
+    )
+
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": ["portfolio-b", "portfolio-c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["portfolio-b"]
+    assert payload["deleted_ids"] == ["portfolio-b"]
+    assert payload["skipped_ids"] == ["portfolio-c"]
+    assert [item["status"] for item in payload["items"]] == ["deleted", "skipped"]
+    assert payload["items"][1]["reason"] == "no_longer_duplicate"
+    assert (portfolios_dir / "portfolio-c.json").exists()
+
+
+def test_deduplicate_backtests_confirm_rechecks_each_id_before_delete(
+    viewer_client, monkeypatch
+):
+    """Backtest twin of the portfolio re-check test.
+
+    Group A (newest, kept) / B / C. Deleting B also removes A. C is then the
+    only remaining entry and must be skipped, not deleted.
+    """
+    import viewer.main as viewer_app_module
+
+    monkeypatch.setattr(viewer_app_module, "list_portfolio_records", lambda: [])
+    monkeypatch.setattr(viewer_app_module, "delete_portfolio_record", lambda _portfolio_id: False)
+
+    alive = {"a", "b", "c"}
+    monkeypatch.setattr(
+        viewer_app_module,
+        "_duplicate_backtest_members",
+        _duplicate_group_fake(alive, _GROUP_CREATED),
+    )
+    deleted: list[str] = []
+
+    def fake_delete(backtest_id):
+        if not deleted:
+            # Concurrent removal of the kept entry between snapshot and delete.
+            alive.discard("a")
+        alive.discard(backtest_id)
+        deleted.append(backtest_id)
+        return {
+            "id": backtest_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
+
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": ["b", "c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["b"]
+    assert payload["deleted_ids"] == ["b"]
+    assert payload["skipped_ids"] == ["c"]
+    assert payload["items"][1]["reason"] == "no_longer_duplicate"
+    assert "c" in alive
+
+
+def test_deduplicate_backtests_recheck_error_skips_item_and_reports_rest(
+    viewer_client, monkeypatch
+):
+    """A failing re-check fails closed for that id only; earlier deletes are reported.
+
+    Group A (newest, kept) / B / C. B is deleted, then the database read for
+    C's re-check fails. C must be reported ``recheck_failed`` and kept, and the
+    response must still list B as deleted instead of returning a bare 500.
+    """
+    import viewer.main as viewer_app_module
+
+    alive = {"a", "b", "c"}
+    read_group = _duplicate_group_fake(alive, _GROUP_CREATED)
+    reads_broken = False
+
+    def members_or_fail() -> list[dict]:
+        if reads_broken:
+            raise RuntimeError("database is unavailable")
+        return read_group()
+
+    monkeypatch.setattr(viewer_app_module, "_duplicate_backtest_members", members_or_fail)
+    deleted: list[str] = []
+
+    def fake_delete(backtest_id):
+        nonlocal reads_broken
+        alive.discard(backtest_id)
+        deleted.append(backtest_id)
+        reads_broken = True  # the re-check for C (next id) fails
+        return {
+            "id": backtest_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
+
+    monkeypatch.setattr(viewer_app_module, "_delete_backtest_with_artifacts", fake_delete)
+
+    response = viewer_client.post(
+        "/api/backtests/deduplicate",
+        json={"dry_run": False, "ids": ["b", "c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["b"]
+    assert payload["deleted_ids"] == ["b"]
+    assert payload["skipped_ids"] == ["c"]
+    assert payload["items"][1] == {"id": "c", "status": "skipped", "reason": "recheck_failed"}
+    assert "c" in alive
+
+
+def test_deduplicate_portfolios_recheck_error_skips_item_and_reports_rest(
+    viewer_client, monkeypatch
+):
+    """Portfolio twin of the backtest re-check failure test (fail closed per id)."""
+    import viewer.main as viewer_app_module
+
+    alive = {"a", "b", "c"}
+    read_group = _duplicate_group_fake(alive, _GROUP_CREATED)
+    reads_broken = False
+
+    def members_or_fail() -> list[dict]:
+        if reads_broken:
+            raise RuntimeError("portfolio store is unavailable")
+        return read_group()
+
+    monkeypatch.setattr(viewer_app_module, "_duplicate_portfolio_members", members_or_fail)
+    deleted: list[str] = []
+
+    def fake_delete(portfolio_id):
+        nonlocal reads_broken
+        alive.discard(portfolio_id)
+        deleted.append(portfolio_id)
+        reads_broken = True  # the re-check for C (next id) fails
+        return {
+            "id": portfolio_id,
+            "status": "deleted",
+            "database": "deleted",
+            "artifact": "deleted",
+        }
+
+    monkeypatch.setattr(viewer_app_module, "_delete_portfolio_with_artifacts", fake_delete)
+
+    response = viewer_client.post(
+        "/api/portfolios/deduplicate",
+        json={"dry_run": False, "ids": ["b", "c"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert deleted == ["b"]
+    assert payload["deleted_ids"] == ["b"]
+    assert payload["skipped_ids"] == ["c"]
+    assert payload["items"][1] == {"id": "c", "status": "skipped", "reason": "recheck_failed"}
+    assert "c" in alive

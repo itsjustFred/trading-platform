@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 import socket
 import ssl
 import struct
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -18,7 +20,7 @@ from live_runner.alpaca_adapter import (
     _default_alpaca_credentials,
 )
 from live_runner.base_adapter import money_digits_from_trader, money_scale
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import load_accounts_env_values, resolve_accounts_env_path
 from shared.logging import get_logger
 from shared.models import LiveAccount
 
@@ -52,6 +54,71 @@ _PROTO_OA_CTID_TRADER_ACCOUNT_REQ: Any = None
 _PROTO_OA_CTID_TRADER_ACCOUNT_RES: Any = None
 
 
+# Reactor implementation modules Twisted can install as an import side effect of
+# ``twisted.internet.reactor``. ``twisted.internet.default._getInstallFunction`` picks one
+# per platform (epollreactor on Linux, pollreactor on other POSIX, selectreactor on
+# Windows and macOS, iocp/kqueue/cf reactors only on request), so the sweep below must not
+# name a single platform. ``twisted.internet.asyncioreactor`` is deliberately absent:
+# importing it installs nothing, and it is the reactor the live adapter installs itself.
+_PLATFORM_REACTOR_MODULE_PREFIX = "twisted.internet."
+_PLATFORM_REACTOR_MODULE_SUFFIX = "reactor"
+_KEPT_REACTOR_MODULES = frozenset({"twisted.internet.asyncioreactor"})
+# ctrader_open_api modules that capture ``twisted.internet.reactor`` at import time.
+_REACTOR_BOUND_CTRADER_MODULES = ("ctrader_open_api", "ctrader_open_api.client")
+
+
+def _is_platform_reactor_module(name: str) -> bool:
+    """True for a module that installs the platform default Twisted reactor."""
+    return (
+        name.startswith(_PLATFORM_REACTOR_MODULE_PREFIX)
+        and name.endswith(_PLATFORM_REACTOR_MODULE_SUFFIX)
+        and name not in _KEPT_REACTOR_MODULES
+    )
+
+
+@contextlib.contextmanager
+def _without_installed_reactor():
+    """Import ``ctrader_open_api`` without leaving a Twisted reactor installed.
+
+    The package ``__init__`` imports ``twisted.internet.reactor``, which installs the
+    platform default reactor (epoll on Linux, poll on other POSIX, select on Windows and
+    macOS) as an import side effect. Discovery only needs the protobuf messages, and a
+    pre-installed reactor makes a later ``CTraderLiveAdapter.connect`` in the same process
+    fail. If no reactor was installed before the import, remove the one the import
+    installed -- the platform reactor module it added, the reactor entry it put in
+    ``sys.modules`` and the ``twisted.internet.reactor`` attribute it set, because
+    ``from twisted.internet import reactor`` falls back to that attribute.
+    """
+    had_reactor = "twisted.internet.reactor" in sys.modules
+    before = frozenset(sys.modules)
+    try:
+        yield
+    finally:
+        # No early ``return`` here: a ``return`` in ``finally`` discards the in-flight
+        # exception (ImportError, KeyboardInterrupt) raised inside the ``with`` body.
+        if not had_reactor:
+            _sweep_installed_reactor(before)
+
+
+def _sweep_installed_reactor(before: frozenset[str]) -> None:
+    """Undo the reactor installation a just-finished import caused."""
+    for name in sorted(sys.modules):
+        if name not in before and _is_platform_reactor_module(name):
+            sys.modules.pop(name, None)
+    twisted_internet = sys.modules.get("twisted.internet")
+    if twisted_internet is not None and hasattr(twisted_internet, "reactor"):
+        delattr(twisted_internet, "reactor")
+    # ``ctrader_open_api.client`` does ``from twisted.internet import reactor`` at module
+    # level and keeps that reactor as ``Client._runningReactor``. Left cached it stays bound
+    # to the reactor swept above, so a Client built after the adapter installs the asyncio
+    # reactor would run on a dead reactor. Dropping the package and ``client`` makes the
+    # next import re-execute them. The protobuf message modules are kept on purpose:
+    # re-executing them would register their descriptors in the pool a second time.
+    for name in _REACTOR_BOUND_CTRADER_MODULES:
+        if name not in before:
+            sys.modules.pop(name, None)
+
+
 def _load_ctrader_protocol() -> None:
     global _OpenApiMessages_pb2
     global _ProtoHeartbeatEvent
@@ -71,23 +138,24 @@ def _load_ctrader_protocol() -> None:
     if _Protobuf is not None:
         return
     try:
-        from ctrader_open_api import Protobuf
-        from ctrader_open_api.messages import OpenApiMessages_pb2
-        from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
-            ProtoHeartbeatEvent,
-            ProtoMessage,
-        )
-        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-            ProtoOAAccountAuthReq,
-            ProtoOAAccountAuthRes,
-            ProtoOAApplicationAuthReq,
-            ProtoOAApplicationAuthRes,
-            ProtoOAErrorRes,
-            ProtoOAGetAccountListByAccessTokenReq,
-            ProtoOAGetAccountListByAccessTokenRes,
-            ProtoOATraderReq,
-            ProtoOATraderRes,
-        )
+        with _without_installed_reactor():
+            from ctrader_open_api import Protobuf
+            from ctrader_open_api.messages import OpenApiMessages_pb2
+            from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import (
+                ProtoHeartbeatEvent,
+                ProtoMessage,
+            )
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOAAccountAuthReq,
+                ProtoOAAccountAuthRes,
+                ProtoOAApplicationAuthReq,
+                ProtoOAApplicationAuthRes,
+                ProtoOAErrorRes,
+                ProtoOAGetAccountListByAccessTokenReq,
+                ProtoOAGetAccountListByAccessTokenRes,
+                ProtoOATraderReq,
+                ProtoOATraderRes,
+            )
     except ImportError as exc:
         raise CTraderUnavailableError(
             "cTrader account discovery requires the optional ctrader extra."
@@ -172,15 +240,15 @@ def _iter_alpaca_credentials(env: dict[str, str]) -> list[dict[str, Any]]:
     with, so is_demo can never contradict the actual trading mode.
     """
     indexed: list[dict[str, Any]] = []
-    for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env)):
-        indexed.append(
-            {
-                "key": str(block.get("source_index", "")),
-                "api_key": str(block["api_key"]),
-                "secret_key": str(block["secret_key"]),
-                "paper": bool(block["paper"]),
-            }
-        )
+    indexed.extend(
+        {
+            "key": str(block.get("source_index", "")),
+            "api_key": str(block["api_key"]),
+            "secret_key": str(block["secret_key"]),
+            "paper": bool(block["paper"]),
+        }
+        for block in _alpaca_credential_blocks(env, _alpaca_acc_indexes(env))
+    )
 
     if indexed:
         return indexed
@@ -315,9 +383,7 @@ def _ctrader_message_name_sources(message: Any) -> list[Any]:
         if isinstance(nested, (str, bytes, bytearray)):
             continue
         try:
-            for item in nested:
-                if item is not None:
-                    sources.append(item)
+            sources.extend(item for item in nested if item is not None)
         except TypeError:
             sources.append(nested)
     return sources
@@ -424,11 +490,11 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
             )
             if isinstance(payload, dict):
                 return payload
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
     if not hasattr(message, "ListFields"):
         return {}
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {}  # type: ignore[no-redef]  # same name intentionally reused for the fallback payload
     for descriptor, value in message.ListFields():
         field_name = str(descriptor.name)
         if descriptor.label == descriptor.LABEL_REPEATED:
@@ -656,7 +722,7 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
             },
         )
         raise _CtraderStreamError(str(exc)) from exc
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         logger.debug(
             "Optional cTrader account detail request failed",
             extra={
@@ -785,7 +851,7 @@ def _build_ctrader_live_account(
         _load_ctrader_trader_details(ctx, account_id)
     except _CtraderStreamError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         error_text = repr(exc)
         if _handle_ctrader_trader_error(error_text, host, account_id) == "skip":
             return None
@@ -850,7 +916,7 @@ async def discover_ctrader_accounts(
                 app_secret=app_secret,
                 access_token=access_token,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             error_text = repr(exc)
             if _is_expected_ctrader_host_route_error(error_text):
                 logger.info(
@@ -883,11 +949,13 @@ async def discover_ctrader_accounts(
 
 
 async def discover_configured_accounts(
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
 ) -> list[LiveAccount]:
     # File-first precedence: .accounts.env wins over the process environment.
     # Discovery also must not mutate os.environ (no load_dotenv side effects).
-    env = load_accounts_env_values(accounts_env)
+    env = load_accounts_env_values(
+        resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
+    )
 
     discovered_accounts: dict[tuple[str, str], LiveAccount] = {}
 
@@ -912,7 +980,7 @@ async def discover_configured_accounts(
                     }
                 },
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping cTrader account discovery because of runtime error",
                 extra={"data": {"error": repr(exc)}},
@@ -925,7 +993,7 @@ async def discover_configured_accounts(
                 credentials["secret_key"],
                 bool(credentials["paper"]),
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping Alpaca account discovery for credential block",
                 extra={
