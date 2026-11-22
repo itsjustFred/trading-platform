@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -40,6 +41,8 @@ __all__ = [
     "align_sleeve_returns",
     "load_sleeve_returns",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -158,11 +161,14 @@ def align_sleeve_returns(
 ) -> SleeveReturns:
     """Align per-sleeve calendar-day return series on one business-day calendar.
 
-    ``returns`` maps sleeve id -> a Series (or array-like) of daily simple
-    returns indexed by datetime. ``metadata`` optionally supplies provenance;
+    ``returns`` maps sleeve id -> a Series indexed by a DatetimeIndex of
+    daily simple returns. ``metadata`` optionally supplies provenance;
     missing entries get a metadata record derived from the sleeve id.
     Business days with no observation for ANY sleeve are dropped from the
-    calendar; per-sleeve gaps stay ``NaN``.
+    calendar; per-sleeve gaps stay ``NaN`` — including non-weekend gaps
+    (holidays, feed outages): alignment cannot distinguish them from
+    trading halts, so a two-week gap contributes its adjacent observed
+    returns as ordinary one-day moves rather than a multi-day return.
     """
     if not returns:
         return SleeveReturns(returns=pd.DataFrame(), metadata={})
@@ -172,6 +178,12 @@ def align_sleeve_returns(
         series = pd.Series(raw, dtype=float)
         if series.empty:
             continue
+        if not isinstance(series.index, pd.DatetimeIndex):
+            raise ValueError(
+                f"sleeve {sleeve_id!r}: return series needs a datetime index "
+                f"(got {type(series.index).__name__}); pass a Series with a "
+                "DatetimeIndex, not a plain list or RangeIndex"
+            )
         try:
             parsed_index = pd.to_datetime(series.index, utc=True)
         except (TypeError, ValueError) as exc:
@@ -228,9 +240,6 @@ def _default_metadata(sleeve_id: str) -> SleeveMetadata:
 # ---------------------------------------------------------------------------
 # matrix_daily_equity.csv
 # ---------------------------------------------------------------------------
-
-_MATRIX_FIELDS = ("strategy", "symbol", "timeframe", "run_id", "time", "equity", "daily_return")
-
 
 def _read_matrix_csv(path: Path) -> dict[str, dict[str, Any]]:
     """Group matrix daily-equity rows into per-sleeve observation lists."""
@@ -299,7 +308,11 @@ def _load_matrix_summary_trades(path: Path | str | None) -> dict[str, int]:
         return {}
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("matrix summary %s unreadable, trade counts skipped: %s", path, exc)
+        return {}
+    if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
+        logger.warning("matrix summary %s has no 'runs' list, trade counts skipped", path)
         return {}
     trades: dict[str, int] = {}
     for row in payload.get("runs") or []:
@@ -320,10 +333,19 @@ def _load_matrix_summary_trades(path: Path | str | None) -> dict[str, int]:
 def _equity_point_time(value: Any) -> pd.Timestamp | None:
     if isinstance(value, bool):
         return None
-    try:
-        parsed = pd.to_datetime(value, utc=True, errors="coerce")
-    except (TypeError, ValueError, OverflowError):
-        return None
+    if isinstance(value, (int, float)):
+        # runner.walkforward writes OOS points as int Unix SECONDS; letting
+        # pandas guess would read them as nanoseconds and collapse the
+        # curve to 1970, silently dropping the sleeve.
+        try:
+            parsed = pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        try:
+            parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        except (TypeError, ValueError, OverflowError):
+            return None
     if pd.isna(parsed):
         return None
     return pd.Timestamp(parsed)
@@ -478,7 +500,11 @@ def load_sleeve_returns(
         ``oos_equity_curve`` fold segments are read — train folds and
         in-sample stats are ignored by construction.
     trade_counts:
-        Optional explicit ``sleeve_id -> trade count`` overrides, applied last.
+        Optional explicit ``sleeve_id -> trade count`` overrides, applied
+        last. For walk-forward sleeves an override is authoritative: it
+        replaces the fold ``trade_periods`` as well, so the sleeve carries
+        a single ``total_trades`` basis — a full-sample figure under
+        ``as_of`` that eligibility rejects unless the caller opts in.
 
     Sleeve ids are ``strategy|symbol|timeframe``. Collisions between sources
     (e.g. the same strategy in a matrix run and a walk-forward run) are
@@ -521,6 +547,13 @@ def load_sleeve_returns(
         base_id = str(info["sleeve_id"])
         sleeve_id = _unique_sleeve_id(base_id, used_ids)
         trades = overrides.get(sleeve_id, info["total_trades"])
+        trade_periods = info["trade_periods"]
+        if sleeve_id in overrides:
+            # An explicit trade-count override is authoritative: it replaces
+            # the fold periods too, so eligibility sees ONE total_trades
+            # basis (full-sample under as_of) instead of silently preferring
+            # the periods the override was meant to replace.
+            trade_periods = ()
         metadata_map[sleeve_id] = SleeveMetadata(
             sleeve_id=sleeve_id,
             strategy=info["strategy"],
@@ -529,7 +562,7 @@ def load_sleeve_returns(
             source="walkforward",
             source_path=info["source_path"],
             total_trades=trades,
-            trade_periods=info["trade_periods"],
+            trade_periods=trade_periods,
             extra={"deduplicated_from": base_id} if sleeve_id != base_id else {},
         )
         series_map[sleeve_id] = info["series"]

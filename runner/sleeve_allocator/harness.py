@@ -14,14 +14,16 @@ such, not absent.
 
 Known phase-1 limitations (documented, not hidden):
 
-* ``total_trades``-only sleeves use a full-sample trade count for the
-  ``min_trades`` check even under ``as_of`` (see ``eligibility``); sleeves
-  with ``trade_periods`` are evaluated strictly point-in-time.
+* ``total_trades``-only sleeves are rejected at point-in-time rebalances
+  unless the caller opts into ``allow_full_sample_trade_counts`` — the
+  count is full-sample (future-inclusive) evidence (see ``eligibility``);
+  sleeves with ``trade_periods`` are evaluated strictly point-in-time.
 * Sleeve-day ``NaN`` is treated as flat (0% contribution) when APPLYING
   weights — correct for market holidays, since the equity genuinely did not
   move; estimation statistics stay pairwise-complete and never see the fill.
-* Metrics use the platform's sqrt(252) daily annualisation (#229 caveat
-  applies to every Sharpe number in the repo).
+* Metrics annualise at the measured observation density (#349's
+  convention), falling back to sqrt(252) only when the density cannot
+  be measured.
 """
 from __future__ import annotations
 
@@ -106,11 +108,32 @@ def _equity_from_returns(returns: pd.Series) -> pd.Series:
     )
 
 
+def _return_periods_per_year(returns: pd.Series) -> float:
+    """Measured observation density: return observations per calendar year.
+
+    Mirrors ``runner.stats._return_periods_per_year`` (#349): a
+    calendar-filled curve observes ~365.25 rows a year, a business-day
+    curve ~261, so annualising at a fixed sqrt(252) understates both
+    Sharpe and the ``ann_return``/``ann_volatility`` figures. The span is
+    first-to-last observation plus one day bucket; series too short to
+    measure fall back to the platform's ``DAILY_RETURN_PERIODS_PER_YEAR``.
+    """
+    index = returns.index
+    if not isinstance(index, pd.DatetimeIndex) or len(returns) < 2:
+        return float(DAILY_RETURN_PERIODS_PER_YEAR)
+    span_days = (index[-1] - index[0]).total_seconds() / 86400.0 + 1.0
+    if span_days <= 0:
+        return float(DAILY_RETURN_PERIODS_PER_YEAR)
+    return float(len(returns)) * 365.25 / span_days
+
+
 def curve_metrics(returns: pd.Series) -> dict[str, Any]:
     """Standard metrics for one chained daily-return series.
 
-    Sharpe/volatility annualise with sqrt(252) — the platform convention
-    (``runner.stats.DAILY_RETURN_PERIODS_PER_YEAR``); #229 caveats apply.
+    Sharpe/volatility/annualised return use the measured observation
+    density (``_return_periods_per_year``, the #349 convention) rather
+    than a fixed sqrt(252); series too short to measure fall back to
+    ``runner.stats.DAILY_RETURN_PERIODS_PER_YEAR``.
     """
     n = int(len(returns))
     metrics: dict[str, Any] = {"n_days": n}
@@ -126,12 +149,13 @@ def curve_metrics(returns: pd.Series) -> dict[str, Any]:
         metrics.update({key: None for key in keys})
         return metrics
 
+    periods_per_year = _return_periods_per_year(returns)
     equity = _equity_from_returns(returns)
     final = float(equity.iloc[-1])
     metrics["final_equity"] = final
     metrics["total_return"] = final - 1.0
     metrics["ann_return"] = (
-        float(final ** (DAILY_RETURN_PERIODS_PER_YEAR / n) - 1.0) if final > 0 else None
+        float(final ** (periods_per_year / n) - 1.0) if final > 0 else None
     )
     peak = equity.cummax()
     drawdown = (peak - equity) / peak.replace(0.0, np.nan)
@@ -139,9 +163,9 @@ def curve_metrics(returns: pd.Series) -> dict[str, Any]:
     if n > 1:
         std = float(returns.std(ddof=1))
         mean = float(returns.mean())
-        metrics["ann_volatility"] = std * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+        metrics["ann_volatility"] = std * math.sqrt(periods_per_year)
         metrics["sharpe"] = (
-            mean / std * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR) if std > 0 else 0.0
+            mean / std * math.sqrt(periods_per_year) if std > 0 else 0.0
         )
     else:
         metrics["ann_volatility"] = None

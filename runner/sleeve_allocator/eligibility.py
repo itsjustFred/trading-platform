@@ -39,7 +39,7 @@ __all__ = ["EligibilityConfig", "EligibilityResult", "filter_eligible_sleeves"]
 class EligibilityConfig:
     """Thresholds for sleeve admission. Defaults follow the issue text."""
 
-    min_history_days: int = 504  # ~2y of calendar-day span
+    min_history_days: int = 730  # ~2y of calendar-day span
     min_trades: int = 100
     ruin_equity_floor: float = 0.01  # min running equity ratio <= floor => ruined
     min_coverage: float = 0.0  # optional: fraction of calendar days observed

@@ -337,10 +337,12 @@ def test_eligibility_as_of_uses_only_prior_data():
     df.loc[late, "sma|EURUSD|1h"] = -0.10
     sr = _synthetic_sleeve_returns(df)
     early = filter_eligible_sleeves(
-        sr, EligibilityConfig(ruin_equity_floor=0.01), as_of=pd.Timestamp("2023-01-02")
+        sr,
+        EligibilityConfig(min_history_days=0, ruin_equity_floor=0.01),
+        as_of=pd.Timestamp("2023-01-02"),
     )
     late_check = filter_eligible_sleeves(
-        sr, EligibilityConfig(ruin_equity_floor=0.01)
+        sr, EligibilityConfig(min_history_days=0, ruin_equity_floor=0.01)
     )
     assert "sma|EURUSD|1h" in early.eligible
     assert "ruined" in late_check.rejected.get("sma|EURUSD|1h", ())
@@ -758,7 +760,11 @@ def test_estimation_window_is_bounded_to_lookback_days():
     sr = _synthetic_sleeve_returns(
         df.rename(columns={"a|X|1d": "sma|EURUSD|1h", "b|X|1d": "rsi|XAUUSD|4h"})
     )
-    cfg = AllocationConfig(lookback_days=60, objectives=("inverse_vol",))
+    cfg = AllocationConfig(
+        lookback_days=60,
+        objectives=("inverse_vol",),
+        eligibility=EligibilityConfig(min_history_days=0),
+    )
     result = walk_forward_allocation(sr, cfg)
     rebs = result.rebalances["inverse_vol"]
     assert rebs
@@ -1004,3 +1010,330 @@ def test_cli_requires_matrix_is_oos_acknowledgement(tmp_path):
     with pytest.raises(SystemExit):
         main(["--matrix-csv", str(csv_path), "--output", str(out)])
     assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Review bundle 32: metric correctness, eligibility boundaries, loader edges
+# ---------------------------------------------------------------------------
+
+
+def test_curve_metrics_hand_computed_values():
+    """Every headline metric hand-computed on a small deterministic series."""
+    from runner.sleeve_allocator import curve_metrics
+
+    index = pd.bdate_range("2024-01-01", periods=60)
+    returns = pd.Series(
+        [0.01, -0.005] * 30, index=index, dtype=float, name="p"
+    )
+    metrics = curve_metrics(returns)
+
+    equity = (1.0 + returns).cumprod()
+    expected_final = float(equity.iloc[-1])
+    assert metrics["final_equity"] == pytest.approx(expected_final)
+    assert metrics["total_return"] == pytest.approx(expected_final - 1.0)
+
+    # Measured density: 60 returns over 60 business days (~84 calendar days).
+    span_days = (index[-1] - index[0]).days + 1
+    ppy = 60 * 365.25 / span_days
+    assert metrics["ann_return"] == pytest.approx(
+        expected_final ** (ppy / 60) - 1.0
+    )
+    std = float(returns.std(ddof=1))
+    mean = float(returns.mean())
+    assert metrics["ann_volatility"] == pytest.approx(std * np.sqrt(ppy))
+    assert metrics["sharpe"] == pytest.approx(mean / std * np.sqrt(ppy))
+
+    peak = equity.cummax()
+    drawdown = ((peak - equity) / peak).max()
+    assert metrics["max_drawdown"] == pytest.approx(float(drawdown))
+    assert metrics["n_days"] == 60
+
+
+def test_curve_metrics_known_ten_percent_year_reports_ten_percent():
+    """Blocker 1: a business-day curve compounding to exactly +10%/yr
+    (261 observations over ~1y, the align_sleeve_returns calendar) must
+    report ~10%, not the sqrt(252)-vs-261-row 9.64% artefact."""
+    from runner.sleeve_allocator import curve_metrics
+
+    index = pd.bdate_range("2023-01-02", "2023-12-29")
+    n = len(index)
+    daily = 1.10 ** (1.0 / n) - 1.0
+    returns = pd.Series([daily] * n, index=index, dtype=float)
+    metrics = curve_metrics(returns)
+    assert metrics["total_return"] == pytest.approx(0.10, abs=1e-9)
+    # abs=2e-3: the old sqrt(252) formula reports 0.0964 (fails); measured
+    # density reports ~0.1001 (passes).
+    assert metrics["ann_return"] == pytest.approx(0.10, abs=2e-3)
+
+
+def test_curve_metrics_empty_and_singleton_series():
+    from runner.sleeve_allocator import curve_metrics
+
+    empty = curve_metrics(pd.Series(dtype=float))
+    assert empty["n_days"] == 0
+    assert empty["ann_return"] is None and empty["sharpe"] is None
+
+    single = curve_metrics(
+        pd.Series([0.01], index=pd.DatetimeIndex(["2024-01-02"]))
+    )
+    assert single["n_days"] == 1
+    assert single["sharpe"] is None and single["ann_volatility"] is None
+    assert single["ann_return"] == pytest.approx(
+        1.01 ** (252.0 / 1) - 1.0
+    )  # unmeasurable density -> 252 fallback
+
+
+def test_eligibility_min_history_days_boundary_is_inclusive():
+    """min_history_days is a >= threshold: span == threshold admits."""
+    start = "2022-01-03"  # Monday
+    end = pd.Timestamp(start) + pd.Timedelta(days=730)
+    index = pd.bdate_range(start, end)
+    span = int((index[-1] - index[0]).days)
+    df = pd.DataFrame({"a|X|1d": np.full(len(index), 0.001)}, index=index)
+    sr = align_sleeve_returns({"a|X|1d": df["a|X|1d"]}, metadata={"a|X|1d": _meta("a|X|1d")})
+    cfg = EligibilityConfig(min_history_days=span, min_trades=0)
+    assert "a|X|1d" in filter_eligible_sleeves(sr, cfg).eligible
+    cfg_strict = EligibilityConfig(min_history_days=span + 1, min_trades=0)
+    assert "insufficient_history" in filter_eligible_sleeves(
+        sr, cfg_strict
+    ).rejected["a|X|1d"]
+
+
+def test_eligibility_min_trades_boundary_is_inclusive():
+    index = pd.bdate_range("2021-01-04", periods=400)
+    df = pd.DataFrame({"a|X|1d": np.full(400, 0.001)}, index=index)
+    periods = (TradePeriod(start="2020-01-01", end="2024-12-31", trades=100),)
+    sr = align_sleeve_returns(
+        {"a|X|1d": df["a|X|1d"]},
+        metadata={"a|X|1d": _meta("a|X|1d", trade_periods=periods)},
+    )
+    cfg = EligibilityConfig(min_history_days=0, min_trades=100)
+    assert "a|X|1d" in filter_eligible_sleeves(sr, cfg).eligible
+    cfg_strict = EligibilityConfig(min_history_days=0, min_trades=101)
+    assert "insufficient_trades" in filter_eligible_sleeves(
+        sr, cfg_strict
+    ).rejected["a|X|1d"]
+
+
+def test_eligibility_min_coverage_rejects_sparse_sleeve():
+    """min_coverage is the observed/calendar fraction of the shared frame."""
+    index = pd.bdate_range("2021-01-04", periods=400)
+    dense = np.full(400, 0.001)
+    sparse = np.full(400, np.nan)
+    sparse[:100] = 0.001  # only 25% of the calendar observed
+    df = pd.DataFrame({"dense|X|1d": dense, "sparse|X|1d": sparse}, index=index)
+    sr = align_sleeve_returns(
+        {c: df[c] for c in df.columns},
+        metadata={c: _meta(c) for c in df.columns},
+    )
+    cfg = EligibilityConfig(min_history_days=0, min_trades=0, min_coverage=0.5)
+    result = filter_eligible_sleeves(sr, cfg)
+    assert "insufficient_coverage" in result.rejected["sparse|X|1d"]
+    assert "dense|X|1d" in result.eligible
+
+
+def test_harness_admits_rebalance_when_window_equals_lookback():
+    """A rebalance is NOT skipped when the lookback window is exactly full:
+    the skip condition is ``len(window) < lookback``, so equality admits."""
+    rng = np.random.default_rng(4)
+    index = pd.bdate_range("2021-01-04", periods=560)
+    df = pd.DataFrame(
+        {"a|X|1d": rng.normal(0.0005, 0.005, 560), "b|X|1d": rng.normal(0, 0.01, 560)},
+        index=index,
+    )
+    sr = align_sleeve_returns(
+        {c: df[c] for c in df.columns},
+        metadata={c: _meta(c) for c in df.columns},
+    )
+    cfg = AllocationConfig(
+        lookback_days=252,
+        objectives=("equal_weight",),
+        eligibility=EligibilityConfig(min_history_days=0, min_trades=0),
+    )
+    result = walk_forward_allocation(sr, cfg)
+    # Early month-ends have < 252 prior observations and are skipped; the
+    # first month-end with exactly 252 prior business days must be admitted
+    # (not skipped for being one short).
+    assert result.report["skipped_rebalances"] >= 1
+    assert result.rebalances["equal_weight"], "expected at least one rebalance"
+
+
+def test_loader_dedup_suffix_when_matrix_and_walkforward_share_id(tmp_path):
+    """A matrix sleeve and a walk-forward sleeve with the same
+    strategy|symbol|timeframe get deterministic ~N suffixes."""
+    csv_path = tmp_path / "m.csv"
+    days = pd.bdate_range("2024-01-01", periods=5)
+    import csv as csv_mod
+
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv_mod.DictWriter(
+            fh,
+            fieldnames=[
+                "strategy", "symbol", "timeframe", "run_id", "time",
+                "equity", "daily_return",
+            ],
+        )
+        writer.writeheader()
+        for day in days:
+            writer.writerow(
+                {
+                    "strategy": "sma", "symbol": "EURUSD", "timeframe": "1h",
+                    "run_id": "r1", "time": day.isoformat(),
+                    "equity": 100000.0, "daily_return": 0.001,
+                }
+            )
+    wf = {
+        "mode": "strategy", "strategy": "sma", "symbols": ["EURUSD"],
+        "timeframe": "1h",
+        "folds": [{
+            "fold": 1, "test_start": "2024-02-01", "test_end": "2024-02-02",
+            "oos_stats": {"total_trades": 7},
+            "oos_equity_curve": [
+                {"time": "2024-02-01T00:00:00Z", "equity": 100000.0},
+                {"time": "2024-02-02T00:00:00Z", "equity": 101000.0},
+            ],
+        }],
+    }
+    wf_path = tmp_path / "wf.json"
+    wf_path.write_text(json.dumps(wf), encoding="utf-8")
+
+    result = load_sleeve_returns(matrix_csv=csv_path, walkforward_paths=[wf_path])
+    assert set(result.returns.columns) == {"sma|EURUSD|1h", "sma|EURUSD|1h~2"}
+    assert result.metadata["sma|EURUSD|1h"].source == "matrix"
+    assert result.metadata["sma|EURUSD|1h~2"].source == "walkforward"
+    assert result.metadata["sma|EURUSD|1h~2"].extra["deduplicated_from"] == "sma|EURUSD|1h"
+
+
+def test_loader_drops_business_days_where_every_sleeve_is_nan():
+    """A business day inside the span with no observation for ANY sleeve is
+    dropped from the calendar rather than published as an all-NaN row."""
+    # Two disjoint observation windows: gap of business days in between.
+    first = pd.bdate_range("2024-01-01", periods=5)
+    second = pd.bdate_range("2024-02-01", periods=5)
+    index = first.append(second)
+    series = pd.Series(np.full(len(index), 0.001), index=index)
+    result = align_sleeve_returns({"a|X|1d": series})
+    # Only the 10 observed business days survive; the January gap days and
+    # the weekend are gone.
+    assert len(result.returns) == 10
+    assert result.returns.index.equals(pd.DatetimeIndex(sorted(index)))
+
+
+def test_loader_duplicate_dates_keep_last_value():
+    index = pd.to_datetime(
+        ["2024-01-02", "2024-01-02", "2024-01-03"], utc=True
+    )
+    series = pd.Series([0.01, 0.05, 0.02], index=index)
+    result = align_sleeve_returns({"a|X|1d": series})
+    out = result.returns["a|X|1d"].dropna()
+    assert out.loc[pd.Timestamp("2024-01-02")] == pytest.approx(0.05)
+    assert out.loc[pd.Timestamp("2024-01-03")] == pytest.approx(0.02)
+
+
+def test_cli_with_no_inputs_errors(tmp_path):
+    from runner.sleeve_allocator.cli import main
+
+    out = tmp_path / "report.json"
+    with pytest.raises(SystemExit):
+        main(["--output", str(out)])
+    assert not out.exists()
+
+
+def test_walkforward_loader_numeric_time_is_unix_seconds(tmp_path):
+    """runner.walkforward emits int Unix-second `time` values; they must not
+    collapse to 1970 via pandas' nanosecond default."""
+    t0 = int(pd.Timestamp("2023-01-02", tz="UTC").timestamp())
+    t1 = int(pd.Timestamp("2023-01-03", tz="UTC").timestamp())
+    payload = {
+        "mode": "strategy", "strategy": "x.py", "symbols": ["EURUSD"],
+        "timeframe": "1h",
+        "folds": [{
+            "fold": 1, "test_start": "2023-01-02", "test_end": "2023-01-03",
+            "oos_stats": {"total_trades": 2},
+            "oos_equity_curve": [
+                {"time": t0, "equity": 100000.0},
+                {"time": t1, "equity": 101000.0},
+            ],
+        }],
+    }
+    path = tmp_path / "wf_unix.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    result = load_sleeve_returns(walkforward_paths=[path])
+    assert not result.returns.empty
+    sleeve = result.returns["x|EURUSD|1h"].dropna()
+    assert sleeve.index.min() >= pd.Timestamp("2023-01-01")
+    assert sleeve.loc[pd.Timestamp("2023-01-03")] == pytest.approx(0.01)
+
+
+def test_trade_counts_override_is_authoritative_over_fold_periods(tmp_path):
+    """An explicit trade_counts override replaces the walk-forward fold
+    trade_periods: eligibility sees ONE total_trades basis, so under as_of
+    the sleeve is rejected as full-sample rather than silently keeping the
+    per-period counts the override was meant to replace."""
+    payload = {
+        "mode": "strategy", "strategy": "x.py", "symbols": ["EURUSD"],
+        "timeframe": "1h",
+        "folds": [{
+            "fold": 1, "test_start": "2023-01-02", "test_end": "2023-06-30",
+            "oos_stats": {"total_trades": 500},
+            "oos_equity_curve": [
+                {"time": "2023-01-02T00:00:00Z", "equity": 100000.0},
+                {"time": "2023-06-30T00:00:00Z", "equity": 101000.0},
+            ],
+        }],
+    }
+    path = tmp_path / "wf_override.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # Without override: periods basis -> counted point-in-time.
+    plain = load_sleeve_returns(walkforward_paths=[path])
+    assert plain.metadata["x|EURUSD|1h"].trade_periods
+
+    # With override: periods gone, single total_trades basis.
+    over = load_sleeve_returns(
+        walkforward_paths=[path], trade_counts={"x|EURUSD|1h": 42}
+    )
+    meta = over.metadata["x|EURUSD|1h"]
+    assert meta.trade_periods == ()
+    assert meta.total_trades == 42
+
+    cfg = EligibilityConfig(min_history_days=0, min_trades=1)
+    as_of = pd.Timestamp("2023-07-15")
+    strict = filter_eligible_sleeves(over, cfg, as_of=as_of)
+    assert "trades_unknown_as_of" in strict.rejected["x|EURUSD|1h"]
+
+
+def test_align_sleeve_returns_rejects_non_datetime_index():
+    with pytest.raises(ValueError, match="datetime index"):
+        align_sleeve_returns({"a|X|1d": pd.Series([0.01, 0.02])})
+
+
+def test_matrix_summary_unreadable_logs_warning(tmp_path, caplog):
+    import logging
+
+    csv_path = tmp_path / "m.csv"
+    import csv as csv_mod
+
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv_mod.DictWriter(
+            fh,
+            fieldnames=[
+                "strategy", "symbol", "timeframe", "run_id", "time",
+                "equity", "daily_return",
+            ],
+        )
+        writer.writeheader()
+        for day in pd.bdate_range("2024-01-01", periods=3):
+            writer.writerow(
+                {
+                    "strategy": "sma", "symbol": "EURUSD", "timeframe": "1h",
+                    "run_id": "r1", "time": day.isoformat(),
+                    "equity": 100000.0, "daily_return": 0.001,
+                }
+            )
+    bad = tmp_path / "summary.json"
+    bad.write_text("not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="runner.sleeve_allocator.loader"):
+        result = load_sleeve_returns(matrix_csv=csv_path, matrix_summary=bad)
+    assert any("unreadable" in r.message for r in caplog.records)
+    assert result.metadata["sma|EURUSD|1h"].total_trades is None

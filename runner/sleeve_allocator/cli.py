@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="output JSON report path")
     parser.add_argument("--lookback-days", type=int, default=252,
                         help="estimation window in business days")
-    parser.add_argument("--min-history-days", type=int, default=504)
+    parser.add_argument("--min-history-days", type=int, default=730)
     parser.add_argument("--min-trades", type=int, default=100)
     parser.add_argument("--ruin-equity-floor", type=float, default=0.01)
     parser.add_argument("--allow-full-sample-trade-counts", action="store_true",

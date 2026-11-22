@@ -29,17 +29,23 @@ of simple returns plus per-sleeve `SleeveMetadata`.
 
 ## Calendar contract
 
+`trade_counts` overrides the loaded `total_trades` — and, for walk-forward
+sleeves, replaces the fold `trade_periods` so the override is the single
+authoritative count basis.
+
 All sleeves share one Monday–Friday calendar. Saturday/Sunday observations
 compound into the next business day (Monday), so weekend P&L of 24/7 sleeves
 lands on Monday instead of being dropped. Business days a sleeve did not
 observe stay `NaN` — never zero-filled (the #229 failure mode). Applying
 weights treats an unobserved sleeve-day as flat; estimation statistics stay
-pairwise-complete.
+pairwise-complete. Non-weekend gaps (holidays, feed outages) are NOT
+compounded: returns before and after the gap are adjacent one-day moves,
+since alignment cannot distinguish a gap from a trading halt.
 
 ## Eligibility
 
 `filter_eligible_sleeves(sleeve_returns, config, as_of=...)` admits a sleeve
-only with: history span ≥ `min_history_days` (default 504 ≈ 2y),
+only with: history span ≥ `min_history_days` (default 730 ≈ 2y),
 `total_trades`/period trades ≥ `min_trades` (default 100), and no ruin
 (minimum running equity ratio > `ruin_equity_floor`, default 0.01). Missing
 evidence rejects (fail closed). `as_of` is exclusive — the harness evaluates
@@ -77,9 +83,13 @@ with nothing to carry it falls back to 1/N over the eligible set
 The chained OOS portfolio curve per objective is the only performance number
 reported. The report (`result.report`) always contains `equal_weight` and
 `inverse_vol` under `objectives`, with metrics (total/annualised return,
-volatility, Sharpe on the platform sqrt(252) convention, max drawdown),
-rebalance counts (carried / fallback-equal-weight / cash), per-sleeve
-`sources`, and average turnover.
+volatility, Sharpe, max drawdown), rebalance counts (carried /
+fallback-equal-weight / cash), per-sleeve `sources`, and average turnover.
+Metrics annualise at the measured observation density of each chained
+curve (#349 convention: observations per calendar year), falling back to
+sqrt(252) only when the density cannot be measured — so a calendar-filled
+curve annualises at ~365.25 and a business-day curve at ~261, not a fixed
+252.
 
 ## CLI
 
