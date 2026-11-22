@@ -173,6 +173,59 @@ clean-up.
   `orders-still-working ... NO-STOP-RESTORED` (the sweep lists open orders only); the leg was
   cancelled by Alpaca's OCO handling and the position was closable afterwards. Tracked separately.
 
+## Internal strategy live runner (#348)
+
+ACTIVE deployments with `signal_source`/`signal_source_type` = `internal` are
+evaluated by `live_runner/internal_strategy_runner.py` (daemon task
+`internal-strategy-loop`, 15 s tick). Discord deployments are unaffected —
+their signals still arrive through the channel listeners.
+
+**What runs.** For each deployment symbol the runner fetches bars through the
+adapter's existing `get_market_data` (no new network client; an adapter that
+cannot serve bars for the timeframe fails closed and the deployment is
+skipped), keeps only *closed* bars, and calls the deployment strategy's own
+`generate_signals(df, params)` through the native engine's
+`_call_strategy`/`_normalize_strategy_output`/`_resolve_direction`/
+`_extract_levels` — the same code path a backtest uses, with
+`STRATEGY_META["parameters"]` defaults (per-deployment
+`settings.strategy_parameters` stays refused, exactly as the promotion gate
+binds it). Up to 1000 bars of history are requested per evaluation, which
+bounds indicator warmup; a strategy needing deeper history than the feed
+serves cannot be evaluated faithfully.
+
+**Timing contract.** The native engine evaluates a signal on bar T's close,
+records T's `close` as the entry reference, and fills the resulting market
+order at the *next* bar's open; signal exits fill at the trigger bar's close.
+Live maps this to: evaluate on the just-closed bar T and submit immediately —
+the broker fill lands at (or very near) the open of bar T+1 for entries, and
+at approximately T's close for exits. Sizing geometry uses T's `close`, the
+same reference the engine records. A signal is only actionable while bar T+1
+is still forming (timeframe length + 30 s grace); an older bar is stale and is
+never traded. Bars that closed while the daemon was down are stale by
+definition: only the newest closed bar is actionable after a restart, and
+missed bars are never backfilled with orders. Missing, malformed, unclosed or
+out-of-window bars fail closed — no order is emitted.
+
+**Orders.** Emitted intents go through the daemon's
+`_submit_internal_strategy_signal` → `_trade_signal_to_live_signal` →
+`_prepare_claim_and_submit_signal`, the same prepare/claim/submit path as
+Discord signals: live level resolution, risk sizing, the SL/TP guard, the
+promotion gate, the demo/paper hard block, the submission lease and adapter
+persistence all apply unchanged. A strategy `exits` row becomes a
+reduce-only `FULL_EXIT` against the deployment's own ledger quantity — it can
+never open or extend a position. A `SHORT` entry on a deployment without
+`allow_short` is skipped (it must not be reinterpreted as an exit). Entries
+carrying more than one take-profit level are skipped: the live bracket carries
+a single TP and emitting only the first would silently drop the native
+partial-exit ladder.
+
+**Idempotency.** Each emitted intent carries a producer-stable
+`metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
+close and intent kind. Within a process the runner tracks the newest
+processed bar per deployment+symbol; across a restart the same closed bar
+re-evaluates to the same key, and the adapter's `save_live_signal` dedupe
+returns the persisted row instead of placing a second broker order.
+
 ## Strategy Promotion Gate (#165)
 
 Only code a named human reviewer promoted to `production` may trade on a

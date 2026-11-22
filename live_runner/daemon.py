@@ -58,6 +58,7 @@ from live_runner.exit_signals import (
     round_exit_qty_down,
     usable_qty_tolerance,
 )
+from live_runner.internal_strategy_runner import run_internal_strategy_loop
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
@@ -2647,6 +2648,80 @@ async def _submit_normalized_discord_signal(
     )
 
 
+async def _submit_internal_strategy_signal(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+) -> None:
+    """Route one internally generated strategy signal through the shared chokepoint.
+
+    The signal was produced by ``internal_strategy_runner`` on a closed bar;
+    conversion, sizing, the submission claim and adapter persistence are the
+    same path Discord signals take. The only internal-specific gate is the
+    short-side check: ``_trade_signal_to_live_signal`` would otherwise turn a
+    SHORT entry on a long-only deployment into a full exit, which is the
+    opposite of what the strategy asked for — skip it instead.
+    """
+    account_id = str(deployment.account_id)
+    direction = str(
+        (trade_signal.metadata or {}).get("internal_direction") or ""
+    ).upper()
+    if direction == "SHORT" and not is_exit_order(
+        trade_signal.action, trade_signal.metadata
+    ):
+        try:
+            allows_short = _deployment_allows_short(deployment)
+        except ValueError:
+            logger.exception(
+                "Invalid deployment boolean config; skipping internal signal",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                    }
+                },
+            )
+            return
+        if not allows_short:
+            logger.warning(
+                "Internal strategy SHORT entry skipped: deployment does not allow shorts",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                    }
+                },
+            )
+            return
+    try:
+        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+    except ValueError:
+        logger.exception(
+            "Internal strategy signal failed conversion; skipping",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+        return
+
+    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    if is_exit:
+        async with _exit_lock(account_id, live_signal.symbol):
+            await _prepare_claim_and_submit_signal(
+                account_id, adapter, deployment, trade_signal, live_signal, is_exit=True
+            )
+        return
+    await _prepare_claim_and_submit_signal(
+        account_id, adapter, deployment, trade_signal, live_signal, is_exit=False
+    )
+
+
 async def _prepare_claim_and_submit_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -5227,9 +5302,22 @@ async def run_daemon(
     commission_task = asyncio.create_task(
         _backfill_commissions_loop(active_adapters), name="commission-backfill"
     )
+    internal_strategy_task = asyncio.create_task(
+        run_internal_strategy_loop(
+            current_deployments=lambda: list(deployment_snapshot),
+            eligible_adapters=lambda: _trailing_eligible_adapters(active_adapters),
+            submit_signal=_submit_internal_strategy_signal,
+        ),
+        name="internal-strategy-loop",
+    )
     try:
         await asyncio.gather(
-            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+            sync_task,
+            service_sync_task,
+            balance_task,
+            trailing_task,
+            commission_task,
+            internal_strategy_task,
         )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
@@ -5253,6 +5341,7 @@ async def run_daemon(
             balance_task,
             trailing_task,
             commission_task,
+            internal_strategy_task,
         ):
             if not task.done():
                 task.cancel()
@@ -5263,6 +5352,7 @@ async def run_daemon(
                 balance_task,
                 trailing_task,
                 commission_task,
+                internal_strategy_task,
                 return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):
