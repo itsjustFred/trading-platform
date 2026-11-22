@@ -275,32 +275,33 @@ class RegressionReporter:
 
         if tdr.missing_trades:
             lines.append("### Missing Trades")
-            for d in tdr.missing_trades:
-                lines.append(f"- {d.explanation}")
+            lines.extend(f"- {d.explanation}" for d in tdr.missing_trades)
             lines.append("")
 
         if tdr.extra_trades:
             lines.append("### Extra Trades")
-            for d in tdr.extra_trades:
-                lines.append(f"- {d.explanation}")
+            lines.extend(f"- {d.explanation}" for d in tdr.extra_trades)
             lines.append("")
 
         matched_issues = [d for d in tdr.matched_trades if d.anomaly_type]
         if matched_issues:
             lines.append("### Trade Mismatches")
-            for d in matched_issues:
+            # Not a flat transformed list: each mismatch's explanation must be followed
+            # by that mismatch's own field deltas, in that order, so a single
+            # comprehension (or an `extend` per level) would regroup the report.
+            # PERF401's premise does not hold on this loop.
+            for d in matched_issues:  # noqa: PERF401
                 lines.append(f"- {d.explanation}")
-                for fd in d.field_deltas:
-                    if not fd.passed:
-                        lines.append(f"  - {fd.explanation}")
+                lines.extend(
+                    f"  - {fd.explanation}" for fd in d.field_deltas if not fd.passed
+                )
             lines.append("")
 
         stats_issues = [d for d in result.stats_delta if not d.passed]
         lines.append("## Statistics Comparison")
         if stats_issues:
             lines.append("### Deviations")
-            for d in stats_issues:
-                lines.append(f"- {d.explanation}")
+            lines.extend(f"- {d.explanation}" for d in stats_issues)
         else:
             lines.append("All statistics match within tolerance.")
         lines.append("")

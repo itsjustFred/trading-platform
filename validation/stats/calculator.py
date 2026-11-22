@@ -9,8 +9,9 @@ Mathematical conventions (kept explicit so results are reproducible):
 * **Sharpe:** ``mean(returns) / population_std(returns) * sqrt(P)`` where the
   "returns" series is the per-trade realized PnL sequence and ``P`` is the
   number of trades per year derived from the trade timestamps
-  (``n_trades / span_years``) — compatible with ``runner/stats.py``, which
-  annualizes daily equity returns with 252 periods. When the timestamps
+  (``n_trades / span_years``) — ``runner/stats.py`` uses a different
+  convention (daily equity returns, calendar-filled non-trading rows
+  dropped, annualized at 252 equities/FX/CFDs or 365 crypto — #229). When the timestamps
   cannot support a trade-frequency annualization (fewer than 2 dated
   trades, zero span, or more than one trade per day on average — e.g.
   intraday or synthetic fixtures), it falls back to ``sqrt(252)``.
@@ -216,10 +217,9 @@ def _daily_net_series(
         exit_ts = pd.to_datetime(str(trade.last_exit_time), utc=True, errors="coerce")
         if pd.isna(exit_ts):
             return None
-        day_totals[pd.Timestamp(exit_ts).normalize().date().isoformat()] = (
-            day_totals.get(pd.Timestamp(exit_ts).normalize().date().isoformat(), 0.0)
-            + _net_realized_pnl(trade)
-        )
+        day_totals[pd.Timestamp(exit_ts).normalize().date().isoformat()] = day_totals.get(
+            pd.Timestamp(exit_ts).normalize().date().isoformat(), 0.0
+        ) + _net_realized_pnl(trade)
     days = int((end - start).total_seconds() // 86400) + 1
     series: List[float] = []
     cursor = start
@@ -242,8 +242,10 @@ def _daily_net_series(
 def _annualize_factor(trades: List[Trade]) -> float:
     """Daily annualization factor (#84).
 
-    Annualization contract shared with ``runner/stats.py``: daily-resampled
-    observations annualized with sqrt(252). The old trades-per-year factor
+    This module's convention: daily-resampled observations annualized with
+    sqrt(252). ``runner/stats.py`` no longer shares it — since #229 it drops
+    calendar-filled non-trading rows and annualizes at 252 (equities/FX/CFDs)
+    or 365 (crypto). The old trades-per-year factor
     (A-L4) made the same strategy's Sharpe depend on trade count instead of
     calendar time.
     """
@@ -332,8 +334,9 @@ def compute_trade_statistics(
         realized_pnls, initial_capital=initial_capital
     )
 
-    # #84: ratio metrics run on the daily-resampled net series with the
-    # shared sqrt(252) annualization (same contract as runner/stats.py).
+    # #84: ratio metrics run on the daily-resampled net series with this
+    # module's sqrt(252) annualization (runner/stats.py uses the asset-class
+    # convention since #229 — the conventions intentionally differ).
     daily_series = _daily_net_series(trades, initial_capital=initial_capital)
     annualize = _annualize_factor(trades)
     ratio_observations = (

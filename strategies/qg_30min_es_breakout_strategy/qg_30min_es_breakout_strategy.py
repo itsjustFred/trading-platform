@@ -7,6 +7,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from shared.strategy_markers import signal_markers
+
 STRATEGY_META = {
     "name": "QG-30Min ES Breakout Strategy",
     "version": "1.0.0",
@@ -221,44 +223,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_reason": exit_reason,
     }
 
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        long_times = timestamps_utc.loc[entries & (direction == "LONG")].dropna()
-        short_times = timestamps_utc.loc[entries & (direction == "SHORT")].dropna()
-        exit_times = timestamps_utc.loc[exits].dropna()
-
-        for ts in long_times.iloc[:200]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "triangleUp",
-                    "color": "#22c55e",
-                    "text": "Long Signal",
-                }
-            )
-        for ts in short_times.iloc[:200]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "triangleDown",
-                    "color": "#ef4444",
-                    "text": "Short Signal",
-                }
-            )
-        for ts in exit_times.iloc[:200]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#f59e0b",
-                    "text": "Exit",
-                }
-            )
+    long_mask = entries & (direction == "LONG")
+    short_mask = entries & (direction == "SHORT")
+    drawings = signal_markers(
+        df,
+        [
+            (long_mask, "belowBar", "triangleUp", "#22c55e", "Long Signal", 200),
+            (short_mask, "aboveBar", "triangleDown", "#ef4444", "Short Signal", 200),
+            (exits, "aboveBar", "arrowDown", "#f59e0b", "Exit", 200),
+        ],
+    )
 
     return entries, exits, indicators_dict, drawings

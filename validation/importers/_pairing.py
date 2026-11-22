@@ -206,7 +206,11 @@ def group_position_fills(
         remaining = remaining_by_scope.setdefault(scope, [])
         position_ids = position_ids_by_scope.setdefault(scope, [])
         if direction == "in":
-            for index, open_quantity in enumerate(remaining):
+            # `index` is used by the loop's `else` arm ("no slot had capacity")
+            # and then again below, so B007's "not used within the loop body"
+            # does not realise this loop's body is only a scan for the first
+            # reusable slot - see `position_id = position_ids[index]` below.
+            for index, open_quantity in enumerate(remaining):  # noqa: B007
                 if open_quantity <= _quantity_tolerance(open_quantity):
                     continue
                 break

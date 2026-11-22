@@ -48,6 +48,8 @@ STRATEGY_META = {
     },
 }
 
+from typing import TypedDict
+
 from pynecore import Series
 from pynecore.lib import (
     dayofmonth,
@@ -67,10 +69,22 @@ from pynecore.lib import (
 _TZ = "America/New_York"
 _OR_START_MINUTES = 9 * 60 + 30  # 09:30 ET
 
+
+class _SessionState(TypedDict):
+    day: tuple[int, int, int] | None
+    or_high: float | None
+    or_low: float | None
+    traded: bool
+    hwm: float | None
+    lwm: float | None
+
+
 # Session state. Module-level by design: the adapter runs one pyne CLI
 # subprocess per symbol, so this is process-isolated (the pyne equivalent
 # of Pine `var`); pynecore.lib offers no Persistent-fields API.
-_STATE = {
+# or_high/or_low are always set and reset together (same branch below), so
+# either both are None or both are floats.
+_STATE: _SessionState = {
     "day": None,
     "or_high": None,
     "or_low": None,
@@ -133,7 +147,7 @@ def main(
     if _OR_START_MINUTES <= minutes_now < or_end:
         bar_high = float(high)
         bar_low = float(low)
-        if _STATE["or_high"] is None:
+        if _STATE["or_high"] is None or _STATE["or_low"] is None:
             _STATE["or_high"] = bar_high
             _STATE["or_low"] = bar_low
         else:
@@ -158,23 +172,32 @@ def main(
         # HWM/LWM track close by design: QC Variant 2 watermarks
         # current_price = bar close (algorithm.py), not high/low.
         price = float(src)
-        if _STATE["hwm"] is None or price > _STATE["hwm"]:
+        hwm = _STATE["hwm"]
+        if hwm is None or price > hwm:
+            hwm = price
             _STATE["hwm"] = price
-        reversion_level = _STATE["hwm"] - _STATE["hwm"] * reversion_multiple
+        reversion_level = hwm - hwm * reversion_multiple
         if price < reversion_level:
             strategy.close("Long", comment="trailing_stop")
             _STATE["traded"] = True
             _STATE["hwm"] = None
     elif position < 0:
         price = float(src)
-        if _STATE["lwm"] is None or price < _STATE["lwm"]:
+        lwm = _STATE["lwm"]
+        if lwm is None or price < lwm:
+            lwm = price
             _STATE["lwm"] = price
-        reversion_level = _STATE["lwm"] + _STATE["lwm"] * reversion_multiple
+        reversion_level = lwm + lwm * reversion_multiple
         if price > reversion_level:
             strategy.close("Short", comment="trailing_stop")
             _STATE["traded"] = True
             _STATE["lwm"] = None
-    elif minutes_now >= or_end and not _STATE["traded"] and _STATE["or_high"] is not None:
+    elif (
+        minutes_now >= or_end
+        and not _STATE["traded"]
+        and _STATE["or_high"] is not None
+        and _STATE["or_low"] is not None
+    ):
         or_range = _STATE["or_high"] - _STATE["or_low"]
         if or_range > 0:
             price = float(src)

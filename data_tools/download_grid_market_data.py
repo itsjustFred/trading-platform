@@ -420,8 +420,7 @@ def main() -> None:
                 )
                 for item in planned
             ]
-            for future in as_completed(futures):
-                rows.append(future.result())
+            rows.extend(future.result() for future in as_completed(futures))
     else:
         rows = [
             download_symbol(

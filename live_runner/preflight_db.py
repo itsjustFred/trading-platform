@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from live_runner.deployment_policy import (
+    KNOWN_SIGNAL_SOURCES,
+    normalize_signal_source,
+    untradeable_signal_source_reason,
+)
 from shared.constants import normalize_symbols, normalize_timeframe
 from shared.models import LiveDeploymentConfig
 
@@ -171,19 +176,6 @@ def read_active_db_deployments(db_path: Path) -> tuple[list[DbDeploymentRow], se
     )
 
 
-def _signal_source(raw: object) -> str:
-    """The form the daemon compares: ``str(raw or "internal").lower()``, with no strip.
-
-    The daemon does not strip the stored value, so `` discord`` is not Discord to it; stripping
-    here would report such a row as the clean match it is not.
-    """
-    return str(raw or "internal").lower()
-
-
-#: The signal sources the daemon routes on; anything else is a stored value it does not recognise.
-_KNOWN_SIGNAL_SOURCES = frozenset({"internal", "discord"})
-
-
 def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
     """What makes this ACTIVE row untradeable as configured, independent of the YAML."""
     errors: list[str] = []
@@ -199,7 +191,10 @@ def _db_row_errors(row: DbDeploymentRow, db_account_ids: set[str]) -> list[str]:
         )
     if not row.timeframe.strip():
         errors.append(f"DB deployment {row.label}: has no timeframe configured.")
-    if _signal_source(row.signal_source) not in _KNOWN_SIGNAL_SOURCES:
+    # "recognised", not "tradeable": `internal` is recognised and untradeable,
+    # so this is the vocabulary question (KNOWN_SIGNAL_SOURCES) and not the daemon's
+    # routing question (TRADEABLE_SIGNAL_SOURCES) the warning further down asks.
+    if normalize_signal_source(row.signal_source) not in KNOWN_SIGNAL_SOURCES:
         errors.append(
             f"DB deployment {row.label}: signal_source {row.signal_source!r} is not 'internal' or "
             "'discord'; the daemon compares the stored text verbatim, so this row does not route "
@@ -219,8 +214,8 @@ def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[
     reports it as an error.
 
     ``signal_source`` is on this list because the daemon gates Discord dispatch on the DB value
-    (``live_runner.daemon._active_discord_deployments_for_account`` and
-    ``_discord_active_account_ids``): a row that says ``discord`` on a deployment the YAML
+    (``live_runner.daemon._dispatchable_discord_deployments_for_account`` and
+    ``_discord_dispatchable_account_ids``): a row that says ``discord`` on a deployment the YAML
     configures as ``internal`` receives Discord signals, and the YAML-side check in
     ``live_runner.preflight._validate_deployments`` never sees the DB row.
     ``signal_source_id`` is on this list because it names the credential the daemon resolves that
@@ -237,10 +232,11 @@ def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[
         differences.append(
             f"timeframe differs (DB {row.timeframe!r} vs YAML {str(yaml_dep.timeframe)!r})"
         )
-    if _signal_source(row.signal_source) != _signal_source(yaml_dep.signal_source):
+    row_source = normalize_signal_source(row.signal_source)
+    yaml_source = normalize_signal_source(yaml_dep.signal_source)
+    if row_source != yaml_source:
         differences.append(
-            f"signal_source differs (DB {_signal_source(row.signal_source)} vs YAML "
-            f"{_signal_source(yaml_dep.signal_source)})"
+            f"signal_source differs (DB {row_source} vs YAML {yaml_source})"
         )
     if row.signal_source_id.strip() != str(yaml_dep.signal_source_id or "").strip():
         differences.append(
@@ -298,6 +294,21 @@ def diff_db_and_yaml(
 
     for row in db_rows:
         errors.extend(_db_row_errors(row, db_account_ids))
+        reason = untradeable_signal_source_reason(row.signal_source)
+        # The YAML twin already reports this row when *it* is the untradeable one
+        # (`_validate_deployments` warns for every ACTIVE non-Discord entry), so
+        # repeating it here would double-count. Silently skipping whenever a twin
+        # exists does not work: a Discord twin is tradeable, so the YAML check is
+        # quiet about it and this row's own untradeable value would go unreported.
+        yaml_twin = yaml_active.get(row.key)
+        twin_is_untradeable = yaml_twin is not None and (
+            untradeable_signal_source_reason(yaml_twin.signal_source) is not None
+        )
+        if reason is not None and not twin_is_untradeable:
+            warnings.append(
+                f"DB deployment {row.label}: {reason}; it will never trade. "
+                "Stop it or move it to a Discord signal source."
+            )
         if row.key in db_by_key:
             # Not cosmetic drift: the daemon dispatches every ACTIVE match, so this row submits
             # its own order per signal while the YAML describes a single deployment.
@@ -323,20 +334,20 @@ def diff_db_and_yaml(
                 )
             continue
         matched.append(row.label)
-        for difference in _db_row_drift(row, yaml_dep):
-            warnings.append(
-                f"DB deployment {row.label}: {difference}; the daemon trades the DB value."
-            )
+        warnings.extend(
+            f"DB deployment {row.label}: {difference}; the daemon trades the DB value."
+            for difference in _db_row_drift(row, yaml_dep)
+        )
 
     only_in_yaml = [
         f"{name} ({account})"
         for (name, account) in sorted(yaml_active)
         if (name, account) not in db_by_key
     ]
-    for label in only_in_yaml:
-        warnings.append(
-            f"YAML deployment {label}: not an ACTIVE row in the DB; the daemon will not trade it."
-        )
+    warnings.extend(
+        f"YAML deployment {label}: not an ACTIVE row in the DB; the daemon will not trade it."
+        for label in only_in_yaml
+    )
     return DbPreflightReport(
         db_path=db_path,
         active_count=len(db_rows),

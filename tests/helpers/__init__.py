@@ -8,7 +8,29 @@ and ``tests/strategies/contract_sma.py``-style conformance tests.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pandas as pd
+
+#: Opt-in dataset root for locally run, dataset-backed tests (see the strategy
+#: data gate in ``tests/strategies/conftest.py``). Read-only by design, so
+#: pointing it at a real dataset cannot trip the repo data-dir guard.
+TEST_OHLCV_DIR_ENV = "TP_TEST_OHLCV_DIR"
+
+
+def resolve_ohlcv_root(data_dir: Path) -> Path:
+    """Directory holding ``<symbol>/<timeframe>.parquet`` shards.
+
+    The explicit ``TP_TEST_OHLCV_DIR`` opt-in when one is exported (what
+    ``AGENTS.md`` documents for local dataset-backed runs), else
+    ``<data_dir>/ohlcv``. The suite's ``DATA_DIR`` is a throwaway temp
+    directory (``tests/conftest.py``), so without the opt-in no local dataset
+    is visible and such a test must skip naming the variable.
+    """
+    override = str(os.environ.get(TEST_OHLCV_DIR_ENV, "")).strip()
+    return Path(override) if override else Path(data_dir) / "ohlcv"
+
 
 #: Crossover strategy shared by the sizing/curve regression tests.
 SMA_CROSSOVER_STRATEGY = """
@@ -54,13 +76,11 @@ def deterministic_ohlcv_frame(*, periods: int = 300, start: float = 100.0) -> pd
         for _ in range(30):
             price += 0.5
             closes.append(price)
-        for _ in range(20):
-            closes.append(price)
+        closes.extend(price for _ in range(20))
         for _ in range(30):
             price -= 0.5
             closes.append(price)
-        for _ in range(20):
-            closes.append(price)
+        closes.extend(price for _ in range(20))
     closes = closes[:periods]
     timestamps = pd.date_range("2024-01-01", periods=len(closes), freq="h", tz="UTC")
     return pd.DataFrame(
