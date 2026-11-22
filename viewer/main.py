@@ -11423,6 +11423,18 @@ def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> d
     """
     fee_rate = payload.fee_rate
     fee_flat_per_trade = payload.fee_flat_per_trade
+    # #361: reject negative/NaN/inf declarations here — ``resolve_fee_model``
+    # clamps negatives to 0.0 downstream, which would turn a declared cost into
+    # a silent zero-cost run (and inf into non-finite fees).
+    for field_name, value in (
+        ("fee_rate", fee_rate),
+        ("fee_flat_per_trade", fee_flat_per_trade),
+    ):
+        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a finite, non-negative number",
+            )
     if payload.fees_zero:
         if fee_rate is not None or fee_flat_per_trade is not None:
             raise HTTPException(
@@ -11595,7 +11607,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     start_str = start_dt.date().isoformat()
     end_str = end_dt.date().isoformat()
-    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     task_id, log_file, stage_total = _register_signal_replay_task(
         payload=payload,
         symbols=symbols,
@@ -11612,23 +11623,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         fee_params=fee_params,
     )
     _set_task_status(task_id, "queued")
-    _update_task_fields(
-        task_id,
-        restart_config={
-            "signal_source": replay_source_label,
-            "account_id": account_id,
-            "start_date": start_str,
-            "end_date": end_str,
-            "timeframe": timeframe,
-            "capital": float(payload.capital or 100000.0),
-            "risk_per_trade_pct": risk_per_trade_pct,
-            "max_position_pct": max_position_pct,
-            "max_positions": max_positions,
-            "signal_processor": signal_processor_name or None,
-            "signal_count": len(normalized_signals),
-            "fee_params": dict(fee_params),
-        },
-    )
     _register_job(
         task_id,
         {
@@ -11752,6 +11746,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                         "signal_processor": signal_processor_name or None,
                         "account_id": account_id or None,
                         "signal_count": len(replay_signals),
+                        # The adapter merges metadata into BacktestMeta.parameters,
+                        # so the saved result records which cost model produced it.
+                        "fee_params": dict(fee_params),
                     },
                     progress_callback=lambda percent, _message: report_stage(
                         handle,
@@ -11887,7 +11884,12 @@ async def _load_and_filter_csv_signals(
     "/api/backtests/run-from-signals",
     status_code=202,
     responses={
-        400: {"description": "Invalid signal_source, filepath, date range or no replayable signals"},
+        400: {
+            "description": (
+                "Invalid signal_source, filepath, date range, missing/conflicting "
+                "fee declaration, or no replayable signals"
+            )
+        },
         403: {"description": "Signal CSV is outside the OHLCV data directory"},
     },
 )
