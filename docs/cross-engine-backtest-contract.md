@@ -39,7 +39,17 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close. When a
+- Fill price: the protective **level itself**, not the bar close — with one
+  owner-decided exception (2026-11-13, realism / MT5 + live-broker parity): a
+  bar that **opens beyond** the level gapped through it and fills at the
+  bar's **open**, the price actually available; an open exactly at the level
+  fills at that price either way, and intrabar touches keep the level fill.
+  The open is the bar's first event, so a gap also beats a later same-bar
+  touch of the other level. The shared helpers are
+  `contract.level_gapped_at_open` / `contract.level_fill_price` /
+  `contract.resolve_protective_exit`. On main today this is implemented for
+  the signal-replay `supertrend_flip` stop/TP1 exits (#287); the remaining
+  engine paths adopt it with #208. When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -78,7 +88,9 @@ level exit) fills at the **trigger bar's close** by default (exception: the
 is one place — `_prepare_next_open_execution_data` keeps the exit leg
 unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
 `close`/`open`) selects `open` to fill at the exit bar's open instead for
-MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
+MT5-parity runs. Stop/TP exits fill at the level in every engine (§1),
+except that a bar opening beyond the level fills at its open (gap rule,
+§1).
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
@@ -200,6 +212,13 @@ bar's close. This is the only replay exit that is not a level and not a
 same-bar-close fill. The run-level `signal_exit_fill` stays `close` for replay
 (the replay has no `open` model); each flip trade records
 `meta["supertrend_flip"]["flip_exit_fill"] = "next_bar_open"`.
+
+The workflow's level exits — the stop before and after TP1, and the TP1
+tranche — follow the §1 gap rule (#287): a bar
+that opens beyond the level fills at the open (`contract.resolve_protective_exit`,
+gap checked before the stop-first same-bar policy), an intrabar touch at the
+level. The entry bar is never evaluated (the fill bar's close is the entry and
+`last_checked_at` starts there), so no `allow_gap=False` exemption is needed.
 
 **Pynecore restatement containment.** `_normalize_trade_exits` tightens a
 level-violating exit leg to the recorded protective level:
