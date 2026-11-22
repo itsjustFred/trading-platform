@@ -3542,7 +3542,7 @@ async def _prepare_claim_and_submit_signal(
             extra={"data": {"deployment_id": str(deployment.id)}},
         )
     logger.info(
-        "Discord signal submitted",
+        f"{source_label} signal submitted",
         extra={
             "data": {
                 "account_id": account_id,

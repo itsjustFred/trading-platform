@@ -75,11 +75,13 @@ Risk-policy notes (maintainer decision 2026-11-22):
   (deployment ``settings``, falling back to a same-named ``STRATEGY_META``
   parameter): default **1 open position per deployment and symbol**. Only 1
   is accepted today — N>1 is not supported end-to-end (per-position sizing,
-  protection and exits on the qty-netted live ledger are unresolved; see the
-  PR's "Open decision" section) and any other value fails closed. Open
+  protection and exits on the qty-netted live ledger are unresolved;
+  maintainer decision 2026-11-22: N=1, N>1 is #382) and any other value
+  fails closed. Open
   positions are counted from the deployment's own persisted ledger —
   filled residuals allocated FIFO plus unfilled entries the broker still
-  lists as working — and the total is capped at ``TRADE_ENGINE_MAX_POSITIONS``.
+  lists as working or holds a non-zero position for — and the total is
+  capped at ``TRADE_ENGINE_MAX_POSITIONS``.
   When the cap or the ledger cannot be read, entries are disabled for the
   deployment while exits keep flowing.
 * **Session-bound symbols** (everything the venue calendar does not resolve
@@ -166,11 +168,14 @@ SUBMIT_FEED_LAG_CAP_SECONDS = 120.0
 INTERNAL_RUNNER_ENABLED_KEY = "internal_runner_enabled"
 #: Per-symbol open-entry cap (deployment ``settings``, falling back to a
 #: same-named ``STRATEGY_META`` parameter). Only 1 is accepted: N>1 per-symbol
-#: entries is not supported end-to-end yet (maintainer decision 2026-11-22,
-#: open decision) and any other value fails closed.
+#: entries is not supported end-to-end yet (maintainer decision 2026-11-22:
+#: N=1; N>1 is #382) and any other value fails closed.
 MAX_OPEN_PER_SYMBOL_KEY = "internal_max_open_per_symbol"
 #: How far ahead the venue calendar is asked to find the next session open.
 SESSION_LOOKAHEAD_DAYS = 14
+#: Broker position quantities at or below this are treated as flat when
+#: deciding whether a symbol is held (dust, not a real position).
+_BROKER_POSITION_QTY_EPSILON = 1e-9
 #: Consecutive submission failures before a one-time ERROR escalation.
 SUBMIT_FAILURE_ESCALATION = 3
 
@@ -259,9 +264,9 @@ def _max_open_per_symbol(
     Deployment ``settings`` win; a same-named ``STRATEGY_META`` parameter is
     the per-strategy fallback. Default 1. Only 1 is accepted: N>1 per-symbol
     entries is not supported end-to-end on the qty-netted live ledger
-    (maintainer decision 2026-11-22, open decision) — anything else, or an
-    unreadable value, fails closed (the caller disables entries while exits
-    keep flowing).
+    (maintainer decision 2026-11-22: N=1; N>1 is #382) — anything else, or
+    an unreadable value, fails closed (the caller disables entries while
+    exits keep flowing).
     """
     settings = deployment.settings or {}
     if MAX_OPEN_PER_SYMBOL_KEY in settings:
@@ -271,17 +276,22 @@ def _max_open_per_symbol(
     try:
         if isinstance(raw, bool):
             raise ValueError("boolean is not a count")
-        value = int(float(raw))
+        number = float(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"{MAX_OPEN_PER_SYMBOL_KEY}={raw!r} is not an integer"
         ) from exc
+    if not number.is_integer():
+        raise ValueError(
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={raw!r} is not an integer"
+        )
+    value = int(number)
     if value != 1:
         raise ValueError(
             f"{MAX_OPEN_PER_SYMBOL_KEY}={value} is not supported: only 1 open "
             "entry per deployment and symbol is implemented end-to-end "
             "(per-position sizing, protection and exits on the netted live "
-            "ledger are an open maintainer decision)"
+            "ledger; maintainer decision 2026-11-22: N=1, N>1 is #382)"
         )
     return value
 
@@ -620,6 +630,67 @@ class InternalStrategyRunner:
                 error=str(exc),
             )
             return None
+
+    async def _broker_held_symbols(
+        self, adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig
+    ) -> set[str] | None:
+        """Symbols where the broker reports a non-zero position (#360).
+
+        A filled order is not working, so the working-order list cannot tell
+        a filled-but-unbooked entry from a dead unfilled one; the account's
+        open positions can. Called only when unfilled entries exist that the
+        working list does not cover. ``None`` fails closed — the caller
+        disables entries rather than guess — and is reported once per
+        deployment. Over-counts when another deployment holds the symbol:
+        that only blocks entries.
+        """
+        deployment_id = str(deployment.id)
+        getter = getattr(adapter, "get_positions", None)
+        if not callable(getter):
+            self._report_once(
+                deployment_id,
+                "broker_positions",
+                "Adapter cannot list positions; filled-but-unbooked entries "
+                "cannot be told from dead ones, so entries are disabled "
+                "(exits still evaluated)",
+                deployment_id=deployment_id,
+                adapter=type(adapter).__name__,
+            )
+            return None
+        try:
+            positions = await getter()
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                "broker_positions",
+                "Broker positions could not be read; filled-but-unbooked "
+                "entries cannot be told from dead ones, so entries are "
+                "disabled (exits still evaluated)",
+                deployment_id=deployment_id,
+                error=str(exc),
+            )
+            return None
+        held: set[str] = set()
+        for position in positions or []:
+            row = position if isinstance(position, dict) else {}
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            qty = row.get("qty")
+            try:
+                qty_value = abs(float(qty)) if qty is not None else 0.0
+            except (TypeError, ValueError):
+                qty_value = float("inf")
+            # An unparseable or non-finite qty, or the adapter's explicit
+            # unreadable flag, counts as held: guessing "flat" here would
+            # read a real position as a dead order.
+            if (
+                row.get("qty_unparseable")
+                or not qty_value < float("inf")
+                or qty_value > _BROKER_POSITION_QTY_EPSILON
+            ):
+                held.add(symbol)
+        return held
 
     def _symbol_calendar(
         self, adapter: BaseLiveAdapter, symbol: str
@@ -1204,11 +1275,29 @@ class InternalStrategyRunner:
                 max_open_per_symbol = 0
             open_entries: dict[str, int] = {}
             if max_open_per_symbol > 0:
-                unfilled_refs = await asyncio.to_thread(
-                    list_live_deployment_unfilled_entry_order_refs, deployment_id
-                )
+                try:
+                    unfilled_refs = await asyncio.to_thread(
+                        list_live_deployment_unfilled_entry_order_refs, deployment_id
+                    )
+                except Exception as exc:  # except-kind: money-decision
+                    # Same fail-closed shape as the counts read below: an
+                    # unguarded raise here would leave run_once and skip exit
+                    # evaluation for this deployment AND every deployment
+                    # after it in the snapshot.
+                    self._report_once(
+                        deployment_id,
+                        "ledger",
+                        "Internal deployment unfilled-entry ledger is "
+                        "unreadable; entry caps cannot be enforced so entries "
+                        "are disabled (exits still evaluated)",
+                        deployment_id=deployment_id,
+                        error=str(exc),
+                    )
+                    max_open_per_symbol = 0
+                    unfilled_refs = set()
                 working_ids: set[str] = set()
-                if unfilled_refs:
+                held_symbols: set[str] | None = None
+                if max_open_per_symbol > 0 and unfilled_refs:
                     # An entry with no fills counts as open only while the
                     # broker still lists its order — a dead unfilled order
                     # must not lock the symbol forever. The broker read
@@ -1218,12 +1307,24 @@ class InternalStrategyRunner:
                         max_open_per_symbol = 0
                     else:
                         working_ids = fetched
+                        if unfilled_refs - working_ids:
+                            # Some unfilled entry is no longer working: it is
+                            # either dead or filled-but-unbooked, and only
+                            # the account's positions can tell them apart.
+                            held = await self._broker_held_symbols(
+                                adapter, deployment
+                            )
+                            if held is None:
+                                max_open_per_symbol = 0
+                            else:
+                                held_symbols = held
                 if max_open_per_symbol > 0:
                     try:
                         open_entries = await asyncio.to_thread(
                             list_live_deployment_open_entry_counts_by_symbol,
                             deployment_id,
                             working_ids,
+                            held_symbols,
                         )
                     except Exception as exc:  # except-kind: money-decision
                         # Without the ledger the entry caps cannot be

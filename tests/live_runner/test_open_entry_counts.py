@@ -90,9 +90,9 @@ def _exit(
     )
 
 
-def _counts(database, deployment_id: str, working=None) -> dict[str, int]:
+def _counts(database, deployment_id: str, working=None, held=None) -> dict[str, int]:
     return database.list_live_deployment_open_entry_counts_by_symbol(
-        deployment_id, working
+        deployment_id, working, held
     )
 
 
@@ -306,12 +306,13 @@ def test_working_unfilled_entry_blocks(isolated_db) -> None:
     by_signal = _entry(database, mine, symbol="MSFT")
 
     assert _counts(database, mine, {"bo-1"}) == {"AAPL": 1}
-    assert _counts(database, mine, {by_signal}) == {"MSFT": 1}
+    assert _counts(database, mine, {by_signal}, held=set()) == {"MSFT": 1}
     assert _counts(database, mine, {"bo-1", by_signal}) == {
         "AAPL": 1, "MSFT": 1,
     }
-    # Neither reference working: nothing blocks.
-    assert _counts(database, mine, {"unrelated"}) == {}
+    # Neither reference working and the broker holds no position: nothing
+    # blocks.
+    assert _counts(database, mine, {"unrelated"}, held=set()) == {}
     # Fail-closed default: unknown working set -> a broker-referenced
     # unfilled entry still counts, a reference-less one does not.
     assert _counts(database, mine, None) == {"AAPL": 1}
@@ -328,9 +329,35 @@ def test_dead_unfilled_entry_does_not_block(isolated_db) -> None:
 
     _entry(database, mine, broker_order_id="bo-dead")
 
-    assert _counts(database, mine, set()) == {}
+    # The broker confirms the order is terminal AND holds no position in
+    # the symbol: the entry is dead and must not lock it.
+    assert _counts(database, mine, set(), held=set()) == {}
     # Once the dead order's row is all that remains, the symbol is free.
-    assert _counts(database, mine, {"bo-other"}) == {}
+    assert _counts(database, mine, {"bo-other"}, held=set()) == {}
+
+
+def test_filled_but_unbooked_entry_counts_via_broker_position(isolated_db) -> None:
+    """Bundle-50 blocker: an entry whose order filled but whose fill has not
+    reached ``live_executions`` is not working either — the working list
+    cannot tell it from a dead unfilled order. A non-zero broker position
+    in the symbol is the proof it is still open, so the N=1 cap holds."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    _entry(database, mine, broker_order_id="bo-filled-unbooked")
+
+    # Not working, but the broker holds AAPL: counted open.
+    assert _counts(database, mine, set(), held={"AAPL"}) == {"AAPL": 1}
+    # The position proof is per-symbol: a held MSFT position does not
+    # rescue an AAPL entry.
+    assert _counts(database, mine, set(), held={"MSFT"}) == {}
+    # Unreadable position state fails closed: still counted open.
+    assert _counts(database, mine, set(), held=None) == {"AAPL": 1}
+    # Symbol matching is case-insensitive like the ledger's.
+    assert _counts(database, mine, set(), held={"aapl"}) == {"AAPL": 1}
 
 
 def test_unfilled_entry_refs_cover_both_id_kinds(isolated_db) -> None:

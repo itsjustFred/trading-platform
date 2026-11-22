@@ -3987,6 +3987,7 @@ def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[st
 def list_live_deployment_open_entry_counts_by_symbol(
     deployment_id: str,
     working_order_ids: Collection[str] | None = None,
+    broker_held_symbols: Collection[str] | None = None,
 ) -> dict[str, int]:
     """Open entry count per symbol for one deployment (#360 maintainer decision).
 
@@ -4011,8 +4012,18 @@ def list_live_deployment_open_entry_counts_by_symbol(
     ``broker_order_id`` or its signal id. When ``working_order_ids`` is
     ``None`` the working status cannot be proven, so every unfilled entry
     that carries a broker order id still counts — the fail-closed direction.
-    Entries with neither fills nor any order reference never reached the
-    broker and do not count.
+
+    A *filled* order is not working either, so the working list alone cannot
+    tell "dead unfilled" from "filled but its fill is not yet booked" (the
+    trade-update stream is down, the post-restart reconcile has not run, or
+    persistence lags a bar). ``broker_held_symbols`` is the adapter's
+    non-zero-position symbol set for the account: a not-working unfilled
+    entry that carries a broker order id counts as open while its symbol is
+    held — over-counting when another deployment holds the symbol only
+    blocks entries, the fail-closed direction. ``broker_held_symbols=None``
+    means the position state could not be proven, so such an entry still
+    counts — again fail-closed. Entries with neither fills nor any order
+    reference never reached the broker and do not count.
 
     Returns ``{SYMBOL: open entry count}`` for symbols with at least one
     open entry; flat symbols are absent.
@@ -4023,6 +4034,11 @@ def list_live_deployment_open_entry_counts_by_symbol(
     working = (
         {str(order_id) for order_id in working_order_ids}
         if working_order_ids is not None
+        else None
+    )
+    held_symbols = (
+        {str(symbol).strip().upper() for symbol in broker_held_symbols}
+        if broker_held_symbols is not None
         else None
     )
     init_db()
@@ -4097,6 +4113,15 @@ def list_live_deployment_open_entry_counts_by_symbol(
                         entry["broker_order_id"] in working
                         or entry["signal_id"] in working
                     )
+                    if not still_open and entry["broker_order_id"]:
+                        # Not working: a filled-but-unbooked entry looks the
+                        # same as a dead unfilled one. The broker's non-zero
+                        # position is the proof it is still open; an
+                        # unreadable position set fails closed.
+                        still_open = (
+                            held_symbols is None
+                            or symbol in held_symbols
+                        )
                 if still_open:
                     open_count += 1
                 continue

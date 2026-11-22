@@ -49,6 +49,8 @@ class FakeAdapter:
         self.serve_bars = serve_bars
         self.calls: list[tuple[str, str, int]] = []
         self.working_ids: set[str] | None = None
+        self.positions: list[dict[str, Any]] = []
+        self.positions_error: Exception | None = None
 
     async def get_market_data(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         self.calls.append((symbol, timeframe, limit))
@@ -61,6 +63,11 @@ class FakeAdapter:
         if self.working_ids is None:
             raise RuntimeError("working orders endpoint unavailable")
         return set(self.working_ids)
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        if self.positions_error is not None:
+            raise self.positions_error
+        return list(self.positions)
 
 
 class NoBarsAdapter(FakeAdapter):
@@ -853,7 +860,7 @@ def test_open_position_blocks_pyramiding(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id, working_order_ids=None: {"AAPL": 1},
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 1},
     )
 
     asyncio.run(
@@ -876,7 +883,7 @@ def test_max_positions_cap_uses_deployment_ledger(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id, working_order_ids=None: {
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {
             "AAA": 1, "BBB": 1, "CCC": 1, "DDD": 1, "EEE": 1,
         },
     )
@@ -906,7 +913,7 @@ def test_max_open_per_symbol_above_one_is_refused(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id, working_order_ids=None: {"AAPL": 1},
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 1},
     )
     adapter = FakeAdapter()
     deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
@@ -937,7 +944,7 @@ def test_max_open_per_symbol_above_engine_maximum_is_refused(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id, working_order_ids=None: {"AAPL": 5},
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 5},
     )
     adapter = FakeAdapter()
     deployment = _deployment(settings={"internal_max_open_per_symbol": 99})
@@ -999,7 +1006,9 @@ def test_engine_position_cap_counts_same_pass_submits(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id, working_order_ids=None: {"H1": 1, "H2": 1, "H3": 1, "H4": 1},
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {
+            "H1": 1, "H2": 1, "H3": 1, "H4": 1,
+        },
     )
     symbols = ["N1", "N2", "N3"]
     deployment = _deployment(symbols=symbols)
@@ -1179,7 +1188,7 @@ def test_working_unfilled_entry_counts_against_cap(
     )
     seen_working: list[set[str]] = []
 
-    def fake_counts(deployment_id, working_order_ids=None):
+    def fake_counts(deployment_id, working_order_ids=None, broker_held_symbols=None):
         seen_working.append(set(working_order_ids or ()))
         return {"AAPL": 1}
 
@@ -1217,7 +1226,7 @@ def test_dead_unfilled_entry_does_not_block_reentry(
     )
     seen_working: list[set[str]] = []
 
-    def fake_counts(deployment_id, working_order_ids=None):
+    def fake_counts(deployment_id, working_order_ids=None, broker_held_symbols=None):
         seen_working.append(set(working_order_ids or ()))
         return {}
 
@@ -1239,6 +1248,132 @@ def test_dead_unfilled_entry_does_not_block_reentry(
 
     assert seen_working == [set()]
     assert len(sent) == 1
+
+
+def test_filled_but_unbooked_entry_counts_via_broker_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bundle-50 blocker: an entry that is no longer working but whose fill
+    is not yet booked must still count against the cap — the broker's
+    non-zero position is the proof. Without it the N=1 cap would be
+    exceeded on the next bar."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-filled"},
+    )
+    seen_held: list[set[str] | None] = []
+
+    def fake_counts(deployment_id, working_order_ids=None, broker_held_symbols=None):
+        seen_held.append(
+            set(broker_held_symbols) if broker_held_symbols is not None else None
+        )
+        return {"AAPL": 1}
+
+    monkeypatch.setattr(
+        runner_mod, "list_live_deployment_open_entry_counts_by_symbol", fake_counts
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.working_ids = set()  # filled orders are not working
+    adapter.positions = [{"symbol": "AAPL", "qty": 5.0}]
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert seen_held == [{"AAPL"}]
+    assert sent == []
+
+
+def test_unreadable_positions_disable_entries_but_exits_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the broker's position list cannot be read, a not-working unfilled
+    entry cannot be told from a filled one: entries fail closed, exits still
+    go out."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-1"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.working_ids = set()
+    adapter.positions_error = RuntimeError("positions endpoint down")
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "broker_positions") in runner._reported
+
+
+def test_unreadable_unfilled_refs_still_evaluates_exits_and_later_deployments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bundle-50 blocker: the unfilled-entry refs read is a ledger read like
+    the counts read — when it raises for one deployment, that deployment's
+    exits still submit AND the next deployment in the snapshot is still
+    evaluated (previously the exception left run_once entirely)."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    first, second = _deployment(), _deployment()
+
+    def refs(deployment_id):
+        if deployment_id == str(first.id):
+            raise RuntimeError("ledger locked")
+        return set()
+
+    monkeypatch.setattr(
+        runner_mod, "list_live_deployment_unfilled_entry_order_refs", refs
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent: list[tuple[str, TradeSignal]] = []
+
+    async def submit(adapter, deployment, signal):
+        sent.append((str(deployment.id), signal))
+        return "submitted"
+
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    adapter = FakeAdapter()
+
+    asyncio.run(
+        runner.run_once(
+            [first, second], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    first_signals = [signal for dep_id, signal in sent if dep_id == str(first.id)]
+    second_signals = [signal for dep_id, signal in sent if dep_id == str(second.id)]
+    # First deployment: entries disabled, but its exit still went out.
+    assert len(first_signals) == 1
+    assert first_signals[0].metadata.get("exit_only") is True
+    assert (str(first.id), "ledger") in runner._reported
+    # Second deployment: evaluated normally — exit AND entry.
+    assert len(second_signals) == 2
+    assert any(not s.metadata.get("exit_only") for s in second_signals)
 
 
 def test_unreadable_working_orders_disable_entries_but_exits_flow(
@@ -1277,7 +1412,7 @@ def test_unreadable_ledger_disables_entries_but_exits_flow(
     disabled for the pass, the exit intent still submits."""
     import live_runner.internal_strategy_runner as runner_mod
 
-    def _boom(deployment_id, working_order_ids=None):
+    def _boom(deployment_id, working_order_ids=None, broker_held_symbols=None):
         raise RuntimeError("ledger locked")
 
     monkeypatch.setattr(
@@ -1309,7 +1444,7 @@ def test_cap_refusal_still_allows_exits(
     monkeypatch.setattr(
         runner_mod,
         "list_live_deployment_open_entry_counts_by_symbol",
-        lambda deployment_id, working_order_ids=None: {},
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {},
     )
     path = _strategy_file(tmp_path, META)
     sent, submit = _collect()

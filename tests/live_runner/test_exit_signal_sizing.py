@@ -475,10 +475,10 @@ def _run_internal_submit(adapter, deployment, trade_signal) -> str:
     """
     import live_runner.daemon as daemon
 
-    original_active = daemon._deployment_is_currently_active
+    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
-    daemon._deployment_is_currently_active = lambda _deployment: True
+    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda *_a, **_k: True
     try:
@@ -486,7 +486,7 @@ def _run_internal_submit(adapter, deployment, trade_signal) -> str:
             daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
         )
     finally:
-        daemon._deployment_is_currently_active = original_active
+        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
 

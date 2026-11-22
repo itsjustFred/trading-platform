@@ -356,17 +356,20 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   (falling back to a same-named `STRATEGY_META` parameter): **default 1 open
   position per deployment+symbol**. Only `1` is accepted today — N>1 is not
   supported end-to-end (per-position sizing, protection and exits on the
-  qty-netted live ledger are unresolved; tracked as an open decision on the
-  PR), so any other value fails closed: **entries are disabled for the
-  deployment but exits keep flowing** — a bad cap must never suppress an
-  exit on an open position. Open positions are counted from the
+  qty-netted live ledger are unresolved; maintainer decision 2026-11-22:
+  N=1, N>1 is #382), so any other value fails closed: **entries are disabled
+  for the deployment but exits keep flowing** — a bad cap must never
+  suppress an exit on an open position. Open positions are counted from the
   deployment's own persisted ledger with oldest-first FIFO attribution of
   reducing fills; an entry with no fills counts only while the broker still
-  lists its order as working, so a canceled or expired unfilled order does
-  not lock the symbol. The count is updated within a pass so same-pass
-  signals cannot exceed the cap, and the deployment total is capped at the
-  engine maximum of 5. If the ledger or the broker's working-order list
-  cannot be read, entries fail closed the same way — exits still evaluate.
+  lists its order as working or holds a non-zero position in the symbol
+  (a filled-but-unbooked entry is not working, so the position is what
+  proves it open), so a canceled or expired unfilled order does not lock
+  the symbol. The count is updated within a pass so same-pass signals
+  cannot exceed the cap, and the deployment total is capped at the engine
+  maximum of 5. If the ledger, the broker's working-order list or its
+  positions cannot be read, entries fail closed the same way — exits still
+  evaluate.
   A same-bar reversal (exit + new entry on one bar) emits the exit but the
   entry waits one bar: the closing position still counts against the cap
   until the next evaluation.
