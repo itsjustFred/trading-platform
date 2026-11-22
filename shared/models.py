@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from datetime import datetime, timezone
@@ -21,9 +22,20 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from shared.atomic_io import write_text_atomically
+from shared.trailing import validate_live_deployment_trailing_override
+
+#: Validation-context flag set when a deployment is rehydrated from the DB.
+STORED_ROW_CONTEXT = "stored_row"
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +218,66 @@ class LiveDeploymentConfig(BaseModel):
     signal_config: dict[str, Any] = Field(default_factory=dict)
     settings: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def signal_timeframe(self) -> str:
+        """The timeframe this deployment signals on, trimmed, with a fallback.
+
+        ``signal_config.timeframe`` when it is not blank, else the deployment's
+        own timeframe. One definition, on the model: deployment validation, the
+        daemon's load path, the trailing loop and the signal-time gates all gate
+        a trailing mode on the timeframe, and three of them used to read a
+        whitespace-only override as "" while the daemon read it as the
+        deployment timeframe — so the same configuration was refused by one
+        stage and accepted by another.
+        """
+        configured = (self.signal_config or {}).get("timeframe")
+        override = str(configured or "").strip()
+        if override:
+            return override
+        return str(self.timeframe or "").strip()
+
+    @property
+    def signal_processor_name(self) -> str:
+        """Registered signal-processor id of this deployment, ``""`` when none.
+
+        One definition, on the model: the daemon's signal-processor gate and the
+        deployment-validation stages (``create_live_deployment``, the YAML
+        parser) resolve the id from the same place, so a processor that cannot
+        be built, or whose own default trailing mode the deployment's broker
+        cannot execute (#150), is caught at deployment validation instead of
+        per signal. The promotion gate hashes this id and is not a trailing
+        gate; it reads the same value through ``live_runner.promotion``.
+        """
+        configured = self.signal_config or {}
+        settings = self.settings or {}
+        return str(
+            configured.get("signal_processor") or settings.get("signal_processor") or ""
+        ).strip().lower()
+
+    @model_validator(mode="after")
+    def _validate_trailing_mode_override(self, info: ValidationInfo) -> "LiveDeploymentConfig":
+        # Issue #150 fail closed, first stage: only the account id is known
+        # here, not its broker, so this rejects a trailing mode that NO live
+        # broker executes (unknown modes, supertrend_flip). Live support is
+        # per broker (#167): the broker-aware stage runs where the account is
+        # resolved (`create_live_deployment`, `update_live_deployment_account`,
+        # `parse_live_deployments_config`) and again at signal time against
+        # the adapter. Deployments without the override inherit the
+        # processor's own (constructor-validated) default.
+        #
+        # Stored rows are the exception: they are rehydrated on every DB read,
+        # so a row written before/outside this check must not make the whole
+        # deployment list raise. The DB read path sets STORED_ROW_CONTEXT and
+        # the daemon refuses such signals at signal time (gates 1 and 2) and
+        # logs the row at load.
+        if isinstance(info.context, dict) and info.context.get(STORED_ROW_CONTEXT):
+            return self
+        validate_live_deployment_trailing_override(
+            self.signal_config,
+            context=f"live deployment '{self.strategy_name}'",
+        )
+        return self
+
 
 class LiveDeploymentCreateRequest(BaseModel):
     """Payload for creating a live deployment via API."""
@@ -280,12 +352,89 @@ class LiveSignal(BaseModel):
 
 #: Verdicts for `LiveExecution.actual_price_observed`.
 #:
-#: `observed`  a finite, positive price was read from the broker payload.
-#: `sent_bad`  the broker stated a price and it is unusable (zero, negative, non-finite).
-#: `absent`    the broker stated no price at all on any field the resolver reads.
+#: `observed`             a finite, positive price was read for THIS fill from the broker payload.
+#: `derived`              a finite, positive price computed from broker-stated prices rather than
+#:                        stated for this fill: Alpaca's order-level `filled_avg_price` on a
+#:                        single-fill order, or a reconciled remainder derived from it (#124).
+#:                        Usable, but it is arithmetic, not a quote - hence its own label.
+#: `sent_bad`             the broker stated a price and it is unusable (zero, negative, non-finite).
+#: `absent`               the broker stated no price at all on any field the resolver reads.
+#: `derived_unavailable`  the broker stated the order's average, but this fill's own price could
+#:                        not be derived honestly (an unpriced sibling leg, or an implausible
+#:                        result). The QUANTITY is real and recorded; the stored price is 0.0.
 PRICE_OBSERVED = "observed"
+PRICE_DERIVED = "derived"
 PRICE_SENT_BAD = "sent_bad"
 PRICE_ABSENT = "absent"
+PRICE_DERIVED_UNAVAILABLE = "derived_unavailable"
+
+#: Verdicts that vouch for the stored price. `None` is a row written before the column existed.
+#: Anything else - a typo, a verdict added later without updating the readers - is not a price.
+USABLE_PRICE_VERDICTS = frozenset({PRICE_OBSERVED, PRICE_DERIVED})
+
+
+def execution_price_is_usable(price: Any, verdict: Any) -> bool:
+    """Whether a stored execution price may be used as a price.
+
+    Allowlist: only no verdict (legacy row), `observed` and `derived` qualify, so `sent_bad`,
+    `absent`, `derived_unavailable` and any unknown or misspelled verdict fail closed.
+    Also False for a missing, non-finite or non-positive number whatever its verdict - a legacy row
+    (no verdict) stored at 0.0 is no more a price than a `sent_bad` one.
+    """
+    if verdict is not None and (
+        not isinstance(verdict, str) or verdict not in USABLE_PRICE_VERDICTS
+    ):
+        return False
+    if price is None or isinstance(price, bool):
+        return False
+    try:
+        number = float(price)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0.0
+
+
+def _commission_input_repr(value: object) -> str:
+    """``repr`` that cannot itself fail: a huge int exceeds the int->str digit limit."""
+    try:
+        return repr(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def validate_commission_cost(value: float | None) -> float | None:
+    """The ``live_executions.commission`` write guard (#285): a charge is a positive cost.
+
+    ``None`` is "fee not known yet" (#124) and ``0.0`` a known zero; both pass through. A
+    negative or non-finite value is refused because net PnL is ``gross - commission``
+    everywhere, so a wrong sign silently flips it. Broker-signed cash flows are converted
+    with ``live_runner.base_adapter.commission_from_signed_cash_flow`` before they get
+    here - that helper decides the sign, this guard decides what may be stored. A broker
+    rebate therefore cannot be stored as a negative cost: the cTrader adapter maps it to
+    ``None`` (fee unknown) before it reaches this guard.
+
+    Runs in ``mode="before"`` on the field, so ``True`` and numeric strings like ``"1.5"``
+    are refused here instead of being silently coerced to ``1.0``/``1.5`` first.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"commission must be a finite number, got {_commission_input_repr(value)}"
+        )
+    try:
+        finite = math.isfinite(value)
+    except (TypeError, OverflowError):
+        # TypeError: not a number at all (e.g. a string). OverflowError: a huge int
+        # too large to convert to float - still not a storable commission.
+        raise ValueError(
+            f"commission must be a finite number, got {_commission_input_repr(value)}"
+        ) from None
+    if not finite:
+        raise ValueError(f"commission must be finite, got {value!r}")
+    if value < 0:
+        raise ValueError(f"commission must be a non-negative cost, got {value!r}")
+    return value
 
 
 class LiveExecution(BaseModel):
@@ -295,7 +444,18 @@ class LiveExecution(BaseModel):
     signal_id: UUID
     actual_price: float
     filled_qty: float
-    commission: float
+    # The fill's fee in account currency (USD), or ``None`` when it is not known (#124).
+    #
+    # ``0.0`` is a *known* zero (Alpaca equities are commission-free) and ``None`` is "the broker
+    # has not told us yet": Alpaca posts crypto fees end of day as ``CFEE`` account activities, so
+    # at fill time the fee is unknown and a later backfill fills it in. The field is required on
+    # purpose - an adapter must decide which of the two it has, rather than inherit a default
+    # zero that silently overstates net PnL. Readers treat ``None`` as "net PnL incomplete".
+    #
+    # Non-negative by construction (#285): a charge is stored as a positive cost and a wrong
+    # sign would silently flip ``gross - commission`` net PnL, so the field validator refuses
+    # a negative or non-finite value instead of storing it.
+    commission: float | None
     timestamp: datetime
     broker_order_id: str
     dedupe_key: str | None = None
@@ -313,8 +473,9 @@ class LiveExecution(BaseModel):
     # Recording it decides nothing and changes no behaviour. It makes the decision *possible*.
     broker_fill_id: int | None = None
 
-    # Whether `actual_price` is a price the broker actually stated, and this is a three-state
-    # answer on purpose: `observed`, `sent_bad`, `absent`.
+    # Whether `actual_price` is a price the broker actually stated: `observed`, `sent_bad`,
+    # `absent`, and for prices computed from broker data `derived` / `derived_unavailable` (#124,
+    # see the verdict constants above).
     #
     # `actual_price` cannot carry that distinction. A resolver that returns `0.0` for "could not
     # be read" produces the same stored value whether the broker omitted `executionPrice` or
@@ -323,10 +484,14 @@ class LiveExecution(BaseModel):
     # existed nothing said which rows those were.
     #
     # `0.0` is never `observed`: a non-positive or non-finite price is `sent_bad`, and a missing
-    # one is `absent`. Nullable because rows written before this column existed, and adapters that
-    # do not classify (Alpaca today), carry no verdict - which is different from a verdict of
-    # `observed`.
+    # one is `absent`. Nullable because rows written before this column existed carry no verdict -
+    # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
+
+    @field_validator("commission", mode="before")
+    @classmethod
+    def _commission_is_a_non_negative_cost(cls, value: float | None) -> float | None:
+        return validate_commission_cost(value)
 
 
 class LiveBalanceRecord(BaseModel):
@@ -337,6 +502,39 @@ class LiveBalanceRecord(BaseModel):
     timestamp: datetime
     balance: float
     equity: float
+
+
+class LiveLossBreakerRecord(BaseModel):
+    """Persisted loss circuit-breaker state for one scope (#301).
+
+    One row per scope: ``account:<account_id>`` covers every deployment on the
+    account and observes the broker account's equity; ``deployment:<id>``
+    covers that deployment alone and observes a synthetic equity - the account
+    equity minus every OTHER deployment's trading P&L - so the scope moves
+    only with its own deployment's P&L. ``day_start_equity``/``peak_equity``/
+    ``last_equity`` are always in the scope's own equity units.
+
+    ``utc_day`` is the UTC day ``day_start_equity`` belongs to; the daily
+    breaker re-bases automatically when it changes. ``peak_equity`` is the
+    high-water mark the drawdown breaker measures from: it rises with every
+    observation and is re-based only by the explicit operator reset
+    (``reset_live_loss_breaker_drawdown``). ``*_breached`` flags latch: the
+    daily one clears on the day rollover, the drawdown one until
+    ``reset_live_loss_breaker_drawdown``.
+    """
+
+    scope: str
+    account_id: str
+    utc_day: str
+    day_start_equity: float
+    peak_equity: float
+    daily_breached: bool = False
+    drawdown_breached: bool = False
+    last_equity: float | None = None
+    last_observed_at: datetime | None = None
+    # JSON detail of the most recent breach latch (kind, equity, threshold,
+    # observed loss/drawdown fraction, UTC instant) for `status` output.
+    breach_detail: dict[str, Any] | None = None
 
 
 # ─── Portfolio models ──────────────────────────────────────────────────────────
@@ -373,6 +571,38 @@ class Portfolio(BaseModel):
 
 VALID_TIMEFRAMES = ("tick", "s1", "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 VALID_DIRECTIONS = ("LONG", "SHORT")
+
+
+class TradeContractError(ValueError):
+    """A ``Trade`` violates its contract (direction outside ``VALID_DIRECTIONS``).
+
+    A ``ValueError`` subclass so existing callers keep working; readers of
+    stored results can catch exactly this instead of every ``ValueError``.
+    """
+
+# Spellings a strategy may use for a per-entry direction. Wider than
+# VALID_DIRECTIONS because signal frames commonly carry lower-case or +1/-1.
+_LONG_DIRECTION_SPELLINGS = ("LONG", "long", 1)
+_SHORT_DIRECTION_SPELLINGS = ("SHORT", "short", -1)
+
+
+def normalize_direction_value(value: Any) -> str:
+    """Map a strategy's per-entry direction value to LONG/SHORT, or raise (#123).
+
+    Anything outside the explicit spellings (NaN/None/``pd.NA`` at an entry
+    bar, ``0``, booleans incl. ``np.bool_``, ``"BUY"``, a typo) raises
+    ``ValueError`` instead of silently becoming LONG.
+    """
+    if isinstance(value, bool) or type(value).__name__ in ("bool", "bool_"):
+        raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
+    try:
+        if value in _SHORT_DIRECTION_SPELLINGS:
+            return "SHORT"
+        if value in _LONG_DIRECTION_SPELLINGS:
+            return "LONG"
+    except (TypeError, ValueError):  # e.g. pd.NA has no truth value
+        pass
+    raise ValueError(f"unknown trade direction value {value!r} at an entry bar")
 
 
 # ─── Exit ────────────────────────────────────────────────────────────────────
@@ -437,7 +667,9 @@ class Trade:
     risk_percent: float | None = None
     exit_reason: str | None = None
     pnl_pct: float | None = None
-    fees: float | None = None  # total fees (entry + all exits)
+    # Total fees over entry and all exits. A positive cost:
+    # net_pnl == pnl - fees, so a rebate (a net swap credit) is negative.
+    fees: float | None = None
     net_pnl: float | None = None
     r_multiple: float | None = None
     mae: float | None = None  # Max Adverse Excursion
@@ -447,6 +679,15 @@ class Trade:
     meta: dict[str, Any] = field(default_factory=dict)
     stop_loss: float | None = None
     take_profit: float | None = None
+
+    def __post_init__(self) -> None:
+        # #123: no case normalisation and no guessing. Anything outside
+        # VALID_DIRECTIONS used to read as SHORT through ``direction_sign``
+        # (and as LONG through several engine comparisons), flipping PnL sign.
+        if self.direction not in VALID_DIRECTIONS:
+            raise TradeContractError(
+                f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -518,12 +759,27 @@ class Trade:
 
     @property
     def last_exit_time(self) -> str:
-        """Time of the final exit."""
-        return self.exits[-1].time if self.exits else self.entry_time
+        """Time of the final exit.
+
+        Raises ValueError for a trade without exits (#123): an open or
+        malformed trade has no exit time, and the old fallback to
+        ``entry_time`` made it look like a zero-duration closed trade.
+        """
+        if not self.exits:
+            raise ValueError(f"trade {self.id} has no exits; last_exit_time is undefined")
+        return self.exits[-1].time
 
     @property
     def direction_sign(self) -> int:
-        return 1 if self.direction == "LONG" else -1
+        # #123: exhaustive and strict - never default to SHORT for a value
+        # that is not in VALID_DIRECTIONS (including after a field mutation).
+        if self.direction == "LONG":
+            return 1
+        if self.direction == "SHORT":
+            return -1
+        raise TradeContractError(
+            f"direction must be one of {VALID_DIRECTIONS}, got {self.direction!r}"
+        )
 
 
 # ─── Equity point ────────────────────────────────────────────────────────────
@@ -717,21 +973,24 @@ class BacktestStats:
     losers: int = 0
     win_rate: float = 0.0
     profit_factor: float | None = None
-    total_pnl: float = 0.0
+    # `total_pnl`/`total_return`/`max_drawdown_pct` are null when the curve's
+    # endpoint is not a finite number (ruin by an unreadable/NaN/inf point): the
+    # figure is unmeasurable, and each is named in `undefined_metrics` then.
+    total_pnl: float | None = 0.0
     avg_winner: float = 0.0
     avg_loser: float = 0.0
     max_consecutive_wins: int = 0
     max_consecutive_losses: int = 0
     avg_holding_bars: float | None = None
-    max_drawdown_pct: float = 0.0
+    max_drawdown_pct: float | None = 0.0
     max_drawdown_duration: int = 0
-    sharpe_ratio: float = 0.0
-    sortino_ratio: float = 0.0
-    calmar_ratio: float = 0.0
-    cagr: float = 0.0
-    total_return: float = 0.0
+    sharpe_ratio: float | None = 0.0
+    sortino_ratio: float | None = 0.0
+    calmar_ratio: float | None = 0.0
+    cagr: float | None = 0.0
+    total_return: float | None = 0.0
     psr: float | None = None
-    p_value: float = 1.0
+    p_value: float | None = 1.0
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -757,7 +1016,10 @@ class BacktestStats:
         }
         if self.avg_holding_bars is not None:
             data["avg_holding_bars"] = self.avg_holding_bars
-        if self.psr is not None:
+        # PSR is omitted when never computed. A ruined run (#132) publishes it
+        # as an explicit null instead, so the payload says "undefined by ruin"
+        # rather than looking like an artifact that never carried the metric.
+        if self.psr is not None or self.extras.get("ruined") is True:
             data["psr"] = self.psr
         data.update(self.extras)
         return data
@@ -943,9 +1205,25 @@ class BacktestResult:
         return p
 
     @classmethod
-    def load(cls, path: str | Path) -> BacktestResult:
-        """Load from JSON file."""
+    def load(cls, path: str | Path, *, root: str | Path | None = None) -> BacktestResult:
+        """Load from JSON file.
+
+        ``root`` optionally confines the read: the resolved path must stay
+        inside the resolved root, so a caller that builds ``path`` from an
+        identifier cannot be walked out of its data directory (#230). Without
+        ``root`` the path is taken as given, which is what the CLI callers
+        need.
+        """
         p = Path(path)
+        if root is not None:
+            # S8707: the unconfined branch is intentional — CLI callers pass
+            # operator-chosen paths, and only viewer id-derived paths pass
+            # root= to confine the read to their data directory (#230).
+            resolved = p.resolve()
+            if not resolved.is_relative_to(Path(root).resolve()):
+                raise ValueError(f"Backtest result path escapes root {root}: {path}")
+            # Read the canonical path the check just approved.
+            p = resolved
         if not p.is_file():
             raise FileNotFoundError(f"Backtest result file not found: {path}")
         return cls.from_json(p.read_text(encoding="utf-8"))

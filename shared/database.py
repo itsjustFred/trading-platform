@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import (
     JSON,
@@ -23,6 +23,8 @@ from sqlalchemy import (
     String,
     TextClause,
     UniqueConstraint,
+    and_,
+    case,
     delete,
     event,
     func,
@@ -35,10 +37,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
+from shared.alpaca_symbols import classify_alpaca_symbol
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
+from shared.constants import normalize_symbols
+from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
     LEGACY_SIGNAL_EXIT_FILL,
+    PRICE_DERIVED,
+    PRICE_DERIVED_UNAVAILABLE,
+    STORED_ROW_CONTEXT,
     BacktestMeta,
     BacktestResult,
     IndicatorSeries,
@@ -46,6 +54,7 @@ from shared.models import (
     LiveBalanceRecord,
     LiveDeploymentConfig,
     LiveExecution,
+    LiveLossBreakerRecord,
     LiveSignal,
     Service,
     ServiceStatus,
@@ -54,7 +63,9 @@ from shared.models import (
     TradeExit,
     VerificationEvidenceRecord,
     VerificationEvidenceStatus,
+    execution_price_is_usable,
     resolve_defined_stat,
+    validate_commission_cost,
 )
 from shared.models import (
     EquityPoint as EquityPointModel,
@@ -65,6 +76,13 @@ from shared.models import (
 from shared.models import (
     PortfolioComponent as PortfolioComponentModel,
 )
+from shared.trailing import validate_live_deployment_trailing_mode
+
+
+def _deployment_trailing_timeframe(deployment: Any) -> str:
+    """The timeframe a deployment signals on (signal_config override, else its own)."""
+    return deployment.signal_timeframe
+
 
 logger = get_logger("database")
 
@@ -606,6 +624,16 @@ class LiveSignalModel(SQLModel, table=True):
         discord_msg_id = _normalize_optional_id(signal.metadata.get("discord_message_id"))
         broker_order_id = _normalize_optional_id(signal.metadata.get("broker_order_id")) or ""
         idempotency_key = _normalize_optional_id(signal.metadata.get("idempotency_key"))
+        metadata = dict(signal.metadata)
+        if BROKER_ORDER_CONFLICTS_KEY in metadata:
+            # The conflict ledger is the only writer of this key; a producer must not be able
+            # to pre-seed or forge the list of untracked broker orders.
+            logger.warning(
+                "Dropping producer-supplied %s from live signal metadata (signal_id=%s)",
+                BROKER_ORDER_CONFLICTS_KEY,
+                signal.id,
+            )
+            del metadata[BROKER_ORDER_CONFLICTS_KEY]
 
         return cls(
             id=str(signal.id),
@@ -622,7 +650,7 @@ class LiveSignalModel(SQLModel, table=True):
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
             idempotency_key=idempotency_key,
-            metadata_json=signal.metadata,
+            metadata_json=metadata,
         )
 
     def to_live_signal(self) -> LiveSignal:
@@ -652,7 +680,10 @@ class LiveExecutionModel(SQLModel, table=True):
     signal_id: str = Field(foreign_key="live_signals.id", index=True)
     actual_price: float = Field(default=0.0)
     filled_qty: float = Field(default=0.0)
-    commission: float = Field(default=0.0)
+    # NULL is "fee not known yet" and 0.0 a known zero (#124). Nullable with no default, for the
+    # same reason as `actual_price_observed`: a default would fabricate a fee nobody stated.
+    # `_make_live_executions_commission_nullable` relaxes the NOT NULL a legacy table carries.
+    commission: float | None = Field(default=None, nullable=True)
     timestamp: datetime = Field(index=True)
     broker_order_id: str = Field(index=True)
     dedupe_key: str | None = Field(
@@ -663,7 +694,8 @@ class LiveExecutionModel(SQLModel, table=True):
     # uniqueness constraint - `dedupe_key` is what enforces uniqueness, and indexing this would
     # invite reading it as one. Adapters with no such id leave it NULL.
     broker_fill_id: int | None = Field(default=None, nullable=True)
-    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad` or `absent`.
+    # Whether `actual_price` is a price the broker stated: `observed`, `sent_bad`,
+    # `absent`, or - for a reconcile remainder - `derived` / `derived_unavailable`.
     # Nullable and with no database default: a row written before this column existed has no
     # verdict, and "no verdict" must not be fabricated into "observed".
     actual_price_observed: str | None = Field(default=None, nullable=True)
@@ -675,7 +707,12 @@ class LiveExecutionModel(SQLModel, table=True):
             signal_id=str(execution.signal_id),
             actual_price=execution.actual_price,
             filled_qty=execution.filled_qty,
-            commission=execution.commission,
+            # The write guard again at the persistence boundary (#285): `LiveExecution`
+            # already validates, but `model_construct` or a future caller could bypass
+            # it, and a wrong-sign commission silently flips `gross - commission` PnL.
+            # SQLModel table models do not run pydantic validators, so the check is
+            # explicit here - the funnel every save path (plain and cumulative) uses.
+            commission=validate_commission_cost(execution.commission),
             timestamp=execution.timestamp,
             broker_order_id=execution.broker_order_id,
             dedupe_key=(str(execution.dedupe_key).strip() or None)
@@ -686,6 +723,16 @@ class LiveExecutionModel(SQLModel, table=True):
         )
 
     def to_live_execution(self) -> LiveExecution:
+        """Rehydrate the domain model — the ``commission`` guard runs again on read.
+
+        ``LiveExecution`` validates ``commission`` (#285), so a row stored before the
+        guard existed (or written around it, e.g. via ``session.add``) with a negative
+        cost raises ``ValidationError`` here instead of silently flipping
+        ``gross - commission`` net PnL. ``init_db``'s one-time
+        ``_migrate_ctrader_commission_to_cost`` ``abs``-converted legacy negatives on
+        resolved cTrader accounts — orphan rows whose broker cannot be determined are
+        skipped — so this fires on corrupt data or such orphans.
+        """
         return LiveExecution(
             id=self.id,
             signal_id=self.signal_id,
@@ -726,6 +773,55 @@ class LiveBalanceModel(SQLModel, table=True):
             timestamp=self.timestamp,
             balance=self.balance,
             equity=self.equity,
+        )
+
+
+class LiveLossBreakerStateModel(SQLModel, table=True):
+    """One loss circuit-breaker row per scope (#301); see LiveLossBreakerRecord."""
+
+    __tablename__ = "live_loss_breaker_state"
+
+    scope: str = Field(primary_key=True)
+    account_id: str = Field(index=True)
+    utc_day: str
+    day_start_equity: float
+    peak_equity: float
+    daily_breached: bool = Field(default=False)
+    drawdown_breached: bool = Field(default=False)
+    last_equity: float | None = Field(default=None)
+    last_observed_at: datetime | None = Field(default=None)
+    breach_detail_json: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+    @classmethod
+    def from_record(cls, record: LiveLossBreakerRecord) -> "LiveLossBreakerStateModel":
+        return cls(
+            scope=record.scope,
+            account_id=record.account_id,
+            utc_day=record.utc_day,
+            day_start_equity=record.day_start_equity,
+            peak_equity=record.peak_equity,
+            daily_breached=record.daily_breached,
+            drawdown_breached=record.drawdown_breached,
+            last_equity=record.last_equity,
+            last_observed_at=record.last_observed_at,
+            breach_detail_json=record.breach_detail,
+        )
+
+    def to_record(self) -> LiveLossBreakerRecord:
+        return LiveLossBreakerRecord(
+            scope=self.scope,
+            account_id=self.account_id,
+            utc_day=self.utc_day,
+            day_start_equity=self.day_start_equity,
+            peak_equity=self.peak_equity,
+            daily_breached=bool(self.daily_breached),
+            drawdown_breached=bool(self.drawdown_breached),
+            last_equity=self.last_equity,
+            last_observed_at=self.last_observed_at,
+            breach_detail=self.breach_detail_json,
         )
 
 
@@ -789,6 +885,87 @@ class LiveControlAuditModel(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column("detail", JSON, nullable=False),
     )
+
+
+#: Reserved ``scope`` of the halt that covers every account. Refused as an account
+#: id on both sides: the account row cannot be created with it (see
+#: :func:`_assert_not_reserved_kill_switch_scope`), and a halt scope spelled that
+#: way is the platform-wide halt rather than one account's. An account literally
+#: named ``global`` would otherwise be indistinguishable from the halt that covers
+#: everything, and halting it would halt the world.
+KILL_SWITCH_GLOBAL_SCOPE = "global"
+
+#: The halt modes, least restrictive first.
+#:
+#: ``entries``  refuse new entries. Working orders and open positions are left
+#:              alone, so an operator can stop adding risk without liquidating.
+#: ``orders``   also cancel every working order.
+#: ``flatten``  also close every open position and sweep the protections the
+#:              flatten orphaned.
+#:
+#: The order is load-bearing: it is the strictness ranking
+#: ``live_runner.kill_switch.strictest_kill_switch_mode`` uses to combine a
+#: global halt with a per-account one. Defined here, not there, because this is
+#: the layer that stores a mode and has to refuse one it cannot interpret.
+KILL_SWITCH_MODES: tuple[str, ...] = ("entries", "orders", "flatten")
+
+
+@dataclass(frozen=True)
+class LiveKillSwitchState:
+    """One halt scope as stored, with the history of its latest episode."""
+
+    scope: str
+    mode: str
+    halted_at: datetime | None = None
+    halted_by: str = "unknown"
+    reason: str = ""
+    cleared_at: datetime | None = None
+    cleared_by: str | None = None
+
+    @property
+    def active(self) -> bool:
+        """Whether this scope is halted right now.
+
+        A cleared row is kept rather than deleted, so "who halted this account,
+        when, and who lifted it" stays answerable after the fact.
+        """
+        return self.cleared_at is None
+
+
+class LiveKillSwitchModel(SQLModel, table=True):
+    """Durable operator halt (kill switch), one row per scope.
+
+    ``scope`` is either :data:`KILL_SWITCH_GLOBAL_SCOPE` or a live account id.
+    The daemon reads it before every entry and on every tick, so it has to
+    survive a restart: an in-process flag would leave a halted account trading
+    again the moment the daemon was redeployed, which is exactly the window an
+    operator uses the halt for.
+
+    Clearing writes ``cleared_at`` instead of deleting the row, so the audit
+    question "was this account halted during the incident, and by whom" is
+    still answerable. Only rows with ``cleared_at IS NULL`` are read as active.
+    """
+
+    __tablename__ = "live_kill_switch"
+
+    scope: str = Field(primary_key=True)
+    mode: str = Field(default="")
+    halted_at: datetime | None = Field(default=None)
+    halted_by: str = Field(default="unknown")
+    reason: str = Field(default="")
+    cleared_at: datetime | None = Field(default=None)
+    cleared_by: str | None = Field(default=None)
+
+    def to_state(self) -> LiveKillSwitchState:
+        return LiveKillSwitchState(
+            scope=self.scope,
+            mode=self.mode,
+            halted_at=self.halted_at,
+            halted_by=self.halted_by,
+            reason=self.reason,
+            cleared_at=self.cleared_at,
+            cleared_by=self.cleared_by,
+        )
 
 
 class ServiceModel(SQLModel, table=True):
@@ -914,11 +1091,7 @@ class LiveDeploymentModel(SQLModel, table=True):
             source_type = "discord"
         source_name = source_name if source_name in {"internal", "discord"} else source_type
         source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = [
-            str(symbol).strip().upper()
-            for symbol in (deployment.symbol_filter or [])
-            if str(symbol).strip()
-        ]
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         return cls(
             id=str(deployment.id),
             strategy_name=deployment.strategy_name,
@@ -943,24 +1116,30 @@ class LiveDeploymentModel(SQLModel, table=True):
     def to_live_deployment(self) -> LiveDeploymentConfig:
         source_type = str(self.signal_source_type or self.signal_source or "internal").lower()
         source_name = str(self.signal_source or source_type or "internal").lower()
-        return LiveDeploymentConfig(
-            id=self.id,
-            strategy_name=self.strategy_name,
-            account_id=self.account_id,
-            symbols=self.symbols_json or [],
-            timeframe=self.timeframe,
-            status=self.status,
-            stopped_enforced_at=self.stopped_enforced_at,
-            signal_source_type=source_type if source_type in {"internal", "discord"} else "internal",
-            signal_source_id=str(self.signal_source_id or "").strip() or None,
-            symbol_filter=[
-                str(symbol).strip().upper()
-                for symbol in (self.symbol_filter_json or [])
-                if str(symbol).strip()
-            ],
-            signal_source=source_name if source_name in {"internal", "discord"} else "internal",
-            signal_config=self.signal_config_json or {},
-            settings=self.settings_json or {},
+        # Rehydrating a stored row must not raise on the write-path trailing
+        # check: one bad row would otherwise break every deployment listing.
+        # See STORED_ROW_CONTEXT in shared/models.py.
+        return LiveDeploymentConfig.model_validate(
+            {
+                "id": self.id,
+                "strategy_name": self.strategy_name,
+                "account_id": self.account_id,
+                "symbols": self.symbols_json or [],
+                "timeframe": self.timeframe,
+                "status": self.status,
+                "stopped_enforced_at": self.stopped_enforced_at,
+                "signal_source_type": (
+                    source_type if source_type in {"internal", "discord"} else "internal"
+                ),
+                "signal_source_id": str(self.signal_source_id or "").strip() or None,
+                "symbol_filter": normalize_symbols(self.symbol_filter_json),
+                "signal_source": (
+                    source_name if source_name in {"internal", "discord"} else "internal"
+                ),
+                "signal_config": self.signal_config_json or {},
+                "settings": self.settings_json or {},
+            },
+            context={STORED_ROW_CONTEXT: True},
         )
 
 
@@ -1156,7 +1335,7 @@ def _normalize_task_record(row: Any) -> BackgroundTaskRecord | None:
     if isinstance(row, BackgroundTaskRecord):
         return row
     if hasattr(row, "_mapping"):
-        values = list(getattr(row, "_mapping").values())
+        values = list(row._mapping.values())
         if values:
             return _normalize_task_record(values[0])
         return None
@@ -1796,6 +1975,197 @@ def _add_live_executions_actual_price_observed(connection: Connection) -> None:
         )
 
 
+_COMMISSION_NOT_NULL_RE = re.compile(
+    r"((?:\"commission\"|`commission`|\[commission\]|\bcommission\b)\s+[A-Za-z]+(?:\s*\([^)]*\))?)"
+    r"\s+NOT\s+NULL",
+    flags=re.IGNORECASE,
+)
+
+
+def _make_live_executions_commission_nullable(connection: Connection) -> bool:
+    """Relax ``live_executions.commission`` to nullable and un-fake the Alpaca crypto zeros (#124).
+
+    An unknown fee is NULL and ``0.0`` is reserved for a known zero. SQLite cannot drop a NOT NULL
+    constraint in place, so the table is rebuilt the same way `_migrate_live_signal_deployment_fk`
+    rebuilds `live_signals`: capture the index DDL before anything is dropped, reuse the table's own
+    CREATE text with only the constraint removed (a column-list rebuild loses the PRIMARY KEY and
+    the ``signal_id`` foreign key), copy, drop, rename, restore the indexes.
+
+    The data step runs only together with the rebuild, so it happens once. It turns ``0.0`` into
+    NULL on every Alpaca row whose zero is not a provable known zero: crypto in any accepted
+    spelling (``BTC/USD``, ``BTC-USD``, ``BTCUSD``), an orphan whose signal, deployment or account
+    row is missing (its broker is unknowable), and any symbol `shared.alpaca_symbols` cannot classify as an equity
+    (an option, a malformed symbol) - fail closed. Before #124 both Alpaca paths hard-coded
+    ``0.0`` - alpaca-py has no commission field - while crypto fills do carry a fee. Alpaca equity zeros are a known zero and
+    stay; other brokers' rows are not touched. The NULLs inside the backfill lookback get their
+    ``CFEE`` from `AlpacaLiveAdapter.backfill_commissions`; older ones stay NULL, which readers
+    report as "net PnL incomplete" - the truth, where ``0.0`` overstated it.
+
+    Returns True when the rebuild ran. No-ops when the column is already nullable or missing.
+    """
+    columns = connection.execute(text("PRAGMA table_info('live_executions')")).fetchall()
+    commission = next((row for row in columns if str(row[1]) == "commission"), None)
+    if commission is None or not int(commission[3]):
+        return False
+
+    index_ddl = [
+        row[0]
+        for row in connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'live_executions' AND sql IS NOT NULL"
+            )
+        ).fetchall()
+    ]
+    create_sql = connection.execute(
+        text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_executions'")
+    ).scalar_one_or_none()
+    if not create_sql:
+        raise RuntimeError("Cannot rebuild live_executions: table definition is missing")
+
+    new_create_sql, relaxed = _COMMISSION_NOT_NULL_RE.subn(r"\1", str(create_sql), count=2)
+    if relaxed != 1:
+        raise RuntimeError(
+            "Cannot safely rebuild live_executions: expected exactly one NOT NULL on commission"
+        )
+    new_create_sql, renamed = re.subn(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"(?:\"live_executions\"|`live_executions`|\[live_executions\]|live_executions)",
+        "CREATE TABLE live_executions__commission_new",
+        new_create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if renamed != 1:
+        raise RuntimeError(
+            "Cannot rebuild live_executions: could not address the table in its own CREATE "
+            "statement"
+        )
+
+    column_list = ", ".join(
+        connection.dialect.identifier_preparer.quote(str(row[1])) for row in columns
+    )
+    foreign_keys_before = int(connection.execute(text("PRAGMA foreign_keys")).scalar_one())
+    legacy_alter_table_before = int(
+        connection.execute(text("PRAGMA legacy_alter_table")).scalar_one()
+    )
+    try:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("PRAGMA legacy_alter_table=ON"))
+        connection.execute(text("DROP TABLE IF EXISTS live_executions__commission_new"))
+        connection.execute(text(new_create_sql))
+        connection.execute(
+            text(
+                f"INSERT INTO live_executions__commission_new ({column_list}) "
+                f"SELECT {column_list} FROM live_executions"
+            )
+        )
+        connection.execute(text("DROP TABLE live_executions"))
+        connection.execute(
+            text("ALTER TABLE live_executions__commission_new RENAME TO live_executions")
+        )
+    finally:
+        connection.execute(text(f"PRAGMA legacy_alter_table={legacy_alter_table_before}"))
+        connection.execute(text(f"PRAGMA foreign_keys={foreign_keys_before}"))
+    for statement in index_ddl:
+        connection.execute(text(statement))
+
+    alpaca_zero_rows = connection.execute(
+        text(
+            "SELECT e.id, s.symbol FROM live_executions e"
+            " LEFT JOIN live_signals s ON s.id = e.signal_id"
+            " LEFT JOIN live_deployments d ON d.id = s.deployment_id"
+            " LEFT JOIN live_accounts a ON a.id = d.account_id"
+            # An orphan (signal/deployment/account row missing) has an undeterminable broker; the
+            # zero is only kept when it is provably an equity, so it joins the Alpaca rows.
+            " WHERE (a.broker IS NULL OR lower(a.broker) = 'alpaca') AND e.commission = 0.0"
+        )
+    ).fetchall()
+    # Classified from the symbol's data, not from a slash (`BTCUSD` is crypto too). Only a provable
+    # equity keeps its zero; crypto and anything undeterminable fail closed to unknown.
+    unfaked_ids = [
+        str(execution_id)
+        for execution_id, symbol in alpaca_zero_rows
+        if classify_alpaca_symbol(symbol) != "us_equity"
+    ]
+    for execution_id in unfaked_ids:
+        connection.execute(
+            text("UPDATE live_executions SET commission = NULL WHERE id = :id"),
+            {"id": execution_id},
+        )
+    unfaked = len(unfaked_ids)
+    logger.info(
+        "Rebuilt live_executions with a nullable commission; %s non-equity Alpaca fill(s) had a "
+        "hard-coded 0.0 commission and are now NULL (unknown), crypto until its CFEE is "
+        "backfilled",
+        unfaked,
+    )
+    return True
+
+
+_CTRADER_COMMISSION_COST_MIGRATION = "ctrader_commission_positive_cost_v1"
+
+
+def _migrate_ctrader_commission_to_cost(connection: Connection) -> bool:
+    """Convert existing cTrader ``live_executions.commission`` rows to a positive cost (#205).
+
+    Before the sign fix, cTrader rows stored ``ProtoOADeal.commission`` raw: a charge is a NEGATIVE
+    cash flow. The convention is now a positive cost for every broker (net = gross - commission), so
+    each cTrader row becomes ``abs`` of its stored value (maintainer decision 2026-11-16). Only
+    accounts whose broker is ``ctrader`` are touched, NULL (unknown) and zero stay as they are, and
+    a row whose broker cannot be determined (orphan) is left alone.
+
+    ``abs`` is not safe to repeat blindly: any negative row still in the table is legacy or
+    corrupt data, and a second pass would flip its sign. So the conversion is recorded in
+    ``schema_data_migrations`` and runs exactly once; ``init_db`` runs on every process start.
+
+    Returns True when the conversion ran. No-ops when it is already recorded.
+    """
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS schema_data_migrations ("
+            "name TEXT NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+    )
+    already_applied = connection.execute(
+        text("SELECT 1 FROM schema_data_migrations WHERE name = :name"),
+        {"name": _CTRADER_COMMISSION_COST_MIGRATION},
+    ).first()
+    if already_applied is not None:
+        return False
+
+    converted = 0
+    # Recorded even when the table is absent: a table created later only ever holds rows from the
+    # fixed adapter, and a converting re-run would turn their rebates into charges.
+    if _table_column_names(connection, "live_executions"):
+        converted = int(
+            connection.execute(
+                text(
+                    "UPDATE live_executions SET commission = abs(commission) "
+                    "WHERE commission < 0 AND signal_id IN ("
+                    "SELECT s.id FROM live_signals s "
+                    "JOIN live_deployments d ON d.id = s.deployment_id "
+                    "JOIN live_accounts a ON a.id = d.account_id "
+                    "WHERE lower(a.broker) = 'ctrader')"
+                )
+            ).rowcount
+            or 0
+        )
+    connection.execute(
+        text("INSERT INTO schema_data_migrations (name, applied_at) VALUES (:name, :now)"),
+        {
+            "name": _CTRADER_COMMISSION_COST_MIGRATION,
+            "now": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info(
+        "Converted %s cTrader live_executions commission(s) from the raw broker sign to a "
+        "positive cost",
+        converted,
+    )
+    return True
+
+
 def _migrate_live_executions_dedupe_key(connection: Connection) -> None:
     """Add the dedupe_key column and its unique index to live_executions."""
     execution_column_names = _table_column_names(connection, "live_executions")
@@ -2211,6 +2581,11 @@ def _migrate_schema() -> None:
         _migrate_live_executions_dedupe_key(connection)
         _add_live_executions_broker_fill_id(connection)
         _add_live_executions_actual_price_observed(connection)
+        # Last: the rebuild copies every column, so the additive ones must already exist.
+        _make_live_executions_commission_nullable(connection)
+        # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
+        # sign the rows hold, so the order is not load-bearing.
+        _migrate_ctrader_commission_to_cost(connection)
 
 
 def _find_existing_live_signal(
@@ -2237,14 +2612,166 @@ def _find_existing_live_signal_by_idempotency_key(
     ).first()
 
 
+# metadata_json key holding broker order ids that conflicted with a signal's tracked id.
+# Reserved for the conflict ledger: producer-supplied values under this key are dropped.
+BROKER_ORDER_CONFLICTS_KEY = "conflicting_broker_order_ids"
+
+
+def _conflicting_broker_order_ids(metadata: Mapping[str, Any]) -> list[str]:
+    """Return the recorded conflicting ids, tolerating any malformed stored shape."""
+    raw = metadata.get(BROKER_ORDER_CONFLICTS_KEY)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning(
+            "Ignoring malformed %s on live signal metadata (type=%s)",
+            BROKER_ORDER_CONFLICTS_KEY,
+            type(raw).__name__,
+        )
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _log_duplicate_live_signal_skipped(record: LiveSignalModel) -> None:
+    """Log the one duplicate shape that needs no ledger change (shared by both skip paths)."""
+    logger.info(
+        "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
+    )
+
+
+#: What :func:`_pause_live_deployment_for_conflict` reports about the halt.
+#: "PAUSED": this call wrote the pause. "already-halted": the deployment was already
+#: PAUSED or STOPPED, so no new halt was needed (a redelivered conflict).
+CONFLICT_HALT_PAUSED = "PAUSED"
+CONFLICT_HALT_ALREADY_HALTED = "already-halted"
+
+#: The status a deployment may open a new position from (#126 decision: a pause or a stop
+#: blocks entries in every wording of the rule).
+LIVE_DISPATCH_ENTRY_STATUSES: tuple[str, ...] = ("ACTIVE",)
+
+#: The statuses a deployment may close a position from. PAUSED is included on purpose
+#: (#126 decision): "stop opening new positions" must not also stop a deployment closing
+#: what it already holds, or a pause forced by a broker-order-id conflict would leave the
+#: known position open until its stop. STOPPED keeps its own cancel-and-flatten
+#: enforcement and is absent.
+#:
+#: One definition for every gate that has to answer it, here and not next to any one of
+#: them, because the three callers live in three modules and widening the exit rule in one
+#: of them only is how a close silently stops reaching the broker: the daemon's dispatch
+#: statuses (:data:`live_runner.daemon.EXIT_DISPATCH_STATUSES`), the atomic submission
+#: claim's SQL filter (:func:`claim_live_deployment_submission`) and the halt's
+#: "already halted" set (:func:`pause_live_deployment_for_order_conflict`) all derive from
+#: this tuple. The values are module constants written here, never caller text, so no
+#: request payload can widen them.
+LIVE_DISPATCH_EXIT_STATUSES: tuple[str, ...] = ("ACTIVE", "PAUSED")
+
+#: The statuses a conflict halt never touches: they are a stronger operator intent (or a
+#: row that is already halted), so a re-pause must leave them exactly as they are.
+CONFLICT_HALT_EXEMPT_STATUSES: tuple[str, ...] = ("PAUSED", "STOPPED")
+
+
+def _pause_live_deployment_for_conflict(session: Session, deployment_id: object) -> str:
+    """Halt the deployment named by a conflicted signal, in the caller's transaction.
+
+    The pause is *narrow* on purpose: only this deployment stops. Other deployments on
+    the same broker account keep trading, and their positions are untouched.
+
+    Writes through the caller's ``session`` rather than :func:`update_live_deployment_status`
+    so the halt and the conflict record that justifies it commit together; a second
+    session would take its own write lock inside the open transaction and deadlock. The
+    row write itself is the shared one (:func:`_apply_live_deployment_status_row`), so
+    the stamp and timestamp rules cannot drift between the two writers.
+
+    Refuses (:data:`CONFLICT_HALT_ALREADY_HALTED`) when the row is already PAUSED - a
+    redelivered conflict re-halts nothing - and when it is STOPPED, which is a stronger
+    operator intent with its own cancel-and-flatten enforcement that this must never
+    downgrade. A deleted deployment is left deleted: the conflict record on the signal is
+    the evidence that survives.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    row = session.get(LiveDeploymentModel, normalized)
+    if row is None:
+        logger.warning(
+            "Broker order id conflict on a signal whose deployment no longer exists "
+            "(deployment_id=%s); the conflict stays recorded on the signal",
+            normalized,
+        )
+        return CONFLICT_HALT_ALREADY_HALTED
+    current_status = str(row.status or "").strip().upper()
+    if current_status in {"PAUSED", "STOPPED"}:
+        return CONFLICT_HALT_ALREADY_HALTED
+    # The same row write `update_live_deployment_status` performs, in this transaction
+    # rather than through a second session: a conflict halt that took its own write lock
+    # inside this one would deadlock, and one that committed separately would leave a
+    # crash between the two commits with a persisted conflict on a still-ACTIVE row.
+    _apply_live_deployment_status_row(row, "PAUSED")
+    session.add(row)
+    return CONFLICT_HALT_PAUSED
+
+
+def pause_live_deployment_for_order_conflict(deployment_id: str) -> str:
+    """Pause one deployment for an unresolved broker order id conflict, atomically.
+
+    The periodic half of the halt (the detection half is
+    :func:`_reconcile_existing_live_signal`, which writes inside its own transaction).
+    Same rule, one conditional statement: the ``WHERE`` re-tests the row status, so a
+    deployment that became ``STOPPED`` between a caller's decision and this call cannot
+    be turned into ``PAUSED`` - a weaker state, whose write clears
+    ``stopped_enforced_at`` and would report a stop that never got proved.
+
+    Returns:
+
+    * :data:`CONFLICT_HALT_PAUSED` - this call wrote the pause;
+    * :data:`CONFLICT_HALT_ALREADY_HALTED` - nothing to do (already PAUSED or STOPPED,
+      already deleted, or no such deployment).
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return CONFLICT_HALT_ALREADY_HALTED
+    now = _utcnow_naive()
+    init_db()
+    # The same shared tuple the daemon's halt set and the claim filter read, so the three
+    # copies of "which statuses stop a conflict re-pause" cannot widen apart.
+    halt_exempt_list = ", ".join(f"'{status}'" for status in CONFLICT_HALT_EXEMPT_STATUSES)
+    with get_session() as session:
+        result = session.execute(
+            text(
+                "UPDATE live_deployments "
+                "SET status = 'PAUSED', stopped_enforced_at = NULL, updated_at = :now "
+                "WHERE id = :deployment_id "
+                f"AND UPPER(status) NOT IN ({halt_exempt_list})"
+            ),
+            {"now": now, "deployment_id": normalized},
+        )
+        session.commit()
+    return CONFLICT_HALT_PAUSED if int(result.rowcount or 0) == 1 else CONFLICT_HALT_ALREADY_HALTED
+
+
 def _reconcile_existing_live_signal(
     session: Session, existing: LiveSignalModel, record: LiveSignalModel
 ) -> None:
-    """Backfill broker_order_id onto an existing duplicate signal."""
-    # Reconcile broker_order_id: if existing lacks it but new record has it, update
+    """Reconcile a duplicate delivery onto the stored signal and commit.
+
+    Backfills ``broker_order_id`` when the stored row lacks one, and records a different
+    broker order id carried by the duplicate in the conflict list
+    (``conflicting_broker_order_ids``) instead of replacing the tracked id.
+    """
     new_broker_id = (record.broker_order_id or "").strip()
     existing_broker_id = (existing.broker_order_id or "").strip()
-    if new_broker_id and not existing_broker_id:
+    if not new_broker_id or new_broker_id == existing_broker_id:
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # Either a backfill (the stored row has no id) or a conflict (it has a different one). Both
+    # are read-modify-writes on state this session may have loaded before a concurrent duplicate
+    # committed, so take the write lock and re-read before deciding. Without it two redeliveries
+    # with different ids on an empty tracked id would both backfill from a stale empty copy and
+    # the loser's id would land nowhere: a live broker order the ledger never tracks.
+    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    session.refresh(existing)
+    existing_broker_id = (existing.broker_order_id or "").strip()
+    if not existing_broker_id:
         existing.broker_order_id = new_broker_id
         # Also update metadata_json for consistency
         metadata = dict(existing.metadata_json or {})
@@ -2256,16 +2783,57 @@ def _reconcile_existing_live_signal(
             "Updated existing live signal with broker_order_id (discord_message_id=%s)",
             record.discord_message_id,
         )
-    elif new_broker_id and existing_broker_id and new_broker_id != existing_broker_id:
-        logger.warning(
-            "Conflicting broker_order_id for duplicate live signal (signal_id=%s)",
-            existing.id,
-        )
         return
-    else:
-        logger.info(
-            "Skipping duplicate live signal (discord_message_id=%s)", record.discord_message_id
-        )
+    if new_broker_id == existing_broker_id:
+        # A concurrent duplicate already stored this very id; ends the lock taken above.
+        session.commit()
+        _log_duplicate_live_signal_skipped(record)
+        return
+    # A second, different broker order id for one logical signal: either a second broker
+    # order was placed or the ids were mapped wrongly. Either way a broker order may exist
+    # that the ledger does not track. The stored id is kept (never overwritten), but the
+    # conflicting id is persisted on the signal so operators and reconciliation can find
+    # and resolve it instead of it living only in a log line (issue #126).
+    metadata = dict(existing.metadata_json or {})
+    conflicts = _conflicting_broker_order_ids(metadata)
+    if new_broker_id not in conflicts:
+        conflicts.append(new_broker_id)
+        metadata[BROKER_ORDER_CONFLICTS_KEY] = conflicts
+        existing.metadata_json = metadata
+        session.add(existing)
+    # Fail closed (#126): the halt and the conflict record share one transaction. A warning
+    # alone leaves the deployment trading while a broker order it does not track may hold
+    # a position, so the affected deployment is paused here and cannot place further
+    # entries. Committing the pause separately would leave a crash between the two commits
+    # with a persisted conflict on a still-ACTIVE deployment.
+    halt_now = _pause_live_deployment_for_conflict(session, existing.deployment_id)
+    # Ends the write transaction opened above; a no-op commit when nothing changed.
+    session.commit()
+    logger.error(
+        "ALERT: conflicting broker_order_id for duplicate live signal: an untracked "
+        "broker order may exist and the deployment was halted. Resolve the conflict "
+        "with the broker before reactivating the deployment "
+        "(signal_id=%s, deployment_id=%s, tracked=%s, conflicting=%s, halt=%s)",
+        existing.id,
+        existing.deployment_id,
+        existing_broker_id,
+        new_broker_id,
+        halt_now,
+        extra={
+            "data": {
+                "alert": "live_broker_order_id_conflict",
+                "signal_id": str(existing.id),
+                "deployment_id": str(existing.deployment_id),
+                "tracked_broker_order_id": existing_broker_id,
+                "conflicting_broker_order_id": new_broker_id,
+                "conflicting_broker_order_ids": list(conflicts),
+                # What this call did to the halt: "PAUSED" when it wrote the pause, and
+                # "already-halted" when the deployment was already PAUSED/STOPPED, so a
+                # redelivery is not reported as a fresh halt.
+                "deployment_halt": halt_now,
+            }
+        },
+    )
 
 
 def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
@@ -2292,7 +2860,30 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             existing = _find_existing_live_signal_by_idempotency_key(
                 session, deployment_id, record.idempotency_key
             )
+            legacy_key = _normalize_optional_id(
+                (record.metadata_json or {}).get("legacy_idempotency_key")
+            )
+            if existing is None and legacy_key and legacy_key != record.idempotency_key:
+                # #127: rows written before the timestamp canonicalisation carry the key of the
+                # verbatim spelling; a replay across the upgrade must still dedupe against them.
+                existing = _find_existing_live_signal_by_idempotency_key(
+                    session, deployment_id, legacy_key
+                )
             if existing is not None:
+                # An identical producer event (same key) is treated as a redelivery. A genuine
+                # re-entry byte-identical to an earlier signal cannot be told apart, and
+                # trading it again on a guess is the worse failure, so it is swallowed - but
+                # never silently: an operator can see which key swallowed which signal.
+                logger.warning(
+                    "Skipping duplicate live signal: idempotency_key=%s already persisted as "
+                    "signal %s (deployment_id=%s, symbol=%s, action=%s); a genuine re-entry "
+                    "with identical producer fields is indistinguishable from a redelivery",
+                    record.idempotency_key,
+                    existing.id,
+                    deployment_id,
+                    record.symbol,
+                    record.action,
+                )
                 _reconcile_existing_live_signal(session, existing, record)
                 return str(existing.id), False
         record_id = str(record.id)
@@ -2317,27 +2908,58 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
                 "Skipping concurrent duplicate live signal (discord_message_id=%s)",
                 discord_msg_id,
             )
+            # The loser may carry a broker id the winner lacks or contradicts; record it the
+            # same way as a sequential duplicate instead of dropping it.
+            _reconcile_existing_live_signal(session, existing, record)
             return str(existing.id), False
     return record_id, True
 
 
 def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
-    """Deterministic dedupe key from fill content (C1).
+    """Deterministic dedupe key for a fill whose caller supplied none (C1, #127).
 
-    A redelivered fill carries identical content, so the key is stable
-    across redeliveries (unlike a random UUID, which would never dedupe).
+    In order of preference:
+
+    1. **The broker's own fill id** (``broker_fill_id``), scoped by signal and order. It is
+       unique per fill by construction, so two genuine partial fills with equal price, quantity
+       and timestamp stay two fills, and a redelivery stays one whatever timestamp precision or
+       zone it arrives with.
+    2. **Fill content**: signal, price, quantity, canonical UTC timestamp and order. A redelivery
+       carries identical content, so the key is stable. The timestamp goes through
+       :func:`shared.fill_keys.canonical_utc_timestamp` - naive/aware/offset spellings of one
+       instant collapse, but precision is never rounded, so fills a microsecond apart differ.
+
+    The content form cannot tell two genuinely distinct fills that agree on every field from one
+    fill delivered twice; only a broker id can. Adapters therefore pass a native key themselves
+    (``ctrader:deal:...``, ``alpaca:exec:...``) and this is the net underneath them.
     """
-    timestamp = execution.timestamp
-    if isinstance(timestamp, datetime):
-        if timestamp.tzinfo:
-            stamp = timestamp.astimezone(timezone.utc).isoformat()
-        else:
-            stamp = timestamp.replace(tzinfo=timezone.utc).isoformat()
-    else:
-        stamp = str(timestamp)
+    fill_id = execution.broker_fill_id
+    if fill_id is not None and int(fill_id) > 0:
+        return f"auto:{execution.signal_id}:fill:{execution.broker_order_id}:{int(fill_id)}"
+    stamp = canonical_utc_timestamp(execution.timestamp)
+    if stamp is None:
+        stamp = str(execution.timestamp)
     return (
         f"auto:{execution.signal_id}:{float(execution.actual_price or 0.0):.8f}:"
         f"{float(execution.filled_qty or 0.0):.8f}:{stamp}:{execution.broker_order_id}"
+    )
+
+
+def _log_dedupe_key_owned_by_other_signal(
+    existing: LiveExecutionModel, incoming_signal_id: str, dedupe_key: str | None
+) -> None:
+    """Shout when a dedupe key already belongs to a different signal (#127, C2).
+
+    The key is unique across the whole table, so a repeat under another signal is not a
+    redelivery of that fill: it is a fill that is about to be dropped (or, worse, merged into
+    someone else's row). Nothing is stored either way; this makes the loss visible.
+    """
+    logger.error(
+        "Dedupe key collision across signals: dedupe_key=%s is already stored for signal %s, "
+        "refusing to treat the fill for signal %s as a redelivery of it; the fill is NOT stored",
+        dedupe_key,
+        existing.signal_id,
+        incoming_signal_id,
     )
 
 
@@ -2353,6 +2975,11 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         .limit(1)
     ).first()
     if existing is not None:
+        if str(existing.signal_id) != str(record.signal_id):
+            _log_dedupe_key_owned_by_other_signal(
+                existing, str(record.signal_id), record.dedupe_key
+            )
+            return False
         logger.info(
             "Skipping duplicate live execution (dedupe_key=%s)", record.dedupe_key
         )
@@ -2372,6 +2999,9 @@ def _insert_live_execution_locked(session: Session, record: LiveExecutionModel) 
         ).first()
         if raced is None:
             raise
+        if str(raced.signal_id) != str(record.signal_id):
+            _log_dedupe_key_owned_by_other_signal(raced, str(record.signal_id), record.dedupe_key)
+            return False
         logger.info(
             "Skipping duplicate live execution on unique constraint (dedupe_key=%s)",
             record.dedupe_key,
@@ -2398,14 +3028,50 @@ def save_live_execution(execution: LiveExecution) -> bool:
 
 
 def save_live_execution_up_to_cumulative(
-    execution: LiveExecution, broker_cumulative_filled_qty: float
+    execution: LiveExecution,
+    broker_cumulative_filled_qty: float,
+    *,
+    cumulative_avg_price: float | None = None,
 ) -> float:
-    """Atomically persist only the quantity still missing up to a broker cumulative fill."""
+    """Atomically persist only the quantity still missing up to a broker cumulative fill.
+
+    ``cumulative_avg_price`` is for a caller that knows the broker's average over the WHOLE
+    cumulative quantity but not the price of the missing part - Alpaca's ``filled_avg_price`` on a
+    reconciled order (#124). The missing part's price is then derived here, inside the same
+    transaction that reads the local quantity, so a stream fill landing between the caller's read
+    and this write cannot skew it::
+
+        remainder price = (avg * cumulative - sum(local price * qty)) / missing qty
+
+    The derived price is stored as ``derived``. When it cannot be derived honestly - a local leg
+    has no usable price (the formula would silently move that leg's cost onto the remainder), the
+    result is not a finite positive price, or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION``
+    of the average - the QUANTITY is still persisted, at price 0.0 with ``derived_unavailable``
+    (logged): the ledger needs the quantity, and only PnL becomes incomplete. An amendment of an
+    existing key is refused (its stored price would need re-deriving too). Without
+    ``cumulative_avg_price`` the caller's ``actual_price`` and verdict are stored as-is.
+    """
     normalized_signal_id = str(execution.signal_id or "").strip()
     cumulative_qty = float(broker_cumulative_filled_qty or 0.0)
     requested_qty = float(execution.filled_qty or 0.0)
+    if not (math.isfinite(cumulative_qty) and math.isfinite(requested_qty)):
+        # SQLite stores NaN as NULL, so a non-finite quantity can only fail or corrupt the sum.
+        logger.warning(
+            "Refusing to persist live execution for signal %s: non-finite quantity "
+            "(filled_qty=%r, broker cumulative=%r)",
+            normalized_signal_id,
+            execution.filled_qty,
+            broker_cumulative_filled_qty,
+        )
+        return 0.0
     if not normalized_signal_id or cumulative_qty <= 0.0 or requested_qty <= 0.0:
         return 0.0
+    if cumulative_avg_price is not None:
+        cumulative_avg_price = float(cumulative_avg_price)
+        if not (math.isfinite(cumulative_avg_price) and cumulative_avg_price > 0.0):
+            raise ValueError(
+                f"cumulative_avg_price must be finite and positive, got {cumulative_avg_price!r}"
+            )
 
     init_db()
     with get_session() as session:
@@ -2427,6 +3093,23 @@ def save_live_execution_up_to_cumulative(
                 ).one()
                 or 0.0
             )
+            if existing is not None and str(existing.signal_id) != normalized_signal_id:
+                # The key belongs to ANOTHER signal. The amendment below would grow that signal's
+                # row using this signal's cumulative, so it must not run (#127, C2).
+                session.rollback()
+                _log_dedupe_key_owned_by_other_signal(
+                    existing, normalized_signal_id, record.dedupe_key
+                )
+                return 0.0
+            if existing is not None and cumulative_avg_price is not None:
+                session.rollback()
+                logger.warning(
+                    "Refusing to amend live execution %s (dedupe key %s) from a cumulative "
+                    "average price: the stored row's own price would need re-deriving",
+                    existing.id,
+                    existing.dedupe_key,
+                )
+                return 0.0
             if existing is not None:
                 # Same dedupe key. Two very different situations share this branch, and conflating
                 # them loses fills:
@@ -2456,15 +3139,21 @@ def save_live_execution_up_to_cumulative(
                     session.rollback()
                     return 0.0
                 existing.filled_qty = prior_qty + delta
-                if record.commission:
+                if existing.commission is None or record.commission is None:
+                    # A known fee plus an unknown one is unknown (#124): keeping the known part
+                    # would read as the whole fee and overstate net PnL.
+                    existing.commission = None
+                elif record.commission:
                     # Commission was recorded against the first-seen quantity, so only the
                     # incremental slice needs adding. A deal that reports commission per unit is
                     # handled by the caller scaling it, same as the partial-persist path below.
-                    existing.commission = float(existing.commission or 0.0) + float(
+                    existing.commission = float(existing.commission) + float(
                         record.commission
                     ) * (delta / requested_qty)
                 if record.actual_price and not existing.actual_price:
                     existing.actual_price = float(record.actual_price)
+                    # The verdict describes the stored price, so it travels with it.
+                    existing.actual_price_observed = record.actual_price_observed
                 session.add(existing)
                 session.commit()
                 logger.info(
@@ -2477,10 +3166,29 @@ def save_live_execution_up_to_cumulative(
                 )
                 return delta
 
-            persisted_qty = min(requested_qty, cumulative_qty - local_filled_qty)
+            missing_qty = cumulative_qty - local_filled_qty
+            persisted_qty = min(requested_qty, missing_qty)
             if persisted_qty <= 0.0:
                 session.rollback()
                 return 0.0
+
+            if cumulative_avg_price is not None:
+                remainder_price = _derive_remainder_price(
+                    session,
+                    normalized_signal_id,
+                    cumulative_avg_price=cumulative_avg_price,
+                    cumulative_qty=cumulative_qty,
+                    missing_qty=missing_qty,
+                )
+                # The QUANTITY is recorded either way: exit sizing and duplicate-order protection
+                # read filled quantity, and a fill dropped here would be dropped on every pass,
+                # because the legs that block the price do not change (review of #143).
+                if remainder_price is None:
+                    record.actual_price = 0.0
+                    record.actual_price_observed = PRICE_DERIVED_UNAVAILABLE
+                else:
+                    record.actual_price = remainder_price
+                    record.actual_price_observed = PRICE_DERIVED
 
             record.filled_qty = persisted_qty
             if requested_qty != persisted_qty and record.commission:
@@ -2492,6 +3200,221 @@ def save_live_execution_up_to_cumulative(
         except Exception:
             session.rollback()
             raise
+
+
+#: A derived remainder price must lie within this fraction of the order's own ``filled_avg_price``
+#: (review of #143). The average is a quantity-weighted mean of every fill of the ONE order, and
+#: the orders this platform submits (market and bracket entries) fill within seconds, so a real
+#: fill more than 10% away from its own order's average is implausible. The remainder price is
+#: also an amplifier: any error in a local leg's price or quantity is divided by the (often small)
+#: missing quantity. A result outside the band therefore says a local leg is inconsistent, not that
+#: the market moved - and the cost of a false rejection is bounded: the quantity is still recorded
+#: (`derived_unavailable`), only PnL is reported incomplete.
+REMAINDER_PRICE_MAX_REL_DEVIATION = 0.10
+
+
+def _derive_remainder_price(
+    session: Session,
+    signal_id: str,
+    *,
+    cumulative_avg_price: float,
+    cumulative_qty: float,
+    missing_qty: float,
+    broker_order_id: str | None = None,
+) -> float | None:
+    """The price of the quantity a signal is still missing, from the broker's cumulative average.
+
+    ``broker_order_id`` scopes the local legs to one broker order's fills: a broker-close
+    signal carries one leg's fills next to its siblings', and only the same leg's earlier
+    slices belong in this leg's notional. ``None`` (logged) when it cannot be derived
+    honestly: a local leg has no usable price (an unusable verdict, or a non-positive or
+    non-finite price - `derived` legs are usable), or the result is not finite and positive,
+    or it lies outside ``REMAINDER_PRICE_MAX_REL_DEVIATION`` of the average. See
+    `save_live_execution_up_to_cumulative`.
+    """
+    legs_query = select(
+        LiveExecutionModel.id,
+        LiveExecutionModel.actual_price,
+        LiveExecutionModel.filled_qty,
+        LiveExecutionModel.actual_price_observed,
+    ).where(LiveExecutionModel.signal_id == signal_id)
+    if broker_order_id is not None:
+        legs_query = legs_query.where(
+            LiveExecutionModel.broker_order_id == broker_order_id
+        )
+    legs = session.exec(legs_query).all()
+    local_notional = 0.0
+    for leg_id, price, qty, observed in legs:
+        if not execution_price_is_usable(price, observed):
+            logger.warning(
+                "Reconciled remainder for signal %s gets no price: local execution %s has no "
+                "usable price (actual_price=%r, actual_price_observed=%r), so the remainder price "
+                "cannot be derived from the broker's cumulative average; its quantity is still "
+                "recorded",
+                signal_id,
+                leg_id,
+                price,
+                observed,
+            )
+            return None
+        local_notional += float(price) * float(qty or 0.0)
+    remainder_price = (cumulative_avg_price * cumulative_qty - local_notional) / missing_qty
+    if not (math.isfinite(remainder_price) and remainder_price > 0.0):
+        problem = "is not a finite positive price"
+    elif (
+        abs(remainder_price - cumulative_avg_price)
+        > REMAINDER_PRICE_MAX_REL_DEVIATION * cumulative_avg_price
+    ):
+        problem = (
+            f"is more than {REMAINDER_PRICE_MAX_REL_DEVIATION:.0%} away from the order's own "
+            "average, which says a local leg is inconsistent"
+        )
+    else:
+        return remainder_price
+    logger.warning(
+        "Reconciled remainder for signal %s gets no price: derived remainder price %r %s "
+        "(broker average %r over %r, local notional %r, missing %r); its quantity is still "
+        "recorded",
+        signal_id,
+        remainder_price,
+        problem,
+        cumulative_avg_price,
+        cumulative_qty,
+        local_notional,
+        missing_qty,
+    )
+    return None
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """``value`` as the naive UTC wall time SQLite stores, so bounds compare like with like."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _account_execution_rows_query(account_id: str) -> SelectOfScalar:
+    return (
+        select(LiveExecutionModel, LiveSignalModel)
+        .join(LiveSignalModel, LiveSignalModel.id == LiveExecutionModel.signal_id)
+        .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+        .where(LiveDeploymentModel.account_id == account_id)
+    )
+
+
+def _commission_backfill_row(execution: LiveExecutionModel, signal: LiveSignalModel) -> dict:
+    timestamp = execution.timestamp
+    if timestamp is not None and timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return {
+        "execution_id": str(execution.id),
+        "signal_id": str(execution.signal_id),
+        "deployment_id": str(signal.deployment_id),
+        "symbol": str(signal.symbol or ""),
+        "action": str(signal.action or "").strip().lower(),
+        "actual_price": float(execution.actual_price or 0.0),
+        "filled_qty": float(execution.filled_qty or 0.0),
+        "commission": _optional_commission(execution),
+        "timestamp": timestamp,
+        "broker_order_id": str(execution.broker_order_id or ""),
+    }
+
+
+def list_live_executions_missing_commission(
+    account_id: str, *, since: datetime, until: datetime
+) -> list[dict[str, Any]]:
+    """The account's executions whose commission is still unknown (NULL), in ``[since, until)``.
+
+    Scoped through the signal's deployment to ``account_id``, so it spans every deployment of the
+    account - a broker fee is charged per account, not per deployment (#124).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        return []
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            _account_execution_rows_query(normalized_account_id)
+            .where(LiveExecutionModel.commission.is_(None))
+            .where(LiveExecutionModel.timestamp >= _naive_utc(since))
+            .where(LiveExecutionModel.timestamp < _naive_utc(until))
+            .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+        ).all()
+    return [_commission_backfill_row(execution, signal) for execution, signal in rows]
+
+
+def list_live_executions_for_broker_orders(
+    account_id: str, broker_order_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Every execution of ``account_id`` recorded against one of ``broker_order_ids``.
+
+    Includes rows whose commission is already known, so a caller can tell a group it may price
+    from one that is partly priced already, and an order this account never recorded from one it
+    did.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    order_ids = sorted({str(item).strip() for item in broker_order_ids if str(item).strip()})
+    if not normalized_account_id or not order_ids:
+        return []
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            _account_execution_rows_query(normalized_account_id)
+            .where(LiveExecutionModel.broker_order_id.in_(order_ids))
+            .order_by(LiveExecutionModel.timestamp.asc(), LiveExecutionModel.id.asc())
+        ).all()
+    return [_commission_backfill_row(execution, signal) for execution, signal in rows]
+
+
+def apply_live_execution_commissions(account_id: str, commissions: Mapping[str, float]) -> int:
+    """Set the commission of still-unknown executions of one account, all or nothing.
+
+    Every id must belong to ``account_id`` and still have a NULL commission; otherwise nothing is
+    written and 0 is returned (logged). That makes the backfill safe against a concurrent writer and
+    against a stale read: a fee allocated across a group is either applied to the whole group or
+    not at all, and a fee that is already known is never overwritten. Returns the rows updated.
+
+    Raises ValueError on a non-finite or negative commission - a caller bug, not broker data.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    updates: dict[str, float] = {}
+    for execution_id, value in commissions.items():
+        number = float(value)
+        if not (math.isfinite(number) and number >= 0.0):
+            raise ValueError(
+                f"commission for execution {execution_id!r} must be finite and non-negative, "
+                f"got {value!r}"
+            )
+        updates[str(execution_id)] = number
+    if not normalized_account_id or not updates:
+        return 0
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            rows = session.exec(
+                _account_execution_rows_query(normalized_account_id)
+                .where(LiveExecutionModel.id.in_(sorted(updates)))
+                .where(LiveExecutionModel.commission.is_(None))
+            ).all()
+            if len(rows) != len(updates):
+                session.rollback()
+                logger.warning(
+                    "Not applying backfilled commissions for account %s: %s of %s execution(s) "
+                    "are no longer unknown or do not belong to the account",
+                    normalized_account_id,
+                    len(updates) - len(rows),
+                    len(updates),
+                )
+                return 0
+            for execution, _signal in rows:
+                execution.commission = updates[str(execution.id)]
+                session.add(execution)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    return len(updates)
 
 
 def get_live_signal_filled_qty(signal_id: str) -> float:
@@ -2507,6 +3430,682 @@ def get_live_signal_filled_qty(signal_id: str) -> float:
             )
         ).one()
     return float(filled_qty or 0.0)
+
+
+# ─── broker-side closes (#144) ────────────────────────────────────────────────────────────────────
+
+#: Metadata key marking a signal this platform created to carry a broker-side close (#144): a
+#: bracket's stop/target leg fill, or a broker-side SL/TP close. It belongs to the same
+#: deployment as the signal whose position it closed, so the deployment's ledger nets it, but it
+#: is neither an entry nor an exit order of ours - nothing dispatches it to a broker.
+BROKER_SIDE_CLOSE_KEY = "broker_side_close"
+#: Metadata key: which kind of broker-side close the signal carries (see the callers).
+BROKER_CLOSE_REASON_KEY = "broker_close_reason"
+#: Metadata key: the signal whose position the close reduced.
+BROKER_CLOSE_PARENT_SIGNAL_KEY = "parent_signal_id"
+
+#: `source` of a broker-close signal. Deliberately neither `internal` nor `discord*`: the replay
+#: path only replays those two, and a close that already happened at the broker must never be
+#: re-submitted as a new order.
+BROKER_CLOSE_SIGNAL_SOURCE = "broker_close"
+
+#: Namespace for the deterministic ids of broker-close signals.
+_BROKER_CLOSE_NAMESPACE = uuid5(NAMESPACE_URL, "trading-platform/live/broker-side-close")
+
+#: Close reasons an adapter passes to :func:`record_live_broker_side_close_fill`.
+BROKER_CLOSE_REASON_ALPACA_STOP_LEG = "alpaca_bracket_stop"
+BROKER_CLOSE_REASON_ALPACA_TARGET_LEG = "alpaca_bracket_target"
+BROKER_CLOSE_REASON_ALPACA_LEG = "alpaca_bracket_leg"
+#: A cTrader position close the platform did not submit (SL/TP, flatten, manual).
+#: cTrader does not say WHICH of those fired, so one reason covers them all; the
+#: deal -> position -> opening-order -> clientOrderId chain is what makes the
+#: attribution exact rather than guessed.
+BROKER_CLOSE_REASON_CTRADER_POSITION_CLOSE = "ctrader_position_close"
+
+
+def broker_close_signal_id(parent_signal_id: str) -> str:
+    """The stable id of the close signal carrying one parent signal's broker-side closes (#144).
+
+    Keyed on the parent signal alone, never on the close reason: every close of one entry - a
+    stop leg, a target leg, a broker-side SL/TP deal - reduces the same quantity, so they must
+    share one close signal or the same fill would be counted once per reason. The reason stays
+    an audit field in the signal's metadata.
+    """
+    return str(uuid5(_BROKER_CLOSE_NAMESPACE, str(parent_signal_id or "")))
+
+
+def get_live_signal_account_id(signal_id: str) -> str | None:
+    """The account id of the deployment a live signal belongs to, or ``None``.
+
+    A broker-side close resolved through a position's opening order must prove
+    the signal it names lives on THIS account before its ledger may be reduced:
+    a ``clientOrderId`` is only a UUID, and a UUID persisted under another
+    account's deployment would otherwise receive the close (#144).
+    """
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id:
+        return None
+    init_db()
+    with get_session() as session:
+        account_id = session.exec(
+            select(LiveDeploymentModel.account_id)
+            .join(
+                LiveSignalModel,
+                LiveSignalModel.deployment_id == LiveDeploymentModel.id,
+            )
+            .where(LiveSignalModel.id == normalized_signal_id)
+        ).first()
+    return str(account_id) if account_id is not None else None
+
+
+def live_execution_dedupe_key_exists(dedupe_key: str) -> bool:
+    """Whether an execution row already carries this dedupe key (#144).
+
+    ``record_live_broker_side_close_fill`` returns ``0.0`` both for a duplicate
+    and for a refusal, and the caller must tell them apart: a duplicate is a
+    handled fill, a refusal is a ledger gap that has to be flagged. The key is
+    the broker-native identity both the stream and the reconcile pass derive,
+    so its presence is the honest answer.
+    """
+    normalized_key = str(dedupe_key or "").strip()
+    if not normalized_key:
+        return False
+    init_db()
+    with get_session() as session:
+        row = session.exec(
+            select(LiveExecutionModel.id)
+            .where(LiveExecutionModel.dedupe_key == normalized_key)
+            .limit(1)
+        ).first()
+    return row is not None
+
+
+def get_live_signal_filled_qty_for_broker_order(signal_id: str, broker_order_id: str) -> float:
+    """The quantity already recorded for one signal and one broker order (a leg's own id).
+
+    A reconciliation pass reads the leg's broker-side cumulative, which covers every partial fill
+    of that leg, so only the slice still missing may be persisted. Summing per (signal, broker
+    order) keeps a sibling leg's fills out of that arithmetic (#144).
+    """
+    normalized_signal_id = str(signal_id or "").strip()
+    normalized_order_id = str(broker_order_id or "").strip()
+    if not normalized_signal_id or not normalized_order_id:
+        return 0.0
+    init_db()
+    with get_session() as session:
+        filled_qty = session.exec(
+            select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                LiveExecutionModel.signal_id == normalized_signal_id
+            )
+            .where(LiveExecutionModel.broker_order_id == normalized_order_id)
+        ).one()
+    return float(filled_qty or 0.0)
+
+
+def record_live_broker_side_close_fill(
+    *,
+    parent_signal_id: str,
+    close_reason: str,
+    filled_qty: float,
+    actual_price: float,
+    actual_price_observed: str | None,
+    commission: float | None,
+    timestamp: datetime,
+    broker_order_id: str,
+    dedupe_key: str,
+    broker_fill_id: int | None = None,
+    close_side: str | None = None,
+    cumulative_filled_qty: float | None = None,
+    cumulative_avg_price: float | None = None,
+) -> float:
+    """Record a broker-side close against the parent signal's deployment ledger (#144).
+
+    A broker-side close - an Alpaca bracket's stop/target leg, and (once that path lands) a
+    cTrader position's SL/TP close - is an order the platform never submitted, so its fill arrives
+    with no signal of ours to attribute it to. Left unrecorded it shrinks the broker position
+    while every ledger still counts the shares, and #142's guard then reports a mismatch on every
+    later exit for that account and symbol: the exit is capped at the broker position, which on a
+    netted account can be another deployment's share.
+
+    The close is carried by a signal of the parent's own deployment whose action is the
+    *reducing* side (a sell for a buy entry), so the deployment's signed net filled quantity
+    falls by exactly what the broker closed - the same ledger every exit is sized against, whose
+    signs come from the parent signal's action. The signal id is derived from the parent signal
+    alone, so a redelivered fill, a reconnect and a second partial fill of the same leg all reuse
+    one close signal; only the fills differ, and they go through the same single locked insert
+    path as every other fill (:func:`save_live_execution`) with the caller's broker-native
+    dedupe key, so a redelivery is a skip rather than a second row. The row is written here
+    rather than through :func:`save_live_signal` because a broker close is no producer event:
+    neither that function's discord nor its idempotency dedupe describes it, and a second call
+    for the same parent would collide on the primary key rather than reuse the row.
+
+    Returns the quantity newly persisted, ``0.0`` when nothing was written (a duplicate, a
+    non-positive quantity, or a refusal below). Refusals never write and are logged: they are
+    broker facts this function cannot honestly attribute, and an invented attribution is the
+    failure mode it exists to prevent.
+
+    Refuses - returning ``0.0`` - when the parent signal is unknown, its action is neither
+    ``buy`` nor ``sell``, ``close_side`` contradicts the reducing side the parent's action
+    implies (a fill that would *extend* the position must never be recorded as a close), the
+    quantity is not finite and positive, or the caller supplied no timestamp.
+
+    Two caps keep the ledger honest inside the same ``BEGIN IMMEDIATE``: a fill is never
+    booked past the broker order's own cumulative filled quantity (``cumulative_filled_qty``,
+    scoped to this ``broker_order_id`` so a sibling leg's fills do not count), and never past
+    the parent signal's filled quantity minus what its close signal already carries - so a
+    double-booked fill (two dedupe keys for one broker fill) cannot drive the ledger below
+    zero. When ``cumulative_avg_price`` is supplied and the caller's price is unusable, the
+    missing slice's price is derived from the broker's cumulative average exactly the way
+    :func:`save_live_execution_up_to_cumulative` does (``derived``, or
+    ``derived_unavailable`` with the quantity still recorded).
+    """
+    normalized_parent = str(parent_signal_id or "").strip()
+    normalized_reason = str(close_reason or "").strip()
+    if not normalized_parent or not normalized_reason:
+        logger.warning(
+            "Broker-side close fill carries no parent signal or no close reason; "
+            "refusing to attribute it",
+            extra={
+                "data": {
+                    "parent_signal_id": str(parent_signal_id or ""),
+                    "close_reason": str(close_reason or ""),
+                    "broker_order_id": str(broker_order_id or ""),
+                }
+            },
+        )
+        return 0.0
+    quantity = float(filled_qty or 0.0)
+    if not math.isfinite(quantity) or quantity <= 0.0:
+        # SQLite stores NaN as NULL, so a non-finite quantity can only fail or corrupt the sum.
+        logger.warning(
+            "Refusing to record a broker-side close fill with a non-positive or non-finite "
+            "quantity (parent_signal_id=%s, close_reason=%s, filled_qty=%r)",
+            normalized_parent,
+            normalized_reason,
+            filled_qty,
+        )
+        return 0.0
+    stamp = timestamp if isinstance(timestamp, datetime) else None
+    if stamp is None:
+        logger.warning(
+            "Refusing to record a broker-side close fill without a timestamp: the execution "
+            "ledger is ordered by it and a fabricated time could not be corrected later "
+            "(parent_signal_id=%s, close_reason=%s)",
+            normalized_parent,
+            normalized_reason,
+        )
+        return 0.0
+    if stamp.tzinfo is None or stamp.tzinfo.utcoffset(stamp) is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    if cumulative_filled_qty is not None:
+        cumulative_filled_qty = float(cumulative_filled_qty)
+        if not (math.isfinite(cumulative_filled_qty) and cumulative_filled_qty > 0.0):
+            raise ValueError(
+                "cumulative_filled_qty must be finite and positive, got "
+                f"{cumulative_filled_qty!r}"
+            )
+
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            parent = session.get(LiveSignalModel, normalized_parent)
+            if parent is None:
+                session.rollback()
+                logger.warning(
+                    "Broker-side close fill names no persisted parent signal; refusing to "
+                    "attribute it (parent_signal_id=%s, close_reason=%s, broker_order_id=%s)",
+                    normalized_parent,
+                    normalized_reason,
+                    str(broker_order_id or ""),
+                )
+                return 0.0
+            parent_action = str(parent.action or "").strip().lower()
+            if parent_action not in {"buy", "sell"}:
+                session.rollback()
+                logger.warning(
+                    "Refusing to record a broker-side close for a parent signal whose action "
+                    "has no position sign (parent_signal_id=%s, action=%r, close_reason=%s)",
+                    normalized_parent,
+                    parent.action,
+                    normalized_reason,
+                )
+                return 0.0
+            reducing_side = "sell" if parent_action == "buy" else "buy"
+            requested_side = str(close_side or "").strip().lower()
+            if requested_side and requested_side != reducing_side:
+                session.rollback()
+                logger.warning(
+                    "Refusing to record a broker-side close on the extending side: the parent "
+                    "signal is a %s, so only a %s reduces it (parent_signal_id=%s, "
+                    "close_reason=%s, side=%r)",
+                    parent_action,
+                    reducing_side,
+                    normalized_parent,
+                    normalized_reason,
+                    close_side,
+                )
+                return 0.0
+
+            close_signal_id = broker_close_signal_id(normalized_parent)
+            close_signal = session.get(LiveSignalModel, close_signal_id)
+            if close_signal is None:
+                close_signal = LiveSignalModel(
+                    id=close_signal_id,
+                    deployment_id=str(parent.deployment_id),
+                    # The parent's symbol, upper-cased the way the ledger and the exit sizing
+                    # compare it (`func.upper(...) == symbol.upper()`).
+                    symbol=str(parent.symbol or "").upper(),
+                    action=reducing_side,
+                    # No price of ours belongs to a close the broker made: the fill's own price
+                    # is recorded on the execution, which is what PnL reads.
+                    theoretical_price=0.0,
+                    timestamp=stamp,
+                    source=BROKER_CLOSE_SIGNAL_SOURCE,
+                    broker_order_id="",
+                    discord_message_id=None,
+                    idempotency_key=None,
+                    metadata_json={
+                        BROKER_SIDE_CLOSE_KEY: True,
+                        BROKER_CLOSE_REASON_KEY: normalized_reason,
+                        BROKER_CLOSE_PARENT_SIGNAL_KEY: normalized_parent,
+                    },
+                )
+                session.add(close_signal)
+                try:
+                    # ``flush`` and not ``commit``: the whole function runs inside one
+                    # ``BEGIN IMMEDIATE``, and committing here would end it - the execution
+                    # insert below would then run without the write lock this function holds
+                    # (the PR body's "one transaction" claim depends on this). A flush is
+                    # enough to make the close signal's primary key real for the insert below.
+                    session.flush()
+                except IntegrityError:
+                    # A concurrent close of the same parent: the row is there, which is all this
+                    # path needs (no broker order is ever dispatched for it).
+                    session.rollback()
+                    close_signal = session.get(LiveSignalModel, close_signal_id)
+                    if close_signal is None:
+                        raise
+
+            # #144: two caps, both read inside this BEGIN IMMEDIATE so a concurrent fill
+            # cannot slip between the check and the insert. First the broker order's own
+            # cumulative, scoped to THIS leg's broker_order_id so a sibling leg's fills on
+            # the same close signal do not count against it; then the parent's filled
+            # quantity minus what the close signal already carries, so no double-booked
+            # fill (two dedupe keys for one broker fill) can drive the ledger below zero.
+            broker_key = str(broker_order_id or "")
+            recorded_for_order = 0.0
+            if broker_key:
+                recorded_for_order = float(
+                    session.exec(
+                        select(
+                            func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)
+                        ).where(
+                            LiveExecutionModel.signal_id == close_signal_id,
+                            LiveExecutionModel.broker_order_id == broker_key,
+                        )
+                    ).one()
+                    or 0.0
+                )
+            if cumulative_filled_qty is not None:
+                order_remaining = float(cumulative_filled_qty) - recorded_for_order
+                if order_remaining <= 0.0:
+                    # The leg's broker cumulative is already fully booked: a delayed
+                    # stream event after a reconcile pass, or a redelivery under a new key.
+                    session.rollback()
+                    return 0.0
+                quantity = min(quantity, order_remaining)
+            parent_filled_qty = float(
+                session.exec(
+                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                        LiveExecutionModel.signal_id == normalized_parent
+                    )
+                ).one()
+                or 0.0
+            )
+            already_closed_qty = float(
+                session.exec(
+                    select(func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0)).where(
+                        LiveExecutionModel.signal_id == close_signal_id
+                    )
+                ).one()
+                or 0.0
+            )
+            unclosed_qty = parent_filled_qty - already_closed_qty
+            if unclosed_qty <= 0.0:
+                session.rollback()
+                logger.warning(
+                    "Refusing to record a broker-side close beyond the parent signal's "
+                    "filled quantity: %s of %s is already closed (parent_signal_id=%s, "
+                    "close_reason=%s, broker_order_id=%s)",
+                    already_closed_qty,
+                    parent_filled_qty,
+                    normalized_parent,
+                    normalized_reason,
+                    broker_key,
+                )
+                return 0.0
+            quantity = min(quantity, unclosed_qty)
+
+            actual_price = float(actual_price or 0.0)
+            price_observed = actual_price_observed
+            if (
+                cumulative_avg_price is not None
+                and cumulative_filled_qty is not None
+                and not execution_price_is_usable(actual_price, price_observed)
+            ):
+                # The caller knows the broker's average over this leg's WHOLE cumulative
+                # but not the missing slice's price (a partial backfill): derive it the
+                # way `save_live_execution_up_to_cumulative` does, scoped to this leg's
+                # own earlier fills so a sibling leg's notional stays out.
+                cumulative_avg_price = float(cumulative_avg_price)
+                if not (math.isfinite(cumulative_avg_price) and cumulative_avg_price > 0.0):
+                    raise ValueError(
+                        "cumulative_avg_price must be finite and positive, got "
+                        f"{cumulative_avg_price!r}"
+                    )
+                remainder_price = _derive_remainder_price(
+                    session,
+                    close_signal_id,
+                    cumulative_avg_price=cumulative_avg_price,
+                    cumulative_qty=float(cumulative_filled_qty),
+                    missing_qty=float(cumulative_filled_qty) - recorded_for_order,
+                    broker_order_id=broker_key or None,
+                )
+                if remainder_price is None:
+                    actual_price = 0.0
+                    price_observed = PRICE_DERIVED_UNAVAILABLE
+                else:
+                    actual_price = remainder_price
+                    price_observed = PRICE_DERIVED
+
+            execution = LiveExecution(
+                signal_id=UUID(close_signal_id),
+                actual_price=actual_price,
+                actual_price_observed=price_observed,
+                filled_qty=quantity,
+                commission=commission,
+                timestamp=stamp,
+                broker_order_id=str(broker_order_id or ""),
+                broker_fill_id=broker_fill_id,
+                dedupe_key=dedupe_key,
+            )
+            record = LiveExecutionModel.from_live_execution(execution)
+            if not record.dedupe_key:
+                # A caller that supplied no key still gets the auto-derived one (C1/#127)
+                # rather than a NULL that bypasses the unique index.
+                record.dedupe_key = _auto_execution_dedupe_key(execution)
+            if not _insert_live_execution_locked(session, record):
+                session.rollback()
+                return 0.0
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    return quantity
+
+
+#: ``live_control_audit.action`` written when a close the ledgers never saw could
+#: not be attributed to one deployment (#144 maintainer decision). The audit row
+#: is the durable flag; periodic broker reconciliation (#330) acts on the
+#: ledger-vs-broker mismatch it computes itself, and this record is what tells an
+#: operator the gap was already detected rather than discovered at the next exit.
+LEDGER_RECONCILIATION_AUDIT_ACTION = "ledger_reconciliation_required"
+
+
+def flag_live_ledger_reconciliation(
+    *,
+    account_id: str,
+    symbol: str,
+    cause: str,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Flag that an account+symbol ledger no longer explains the broker position.
+
+    Written when a broker-side close cannot be attributed to exactly one
+    deployment's parent signal - a flatten, a manual close, or a position whose
+    opening orders name several signals (a netted book). The fill is NOT
+    guessed into a ledger: the flag plus the caller's ERROR alert is the surface
+    (#144 decision), and the next exit's ``LedgerMismatchError`` or the periodic
+    broker reconciliation is what acts on it. Never raises - an audit write that
+    could abort fill handling would be a worse failure than the missing flag.
+    """
+    return record_live_control_audit(
+        action=LEDGER_RECONCILIATION_AUDIT_ACTION,
+        target_type="account_symbol",
+        target_id=f"{str(account_id or '').strip()}:{str(symbol or '').strip().upper()}",
+        actor="live-runner",
+        detail={
+            "account_id": str(account_id or ""),
+            "symbol": str(symbol or "").strip().upper(),
+            "cause": str(cause or ""),
+            **dict(detail or {}),
+        },
+    )
+
+
+def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float:
+    """The deployment's own signed net filled quantity for ``symbol`` (#121).
+
+    This is the ledger an exit signal closes against: buy fills count positive,
+    sell fills negative, summed over every signal *this* deployment persisted for
+    the symbol. Another deployment's fills on the same (netted) broker position
+    are not included, so an exit closes only this deployment's share.
+
+    Only fills attributed to one of the deployment's own signals are counted. A
+    broker-side close that was never persisted (a bracket leg fill no adapter
+    path has booked yet, for example) is not in the ledger; callers cap the
+    result at the broker position for that reason.
+
+    Fails closed on a stored action other than buy/sell rather than guessing its
+    sign.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for the ledger quantity")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.action)
+        ).all()
+    net = 0.0
+    for action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            net += quantity
+        elif normalized_action == "sell":
+            net -= quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {normalized_deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+    return net
+
+
+def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
+    """Every deployment's signed net filled quantity for ``symbol`` on one account.
+
+    The ledger of each deployment whose ``account_id`` is ``account_id``, whatever
+    its status (a stopped deployment's holdings are still at the broker), as in
+    :func:`get_live_deployment_net_filled_qty`. Deployments without fills for the
+    symbol are absent. An exit compares the sum with the broker position before
+    trusting any one deployment's share of it (#121).
+
+    Fails closed on a stored action other than buy/sell.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for the account ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveSignalModel.deployment_id, LiveSignalModel.action)
+        ).all()
+    ledgers: dict[str, float] = {}
+    for deployment_id, action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            signed = quantity
+        elif normalized_action == "sell":
+            signed = -quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({normalized_symbol}) has no known position sign; refusing to size an exit."
+            )
+        key = str(deployment_id)
+        ledgers[key] = ledgers.get(key, 0.0) + signed
+    return ledgers
+
+
+#: A filled quantity this close to the requested one counts as fully filled.
+_EXIT_FILL_TOLERANCE = 1e-9
+
+
+def list_live_deployment_unfilled_exit_orders(
+    deployment_id: str, symbol: str
+) -> list[dict[str, Any]]:
+    """This deployment's exit orders for ``symbol`` not known to be fully filled.
+
+    An exit order is a persisted signal whose metadata carries
+    ``risk_sizing_mode == "exit_only"``. It is listed unless its persisted fills
+    reach the quantity it asked for; one without a readable requested quantity
+    is listed too, because it cannot be shown to be done. Whether a listed order
+    is still *working* is the broker's to say - a cancelled or rejected one is
+    listed here as well (#121).
+
+    Each row: ``signal_id``, ``deployment_id``, ``broker_order_id`` (may be
+    empty), ``requested_qty`` (``None`` when unreadable), ``filled_qty`` and
+    ``action`` (``buy``/``sell``, the side the order closes).
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol, deployment_id=normalized_deployment_id
+    )
+
+
+def list_account_unfilled_exit_orders(
+    account_id: str, symbol: str, *, exclude_deployment_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Exit orders for ``symbol`` of every deployment on one account not known to be filled.
+
+    Same rows and meaning as :func:`list_live_deployment_unfilled_exit_orders`,
+    across all deployments whose ``account_id`` is ``account_id`` (whatever their
+    status), optionally leaving out one deployment. Deployments on one account
+    share a netted broker position, so an exit of one is in flight for all of
+    them (#121).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account_id or not normalized_symbol:
+        raise ValueError("An account id and a symbol are required for pending exits")
+    return _list_unfilled_exit_orders(
+        normalized_symbol,
+        account_id=normalized_account_id,
+        exclude_deployment_id=str(exclude_deployment_id or "").strip() or None,
+    )
+
+
+def _list_unfilled_exit_orders(
+    normalized_symbol: str,
+    *,
+    deployment_id: str | None = None,
+    account_id: str | None = None,
+    exclude_deployment_id: str | None = None,
+) -> list[dict[str, Any]]:
+    # Lazy: keeps shared/ free of an import-time dependency on live_runner.
+    from live_runner.base_adapter import EXIT_ONLY_RISK_SIZING_MODE
+
+    init_db()
+    with get_session() as session:
+        # Two queries rather than one grouped join: grouping by a JSON column is
+        # not portable across database dialects.
+        signal_query = (
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.action,
+            )
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+        )
+        fill_query = (
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveExecutionModel.signal_id)
+        )
+        if deployment_id is not None:
+            signal_query = signal_query.where(LiveSignalModel.deployment_id == deployment_id)
+            fill_query = fill_query.where(LiveSignalModel.deployment_id == deployment_id)
+        if account_id is not None:
+            signal_query = signal_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+            fill_query = fill_query.join(
+                LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id
+            ).where(LiveDeploymentModel.account_id == account_id)
+        if exclude_deployment_id is not None:
+            signal_query = signal_query.where(
+                LiveSignalModel.deployment_id != exclude_deployment_id
+            )
+            fill_query = fill_query.where(LiveSignalModel.deployment_id != exclude_deployment_id)
+        signals = session.exec(signal_query).all()
+        fills = dict(session.exec(fill_query).all())
+    pending: list[dict[str, Any]] = []
+    for signal_id, signal_deployment_id, broker_order_id, metadata, action in signals:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if str(metadata.get("risk_sizing_mode") or "") != EXIT_ONLY_RISK_SIZING_MODE:
+            continue
+        filled_qty = float(fills.get(signal_id) or 0.0)
+        requested_qty: float | None
+        try:
+            requested_qty = abs(float(metadata.get("explicit_qty", metadata.get("qty"))))
+        except (TypeError, ValueError):
+            requested_qty = None
+        if requested_qty is not None and not math.isfinite(requested_qty):
+            requested_qty = None
+        if requested_qty is not None and filled_qty >= requested_qty - _EXIT_FILL_TOLERANCE:
+            continue
+        pending.append(
+            {
+                "signal_id": str(signal_id),
+                "deployment_id": str(signal_deployment_id),
+                "broker_order_id": str(broker_order_id or ""),
+                "requested_qty": requested_qty,
+                "filled_qty": filled_qty,
+                "action": str(action or "").strip().lower(),
+            }
+        )
+    return pending
 
 
 def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
@@ -2560,6 +4159,225 @@ def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
             return None
         metadata = dict(record.metadata_json or {})
     return metadata
+
+
+#: Page size for the newest-first scan in
+#: :func:`find_latest_filled_live_entry_signals`. The entry signal of an open
+#: position is normally the newest or second-newest filled signal of its symbol.
+_ENTRY_SIGNAL_SCAN_PAGE_SIZE = 25
+
+
+def _is_exit_only_signal_metadata(metadata: Mapping[str, Any]) -> bool:
+    return bool(metadata.get("exit_only")) or (
+        str(metadata.get("risk_sizing_mode") or "").strip().lower() == "exit_only"
+    )
+
+
+def find_latest_filled_live_entry_signals(
+    deployment_ids: list[str],
+    symbols: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Newest filled *entry* signal per symbol among the given deployments.
+
+    This is the persisted half of live trailing-stop state (issue #167): the
+    signal that opened a broker position carries the trailing config
+    (``metadata["trailing_sl_config"]``) the position must be trailed with, so
+    a restarted daemon recovers it from here instead of from process memory.
+
+    - Only signals with at least one persisted fill count: a later signal that
+      was refused or never filled must not displace the one whose position is
+      actually open.
+    - Exit-only signals are skipped: a partial close must not end the trail of
+      the remaining position. Whether a position is still open is the broker's
+      truth and is checked by the caller.
+
+    Returns ``{SYMBOL: {signal_id, deployment_id, symbol, action, timestamp,
+    metadata}}`` (symbol upper-cased, timestamp tz-aware UTC). Symbols without
+    a filled entry signal are absent.
+    """
+    normalized_ids = sorted({str(item).strip() for item in deployment_ids if str(item).strip()})
+    normalized_symbols = sorted(
+        {str(item).strip().upper() for item in symbols if str(item).strip()}
+    )
+    if not normalized_ids or not normalized_symbols:
+        return {}
+
+    init_db()
+    found: dict[str, dict[str, Any]] = {}
+    with get_session() as session:
+        for symbol in normalized_symbols:
+            entry = _newest_filled_entry_signal(session, normalized_ids, symbol)
+            if entry is not None:
+                found[symbol] = entry
+    return found
+
+
+def _newest_filled_entry_signal(
+    session: Any, deployment_ids: list[str], symbol: str
+) -> dict[str, Any] | None:
+    has_fill = (
+        select(LiveExecutionModel.id)
+        .where(LiveExecutionModel.signal_id == LiveSignalModel.id)
+        .where(LiveExecutionModel.filled_qty > 0)
+        .exists()
+    )
+    statement = (
+        select(LiveSignalModel)
+        .where(LiveSignalModel.deployment_id.in_(deployment_ids))
+        .where(func.upper(LiveSignalModel.symbol) == symbol)
+        .where(has_fill)
+        # #144: a broker-side close is a bookkeeping row for the parent entry, not an entry.
+        # It carries the newest fill on the symbol, so without this a trailing stop would read
+        # it as the entry and see a sell against a long, dropping the trail for the symbol.
+        .where(
+            or_(
+                LiveSignalModel.source.is_(None),
+                LiveSignalModel.source != BROKER_CLOSE_SIGNAL_SOURCE,
+            )
+        )
+        .order_by(LiveSignalModel.timestamp.desc(), LiveSignalModel.id.desc())
+    )
+    offset = 0
+    while True:
+        rows = session.exec(statement.offset(offset).limit(_ENTRY_SIGNAL_SCAN_PAGE_SIZE)).all()
+        for row in rows:
+            metadata = dict(row.metadata_json or {})
+            if _is_exit_only_signal_metadata(metadata):
+                continue
+            timestamp = row.timestamp
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": symbol,
+                "action": str(row.action or "").strip().lower(),
+                "timestamp": timestamp.astimezone(timezone.utc),
+                "metadata": metadata,
+            }
+        if not rows:
+            return None
+        offset += len(rows)
+
+
+def list_live_signal_broker_order_conflicts(limit: int | None = 200) -> list[dict[str, Any]]:
+    """Signals whose duplicate delivery carried a different broker order id.
+
+    Each row is a potentially untracked broker order: ``conflicting_broker_order_ids``
+    should be checked against the broker's open orders and positions.
+
+    ``limit=None`` reads every conflicted signal. It is for the reads that must not
+    silently truncate the truth - the halt enforcement and the health read - and it
+    costs no extra work: the scan behind this is a full table scan either way, so the
+    cap only bounds the rows that come back, not the query.
+    """
+    init_db()
+    # Filter and cap in SQL so only conflicted rows are returned (the scan itself is still a
+    # full table scan; there is no index on the JSON key). The two-argument form of
+    # json_array_length reads the key inside the stored document: it is 0 for any non-array
+    # value (a string, number or object under the key) and NULL when the key is absent, so
+    # only signals holding a non-empty list pass. Unwrapping the value first with
+    # json_extract would hand a stored string to json_array_length as JSON text and raise
+    # "malformed JSON" for the whole query.
+    conflict_count = func.json_array_length(
+        LiveSignalModel.metadata_json, f"$.{BROKER_ORDER_CONFLICTS_KEY}"
+    )
+    statement = (
+        select(LiveSignalModel).where(conflict_count > 0).order_by(LiveSignalModel.timestamp.desc())
+    )
+    if limit is not None:
+        statement = statement.limit(max(1, int(limit)))
+    with get_session() as session:
+        rows = session.exec(statement).all()
+    conflicts: list[dict[str, Any]] = []
+    for row in rows:
+        ids = _conflicting_broker_order_ids(row.metadata_json or {})
+        if not ids:
+            continue
+        conflicts.append(
+            {
+                "signal_id": str(row.id),
+                "deployment_id": str(row.deployment_id),
+                "symbol": row.symbol,
+                "broker_order_id": row.broker_order_id,
+                "conflicting_broker_order_ids": ids,
+            }
+        )
+    return conflicts
+
+
+def resolve_live_signal_broker_order_conflicts(signal_id: str) -> list[str]:
+    """Clear the recorded conflicting broker order ids for one signal.
+
+    The way out of a conflict halt (#126): while a conflict stays recorded the daemon
+    keeps the deployment paused, so a resolution cannot be a status write and nothing
+    else. This removes the key from the signal's metadata and returns the ids it
+    removed. A malformed value stored under the key (not a list) is removed too: it
+    keeps the signal in every conflict listing, and nothing can be reconciled against
+    a spelling the ledger refuses to read.
+
+    The caller is an explicit operator action - the viewer's resolve endpoint, which
+    requires a confirmation naming the deployment and audits the call. It is not
+    reachable from a signal payload: :meth:`LiveSignalModel.from_live_signal` drops a
+    producer-supplied conflict list, and nothing else writes this key.
+
+    Returns ``[]`` for an unknown signal or one with no recorded conflict, so a caller
+    can tell "nothing to resolve" from "resolved" without reading the row.
+
+    A duplicate that lands *after* this commit still re-records the conflict, and the
+    daemon re-pauses the deployment at the next tick. That is the fail-closed direction
+    and the operator sees it in the same health read; a duplicate that commits *before*
+    this read is the one the write lock covers, because it has to be seen rather than
+    clobbered.
+    """
+    normalized = str(signal_id or "").strip()
+    if not normalized:
+        return []
+    init_db()
+    with get_session() as session:
+        # Take the write lock before reading, exactly like the conflict ledger's own
+        # read-modify-write does. Without it a duplicate committing between this read
+        # and this write would be clobbered by a stale copy of the metadata: the operator
+        # would be told the conflict was resolved and the recording that replaced it
+        # would have vanished with no record anywhere.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveSignalModel, normalized)
+        if record is None:
+            return []
+        metadata = dict(record.metadata_json or {})
+        removed = _conflicting_broker_order_ids(metadata)
+        if not removed and BROKER_ORDER_CONFLICTS_KEY not in metadata:
+            return []
+        metadata.pop(BROKER_ORDER_CONFLICTS_KEY, None)
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return removed
+
+
+def deployments_with_broker_order_conflicts(
+    limit: int | None = 200,
+) -> dict[str, list[dict[str, Any]]]:
+    """Unresolved broker order id conflicts, grouped by deployment id.
+
+    The read behind the halt: the daemon's conflict enforcement re-pauses every
+    deployment that still carries an unresolved conflict, and the viewer reports them
+    to operators. One query for the whole fleet, so neither side scans signals per
+    deployment. Both callers are periodic (a 60 s service-sync tick and an HTTP
+    request), so the cost to remember is the one already documented on
+    ``list_live_signal_broker_order_conflicts``: the scan behind this has no index for
+    the JSON key.
+
+    ``limit=None`` reads the whole ledger. The enforcement uses it on purpose: a cap
+    that silently dropped an older conflict would leave a deployment the resolution
+    cannot clear and the halt never re-asserts, and that truncation would be invisible
+    in the response. Bounded callers (an HTTP payload) keep an explicit limit and say
+    so, rather than inheriting a default nobody asked for.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for conflict in list_live_signal_broker_order_conflicts(limit=limit):
+        grouped.setdefault(str(conflict["deployment_id"]), []).append(conflict)
+    return grouped
 
 
 def get_live_signal_timestamp(signal_id: str) -> datetime | None:
@@ -2642,6 +4460,14 @@ def list_live_signal_ids_for_reconciliation(
                 LiveSignalModel.deployment_id == LiveDeploymentModel.id,
             )
             .where(LiveDeploymentModel.account_id == normalized_account_id)
+            # #144: a broker-close signal is a ledger row, not a live order: it has no broker
+            # order of ours, so reconciling it is a wasted fetch of a nonexistent order.
+            .where(
+                or_(
+                    LiveSignalModel.source.is_(None),
+                    LiveSignalModel.source != BROKER_CLOSE_SIGNAL_SOURCE,
+                )
+            )
         )
         if before is not None:
             cursor_timestamp, cursor_id = before
@@ -2724,6 +4550,7 @@ def _create_live_account_record(
     is_demo: bool | None = None,
 ) -> LiveAccountConfig:
     """Insert a brand-new live account row."""
+    _assert_not_reserved_kill_switch_scope(account_id)
     account = LiveAccountModel(
         id=account_id,
         broker=broker,
@@ -2809,6 +4636,38 @@ def ensure_live_account(
         return current.to_live_account()
 
 
+def register_live_account_if_absent(
+    account_id: str,
+    broker: str,
+    *,
+    name: str = "",
+    ctid: str | None = None,
+    broker_login: str | None = None,
+    is_demo: bool | None = None,
+) -> bool:
+    """Insert the account row only when it does not exist, and never modify an existing one.
+
+    The existence check and the insert share one session, so there is no gap in which another
+    writer can be overwritten: if a row appears before the insert, the insert fails on the primary
+    key and the error propagates, leaving that row exactly as it was. Returns ``True`` when this
+    call created the row.
+    """
+    init_db()
+    with get_session() as session:
+        if session.get(LiveAccountModel, account_id) is not None:
+            return False
+        _create_live_account_record(
+            session,
+            account_id,
+            broker,
+            name=name,
+            ctid=ctid,
+            broker_login=broker_login,
+            is_demo=is_demo,
+        )
+    return True
+
+
 def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
     """Persist what discovery reported, without erasing what it did not.
 
@@ -2820,6 +4679,19 @@ def upsert_live_accounts(accounts: list[LiveAccountConfig]) -> None:
     init_db()
     with get_session() as session:
         for account in accounts:
+            try:
+                _assert_not_reserved_kill_switch_scope(account.id)
+            except ValueError as exc:
+                # Discovery data, not an operator request: refusing the whole
+                # batch would stop every other account from being persisted, and
+                # one unusable row is not worth that.
+                logger.error(
+                    "Refusing to store a live account whose id collides with the "
+                    "reserved kill switch scope: %r",
+                    account.id,
+                    extra={"data": {"account_id": str(account.id), "error": str(exc)}},
+                )
+                continue
             current = session.get(LiveAccountModel, account.id)
             if current is None:
                 session.add(LiveAccountModel.from_live_account(account))
@@ -3057,18 +4929,18 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
     return signal_source_type, signal_source
 
 
-def _normalized_symbol_filter(symbols: list[str]) -> list[str]:
-    """Uppercase stripped symbol entries, dropping blanks."""
-    return [
-        str(symbol).strip().upper()
-        for symbol in (symbols or [])
-        if str(symbol).strip()
-    ]
-
-
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.loss_breaker import deployment_loss_breaker_limits
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
+    from risk.live import entry_gate_settings
 
+    # Entry-gate settings (#125) are refused at creation, not first at
+    # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
+    # otherwise sit in the database until the first signal is rejected.
+    entry_gate_settings(deployment.settings)
+    # Loss breaker settings (#301) get the same treatment: a malformed
+    # threshold would otherwise refuse every entry at dispatch.
+    deployment_loss_breaker_limits(deployment)
     init_db()
     with get_session() as session:
         account = session.get(LiveAccountModel, deployment.account_id)
@@ -3098,12 +4970,24 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
             account_broker_login=account.broker_login or account.ctid or "",
             accounts_env_values=route_env,
         )
+        # #150/#167 fail closed: live trailing support is per broker, and this
+        # is where the deployment's broker is first known. Both the mode the
+        # deployment sets explicitly and the one its signal processor emits by
+        # default are checked (the bot's own config is where #150's defect came
+        # from), so a deployment that could never run its trail is refused here
+        # instead of signal by signal.
+        validate_live_deployment_trailing_mode(
+            deployment,
+            context=f"live deployment '{deployment.strategy_name}'",
+            broker=account.broker,
+            timeframe=_deployment_trailing_timeframe(deployment),
+        )
         deployment_status = str(deployment.status or "ACTIVE").upper()
         if deployment_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
             raise ValueError(f"Invalid deployment status '{deployment.status}'")
         signal_source_type, signal_source = _resolve_deployment_signal_source(deployment)
         signal_source_id = str(deployment.signal_source_id or "").strip()
-        symbol_filter = _normalized_symbol_filter(deployment.symbol_filter)
+        symbol_filter = normalize_symbols(deployment.symbol_filter)
         record = LiveDeploymentModel.from_live_deployment(deployment)
         record.status = deployment_status
         record.signal_source = signal_source
@@ -3114,6 +4998,28 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
         session.commit()
         session.refresh(record)
     return record.to_live_deployment()
+
+
+def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> None:
+    """Write a deployment's status (and the fields that go with it) on a loaded row.
+
+    One definition for every writer of `live_deployments.status`, in-session and
+    session-of-its-own alike, so the two rules that travel with a status change cannot
+    drift apart between them. Those rules are what makes a status readable afterwards:
+    an unchanged `updated_at` hides the write, and a `stopped_enforced_at` left on a
+    non-STOPPED row makes the next skip of the stop enforcement look proven (see the
+    STOPPED -> PAUSED -> STOPPED cycle below).
+    """
+    row.status = status
+    if status != "STOPPED":
+        # Clear the enforcement stamp in the *same* transaction as the status change.
+        # Without this a STOPPED -> PAUSED -> STOPPED cycle keeps the old stamp, and the
+        # second stop is skipped as "already enforced" while its positions are still
+        # open. Doing it in one commit matters: a crash between the two writes must not
+        # leave a non-STOPPED deployment carrying a stamp that disables the next
+        # enforcement.
+        row.stopped_enforced_at = None
+    row.updated_at = _utcnow_naive()
 
 
 def update_live_deployment_status(
@@ -3127,17 +5033,7 @@ def update_live_deployment_status(
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return None
-        record.status = next_status
-        if next_status != "STOPPED":
-            # Clear the enforcement stamp in the *same* transaction as the
-            # status change. Without this a STOPPED -> PAUSED -> STOPPED cycle
-            # keeps the old stamp, and the second stop is skipped as "already
-            # enforced" while its positions are still open. Doing it in one
-            # commit matters: a crash between the two writes must not leave a
-            # non-STOPPED deployment carrying a stamp that disables the next
-            # enforcement.
-            record.stopped_enforced_at = None
-        record.updated_at = _utcnow_naive()
+        _apply_live_deployment_status_row(record, next_status)
         session.add(record)
         session.commit()
         session.refresh(record)
@@ -3221,6 +5117,239 @@ def clear_live_deployment_stopped_enforced(deployment_id: str) -> bool:
     return True
 
 
+def _normalize_kill_switch_scope(scope: object) -> str:
+    """Normalize and validate one halt scope, or refuse it.
+
+    The reserved global scope is only accepted in its exact spelling: a padded
+    or differently-cased ``Global`` would be read back as an *account* scope, so
+    the halt would silently cover one account named "Global" instead of every
+    account.
+    """
+    normalized = str(scope or "").strip()
+    if not normalized:
+        raise ValueError("kill switch scope must not be empty")
+    if normalized.upper() == KILL_SWITCH_GLOBAL_SCOPE.upper():
+        if normalized != KILL_SWITCH_GLOBAL_SCOPE:
+            raise ValueError(
+                f"'{normalized}' looks like the reserved global halt scope; "
+                f"write it exactly as '{KILL_SWITCH_GLOBAL_SCOPE}'"
+            )
+        return KILL_SWITCH_GLOBAL_SCOPE
+    return normalized
+
+
+def _assert_not_reserved_kill_switch_scope(account_id: object) -> None:
+    """Refuse an account id that would collide with the reserved halt scope.
+
+    The kill switch's global scope and an account scope are one column, so an
+    account literally named ``global`` could not be halted as an account: writing
+    a halt for it would halt every account instead of that one. Refused at
+    creation rather than at halt time, so the ambiguity never exists to be
+    resolved under pressure.
+    """
+    normalized = str(account_id or "").strip()
+    if normalized.upper() == KILL_SWITCH_GLOBAL_SCOPE.upper():
+        raise ValueError(
+            f"'{account_id}' is the reserved kill switch scope and cannot be a "
+            f"live account id; halting that account would halt every account"
+        )
+
+
+def _kill_switch_scope_is_unknown_account(scope: str) -> bool:
+    """Whether ``live_accounts`` *proves* this scope names no account.
+
+    ``True`` only for a lookup that answered. A lookup that failed cannot prove
+    the scope is a typo, and refusing the halt on that basis would make a broken
+    read the reason trading kept running - the opposite of what a kill switch is
+    for.
+    """
+    try:
+        known = {str(account.id) for account in list_live_accounts()}
+    except Exception as exc:
+        logger.warning(
+            "Could not verify the kill switch account scope %s; writing the halt anyway",
+            scope,
+            extra={"data": {"scope": scope, "error": repr(exc)}},
+        )
+        return False
+    return scope not in known
+
+
+def set_live_kill_switch(
+    scope: object,
+    mode: object,
+    *,
+    actor: str = "unknown",
+    reason: str = "",
+) -> LiveKillSwitchState:
+    """Halt ``scope`` in ``mode``, and return the stored state.
+
+    ``mode`` must be one of the modes ``live_runner.kill_switch`` defines. It is
+    normalized (case, padding) here so every reader sees the same spelling, and
+    an unrecognized mode is refused rather than stored for a later reader to
+    interpret - a misspelling that reached the table would either halt nothing
+    while reporting a halt, or be read as the strictest mode.
+
+    Re-setting an already halted scope escalates in place: the mode is replaced
+    but ``halted_at``, ``halted_by`` and ``reason`` are not, because the account
+    has been halted continuously since the first write and that instant - and
+    whoever set it - is what an incident review asks for. The escalation itself is
+    attributed in ``live_control_audit``, which records the actor of every write.
+    Escalating never needs a restart to take effect either - the daemon keys its
+    re-sweep on the mode, so a change re-sweeps immediately.
+
+    A *weaker* mode on a standing halt is refused. The halt is an operator
+    emergency control, and a step-down from ``flatten`` to ``entries`` would stop
+    the sweeps while the row still reads as halted - silently weakening the one
+    control that must not weaken by accident (a stale tab, a mistyped mode, a
+    half-finished script). Lifting is ``clear_live_kill_switch``, which states
+    what it did and attributes it; weakening is not a quiet edit.
+
+    Re-arming a *cleared* scope is a new episode, not an escalation: one row per
+    scope has nowhere else to keep the earlier episode's instant, and reporting
+    that one would claim the account had been halted continuously since then -
+    which is precisely what the clear denied.
+
+    An account scope that matches no live account is refused: a typo'd id writes
+    a halt that covers nothing while the operator reads it as armed. The check
+    is skipped only when the accounts cannot be read at all (see
+    :func:`_kill_switch_scope_is_unknown_account`).
+    """
+    normalized_scope = _normalize_kill_switch_scope(scope)
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode not in KILL_SWITCH_MODES:
+        raise ValueError(
+            f"Unknown kill switch mode {mode!r}; expected one of "
+            f"{', '.join(sorted(KILL_SWITCH_MODES))}"
+        )
+    if (
+        normalized_scope != KILL_SWITCH_GLOBAL_SCOPE
+        and _kill_switch_scope_is_unknown_account(normalized_scope)
+    ):
+        raise ValueError(
+            f"Refusing to write a kill switch halt for unknown live account "
+            f"'{normalized_scope}'; a typo'd scope would halt nothing while "
+            f"reporting a halt"
+        )
+    actor_name = str(actor or "unknown").strip() or "unknown"
+    init_db()
+    with get_session() as session:
+        # Take the write lock before the weaken check, not after it: the check
+        # and the write must be one atomic fact, or two concurrent halts (a CLI
+        # 'flatten' and a viewer 'orders', say) both pass on the same snapshot
+        # and the last commit silently steps the halt down. BEGIN IMMEDIATE
+        # serialises the check against every other writer, the same way the
+        # submission-claim and re-point paths do.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveKillSwitchModel, normalized_scope)
+            now = _utcnow_naive()
+            if (
+                record is not None
+                and record.cleared_at is None
+                and str(record.mode) in KILL_SWITCH_MODES
+                and KILL_SWITCH_MODES.index(normalized_mode)
+                < KILL_SWITCH_MODES.index(str(record.mode))
+            ):
+                raise ValueError(
+                    f"Refusing to weaken a standing kill switch halt on "
+                    f"'{normalized_scope}' from '{record.mode}' to '{normalized_mode}'; "
+                    "lift the halt instead (clear_live_kill_switch)"
+                )
+            if record is None:
+                record = LiveKillSwitchModel(
+                    scope=normalized_scope,
+                    mode=normalized_mode,
+                    halted_at=now,
+                    halted_by=actor_name,
+                    reason=str(reason or ""),
+                )
+                session.add(record)
+            else:
+                record.mode = normalized_mode
+                if record.cleared_at is not None or record.halted_at is None:
+                    # A new episode (the row was cleared) or a row that never carried
+                    # an instant gets one now, and it is attributed to whoever armed
+                    # it. An escalation of a standing halt keeps the original actor,
+                    # reason and instant, because the account has been halted since
+                    # then and by them.
+                    record.halted_at = now
+                    record.halted_by = actor_name
+                    record.reason = str(reason or "")
+                # A row that was cleared is un-cleared by this write: the halt is
+                # live again, and a stale cleared_at would read it back as lifted.
+                record.cleared_at = None
+                record.cleared_by = None
+            session.commit()
+            session.refresh(record)
+        except Exception:
+            session.rollback()
+            raise
+        return record.to_state()
+
+
+def clear_live_kill_switch(
+    scope: object,
+    *,
+    actor: str = "unknown",
+) -> bool:
+    """Lift the halt on ``scope``. ``False`` when it was not halted.
+
+    The row is kept and stamped rather than deleted, so the history above stays
+    readable. Clearing a scope that is already clear is reported as a no-op
+    instead of rewriting a second clear over the first one's attribution.
+    """
+    normalized_scope = _normalize_kill_switch_scope(scope)
+    actor_name = str(actor or "unknown").strip() or "unknown"
+    init_db()
+    with get_session() as session:
+        # Same write lock as set_live_kill_switch: a resume racing a halt must
+        # serialise, not interleave a stale read into a lost update.
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            record = session.get(LiveKillSwitchModel, normalized_scope)
+            if record is None or record.cleared_at is not None:
+                return False
+            record.cleared_at = _utcnow_naive()
+            record.cleared_by = actor_name
+            session.add(record)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    return True
+
+
+def get_live_kill_switch_state(scope: object) -> LiveKillSwitchState | None:
+    """One scope's stored state, cleared or active, or ``None`` if never halted."""
+    normalized_scope = _normalize_kill_switch_scope(scope)
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveKillSwitchModel, normalized_scope)
+        return None if record is None else record.to_state()
+
+
+def read_live_kill_switch_scopes() -> dict[str, str]:
+    """``{scope: mode}`` for every scope halted right now.
+
+    One query, and it is the only read the daemon's hot paths make: the entry
+    gate runs it before every entry and the tick enforcement once per tick. A
+    scope cleared (or never halted) is simply absent.
+
+    Raises on a database failure rather than returning ``{}``: an empty result
+    is indistinguishable from "nothing is halted", which is the one answer that
+    must never be produced by an unreadable database.
+    """
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(LiveKillSwitchModel.scope, LiveKillSwitchModel.mode).where(
+                LiveKillSwitchModel.cleared_at.is_(None)
+            )
+        ).all()
+    return {str(scope): str(mode) for scope, mode in rows}
+
+
 def list_stopped_enforced_deployment_ids() -> set[str]:
     """Deployment ids whose STOPPED enforcement already completed.
 
@@ -3242,15 +5371,21 @@ def claim_live_deployment_submission(
     token: str,
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
+    allow_paused: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
-    Two independent facts have to hold, and both are decided by the database
+    Three independent facts have to hold, and the first two are decided by the database
     rather than by a status snapshot taken earlier in the dispatch:
 
-    * the deployment is still ``ACTIVE`` (the ``INSERT ... SELECT`` reads the
-      live row, so a PAUSE that committed first wins the race);
+    * the deployment is in a dispatchable status (the ``INSERT ... SELECT`` reads
+      the live row, so a PAUSE that committed first wins the race) - ``ACTIVE``
+      always, and ``PAUSED`` only when ``allow_paused`` is set;
     * no other process holds a lease for it (``UNIQUE(deployment_id)``).
+
+    ``allow_paused`` is for exits only (the #126 decision): a PAUSED deployment closes
+    what it holds but opens nothing. The caller is the daemon's claim site, which knows
+    the signal kind; leaving it at the default keeps a plain status gate for entries.
 
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
@@ -3265,6 +5400,12 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    # Built from the shared status tuple, never from caller text, so the set cannot be
+    # widened by anything but this flag - and so the daemon's dispatch statuses and this
+    # filter cannot drift apart.
+    allowed = LIVE_DISPATCH_EXIT_STATUSES if allow_paused else LIVE_DISPATCH_ENTRY_STATUSES
+    status_list = ", ".join(f"'{status}'" for status in allowed)
+    status_filter = f"UPPER(status) IN ({status_list})"
     with get_session() as session:
         session.exec(
             delete(LiveDeploymentSubmissionClaimModel).where(
@@ -3280,7 +5421,7 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    "WHERE id = :deployment_id AND UPPER(status) = 'ACTIVE'"
+                    f"WHERE id = :deployment_id AND {status_filter}"
                 ),
                 {
                     "token": normalized_token,
@@ -3479,6 +5620,18 @@ def update_live_deployment_account(
                 raise ValueError(
                     f"Refusing to re-point at unknown account '{account_id}'"
                 )
+
+            # #150/#167 fail closed: the new account may sit on a broker that
+            # cannot execute the deployment's trailing mode — whether the mode
+            # comes from the deployment's own override or from the bot config
+            # its processor runs with.
+            re_pointed = record.to_live_deployment()
+            validate_live_deployment_trailing_mode(
+                re_pointed,
+                context=f"live deployment '{record.strategy_name}' re-point",
+                broker=account.broker,
+                timeframe=_deployment_trailing_timeframe(re_pointed),
+            )
 
             current_status = str(record.status or "").strip().upper()
             if current_status == "ACTIVE":
@@ -3762,6 +5915,504 @@ def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRec
     return latest
 
 
+# ─── Loss circuit breaker (#301) ─────────────────────────────────────────────
+#
+# One row per scope in ``live_loss_breaker_state``. The observe/latch/reset
+# helpers are deliberately dumb storage: threshold evaluation lives in
+# ``live_runner.loss_breaker`` so this layer never decides whether trading is
+# allowed. ``observe`` is the only writer of the equity series; its
+# read-modify-write runs under a per-scope ``threading.Lock`` so the balance
+# poll and an entry check observing the same scope from different worker
+# threads cannot lose each other's update (a lost ``peak_equity`` update would
+# understate drawdown; two first observations at once would raise
+# ``IntegrityError`` on the primary key).
+
+_OBSERVE_LOCKS_GUARD = threading.Lock()
+_OBSERVE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _loss_breaker_observe_lock(scope: str) -> threading.Lock:
+    with _OBSERVE_LOCKS_GUARD:
+        lock = _OBSERVE_LOCKS.get(scope)
+        if lock is None:
+            lock = threading.Lock()
+            _OBSERVE_LOCKS[scope] = lock
+        return lock
+
+
+def _loss_breaker_utc_day(observed_at: datetime) -> str:
+    """The UTC calendar day ``observed_at`` falls on, as ``YYYY-MM-DD``."""
+    if observed_at.tzinfo is None:
+        aware = observed_at.replace(tzinfo=timezone.utc)
+    else:
+        aware = observed_at
+    return aware.astimezone(timezone.utc).date().isoformat()
+
+
+def get_live_loss_breaker_state(scope: str) -> LiveLossBreakerRecord | None:
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        return None
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+    return row.to_record() if row is not None else None
+
+
+def list_live_loss_breaker_states(
+    account_id: str | None = None,
+) -> list[LiveLossBreakerRecord]:
+    init_db()
+    with get_session() as session:
+        statement = select(LiveLossBreakerStateModel).order_by(
+            LiveLossBreakerStateModel.scope.asc()
+        )
+        if account_id is not None:
+            statement = statement.where(
+                LiveLossBreakerStateModel.account_id == str(account_id)
+            )
+        rows = session.exec(statement).all()
+    return [row.to_record() for row in rows]
+
+
+def observe_live_loss_breaker(
+    scope: str,
+    account_id: str,
+    equity: float,
+    observed_at: datetime,
+) -> LiveLossBreakerRecord:
+    """Record one equity observation for ``scope`` and return the new state.
+
+    First observation of a UTC day re-bases ``day_start_equity`` to the last
+    equity observed before the boundary (the closest available estimate of
+    start-of-day equity - it also captures an overnight gap a fresh baseline
+    would hide) and clears the daily latch; with no earlier observation the
+    current equity is the baseline. ``peak_equity`` only ever rises here - it
+    is re-based solely by ``reset_live_loss_breaker_drawdown``. Breach flags
+    are not evaluated here; ``latch_live_loss_breaker_breach`` owns them.
+
+    A scope's first-ever observation always seeds ``day_start_equity`` and
+    ``peak_equity`` from THAT observation - never from another scope's
+    baseline. A deployment scope observes a synthetic equity
+    (``account_equity - other deployments' P&L``) on a different basis than
+    the account scope, so inheriting the account row's baseline would trip a
+    brand-new deployment instantly (or hide its first-day losses).
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_account = str(account_id or "").strip()
+    if not normalized_scope or not normalized_account:
+        raise ValueError("observe_live_loss_breaker requires a scope and an account_id")
+    equity_value = float(equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    observed_naive = _naive_utc(observed_at)
+    utc_day = _loss_breaker_utc_day(observed_at)
+
+    init_db()
+    with _loss_breaker_observe_lock(normalized_scope):
+        with get_session() as session:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            if row is None:
+                row = LiveLossBreakerStateModel(
+                    scope=normalized_scope,
+                    account_id=normalized_account,
+                    utc_day=utc_day,
+                    day_start_equity=equity_value,
+                    peak_equity=equity_value,
+                    daily_breached=False,
+                    drawdown_breached=False,
+                    last_equity=equity_value,
+                    last_observed_at=observed_naive,
+                    breach_detail_json=None,
+                    updated_at=observed_naive,
+                )
+                session.add(row)
+            else:
+                if row.utc_day != utc_day:
+                    # UTC day boundary: the daily breaker resets automatically.
+                    # The new day's baseline is the equity last seen before the
+                    # boundary, not this observation - a gap across midnight is a
+                    # loss of the new day, not its starting capital.
+                    row.utc_day = utc_day
+                    row.day_start_equity = (
+                        float(row.last_equity)
+                        if row.last_equity is not None
+                        else equity_value
+                    )
+                    row.daily_breached = False
+                row.peak_equity = max(float(row.peak_equity), equity_value)
+                row.last_equity = equity_value
+                row.last_observed_at = observed_naive
+                row.updated_at = observed_naive
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
+
+
+def latch_live_loss_breaker_breach(
+    scope: str,
+    kind: str,
+    detail: dict[str, Any],
+    latched_at: datetime,
+) -> bool:
+    """Set the ``daily``/``drawdown`` latch on ``scope``; True when it transitions.
+
+    The return value is what the caller alerts on: a scope already latched for
+    that kind reports False so a standing breach alerts once per episode, not
+    once per observation.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("latch_live_loss_breaker_breach requires a scope")
+    if kind not in {"daily", "drawdown"}:
+        raise ValueError(f"unknown loss breaker breach kind {kind!r}")
+    latched_naive = _naive_utc(latched_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            raise KeyError(f"no loss breaker state for scope {normalized_scope!r}")
+        flag = "daily_breached" if kind == "daily" else "drawdown_breached"
+        already = bool(getattr(row, flag))
+        setattr(row, flag, True)
+        row.breach_detail_json = dict(detail)
+        row.updated_at = latched_naive
+        session.add(row)
+        session.commit()
+        return not already
+
+
+def reset_live_loss_breaker_drawdown(
+    scope: str,
+    equity: float,
+    reset_at: datetime,
+) -> LiveLossBreakerRecord | None:
+    """Operator reset of the drawdown breaker: clear the latch, re-base the peak.
+
+    ``peak_equity`` is set to the current equity, not kept: the drawdown
+    breaker measures from the peak, so a reset that kept the old high-water
+    mark would re-trip on the very next observation. Returns ``None`` when the
+    scope has no state row.
+    """
+    normalized_scope = str(scope or "").strip()
+    if not normalized_scope:
+        raise ValueError("reset_live_loss_breaker_drawdown requires a scope")
+    equity_value = float(equity)
+    if not math.isfinite(equity_value):
+        raise ValueError(f"loss breaker equity must be finite, got {equity!r}")
+    reset_naive = _naive_utc(reset_at)
+
+    init_db()
+    with get_session() as session:
+        row = session.get(LiveLossBreakerStateModel, normalized_scope)
+        if row is None:
+            return None
+        row.drawdown_breached = False
+        row.peak_equity = equity_value
+        row.last_equity = equity_value
+        row.last_observed_at = reset_naive
+        row.updated_at = reset_naive
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.to_record()
+
+
+# ─── Deployment trading flows (loss breaker, #301) ────────────────────────────
+#
+# The deployment loss-breaker scope cannot read a "deployment equity" from the
+# broker: positions on a netted account belong to the account, not to a
+# deployment. What the platform does have is the persisted fill ledger - every
+# execution knows its deployment, symbol, side, quantity, price and commission.
+# From it a deployment's trading P&L (realized AND unrealized, in account
+# currency once marked with the current quote and pip value) is computable:
+#
+#     pnl = pip_value * (cash + net_qty * price_now) - commission
+#
+# where ``cash`` is net cash paid (negative) or received (positive) in
+# qty x price units and ``net_qty`` the signed open quantity. This section only
+# aggregates the ledger; marking to market and the breaker math live in
+# ``live_runner.loss_breaker``.
+
+#: ``actual_price_observed`` verdicts a fill's price may be trusted for P&L.
+#: ``derived`` is the reconcile remainder's estimate - the best available and
+#: excluding it would make every deployment that ever needed a reconcile
+#: unmeasurable. ``sent_bad``/``absent``/``derived_unavailable`` and a
+#: non-positive price are not a price. A NULL verdict is a row written before
+#: the column existed; its ``actual_price`` was still recorded, so it counts
+#: when positive.
+_TRUSTED_FILL_PRICE_OBSERVED = ("observed", "derived")
+
+
+def get_account_deployment_trading_flows(
+    account_id: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Per-deployment, per-symbol trading flows for one account's breaker scopes.
+
+    Returns ``{deployment_id: {symbol: flow}}`` where ``flow`` holds:
+
+    * ``net_qty`` - signed filled quantity (buy ``+``, sell ``-``);
+    * ``cash`` - ``-sum(sign * qty * actual_price)`` in qty x price units:
+      net cash paid (negative) or received (positive);
+    * ``commission`` - summed per-fill commission in account currency.
+      KNOWN APPROXIMATION: a NULL commission is summed as 0. Alpaca crypto
+      fees stay NULL until the CFEE backfill lands (about two days), so a
+      crypto deployment's P&L is overstated by those fees until then.
+      Failing closed instead would stop crypto deployments for days after
+      each fill, so the runbook documents this as accepted;
+    * ``unpriced_fills`` - fills whose ``actual_price`` cannot be trusted
+      (see ``_TRUSTED_FILL_PRICE_OBSERVED``). Any non-zero count means the
+      deployment's P&L cannot be computed exactly and the caller must fail
+      closed rather than mark to market on a partial ledger.
+
+    Every deployment on the account is covered whatever its status - a stopped
+    deployment's ledger still describes positions at the broker. Deployments
+    without fills are absent (their P&L is 0). Fails closed on a stored action
+    other than buy/sell, like the quantity ledger.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        raise ValueError("An account id is required for deployment trading flows")
+    trusted = or_(
+        LiveExecutionModel.actual_price_observed.is_(None),
+        LiveExecutionModel.actual_price_observed.in_(_TRUSTED_FILL_PRICE_OBSERVED),
+    )
+    priced = and_(
+        LiveExecutionModel.actual_price > 0,
+        trusted,
+    )
+    unpriced = ~priced
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                func.sum(LiveExecutionModel.filled_qty),
+                func.sum(LiveExecutionModel.filled_qty * LiveExecutionModel.actual_price),
+                func.sum(func.coalesce(LiveExecutionModel.commission, 0.0)),
+                func.sum(case((unpriced, 1), else_=0)),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account)
+            .group_by(
+                LiveSignalModel.deployment_id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+            )
+        ).all()
+    flows: dict[str, dict[str, dict[str, Any]]] = {}
+    for deployment_id, symbol, action, qty, qty_price, commission, unpriced_count in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(qty or 0.0)
+        qty_at_price = float(qty_price or 0.0)
+        if normalized_action == "buy":
+            sign = 1.0
+        elif normalized_action == "sell":
+            sign = -1.0
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({symbol}) has no known position sign; the deployment loss "
+                "breaker cannot compute its P&L."
+            )
+        dep = flows.setdefault(str(deployment_id), {})
+        flow = dep.setdefault(
+            str(symbol),
+            {"net_qty": 0.0, "cash": 0.0, "commission": 0.0, "unpriced_fills": 0},
+        )
+        flow["net_qty"] += sign * quantity
+        flow["cash"] += -sign * qty_at_price
+        flow["commission"] += float(commission or 0.0)
+        flow["unpriced_fills"] += int(unpriced_count or 0)
+    return flows
+
+
+#: ``live_control_audit.action`` written when a broker-side close could not be
+#: attributed to one deployment's ledger (#144; the writer lands with #277).
+#: The loss breaker treats any such row on the account as "the fill ledger may
+#: be incomplete" and fails deployment scopes closed - a stale ledger P&L
+#: would otherwise move every OTHER deployment's synthetic equity.
+LEDGER_RECONCILIATION_AUDIT_ACTION = "ledger_reconciliation_required"
+
+#: ``live_control_audit.action`` written by the operator resolution path
+#: (``scripts.live_loss_breaker resolve-ledger-flag``): an operator has
+#: reconciled the flagged ``account:symbol`` by hand. A flag counts as
+#: UNRESOLVED only while it is newer than the latest resolution for the same
+#: ``account:symbol`` - audit rows are append-only, so "resolved" can never
+#: delete the flag, only supersede it.
+LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION = "ledger_reconciliation_resolved"
+
+
+def _ledger_flag_account_like(account_id: str) -> str:
+    """The LIKE pattern matching ``<account_id>:*`` audit target ids.
+
+    The trailing colon keeps ``acc-1`` from matching ``acc-10:SYM``.
+    """
+    escaped_account = (
+        str(account_id).replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+    return f"{escaped_account}:%"
+
+
+def _latest_audit_timestamps_by_target(
+    session: Session, action: str, like_pattern: str
+) -> dict[str, Any]:
+    """``{target_id: max(created_at)}`` for one audit action on an account."""
+    rows = session.exec(
+        select(
+            LiveControlAuditModel.target_id,
+            func.max(LiveControlAuditModel.created_at),
+        )
+        .where(LiveControlAuditModel.action == action)
+        .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        .group_by(LiveControlAuditModel.target_id)
+    ).all()
+    return {str(target_id): created_at for target_id, created_at in rows}
+
+
+def list_unresolved_ledger_reconciliation_flags(account_id: str) -> list[str]:
+    """The ``<account_id>:<SYMBOL>`` targets with an UNRESOLVED flag.
+
+    ``flag_live_ledger_reconciliation`` (#277) writes one audit row per
+    ``account:symbol`` whose broker position the persisted fill ledger cannot
+    explain. A flag is unresolved while it is newer than the latest
+    ``ledger_reconciliation_resolved`` row for the SAME target: the operator
+    resolution command writes those, and a NEW flag after a resolution flags
+    the target again. ``target_id`` is ``<account_id>:<SYMBOL>``; the LIKE
+    pattern's trailing colon keeps ``acc-1`` from matching ``acc-10:SYM``.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    like_pattern = _ledger_flag_account_like(normalized_account)
+    init_db()
+    with get_session() as session:
+        flagged = _latest_audit_timestamps_by_target(
+            session, LEDGER_RECONCILIATION_AUDIT_ACTION, like_pattern
+        )
+        if not flagged:
+            return []
+        resolved = _latest_audit_timestamps_by_target(
+            session, LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION, like_pattern
+        )
+    return sorted(
+        target_id
+        for target_id, flagged_at in flagged.items()
+        if target_id not in resolved
+        or flagged_at is None
+        or resolved[target_id] is None
+        or flagged_at > resolved[target_id]
+    )
+
+
+def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
+    """Whether ``account_id`` has any UNRESOLVED ledger-reconciliation flag.
+
+    See :func:`list_unresolved_ledger_reconciliation_flags`: ANY unresolved
+    row means the ledger may be missing fills and deployment P&L derived from
+    it is not trustworthy.
+    """
+    return bool(list_unresolved_ledger_reconciliation_flags(account_id))
+
+
+def resolve_ledger_reconciliation_flag(
+    *,
+    account_id: str,
+    symbol: str,
+    actor: str = "operator",
+    note: str = "",
+) -> dict[str, Any]:
+    """Record the operator resolution of one ``account:symbol`` flag.
+
+    Writes a ``ledger_reconciliation_resolved`` audit row against the same
+    ``account:symbol`` target the flag used, so the flag stops counting as
+    unresolved (it is newer-than-resolution that keeps it live - see
+    :func:`list_unresolved_ledger_reconciliation_flags`). The flag row itself
+    is never touched: the audit trail stays append-only. Never raises - the
+    audit writer logs and returns its payload either way.
+    """
+    normalized_account = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account or not normalized_symbol:
+        raise ValueError("resolve_ledger_reconciliation_flag requires account and symbol")
+    return record_live_control_audit(
+        action=LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION,
+        target_type="account_symbol",
+        target_id=f"{normalized_account}:{normalized_symbol}",
+        actor=actor,
+        detail={
+            "account_id": normalized_account,
+            "symbol": normalized_symbol,
+            "note": str(note or ""),
+        },
+    )
+
+
+def list_untrusted_fill_references(
+    account_id: str, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Identities of the account's fills whose price cannot be trusted.
+
+    The counterpart of ``unpriced_fills`` in
+    :func:`get_account_deployment_trading_flows` for alerting: the aggregate
+    only counts them, this names them so an operator can find and repair the
+    rows. Same trust rule (``_TRUSTED_FILL_PRICE_OBSERVED`` + positive price).
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    trusted = or_(
+        LiveExecutionModel.actual_price_observed.is_(None),
+        LiveExecutionModel.actual_price_observed.in_(_TRUSTED_FILL_PRICE_OBSERVED),
+    )
+    priced = and_(
+        LiveExecutionModel.actual_price > 0,
+        trusted,
+    )
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                LiveExecutionModel.id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                LiveExecutionModel.filled_qty,
+                LiveExecutionModel.actual_price,
+                LiveExecutionModel.actual_price_observed,
+                LiveExecutionModel.broker_order_id,
+                LiveExecutionModel.timestamp,
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account)
+            .where(~priced)
+            .order_by(LiveExecutionModel.timestamp.desc())
+            .limit(max(1, int(limit)))
+        ).all()
+    return [
+        {
+            "execution_id": str(row[1]),
+            "deployment_id": str(row[0]),
+            "symbol": str(row[2]),
+            "action": str(row[3] or ""),
+            "filled_qty": float(row[4] or 0.0),
+            "actual_price": float(row[5] or 0.0),
+            "actual_price_observed": row[6],
+            "broker_order_id": str(row[7] or ""),
+            "timestamp": row[8].isoformat() if row[8] else None,
+        }
+        for row in rows
+    ]
+
+
 def list_live_signal_executions_for_deployments(
     deployment_ids: list[str],
 ) -> list[dict[str, Any]]:
@@ -3824,15 +6475,15 @@ def _live_signal_deployment_execution_fields(
         "execution_timestamp": (
             execution.timestamp if execution is not None else None
         ),
-        "actual_price": (
-            float(execution.actual_price or 0.0) if execution is not None else None
+        "actual_price": _optional_execution_price(execution),
+        "actual_price_observed": (
+            execution.actual_price_observed if execution is not None else None
         ),
         "filled_qty": (
             float(execution.filled_qty or 0.0) if execution is not None else None
         ),
-        "commission": (
-            float(execution.commission or 0.0) if execution is not None else None
-        ),
+        # NULL stays None: an unknown fee is not a zero fee (#124).
+        "commission": _optional_commission(execution),
         "broker_order_id": (
             str(execution.broker_order_id or "") if execution is not None else None
         ),
@@ -4014,7 +6665,13 @@ def _scalar_stats_for_save(
         ).where(BacktestRecord.id == backtest_id)
     ).first()
     if row is not None:
-        current.update(zip((name for name, _ in _SCALAR_STAT_COLUMNS), row))
+        # `strict=True` is the invariant the comment above is defending: the
+        # select list and the row are built from the same tuple, so a length
+        # mismatch means a column moved, and failing here is the only way that
+        # does not publish a mislabelled stat.
+        current.update(
+            zip((name for name, _ in _SCALAR_STAT_COLUMNS), row, strict=True)
+        )
     resolved: dict[str, float] = {}
     for name, _default in _SCALAR_STAT_COLUMNS:
         # `default=None` makes "the producer did not name it" and "the producer declared it
@@ -4029,7 +6686,10 @@ def _scalar_stats_for_save(
         # it is logged because a malformed number is a producer bug, not an absence.
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer outside float64 range (10**400) is
+            # stored JSON that cannot be read as a stat. Same rule as NaN:
+            # absence, so the stored column carries forward (#256).
             number = math.nan
         if math.isfinite(number):
             resolved[name] = number
@@ -4043,13 +6703,42 @@ def _scalar_stats_for_save(
     return resolved
 
 
+def _optional_execution_price(execution: LiveExecutionModel | None) -> float | None:
+    """A row's price, or None when it is not a price (see `execution_price_is_usable`)."""
+    if execution is None or not execution_price_is_usable(
+        execution.actual_price, execution.actual_price_observed
+    ):
+        return None
+    return float(execution.actual_price)
+
+
+def _optional_commission(execution: LiveExecutionModel | None) -> float | None:
+    """A row's commission, keeping NULL ("not known yet", #124) distinct from a known 0.0."""
+    if execution is None or execution.commission is None:
+        return None
+    return float(execution.commission)
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
         theoretical = float(signal.theoretical_price or 0.0)
-        actual = float(execution.actual_price or 0.0)
-        slippage = actual - theoretical
-        slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
+        # An unusable price (#124, review of #143) is None, not 0.0: a 0.0 here would read as a
+        # fill at zero and a slippage of -100%.
+        actual = _optional_execution_price(execution)
+        # #144: a broker-side close has no theoretical price of ours (the broker
+        # decided the exit), so `actual - theoretical` is not a slippage - it would
+        # read as the whole fill price. Report no slippage, never a fabricated one.
+        broker_close = str(signal.source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        slippage = (
+            actual - theoretical
+            if actual is not None and not broker_close
+            else None
+        )
+        if slippage is None:
+            slippage_bps = None
+        else:
+            slippage_bps = 0.0 if theoretical == 0 else (slippage / theoretical) * 10000.0
         payload.append(
             {
                 "signal_id": signal.id,
@@ -4062,8 +6751,9 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "actual_price": actual,
                 "slippage": slippage,
                 "slippage_bps": slippage_bps,
+                "actual_price_observed": execution.actual_price_observed,
                 "filled_qty": float(execution.filled_qty or 0.0),
-                "commission": float(execution.commission or 0.0),
+                "commission": _optional_commission(execution),
                 "signal_timestamp": signal.timestamp,
                 "execution_timestamp": execution.timestamp,
                 "broker_order_id": execution.broker_order_id,
@@ -4293,7 +6983,7 @@ def _coerce_backtest_row_id(row: Any) -> str | None:
     if row is None:
         return None
     if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
+        mapping = row._mapping
         value = mapping.get("id")
         return str(value) if value else None
     if isinstance(row, (tuple, list)) and row and row[0]:
@@ -4321,16 +7011,6 @@ def _as_string_list(value: Any) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
-def _safe_stat_number(value: Any, default: float = 0.0) -> float:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return default
-    if math.isnan(numeric):
-        return default
-    return numeric
-
-
 def _stat_number_or_undefined(
     stats: dict[str, Any], key: str, default: float
 ) -> float | None:
@@ -4354,9 +7034,54 @@ def _stat_number_or_undefined(
         return None
     try:
         numeric = float(resolved)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a corrupt artifact can carry a JSON integer outside
+        # float64 range (10**400); that is unreadable, not a measurement (#256).
         return None
     return numeric if math.isfinite(numeric) else None
+
+
+def _backtest_is_ruined(backtest: BacktestRecord, stats: dict[str, Any]) -> bool:
+    """Whether a stored backtest's account reached zero (#132).
+
+    Artifacts saved after the flag existed carry ``ruined`` in their stats and
+    that is authoritative. Older artifacts carry no such key, and reading that
+    as "not ruined" would let a liquidated legacy run (whose pre-ruin Sharpe can
+    look excellent) reach live deployment selection. For those the persisted
+    equity curve is checked directly: any non-positive equity point means ruin.
+    A legacy artifact with no curve at all keeps the previous reading (not
+    ruined) because there is nothing to derive it from.
+
+    A curve that exists but has a point that cannot be read as a finite number
+    (``None``, text, NaN/inf, a malformed entry) fails closed: that point could
+    have been the liquidation, and this gate guards live deployment, so an
+    unprovable "survived" counts as ruined. A readable non-positive point is
+    ruin regardless of where unreadable points sit.
+    """
+    flag = stats.get("ruined")
+    if isinstance(flag, bool):
+        return flag
+    curve = backtest.equity_curve
+    if not isinstance(curve, list):
+        return False
+    for point in curve:
+        try:
+            equity = float(point.get("equity")) if isinstance(point, dict) else math.nan
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a JSON integer outside float64 range (10**400) is
+            # stored JSON that cannot be read as an account value. Same rule as
+            # None/text: unable to read it, so unable to prove the account
+            # survived.
+            equity = math.nan
+        if not (math.isfinite(equity) and equity > 0):
+            logger.warning(
+                "Backtest %s predates the ruin flag and its equity curve reaches %s; "
+                "treating it as ruined (non-positive or unreadable)",
+                backtest.id,
+                equity,
+            )
+            return True
+    return False
 
 
 def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> dict[str, Any]:
@@ -4381,14 +7106,17 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "timeframe": timeframe,
         "start_date": str(backtest.backtest_start or ""),
         "end_date": str(backtest.backtest_end or ""),
-        "total_return": _safe_stat_number(stats.get("total_return"), 0.0),
-        "cagr": _safe_stat_number(stats.get("cagr"), 0.0),
+        "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
+        "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
-        "max_drawdown": _safe_stat_number(stats.get("max_drawdown_pct"), 0.0),
+        "max_drawdown": _stat_number_or_undefined(stats, "max_drawdown_pct", 0.0),
         "win_rate": stats.get("win_rate"),
         "trade_count": max(int(trade_count), 0),
+        # #132: a ruined run has undefined return metrics; consumers that rank
+        # backtests (live deployment selection) must be able to exclude it.
+        "ruined": _backtest_is_ruined(backtest, stats),
         "created_at": str(backtest.created_at or ""),
         "tags": tags,
     }
@@ -4419,7 +7147,7 @@ def _extract_backtest_and_trade_count(row: Any) -> tuple[BacktestRecord | None, 
         return row, 0
 
     if hasattr(row, "_mapping"):
-        values = list(getattr(row, "_mapping").values())
+        values = list(row._mapping.values())
     elif isinstance(row, (tuple, list)):
         values = list(row)
     else:
@@ -4479,7 +7207,7 @@ def list_backtest_fingerprint_rows() -> list[dict[str, Any]]:
     for row in rows:
         backtest = row if isinstance(row, BacktestRecord) else None
         if backtest is None and hasattr(row, "_mapping"):
-            values = list(getattr(row, "_mapping").values())
+            values = list(row._mapping.values())
             if values and isinstance(values[0], BacktestRecord):
                 backtest = values[0]
         if backtest is None and isinstance(row, (tuple, list)) and row and isinstance(row[0], BacktestRecord):
@@ -5111,7 +7839,7 @@ def _unwrap_equity_point_row(raw_row: Any) -> EquityPoint | None:
     if isinstance(raw_row, EquityPoint):
         row = raw_row
     elif hasattr(raw_row, "_mapping"):
-        values = list(getattr(raw_row, "_mapping").values())
+        values = list(raw_row._mapping.values())
         row = values[0] if values else None
     elif isinstance(raw_row, (tuple, list)):
         row = raw_row[0] if raw_row else None
@@ -5257,7 +7985,7 @@ def _equity_preview_query_params(
 
 def _equity_preview_row_fields(row: Any) -> tuple[str, str, Any] | None:
     if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
+        mapping = row._mapping
         return (
             str(mapping.get("backtest_id") or "").strip(),
             str(mapping.get("time") or "").strip(),
@@ -5319,7 +8047,7 @@ def _unwrap_model_row(row: Any) -> Any:
     if row is None:
         return None
     if hasattr(row, "_mapping"):
-        mapping = getattr(row, "_mapping")
+        mapping = row._mapping
         values = list(mapping.values())
         return values[0] if values else None
     if isinstance(row, (tuple, list)):

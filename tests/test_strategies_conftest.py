@@ -17,7 +17,6 @@ These cover the three silent-skip defects of Cleanup 17-B:
 from __future__ import annotations
 
 import importlib.util
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -35,6 +34,10 @@ def _load_gate():
 
 @pytest.fixture
 def gate(monkeypatch, tmp_path):
+    # An exported TP_TEST_OHLCV_DIR (the local read-only opt-in) must not leak into
+    # these tests: they build their own dataset under tmp_path. Tests of the opt-in
+    # set it explicitly.
+    monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)
     module = _load_gate()
     monkeypatch.setattr(module, "DATA_DIR", tmp_path)
     monkeypatch.setattr(module, "FAIL_ON_MISSING_DATA", False)
@@ -238,3 +241,30 @@ def test_strict_mode_failures_are_not_counted_as_skips(gate, tmp_path, capsys):
     assert "FAILED by the data gate" in output
     assert "skipped on missing" not in output
 
+
+def test_ohlcv_root_defaults_to_the_suite_data_dir(gate, monkeypatch, tmp_path):
+    monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)
+
+    assert gate._ohlcv_root() == tmp_path / "ohlcv"
+
+
+def test_ohlcv_opt_in_reads_a_local_dataset_outside_the_suite_data_dir(gate, monkeypatch, tmp_path):
+    """The suite's DATA_DIR is a throwaway dir, so a developer's real datasets are invisible unless
+    they name them explicitly with TP_TEST_OHLCV_DIR (read-only; the data-dir guard never sees
+    it)."""
+    local_datasets = tmp_path / "local-datasets"
+    _write_shard(local_datasets / "forex" / "EURUSD" / "1h.parquet", "2024-01-01", "2024-01-02")
+    monkeypatch.delenv("TP_TEST_OHLCV_DIR", raising=False)
+    assert not gate._has_ohlcv_data("EURUSD", "1h")
+
+    monkeypatch.setenv("TP_TEST_OHLCV_DIR", str(local_datasets))
+
+    assert gate._ohlcv_root() == local_datasets
+    assert gate._has_ohlcv_data("EURUSD", "1h")
+
+
+def test_missing_dataset_message_names_the_opt_in(gate):
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        gate._require_ohlcv_coverage("US500", "1h", "2025-01-01", "2025-03-31")
+
+    assert "TP_TEST_OHLCV_DIR" in str(excinfo.value)

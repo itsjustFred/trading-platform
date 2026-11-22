@@ -63,7 +63,11 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_eurusd_h1.json"),
-        "use_native_daily_ohlcv": True,
+        # MT5 builds D1 bars on the server clock; the UTC-day 1d parquet has other day
+        # boundaries (and Sunday-evening rows), so the D1 bars come from the M1 bars.
+        "use_native_daily_ohlcv": False,
+        # Dukascopy-demo tester history clock (shared/broker_clock.py, audit README).
+        "broker_clock": "dukascopy_mt5_forex",
         # Account-Währung aus Tester-Setfile Currency=... (EURUSD_H1_setfile.ini: USD).
         "account_currency": "USD",
     },
@@ -76,6 +80,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_nas100_m15.json"),
+        "broker_clock": "dukascopy_mt5_index",
         # Account-Währung aus Tester-Setfile Currency=... (NAS100_M15_setfile.ini: EUR).
         "account_currency": "EUR",
     },
@@ -88,6 +93,7 @@ COMPARISON_CASES: tuple[dict[str, Any], ...] = (
         "start": "2018-01-01",
         "end": "2026-06-23",
         "output": Path("data/backtests/intraday_volatility_breakout_sp500_m1.json"),
+        "broker_clock": "dukascopy_mt5_index",
         # Account-Währung aus Tester-Setfile Currency=... (SP500_M1_setfile.ini: USD).
         "account_currency": "USD",
     },
@@ -318,7 +324,31 @@ def _opposite_side_series(frame: pd.DataFrame, side: str, field: str) -> pd.Seri
 
 
 def _round_mt5_lots(symbol: str, lots: float) -> float:
-    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max))."""
+    """MT5-Lot-Rundung + Broker-Clamp (.mq5 Z.391-393: floor, max(min), min(max)).
+
+    The floor keeps MT5's ABSOLUTE epsilon -- `+ 1e-12` added to the QUOTIENT
+    (`lots / step`), not a relative tolerance -- because this generator is the
+    reference the engine is parity-checked against: it reproduces the EA, it
+    does not improve on it. The engine's lot floor is the shared decimal floor
+    `shared.lot_grid.floor_qty_to_step` (#278, reached through
+    `runner.engine_pkg.trading_engine._floor_to_lot_grid`): exact `repr`
+    decimals with a noise band of 1e-6 OF A STEP added to the quotient, so
+    the engine snaps a size UP to the next step whenever `lots / step` lands
+    within 1e-6 below an integer. MT5's band is the absolute `+ 1e-12` on
+    the same quotient, so the two rules disagree on EVERY size inside that
+    1e-6-of-a-step window -- not only the `k * lot_step` ulp case from step
+    counts of a few thousand and up (`25602 * 0.01`, float quotient
+    `25601.999999999996`, ~4e-12 off an integer, comes out `256.01` here and
+    `256.02` in the engine), but also real fractions like
+    `0.029999995 / 0.01` (quotient 2.9999995): `0.02` here, `0.03` in the
+    engine. The divergence is pinned, not incidental: no committed strategy
+    configures the engine's lot metadata (`lot_step`/`min_lot`/`max_lot`) --
+    asserted by `test_no_committed_strategy_configures_lot_metadata` -- so
+    the committed goldens do not shift, and the boundary itself is pinned by
+    `test_mt5_and_engine_lot_floors_diverge_above_the_absolute_epsilon`. The
+    first config that wires a `lot_step` must decide which of the two rules
+    its goldens pin (or stay on the absolute-epsilon side of the reference).
+    """
     step = MT5_LOT_STEPS.get(symbol, 0.0)
     if step <= 0:
         floored = max(lots, 0.0)
@@ -516,7 +546,8 @@ def regenerate_case(
             "comparison_label": case["label"],
             "reference_symbol": case["symbol"],
             "reference_timeframe": case["report_timeframe"],
-            "session_timezone": "Europe/Athens",
+            # MT5 server time = the broker clock of the tester history, not a civil zone.
+            "broker_clock": case["broker_clock"],
         }
     )
     df = _load_ohlcv(
@@ -608,12 +639,31 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--capital", type=float, default=100_000.0)
     parser.add_argument("--risk-pct", type=float, default=0.01)
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=[str(case["label"]) for case in COMPARISON_CASES],
+        help="Regenerate only this case (repeatable; default: all). One case at a time keeps peak RAM "
+        "low.",
+    )
     args = parser.parse_args()
 
-    conversion = _conversion_series(args.data_dir, "2018-01-01", "2026-06-23")
+    cases = [case for case in COMPARISON_CASES if not args.case or case["label"] in args.case]
+    needs_conversion = any(
+        str(case.get("account_currency", "USD")).upper() == "EUR" for case in cases
+    )
+    conversion = (
+        _conversion_series(args.data_dir, "2018-01-01", "2026-06-23") if needs_conversion else None
+    )
     summary = [
-        regenerate_case(case, data_dir=args.data_dir, capital=args.capital, risk_pct=args.risk_pct, conversion=conversion)
-        for case in COMPARISON_CASES
+        regenerate_case(
+            case,
+            data_dir=args.data_dir,
+            capital=args.capital,
+            risk_pct=args.risk_pct,
+            conversion=conversion,
+        )
+        for case in cases
     ]
     print(json.dumps(summary, indent=2, default=str))
 

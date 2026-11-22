@@ -8,14 +8,16 @@ B. Signal-driven exits fill at the NEXT bar's open, like entries. A signal on
    bar's close) takes the position and the trade is flagged
    ``meta["signal_exit_deferred_to_end_of_data"]``.
 
-Covered engines: native ``TradeEngine``, ``VectorbtAdapter`` (+ its intrabar
-walk), ``SignalReplayAdapter`` and PyneCore's exit-containment helper, plus
-the shared ``contract`` primitives they all route through.
+Covered engines: native ``TradeEngine`` (the only engine under development,
+ADR ``docs/adr/0001-native-single-strategy-engine.md``), ``SignalReplayAdapter``
+(separate product, already gap-aware) and PyneCore's exit-containment helper,
+plus the shared ``contract`` primitives. The frozen vectorbt adapter keeps its
+level fills and legacy signal-exit convention (``next_open`` is mapped to
+``close`` with a warning), so its gap/next-open coverage is intentionally
+absent here.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -26,10 +28,7 @@ from runner.engines import contract
 from runner.engines.base import BacktestConfig
 from runner.engines.pynecore_adapter import _normalize_trade_exits
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
-from runner.engines.vectorbt_adapter import VectorbtAdapter, _resolve_intrabar_exit
 from shared.models import Trade, TradeExit
-from tests.helpers import with_zero_fees
-from tests.helpers import write_ohlcv as _write_ohlcv
 
 # --------------------------------------------------------------------------- #
 # shared primitives
@@ -397,250 +396,6 @@ class TestNativeSignalExitNextOpen:
 
 
 # --------------------------------------------------------------------------- #
-# vectorbt
-# --------------------------------------------------------------------------- #
-
-
-def _vbt_strategy(entry_bar: int, exit_bar: int | None, *, direction: str = "LONG", stop=None, tp=None) -> str:
-    exit_line = f"exits.iloc[{exit_bar}] = True" if exit_bar is not None else "pass"
-    stop_line = (
-        f'indicators["stop_loss"] = pd.Series({stop!r}, index=df.index)' if stop is not None else ""
-    )
-    tp_line = (
-        f'indicators["take_profit"] = pd.Series({tp!r}, index=df.index)' if tp is not None else ""
-    )
-    return f'''
-import pandas as pd
-
-
-def generate_signals(df, params):
-    entries = pd.Series(False, index=df.index)
-    exits = pd.Series(False, index=df.index)
-    entries.iloc[{entry_bar}] = True
-    {exit_line}
-    indicators = {{"direction": pd.Series({direction!r}, index=df.index)}}
-    {stop_line}
-    {tp_line}
-    return entries, exits, indicators, []
-'''
-
-
-def _vbt_run(tmp_path: Path, rows, strategy_text: str, *, intrabar: pd.DataFrame | None = None, **cfg):
-    _write_ohlcv(tmp_path, "T", _bars(rows))
-    payload = {
-        "strategy_name": "realistic-fills",
-        "symbols": ["T"],
-        "timeframe": "1h",
-        "start_date": "2024-01-01",
-        "end_date": "2024-01-31",
-        "initial_capital": 100_000.0,
-        "risk_per_trade_pct": 0.01,
-        "max_leverage": 100.0,
-        "modeling_resolution": "main_timeframe",
-        "data_dir": str(tmp_path),
-        "parameters": {},
-    }
-    if intrabar is not None:
-        _write_ohlcv(tmp_path, "T", intrabar, timeframe="15m")
-        payload["modeling_resolution"] = "15m"
-    payload.update(cfg)
-    path = tmp_path / "strat.py"
-    path.write_text(strategy_text)
-    return VectorbtAdapter().run(BacktestConfig(**with_zero_fees(payload)), str(path))
-
-
-def _subbars(rows, per_bar: int = 4) -> pd.DataFrame:
-    """Expand each hourly bar into ``per_bar`` flat-ish 15m sub-bars.
-
-    The first sub-bar carries the bar's open, the last its close; the bar's
-    high/low land on the second sub-bar so intrabar touches are real.
-    """
-    records = []
-    ts0 = pd.Timestamp("2024-01-01", tz="UTC")
-    for h, (o, hi, lo, c) in enumerate(rows):
-        for k in range(per_bar):
-            sub_open = o if k == 0 else (o + c) / 2
-            sub_close = c if k == per_bar - 1 else (o + c) / 2
-            sub_high = max(hi if k == 1 else max(sub_open, sub_close), sub_open, sub_close)
-            sub_low = min(lo if k == 1 else min(sub_open, sub_close), sub_open, sub_close)
-            records.append(
-                {
-                    "timestamp": ts0 + pd.Timedelta(hours=h, minutes=15 * k),
-                    "open": sub_open,
-                    "high": sub_high,
-                    "low": sub_low,
-                    "close": sub_close,
-                    "volume": 100.0,
-                }
-            )
-    return pd.DataFrame(records)
-
-
-def _walk(
-    direction, stop, tp, sub_rows, *, spread: float = 0.0, parameters: dict | None = None
-):
-    """Run the intrabar walk over hand-written 15m sub-bars (entry at 00:00)."""
-    data: dict[str, object] = {
-        "timestamp": pd.date_range("2024-01-01 00:00", periods=len(sub_rows), freq="15min", tz="UTC"),
-        "open": [r[0] for r in sub_rows],
-        "high": [r[1] for r in sub_rows],
-        "low": [r[2] for r in sub_rows],
-        "close": [r[3] for r in sub_rows],
-    }
-    if spread:
-        data["spread_price"] = [spread] * len(sub_rows)
-    sub = pd.DataFrame(data)
-    return _resolve_intrabar_exit(
-        intrabar_df=sub,
-        intrabar_timeframe="15m",
-        base_timeframe="1h",
-        direction=direction,
-        entry_time="2024-01-01T00:00:00+00:00",
-        scheduled_exit_time="2024-01-01T03:00:00+00:00",
-        stop_price=stop,
-        take_profit_price=tp,
-        parameters=parameters or {},
-    )
-
-
-class TestVectorbtIntrabarWalkGaps:
-    # Sub-bar 0 is the entry sub-bar; sub-bar 1 gaps.
-    def test_long_gap_through_stop_fills_at_the_sub_bar_open(self):
-        hit = _walk("LONG", 95.0, None, [(100, 100.5, 99.5, 100), (90, 91, 88, 89)])
-        assert hit["price"] == pytest.approx(90.0)
-        assert hit["reason"] == "stop_loss"
-
-    def test_short_gap_through_stop_fills_at_the_sub_bar_open(self):
-        hit = _walk("SHORT", 105.0, None, [(100, 100.5, 99.5, 100), (110, 112, 109, 111)])
-        assert hit["price"] == pytest.approx(110.0)
-        assert hit["reason"] == "stop_loss"
-
-    def test_long_gap_through_target_fills_at_the_sub_bar_open(self):
-        hit = _walk("LONG", 95.0, 110.0, [(100, 100.5, 99.5, 100), (115, 116, 114, 115)])
-        assert hit["price"] == pytest.approx(115.0)
-        assert hit["reason"] == "take_profit"
-
-    def test_short_gap_through_target_fills_at_the_sub_bar_open(self):
-        hit = _walk("SHORT", 105.0, 90.0, [(100, 100.5, 99.5, 100), (85, 86, 84, 85)])
-        assert hit["price"] == pytest.approx(85.0)
-        assert hit["reason"] == "take_profit"
-
-    @pytest.mark.parametrize(
-        ("direction", "stop", "tp", "sub", "expected", "reason"),
-        [
-            ("LONG", 95.0, None, (99, 99.5, 94, 96), 95.0, "stop_loss"),
-            ("SHORT", 105.0, None, (101, 106, 100.5, 104), 105.0, "stop_loss"),
-            ("LONG", 95.0, 110.0, (105, 112, 104, 111), 110.0, "take_profit"),
-            ("SHORT", 105.0, 90.0, (95, 96, 88, 89), 90.0, "take_profit"),
-        ],
-    )
-    def test_intrabar_touch_still_fills_at_the_level(
-        self, direction, stop, tp, sub, expected, reason
-    ):
-        hit = _walk(direction, stop, tp, [(100, 100.5, 99.5, 100), sub])
-        assert hit["price"] == pytest.approx(expected)
-        assert hit["reason"] == reason
-
-    def test_entry_sub_bar_is_exempt_from_the_gap_rule(self):
-        # Entry fills at the first sub-bar's open (100) which trades down to 94:
-        # a touch of the 95 stop, not a gap.
-        hit = _walk("LONG", 95.0, None, [(100, 100.5, 94, 96)])
-        assert hit["price"] == pytest.approx(95.0)
-
-    def test_signal_exit_window_stops_at_the_exit_bar_open(self):
-        # A stop touched only inside the exit bar's sub-bars: a next-open signal
-        # exit filled at that bar's open, so the touch comes too late.
-        sub_rows = [(100, 100.5, 99.5, 100)] * 4 + [(100, 100.5, 94, 96)] * 4
-        sub = pd.DataFrame(
-            {
-                "timestamp": pd.date_range("2024-01-01", periods=8, freq="15min", tz="UTC"),
-                "open": [r[0] for r in sub_rows],
-                "high": [r[1] for r in sub_rows],
-                "low": [r[2] for r in sub_rows],
-                "close": [r[3] for r in sub_rows],
-            }
-        )
-        kwargs = dict(
-            intrabar_df=sub,
-            intrabar_timeframe="15m",
-            base_timeframe="1h",
-            direction="LONG",
-            entry_time="2024-01-01T00:00:00+00:00",
-            scheduled_exit_time="2024-01-01T01:00:00+00:00",
-            stop_price=95.0,
-            take_profit_price=None,
-        )
-        assert _resolve_intrabar_exit(**kwargs) is not None  # legacy: through the bar
-        assert _resolve_intrabar_exit(**kwargs, exit_at_open=True) is None
-
-
-class TestVectorbtAdapterSignalExits:
-    ROWS = [_flat(100.0), _flat(100.0), _flat(101.0), _flat(102.0), _flat(103.0), _flat(104.0)]
-
-    def test_signal_exit_fills_at_the_next_bar_open(self, tmp_path):
-        result = _vbt_run(tmp_path, self.ROWS, _vbt_strategy(0, 3))
-        (trade,) = result.trades
-        assert trade.entry_price == pytest.approx(100.0)
-        assert trade.exits[0].price == pytest.approx(103.0)  # bar4 open
-        assert pd.Timestamp(trade.exits[0].time) == pd.Timestamp("2024-01-01 04:00", tz="UTC")
-        assert "signal_exit_deferred_to_end_of_data" not in trade.meta
-
-    def test_last_bar_signal_is_closed_by_end_of_data_and_flagged(self, tmp_path):
-        result = _vbt_run(tmp_path, self.ROWS, _vbt_strategy(0, len(self.ROWS) - 1))
-        (trade,) = result.trades
-        assert trade.exits[0].reason == "end_of_data"
-        assert trade.exits[0].price == pytest.approx(104.0)  # last close
-        assert trade.meta["signal_exit_deferred_to_end_of_data"] is True
-
-    def test_plain_end_of_data_close_is_not_flagged(self, tmp_path):
-        result = _vbt_run(tmp_path, self.ROWS, _vbt_strategy(0, None))
-        (trade,) = result.trades
-        assert trade.exits[0].reason == "end_of_data"
-        assert trade.exits[0].price == pytest.approx(104.0)
-        assert "signal_exit_deferred_to_end_of_data" not in trade.meta
-
-    def test_exit_and_entry_signalled_together_reverse_at_one_open(self, tmp_path):
-        text = '''
-import pandas as pd
-
-def generate_signals(df, params):
-    entries = pd.Series(False, index=df.index)
-    exits = pd.Series(False, index=df.index)
-    entries.iloc[0] = True
-    entries.iloc[3] = True
-    exits.iloc[3] = True
-    return entries, exits, {"direction": pd.Series("LONG", index=df.index)}, []
-'''
-        rows = self.ROWS + [_flat(105.0), _flat(106.0)]
-        result = _vbt_run(tmp_path, rows, text)
-        first, second = result.trades
-        assert first.exits[0].price == pytest.approx(103.0)
-        assert second.entry_price == pytest.approx(103.0)
-
-    def test_legacy_close_opt_in_fills_on_the_signal_bar(self, tmp_path):
-        result = _vbt_run(tmp_path, self.ROWS, _vbt_strategy(0, 3), signal_exit_fill="close")
-        (trade,) = result.trades
-        assert trade.exits[0].price == pytest.approx(102.0)  # bar3 close
-
-    def test_end_to_end_gap_through_the_stop_with_intrabar_data(self, tmp_path):
-        rows = [_flat(), _flat(), (90.0, 91.0, 88.0, 89.0), _flat(90.0), _flat(90.0)]
-        result = _vbt_run(
-            tmp_path, rows, _vbt_strategy(0, 4, stop=95.0), intrabar=_subbars(rows)
-        )
-        (trade,) = result.trades
-        assert trade.exits[0].price == pytest.approx(90.0)
-        assert trade.exits[0].reason == "stop_loss"
-
-    def test_end_to_end_intrabar_touch_fills_at_the_stop(self, tmp_path):
-        rows = [_flat(), _flat(), (99.0, 99.5, 94.0, 96.0), _flat(96.0), _flat(96.0)]
-        result = _vbt_run(
-            tmp_path, rows, _vbt_strategy(0, 4, stop=95.0), intrabar=_subbars(rows)
-        )
-        (trade,) = result.trades
-        assert trade.exits[0].price == pytest.approx(95.0)
-
-
-# --------------------------------------------------------------------------- #
 # signal replay
 # --------------------------------------------------------------------------- #
 
@@ -797,7 +552,7 @@ class TestPyneCoreContainment:
 
 # (direction, stop, tp, gap bar OHLC, expected fill, expected kind). Each bar
 # OPENS beyond one level and later trades through the other: the open came
-# first, so the gapped level wins at the open in EVERY engine - also when the
+# first, so the gapped level wins at the open in every covered engine - also when the
 # gap is the favourable one (target) and the later touch is the stop, where a
 # stop-first range test would book a loss at the stop instead.
 _GAP_FIRST_CASES = [
@@ -809,7 +564,7 @@ _GAP_FIRST_CASES = [
 _REASONS = {"tp": {"tp", "take_profit"}, "stop": {"stop_loss"}}
 
 
-class TestGapIsTheFirstEventAcrossEngines:
+class TestGapIsTheFirstEvent:
     @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
     def test_contract_primitive(self, direction, stop, tp, bar, fill, kind):
         o, h, lo, _ = bar
@@ -836,12 +591,6 @@ class TestGapIsTheFirstEventAcrossEngines:
         assert trade.exits[-1].price == pytest.approx(fill)
         assert trade.exits[-1].reason in _REASONS[kind]
 
-    @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
-    def test_vectorbt_intrabar_walk(self, direction, stop, tp, bar, fill, kind):
-        hit = _walk(direction, stop, tp, [(100, 100.5, 99.5, 100), bar])
-        assert hit["price"] == pytest.approx(fill)
-        assert hit["reason"] in _REASONS[kind]
-        assert hit["gap"] is True
 
     @pytest.mark.parametrize(("direction", "stop", "tp", "bar", "fill", "kind"), _GAP_FIRST_CASES)
     def test_signal_replay(self, direction, stop, tp, bar, fill, kind):
@@ -855,30 +604,16 @@ class TestGapIsTheFirstEventAcrossEngines:
         assert trade.exits[-1].price == pytest.approx(fill)
         assert trade.exit_reason in _REASONS[kind]
 
-    def test_vectorbt_end_to_end_favourable_gap_beats_a_later_stop_touch(self, tmp_path):
-        rows = [_flat(), _flat(), (120.0, 125.0, 90.0, 100.0), _flat(100.0), _flat(100.0)]
-        intrabar = _subbars(rows)
-        # Put the whole gap bar's range into its FIRST sub-bar: it opens above
-        # the target and trades down through the stop within that one step.
-        gap_sub = intrabar["timestamp"] == pd.Timestamp("2024-01-01 02:00", tz="UTC")
-        intrabar.loc[gap_sub, ["high", "low"]] = [125.0, 90.0]
-        result = _vbt_run(
-            tmp_path, rows, _vbt_strategy(0, 4, stop=95.0, tp=110.0), intrabar=intrabar
-        )
-        (trade,) = result.trades
-        assert trade.exits[0].price == pytest.approx(120.0)
-        assert trade.exits[0].reason == "take_profit"
-
 
 # --------------------------------------------------------------------------- #
-# cross-engine: SHORT protective exits buy the ask (review of #208, P3)
+# SHORT protective exits buy the ask (native)
 # --------------------------------------------------------------------------- #
 
 _SPREAD = 0.4
 # (stop, tp, bar, expected fill = base + spread). The last case gaps just
 # through the target (opens 89.8 below the 90 target) by less than the spread:
 # the fill at the ask (90.2) is WORSE than the target. That is realistic - a
-# gap fill is a market fill at the available price - and both engines agree.
+# gap fill is a market fill at the available price.
 _SHORT_SPREAD_CASES = [
     (105.0, None, (110.0, 112.0, 109.0, 111.0), 110.0 + _SPREAD),  # gap through stop
     (105.0, None, (101.0, 106.0, 100.5, 104.0), 105.0 + _SPREAD),  # stop touch
@@ -887,7 +622,7 @@ _SHORT_SPREAD_CASES = [
 ]
 
 
-class TestShortProtectiveFillsCarryTheSpreadAcrossEngines:
+class TestShortProtectiveFillsCarryTheSpread:
     @pytest.mark.parametrize(("stop", "tp", "bar", "fill"), _SHORT_SPREAD_CASES)
     def test_native(self, stop, tp, bar, fill):
         result = _native(
@@ -902,23 +637,4 @@ class TestShortProtectiveFillsCarryTheSpreadAcrossEngines:
         assert trade.entry_price == pytest.approx(100.0)  # SHORT entry hits the bid
         assert trade.exits[-1].price == pytest.approx(fill)
 
-    @pytest.mark.parametrize(("stop", "tp", "bar", "fill"), _SHORT_SPREAD_CASES)
-    def test_vectorbt_intrabar_walk(self, stop, tp, bar, fill):
-        hit = _walk(
-            "SHORT",
-            stop,
-            tp,
-            [(100, 100.5, 99.5, 100), bar],
-            spread=_SPREAD,
-            parameters={"spread_price_col": "spread_price"},
-        )
-        assert hit["price"] == pytest.approx(fill)
 
-    def test_long_protective_fills_carry_no_spread_in_the_walk(self):
-        # LONG exits sell the bid: no surcharge on a gap or a touch.
-        kw = {"spread": _SPREAD, "parameters": {"spread_price_col": "spread_price"}}
-        entry = (100, 100.5, 99.5, 100)
-        gap = _walk("LONG", 95.0, None, [entry, (90, 91, 88, 89)], **kw)
-        touch = _walk("LONG", 95.0, None, [entry, (99, 99.5, 94, 96)], **kw)
-        assert gap["price"] == pytest.approx(90.0)
-        assert touch["price"] == pytest.approx(95.0)

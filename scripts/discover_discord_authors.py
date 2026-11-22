@@ -190,13 +190,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    # `discover_discord_bots_from_env` reads DEFAULT_ACCOUNTS_ENV itself, so the
-    # flag has to be applied to the module attribute rather than merely passed
-    # around - otherwise --accounts-env is silently ignored and the tool reports
-    # "no bots configured" against the wrong file.
-    service_discovery.DEFAULT_ACCOUNTS_ENV = args.accounts_env
+    # The flag is passed to both readers explicitly: mutating the module attribute instead
+    # would leave every other reader of service_discovery.DEFAULT_ACCOUNTS_ENV on the default,
+    # and --accounts-env would be silently ignored for them.
     env_values = load_accounts_env_values(args.accounts_env)
-    bots = service_discovery.discover_discord_bots_from_env()
+    bots = service_discovery.discover_discord_bots_from_env(args.accounts_env)
     if not bots:
         print(
             f"No Discord bots configured in {args.accounts_env}",

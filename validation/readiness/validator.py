@@ -10,6 +10,7 @@ import math
 from typing import Any
 
 from validation.comparison.delta_report import TradeDeltaReport
+from validation.comparison.tolerances import abs_pct_diff
 from validation.readiness.models import (
     PaperReadinessLevel,
     ReadinessCheck,
@@ -22,18 +23,20 @@ from validation.stats.calculator import TradeStatistics
 
 
 def _abs_pct_diff(expected: float, actual: float) -> float:
-    """Relative difference against the EXPECTED base (#83).
+    """Relative difference against the EXPECTED base (#83, #128).
 
     The old ``max(|expected|, |actual|)`` denominator halved real drift
     (100 -> 200 read as 50%, not 100%). Zero expected fails closed unless
-    actual is also zero.
+    actual is also zero. The rule itself lives in the shared comparison helper
+    (``validation.comparison.tolerances.abs_pct_diff``) so every
+    tolerance-gate relative deviation uses one definition (#128).
+
+    ``validation/comparison/matcher.py`` deliberately keeps a symmetric
+    ``max(|ref|, |act|, 1e-12)`` denominator: it scores candidate trade
+    pairings rather than gating a tolerance, and a one-sided base would bias
+    the pairing toward whichever side happens to be larger.
     """
-    denom = abs(expected)
-    if denom <= 0.0:
-        # Exact zero, not a tolerance: with no expected value there is no
-        # proportion to compute, so any non-zero actual is total drift.
-        return 0.0 if abs(actual) <= 0.0 else 1.0
-    return abs(expected - actual) / denom
+    return abs_pct_diff(expected, actual)
 
 
 _NO_TRADE_DELTA_REPORT_MESSAGE = "No trade delta report provided; skipping."
@@ -119,16 +122,16 @@ class ReadinessValidator:
             missing_required.append("statistics comparison")
 
         if missing_required:
-            for artifact in missing_required:
-                checks.append(
-                    ReadinessCheck(
-                        name=f"required_{artifact.replace(' ', '_')}",
-                        description=f"Required artifact present: {artifact}",
-                        passed=False,
-                        severity="error",
-                        message=f"Missing required artifact: {artifact}",
-                    )
+            checks.extend(
+                ReadinessCheck(
+                    name=f"required_{artifact.replace(' ', '_')}",
+                    description=f"Required artifact present: {artifact}",
+                    passed=False,
+                    severity="error",
+                    message=f"Missing required artifact: {artifact}",
                 )
+                for artifact in missing_required
+            )
 
         # `applicable` is excluded from both counts: a check with no answer must not be counted
         # as a failure, and must not be counted as a pass either. Default True, so this is a

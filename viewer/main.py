@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures.thread
+import errno
 import json
 import logging
 import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -15,7 +17,7 @@ import time
 import traceback
 import uuid
 import weakref
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, BinaryIO, Callable, Literal, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -39,7 +41,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic import Field as PydanticField
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -77,29 +79,41 @@ LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
+from live_runner.kill_switch import (
+    KillSwitchMode,
+    kill_switch_payload,
+    read_kill_switch_state,
+)
+from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
+from risk.live import entry_gate_settings
 from runner.agent_process import build_backtest_child_env
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
+from runner.promotion_gate import StrategyNotPromotedError
 from shared.database import (
     DB_PATH as BACKTEST_DB_PATH,
 )
 from shared.database import (
+    BROKER_CLOSE_SIGNAL_SOURCE,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
+    clear_live_kill_switch,
     create_live_deployment,
     create_service,
     delete_background_task_record,
     delete_backtest,
     delete_live_deployment,
     delete_service,
+    deployments_with_broker_order_conflicts,
     ensure_live_account,
     get_background_task_record,
     get_latest_live_balances,
     get_live_account,
     get_live_deployment,
+    get_live_kill_switch_state,
     get_service,
     init_db,
     list_background_task_records,
@@ -128,6 +142,7 @@ from shared.database import (
     normalize_task_status,
     record_live_control_audit,
     save_result_to_sqlite,
+    set_live_kill_switch,
     update_live_deployment_account,
     update_live_deployment_status,
     update_service_status,
@@ -156,8 +171,10 @@ from shared.models import (
     Service,
     ServiceStatus,
     ServiceType,
+    TradeContractError,
     VerificationEvidenceRecord,
     VerificationEvidenceSummary,
+    execution_price_is_usable,
     resolve_defined_stat,
 )
 from shared.models import (
@@ -176,6 +193,10 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency for accoun
         return []
 
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.broker_order_conflicts import (
+    CONFLICT_SCAN_LIMIT,
+    resolve_broker_order_conflicts,
+)
 from live_runner.market_data_stream import LiveMarketDataStreamService
 from runner.capm import align_return_series, calculate_capm
 from shared.models import (
@@ -1430,6 +1451,12 @@ class BacktestRunSignalsRequest(SQLModel):
     max_position_pct: float | None = None
     max_positions: int | None = None
     auto_download: bool = True
+    # #361/#84: the replay adapter fails closed without an explicit fee
+    # declaration; the viewer requires the caller to declare costs up front —
+    # fees_zero for a conscious no-cost run, or fee_rate/fee_flat_per_trade.
+    fee_rate: float | None = None
+    fee_flat_per_trade: float | None = None
+    fees_zero: bool = False
 
 
 class BacktestRunFromSignalsRequest(SQLModel):
@@ -1445,6 +1472,9 @@ class BacktestRunFromSignalsRequest(SQLModel):
     max_position_pct: float | None = None
     max_positions: int | None = None
     auto_download: bool = True
+    fee_rate: float | None = None
+    fee_flat_per_trade: float | None = None
+    fees_zero: bool = False
 
 
 class PortfolioStrategyConfig(SQLModel):
@@ -1545,8 +1575,11 @@ class BacktestsDuplicatesResponse(SQLModel):
 
 
 class BacktestsDeduplicateResponse(SQLModel):
+    dry_run: bool = False
     deleted_ids: list[str]
     kept_ids: list[str]
+    candidate_ids: list[str] = PydanticField(default_factory=list)
+    skipped_ids: list[str] = PydanticField(default_factory=list)
     groups_affected: int
     items: list[dict[str, Any]] = PydanticField(default_factory=list)
 
@@ -1558,8 +1591,11 @@ class PortfoliosDuplicatesResponse(SQLModel):
 
 
 class PortfoliosDeduplicateResponse(SQLModel):
+    dry_run: bool = False
     deleted_ids: list[str]
     kept_ids: list[str]
+    candidate_ids: list[str] = PydanticField(default_factory=list)
+    skipped_ids: list[str] = PydanticField(default_factory=list)
     groups_affected: int
     items: list[dict[str, Any]] = PydanticField(default_factory=list)
 
@@ -1572,46 +1608,55 @@ class PortfoliosBulkDeleteRequest(SQLModel):
     ids: list[str]
 
 
-_SAFE_ASSET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+class BacktestsRemoveEmptyRequest(SQLModel):
+    """Two-phase bulk delete of backtests with zero trades.
 
-
-def _safe_asset_id(raw_id: object) -> str:
-    """Normalize a client-supplied asset id for file-backed operations.
-
-    Returns an empty string for ids that are blank or that could participate
-    in a path traversal (path separators, ``..`` segments). Ids are only ever
-    joined onto a fixed directory below, and the join is containment-checked
-    again by :func:`_contained_asset_path`.
+    Phase 1 (default, ``dry_run=True``) ignores ``ids`` and returns the exact
+    candidate list without deleting anything. Phase 2 (``dry_run=False``)
+    requires the ``ids`` returned by phase 1; every id is re-checked against
+    the zero-trades criterion before its deletion.
     """
-    normalized = str(raw_id or "").strip()
-    if not normalized:
-        return ""
-    if normalized in {".", ".."}:
-        return ""
-    if not _SAFE_ASSET_ID_RE.match(normalized):
-        return ""
-    return normalized
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
 
 
-def _contained_asset_path(base_dir: Path, asset_id: str, suffix: str) -> Path | None:
-    """Join ``asset_id`` onto ``base_dir`` if the result stays inside it.
+class PortfoliosRemoveEmptyRequest(SQLModel):
+    """Two-phase bulk delete of portfolios without components.
 
-    The resolved candidate must be contained in the resolved base directory,
-    otherwise ``None`` is returned so the caller never builds an unlink path
-    from raw input. See :func:`_contained_client_data_file` for the
-    client-path variant of the same containment contract.
+    Same contract as :class:`BacktestsRemoveEmptyRequest`.
     """
-    normalized = _safe_asset_id(asset_id)
-    if not normalized:
-        return None
-    base = base_dir.resolve()
-    raw_candidate = base_dir / f"{normalized}{suffix}"
-    if raw_candidate.is_symlink():
-        return None
-    candidate = raw_candidate.resolve()
-    if candidate.parent != base:
-        return None
-    return candidate
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
+
+
+class BacktestsDeduplicateRequest(SQLModel):
+    """Two-phase bulk delete of duplicate backtests.
+
+    Same contract as :class:`BacktestsRemoveEmptyRequest`; the deletion
+    criterion is "member of a duplicate group that is not the kept (newest)
+    entry".
+    """
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
+
+
+class PortfoliosDeduplicateRequest(SQLModel):
+    """Two-phase bulk delete of duplicate portfolios.
+
+    Same contract as :class:`BacktestsDeduplicateRequest`.
+    """
+
+    dry_run: bool = True
+    ids: list[str] = PydanticField(default_factory=list)
+
+
+# The id→path containment contract lives in ONE place (viewer.core, #230);
+# these aliases keep the historical viewer.main names for routes and tests.
+_safe_asset_id = legacy_viewer._safe_asset_id
+_contained_asset_path = legacy_viewer._contained_asset_path
 
 
 def _contained_client_data_file(
@@ -1817,17 +1862,47 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+class _StoredResultViolatesContract(Exception):
+    """A stored backtest row exists but breaks the Trade contract."""
+
+
+def _load_stored_result_or_raise(backtest_id: str) -> BacktestResult | None:
+    """``load_backtest_result``; a Trade-contract violation (e.g. a legacy
+    lower-case direction) is logged and re-raised as a private marker. Every
+    other error propagates unchanged."""
+    try:
+        return load_backtest_result(backtest_id)
+    except TradeContractError as exc:
+        logger.warning("Stored backtest %s violates the trade contract: %s", backtest_id, exc)
+        raise _StoredResultViolatesContract(backtest_id) from exc
+
+
+def _load_stored_result(backtest_id: str) -> BacktestResult | None:
+    """Stored result, or ``None`` when it is missing or breaks the Trade contract."""
+    try:
+        return _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        return None
+
+
 def _load_result(backtest_id: str) -> BacktestResult | None:
-    result = load_backtest_result(backtest_id)
+    try:
+        result = _load_stored_result_or_raise(backtest_id)
+    except _StoredResultViolatesContract:
+        # The row exists: never fall back to the JSON artifact here, since that
+        # path rewrites the stored rows on a read.
+        return None
     if result is not None:
         return result
 
-    path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
-    if not path.exists():
+    # Containment, not a bare join: the id is a route parameter, and an
+    # unresolved `..`/absolute form must never read outside BACKTESTS_DIR (#230).
+    path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if path is None or not path.exists():
         return None
 
     try:
-        fallback_result = BacktestResult.load(str(path))
+        fallback_result = BacktestResult.load(path, root=BACKTESTS_DIR)
         save_result_to_sqlite(fallback_result)
         return fallback_result
     except Exception as exc:
@@ -2358,7 +2433,7 @@ def _task_elapsed_seconds(task: dict[str, Any], status: str) -> int | None:
     elapsed = (ended - started).total_seconds()
     if elapsed < 0:
         return 0
-    return int(round(elapsed))
+    return round(elapsed)
 
 
 def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | None) -> int | None:
@@ -2371,7 +2446,7 @@ def _task_eta_seconds(task: dict[str, Any], status: str, elapsed_seconds: int | 
     eta = elapsed_seconds * (100.0 - progress) / progress
     if not math.isfinite(eta):
         return None
-    return max(0, int(round(eta)))
+    return max(0, round(eta))
 
 
 def _json_safe(value: Any) -> Any:
@@ -2511,7 +2586,7 @@ def _downsample_numeric_minmax(values: list[float], *, limit: int) -> list[float
     sampled.append(float(values[-1]))
     # Hard cap in case bucket logic overshoots.
     if len(sampled) > normalized_limit:
-        sampled = sampled[: normalized_limit - 1] + [float(values[-1])]
+        sampled = [*sampled[: normalized_limit - 1], float(values[-1])]
     return sampled
 
 
@@ -3153,6 +3228,207 @@ def _delete_portfolio_with_artifacts(portfolio_id: str) -> dict[str, Any]:
     return result
 
 
+def _bulk_delete_skipped_item(item_id: str, reason: str) -> dict[str, Any]:
+    """Per-item entry for a confirmed id that was not deleted.
+
+    Used by the phase-2 (confirm) handlers of the two-phase bulk-delete
+    endpoints when an id no longer meets the deletion criterion.
+    """
+    return {"id": item_id, "status": "skipped", "reason": reason}
+
+
+def _bulk_delete_failed_item(item_id: str, exc: Exception) -> dict[str, Any]:
+    """Per-item entry for an unexpected error while handling one id."""
+    return {
+        "id": item_id,
+        "status": "failed",
+        "database": "not_attempted",
+        "artifact": "not_attempted",
+        "error": redact_text(str(exc))[:300],
+    }
+
+
+def _empty_backtest_candidates() -> list[dict[str, Any]]:
+    """Backtests with zero trades, with display info for the confirm dialog."""
+    candidates: list[dict[str, Any]] = []
+    for item in _snapshot_backtest_meta_cache():
+        backtest_id = str(item.get("id") or "").strip()
+        if not backtest_id:
+            continue
+        trade_count = max(int(_safe_float(item.get("trade_count"), 0.0)), 0)
+        if trade_count != 0:
+            continue
+        candidates.append(
+            {
+                "id": backtest_id,
+                "display_name": str(item.get("display_name") or ""),
+                "strategy_name": str(item.get("strategy_name") or ""),
+                "symbols": [
+                    str(symbol)
+                    for symbol in (item.get("symbols") or [])
+                    if str(symbol).strip()
+                ],
+                "timeframe": str(item.get("timeframe") or ""),
+                "trade_count": trade_count,
+                "created_at": str(item.get("created_at") or ""),
+            }
+        )
+    return candidates
+
+
+def _empty_backtest_skip_reason(backtest_id: str) -> str:
+    """Re-check the zero-trades criterion; "" when deletion may proceed.
+
+    Reads the database row fresh instead of the metadata cache so a backtest
+    that gained trades (or was deleted) between the dry run and the confirm
+    call is skipped, not deleted.
+    """
+    try:
+        row = load_backtest_metadata_row(backtest_id)
+    except Exception:
+        return "recheck_failed"
+    if row is None:
+        return "not_found"
+    trade_count = max(int(_safe_float(row.get("trade_count"), 0.0)), 0)
+    if trade_count != 0:
+        return "no_longer_empty"
+    return ""
+
+
+def _empty_portfolio_candidates() -> list[dict[str, Any]]:
+    """Portfolios without components, with display info for the confirm dialog."""
+    candidates: list[dict[str, Any]] = []
+    for portfolio in _snapshot_portfolio_payloads():
+        portfolio_id = str(portfolio.get("id") or "").strip()
+        components = portfolio.get("components")
+        has_components = isinstance(components, list) and len(components) > 0
+        if not portfolio_id or has_components:
+            continue
+        candidates.append(
+            {
+                "id": portfolio_id,
+                "name": str(portfolio.get("name") or ""),
+                "component_count": 0,
+                "created_at": str(portfolio.get("created_at") or ""),
+            }
+        )
+    return candidates
+
+
+def _empty_portfolio_skip_reason(portfolio_id: str) -> str:
+    """Re-check the no-components criterion; "" when deletion may proceed.
+
+    Snapshot reads are fresh (files and database records), so a portfolio that
+    gained components (or was deleted) between the phases is skipped.
+    """
+    try:
+        payloads = _snapshot_portfolio_payloads()
+    except Exception:
+        return "recheck_failed"
+    by_id = {str(payload.get("id") or ""): payload for payload in payloads}
+    payload = by_id.get(portfolio_id)
+    if payload is None:
+        return "not_found"
+    components = payload.get("components")
+    if isinstance(components, list) and len(components) > 0:
+        return "no_longer_empty"
+    return ""
+
+
+def _duplicate_backtest_members() -> list[dict[str, Any]]:
+    """Flatten duplicate backtest groups into per-member entries.
+
+    Every member of a group with at least two entries carries the group's
+    display info, the id of the kept (newest) entry, and whether it is that
+    kept entry itself. Ordered newest group first, like
+    :func:`_group_duplicate_backtests`.
+    """
+    groups, _ = _group_duplicate_backtests()
+    meta_by_id = {
+        str(item.get("id") or ""): item for item in _snapshot_backtest_meta_cache()
+    }
+    members: list[dict[str, Any]] = []
+    for group in groups:
+        backtests = group.get("backtests", [])
+        if len(backtests) < 2:
+            continue
+        kept_id = str(backtests[0].get("id") or "")
+        for entry in backtests:
+            entry_id = str(entry.get("id") or "")
+            if not entry_id:
+                continue
+            meta = meta_by_id.get(entry_id, {})
+            members.append(
+                {
+                    "id": entry_id,
+                    "display_name": str(meta.get("display_name") or ""),
+                    "strategy_name": str(group.get("strategy_name") or ""),
+                    "symbols": [
+                        str(symbol)
+                        for symbol in (group.get("symbols") or [])
+                        if str(symbol).strip()
+                    ],
+                    "timeframe": str(group.get("timeframe") or ""),
+                    "trade_count": max(
+                        int(_safe_float(meta.get("trade_count"), 0.0)), 0
+                    ),
+                    "created_at": str(entry.get("created_at") or ""),
+                    "fingerprint": str(group.get("fingerprint") or ""),
+                    "kept_id": kept_id,
+                    "is_kept": entry_id == kept_id,
+                }
+            )
+    return members
+
+
+def _duplicate_portfolio_members() -> list[dict[str, Any]]:
+    """Flatten duplicate portfolio groups into per-member entries.
+
+    Same shape as :func:`_duplicate_backtest_members` with portfolio display
+    info (name, component count) instead of backtest info.
+    """
+    groups, _ = _group_duplicate_portfolios()
+    members: list[dict[str, Any]] = []
+    for group in groups:
+        portfolios = group.get("portfolios", [])
+        if len(portfolios) < 2:
+            continue
+        kept_id = str(portfolios[0].get("id") or "")
+        for entry in portfolios:
+            entry_id = str(entry.get("id") or "")
+            if not entry_id:
+                continue
+            members.append(
+                {
+                    "id": entry_id,
+                    "name": str(entry.get("name") or ""),
+                    "component_count": max(int(_safe_float(group.get("component_count"), 0.0)), 0),
+                    "created_at": str(entry.get("created_at") or ""),
+                    "fingerprint": str(group.get("fingerprint") or ""),
+                    "kept_id": kept_id,
+                    "is_kept": entry_id == kept_id,
+                }
+            )
+    return members
+
+
+def _current_duplicate_member(
+    load_members: Callable[[], list[dict[str, Any]]], item_id: str
+) -> dict[str, Any] | None:
+    """Return ``item_id``'s member entry from a fresh duplicate-group read.
+
+    Used immediately before each confirmed delete. The confirm loop must not
+    act on the dry-run snapshot: if the other members of a group disappear in
+    between, the id may now be the last surviving entry, and deleting it would
+    destroy the group's only copy. ``None`` means it is no longer a duplicate
+    (or no longer exists).
+    """
+    for member in load_members():
+        if str(member["id"]) == item_id:
+            return member
+    return None
+
+
 def _current_backtest_store_mtime_ns() -> int:
     try:
         return int(BACKTEST_DB_PATH.stat().st_mtime_ns)
@@ -3416,7 +3692,13 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         if initial_capital > 0
         else total_return_decimal * 100.0
     )
-    cagr_decimal = _safe_float(meta.get("cagr"), total_return_decimal)
+    # An undefined CAGR (ruined run, #132) stays undefined: falling back to the
+    # total return would publish a measured-looking annualised figure.
+    cagr_decimal = (
+        _optional_float(meta.get("cagr"))
+        if "cagr" in meta
+        else total_return_decimal
+    )
     sharpe_ratio = _optional_float(meta.get("sharpe_ratio"))
     psr = _optional_float(meta.get("psr"))
     p_value = _optional_float(meta.get("p_value"))
@@ -3443,7 +3725,7 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "created_at": str(meta.get("created_at") or ""),
         "sharpe": sharpe_ratio,
         "sharpe_ratio": sharpe_ratio,
-        "cagr": round(cagr_decimal * 100.0, 2),
+        "cagr": round(cagr_decimal * 100.0, 2) if cagr_decimal is not None else None,
         "max_drawdown_pct": round(max_drawdown_decimal * 100.0, 2),
         "net_profit": round(total_pnl, 6),
         "net_profit_pct": round(net_profit_pct, 2),
@@ -3452,6 +3734,12 @@ def _backtest_summary_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "win_rate": round(win_rate, 6) if win_rate is not None else None,
         "equity_mini": [],
     }
+
+
+def _magnitude_or_none(value: object) -> float | None:
+    """Absolute value of a measured metric; ``None`` when it was not measured."""
+    measured = _optional_float(value)
+    return None if measured is None else abs(measured)
 
 
 def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
@@ -3473,12 +3761,12 @@ def _backtest_all_item_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
         "strategy_slug": str(meta.get("strategy_name") or "unknown"),
         "symbols": [str(item) for item in meta.get("symbols", []) if str(item).strip()],
         "timeframe": normalize_timeframe(str(meta.get("timeframe") or "")),
-        "total_return": _safe_float(meta.get("total_return"), 0.0),
+        "total_return": _optional_float(meta.get("total_return")),
         "sharpe_ratio": _optional_float(meta.get("sharpe_ratio")),
         "psr": _optional_float(meta.get("psr")),
         "p_value": _optional_float(meta.get("p_value")),
         "cagr": _optional_float(meta.get("cagr")),
-        "max_drawdown": abs(_safe_float(meta.get("max_drawdown"), 0.0)),
+        "max_drawdown": _magnitude_or_none(meta.get("max_drawdown")),
         "trade_count": max(int(meta.get("trade_count", 0) or 0), 0),
         "win_rate": win_rate,
         "start_date": str(meta.get("start_date") or ""),
@@ -4920,7 +5208,51 @@ def _serialize_live_account_payload(account: Any) -> dict[str, Any]:
     }
 
 
-def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict[str, Any]:
+#: How many conflicting signals one deployment's payload may carry before the viewer
+#: truncates the list. The halt is binary; the ids are the evidence an operator needs
+#: to reconcile, so the cap is generous and states itself when it bites.
+MAX_BROKER_ORDER_CONFLICT_ROWS = 20
+
+
+def _broker_order_conflict_health(
+    grouped: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Fleet-wide unresolved broker order id conflicts (#126), for the dashboard.
+
+    Same read as :func:`live_runner.broker_order_conflicts.check_broker_order_conflicts`,
+    kept here because the payload caps how many rows it carries: the daemon loop wants
+    every one, a dashboard wants the shape of the problem.
+
+    ``grouped`` is the already-read mapping. The dashboard needs it anyway to annotate
+    its ACTIVE rows, and the read is a full scan of the signal table, so a caller that
+    has it passes it rather than scanning twice for one response.
+    """
+    if grouped is None:
+        grouped = deployments_with_broker_order_conflicts(limit=CONFLICT_SCAN_LIMIT)
+    conflicts = [conflict for rows in grouped.values() for conflict in rows]
+    return {
+        "status": "error" if conflicts else "ok",
+        "deployment_ids": sorted(grouped),
+        "conflicts": conflicts[:MAX_BROKER_ORDER_CONFLICT_ROWS],
+        "truncated": len(conflicts) > MAX_BROKER_ORDER_CONFLICT_ROWS,
+    }
+
+
+def _serialize_live_deployment_payload(
+    deployment: LiveDeploymentConfig,
+    broker_order_conflicts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Serialize one deployment for the API.
+
+    ``broker_order_conflicts`` are this deployment's unresolved broker order id
+    conflicts (#126), already grouped for it by the caller, or ``None`` when the
+    caller did not read them. A deployment that is not ACTIVE *and* carries a
+    conflict is reported as ``halted_for_broker_order_conflict``: that is the
+    answer to "why is this paused" for a pause the operator did not set, and it
+    is what the operator needs to see before they resume anything. Callers that
+    did not read the conflicts pass the rows as an empty list rather than
+    ``None`` when they want the key to be decisive.
+    """
     # STOPPED is a request, not a fact. The daemon marks
     # `stopped_enforced_at` only after a *complete* cancel-and-flatten sweep, so
     # a STOPPED row without that stamp still has exposure at the broker. The
@@ -4930,6 +5262,25 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
     exposure_may_be_open = (
         str(deployment.status or "").strip().upper() == "STOPPED"
         and stopped_enforced_at is None
+    )
+    # None means "this response did not read the conflict ledger", which is a different
+    # statement from "there is none" - the same distinction that makes
+    # `exposure_may_be_open` worth reporting. A create, update or re-point response never
+    # reads conflicts, so it must not answer for them.
+    read_conflicts = None if broker_order_conflicts is None else list(broker_order_conflicts)
+    conflicts = None
+    conflicts_truncated = False
+    if read_conflicts is not None:
+        # An HTTP payload has to be bounded, and a deployment with a pathological
+        # conflict backlog must not drag the whole deployments list with it. So the
+        # list is cut at the cap the dashboard already uses and the cut is *said*: a
+        # silently shortened list would read as "these are all of them" to the operator
+        # deciding whether to resolve, and the halt itself is unaffected - it is decided
+        # by the presence of any conflict, never by the count.
+        conflicts = read_conflicts[:MAX_BROKER_ORDER_CONFLICT_ROWS]
+        conflicts_truncated = len(read_conflicts) > MAX_BROKER_ORDER_CONFLICT_ROWS
+    halted_for_conflict = bool(read_conflicts) and (
+        str(deployment.status or "").strip().upper() != "ACTIVE"
     )
     payload = {
         "id": str(deployment.id),
@@ -4942,6 +5293,12 @@ def _serialize_live_deployment_payload(deployment: LiveDeploymentConfig) -> dict
             stopped_enforced_at.isoformat() if stopped_enforced_at is not None else None
         ),
         "exposure_may_be_open": exposure_may_be_open,
+        # (#126) broker order ids recorded as conflicting for this deployment's
+        # signals: a broker order may exist that the ledger does not track. None when
+        # this response did not read them (see above).
+        "broker_order_conflicts": conflicts,
+        "broker_order_conflicts_truncated": conflicts_truncated,
+        "halted_for_broker_order_conflict": halted_for_conflict,
         "signal_source_type": deployment.signal_source_type,
         "signal_source_id": deployment.signal_source_id,
         "symbol_filter": deployment.symbol_filter,
@@ -5490,14 +5847,78 @@ def _calculate_realized_live_pnl(
     return total_pnl, wins, losses
 
 
+def _live_commission_totals(rows: list[dict[str, Any]]) -> tuple[float | None, int]:
+    """The summed commission of ``rows`` and how many are unknown; the sum is None if any is.
+
+    An unknown (NULL) commission is "the broker has not told us yet" - Alpaca posts crypto fees end
+    of day (#124). Netting it as zero would overstate net PnL, so one unknown row makes the total
+    unknown rather than a smaller number that looks complete.
+    """
+    total = 0.0
+    unknown = 0
+    for row in rows:
+        commission = row.get("commission")
+        if commission is None:
+            unknown += 1
+            continue
+        total += _safe_float(commission, 0.0)
+    return (None if unknown else total), unknown
+
+
+def _live_unpriced_fill_count(rows: list[dict[str, Any]]) -> int:
+    """How many buy/sell fills carry real quantity at an unusable price (#124, review of #143).
+
+    Such a fill (stored at 0.0 with `sent_bad`, `absent` or `derived_unavailable`, served as
+    `actual_price: None`) still moved the position. `_calculate_realized_live_pnl` cannot price
+    it, so every realized number after it is unknown rather than a smaller real number.
+    """
+    count = 0
+    for row in rows:
+        action = str(row.get("action") or "").strip().lower()
+        if action not in ("buy", "sell") or abs(_safe_float(row.get("filled_qty"), 0.0)) <= 0.0:
+            continue
+        if not execution_price_is_usable(row.get("actual_price"), row.get("actual_price_observed")):
+            count += 1
+    return count
+
+
 def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     balances, execution_rows = load_live_account_stats_inputs(account_id)
 
     total_pnl_realized, wins, losses = _calculate_realized_live_pnl(execution_rows)
+    # A fill at an unknown price makes realized PnL unknown, like an unknown fee makes net PnL
+    # unknown: never a 0.0 price.
+    price_unknown_count = _live_unpriced_fill_count(execution_rows)
+    pnl_complete = price_unknown_count == 0
+    # `total_pnl` is gross (price PnL of closed round trips). Net PnL subtracts every execution's
+    # commission and is reported only when every commission is known.
+    total_commission, commission_unknown_count = _live_commission_totals(execution_rows)
+    net_pnl = (
+        round(total_pnl_realized - total_commission, 2)
+        if total_commission is not None and pnl_complete
+        else None
+    )
     # Win rate denominators are closed round trips (a win or a loss), never raw
     # execution rows: partial fills would otherwise deflate the ratio.
     total_trades = wins + losses
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
+    # The counts come from the same walk as `total_pnl`, so they are just as incomplete when a
+    # fill's price is unknown: report them as unknown, never as a measured win or loss.
+    win_loss_fields: dict[str, Any] = (
+        {
+            "total_trades": total_trades,
+            "winning_trades": wins,
+            "losing_trades": losses,
+            "win_rate": round(win_rate, 2),
+        }
+        if pnl_complete
+        else {
+            "total_trades": None,
+            "winning_trades": None,
+            "losing_trades": None,
+            "win_rate": None,
+        }
+    )
 
     max_drawdown = 0.0
     max_drawdown_pct = 0.0
@@ -5517,11 +5938,16 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
 
     return {
         "account_id": account_id,
-        "total_trades": total_trades,
-        "winning_trades": wins,
-        "losing_trades": losses,
-        "win_rate": round(win_rate, 2),
-        "total_pnl": round(total_pnl_realized, 2),
+        **win_loss_fields,
+        "total_pnl": round(total_pnl_realized, 2) if pnl_complete else None,
+        "pnl_complete": pnl_complete,
+        "price_unknown_count": price_unknown_count,
+        "total_commission": (
+            round(total_commission, 2) if total_commission is not None else None
+        ),
+        "commission_unknown_count": commission_unknown_count,
+        "net_pnl": net_pnl,
+        "net_pnl_complete": pnl_complete and commission_unknown_count == 0,
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "current_balance": round(current_balance, 2),
@@ -8195,7 +8621,7 @@ def _download_and_verify_missing_data(
     for index, missing in enumerate(missing_items, start=1):
         progress_before = 10.0 + ((index - 1) / total_missing) * 35.0
         if progress_callback is not None:
-            progress_callback(progress_before, f"Downloading data... {int(round(progress_before))}%")
+            progress_callback(progress_before, f"Downloading data... {round(progress_before)}%")
 
         symbol = str(missing["symbol"])
         source = str(missing["source"])
@@ -8251,7 +8677,7 @@ def _download_and_verify_missing_data(
 
         progress_after = 10.0 + (index / total_missing) * 35.0
         if progress_callback is not None:
-            progress_callback(progress_after, f"Downloading data... {int(round(progress_after))}%")
+            progress_callback(progress_after, f"Downloading data... {round(progress_after)}%")
 
 
 def _ensure_backtest_data_availability(
@@ -8486,14 +8912,14 @@ def _aggregate_symbol_timeframe_entries(
 ) -> list[dict[str, Any]]:
     logical_entries: list[dict[str, Any]] = []
     merged_entries = merge_ohlcv_entries([entry for entry in entries if isinstance(entry, dict)])
-    for entry in merged_entries:
-        logical_entries.append(
-            _aggregate_ohlcv_entry_payload(
-                entry,
-                include_category=include_category,
-                include_size_bytes=include_size_bytes,
-            )
+    logical_entries.extend(
+        _aggregate_ohlcv_entry_payload(
+            entry,
+            include_category=include_category,
+            include_size_bytes=include_size_bytes,
         )
+        for entry in merged_entries
+    )
 
     logical_entries.sort(
         key=lambda item: (
@@ -8593,7 +9019,7 @@ async def approve_strategy(relative_file: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/strategies/{name:path}", response_model=dict[str, Any])
+@app.get("/api/strategies/{name:path}")
 async def get_strategy(name: str) -> dict[str, Any]:
     entry = _safe_strategy_entry(name)
     if entry is None:
@@ -8633,11 +9059,140 @@ async def rename_strategy(name: str, payload: NameUpdateRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "strategy rename")) from exc
 
 
+def _contained_in_results_dir(path: Path) -> bool:
+    """Whether ``path`` is a file directly inside the resolved results directory.
+
+    The directory itself is refused: it is contained, and handing it out would
+    send a caller (or a response) at a directory instead of a file.
+    """
+    base = MATRIX_RESULTS_DIR.resolve()
+    return path != base and path.is_relative_to(base)
+
+
 def _matrix_result_path(filename: str) -> Path:
+    """Return the resolved path of a matrix result file inside MATRIX_RESULTS_DIR.
+
+    Separator and drive forms are refused up front so the same input is rejected
+    on Linux, Windows and macOS alike. The candidate is then resolved (following
+    symlinks) and must stay inside the resolved results directory (#155).
+    """
     normalized = str(filename or "").strip()
-    if not normalized or ".." in normalized or normalized.startswith("/"):
+    if (
+        not normalized
+        or ".." in normalized
+        or normalized.startswith("/")
+        or "\\" in normalized
+        or ":" in normalized
+    ):
         raise HTTPException(status_code=400, detail="Invalid matrix filename")
-    return MATRIX_RESULTS_DIR / normalized
+    resolved = (MATRIX_RESULTS_DIR / normalized).resolve()
+    if not _contained_in_results_dir(resolved):
+        raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    return resolved
+
+
+class _CheckedMatrixResult(NamedTuple):
+    """A matrix result file opened from the path that containment approved."""
+
+    path: Path
+    handle: BinaryIO
+    size: int
+
+
+def _checked_matrix_result(filename: str, *, not_found_detail: str) -> _CheckedMatrixResult:
+    """Open the matrix result file :func:`_matrix_result_path` just approved.
+
+    Checking a path and opening it are two separate walks, so containment alone
+    is a check-time promise: anything renamed inside the results directory in
+    between the two would have been followed. The descriptor opened here is the
+    one the response streams, so the file that is served is the file that was
+    checked, and four things are refused instead of followed (#155):
+
+    * ``O_NOFOLLOW``, where the platform provides it, makes the kernel refuse a
+      final component that has become a symlink since the check;
+    * the path is resolved *again* after the open and required to be contained,
+      which covers a swapped directory component -- the same escape one level
+      up, and one the kernel cannot see at the final component;
+    * a regular file is required, so a name that resolves to a directory, or to
+      a file that is gone, answers the caller instead of failing inside the
+      response;
+    * ``O_NONBLOCK`` keeps the open itself from blocking, so a FIFO or device
+      planted under the name answers instead of stalling the request -- and with
+      it the event loop every other request shares.
+
+    ``O_NOFOLLOW`` is read through ``getattr`` because it is not in every
+    platform's ``os`` module; where it is missing, the containment re-check is
+    what closes that window. A rename that is undone before that re-check cannot
+    be seen from here at all; excluding it needs the components opened one at a
+    time relative to a directory descriptor (``dir_fd``), which is not available
+    on every platform this runs on.
+    """
+    path = _matrix_result_path(filename)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    # Windows opens in text mode unless O_BINARY is passed: reads would turn
+    # CRLF into LF and stop at 0x1A, so the body would not match Content-Length.
+    binary = getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | binary | nofollow | nonblock)
+    except OSError as exc:
+        if exc.errno == getattr(errno, "ELOOP", None):
+            # A symlink stands where the check found a regular file.
+            raise HTTPException(status_code=400, detail="Invalid matrix filename") from exc
+        raise HTTPException(status_code=404, detail=not_found_detail) from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        if not _contained_in_results_dir(Path(os.path.realpath(path))):
+            raise HTTPException(status_code=400, detail="Invalid matrix filename")
+    except HTTPException:
+        os.close(descriptor)
+        raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise HTTPException(status_code=404, detail=not_found_detail) from exc
+    return _CheckedMatrixResult(path, os.fdopen(descriptor, "rb"), info.st_size)
+
+
+class _MatrixCsvResponse(StreamingResponse):
+    """Stream a matrix CSV from the descriptor that containment checked.
+
+    ``FileResponse`` opens its path when the response is sent, so the bytes it
+    serves come from a second, unchecked walk -- the window
+    ``_checked_matrix_result`` exists to close. Streaming the open descriptor
+    instead keeps the route declared as a CSV download.
+    """
+
+    media_type = "text/csv"
+
+
+def _stream_matrix_result(handle: BinaryIO, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+    """Yield the open descriptor's bytes in the order it reads them.
+
+    A generator, so the reads run where ``StreamingResponse`` runs its content
+    -- in a thread pool -- rather than on the event loop.
+    """
+    try:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+    finally:
+        handle.close()
+
+
+def _matrix_result_response(filename: str, *, not_found_detail: str) -> _MatrixCsvResponse:
+    """Serve a matrix result file, or say why there is nothing to serve."""
+    checked = _checked_matrix_result(filename, not_found_detail=not_found_detail)
+    return _MatrixCsvResponse(
+        _stream_matrix_result(checked.handle),
+        headers={
+            "content-disposition": f'attachment; filename="{checked.path.name}"',
+            "content-length": str(checked.size),
+        },
+    )
 
 
 def _stale_grid_findings(
@@ -8729,6 +9284,9 @@ def _matrix_summary_payload() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=_internal_error_detail(exc, "matrix summary")) from exc
     runs = [row for row in payload.get("runs", []) if isinstance(row, dict)]
     _refuse_stale_grid_rows(runs, source="matrix summary")
+    # A path, not an open file: these are informational strings describing where
+    # the results would be, so a run that produced no CSV yet still answers. The
+    # routes that serve them go through _checked_matrix_result.
     payload["matrix_csv"] = str(_matrix_result_path("matrix_matrix.csv"))
     payload["daily_equity_csv"] = str(_matrix_result_path("matrix_daily_equity.csv"))
     return payload
@@ -8786,7 +9344,7 @@ def _matrix_grid_row_with_trades(row: dict[str, Any], *, trades_limit: int) -> d
         enriched["trade_sample_count"] = 0
         return enriched
 
-    result = load_backtest_result(backtest_id)
+    result = _load_stored_result(backtest_id)
     if result is None:
         enriched.setdefault("trades", [])
         enriched["trade_sample_count"] = 0
@@ -8806,20 +9364,16 @@ async def get_backtest_matrix_summary() -> dict[str, Any]:
     return _matrix_summary_payload()
 
 
-@app.get("/api/backtests/matrix/matrix.csv", response_class=FileResponse)
-async def get_backtest_matrix_csv() -> FileResponse:
-    path = _matrix_result_path("matrix_matrix.csv")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Matrix CSV not found")
-    return FileResponse(path, media_type="text/csv", filename=path.name)
+@app.get("/api/backtests/matrix/matrix.csv", response_class=_MatrixCsvResponse)
+async def get_backtest_matrix_csv() -> _MatrixCsvResponse:
+    return _matrix_result_response("matrix_matrix.csv", not_found_detail="Matrix CSV not found")
 
 
-@app.get("/api/backtests/matrix/daily-equity.csv", response_class=FileResponse)
-async def get_backtest_matrix_daily_equity_csv() -> FileResponse:
-    path = _matrix_result_path("matrix_daily_equity.csv")
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Matrix daily equity CSV not found")
-    return FileResponse(path, media_type="text/csv", filename=path.name)
+@app.get("/api/backtests/matrix/daily-equity.csv", response_class=_MatrixCsvResponse)
+async def get_backtest_matrix_daily_equity_csv() -> _MatrixCsvResponse:
+    return _matrix_result_response(
+        "matrix_daily_equity.csv", not_found_detail="Matrix daily equity CSV not found"
+    )
 
 
 @app.get("/api/grid/{strategy_id:path}")
@@ -8966,58 +9520,192 @@ async def list_backtest_duplicates() -> BacktestsDuplicatesResponse:
 
 
 @app.post("/api/backtests/deduplicate")
-async def deduplicate_backtests() -> BacktestsDeduplicateResponse:
-    groups, _ = _group_duplicate_backtests()
-    deleted_ids: list[str] = []
+async def deduplicate_backtests(
+    payload: BacktestsDeduplicateRequest | None = None,
+) -> BacktestsDeduplicateResponse:
+    """Two-phase bulk delete of duplicate backtests (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidate_ids`` — exactly
+    the ids that would be deleted (every duplicate-group member except the
+    kept newest entry) — plus per-candidate display info in ``items``. Nothing
+    is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the criterion first: a member that is no longer in a duplicate group, is
+    now the kept newest entry, or no longer exists is reported per item with
+    status ``skipped`` and a ``reason`` and is not deleted. If the re-check
+    itself raises, that id is skipped with reason ``recheck_failed`` and the
+    rest of the request continues. ``kept_ids`` is the group snapshot taken
+    when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed``) and retrying with the same id list is safe (an id that is no
+    longer a duplicate comes back as ``no_longer_duplicate``). Nothing outside
+    the submitted list is ever touched.
+    """
+    request = payload or BacktestsDeduplicateRequest()
+    members = _duplicate_backtest_members()
     kept_ids: list[str] = []
+    seen_kept: set[str] = set()
+    for member in members:
+        member_id = str(member["id"])
+        if member["is_kept"] and member_id not in seen_kept:
+            seen_kept.add(member_id)
+            kept_ids.append(member_id)
+    candidates = [member for member in members if not member["is_kept"]]
+    candidate_ids = [str(member["id"]) for member in candidates]
+
+    if request.dry_run:
+        return BacktestsDeduplicateResponse(
+            dry_run=True,
+            deleted_ids=[],
+            kept_ids=kept_ids,
+            candidate_ids=candidate_ids,
+            skipped_ids=[],
+            groups_affected=len(
+                {str(member.get("fingerprint") or "") for member in candidates}
+            ),
+            items=[{**member, "status": "candidate"} for member in candidates],
+        )
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    deleted_ids: list[str] = []
+    skipped_ids: list[str] = []
+    affected_fingerprints: set[str] = set()
     items: list[dict[str, Any]] = []
-    affected = 0
-
-    for group in groups:
-        backtests = group.get("backtests", [])
-        if len(backtests) < 2:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        backtest_id = str(raw_id or "").strip()
+        if not backtest_id or backtest_id in seen:
             continue
-        keep_id = str(backtests[0].get("id") or "")
-        if keep_id:
-            kept_ids.append(keep_id)
-
-        removed_in_group = False
-        for entry in backtests[1:]:
-            backtest_id = str(entry.get("id") or "")
-            if not backtest_id:
-                continue
+        seen.add(backtest_id)
+        try:
+            member = _current_duplicate_member(_duplicate_backtest_members, backtest_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Backtest duplicate re-check failed",
+                extra={"data": {"backtest": _log_safe(backtest_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(backtest_id, "recheck_failed"))
+            skipped_ids.append(backtest_id)
+            continue
+        if member is None:
+            items.append(_bulk_delete_skipped_item(backtest_id, "no_longer_duplicate"))
+            skipped_ids.append(backtest_id)
+            continue
+        if member.get("is_kept"):
+            items.append(_bulk_delete_skipped_item(backtest_id, "now_kept_entry"))
+            skipped_ids.append(backtest_id)
+            continue
+        try:
             result = _delete_backtest_with_artifacts(backtest_id)
-            items.append(result)
-            if result.get("status") == "deleted":
-                deleted_ids.append(backtest_id)
-                removed_in_group = True
-        if removed_in_group:
-            affected += 1
+        except Exception as exc:
+            logger.exception(
+                "Backtest bulk delete failed",
+                extra={"data": {"backtest": _log_safe(backtest_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(backtest_id, exc)
+        items.append(result)
+        if result.get("status") == "deleted":
+            deleted_ids.append(backtest_id)
+            affected_fingerprints.add(str(member.get("fingerprint") or ""))
 
     return BacktestsDeduplicateResponse(
+        dry_run=False,
         deleted_ids=deleted_ids,
         kept_ids=kept_ids,
-        groups_affected=affected,
+        candidate_ids=[],
+        skipped_ids=skipped_ids,
+        groups_affected=len(affected_fingerprints),
         items=items,
     )
 
 
 @app.post("/api/backtests/remove-empty")
-async def remove_empty_backtests() -> dict[str, Any]:
-    removed = 0
+async def remove_empty_backtests(
+    payload: BacktestsRemoveEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Two-phase bulk delete of backtests with zero trades (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidates`` (id, name,
+    strategy, symbols, timeframe, trade count) and ``candidate_ids`` — exactly
+    the backtests that would be deleted. Nothing is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the zero-trades criterion first (fresh database read, not the cache): a
+    backtest that gained trades or no longer exists is reported per item with
+    status ``skipped`` and a ``reason`` and is not deleted. A phase-2 call
+    without ``ids`` deletes nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed`` / ``cleanup_pending``) and retrying with the same id list is
+    safe. Nothing outside the submitted list is ever touched.
+    """
+    request = payload or BacktestsRemoveEmptyRequest()
+    if request.dry_run:
+        candidates = _empty_backtest_candidates()
+        return {
+            "dry_run": True,
+            "candidates": candidates,
+            "candidate_ids": [str(candidate["id"]) for candidate in candidates],
+        }
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    deleted = 0
+    skipped = 0
+    failed = 0
+    removed_ids: list[str] = []
     items: list[dict[str, Any]] = []
-    for item in _snapshot_backtest_meta_cache():
-        backtest_id = str(item.get("id") or "").strip()
-        if not backtest_id:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        backtest_id = str(raw_id or "").strip()
+        if not backtest_id or backtest_id in seen:
             continue
-        trade_count = max(int(_safe_float(item.get("trade_count"), 0.0)), 0)
-        if trade_count != 0:
+        seen.add(backtest_id)
+        skip_reason = _empty_backtest_skip_reason(backtest_id)
+        if skip_reason:
+            items.append(_bulk_delete_skipped_item(backtest_id, skip_reason))
+            skipped += 1
             continue
-        result = _delete_backtest_with_artifacts(backtest_id)
+        try:
+            result = _delete_backtest_with_artifacts(backtest_id)
+        except Exception as exc:
+            logger.exception(
+                "Backtest bulk delete failed",
+                extra={"data": {"backtest": _log_safe(backtest_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(backtest_id, exc)
         items.append(result)
         if result.get("status") == "deleted":
-            removed += 1
-    return {"removed": removed, "items": items}
+            deleted += 1
+            removed_ids.append(backtest_id)
+        elif result.get("status") in {"failed", "cleanup_pending"}:
+            failed += 1
+    return {
+        "dry_run": False,
+        "deleted": deleted,
+        "skipped": skipped,
+        "failed": failed,
+        "removed_ids": removed_ids,
+        "items": items,
+    }
 
 
 @app.post("/api/backtests/delete-bulk")
@@ -9139,7 +9827,11 @@ async def rename_backtest(backtest_id: str, payload: NameUpdateRequest) -> dict[
 
     result.meta.notes = updated_name
     BACKTESTS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = BACKTESTS_DIR / f"{backtest_id}.trades.json"
+    # The write side of the same id→path join the loader contains (#230): a
+    # stored row loaded by id must never be written outside BACKTESTS_DIR.
+    output_path = _contained_asset_path(BACKTESTS_DIR, backtest_id, BACKTEST_TRADES_SUFFIX)
+    if output_path is None:
+        raise HTTPException(status_code=400, detail="Invalid backtest id")
     try:
         result.save(output_path)
         save_result_to_sqlite(result)
@@ -9580,7 +10272,7 @@ def _replay_keep_mask_from_trades(df: pd.DataFrame, trade_payloads: list[dict[st
     event_count = max(1, int(event_ns.size))
     budget_per_event = max(REPLAY_MIN_BARS_PER_EVENT, REPLAY_TARGET_BARS // event_count)
     bars_per_event = min(REPLAY_MAX_BARS_PER_EVENT, budget_per_event)
-    window_before = max(1, int(round(bars_per_event * 0.6)))
+    window_before = max(1, round(bars_per_event * 0.6))
     window_after = max(1, bars_per_event - window_before)
     insert_idx = np.searchsorted(timestamp_values, event_ns, side="left")
     insert_idx = np.clip(insert_idx, 0, len(df) - 1)
@@ -10283,7 +10975,7 @@ def _backtest_runner_stage(message: str) -> tuple[float, str] | None:
             progress_message = payload[2].strip() or "Running backtest..."
             scaled = 45.0 + (max(0.0, min(percent, 100.0)) * 0.55)
             if progress_message:
-                return (scaled, f"Running backtest... {int(round(scaled))}%")
+                return (scaled, f"Running backtest... {round(scaled)}%")
             return (scaled, "Running backtest...")
         return None
     if "auto-detected date range" in normalized:
@@ -10550,13 +11242,13 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
                 # collects the exit status after EOF (or after the kill).
                 try:
                     returncode = proc.wait(timeout=30)
-                except subprocess.TimeoutExpired:
+                except subprocess.TimeoutExpired as exc:
                     if proc.poll() is None:
                         watchdog_timed_out.set()
                         _kill_process_group(proc)
                     raise subprocess.SubprocessError(
                         f"Backtest timed out after {BACKTEST_WATCHDOG_TIMEOUT_SECONDS:.0f} seconds"
-                    )
+                    ) from exc
                 if watchdog_timed_out.is_set():
                     # The watchdog killed the child, so its returncode is the
                     # signal that terminated it (-9), not a real exit status.
@@ -10771,6 +11463,54 @@ def _validated_signal_replay_request(
     )
 
 
+def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> dict[str, Any]:
+    """Resolve the replay fee declaration (#361), failing closed like #84.
+
+    ``SignalReplayAdapter.run`` refuses to run without an explicit fee model
+    (``resolve_fee_model`` raises on missing config), so the viewer requires
+    the caller to declare costs in the request — ``fees_zero`` for a conscious
+    no-cost run, or ``fee_rate``/``fee_flat_per_trade`` mirroring the CLI
+    flags — instead of letting every replay task die inside the worker with a
+    config error. The flags conflict exactly like ``--fees-zero`` does on the
+    CLI.
+    """
+    fee_rate = payload.fee_rate
+    fee_flat_per_trade = payload.fee_flat_per_trade
+    # #361: reject negative/NaN/inf declarations here — ``resolve_fee_model``
+    # clamps negatives to 0.0 downstream, which would turn a declared cost into
+    # a silent zero-cost run (and inf into non-finite fees).
+    for field_name, value in (
+        ("fee_rate", fee_rate),
+        ("fee_flat_per_trade", fee_flat_per_trade),
+    ):
+        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name} must be a finite, non-negative number",
+            )
+    if payload.fees_zero:
+        if fee_rate is not None or fee_flat_per_trade is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="fees_zero conflicts with fee_rate/fee_flat_per_trade",
+            )
+        return {"fees": "zero"}
+    fee_params: dict[str, Any] = {}
+    if fee_rate is not None:
+        fee_params["fee_rate"] = float(fee_rate)
+    if fee_flat_per_trade is not None:
+        fee_params["fee_flat_per_trade"] = float(fee_flat_per_trade)
+    if not fee_params:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "fee configuration required: pass fee_rate/fee_flat_per_trade "
+                "or fees_zero=true (#84 fail-closed)"
+            ),
+        )
+    return fee_params
+
+
 def _register_signal_replay_task(
     *,
     payload: BacktestRunSignalsRequest,
@@ -10785,6 +11525,7 @@ def _register_signal_replay_task(
     timeframe: str,
     start_dt: datetime,
     end_dt: datetime,
+    fee_params: dict[str, Any],
 ) -> tuple[str, Any, int]:
     """Create the replay task record, restart config and job placeholder."""
     task_id = str(uuid.uuid4())[:8]
@@ -10822,6 +11563,7 @@ def _register_signal_replay_task(
             "max_positions": max_positions,
             "signal_processor": signal_processor_name or None,
             "signal_count": len(normalized_signals),
+            "fee_params": dict(fee_params),
         },
     )
     _running_jobs[task_id] = {
@@ -10894,6 +11636,10 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         max_position_pct,
         max_positions,
     ) = _validated_signal_replay_request(payload)
+    # #361: resolve the fee declaration BEFORE registering the task — a
+    # missing/conflicting declaration is a 400, not a task that dies in the
+    # worker on the adapter's fail-closed fee check.
+    fee_params = _validated_signal_replay_fee_params(payload)
 
     default_timeframe = requested_timeframe or "1h"
     normalized_signals, replay_source_label = await _gather_replay_signals(
@@ -10914,7 +11660,6 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     start_str = start_dt.date().isoformat()
     end_str = end_dt.date().isoformat()
-    symbols = sorted({str(item["symbol"]).strip().upper() for item in normalized_signals})
     task_id, log_file, stage_total = _register_signal_replay_task(
         payload=payload,
         symbols=symbols,
@@ -10928,24 +11673,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         timeframe=timeframe,
         start_dt=start_dt,
         end_dt=end_dt,
+        fee_params=fee_params,
     )
     _set_task_status(task_id, "queued")
-    _update_task_fields(
-        task_id,
-        restart_config={
-            "signal_source": replay_source_label,
-            "account_id": account_id,
-            "start_date": start_str,
-            "end_date": end_str,
-            "timeframe": timeframe,
-            "capital": float(payload.capital or 100000.0),
-            "risk_per_trade_pct": risk_per_trade_pct,
-            "max_position_pct": max_position_pct,
-            "max_positions": max_positions,
-            "signal_processor": signal_processor_name or None,
-            "signal_count": len(normalized_signals),
-        },
-    )
     _register_job(
         task_id,
         {
@@ -11056,6 +11786,7 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     initial_capital=float(payload.capital or 100000.0),
                     default_timeframe=timeframe,
                     signal_processor_name=signal_processor_name or None,
+                    fee_params=fee_params,
                 )
                 result = adapter.run(
                     signals=replay_signals,
@@ -11068,6 +11799,9 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                         "signal_processor": signal_processor_name or None,
                         "account_id": account_id or None,
                         "signal_count": len(replay_signals),
+                        # The adapter merges metadata into BacktestMeta.parameters,
+                        # so the saved result records which cost model produced it.
+                        "fee_params": dict(fee_params),
                     },
                     progress_callback=lambda percent, _message: report_stage(
                         handle,
@@ -11203,7 +11937,12 @@ async def _load_and_filter_csv_signals(
     "/api/backtests/run-from-signals",
     status_code=202,
     responses={
-        400: {"description": "Invalid signal_source, filepath, date range or no replayable signals"},
+        400: {
+            "description": (
+                "Invalid signal_source, filepath, date range, missing/conflicting "
+                "fee declaration, or no replayable signals"
+            )
+        },
         403: {"description": "Signal CSV is outside the OHLCV data directory"},
     },
 )
@@ -11222,6 +11961,9 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
             max_position_pct=payload.max_position_pct,
             max_positions=payload.max_positions,
             auto_download=payload.auto_download,
+            fee_rate=payload.fee_rate,
+            fee_flat_per_trade=payload.fee_flat_per_trade,
+            fees_zero=payload.fees_zero,
         )
         return await run_backtest_signals(replay_payload)
 
@@ -11269,6 +12011,9 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
         max_position_pct=payload.max_position_pct,
         max_positions=payload.max_positions,
         auto_download=payload.auto_download,
+        fee_rate=payload.fee_rate,
+        fee_flat_per_trade=payload.fee_flat_per_trade,
+        fees_zero=payload.fees_zero,
     )
     return await run_backtest_signals(replay_payload)
 
@@ -11486,61 +12231,191 @@ async def list_portfolio_duplicates() -> PortfoliosDuplicatesResponse:
 
 
 @app.post("/api/portfolios/deduplicate")
-async def deduplicate_portfolios() -> PortfoliosDeduplicateResponse:
-    groups, _ = _group_duplicate_portfolios()
-    deleted_ids: list[str] = []
+async def deduplicate_portfolios(
+    payload: PortfoliosDeduplicateRequest | None = None,
+) -> PortfoliosDeduplicateResponse:
+    """Two-phase bulk delete of duplicate portfolios (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidate_ids`` — exactly
+    the ids that would be deleted (every duplicate-group member except the
+    kept newest entry) — plus per-candidate display info in ``items``. Nothing
+    is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the criterion first: a portfolio that is no longer in a duplicate group,
+    is now the kept newest entry, or no longer exists is reported per item
+    with status ``skipped`` and a ``reason`` and is not deleted. If the
+    re-check itself raises, that id is skipped with reason ``recheck_failed``
+    and the rest of the request continues. ``kept_ids`` is the group snapshot
+    taken when the request starts; the per-item reasons are authoritative. A
+    phase-2 call without ``ids`` deletes nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed``) and retrying with the same id list is safe (an id that is no
+    longer a duplicate comes back as ``no_longer_duplicate``). Nothing outside
+    the submitted list is ever touched.
+    """
+    request = payload or PortfoliosDeduplicateRequest()
+    members = _duplicate_portfolio_members()
     kept_ids: list[str] = []
+    seen_kept: set[str] = set()
+    for member in members:
+        member_id = str(member["id"])
+        if member["is_kept"] and member_id not in seen_kept:
+            seen_kept.add(member_id)
+            kept_ids.append(member_id)
+    candidates = [member for member in members if not member["is_kept"]]
+    candidate_ids = [str(member["id"]) for member in candidates]
+
+    if request.dry_run:
+        return PortfoliosDeduplicateResponse(
+            dry_run=True,
+            deleted_ids=[],
+            kept_ids=kept_ids,
+            candidate_ids=candidate_ids,
+            skipped_ids=[],
+            groups_affected=len(
+                {str(member.get("fingerprint") or "") for member in candidates}
+            ),
+            items=[{**member, "status": "candidate"} for member in candidates],
+        )
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    deleted_ids: list[str] = []
+    skipped_ids: list[str] = []
+    affected_fingerprints: set[str] = set()
     items: list[dict[str, Any]] = []
-    affected = 0
-
-    for group in groups:
-        portfolios = group.get("portfolios", [])
-        if len(portfolios) < 2:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        portfolio_id = str(raw_id or "").strip()
+        if not portfolio_id or portfolio_id in seen:
             continue
-        keep_id = str(portfolios[0].get("id") or "")
-        if keep_id:
-            kept_ids.append(keep_id)
-
-        removed_in_group = False
-        for entry in portfolios[1:]:
-            portfolio_id = str(entry.get("id") or "")
-            if not portfolio_id:
-                continue
+        seen.add(portfolio_id)
+        try:
+            member = _current_duplicate_member(_duplicate_portfolio_members, portfolio_id)
+        except Exception:
+            # Fail closed for this id only: an unreadable re-check keeps it, and
+            # the items already deleted stay reported.
+            logger.exception(
+                "Portfolio duplicate re-check failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id)}},
+            )
+            items.append(_bulk_delete_skipped_item(portfolio_id, "recheck_failed"))
+            skipped_ids.append(portfolio_id)
+            continue
+        if member is None:
+            items.append(_bulk_delete_skipped_item(portfolio_id, "no_longer_duplicate"))
+            skipped_ids.append(portfolio_id)
+            continue
+        if member.get("is_kept"):
+            items.append(_bulk_delete_skipped_item(portfolio_id, "now_kept_entry"))
+            skipped_ids.append(portfolio_id)
+            continue
+        try:
             result = _delete_portfolio_with_artifacts(portfolio_id)
-            items.append(result)
-            if result.get("status") == "deleted":
-                deleted_ids.append(portfolio_id)
-                removed_in_group = True
-        if removed_in_group:
-            affected += 1
+        except Exception as exc:
+            logger.exception(
+                "Portfolio bulk delete failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(portfolio_id, exc)
+        items.append(result)
+        if result.get("status") == "deleted":
+            deleted_ids.append(portfolio_id)
+            affected_fingerprints.add(str(member.get("fingerprint") or ""))
 
     return PortfoliosDeduplicateResponse(
+        dry_run=False,
         deleted_ids=deleted_ids,
         kept_ids=kept_ids,
-        groups_affected=affected,
+        candidate_ids=[],
+        skipped_ids=skipped_ids,
+        groups_affected=len(affected_fingerprints),
         items=items,
     )
 
 
 @app.post("/api/portfolios/remove-empty")
-async def remove_empty_portfolios() -> dict[str, Any]:
-    portfolios = _snapshot_portfolio_payloads()
+async def remove_empty_portfolios(
+    payload: PortfoliosRemoveEmptyRequest | None = None,
+) -> dict[str, Any]:
+    """Two-phase bulk delete of portfolios without components (dry-run + confirm).
+
+    Phase 1 (default, ``dry_run=True``): returns ``candidates`` (id, name,
+    component count) and ``candidate_ids`` — exactly the portfolios that
+    would be deleted. Nothing is deleted.
+
+    Phase 2 (``dry_run=False``): requires ``ids``, the candidate id list from
+    phase 1. Only submitted ids are deleted, and each id is re-checked against
+    the no-components criterion first: a portfolio that gained components or
+    no longer exists is reported per item with status ``skipped`` and a
+    ``reason`` and is not deleted. A phase-2 call without ``ids`` deletes
+    nothing and returns HTTP 400.
+
+    Deletion is journaled per item, so a failure in the middle leaves earlier
+    items deleted; ``items`` reports every item (``deleted`` / ``skipped`` /
+    ``failed`` / ``cleanup_pending``) and retrying with the same id list is
+    safe. Nothing outside the submitted list is ever touched.
+    """
+    request = payload or PortfoliosRemoveEmptyRequest()
+    if request.dry_run:
+        candidates = _empty_portfolio_candidates()
+        return {
+            "dry_run": True,
+            "candidates": candidates,
+            "candidate_ids": [str(candidate["id"]) for candidate in candidates],
+        }
+
+    if not request.ids:
+        raise HTTPException(
+            status_code=400,
+            detail="dry_run=false requires the id list returned by the dry run",
+        )
+
+    deleted = 0
+    skipped = 0
+    failed = 0
     removed_ids: list[str] = []
     items: list[dict[str, Any]] = []
-    for portfolio in portfolios:
-        portfolio_id = str(portfolio.get("id") or "").strip()
-        components = portfolio.get("components")
-        has_components = isinstance(components, list) and len(components) > 0
-        if not portfolio_id or has_components:
+    seen: set[str] = set()
+    for raw_id in request.ids:
+        portfolio_id = str(raw_id or "").strip()
+        if not portfolio_id or portfolio_id in seen:
             continue
-        result = _delete_portfolio_with_artifacts(portfolio_id)
+        seen.add(portfolio_id)
+        skip_reason = _empty_portfolio_skip_reason(portfolio_id)
+        if skip_reason:
+            items.append(_bulk_delete_skipped_item(portfolio_id, skip_reason))
+            skipped += 1
+            continue
+        try:
+            result = _delete_portfolio_with_artifacts(portfolio_id)
+        except Exception as exc:
+            logger.exception(
+                "Portfolio bulk delete failed",
+                extra={"data": {"portfolio": _log_safe(portfolio_id), "error": str(exc)}},
+            )
+            result = _bulk_delete_failed_item(portfolio_id, exc)
         items.append(result)
         if result.get("status") == "deleted":
+            deleted += 1
             removed_ids.append(portfolio_id)
+        elif result.get("status") in {"failed", "cleanup_pending"}:
+            failed += 1
 
     remaining = len(_snapshot_portfolio_payloads())
     return {
-        "removed": len(removed_ids),
+        "dry_run": False,
+        "deleted": deleted,
+        "skipped": skipped,
+        "failed": failed,
         "remaining": remaining,
         "removed_ids": removed_ids,
         "items": items,
@@ -11963,6 +12838,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
 
     trades: list[dict[str, Any]] = []
     for row in rows:
+        # #144: a broker-side close is a ledger row for a fill the broker made, not a
+        # trade of ours: it has no theoretical price, so any P&L or slippage computed
+        # from it would be fabricated (a stop at 95 would read as a -950 loss on 10
+        # shares). The realized-PnL stats path prices it from actual prices instead.
+        if str(row.get("source") or "") == BROKER_CLOSE_SIGNAL_SOURCE:
+            continue
         signal_metadata = row.get("signal_metadata")
         metadata = signal_metadata if isinstance(signal_metadata, dict) else {}
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
@@ -11976,9 +12857,11 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "symbol": row.get("symbol", ""),
                 "action": row.get("action", ""),
                 "theoretical_price": float(row.get("theoretical_price", 0.0)),
-                "actual_price": float(row.get("actual_price", 0.0)),
-                "slippage": float(row.get("slippage", 0.0)),
-                "slippage_bps": float(row.get("slippage_bps", 0.0)),
+                # None is "no usable price" (#124, review of #143), never a fill at 0.0.
+                "actual_price": _optional_float(row.get("actual_price")),
+                "actual_price_observed": row.get("actual_price_observed"),
+                "slippage": _optional_float(row.get("slippage")),
+                "slippage_bps": _optional_float(row.get("slippage_bps")),
                 "filled_qty": float(row.get("filled_qty", 0.0)),
                 "position_size": _execution_risk_value(row, metadata, "position_size"),
                 "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),
@@ -11988,7 +12871,12 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                     if row.get("exit_reason") not in (None, "")
                     else None
                 ),
-                "commission": float(row.get("commission", 0.0)),
+                # None is "fee not known yet" (#124), never a zero fee.
+                "commission": (
+                    _safe_float(row.get("commission"))
+                    if row.get("commission") is not None
+                    else None
+                ),
                 "signal_timestamp": signal_iso,
                 "signal_time": signal_unix,
                 "execution_timestamp": execution_iso,
@@ -12016,7 +12904,16 @@ async def _live_signals_payload(account_id: str, *, limit: int = 200) -> dict[st
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
         execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
         raw_source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
-        source = "discord" if raw_source.startswith("discord") else "internal"
+        if raw_source.startswith("discord"):
+            source = "discord"
+        elif raw_source == "broker_close":
+            # A close the broker made (#144): not an entry of ours, so it gets
+            # its own label rather than reading as an internal signal. Its
+            # theoretical_price is 0.0 by construction - the marker price is the
+            # fill's actual_price, which the row already carries.
+            source = "broker_close"
+        else:
+            source = "internal"
         status = _signal_status_from_row(row)
         waiting_seconds = (
             _waiting_countdown(signal_metadata, signal_unix)
@@ -12460,8 +13357,22 @@ async def _resolve_live_deployment_signal_source(
 @app.get(LIVE_DEPLOYMENTS_PATH)
 async def get_live_deployments() -> list[dict[str, Any]]:
     _log_live_endpoint_request(LIVE_DEPLOYMENTS_PATH)
-    deployments = await asyncio.to_thread(list_live_deployments)
-    return [_serialize_live_deployment_payload(deployment) for deployment in deployments]
+    deployments, conflicts_by_deployment = await asyncio.gather(
+        asyncio.to_thread(list_live_deployments),
+        # The shared scan limit, not the database default: a deployment halted by a
+        # conflict older than the 200-row default would report no conflict and no halt
+        # reason, which is the one fact this payload exists to carry.
+        asyncio.to_thread(deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT),
+    )
+    return [
+        _serialize_live_deployment_payload(
+            # Read, and none: an empty list. `None` means the ledger was not read at
+            # all (see the serializer), which is a different answer to give.
+            deployment,
+            conflicts_by_deployment.get(str(deployment.id), []),
+        )
+        for deployment in deployments
+    ]
 
 
 @app.get("/api/live/dashboard")
@@ -12478,6 +13389,9 @@ async def get_live_dashboard() -> dict[str, Any]:
     active_deployments = [
         deployment for deployment in deployments if str(deployment.status).upper() == "ACTIVE"
     ]
+    conflicts_by_deployment = await asyncio.to_thread(
+        deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT
+    )
 
     # Fetch stats and trades for all accounts concurrently instead of
     # serially awaiting a full stats+trades scan per account.
@@ -12490,8 +13404,16 @@ async def get_live_dashboard() -> dict[str, Any]:
     trades_payloads = await asyncio.gather(
         *(_live_trades_payload(account.id) for account in accounts)
     )
+    # Read once for the whole dashboard: the conflict ledger is fleet-wide state, not
+    # per-account state (#126), and this response already needs the grouping to
+    # annotate its own rows.
+    conflict_health = _broker_order_conflict_health(conflicts_by_deployment)
 
-    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads):
+    # Both payload lists come from `asyncio.gather` over the same `accounts`
+    # comprehension, so all three are the same length; `strict=True` turns a
+    # dropped gather result into an error instead of into another account's
+    # trades being shown under this one.
+    for account, stats, trades_payload in zip(accounts, stats_list, trades_payloads, strict=True):
         equity = _safe_float(stats.get("current_equity"), 0.0) or 0.0
         total_equity += equity
         account_payloads.append(
@@ -12499,8 +13421,9 @@ async def get_live_dashboard() -> dict[str, Any]:
                 **_serialize_live_account_payload(account),
                 "current_equity": equity,
                 "current_balance": _safe_float(stats.get("current_balance"), 0.0),
-                "total_trades": stats.get("total_trades", 0),
-                "total_pnl": stats.get("total_pnl", 0.0),
+                # None means "unknown" (an unusable fill price), not zero: pass it through.
+                "total_trades": stats["total_trades"] if "total_trades" in stats else 0,
+                "total_pnl": stats["total_pnl"] if "total_pnl" in stats else 0.0,
             }
         )
         recent_fills.extend(trades_payload.get("trades", [])[:10])
@@ -12521,7 +13444,10 @@ async def get_live_dashboard() -> dict[str, Any]:
         )
         active_strategies.append(
             {
-                **_serialize_live_deployment_payload(deployment),
+                **_serialize_live_deployment_payload(
+                    deployment,
+                    conflicts_by_deployment.get(str(deployment.id), []),
+                ),
                 "capital_allocation": round(allocation, 6),
                 "account_equity": round(account_equity, 2),
             }
@@ -12532,6 +13458,11 @@ async def get_live_dashboard() -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "accounts": account_payloads,
         "active_strategies": active_strategies,
+        # (#126) Fleet health for the one failure a dashboard of ACTIVE rows cannot
+        # show: a deployment halted because a duplicate live signal carried a broker
+        # order id the ledger does not track is not in `active_strategies` at all, so
+        # the conflict has to be reported on its own or the halt is invisible.
+        "broker_order_conflicts": conflict_health,
         "capital": {
             "total_equity": round(total_equity, 2),
             "active_account_count": len(account_payloads),
@@ -12541,7 +13472,10 @@ async def get_live_dashboard() -> dict[str, Any]:
     }
 
 
-@app.post("/api/live/deployments/ctrader/top5")
+@app.post(
+    "/api/live/deployments/ctrader/top5",
+    responses={409: {"description": "A deployment is refused by the promotion gate (#165)"}},
+)
 async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dict[str, Any]:
     limit = max(1, min(int(payload.limit or 5), 20))
     status = "ACTIVE" if payload.activate else "PAUSED"
@@ -12567,11 +13501,27 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
             detail="No eligible cTrader account or backtest candidates found",
         )
 
+    # Promotion gate (#165), before the dry-run return on purpose: a plan that
+    # could not be deployed must not be presented as deployable. Its verdict does
+    # not depend on the status, so the pause below is free to change it afterwards.
+    demo_flags: dict[str, bool | None] = {}
+    for deployment in plan:
+        if deployment.account_id not in demo_flags:
+            demo_flags[deployment.account_id] = await _broker_reported_demo_flag(
+                deployment.account_id
+            )
+        _require_promotion_gate(deployment, demo_flag=demo_flags[deployment.account_id])
+
+    # #261, and before the dry-run return on purpose as well: a preview showing
+    # ACTIVE rows would advertise a deploy the account cannot have.
+    plan, paused_as_real_money = _pause_non_demo_deployments(plan, demo_flags)
+
     if payload.dry_run:
         return {
             "status": "planned",
             "dry_run": True,
             "deployments": [_serialize_live_deployment_payload(item) for item in plan],
+            "paused_as_real_money": paused_as_real_money,
         }
 
     created: list[dict[str, Any]] = []
@@ -12585,7 +13535,123 @@ async def deploy_top_ctrader_strategies(payload: CTraderTopDeployRequest) -> dic
         "status": "created",
         "dry_run": False,
         "deployments": created,
+        "paused_as_real_money": paused_as_real_money,
     }
+
+
+#: Why a top-N deployment was created PAUSED instead of ACTIVE (#261). Two texts
+#: because they ask different things of the operator: a broker-reported live
+#: account is a decision to accept, an unanswered question is a check to make.
+_PAUSE_REASON_LIVE = "the broker reports this account as live (non-demo)"
+_PAUSE_REASON_UNKNOWN = "the broker could not assert that this account is demo"
+
+
+def _pause_non_demo_deployments(
+    plan: Sequence[LiveDeploymentConfig],
+    demo_flags: Mapping[str, bool | None],
+) -> tuple[list[LiveDeploymentConfig], list[dict[str, Any]]]:
+    """Create the non-demo rows of a top-N plan PAUSED instead of ACTIVE (#261).
+
+    A bulk deploy is a one-shot action: it arms what it creates without the fresh
+    broker re-verification the single-deployment activate path performs, so
+    `activate` used to be the only route that could put an armed deployment on an
+    account the broker does not report as demo. Only the daemon's demo-only block
+    then stood between those rows and real money, and a single safeguard must not
+    be what protects a live account. A maintainer activates the rows by hand
+    instead, through the status endpoint, which re-verifies the account first.
+
+    The account classification is the shared one: :func:`is_real_money` over the
+    broker-reported flag, the same verdict the daemon's demo-only guard reaches
+    for its adapter. An account the broker did not assert as demo - including one
+    it could not answer for - is real money here too, so it fails closed. Demo
+    accounts keep the ACTIVE status they were given, and a row that was requested
+    PAUSED is never touched.
+
+    Returns the plan as it will be created, and one entry per deployment paused
+    here naming it and the reason, for the response and the log below.
+    """
+    deployments: list[LiveDeploymentConfig] = []
+    paused: list[dict[str, Any]] = []
+    labels: list[str] = []
+    for deployment in plan:
+        demo_flag = demo_flags.get(deployment.account_id)
+        if deployment.status == "ACTIVE" and is_real_money(demo_flag):
+            reason = _PAUSE_REASON_LIVE if demo_flag is False else _PAUSE_REASON_UNKNOWN
+            strategy_name = deployment.strategy_name
+            account_id = str(deployment.account_id)
+            paused.append(
+                {
+                    "strategy_name": strategy_name,
+                    "account_id": account_id,
+                    "reason": reason,
+                }
+            )
+            labels.append(f"'{strategy_name}' on account '{account_id}' ({reason})")
+            deployment = deployment.model_copy(update={"status": "PAUSED"})
+        deployments.append(deployment)
+    if paused:
+        logger.warning(
+            "cTrader top-N deploy created %d deployment(s) PAUSED instead of "
+            "ACTIVE, because a non-demo account is never armed by a bulk deploy "
+            "(#261): %s. Activate them by hand once reviewed.",
+            len(paused),
+            "; ".join(labels),
+            extra={"data": {"paused": paused}},
+        )
+    return deployments, paused
+
+
+async def _broker_reported_demo_flag(account_id: str) -> bool | None:
+    """What broker discovery says about ``account_id``: demo, not demo, or unknown.
+
+    The promotion gate's real-money verdict for deployment create and the
+    cTrader top-N deploy (#165), and the account classification that decides
+    whether that deploy may arm its rows (#261). It asks broker discovery
+    directly, bypassing the 30 s discovery cache, so a broker that reclassifies
+    the account is seen at once, as activation's re-verification sees it. It never
+    reads the stored account row. ``None`` means discovery failed, did not return
+    the account, or did not assert the flag; the gate treats that as real money.
+    """
+    try:
+        discovered = await asyncio.to_thread(
+            _cached_live_accounts_payload, force_refresh=True
+        )
+    except Exception as exc:
+        logger.warning(
+            "Broker discovery failed; the promotion gate treats the account as real money",
+            extra={"data": {"account_id": account_id, "error": repr(exc)}},
+        )
+        return None
+    for account in discovered:
+        if str(account.get("id") or "") != str(account_id):
+            continue
+        if account.get("is_demo_asserted") is not True:
+            return None
+        return account.get("is_demo") is True
+    return None
+
+
+def _promotion_gate_refusal(
+    deployment: LiveDeploymentConfig, *, demo_flag: bool | None
+) -> str | None:
+    """The promotion gate's refusal for ``deployment``, or None when it passes.
+
+    The single viewer-side call into :func:`enforce_promotion_gate`; create,
+    activate and the cTrader top-N deploy all go through here.
+    """
+    try:
+        enforce_promotion_gate(deployment, real_money=is_real_money(demo_flag))
+    except StrategyNotPromotedError as exc:
+        return str(exc)
+    return None
+
+
+def _require_promotion_gate(
+    deployment: LiveDeploymentConfig, *, demo_flag: bool | None
+) -> None:
+    refusal = _promotion_gate_refusal(deployment, demo_flag=demo_flag)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
 
 
 def _validate_live_deployment_route(
@@ -12627,7 +13693,11 @@ def _validate_live_deployment_route(
         ) from exc
 
 
-@app.post(LIVE_DEPLOYMENTS_PATH, status_code=201)
+@app.post(
+    LIVE_DEPLOYMENTS_PATH,
+    status_code=201,
+    responses={409: {"description": "The deployment is refused by the promotion gate (#165)"}},
+)
 async def create_live_deployment_endpoint(
     payload: LiveDeploymentCreateRequest,
 ) -> dict[str, Any]:
@@ -12688,20 +13758,32 @@ async def create_live_deployment_endpoint(
         signal_config_payload=signal_config_payload,
     )
 
-    deployment = LiveDeploymentConfig(
-        strategy_name=strategy_name,
-        account_id=payload.account_id,
-        symbols=symbols,
-        timeframe=payload.timeframe,
-        status="ACTIVE",
-        signal_source_type=signal_source_type,
-        signal_source_id=signal_source_id or None,
-        symbol_filter=symbol_filter,
-        signal_source=signal_source_type,
-        signal_config=signal_config_payload,
-        settings=payload.settings or {},
-    )
+    try:
+        deployment = LiveDeploymentConfig(
+            strategy_name=strategy_name,
+            account_id=payload.account_id,
+            symbols=symbols,
+            timeframe=payload.timeframe,
+            status="ACTIVE",
+            signal_source_type=signal_source_type,
+            signal_source_id=signal_source_id or None,
+            symbol_filter=symbol_filter,
+            signal_source=signal_source_type,
+            signal_config=signal_config_payload,
+            settings=payload.settings or {},
+        )
+        # #125: refuse invalid entry-gate settings before anything is stored.
+        entry_gate_settings(deployment.settings)
+    except ValueError as exc:
+        # Model-level config rejections (e.g. #150 trailing override) and
+        # invalid gate settings are client errors, not a 500.
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
     _validate_live_deployment_route(deployment, account_payload)
+    # Promotion gate (#165). A deployment is created ACTIVE, so this is a
+    # deploy action in its own right, not only a record being written.
+    _require_promotion_gate(
+        deployment, demo_flag=await _broker_reported_demo_flag(deployment.account_id)
+    )
     try:
         created = await asyncio.to_thread(create_live_deployment, deployment)
     except ValueError as exc:
@@ -12859,7 +13941,17 @@ async def _reverify_account_against_broker(account_id: str) -> bool:
     return False
 
 
-@app.put("/api/live/deployments/{deployment_id}/status")
+@app.put(
+    "/api/live/deployments/{deployment_id}/status",
+    responses={
+        409: {
+            "description": (
+                "Activation is refused by the promotion gate (#165) or by an "
+                "unresolved broker order id conflict (#126)"
+            )
+        }
+    },
+)
 async def update_live_deployment_status_endpoint(
     deployment_id: str,
     payload: LiveDeploymentStatusUpdateRequest,
@@ -12884,6 +13976,49 @@ async def update_live_deployment_status_endpoint(
         deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
         if deployment is None:
             raise HTTPException(status_code=404, detail="Live deployment not found")
+
+        # Fail closed (#126): a deployment that still carries a broker order id conflict is
+        # halted, and this endpoint is the documented way back - so it must not be the way
+        # *out*. Writing ACTIVE here re-opens ENTRY_DISPATCH_STATUSES and the submission
+        # claim immediately, while `enforce_broker_order_conflict_halts` only re-pauses it
+        # on the next service-sync tick: an entry accepted inside that window is a live
+        # order on a deployment whose broker exposure the ledger cannot explain. One extra
+        # read per operator action, on a path that is about to spend broker round-trips.
+        recorded_conflicts = await asyncio.to_thread(
+            deployments_with_broker_order_conflicts, CONFLICT_SCAN_LIMIT
+        )
+        conflicting_ids = sorted(
+            {
+                str(conflicting_id)
+                for conflict in recorded_conflicts.get(deployment_id, [])
+                for conflicting_id in conflict["conflicting_broker_order_ids"]
+            }
+        )
+        if conflicting_ids:
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "unresolved broker order id conflict",
+                    "account_id": str(deployment.account_id or ""),
+                    "conflicting_broker_order_ids": conflicting_ids,
+                },
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This deployment is halted for an unresolved broker order id "
+                    f"conflict (conflicting ids: {', '.join(conflicting_ids)}). An "
+                    "untracked broker order may exist, so it cannot be activated. "
+                    "Reconcile the conflicting id with the broker, then clear it with "
+                    f"POST /api/live/deployments/{deployment_id}/broker-order-conflicts/resolve"
+                    " before resuming."
+                ),
+            )
 
         # Check what can actually trade before spending a broker round-trip on
         # it. An internal-source deployment has no live evaluator, so no account
@@ -12915,7 +14050,15 @@ async def update_live_deployment_status_endpoint(
 
         # Re-verify the account against the broker immediately before arming so
         # a stale identity can never be reused to arm a deployment.
-        if not await _reverify_account_against_broker(deployment.account_id):
+        demo_confirmed = await _reverify_account_against_broker(deployment.account_id)
+        # Promotion gate (#165), on the verdict of that same fresh broker
+        # answer. It is an additional layer: the demo-only block below still
+        # refuses every account the broker did not confirm as demo, promoted or
+        # not, and a refusal names both reasons.
+        promotion_refusal = _promotion_gate_refusal(
+            deployment, demo_flag=True if demo_confirmed else None
+        )
+        if not demo_confirmed:
             await _audit_live_control(
                 action="deployment.status",
                 target_type="live_deployment",
@@ -12926,6 +14069,7 @@ async def update_live_deployment_status_endpoint(
                     "requested_status": requested_status,
                     "reason": "broker could not confirm a demo account",
                     "account_id": str(deployment.account_id or ""),
+                    "promotion_gate": promotion_refusal or "promoted",
                 },
             )
             raise HTTPException(
@@ -12933,8 +14077,27 @@ async def update_live_deployment_status_endpoint(
                 detail=(
                     "Broker could not confirm the account is a demo account; "
                     "refusing to activate"
+                    + (f". {promotion_refusal}" if promotion_refusal else "")
                 ),
             )
+        if promotion_refusal is not None:
+            # Unreachable while the demo-only block above stands (a confirmed
+            # demo account always passes the gate). Kept so that lifting that
+            # block cannot silently lift the promotion gate with it.
+            await _audit_live_control(
+                action="deployment.status",
+                target_type="live_deployment",
+                target_id=deployment_id,
+                request=request,
+                succeeded=False,
+                detail={
+                    "requested_status": requested_status,
+                    "reason": "promotion gate refused the deployment",
+                    "account_id": str(deployment.account_id or ""),
+                    "promotion_gate": promotion_refusal,
+                },
+            )
+            raise HTTPException(status_code=409, detail=promotion_refusal)
 
     # Inventory the leases to account for *before* the write, so a lease that is
     # reaped in the window between the commit and the drain's first poll is still
@@ -13017,6 +14180,500 @@ async def update_live_deployment_status_endpoint(
                 },
             )
     return payload
+
+
+@app.post(
+    "/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+    responses={
+        400: {"description": "The resolution carries no reason"},
+        428: {"description": "The control was not confirmed"},
+        404: {"description": "Live deployment not found"},
+    },
+)
+async def resolve_live_deployment_broker_order_conflicts_endpoint(
+    deployment_id: str,
+    payload: LiveControlConfirmation | None = None,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Record that a deployment's broker order id conflicts were reconciled (#126).
+
+    The way out of a conflict halt. While a conflict is recorded the daemon keeps
+    the deployment paused, so a resolution cannot be a status write and nothing
+    else: this clears the recorded ids and reports what it cleared, and the
+    operator then resumes the deployment through the status endpoint (which does
+    its own broker re-verification).
+
+    The confirmation and the reason are required on purpose. Clearing one of these
+    says "there is no untracked broker order any more", which is a statement about
+    the broker, not about the UI; the reason is the evidence of the reconciliation
+    and it goes into the audit trail next to who made it.
+    """
+    _log_live_endpoint_request(
+        "/api/live/deployments/{deployment_id}/broker-order-conflicts/resolve",
+        deployment_id=deployment_id,
+    )
+    await _require_live_control_confirmation(
+        action="deployment.broker_order_conflict.resolve",
+        deployment_id=deployment_id,
+        confirmation=payload,
+        request=request,
+    )
+    reason = str(payload.reason or "").strip()
+    if not reason:
+        await _audit_live_control(
+            action="deployment.broker_order_conflict.resolve",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no resolution reason supplied"},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Record what you reconciled at the broker in confirmation.reason; "
+                "resolving a conflict says there is no untracked broker order, "
+                "and that has to be attributable."
+            ),
+        )
+    deployment = await asyncio.to_thread(get_live_deployment, deployment_id)
+    if deployment is None:
+        await _audit_live_control(
+            action="deployment.broker_order_conflict.resolve",
+            target_type="live_deployment",
+            target_id=deployment_id,
+            request=request,
+            succeeded=False,
+            detail={"reason": "deployment not found", "resolution_reason": reason},
+        )
+        raise HTTPException(status_code=404, detail="Live deployment not found")
+
+    # Inventory the leases before clearing anything: an exit already in flight was
+    # sized against a ledger that has not seen its fill yet, so the operator has to
+    # hear about it while deciding to resume.
+    pending_claims = await asyncio.to_thread(
+        list_live_deployment_submission_claims, deployment_id
+    )
+    drain = await _drain_live_deployment_submissions(
+        deployment_id, initial_claims=pending_claims
+    )
+    resolved = await asyncio.to_thread(resolve_broker_order_conflicts, deployment_id)
+
+    await _audit_live_control(
+        action="deployment.broker_order_conflict.resolve",
+        target_type="live_deployment",
+        target_id=deployment_id,
+        request=request,
+        detail={
+            "resolution_reason": reason,
+            "account_id": str(deployment.account_id or ""),
+            "resolved": resolved,
+            "submission_drain_outcome": drain.outcome.value,
+            "in_flight_submissions": drain.in_flight,
+            "expired_unreleased_submissions": drain.expired_unreleased,
+        },
+    )
+    if not drain.complete:
+        logger.error(
+            "Broker order id conflict resolved while submissions were still "
+            "unaccounted for; verify the broker before resuming the deployment",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "submission_drain_outcome": drain.outcome.value,
+                    "in_flight_submissions": drain.in_flight,
+                    "expired_unreleased_submissions": drain.expired_unreleased,
+                }
+            },
+        )
+
+    response: dict[str, Any] = {
+        "deployment_id": deployment_id,
+        "resolved": resolved,
+        "resolved_count": len(resolved),
+        "submission_drain_outcome": drain.outcome.value,
+        "submission_drain_complete": drain.complete,
+        "in_flight_submissions": drain.in_flight,
+        "expired_unreleased_submissions": drain.expired_unreleased,
+    }
+    # Both warnings are kept, in one message: the drain outcome and the resolution are
+    # different facts about the same call, and the second used to overwrite the first -
+    # dropping "verify the broker" for exactly the operator who most needs it.
+    warnings: list[str] = []
+    if not drain.complete:
+        warnings.append(
+            "The conflicts are resolved, but submissions were still unaccounted "
+            "for at the broker. Verify the broker before resuming the deployment."
+        )
+    if not resolved:
+        warnings.append(
+            "This deployment had no recorded broker order id conflict."
+        )
+    if warnings:
+        response["warning"] = " ".join(warnings)
+    return response
+
+
+# ── Kill switch (#300) ───────────────────────────────────────────────────────
+#
+# The viewer's half of the operator halt. What it writes is the same row the CLI
+# writes and the daemon reads before every entry and on every tick, so a halt
+# from the dashboard holds across a restart exactly like one from a shell.
+
+
+class LiveKillSwitchHaltRequest(BaseModel):
+    """Halt one scope. ``scope`` is 'global' or a live account id."""
+
+    scope: str
+    #: One of the modes `live_runner.kill_switch` defines. Validated here rather
+    #: than left to the database, so a typo is a 400 the UI can show instead of a
+    #: refusal from a layer the caller cannot see.
+    mode: str
+    reason: str = ""
+    #: Required only for the modes that move money: `orders` cancels working
+    #: orders and `flatten` closes positions. A plain `entries` halt refuses new
+    #: entries and can cost nothing, so it must stay one click in an incident -
+    #: a confirmation gate on the emergency control would be the wrong trade.
+    confirmed_scope: str | None = None
+
+
+class LiveKillSwitchResumeRequest(BaseModel):
+    """Lift the halt on one scope. Confirmed, because it re-enables trading."""
+
+    scope: str
+    confirmed_scope: str | None = None
+
+
+async def _require_kill_switch_confirmation(
+    *,
+    action: str,
+    scope: str,
+    confirmed_scope: str | None,
+    request: Request | None,
+    why: str,
+) -> None:
+    """Refuse a money-moving kill-switch control that was not confirmed.
+
+    The scope is echoed back, for the same reason the deployment confirmation
+    echoes the deployment id: naming the scope proves the operator confirmed
+    *this* account, which is the mistake that happens when several accounts are
+    stacked in a list. 428 rather than 400, so a caller can tell "you did not
+    confirm this" from "your payload was malformed".
+    """
+    if confirmed_scope is None:
+        await _audit_live_control(
+            action=action,
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": "no confirmation supplied"},
+        )
+        raise HTTPException(
+            status_code=428,
+            detail=f"'{action}' {why} Send confirmed_scope='{scope}'.",
+        )
+    if str(confirmed_scope).strip() != scope:
+        await _audit_live_control(
+            action=action,
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={
+                "reason": "confirmation named a different scope",
+                "confirmed_scope": str(confirmed_scope),
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Confirmation does not match this scope (confirmed "
+                f"'{confirmed_scope}', requested '{scope}')."
+            ),
+        )
+
+
+async def _kill_switch_details(state: Any) -> list[dict[str, Any]]:
+    """Every halted scope with the history its row carries, for the payload.
+
+    The mode is the one the state read already captured, so the payload's two
+    views cannot describe two different observations of a halt someone escalated
+    in between. A history read that fails is marked as such rather than allowed to
+    fail the whole response: the state above it is the answer the caller asked
+    for, and "history unavailable" is distinguishable from "no history".
+    """
+    details: list[dict[str, Any]] = []
+    for scope in state.halted_scopes():
+        mode = state.halts[scope].value
+        try:
+            record = await asyncio.to_thread(get_live_kill_switch_state, scope)
+        except Exception as exc:
+            logger.warning(
+                "Could not read the halt history for scope %s",
+                scope,
+                extra={"data": {"scope": scope, "error": repr(exc)}},
+            )
+            details.append(
+                {
+                    "scope": scope,
+                    "mode": mode,
+                    "halted_at": None,
+                    "halted_by": "unknown",
+                    "reason": "",
+                    "history_available": False,
+                }
+            )
+            continue
+        details.append(
+            {
+                "scope": scope,
+                "mode": mode,
+                "halted_at": record.halted_at if record is not None else None,
+                "halted_by": record.halted_by if record is not None else "unknown",
+                "reason": record.reason if record is not None else "",
+                "history_available": True,
+            }
+        )
+    return details
+
+
+async def _live_kill_switch_state_payload(state: Any = None) -> dict[str, Any]:
+    """The halt state as the daemon enforces it, plus each scope's history.
+
+    An already-read ``state`` is reused so a caller can answer from the same
+    observation it just acted on rather than racing a second read.
+    """
+    resolved = (
+        state
+        if state is not None
+        else await asyncio.to_thread(read_kill_switch_state)
+    )
+    return {
+        **kill_switch_payload(resolved),
+        "halt_details": await _kill_switch_details(resolved),
+    }
+
+
+@app.get("/api/live/kill-switch")
+async def get_live_kill_switch() -> dict[str, Any]:
+    """The halt state. Read-only: it touches no trading state."""
+    _log_live_endpoint_request("/api/live/kill-switch")
+    return await _live_kill_switch_state_payload()
+
+
+@app.post(
+    "/api/live/kill-switch/halt",
+    responses={
+        400: {"description": "Unknown scope, or a mode this build cannot interpret"},
+        428: {"description": "A money-moving mode was not confirmed"},
+        409: {"description": "The confirmation named a different scope"},
+    },
+)
+async def halt_live_kill_switch(
+    payload: LiveKillSwitchHaltRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Halt one scope. The daemon enforces it on its next tick.
+
+    The scope must name a real account: the database refuses one that does not,
+    because a halt that covers nothing while the dashboard reads it as armed is
+    worse than no halt at all. That refusal is a 400 and it is audited.
+    """
+    scope = str(payload.scope or "").strip()
+    mode = str(payload.mode or "").strip().lower()
+    _log_live_endpoint_request("/api/live/kill-switch/halt", scope=scope, mode=mode)
+    if KillSwitchMode.parse(mode) is None:
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": "unknown mode", "mode": mode},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown kill switch mode '{payload.mode}'; expected one of "
+                f"{', '.join(item.value for item in KillSwitchMode)}"
+            ),
+        )
+    if mode != KillSwitchMode.ENTRIES.value:
+        await _require_kill_switch_confirmation(
+            action="kill_switch.halt",
+            scope=scope,
+            confirmed_scope=payload.confirmed_scope,
+            request=request,
+            why=(
+                f"in '{mode}' mode cancels working orders"
+                + (
+                    " and closes positions"
+                    if mode == KillSwitchMode.FLATTEN.value
+                    else ""
+                )
+                + ", so it must be confirmed."
+            ),
+        )
+    try:
+        halted = await asyncio.to_thread(
+            set_live_kill_switch,
+            scope,
+            mode,
+            actor=_live_control_actor(request),
+            reason=str(payload.reason or ""),
+        )
+    except ValueError as exc:
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": str(exc), "mode": mode},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    except Exception as exc:
+        # A database failure is not a client error, but the attempt still
+        # belongs in the audit trail: an operator asking "did anyone try to
+        # halt this" must not get silence because the write 500'd. The original
+        # failure is logged first so an audit problem can never be the
+        # exception the caller sees instead of it.
+        logger.exception("Kill switch halt write failed")
+        await _audit_live_control(
+            action="kill_switch.halt",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": f"{type(exc).__name__}: {exc}", "mode": mode},
+        )
+        raise
+    await _audit_live_control(
+        action="kill_switch.halt",
+        target_type="live_kill_switch",
+        target_id=halted.scope,
+        request=request,
+        succeeded=True,
+        detail={"mode": halted.mode, "reason": halted.reason},
+    )
+    logger.warning(
+        "Kill switch halt written by the viewer",
+        extra={
+            "data": {
+                "scope": halted.scope,
+                "mode": halted.mode,
+                "actor": _live_control_actor(request),
+                "reason": halted.reason,
+            }
+        },
+    )
+    return {
+        "halted": True,
+        "scope": halted.scope,
+        "mode": halted.mode,
+        "halted_at": halted.halted_at,
+        "halted_by": halted.halted_by,
+        "reason": halted.reason,
+        # Read back rather than echoed: what the daemon enforces is the combined
+        # state (a global halt covers this account too), and a caller that
+        # echoed its own write would report a weaker halt than the one in force.
+        "state": await _live_kill_switch_state_payload(),
+    }
+
+
+@app.post(
+    "/api/live/kill-switch/resume",
+    responses={
+        428: {"description": "The resume was not confirmed"},
+        409: {"description": "The confirmation named a different scope"},
+    },
+)
+async def resume_live_kill_switch(
+    payload: LiveKillSwitchResumeRequest,
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Lift the halt on one scope, so the daemon may trade it again.
+
+    Idempotent: resuming a scope that is not halted reports ``lifted: false``
+    rather than failing, because the state the caller wants is the state that
+    results. Confirmed anyway - it is the action that re-enables trading.
+    """
+    scope = str(payload.scope or "").strip()
+    _log_live_endpoint_request("/api/live/kill-switch/resume", scope=scope)
+    await _require_kill_switch_confirmation(
+        action="kill_switch.resume",
+        scope=scope,
+        confirmed_scope=payload.confirmed_scope,
+        request=request,
+        why="re-enables trading on this scope, so it must be confirmed.",
+    )
+    try:
+        lifted = await asyncio.to_thread(
+            clear_live_kill_switch, scope, actor=_live_control_actor(request)
+        )
+    except ValueError as exc:
+        # An empty or mis-cased scope is a client error, not a server one, and
+        # the refusal is the event worth recording.
+        await _audit_live_control(
+            action="kill_switch.resume",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=_public_value_error_detail(exc)) from exc
+    except Exception as exc:
+        # Same rule as the halt route: a failed write is still an attempt, and
+        # the audit trail is where an operator looks for it. The original
+        # failure is logged first so an audit problem can never be the
+        # exception the caller sees instead of it.
+        logger.exception("Kill switch resume write failed")
+        await _audit_live_control(
+            action="kill_switch.resume",
+            target_type="live_kill_switch",
+            target_id=scope,
+            request=request,
+            succeeded=False,
+            detail={"reason": f"{type(exc).__name__}: {exc}"},
+        )
+        raise
+    await _audit_live_control(
+        action="kill_switch.resume",
+        target_type="live_kill_switch",
+        target_id=scope,
+        request=request,
+        succeeded=lifted,
+        detail={"lifted": lifted},
+    )
+    if not lifted:
+        logger.info(
+            "Kill switch resume found no halt in force",
+            extra={"data": {"scope": scope}},
+        )
+    else:
+        logger.warning(
+            "Kill switch halt lifted by the viewer",
+            extra={
+                "data": {
+                    "scope": scope,
+                    "actor": _live_control_actor(request),
+                }
+            },
+        )
+    # ``halted`` answers "is this scope still covered by a halt", not "was this
+    # scope's own row lifted": a global halt still covers the account after its
+    # own halt is resumed, and reporting ``halted: false`` there would tell the
+    # operator trading may resume when it may not. Read once, after the clear,
+    # so the answer and the embedded state describe the same observation.
+    state = await asyncio.to_thread(read_kill_switch_state)
+    return {
+        "halted": state.mode_for_account(scope) is not None,
+        "lifted": lifted,
+        "scope": scope,
+        "state": await _live_kill_switch_state_payload(state),
+    }
 
 
 @app.put("/api/live/deployments/{deployment_id}/account")
@@ -13551,7 +15208,7 @@ async def data_category_details(category_name: str) -> dict[str, Any]:
     return await asyncio.to_thread(_data_category_payload, category_name)
 
 
-@app.post("/api/data/cache/invalidate", response_model=dict[str, Any])
+@app.post("/api/data/cache/invalidate")
 async def invalidate_data_cache(
     reason: str = Query(default="manual"),
     include_validation: bool | None = Query(default=None),
@@ -14343,14 +16000,14 @@ async def list_logs() -> list[LogFileModel]:
     logs: list[LogFileModel] = [
         LogFileModel(name=ALL_LOGS_NAME, size_bytes=total_size, modified=latest_modified)
     ]
-    for log_file in log_files:
-        logs.append(
-            LogFileModel(
-                name=log_file.name,
-                size_bytes=log_file.stat().st_size,
-                modified=datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).isoformat(),
-            )
+    logs.extend(
+        LogFileModel(
+            name=log_file.name,
+            size_bytes=log_file.stat().st_size,
+            modified=datetime.fromtimestamp(log_file.stat().st_mtime, tz=timezone.utc).isoformat(),
         )
+        for log_file in log_files
+    )
     return logs
 
 

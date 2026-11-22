@@ -878,6 +878,66 @@ async def _download_minute_side_dataframe(
     return _assemble_candle_dataframe(bi5_results, decimal_factor)
 
 
+async def download_minute_candles(
+    instrument: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    *,
+    side: str = "bid",
+    batch_size: int = 10,
+    pipeline_batches: int = 1,
+    pause_ms: int = 1000,
+    max_retries: int = 3,
+    report_progress: Callable[[float, str], None] | None = None,
+    stop_event: Event | None = None,
+    pause_event: Event | None = None,
+    log_callback: Callable[[str], None] | None = None,
+) -> pd.DataFrame:
+    """Fetch raw 1m candle data for a window and return it as a frame.
+
+    The public face of the minute-candle path, for callers that want the bars
+    and not a parquet file. ``DukascopyNativeDownloader.download`` can only
+    write into the catalog (a ``{sym}/{tf}.parquet`` under the data dir, plus a
+    ``source_meta.json`` entry and smart-resume merge), which is not what a
+    one-off reference slice wants: it must be reproducible from a fixed window
+    and must not touch the catalog of the machine it runs on.
+
+    The download itself is the same code the downloader uses (per-file retries,
+    throttle-aware batch pauses, 404 tolerance for hours/days with no data), so
+    this is a thinner entry point rather than a second implementation.
+
+    ``end_dt`` is inclusive at day granularity, as everywhere else in this
+    module: the daily file for its date is fetched, and the caller truncates to
+    the exact hour it wants.
+    """
+    decimal_factor = _get_decimal_factor(instrument)
+    normalized_side = _normalize_offer_side(side)
+    if normalized_side == "both":
+        # The two sides live in different daily URLs (BID_/ASK_candles_min_1),
+        # unlike the shared hourly tick files, so there is nothing to split
+        # afterwards. Refuse rather than request a URL that cannot exist and
+        # come back as an unexplained empty frame.
+        raise NotImplementedError(
+            "download_minute_candles fetches one offer side; call it once per "
+            "side ('bid', then 'ask') to mirror a both-sided candle download"
+        )
+    return await _download_minute_side_dataframe(
+        instrument,
+        start_dt,
+        end_dt,
+        side=normalized_side,
+        decimal_factor=decimal_factor,
+        batch_size=batch_size,
+        pipeline_batches=pipeline_batches,
+        pause_ms=pause_ms,
+        max_retries=max_retries,
+        report_progress=report_progress,
+        stop_event=stop_event,
+        pause_event=pause_event,
+        log_callback=log_callback,
+    )
+
+
 def _ticks_to_ohlcv(
     tick_df: pd.DataFrame, timeframe: str, price_type: str = "bid"
 ) -> pd.DataFrame:

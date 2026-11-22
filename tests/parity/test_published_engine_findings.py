@@ -1,6 +1,6 @@
 """Engine findings surfaced by the published-strategy parity work (minimal reproductions).
 
-Fixed: the reporting equity curve is mark-to-market on every engine, so the
+Fixed: the reporting equity curve is mark-to-market on the native engine, so the
 drawdown of an open position reaches ``max_drawdown_pct`` (see
 ``docs/cross-engine-backtest-contract.md`` section 4b and
 ``tests/test_mtm_equity.py`` for the per-engine coverage).

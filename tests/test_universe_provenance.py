@@ -651,7 +651,8 @@ def _train_subperiods() -> list[dict[str, str]]:
     import runner.optimizer as opt
     from runner.optimization_diagnostics import subperiods_from_walk_forward, walk_forward_splits
 
-    train_period, _test_period = opt._split_backtest_period("2024-01-01", "2024-06-01", 0.7)
+    split = opt._split_backtest_period("2024-01-01", "2024-06-01", 0.7)
+    train_period = split.train
     folds = walk_forward_splits(
         train_period["start"], train_period["end"], n_splits=2, train_fraction=0.7
     )
@@ -715,11 +716,13 @@ def test_the_optimization_artifact_carries_provenance_survivorship_and_stability
         exits = (
             [
                 (_midpoint(subperiod), pnl)
-                for subperiod, pnl in zip(subperiods, realized_by_window[window])
+                for subperiod, pnl in zip(subperiods, realized_by_window[window], strict=True)
                 if pnl
             ]
             if is_train
-            else []
+            # Out-of-sample windows must trade: a trial that does nothing on
+            # validation is (correctly) unselectable.
+            else [(config.end_date, 1.0)]
         )
         return _trial(config, metric=sharpe_by_window[window], exits=exits)
 
@@ -892,7 +895,7 @@ def test_contradictory_universe_flags_fail_before_the_engine_runs(monkeypatch, t
         ]
     )
 
-    with pytest.raises(ValueError, match="as-of|as_of"):
+    with pytest.raises(ValueError, match=r"as-of|as_of"):
         cli.cmd_run(args)
 
     assert engine.run_calls == 0, "the engine ran before the flags were rejected"

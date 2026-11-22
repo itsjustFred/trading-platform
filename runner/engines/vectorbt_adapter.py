@@ -50,19 +50,16 @@ from runner.engines.base import (
     resolve_strategy_parameters,
 )
 from runner.engines.contract import resolve_same_bar_exit
-from runner.engines.mtm_equity import (
-    build_mark_to_market_curve,
-    closes_from_frame,
-    describe_basis,
-)
 from runner.fees import resolve_fee_model
 from shared.constants import DATA_DIR
 from shared.models import (
     BacktestMeta,
     BacktestResult,
+    EquityPoint,
     IndicatorSeries,
     Trade,
     TradeExit,
+    normalize_direction_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -384,13 +381,6 @@ def _process_symbol(
         indicators,
         column_roles if isinstance(column_roles, dict) else None,
         require_explicit_roles=bool(config.require_explicit_column_roles),
-        signal_exit_fill=config.signal_exit_fill,
-    )
-    # Owner decision 2026-11-13: a signal exit on the LAST bar has no next bar
-    # to fill at - the forced end-of-data close takes the trade (at that bar's
-    # close) and flags it.
-    last_bar_signal_exit = bool(
-        signals["exits"].iloc[-1] if "exits" in signals.columns and len(signals) else False
     )
     entries = execution_signals["entries"]
     exits = execution_signals["exits"]
@@ -406,6 +396,9 @@ def _process_symbol(
     direction_series = _find_direction_series(execution_signals, execution_indicators)
     exit_price_series = _find_exit_price_series(execution_signals, execution_indicators)
     exit_reason_series = _find_exit_reason_series(execution_signals, execution_indicators)
+    exit_order_type_series = _find_exit_order_type_series(
+        execution_signals, execution_indicators
+    )
 
     trades: list[Trade] = []
     in_trade = False
@@ -413,280 +406,6 @@ def _process_symbol(
     equity = config.initial_capital
     trade_counter = 0
     inverted_stop_drops = 0
-    next_open_exits = (
-        str(getattr(config, "signal_exit_fill", contract.SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
-        == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
-    )
-
-    def settle(i: int, entry_idx: int, *, forced_end: bool) -> None:
-        """Close the open trade on bar ``i`` and book it (sizing, fees, equity).
-
-        ``forced_end`` marks the end-of-data close of a still-open trade.
-        """
-        nonlocal trade_counter, equity, inverted_stop_drops
-        entry_row = df.iloc[entry_idx]
-        exit_row = df.iloc[i]
-        direction = _resolve_direction(execution_signals, direction_series, entry_idx)
-        entry_price = _resolve_entry_price(
-            entry_row,
-            direction,
-            entry_stop_series,
-            entry_idx,
-            parameters=resolved_parameters,
-        )
-        if entry_price is None:
-            # D2 strict (A-H2): entry_stop present but never touched --
-            # no fill, no phantom trade. State is already flat
-            # (in_trade=False above); skip before sizing/equity.
-            return
-        trade_counter += 1
-        exit_price = _resolve_exit_price(
-            exit_row,
-            i,
-            exit_price_series,
-            # A forced end-of-data close has no next bar: under the default
-            # next_open convention it fills at the last bar's close.
-            signal_exit_fill=(
-                "close"
-                if forced_end and next_open_exits
-                else getattr(config, "signal_exit_fill", "next_open")
-            ),
-            parameters=resolved_parameters,
-            direction=direction,
-        )
-        exit_reason = _resolve_exit_reason(i, exit_reason_series)
-        if forced_end:
-            exit_reason = "end_of_data"
-        entry_ts = str(entry_row.get("timestamp", entry_row.name))
-        exit_ts = str(exit_row.get("timestamp", exit_row.name))
-        trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
-        if forced_end and next_open_exits and last_bar_signal_exit:
-            # The strategy signalled an exit on the last bar; there is no next
-            # open to fill it at, so end-of-data took the trade (flagged).
-            trade_meta["signal_exit_deferred_to_end_of_data"] = True
-        stop_price = _resolve_level_value(stop_loss_series, entry_idx)
-        take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
-        risk_target_usd: float | None = None
-        stop_distance: float | None = None
-        max_position_exposure_pct: float | None = None
-        max_leverage: float | None = None
-        required_notional: float | None = None
-        cap_notional: float | None = None
-        leverage_notional_limit: float | None = None
-        final_notional: float | None = None
-        capped_by_max_position = False
-        capped_by_max_leverage = False
-
-        intrabar_exit = _resolve_intrabar_exit(
-            intrabar_df=intrabar_df,
-            intrabar_timeframe=intrabar_timeframe,
-            base_timeframe=config.timeframe,
-            direction=direction,
-            entry_time=entry_ts,
-            scheduled_exit_time=exit_ts,
-            stop_price=_resolve_level_value(stop_loss_series, entry_idx),
-            take_profit_price=take_profit_price,
-            parameters=resolved_parameters,
-            # A next-open signal exit executes at the OPEN of the exit bar, so
-            # that bar's own sub-bars come after the exit and cannot stop it
-            # out; a forced end-of-data close (at the close) and the legacy
-            # same-bar modes keep the walk through the exit bar.
-            exit_at_open=next_open_exits and not forced_end,
-        )
-        if intrabar_exit is not None:
-            exit_price = intrabar_exit["price"]
-            exit_ts = intrabar_exit["time"]
-            exit_reason = intrabar_exit["reason"]
-            trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
-
-        # Inverted SIZING-only stop guard (mirrors native
-        # `_fill_pending_orders`, which skips a market order whose
-        # sizing stop is on the wrong side of the fill). The protective
-        # inverted-stop guard below only sees the protective stop series;
-        # a sizing-only stop (e.g. ``sizing_sl_price``) left above a LONG
-        # entry by a gap down would otherwise be sized on
-        # abs(entry - stop), i.e. on a risk distance that does not exist.
-        # Skip before sizing so no fantasy risk reaches the equity path.
-        if sizing_stop_series is not None:
-            sizing_stop_value = _resolve_level_value(sizing_stop_series, entry_idx)
-            if sizing_stop_value is not None and (
-                (direction == "LONG" and sizing_stop_value >= entry_price)
-                or (direction != "LONG" and sizing_stop_value <= entry_price)
-            ):
-                inverted_stop_drops += 1
-                _warn_once(
-                    (symbol, config.timeframe, "inverted_sizing_stop"),
-                    "Skipping %s/%s trade at %s: %s sizing stop %.6f is on "
-                    "the wrong side of entry %.6f",
-                    symbol,
-                    config.timeframe,
-                    entry_ts,
-                    direction,
-                    sizing_stop_value,
-                    entry_price,
-                    warning_keys=warning_keys,
-                )
-                return
-
-        sizing = _size_trade(
-            config=config,
-            equity=equity,
-            entry_price=entry_price,
-            asset_class=asset_class,
-            stop_loss_series=sizing_basis_series,
-            atr_series=atr_series,
-            entry_idx=entry_idx,
-            symbol=symbol,
-            trade_counter=trade_counter,
-            warning_keys=warning_keys,
-        )
-
-        qty = sizing["qty"]
-        sizing_mode = sizing["sizing_mode"]
-        risk_target_usd = sizing["risk_target_usd"]
-        stop_distance = sizing["stop_distance"]
-        max_position_exposure_pct = sizing["max_position_exposure_pct"]
-        max_leverage = sizing["max_leverage"]
-        required_notional = sizing["required_notional"]
-        cap_notional = sizing["cap_notional"]
-        leverage_notional_limit = sizing["leverage_notional_limit"]
-        final_notional = sizing["final_notional"]
-        capped_by_max_position = sizing["capped_by_max_position"]
-        capped_by_max_leverage = sizing["capped_by_max_leverage"]
-        if sizing["rejected"]:
-            return
-
-        if stop_price is None and stop_distance is not None and stop_distance > 0:
-
-            stop_price = (
-                entry_price - stop_distance
-                if direction == "LONG"
-                else entry_price + stop_distance
-            )
-
-        if stop_price is None:
-            sl_from_meta = trade_meta.get("sl_price")
-            if isinstance(sl_from_meta, (int, float)):
-                stop_price = float(sl_from_meta)
-
-        # Inverted-stop guard: a stop on the wrong side of the entry
-        # (LONG stop >= entry, SHORT stop <= entry) would produce an
-        # instantly-triggered, sign-flipped fantasy exit. This happens
-        # when a stop-order strategy's level is resolved against a
-        # market fill instead of its stop fill. Skip the trade loudly
-        # instead of compounding garbage into equity.
-        if stop_price is not None:
-            inverted = (
-                direction == "LONG" and stop_price >= entry_price
-            ) or (direction != "LONG" and stop_price <= entry_price)
-            if inverted:
-                # A-M7: count every drop (the warn-once log only shows
-                # the first) — the per-run total is reported in
-                # meta.data["inverted_stop_drops"] by VectorbtAdapter.run.
-                inverted_stop_drops += 1
-                _warn_once(
-                    (symbol, config.timeframe, "inverted_stop"),
-                    "Skipping %s/%s trade at %s: %s stop %.6f is on the "
-                    "wrong side of entry %.6f",
-                    symbol,
-                    config.timeframe,
-                    entry_ts,
-                    direction,
-                    stop_price,
-                    entry_price,
-                    warning_keys=warning_keys,
-                )
-
-
-                return
-
-        if stop_distance is None and stop_price is not None:
-            stop_distance = abs(entry_price - stop_price)
-
-        trade_meta["risk_math"] = {
-            "sizing_mode": sizing_mode,
-            "equity_at_entry": round(equity, 2),
-            "risk_target_usd": (
-                round(risk_target_usd, 2)
-                if risk_target_usd is not None
-                else None
-            ),
-            "entry_price": round(entry_price, 6),
-            "sl_price": round(stop_price, 6) if stop_price is not None else None,
-            "stop_distance": round(stop_distance, 6) if stop_distance is not None else None,
-            "position_size": round(qty, 4),
-            "required_notional": (
-                round(required_notional, 2) if required_notional is not None else None
-            ),
-            "final_notional": round(final_notional, 2) if final_notional is not None else None,
-            "max_position_notional": (
-                round(cap_notional, 2) if cap_notional is not None else None
-            ),
-            "max_leverage_notional": (
-                round(leverage_notional_limit, 2)
-                if leverage_notional_limit is not None
-                else None
-            ),
-            # "max_position_pct" stays for artifact compatibility
-            # (frontend TradeRiskMath + SQLite fallback in
-            # shared/database.py); "max_position_exposure_pct" carries
-            # the same value under the canonical _SizeRecord name so the
-            # sizing-record viewer contract holds for both spellings.
-            "max_position_pct": (
-                round(max_position_exposure_pct, 6)
-                if max_position_exposure_pct is not None
-                else None
-            ),
-            "max_position_exposure_pct": (
-                round(max_position_exposure_pct, 6)
-                if max_position_exposure_pct is not None
-                else None
-            ),
-            "max_leverage": round(max_leverage, 6) if max_leverage is not None else None,
-            "capped_by_max_position": capped_by_max_position,
-            "capped_by_max_leverage": capped_by_max_leverage,
-            "rejected": sizing["rejected"],
-            "rejection_reason": sizing["rejection_reason"],
-        }
-
-        if direction == "LONG":
-            pnl = (exit_price - entry_price) * qty
-        else:
-            pnl = (entry_price - exit_price) * qty
-
-        # #84: explicit pluggable fee model — missing fee config is a
-        # hard error, never silent gross.
-        fee_model = resolve_fee_model(resolved_parameters)
-        fees = fee_model.fee_for_trade(entry_price, exit_price, qty)
-
-        trade = Trade(
-            id=trade_counter,  # temporary; renumbered after merge
-            symbol=symbol,
-            direction=direction,
-            entry_time=entry_ts,
-            entry_price=round(entry_price, 6),
-            quantity=round(qty, 4),
-            exits=[
-                TradeExit(
-                    time=exit_ts,
-                    price=round(exit_price, 6),
-                    quantity=round(qty, 4),
-                    pnl=round(pnl, 2),
-                    reason=exit_reason,
-                )
-            ],
-            pnl=round(pnl, 2),
-            fees=round(fees, 2),
-            net_pnl=round(pnl - fees, 2),
-            stop_loss=stop_price,
-            take_profit=take_profit_price,
-            holding_bars=i - entry_idx,
-            tags=["vectorbt"],
-            meta=trade_meta,
-        )
-        trades.append(trade)
-        # #84: the equity path accumulates NET pnl (fees are real costs).
-        equity += pnl - fees
 
     for i in range(len(df)):
         if trade_from is not None:
@@ -700,33 +419,408 @@ def _process_symbol(
             )
             if pd.notna(bar_ts) and bar_ts < trade_from:
                 continue
+        if not in_trade and bool(entries.iloc[i]):
+            # Entry leg executes next-open (shifted index = execution bar).
+            in_trade = True
+            entry_idx = i
         is_terminal_bar = i == len(df) - 1
-        if next_open_exits:
-            # Owner decision 2026-11-13: entry AND signal-exit legs both execute
-            # on the bar after their signal (see _prepare_next_open_execution_data),
-            # so an exit leg on this bar closes a trade opened on an EARLIER bar
-            # at this bar's open - before this bar's entry leg can open the
-            # replacement position (a reversal: exit + entry on the same bar).
-            if in_trade and bool(exits.iloc[i]):
-                in_trade = False
-                settle(i, entry_idx, forced_end=False)
-            if not in_trade and bool(entries.iloc[i]):
-                in_trade = True
-                entry_idx = i
-            if in_trade and is_terminal_bar:
-                in_trade = False
-                settle(i, entry_idx, forced_end=True)
-        else:
-            # Legacy opt-in ("close" / "open"): the exit leg stays on the signal
-            # bar, so an exit may fire on the entry execution bar itself.
-            if not in_trade and bool(entries.iloc[i]):
-                in_trade = True
-                entry_idx = i
-            if in_trade and (bool(exits.iloc[i]) or is_terminal_bar):
-                in_trade = False
-                settle(i, entry_idx, forced_end=is_terminal_bar and not bool(exits.iloc[i]))
+        if in_trade and (bool(exits.iloc[i]) or is_terminal_bar):
+            # D4 (A-M1): the exit leg stays on the trigger bar, so an exit
+            # may fire on the entry execution bar itself (same-bar open
+            # fill -> close exit), exactly like the native engine which
+            # fills pending orders at the open and closes signal exits at
+            # the close of the same bar. No `elif`: it would swallow the
+            # exit whenever both legs land on one bar.
+            in_trade = False
+
+            entry_row = df.iloc[entry_idx]
+            exit_row = df.iloc[i]
+            direction = _resolve_direction(execution_signals, direction_series, entry_idx)
+            entry_price = _resolve_entry_price(
+                entry_row,
+                direction,
+                entry_stop_series,
+                entry_idx,
+                parameters=resolved_parameters,
+            )
+            if entry_price is None:
+                # D2 strict (A-H2): entry_stop present but never touched --
+                # no fill, no phantom trade. State is already flat
+                # (in_trade=False above); skip before sizing/equity.
+                continue
+            trade_counter += 1
+            # Explicit exit order type (#243): "market" ignores exit_price and
+            # fills at the signal-exit convention price; "level" fills at
+            # exit_price (a missing/unusable level falls back to the market
+            # fill and is flagged). Unspecified keeps the legacy rule — a
+            # usable exit_price is a level. The order type is only evaluated
+            # on a real exit signal: the forced end-of-data close on the last
+            # bar keeps the convention fill and ignores exit_price entirely,
+            # matching native's end_of_data close.
+            is_signal_exit = bool(exits.iloc[i])
+            exit_order_type = None
+            order_type_invalid = False
+            level_missing_price = False
+            level_unreachable = False
+            level_gapped = False
+            effective_exit_price_series = exit_price_series
+            if is_terminal_bar and not is_signal_exit:
+                effective_exit_price_series = None
+            if is_signal_exit:
+                exit_order_type, order_type_invalid = _exit_order_type_at(
+                    exit_order_type_series, i
+                )
+                if order_type_invalid:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_order_type_invalid"),
+                        "%s/%s: unrecognized exit_order_type value; expected "
+                        "'market' or 'level'. Falling back to the legacy rule "
+                        "(a usable exit_price fills at the level).",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                if exit_order_type == contract.EXIT_ORDER_TYPE_MARKET:
+                    effective_exit_price_series = None
+                elif exit_order_type == contract.EXIT_ORDER_TYPE_LEVEL and (
+                    contract.usable_exit_price(
+                        exit_price_series.iloc[i]
+                        if exit_price_series is not None
+                        else None
+                    )
+                    is None
+                ):
+                    effective_exit_price_series = None
+                    level_missing_price = True
+            # A level is only honored inside the exit bar's traded range.
+            # Beyond it on the untraded side the order could never have
+            # filled — fall back to the market fill rather than book a
+            # fantasy price. Beyond it on the marketable side the order was
+            # marketable at the open, so it fills at the bar's open
+            # (gap-through-level). This applies to every level fill,
+            # explicit or legacy implicit.
+            level_fill_price = (
+                contract.usable_exit_price(effective_exit_price_series.iloc[i])
+                if effective_exit_price_series is not None
+                else None
+            )
+            if level_fill_price is not None and is_signal_exit:
+                # A-H4 (D3)/A-L5: a SHORT exit buys the ask, so reachability
+                # is judged on the ask range when ask-side data is enabled —
+                # mirroring native _close_position/_ask_bar.
+                bar_high = exit_row.get("high")
+                bar_low = exit_row.get("low")
+                if direction != "LONG":
+                    ask_high, ask_low = _vbt_ask_bar(exit_row, resolved_parameters)
+                    if ask_high is not None:
+                        bar_high = ask_high
+                    if ask_low is not None:
+                        bar_low = ask_low
+                level_disposition = contract.exit_level_disposition(
+                    direction=direction,
+                    level=level_fill_price,
+                    high=bar_high,
+                    low=bar_low,
+                )
+                if level_disposition == contract.EXIT_LEVEL_UNREACHABLE:
+                    effective_exit_price_series = None
+                    level_unreachable = True
+                elif level_disposition == contract.EXIT_LEVEL_GAPPED:
+                    effective_exit_price_series = None
+                    level_gapped = True
+            exit_price = _resolve_exit_price(
+                exit_row,
+                i,
+                effective_exit_price_series,
+                signal_exit_fill=getattr(config, "signal_exit_fill", "close"),
+                parameters=resolved_parameters,
+                direction=direction,
+                gap_open=level_gapped,
+            )
+            exit_reason = _resolve_exit_reason(i, exit_reason_series)
+            if is_terminal_bar and not bool(exits.iloc[i]):
+                exit_reason = "end_of_data"
+            entry_ts = str(entry_row.get("timestamp", entry_row.name))
+            exit_ts = str(exit_row.get("timestamp", exit_row.name))
+            trade_meta = _extract_trade_meta(execution_signals, execution_indicators, entry_idx, i)
+            if exit_order_type is not None:
+                # Canonical value, matching native's position.meta — the
+                # indicator extraction above may have recorded the raw cell.
+                trade_meta["exit_order_type"] = exit_order_type
+            stop_price = _resolve_level_value(stop_loss_series, entry_idx)
+            take_profit_price = _resolve_level_value(take_profit_series, entry_idx)
+            risk_target_usd: float | None = None
+            stop_distance: float | None = None
+            max_position_exposure_pct: float | None = None
+            max_leverage: float | None = None
+            required_notional: float | None = None
+            cap_notional: float | None = None
+            leverage_notional_limit: float | None = None
+            final_notional: float | None = None
+            capped_by_max_position = False
+            capped_by_max_leverage = False
+
+            intrabar_exit = _resolve_intrabar_exit(
+                intrabar_df=intrabar_df,
+                intrabar_timeframe=intrabar_timeframe,
+                base_timeframe=config.timeframe,
+                direction=direction,
+                entry_time=entry_ts,
+                scheduled_exit_time=exit_ts,
+                stop_price=_resolve_level_value(stop_loss_series, entry_idx),
+                take_profit_price=take_profit_price,
+                parameters=resolved_parameters,
+            )
+            if intrabar_exit is not None:
+                exit_price = intrabar_exit["price"]
+                exit_ts = intrabar_exit["time"]
+                exit_reason = intrabar_exit["reason"]
+                trade_meta["modeling_resolution"] = intrabar_exit["resolution"]
+            elif is_signal_exit:
+                # The level governed the exit only when no protective
+                # stop/TP superseded the signal exit — flag and warn then,
+                # never for trades that actually left on a stop or TP.
+                if level_missing_price:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_missing_price"),
+                        "%s/%s: exit_order_type='level' but no usable "
+                        "exit_price on the exit bar; falling back to the "
+                        "market fill.",
+                        symbol,
+                        config.timeframe,
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_missing_price"] = True
+                if level_unreachable:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_unreachable"),
+                        "%s/%s: exit level %.6f is outside the exit bar's "
+                        "traded range; falling back to the market fill.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_unreachable"] = True
+                if level_gapped:
+                    _warn_once(
+                        (symbol, config.timeframe, "exit_level_gapped"),
+                        "%s/%s: exit level %.6f gapped the exit bar's open; "
+                        "filling at the open instead of the level.",
+                        symbol,
+                        config.timeframe,
+                        level_fill_price if level_fill_price is not None else float("nan"),
+                        warning_keys=warning_keys,
+                    )
+                    trade_meta["exit_level_gapped"] = True
+
+            # Inverted SIZING-only stop guard (mirrors native
+            # `_fill_pending_orders`, which skips a market order whose
+            # sizing stop is on the wrong side of the fill). The protective
+            # inverted-stop guard below only sees the protective stop series;
+            # a sizing-only stop (e.g. ``sizing_sl_price``) left above a LONG
+            # entry by a gap down would otherwise be sized on
+            # abs(entry - stop), i.e. on a risk distance that does not exist.
+            # Skip before sizing so no fantasy risk reaches the equity path.
+            if sizing_stop_series is not None:
+                sizing_stop_value = _resolve_level_value(sizing_stop_series, entry_idx)
+                if sizing_stop_value is not None and (
+                    (direction == "LONG" and sizing_stop_value >= entry_price)
+                    or (direction != "LONG" and sizing_stop_value <= entry_price)
+                ):
+                    inverted_stop_drops += 1
+                    _warn_once(
+                        (symbol, config.timeframe, "inverted_sizing_stop"),
+                        "Skipping %s/%s trade at %s: %s sizing stop %.6f is on "
+                        "the wrong side of entry %.6f",
+                        symbol,
+                        config.timeframe,
+                        entry_ts,
+                        direction,
+                        sizing_stop_value,
+                        entry_price,
+                        warning_keys=warning_keys,
+                    )
+                    continue
+
+            sizing = _size_trade(
+                config=config,
+                equity=equity,
+                entry_price=entry_price,
+                asset_class=asset_class,
+                stop_loss_series=sizing_basis_series,
+                atr_series=atr_series,
+                entry_idx=entry_idx,
+                symbol=symbol,
+                trade_counter=trade_counter,
+                warning_keys=warning_keys,
+            )
+
+            qty = sizing["qty"]
+            sizing_mode = sizing["sizing_mode"]
+            risk_target_usd = sizing["risk_target_usd"]
+            stop_distance = sizing["stop_distance"]
+            max_position_exposure_pct = sizing["max_position_exposure_pct"]
+            max_leverage = sizing["max_leverage"]
+            required_notional = sizing["required_notional"]
+            cap_notional = sizing["cap_notional"]
+            leverage_notional_limit = sizing["leverage_notional_limit"]
+            final_notional = sizing["final_notional"]
+            capped_by_max_position = sizing["capped_by_max_position"]
+            capped_by_max_leverage = sizing["capped_by_max_leverage"]
+            if sizing["rejected"]:
+                continue
+
+            if stop_price is None and stop_distance is not None and stop_distance > 0:
+
+                stop_price = (
+                    entry_price - stop_distance
+                    if direction == "LONG"
+                    else entry_price + stop_distance
+                )
+
+            if stop_price is None:
+                sl_from_meta = trade_meta.get("sl_price")
+                if isinstance(sl_from_meta, (int, float)):
+                    stop_price = float(sl_from_meta)
+
+            # Inverted-stop guard: a stop on the wrong side of the entry
+            # (LONG stop >= entry, SHORT stop <= entry) would produce an
+            # instantly-triggered, sign-flipped fantasy exit. This happens
+            # when a stop-order strategy's level is resolved against a
+            # market fill instead of its stop fill. Skip the trade loudly
+            # instead of compounding garbage into equity.
+            if stop_price is not None:
+                inverted = (
+                    direction == "LONG" and stop_price >= entry_price
+                ) or (direction != "LONG" and stop_price <= entry_price)
+                if inverted:
+                    # A-M7: count every drop (the warn-once log only shows
+                    # the first) — the per-run total is reported in
+                    # meta.data["inverted_stop_drops"] by VectorbtAdapter.run.
+                    inverted_stop_drops += 1
+                    _warn_once(
+                        (symbol, config.timeframe, "inverted_stop"),
+                        "Skipping %s/%s trade at %s: %s stop %.6f is on the "
+                        "wrong side of entry %.6f",
+                        symbol,
+                        config.timeframe,
+                        entry_ts,
+                        direction,
+                        stop_price,
+                        entry_price,
+                        warning_keys=warning_keys,
+                    )
+
+
+                    continue
+
+            if stop_distance is None and stop_price is not None:
+                stop_distance = abs(entry_price - stop_price)
+
+            trade_meta["risk_math"] = {
+                "sizing_mode": sizing_mode,
+                "equity_at_entry": round(equity, 2),
+                "risk_target_usd": (
+                    round(risk_target_usd, 2)
+                    if risk_target_usd is not None
+                    else None
+                ),
+                "entry_price": round(entry_price, 6),
+                "sl_price": round(stop_price, 6) if stop_price is not None else None,
+                "stop_distance": round(stop_distance, 6) if stop_distance is not None else None,
+                "position_size": round(qty, 4),
+                "required_notional": (
+                    round(required_notional, 2) if required_notional is not None else None
+                ),
+                "final_notional": round(final_notional, 2) if final_notional is not None else None,
+                "max_position_notional": (
+                    round(cap_notional, 2) if cap_notional is not None else None
+                ),
+                "max_leverage_notional": (
+                    round(leverage_notional_limit, 2)
+                    if leverage_notional_limit is not None
+                    else None
+                ),
+                # "max_position_pct" stays for artifact compatibility
+                # (frontend TradeRiskMath + SQLite fallback in
+                # shared/database.py); "max_position_exposure_pct" carries
+                # the same value under the canonical _SizeRecord name so the
+                # sizing-record viewer contract holds for both spellings.
+                "max_position_pct": (
+                    round(max_position_exposure_pct, 6)
+                    if max_position_exposure_pct is not None
+                    else None
+                ),
+                "max_position_exposure_pct": (
+                    round(max_position_exposure_pct, 6)
+                    if max_position_exposure_pct is not None
+                    else None
+                ),
+                "max_leverage": round(max_leverage, 6) if max_leverage is not None else None,
+                "capped_by_max_position": capped_by_max_position,
+                "capped_by_max_leverage": capped_by_max_leverage,
+                "rejected": sizing["rejected"],
+                "rejection_reason": sizing["rejection_reason"],
+            }
+
+            if direction == "LONG":
+                pnl = (exit_price - entry_price) * qty
+            else:
+                pnl = (entry_price - exit_price) * qty
+
+            # #84: explicit pluggable fee model — missing fee config is a
+            # hard error, never silent gross.
+            fee_model = resolve_fee_model(resolved_parameters)
+            fees = fee_model.fee_for_trade(entry_price, exit_price, qty)
+
+            trade = Trade(
+                id=trade_counter,  # temporary; renumbered after merge
+                symbol=symbol,
+                direction=direction,
+                entry_time=entry_ts,
+                entry_price=round(entry_price, 6),
+                quantity=round(qty, 4),
+                exits=[
+                    TradeExit(
+                        time=exit_ts,
+                        price=round(exit_price, 6),
+                        quantity=round(qty, 4),
+                        pnl=round(pnl, 2),
+                        reason=exit_reason,
+                    )
+                ],
+                pnl=round(pnl, 2),
+                fees=round(fees, 2),
+                net_pnl=round(pnl - fees, 2),
+                stop_loss=stop_price,
+                take_profit=take_profit_price,
+                holding_bars=i - entry_idx,
+                tags=["vectorbt"],
+                meta=trade_meta,
+            )
+            trades.append(trade)
+            # #84: the equity path accumulates NET pnl (fees are real costs).
+            equity += pnl - fees
 
     return trades, extra_timeframes, drawings, indicator_series, len(df), inverted_stop_drops
+
+
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Map the native-only ``next_open`` exit model onto this frozen adapter's
+    documented signal-bar fill (ADR ``docs/adr/0001-native-single-strategy-engine.md``:
+    frozen engines keep their existing semantics until removal). Without this a
+    default ``next_open`` run would silently simulate the legacy ``close`` fill
+    while the persisted meta claimed otherwise.
+    """
+    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
+    if mode != "next_open":
+        return config
+    logger.warning(
+        "frozen engine does not implement signal_exit_fill='next_open'; "
+        "running with the legacy 'close' signal-exit fill instead"
+    )
+    return config.model_copy(update={"signal_exit_fill": "close"})
 
 
 @dataclass
@@ -746,6 +840,7 @@ class VectorbtAdapter(EngineAdapter):
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):
             raise ValueError(f"Strategy {strategy_path} must define generate_signals(df, params)")
@@ -887,40 +982,62 @@ class VectorbtAdapter(EngineAdapter):
         # re-scale chronologically from shared equity instead of compounding
         # N symbols x full capital. Single-symbol runs keep the legacy path
         # bit-identical (no replay).
-        curve_start = (
-            f"{config.start_date}T00:00:00+00:00"
-            if len(config.start_date) == 10
-            else config.start_date
-        )
         shared_summary: dict[str, Any] = {}
         if num_symbols > 1 and all_trades:
             from runner.engines._shared import replay_shared_equity
 
-            all_trades, _, shared_summary = replay_shared_equity(
+            all_trades, shared_equity_curve, shared_summary = replay_shared_equity(
                 all_trades,
                 config.initial_capital,
-                start_time=curve_start,
+                start_time=(
+                    f"{config.start_date}T00:00:00+00:00"
+                    if len(config.start_date) == 10
+                    else config.start_date
+                ),
             )
             # Renumber again: the replay re-sorts chronologically by entry.
             all_trades.sort(key=lambda t: t.entry_time)
             for idx, trade in enumerate(all_trades, start=1):
                 trade.id = idx
-        # The persisted curve is the MARK-TO-MARKET portfolio equity (one
-        # observation per bar, built once from the final trades): drawdown /
-        # Sharpe / volatility must see the paper drawdown of open positions.
-        # It describes reporting only - sizing stays on realized cash inside
-        # `_process_symbol`. Per-symbol paths are NOT summed (that would
-        # multiply capital by the symbol count).
-        all_equity, unmarked_symbols = build_mark_to_market_curve(
-            all_trades,
-            _load_mark_closes(
-                data_root,
-                config,
-                {trade.symbol for trade in all_trades},
-            ),
-            config.initial_capital,
-            start_time=curve_start,
-        )
+            all_equity = shared_equity_curve
+        else:
+            # Build equity curve from sorted trades (Cleanup 16-D1, F5).
+            # Semantics decision: the persisted curve is a REALIZED-PnL portfolio
+            # curve over EXIT time. Each symbol's own sizing compounds from the
+            # shared initial capital inside `_process_symbol`; summing those
+            # per-symbol paths into one "portfolio" equity would multiply capital
+            # by the symbol count, so the aggregate curve here intentionally
+            # replays only closed PnL, once per portfolio, credited at the trade's
+            # exit — and therefore replayed in EXIT order (native/pynecore do the
+            # same). Drawdown/Sharpe computed on this curve describe the realized
+            # portfolio, not an intraday mark-to-market path — the limitation is
+            # documented in the cross-engine contract.
+            all_equity: list[EquityPoint] = [
+                EquityPoint(
+                    time=(
+                        f"{config.start_date}T00:00:00+00:00"
+                        if len(config.start_date) == 10
+                        else config.start_date
+                    ),
+                    equity=round(config.initial_capital, 2),
+                )
+            ]
+            equity = config.initial_capital
+            for trade in sorted(all_trades, key=lambda item: item.last_exit_time):
+                # #84: portfolio replay accumulates NET pnl.
+                equity += (
+                    float(trade.net_pnl)
+                    if trade.net_pnl is not None
+                    else float(trade.pnl) - float(trade.fees or 0.0)
+                )
+                point = EquityPoint(
+                    time=trade.last_exit_time or trade.entry_time,
+                    equity=round(equity, 2),
+                )
+                if all_equity[-1].time == point.time:
+                    all_equity[-1] = point
+                else:
+                    all_equity.append(point)
 
         now = datetime.now(timezone.utc)
         if hasattr(strategy_mod, "STRATEGY_META"):
@@ -964,7 +1081,6 @@ class VectorbtAdapter(EngineAdapter):
                 # A-M4 (D5): shared-equity replay summary for multi-symbol
                 # runs (empty for single-symbol legacy path).
                 "shared_equity": shared_summary,
-                **describe_basis(unmarked_symbols),
             },
             initial_capital=config.initial_capital,
             risk_per_trade_pct=config.risk_per_trade_pct,
@@ -1116,31 +1232,35 @@ def _is_exit_column(name: str, explicit_roles: Mapping[str, str] | None = None) 
     )
 
 
+def _exit_order_type_at(
+    series: pd.Series | None, idx: int
+) -> tuple[str | None, bool]:
+    """``(canonical exit_order_type, unrecognized_value_present)`` at ``idx``."""
+    if series is None:
+        return None, False
+    raw = series.iloc[idx]
+    order_type = contract.normalize_exit_order_type(raw)
+    invalid = order_type is None and contract.exit_order_type_is_present(raw)
+    return order_type, invalid
+
+
 def _prepare_next_open_execution_data(
     signals: pd.DataFrame,
     indicators: IndicatorMap,
     explicit_roles: Mapping[str, str] | None = None,
     *,
     require_explicit_roles: bool = False,
-    signal_exit_fill: str = contract.SIGNAL_EXIT_FILL_NEXT_OPEN,
 ) -> tuple[pd.DataFrame, IndicatorMap]:
-    """Split strategy output into execution timing.
+    """Split strategy output into execution timing (D4, A-M1).
 
+    Unified Fill-zum-Trigger-Close convention:
     - ENTRIES execute on the next bar open → entry leg (entries + entry-when
       series: direction, stop_loss, take_profit, atr, entry_stop, meta_*)
       shifts by one bar.
-    - SIGNAL EXITS (owner decision 2026-11-13, supersedes D4 / A-M1
-      Fill-zum-Trigger-Close): with the default ``signal_exit_fill="next_open"``
-      the exit leg (exits + exit-when series: exit_price, exit_reason, exit_*,
-      exit_meta_*) shifts by one bar too, so the exit fires on - and fills at
-      the open of - the bar after the signal, exactly like entries. The legacy
-      opt-ins ``"close"`` / ``"open"`` keep the exit leg UNSHIFTED (fills on the
-      signal bar itself).
+    - SIGNAL EXITS fill at the trigger bar's close → exit leg (exits +
+      exit-when series: exit_price, exit_reason, exit_*, exit_meta_*) stays
+      UNSHIFTED, so both engines price the same bar's close.
     """
-    shift_exit_leg = (
-        str(signal_exit_fill or contract.SIGNAL_EXIT_FILL_NEXT_OPEN).lower()
-        == contract.SIGNAL_EXIT_FILL_NEXT_OPEN
-    )
     roles = dict(explicit_roles or {})
     if require_explicit_roles:
         canonical = {
@@ -1155,6 +1275,7 @@ def _prepare_next_open_execution_data(
             "entry_stop",
             "exit_price",
             "exit_reason",
+            "exit_order_type",
         }
         for column in signals.columns:
             if str(column).lower() not in canonical and str(column) not in roles:
@@ -1175,7 +1296,7 @@ def _prepare_next_open_execution_data(
     execution_signals = pd.DataFrame(index=signals.index)
     for column in signals.columns:
         raw = signals[column]
-        if _is_exit_column(column, explicit_roles) and not shift_exit_leg:
+        if _is_exit_column(column, explicit_roles):
             aligned = raw.copy()
             aligned.index = signals.index
         else:
@@ -1192,7 +1313,7 @@ def _prepare_next_open_execution_data(
             name,
             str(roles.get(name, "")).strip().lower() or explicit_when,
         )
-        if when == "exit" and not shift_exit_leg:
+        if when == "exit":
             shifted_series = series.copy()
         else:
             shifted_series = series.shift(1)
@@ -1245,7 +1366,7 @@ def _infer_indicator_when(name: str, explicit_when: str) -> str:
 
 def _indicator_meta_key(name: str) -> str:
     lowered = name.lower()
-    if lowered in {"exit_price", "exit_reason"}:
+    if lowered in {"exit_price", "exit_reason", "exit_order_type"}:
         return lowered
     if lowered.startswith("exit_"):
         return name[5:]
@@ -1271,12 +1392,16 @@ def _find_indicator_series(
         return signals["exit_price"]
     if kind == "exit_reason" and "exit_reason" in signals.columns:
         return signals["exit_reason"]
+    if kind == "exit_order_type" and "exit_order_type" in signals.columns:
+        return signals["exit_order_type"]
     if kind == "atr":
         for column in signals.columns:
             if str(column).lower().startswith("atr"):
                 return signals[column]
 
-    desired_when = "exit" if kind in {"exit_price", "exit_reason"} else "entry"
+    desired_when = (
+        "exit" if kind in {"exit_price", "exit_reason", "exit_order_type"} else "entry"
+    )
     for name, (series, explicit_when) in indicators.items():
         when = _infer_indicator_when(name, explicit_when)
         if when != desired_when:
@@ -1294,6 +1419,8 @@ def _find_indicator_series(
         if kind == "exit_price" and lowered == "exit_price":
             return series
         if kind == "exit_reason" and lowered == "exit_reason":
+            return series
+        if kind == "exit_order_type" and lowered == "exit_order_type":
             return series
         if kind == "entry_stop" and lowered == "entry_stop":
             return series
@@ -1331,14 +1458,19 @@ def _find_exit_reason_series(signals: pd.DataFrame, indicators: IndicatorMap) ->
     return _find_indicator_series(signals, indicators, kind="exit_reason")
 
 
+def _find_exit_order_type_series(
+    signals: pd.DataFrame, indicators: IndicatorMap
+) -> pd.Series | None:
+    return _find_indicator_series(signals, indicators, kind="exit_order_type")
+
+
 def _find_entry_stop_series(signals: pd.DataFrame, indicators: IndicatorMap) -> pd.Series | None:
     return _find_indicator_series(signals, indicators, kind="entry_stop")
 
 
 def _normalize_direction_value(value: Any) -> str:
-    if value in ("SHORT", "short", -1):
-        return "SHORT"
-    return "LONG"
+    """Strict per-entry direction mapping; see ``shared.models.normalize_direction_value``."""
+    return normalize_direction_value(value)
 
 
 def _resolve_direction(
@@ -1384,26 +1516,30 @@ def _resolve_exit_price(
     exit_idx: int,
     exit_price_series: pd.Series | None,
     *,
-    signal_exit_fill: str = "next_open",
+    signal_exit_fill: str = "close",
     parameters: dict[str, Any] | None = None,
     direction: str | None = None,
+    gap_open: bool = False,
 ) -> float:
-    # Owner decision 2026-11-13: signal exits fill at the next bar's open. The
-    # exit leg is shifted onto the execution bar (see
-    # _prepare_next_open_execution_data), so "next_open" prices that bar's open;
-    # the legacy opt-ins keep the exit on the signal bar ("close": its close,
-    # "open": its open, mirroring native _close_position). Stop/TP legs resolve
-    # via the intrabar walk (level, or the open on a gap). An explicit strategy
-    # exit_price level always wins.
+    # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
+    # Signal exits stay on the trigger bar (see
+    # _prepare_next_open_execution_data) and fill at its close (or open with
+    # signal_exit_fill="open", mirroring native _close_position); stop/TP
+    # legs resolve via the intrabar walk at their levels. An explicit
+    # strategy exit_price level always wins — except a level that gapped
+    # the bar's open (gap_open=True), which fills at the open under the
+    # gap-through-level convention regardless of signal_exit_fill.
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
-    if exit_price_series is not None:
-        exit_price = exit_price_series.iloc[exit_idx]
-        if pd.notna(exit_price) and float(exit_price) > 0:
-            return float(exit_price)
-    # next_open: the exit leg was shifted onto the execution bar, so the exit
-    # fills at THAT bar's open - the same arithmetic as the legacy "open" mode.
-    fill_at_open = str(signal_exit_fill or "next_open").lower() in {"open", "next_open"}
+    if exit_price_series is not None and not gap_open:
+        # Same usability rule as the explicit ``level`` contract
+        # (contract.usable_exit_price): positive, finite — an inf/NaN level
+        # falls back to the convention fill instead of booking a fantasy
+        # price.
+        level = contract.usable_exit_price(exit_price_series.iloc[exit_idx])
+        if level is not None:
+            return level
+    fill_at_open = gap_open or str(signal_exit_fill or "close").lower() == "open"
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")
     open_ok = open_value is not None and pd.notna(open_value)
@@ -1547,32 +1683,6 @@ def _load_ohlcv(
     return df.reset_index(drop=True), selected_path
 
 
-def _load_mark_closes(
-    data_root: Path,
-    config: BacktestConfig,
-    symbols: set[str],
-) -> dict[str, pd.Series]:
-    """Close series of the traded symbols over the backtest window.
-
-    Used only to mark open positions to market in the reporting equity curve
-    (never for sizing or signals). A symbol whose data cannot be loaded is left
-    out; the curve builder reports it as unmarked instead of failing the run.
-    """
-    closes: dict[str, pd.Series] = {}
-    for symbol in sorted(symbols):
-        try:
-            frame, _ = _load_ohlcv(
-                data_root, symbol, config.timeframe, config.start_date, config.end_date
-            )
-        except Exception:  # noqa: BLE001 - marking is best effort, reported via meta
-            logger.warning("Could not load mark prices for %s", symbol, exc_info=True)
-            continue
-        series = closes_from_frame(frame)
-        if series is not None:
-            closes[symbol] = series
-    return closes
-
-
 def _normalize_intrabar_resolution(value: str | None) -> str:
     # Conformance (Cleanup 16-A): the spelling convention lives in ONE place
     # (contract.normalize_intrabar_resolution); this delegation keeps the
@@ -1622,7 +1732,6 @@ def _resolve_intrabar_exit(
     stop_price: float | None,
     take_profit_price: float | None,
     parameters: dict[str, Any] | None = None,
-    exit_at_open: bool = False,
 ) -> dict[str, Any] | None:
     if intrabar_df is None or intrabar_df.empty or intrabar_timeframe is None:
         return None
@@ -1651,10 +1760,6 @@ def _resolve_intrabar_exit(
     # stay excluded: the window ends at the trigger bar's close.
     base_duration = TIMEFRAME_TO_DURATION.get(str(base_timeframe).lower())
     window_end = effective_end + base_duration if base_duration else effective_end
-    if exit_at_open:
-        # Owner decision 2026-11-13: the signal exit fills at the exit bar's
-        # open, i.e. BEFORE any of that bar's sub-bars.
-        window_end = effective_end
     window = intrabar_df.loc[(timestamps >= effective_start) & (timestamps < window_end)]
     if window.empty:
         return None
@@ -1673,43 +1778,15 @@ def _resolve_intrabar_exit(
                 high = ask_high
             if ask_low is not None:
                 low = ask_low
-        # Owner decision 2026-11-13: a sub-bar that OPENS beyond a level gapped
-        # through it - the open is the sub-bar's first event, so that exit wins
-        # over a later touch of the other level on the same sub-bar and fills
-        # at the open, not at the skipped level (gap checked BEFORE the
-        # stop-first range test, mirroring native _check_stops). The entry
-        # bar's first sub-bar is exempt (the position was opened at that very
-        # open). Intrabar touches keep filling at the level.
-        spread = _vbt_bar_spread(row, parameters) if direction == "SHORT" else 0.0
-        sub_open = row.get("open")
-        trigger_open: float | None = None
-        if sub_open is not None and pd.notna(sub_open):
-            trigger_open = float(sub_open)
-            if direction == "SHORT" and bool((parameters or {}).get("ask_ohlc", False)):
-                trigger_open += spread
-        kind, gapped = contract.resolve_protective_exit(
+        event = _match_intrabar_exit_event(
             direction=direction,
-            bar_open=trigger_open,
             high=high,
             low=low,
             stop_price=stop_price,
             take_profit_price=take_profit_price,
-            allow_gap=timestamp > entry_ts,
         )
-        if kind is None:
+        if event is None:
             continue
-        level = stop_price if kind == "stop" else take_profit_price
-        assert level is not None  # a hit is only reported for a set level
-        # SHORT exits buy the ask: level and gap fills both carry the sub-bar
-        # spread, exactly like native _level_fill_price (A-H7). A gap fill at
-        # open + spread can be worse than the level - it is a market fill.
-        base = float(sub_open) if gapped else float(level)
-        event = {
-            "price": base + spread,
-            "reason": "stop_loss" if kind == "stop" else "take_profit",
-        }
-        if gapped:
-            event["gap"] = True
         event["time"] = timestamp.isoformat()
         event["resolution"] = intrabar_timeframe
         return event

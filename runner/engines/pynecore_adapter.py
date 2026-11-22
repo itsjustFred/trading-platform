@@ -47,11 +47,6 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
-from runner.engines.mtm_equity import (
-    build_mark_to_market_curve,
-    closes_from_frame,
-    describe_basis,
-)
 from runner.fees import resolve_fee_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR
@@ -120,30 +115,21 @@ def _apply_fill_parity(
       column is configured AND the entry bar is locatable — otherwise the
       engine price stands (default off = unchanged behavior).
     - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
-      follow ``signal_exit_fill``: "next_open" (default) and "open" fill at the
-      exit bar's open, "close" (legacy opt-in) at its close; SHORT open-exits
-      pay the spread (ask). Level exits keep the engine price (the level, or the
-      bar's open when it gapped through the level - see
-      :func:`_normalize_trade_exits`).
+      follow ``signal_exit_fill``: "close" (default) fills at the exit bar's
+      close, "open" at its open; SHORT open-exits pay the spread (ask).
+      Level exits keep the engine price (stop-market fills at the level).
     - Touched legs get their pnl recomputed from the new prices so
       trade.pnl stays consistent ahead of risk sizing.
 
     Known limitation (documented, not silent): stop/TP TRIGGER TIMING stays
     engine-internal — PyneCore detects triggers on its own feed without an
     ask-side distinction, so ask_ohlc cannot move a stop earlier post-hoc.
-    Price parity holds (stops fill at the level, or the open on a gap, in every engine); only the
+    Price parity holds (stops fill at the level in every engine); only the
     ask-side early-trigger edge is native/vectorbt-only.
     """
     if not trades or df is None or df.empty or "timestamp" not in df.columns:
         return
-    # PyneCore (like TradingView) fills market orders at the NEXT bar's open and
-    # stamps the ledger leg on that fill bar, so the default ``next_open``
-    # convention (owner decision 2026-11-13) prices the leg's own bar at its
-    # open - the same arithmetic as the legacy ``open`` opt-in. Only the legacy
-    # ``close`` opt-in re-prices to the leg bar's close.
-    fill_at_open = str(
-        getattr(config, "signal_exit_fill", "next_open") or "next_open"
-    ).lower() in {"open", "next_open"}
+    fill_at_open = str(getattr(config, "signal_exit_fill", "close") or "close").lower() == "open"
     timestamp_series = df["timestamp"]
     for trade in trades:
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
@@ -256,6 +242,23 @@ def _pyne_cli_start_bound(start_date: str) -> str:
     return raw
 
 
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Map the native-only ``next_open`` exit model onto this frozen adapter's
+    documented signal-bar fill (ADR ``docs/adr/0001-native-single-strategy-engine.md``:
+    frozen engines keep their existing semantics until removal). Without this a
+    default ``next_open`` run would silently simulate the legacy ``close`` fill
+    while the persisted meta claimed otherwise.
+    """
+    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
+    if mode != "next_open":
+        return config
+    logger.warning(
+        "frozen engine does not implement signal_exit_fill='next_open'; "
+        "running with the legacy 'close' signal-exit fill instead"
+    )
+    return config.model_copy(update={"signal_exit_fill": "close"})
+
+
 class PyneCoreAdapter(EngineAdapter):
     """Adapter for PyneCore-based Pine-style backtesting."""
 
@@ -270,6 +273,7 @@ class PyneCoreAdapter(EngineAdapter):
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         # #84: missing fee/slippage config is a hard error, never silent gross.
@@ -282,7 +286,6 @@ class PyneCoreAdapter(EngineAdapter):
         asset_classes: dict[str, str] = {}
         trade_counter = 0
         total_bars = 0
-        symbol_closes: dict[str, pd.Series] = {}
         strategy_name, context_builder, drawings_builder = _load_strategy_artifacts(
             strategy_path, config.strategy_name
         )
@@ -305,9 +308,6 @@ class PyneCoreAdapter(EngineAdapter):
                 )
 
             total_bars += len(df)
-            closes = closes_from_frame(df)
-            if closes is not None:
-                symbol_closes[symbol] = closes
             trades, symbol_stats = self._run_pyne_for_symbol(
                 config, strategy_path, symbol, df, context_builder, trade_counter
             )
@@ -339,15 +339,10 @@ class PyneCoreAdapter(EngineAdapter):
             asset_class_by_symbol=asset_classes,
             fee_model=fee_model,
         )
-        equity_curve, unmarked_symbols = _equity_curve_from_trades(
-            config, all_trades, symbol_closes
-        )
-        meta = _pyne_meta(config, strategy_name, resolved_parameters, total_bars)
-        meta.data = {**(meta.data or {}), **describe_basis(unmarked_symbols)}
         result = BacktestResult(
-            meta=meta,
+            meta=_pyne_meta(config, strategy_name, resolved_parameters, total_bars),
             trades=all_trades,
-            equity_curve=equity_curve,
+            equity_curve=_equity_curve_from_trades(config, all_trades),
             stats=all_stats,
             drawings=all_drawings,
         )
@@ -460,6 +455,7 @@ class PyneCoreAdapter(EngineAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                check=False,
                 capture_output=True,
                 text=True,
                 cwd=str(tmpdir_path),
@@ -532,25 +528,41 @@ def _apply_fee_model(all_trades: list[Trade], fee_model) -> None:
         trade.net_pnl = round(float(trade.pnl) - fees, 2)
 
 
-def _equity_curve_from_trades(
-    config: BacktestConfig,
-    all_trades: list[Trade],
-    closes: dict[str, pd.Series],
-) -> tuple[list[EquityPoint], list[str]]:
-    """Mark-to-market portfolio curve from the merged (risk-sized) trades."""
-    if not all_trades:
-        return [], []
+def _equity_curve_from_trades(config: BacktestConfig, all_trades: list[Trade]) -> list[EquityPoint]:
+    """Build a net, exit-timed equity curve from merged trades."""
+    equity = float(config.initial_capital)
+    events: list[tuple[str, float]] = []
+    for trade in all_trades:
+        exits = sorted(trade.exits or [], key=lambda item: str(item.time))
+        if not exits:
+            events.append((str(trade.entry_time), float(trade.net_pnl or 0.0)))
+            continue
+        gross_total = sum(float(leg.pnl or 0.0) for leg in exits)
+        net_total = (
+            float(trade.net_pnl)
+            if trade.net_pnl is not None
+            else float(trade.pnl) - float(trade.fees or 0.0)
+        )
+        fee_delta = net_total - gross_total
+        for leg in exits:
+            gross_leg = float(leg.pnl or 0.0)
+            share = gross_leg / gross_total if gross_total else 1.0 / len(exits)
+            events.append((str(leg.time), gross_leg + fee_delta * share))
+
+    if not events:
+        return []
     start = pd.to_datetime(config.start_date, utc=True, errors="coerce")
     if pd.isna(start):
-        start = pd.to_datetime(
-            min(str(trade.entry_time) for trade in all_trades), utc=True, format="mixed"
-        )
-    return build_mark_to_market_curve(
-        all_trades,
-        closes,
-        float(config.initial_capital),
-        start_time=pd.Timestamp(start).isoformat(),
-    )
+        start = pd.to_datetime(events[0][0], utc=True)
+    curve = [EquityPoint(time=pd.Timestamp(start).isoformat(), equity=round(equity, 2))]
+    for timestamp, pnl in sorted(events, key=lambda item: (pd.Timestamp(item[0]), item[0])):
+        equity += pnl
+        point = EquityPoint(time=pd.Timestamp(timestamp).isoformat(), equity=round(equity, 2))
+        if curve[-1].time == point.time:
+            curve[-1] = point
+        else:
+            curve.append(point)
+    return curve
 
 
 def _pyne_meta(
@@ -1373,6 +1385,15 @@ def _initial_exit_reason(raw_signal: str) -> str | None:
     return "_".join(signal.lower().split())
 
 
+def _csv_trade_direction(trade_type: str) -> str:
+    """LONG/SHORT from a lower-cased "entry long"/"entry short" cell, else raise."""
+    if "long" in trade_type and "short" not in trade_type:
+        return "LONG"
+    if "short" in trade_type and "long" not in trade_type:
+        return "SHORT"
+    raise ValueError(f"unknown trade direction in trade CSV type {trade_type!r}")
+
+
 def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]:
     trades: list[Trade] = []
     entries: dict[int, dict[str, Any]] = {}
@@ -1391,7 +1412,7 @@ def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]
                         "time": row["Date/Time"],
                         "price": 0.0,
                         "contracts": 0.0,
-                        "direction": "LONG" if "long" in trade_type else "SHORT",
+                        "direction": _csv_trade_direction(trade_type),
                     },
                 )
                 quantity = float(row["Contracts"])
