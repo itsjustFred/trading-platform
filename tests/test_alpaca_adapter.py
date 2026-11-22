@@ -3057,6 +3057,210 @@ def test_flat_marker_is_kept_while_its_recorded_protection_works(
     assert cleared == []
 
 
+def test_flat_branch_reads_the_book_before_the_position(monkeypatch) -> None:
+    """The flat branch lists the book BEFORE reading the position (#367 review).
+
+    A marker-owned order that fills during the listing reopens the position:
+    read position-first, the stale flat answer spends the marker over a live
+    position; listed first, the position read sees the reopen and the marker
+    stays for the re-protection path.
+    """
+    exit_order = _FakeOrder(
+        id="exit-1",
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        qty=10.0,
+        limit_price=200.0,
+        status="new",
+    )
+    client = _FakeTradingClient(orders=[exit_order], positions=[])
+    calls: list[str] = []
+    original_get_orders = client.get_orders
+    fired = {"done": False}
+
+    def _get_orders(filter=None):  # noqa: A002 - mirrors alpaca-py
+        calls.append("orders")
+        if not fired["done"]:
+            fired["done"] = True
+            # The marker-owned exit fills mid-listing and reopens the position.
+            client.orders = [
+                order for order in client.orders if order is not exit_order
+            ]
+            client.positions.append(_FakePosition("AAPL", 6.0))
+        return original_get_orders(filter)
+
+    def _get_positions():
+        calls.append("positions")
+        return list(client.positions)
+
+    client.get_orders = _get_orders  # type: ignore[method-assign]
+    client.get_all_positions = _get_positions  # type: ignore[method-assign]
+    adapter = _adapter(client)
+    _patch_pending_reprotections(monkeypatch, [_flat_marker_row()])
+    clears: list[tuple[str, str, str]] = []
+
+    async def _record_clear(signal_id: str, symbol: str, reason: str) -> None:
+        clears.append((signal_id, symbol, reason))
+
+    monkeypatch.setattr(
+        alpaca_module, "_clear_exit_reprotection_marker", _record_clear
+    )
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    # The marker is spent only AFTER protection is re-placed on the reopened
+    # position - never as "position flat" over a live position.
+    assert clears == [("sig-1", "AAPL", "recovery re-placed protection")]
+    assert client.submitted, "the reopened remainder must be re-protected"
+    assert calls.index("orders") < calls.index("positions")
+
+
+def _entry_marker(entry_id: str) -> dict:
+    return {
+        "side": "sell",
+        "stop_price": 190.0,
+        "take_profit_price": 210.0,
+        "entry_signal_id": entry_id,
+    }
+
+
+def test_flat_marker_is_kept_while_an_entry_signal_order_works(
+    monkeypatch,
+) -> None:
+    """``client_order_id == entry_signal_id`` is marker-owned (#367 review)."""
+    entry_id = str(uuid4())
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="entry-order-1",
+                symbol="AAPL",
+                side="buy",
+                order_type="limit",
+                qty=5.0,
+                limit_price=195.0,
+                status="new",
+                client_order_id=entry_id,
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    _patch_pending_reprotections(
+        monkeypatch,
+        [_reprotect_row(_entry_marker(entry_id), broker_order_id="exit-1")],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert cleared == []
+
+
+def test_flat_marker_is_kept_while_a_verified_reprotect_order_works(
+    monkeypatch,
+) -> None:
+    """A ``{entry}-reprotect-{exit}`` client order id verified to the marker's
+    entry keeps the flat marker pending (#367 review)."""
+    entry_id = str(uuid4())
+    exit_id = str(uuid4())
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="reprotect-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="stop",
+                qty=6.0,
+                stop_price=190.0,
+                status="new",
+                client_order_id=f"{entry_id}-reprotect-{exit_id}",
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    monkeypatch.setattr(alpaca_module, "get_live_signal_metadata", lambda _sid: {})
+    _patch_pending_reprotections(
+        monkeypatch,
+        [_reprotect_row(_entry_marker(entry_id), broker_order_id="exit-1")],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert cleared == []
+
+
+def test_flat_marker_is_cleared_when_reprotect_verifies_to_another_entry(
+    monkeypatch,
+) -> None:
+    """A ``-reprotect`` id that verifies to a DIFFERENT entry is not this
+    marker's order: on a flat book with nothing else working the marker is
+    spent (#367 review)."""
+    entry_id = str(uuid4())
+    other_id = str(uuid4())
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="reprotect-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="stop",
+                qty=6.0,
+                stop_price=190.0,
+                status="new",
+                client_order_id=f"{other_id}-reprotect-{uuid4()}",
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    monkeypatch.setattr(alpaca_module, "get_live_signal_metadata", lambda _sid: {})
+    _patch_pending_reprotections(
+        monkeypatch,
+        [_reprotect_row(_entry_marker(entry_id), broker_order_id="exit-1")],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert cleared == ["sig-1"]
+
+
+def test_flat_marker_is_kept_while_a_bracket_leg_map_order_works(
+    monkeypatch,
+) -> None:
+    """An order id the learned bracket-leg map attributes to the marker's
+    entry keeps the flat marker pending (#367 review)."""
+    entry_id = str(uuid4())
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                id="leg-mapped-1",
+                symbol="AAPL",
+                side="sell",
+                order_type="stop",
+                qty=6.0,
+                stop_price=190.0,
+                status="new",
+            )
+        ],
+        positions=[],
+    )
+    adapter = _adapter(client)
+    adapter._bracket_leg_order_id_to_signal_id["leg-mapped-1"] = entry_id
+    _patch_pending_reprotections(
+        monkeypatch,
+        [_reprotect_row(_entry_marker(entry_id), broker_order_id="exit-1")],
+    )
+    cleared = _patch_marker_clears(monkeypatch)
+
+    asyncio.run(adapter._recover_exit_reprotections())
+
+    assert cleared == []
+
+
 def test_full_fill_marker_requires_the_replacement_protection_to_exist(
     monkeypatch,
 ) -> None:
