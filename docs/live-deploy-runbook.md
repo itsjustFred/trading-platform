@@ -441,9 +441,14 @@ Keep the daemon running long enough to verify Discord connection, paper order su
 
 Every live account and every deployment carries a persisted loss breaker
 (`live_loss_breaker_state`, one row per `account:<id>` and `deployment:<id>`
-scope). Both breakers measure the broker account's equity — a deployment has
-no equity of its own, so a deployment scope applies its own thresholds to the
-equity of the account it trades on:
+scope). The account scope measures the broker account's equity — for cTrader
+that is balance **plus unrealized P&L** of open positions, so an open position
+under water counts before it is closed. The deployment scope cannot read a
+"deployment equity" from the broker (positions on a netted account belong to
+the account), so it observes a synthetic equity: account equity minus every
+OTHER deployment's trading P&L, reconstructed from the persisted fill ledger
+and marked to market. The scope therefore moves only with its own
+deployment's realized+unrealized P&L, on the account-equity scale:
 
 - **Daily loss** — equity down the configured fraction (default 5 %) of the
   start-of-day equity. The baseline is the last equity observed before the UTC
@@ -454,9 +459,17 @@ equity of the account it trades on:
   operator reset, which also re-bases the peak to the current equity.
 
 On breach the breaker blocks **new entries only** — exits are never blocked
-(PAUSED semantics). A breach latches and alerts once per episode through the
-`data.alert` log path. An unreadable breaker state or unreadable equity fails
+(PAUSED semantics), and resting entry orders already at the broker are NOT
+cancelled; they are the same class of exposure a manual PAUSE leaves. A
+breach latches and alerts once per episode through the `data.alert` log path —
+until #331 lands that is an ERROR log line (picked up by Sentry), not a
+webhook. An unreadable breaker state, unreadable equity, or a deployment P&L
+that cannot be measured (untrusted fill price, missing quote/pip value) fails
 closed and refuses entries.
+
+Deposits and withdrawals are NOT separated from P&L: a 5 % withdrawal trips
+the daily breaker and a 20 % withdrawal latches drawdown. After a planned
+withdrawal, run `reset-drawdown` once the new equity is being observed.
 
 Thresholds, most specific first: deployment `settings` keys
 (`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
@@ -474,10 +487,18 @@ uv run python -m scripts.live_loss_breaker status
 uv run python -m scripts.live_loss_breaker status --account alpaca-paper
 
 # The only way to clear a drawdown latch: re-bases the peak to the current
-# equity (latest balance snapshot, or --equity to state it explicitly):
+# equity. Resetting an account scope ALSO resets that account's deployment
+# scopes (each to its own last observed equity) and prints any scopes still
+# latched - the daily latches intentionally survive until the UTC rollover:
 uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
-uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id> --equity 82000
+uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id>
 ```
+
+Without `--equity` an account scope re-bases to the latest balance snapshot,
+refused when that snapshot is missing, non-positive or older than 10 minutes
+- pass `--equity` to state the figure explicitly. A deployment scope always
+re-bases to its own last observed (P&L-adjusted) equity; `--equity` does not
+apply to it.
 
 There is deliberately no daily reset command: the daily breaker resets itself
 at the UTC boundary.

@@ -36,6 +36,8 @@ from shared.database import (
     list_live_loss_breaker_states,
     observe_live_loss_breaker,
     save_live_balance,
+    save_live_execution,
+    save_live_signal,
 )
 from shared.models import LiveBalanceRecord, LiveDeploymentConfig, LiveSignal
 
@@ -65,6 +67,32 @@ def _deployment(
 def _observe(scope_account: str, equity: float, when: datetime) -> None:
     observe_live_loss_breaker(
         account_loss_breaker_scope(scope_account), scope_account, equity, when
+    )
+
+
+def _gate(
+    deployment: LiveDeploymentConfig,
+    *,
+    equity: float,
+    now: datetime,
+    env_values: dict | None = None,
+    symbol: str | None = None,
+    deployment_equity: float | None = None,
+) -> None:
+    """The entry gate with ``deployment_equity`` defaulting to ``equity``.
+
+    These tests have no other deployments' P&L, so the deployment scope's
+    synthetic equity equals the account equity; tests that exercise the
+    P&L-adjusted scope pass ``deployment_equity`` or call
+    ``refuse_entry_if_loss_breaker_tripped`` directly.
+    """
+    return refuse_entry_if_loss_breaker_tripped(
+        deployment,
+        equity=equity,
+        deployment_equity=equity if deployment_equity is None else deployment_equity,
+        now=now,
+        env_values=NO_ENV if env_values is None else env_values,
+        symbol=symbol,
     )
 
 
@@ -184,7 +212,7 @@ def test_daily_breaker_trips_at_five_percent_and_refuses_entries():
     _observe("acc-daily", 100_000.0, DAY1)
     # Equity down exactly 5 %: the threshold is inclusive.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=95_000.0, now=DAY1, env_values=NO_ENV
         )
     assert excinfo.value.kind == "daily"
@@ -197,7 +225,7 @@ def test_daily_breaker_allows_losses_below_threshold():
     deployment = _deployment(account_id="acc-ok")
     _observe("acc-ok", 100_000.0, DAY1)
     # 4.9 % down: under the 5 % daily limit and far under the drawdown limit.
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         deployment, equity=95_100.0, now=DAY1, env_values=NO_ENV
     )
 
@@ -206,13 +234,13 @@ def test_daily_latch_holds_even_if_equity_recovers_same_day():
     deployment = _deployment(account_id="acc-latch")
     _observe("acc-latch", 100_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=94_000.0, now=DAY1, env_values=NO_ENV
         )
     # Equity back above the threshold: the latch still refuses - the daily
     # breaker resets at the UTC boundary, not on recovery.
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=99_000.0, now=DAY1 + timedelta(hours=1), env_values=NO_ENV
         )
 
@@ -221,13 +249,13 @@ def test_daily_breaker_resets_at_utc_day_boundary():
     deployment = _deployment(account_id="acc-roll")
     _observe("acc-roll", 100_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=90_000.0, now=DAY1, env_values=NO_ENV
         )
     # Next UTC day: the daily latch clears and the baseline re-bases to the
     # last pre-boundary equity (90 000), so the same equity is not a "daily"
     # loss any more.
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         deployment, equity=90_000.0, now=DAY2, env_values=NO_ENV
     )
     state = get_live_loss_breaker_state(account_loss_breaker_scope("acc-roll"))
@@ -242,7 +270,7 @@ def test_overnight_gap_counts_against_the_new_day():
     _observe("acc-gap", 100_000.0, DAY1)
     # 10 % gap down observed just after the UTC boundary.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=90_000.0, now=DAY2, env_values=NO_ENV
         )
     assert excinfo.value.kind == "daily"
@@ -256,7 +284,7 @@ def test_drawdown_breaker_trips_twenty_percent_below_peak():
     _observe("acc-dd", 100_000.0, DAY1)
     _observe("acc-dd", 120_000.0, DAY1 + timedelta(hours=1))  # new peak
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=95_999.0, now=DAY1 + timedelta(hours=2), env_values=NO_ENV
         )
     assert excinfo.value.kind == "drawdown"
@@ -269,7 +297,7 @@ def test_drawdown_latch_survives_equity_recovery_and_day_rollover():
     deployment = _deployment(account_id="acc-dd2")
     _observe("acc-dd2", 100_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=79_000.0, now=DAY1, env_values=NO_ENV
         )
     # 21 % under day-start AND 21 % under peak: BOTH latches must be set -
@@ -281,7 +309,7 @@ def test_drawdown_latch_survives_equity_recovery_and_day_rollover():
     # Recovery and a new UTC day do NOT clear the drawdown latch: only the
     # explicit operator reset does.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=100_000.0, now=DAY2, env_values=NO_ENV
         )
     assert excinfo.value.kind == "drawdown"
@@ -294,7 +322,7 @@ def test_drawdown_operator_reset_clears_latch_and_rebases_peak():
     scope = account_loss_breaker_scope("acc-dd3")
     _observe("acc-dd3", 100_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=79_000.0, now=DAY1, env_values=NO_ENV
         )
     updated = reset_drawdown_breaker(scope, equity=80_000.0, now=DAY1)
@@ -303,18 +331,18 @@ def test_drawdown_operator_reset_clears_latch_and_rebases_peak():
     # The reset is drawdown-only: the daily latch from the same crash still
     # stands, so entries stay refused the rest of the UTC day.
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=80_000.0, now=DAY1, env_values=NO_ENV
         )
     # Next UTC day the daily breaker resets; with the drawdown latch cleared
     # and the peak re-based to 80k, entries are allowed again - the old 100k
     # high-water mark cannot re-trip the breaker.
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         deployment, equity=80_000.0, now=DAY2, env_values=NO_ENV
     )
     # But a fresh 20 % drawdown from the NEW peak still trips.
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=63_000.0, now=DAY2, env_values=NO_ENV
         )
 
@@ -335,13 +363,13 @@ def test_account_breach_blocks_every_deployment_on_the_account():
     dep_b = _deployment(account_id="acc-shared")
     _observe("acc-shared", 100_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             dep_a, equity=90_000.0, now=DAY1, env_values=NO_ENV
         )
     # A second deployment on the same account is refused by the ACCOUNT
     # scope even though its own deployment scope never breached.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             dep_b, equity=90_000.0, now=DAY1, env_values=NO_ENV
         )
     assert excinfo.value.scope == account_loss_breaker_scope("acc-shared")
@@ -357,12 +385,12 @@ def test_deployment_breach_blocks_only_that_deployment():
     # 2 % down: over the tight deployment's 1 % daily limit, under the
     # account's 5 %.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             tight, equity=98_000.0, now=DAY1, env_values=NO_ENV
         )
     assert excinfo.value.scope == deployment_loss_breaker_scope(str(tight.id))
     # The sibling deployment on the same account still trades.
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         loose, equity=98_000.0, now=DAY1, env_values=NO_ENV
     )
 
@@ -373,10 +401,10 @@ def test_other_accounts_are_unaffected():
     _observe("acc-hit", 100_000.0, DAY1)
     _observe("acc-safe", 50_000.0, DAY1)
     with pytest.raises(LossBreakerBreachError):
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             dep, equity=90_000.0, now=DAY1, env_values=NO_ENV
         )
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         other, equity=50_000.0, now=DAY1, env_values=NO_ENV
     )
 
@@ -389,13 +417,13 @@ def test_disabled_deployment_scope_never_latches_but_account_still_enforces():
     _observe("acc-off", 100_000.0, DAY1)
     # A quiet observation creates the deployment row (baseline stays warm for
     # a re-enable) without latching it.
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         deployment, equity=99_000.0, now=DAY1, env_values=NO_ENV
     )
     # 10 % down: the ACCOUNT breaker (5 %) refuses; the disabled deployment
     # scope never latches on its own.
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=90_000.0, now=DAY1, env_values=NO_ENV
         )
     assert excinfo.value.scope == account_loss_breaker_scope("acc-off")
@@ -413,7 +441,7 @@ def test_fully_disabled_breaker_never_writes_state():
         settings={"loss_breaker_enabled": False},
     )
     env = {"LOSS_BREAKER_ENABLED": "false"}
-    refuse_entry_if_loss_breaker_tripped(
+    _gate(
         deployment, equity=50_000.0, now=DAY1, env_values=env
     )
     assert list_live_loss_breaker_states("acc-off2") == []
@@ -426,7 +454,7 @@ def test_unreadable_equity_refuses_entries():
     deployment = _deployment(account_id="acc-bad-eq")
     for bad in (0.0, -5.0, float("nan"), float("inf")):
         with pytest.raises(LossBreakerBreachError) as excinfo:
-            refuse_entry_if_loss_breaker_tripped(
+            _gate(
                 deployment, equity=bad, now=DAY1, env_values=NO_ENV
             )
         assert excinfo.value.state_unreadable is True
@@ -440,7 +468,7 @@ def test_unreadable_state_refuses_entries(monkeypatch):
 
     monkeypatch.setattr(loss_breaker, "observe_live_loss_breaker", _boom)
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=100_000.0, now=DAY1, env_values=NO_ENV
         )
     assert excinfo.value.state_unreadable is True
@@ -461,7 +489,7 @@ def test_nonpositive_stored_baseline_refuses_entries():
         session.add(row)
         session.commit()
     with pytest.raises(LossBreakerBreachError) as excinfo:
-        refuse_entry_if_loss_breaker_tripped(
+        _gate(
             deployment, equity=100_000.0, now=DAY1, env_values=NO_ENV
         )
     assert excinfo.value.state_unreadable is True
@@ -477,7 +505,7 @@ def test_breach_alerts_once_per_episode(caplog):
     with caplog.at_level(logging.ERROR, logger=logger.name):
         for _ in range(3):
             with pytest.raises(LossBreakerBreachError):
-                refuse_entry_if_loss_breaker_tripped(
+                _gate(
                     deployment, equity=90_000.0, now=DAY1, env_values=NO_ENV
                 )
     alerts = [
@@ -500,6 +528,7 @@ def test_poll_observation_trips_breaker_without_any_entry():
         100_000.0,
         now=DAY1,
         deployments=[dep_a, dep_b],
+        deployment_pnls={},
         env_values=NO_ENV,
     )
     # Second poll: equity down 6 % - both scopes latch on the poll itself.
@@ -508,11 +537,12 @@ def test_poll_observation_trips_breaker_without_any_entry():
         94_000.0,
         now=DAY1 + timedelta(minutes=1),
         deployments=[dep_a, dep_b],
+        deployment_pnls={},
         env_values=NO_ENV,
     )
     for dep in (dep_a, dep_b):
         with pytest.raises(LossBreakerBreachError):
-            refuse_entry_if_loss_breaker_tripped(
+            _gate(
                 dep, equity=94_000.0, now=DAY1, env_values=NO_ENV
             )
     state = get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep_a.id)))
@@ -527,6 +557,7 @@ def test_poll_observation_ignores_deployments_of_other_accounts():
         100_000.0,
         now=DAY1,
         deployments=[mine, theirs],
+        deployment_pnls={},
         env_values=NO_ENV,
     )
     scopes = {row.scope for row in list_live_loss_breaker_states("acc-p1")}
@@ -536,7 +567,7 @@ def test_poll_observation_ignores_deployments_of_other_accounts():
 
 def test_poll_observation_skips_unusable_equity(caplog):
     observe_account_loss_breaker_equity(
-        "acc-p3", float("nan"), now=DAY1, deployments=[], env_values=NO_ENV
+        "acc-p3", float("nan"), now=DAY1, deployments=[], deployment_pnls={}, env_values=NO_ENV
     )
     assert list_live_loss_breaker_states("acc-p3") == []
 
@@ -624,3 +655,406 @@ def test_latest_balance_lookup_for_reset():
     latest = get_latest_live_balance("acc-bal")
     assert latest is not None
     assert latest.equity == pytest.approx(95.5)
+
+
+# ─── Deployment scope: the deployment's OWN P&L (#301 review) ─────────────────
+#
+# A deployment scope does not observe raw account equity: it observes
+# ``account_equity - sum(other deployments' P&L)`` so it moves only with its
+# own deployment's realized+unrealized P&L. These tests pin that a deployment
+# losing money trips ITS breaker even while the account net is fine, and that
+# an unmeasurable deployment P&L fails closed.
+
+
+def test_deployment_scope_trips_on_own_pnl_while_account_stays_under():
+    """The reviewer's scenario: A loses 6%, B gains 3%, account nets -3%."""
+    dep_a = _deployment(account_id="acc-pnl")
+    dep_b = _deployment(account_id="acc-pnl")
+    pnls_flat = {str(dep_a.id): 0.0, str(dep_b.id): 0.0}
+    observe_account_loss_breaker_equity(
+        "acc-pnl", 100_000.0, now=DAY1,
+        deployments=[dep_a, dep_b], deployment_pnls=pnls_flat, env_values=NO_ENV,
+    )
+    # Account equity -3% (A -6k, B +3k): under the 5% account daily limit.
+    observe_account_loss_breaker_equity(
+        "acc-pnl", 97_000.0, now=DAY1 + timedelta(minutes=1),
+        deployments=[dep_a, dep_b],
+        deployment_pnls={str(dep_a.id): -6_000.0, str(dep_b.id): 3_000.0},
+        env_values=NO_ENV,
+    )
+    account_state = get_live_loss_breaker_state(account_loss_breaker_scope("acc-pnl"))
+    assert account_state.daily_breached is False
+    # A's synthetic equity: 97_000 - (-3_000) + (-6_000) = 94_000 -> -6%: trips.
+    state_a = get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep_a.id)))
+    assert state_a.daily_breached is True
+    assert state_a.last_equity == pytest.approx(94_000.0)
+    # B's synthetic equity: 97_000 - (-3_000) + 3_000 = 103_000 -> +3%: fine.
+    state_b = get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep_b.id)))
+    assert state_b.daily_breached is False
+    assert state_b.drawdown_breached is False
+
+
+def test_gate_uses_deployment_equity_not_account_equity():
+    dep = _deployment(account_id="acc-v")
+    _observe("acc-v", 100_000.0, DAY1)
+    # Account equity flat at 100k but this deployment's synthetic equity is
+    # 94k (-6%): only the deployment scope trips.
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        _gate(dep, equity=100_000.0, now=DAY1, deployment_equity=94_000.0)
+    assert excinfo.value.scope == deployment_loss_breaker_scope(str(dep.id))
+
+
+def test_gate_refuses_when_deployment_pnl_unmeasurable():
+    dep = _deployment(account_id="acc-nopnl")
+    _observe("acc-nopnl", 100_000.0, DAY1)
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        refuse_entry_if_loss_breaker_tripped(
+            dep, equity=100_000.0, deployment_equity=None,
+            now=DAY1, env_values=NO_ENV,
+        )
+    assert excinfo.value.state_unreadable is True
+    assert excinfo.value.scope == deployment_loss_breaker_scope(str(dep.id))
+
+
+def test_gate_skips_unmeasurable_deployment_scope_when_disabled():
+    dep = _deployment(
+        account_id="acc-nopnl2", settings={"loss_breaker_enabled": False}
+    )
+    _observe("acc-nopnl2", 100_000.0, DAY1)
+    # Deployment breaker disabled: no P&L needed, account scope still passes.
+    refuse_entry_if_loss_breaker_tripped(
+        dep, equity=100_000.0, deployment_equity=None,
+        now=DAY1, env_values=NO_ENV,
+    )
+
+
+def test_poll_skips_deployment_scopes_when_pnl_unmeasurable():
+    dep = _deployment(account_id="acc-pnp")
+    observe_account_loss_breaker_equity(
+        "acc-pnp", 100_000.0, now=DAY1,
+        deployments=[dep], deployment_pnls=None, env_values=NO_ENV,
+    )
+    # Account scope observed; the deployment scope was skipped entirely.
+    assert get_live_loss_breaker_state(account_loss_breaker_scope("acc-pnp")) is not None
+    assert (
+        get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep.id)))
+        is None
+    )
+
+
+# ─── Deployment P&L reconstruction from the fill ledger ────────────────────────
+
+
+def _persist_fill(
+    account_id: str,
+    deployment_id: str,
+    symbol: str,
+    action: str,
+    qty: float,
+    price: float,
+    *,
+    observed: str | None = "observed",
+    commission: float | None = None,
+) -> None:
+    """Persist account+deployment+signal+execution rows for the flow ledger."""
+    import shared.database as database
+    from shared.models import LiveExecution, LiveSignal
+
+    with database.get_session() as session:
+        if session.get(database.LiveAccountModel, account_id) is None:
+            session.add(
+                database.LiveAccountModel(id=account_id, broker="test", name=account_id)
+            )
+        if session.get(database.LiveDeploymentModel, deployment_id) is None:
+            session.add(
+                database.LiveDeploymentModel(
+                    id=deployment_id,
+                    strategy_name="t",
+                    account_id=account_id,
+                    symbols_json=[symbol],
+                    timeframe="1h",
+                )
+            )
+        session.commit()
+    signal = LiveSignal(
+        id=uuid4(),
+        deployment_id=deployment_id,
+        symbol=symbol,
+        action=action,
+        theoretical_price=price,
+        timestamp=DAY1,
+        metadata={},
+    )
+    save_live_signal(signal)
+    save_live_execution(
+        LiveExecution(
+            signal_id=signal.id,
+            actual_price=price,
+            filled_qty=qty,
+            commission=commission,
+            timestamp=DAY1,
+            broker_order_id=f"bo-{uuid4()}",
+            actual_price_observed=observed,
+        )
+    )
+
+
+class _PnlAdapter:
+    """Adapter stub for deployment-P&L marking: flat quotes, unit pip value."""
+
+    def __init__(self, price: float = 100.0, *, pip: float = 1.0, quote_fails: bool = False):
+        self._price = price
+        self._pip = pip
+        self._quote_fails = quote_fails
+
+    async def get_quote(self, symbol):
+        if self._quote_fails:
+            raise RuntimeError("no quote")
+        return LiveQuote(bid=self._price, ask=self._price, timestamp=datetime.now(timezone.utc))
+
+    async def get_pip_value(self, symbol):
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=self._pip, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+
+def test_deployment_pnl_combines_realized_and_unrealized():
+    """buy 100@100, sell 50@110, mark 115, pip 1 -> pnl 1250."""
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-flow", dep_id, "AAPL", "buy", 100.0, 100.0)
+    _persist_fill("acc-flow", dep_id, "AAPL", "sell", 50.0, 110.0)
+    pnls = asyncio.run(account_deployment_trading_pnls(_PnlAdapter(115.0), "acc-flow"))
+    assert pnls is not None
+    assert pnls[dep_id] == pytest.approx(1_250.0)
+
+
+def test_deployment_pnl_subtracts_commission():
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-flow2", dep_id, "AAPL", "buy", 10.0, 100.0, commission=5.0)
+    pnls = asyncio.run(account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-flow2"))
+    assert pnls is not None
+    # Flat mark: cash -1000 + qty 10 * 100 = 0, minus commission 5.
+    assert pnls[dep_id] == pytest.approx(-5.0)
+
+
+def test_deployment_pnl_fails_closed_on_untrusted_fill_price():
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-flow3", dep_id, "AAPL", "buy", 10.0, 100.0, observed="absent")
+    pnls = asyncio.run(account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-flow3"))
+    assert pnls is None
+
+
+def test_deployment_pnl_fails_closed_without_quote_for_open_position():
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-flow4", dep_id, "AAPL", "buy", 10.0, 100.0)
+    pnls = asyncio.run(
+        account_deployment_trading_pnls(_PnlAdapter(quote_fails=True), "acc-flow4")
+    )
+    assert pnls is None
+
+
+def test_deployment_pnl_empty_ledger_returns_empty_map():
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    pnls = asyncio.run(account_deployment_trading_pnls(_PnlAdapter(), "acc-no-fills"))
+    assert pnls == {}
+
+
+# ─── Daemon wiring: poll, claim path, run_daemon (#301 review mutants) ─────────
+
+
+class _PollAdapter:
+    """Balance-poll adapter: scripted equity, no positions, unit pip value."""
+
+    def __init__(self, equities: list[float]) -> None:
+        self._equities = list(equities)
+
+    async def get_balance(self):
+        equity = self._equities.pop(0) if len(self._equities) > 1 else self._equities[0]
+        return equity, equity
+
+    async def get_quote(self, symbol):
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc))
+
+    async def get_pip_value(self, symbol):
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+
+def test_poll_adapter_balance_latches_account_and_deployment_scopes():
+    """Drives the real ``_poll_adapter_balance``: a 6% equity drop latches
+    BOTH the account scope and the deployment scope on the poll itself, and
+    the deployment row inherits the account baseline (it is created mid-stream)."""
+    dep = _deployment(account_id="acc-pollwire")
+    adapter = _PollAdapter([100_000.0, 94_000.0])
+    for equity_time in (DAY1, DAY1 + timedelta(minutes=1)):
+        asyncio.run(
+            daemon._poll_adapter_balance(
+                {"acc-pollwire": adapter},
+                "acc-pollwire",
+                adapter,
+                equity_time,
+                current_deployments=lambda: [dep],
+            )
+        )
+    account_state = get_live_loss_breaker_state(account_loss_breaker_scope("acc-pollwire"))
+    assert account_state.daily_breached is True
+    dep_state = get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep.id)))
+    assert dep_state is not None
+    assert dep_state.daily_breached is True
+    # Seeded from the account row's baseline, not blind at 94k.
+    assert dep_state.day_start_equity == pytest.approx(100_000.0)
+
+
+def test_poll_balances_forwards_current_deployments():
+    """``_poll_balances`` must hand ``current_deployments`` to the per-account
+    poll - without it deployment scopes can never be observed."""
+    captured = {}
+
+    async def _fake_poll_adapter_balance(*args, **kwargs):
+        captured["current_deployments"] = kwargs.get("current_deployments")
+
+    import live_runner.daemon as daemon_module
+
+    original = daemon_module._poll_adapter_balance
+    daemon_module._poll_adapter_balance = _fake_poll_adapter_balance
+    dep = _deployment(account_id="acc-fwd")
+    try:
+        async def _one_tick():
+            import contextlib
+
+            task = asyncio.create_task(
+                daemon_module._poll_balances(
+                    {"acc-fwd": _PollAdapter([1.0])},
+                    interval_seconds=60.0,
+                    current_deployments=lambda: [dep],
+                )
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_one_tick())
+    finally:
+        daemon_module._poll_adapter_balance = original
+    assert captured["current_deployments"] is not None
+    assert captured["current_deployments"]()[0].id == dep.id
+
+
+def test_start_balance_poller_wires_deployment_snapshot():
+    """``run_daemon`` starts the poller through ``_start_balance_poller``; the
+    snapshot must reach ``_poll_balances`` as ``current_deployments``."""
+    import live_runner.daemon as daemon_module
+
+    captured = {}
+
+    async def _fake_poll_balances(adapters, **kwargs):
+        captured.update(kwargs)
+
+    original = daemon_module._poll_balances
+    daemon_module._poll_balances = _fake_poll_balances
+    dep = _deployment(account_id="acc-wire")
+    try:
+        async def _run():
+            task = daemon_module._start_balance_poller({}, [dep])
+            await task
+
+        asyncio.run(_run())
+    finally:
+        daemon_module._poll_balances = original
+    assert callable(captured.get("current_deployments"))
+    assert captured["current_deployments"]()[0].id == dep.id
+
+
+def test_claim_path_logs_breaker_refusal_and_submits_nothing(monkeypatch, caplog):
+    """A LossBreakerBreachError in the claim path logs the distinct breaker
+    warning and returns BEFORE the submission claim - nothing is sent and the
+    signal is not marked failed by the generic handler."""
+    import logging
+
+    from risk.models import TradeSignal
+
+    dep = _deployment(account_id="acc-claim")
+    adapter = _Adapter(equity=100_000.0)
+    claims = []
+
+    async def _raise_breaker(*args, **kwargs):
+        raise LossBreakerBreachError(
+            "refused",
+            scope=account_loss_breaker_scope("acc-claim"),
+            kind="daily",
+            account_id="acc-claim",
+            deployment_id=str(dep.id),
+        )
+
+    def _claim(*args, **kwargs):
+        claims.append(args)
+        return True
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _raise_breaker)
+    monkeypatch.setattr(daemon, "claim_live_deployment_submission", _claim)
+    normalized = TradeSignal(
+        action="buy", symbol="AAPL", entry_price=100.0, stop_loss=95.0,
+        take_profit=110.0, timeframe="1h", metadata={},
+    )
+    live_signal = _entry_signal(dep)
+    logger = daemon.logger
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        asyncio.run(
+            daemon._prepare_claim_and_submit_signal(
+                "acc-claim", adapter, dep, normalized, live_signal, is_exit=False
+            )
+        )
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("loss circuit breaker" in m for m in messages)
+    breaker_records = [
+        r for r in caplog.records
+        if getattr(r, "data", {}).get("breaker_scope")
+    ]
+    assert breaker_records, "expected the distinct breaker refusal record"
+    assert claims == [], "submission claim must not run for a breaker refusal"
+
+
+def test_drawdown_trips_at_exactly_twenty_percent():
+    """Boundary pin: drawdown == threshold trips (>=, not >)."""
+    dep = _deployment(account_id="acc-dd-edge")
+    _observe("acc-dd-edge", 100_000.0, DAY1)
+    _observe("acc-dd-edge", 125_000.0, DAY1 + timedelta(hours=1))  # peak
+    # Same UTC day: day-start stays 100k, so only the drawdown leg can trip.
+    # (125k - 100k) / 125k = exactly 20%.
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        _gate(dep, equity=100_000.0, now=DAY1 + timedelta(hours=2), env_values=NO_ENV)
+    assert excinfo.value.kind == "drawdown"
+    state = get_live_loss_breaker_state(account_loss_breaker_scope("acc-dd-edge"))
+    assert state.drawdown_breached is True
+
+
+def test_breaker_records_broker_equity_not_account_balance_override():
+    """``account_balance`` is a sizing input; the breaker must observe the
+    adapter's equity so a caller-supplied number cannot poison the series."""
+    account_id = "acc-override"
+    dep = _deployment(account_id=account_id)
+    _observe(account_id, 100_000.0, DAY1)
+    adapter = _Adapter(equity=90_000.0)  # broker equity -10%: breaker must trip
+    with pytest.raises(LossBreakerBreachError):
+        asyncio.run(
+            daemon.prepare_order_with_risk(
+                adapter, dep, _entry_signal(dep), account_balance=1_000_000.0
+            )
+        )

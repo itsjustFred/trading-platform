@@ -346,3 +346,30 @@ def _isolate_loss_breaker_state():
     except Exception:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_loss_breaker_accounts_env(tmp_path):
+    """Point the loss breaker's ``.accounts.env`` at a path that does not exist.
+
+    ``refuse_entry_if_loss_breaker_tripped`` and the balance-poll observation
+    resolve ``LOSS_BREAKER_*`` thresholds file-first through the repo's
+    ``.accounts.env`` when no ``env_values`` mapping is passed. Without this
+    isolation every daemon test that reaches ``prepare_order_with_risk`` would
+    parse the live credentials file, and a ``LOSS_BREAKER_*`` typo there would
+    fail unrelated tests - the same reason ``DATA_DIR`` is isolated above.
+    Process-env ``LOSS_BREAKER_*`` variables still apply on top, matching
+    production precedence.
+
+    Uses its own ``MonkeyPatch`` rather than the ``monkeypatch`` fixture, for
+    the same reason as ``_no_jforex_jvm_prewarm`` above: an autouse fixture
+    that requested it would instantiate it before every test's other fixtures
+    and delay its undo until after them.
+    """
+    import live_runner.loss_breaker as loss_breaker
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            loss_breaker, "_ACCOUNTS_ENV", tmp_path / "absent-accounts.env"
+        )
+        yield

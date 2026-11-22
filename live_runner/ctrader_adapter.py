@@ -2992,14 +2992,63 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
         return trader_res.trader
 
+    async def _fetch_position_unrealized_pnl(self, fallback_money_digits: int) -> float:
+        """Summed net unrealized P&L of all open positions, in account currency.
+
+        ``ProtoOAGetPositionUnrealizedPnLRes`` reports one entry per open
+        position with ``grossUnrealizedPnL``/``netUnrealizedPnL`` in money
+        digits; the net figure (after accrued swap/commission) is what the
+        account's equity actually carries. The response carries its own
+        ``moneyDigits``; the trader's digits are the fallback when it is unset.
+        Any failure raises - the caller treats unreadable equity as unreadable,
+        never as "no unrealized loss".
+        """
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOAGetPositionUnrealizedPnLReq,
+            ProtoOAGetPositionUnrealizedPnLRes,
+        )
+
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+
+        self._raise_if_terminal_auth_failed()
+        request = ProtoOAGetPositionUnrealizedPnLReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=15
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(response, ProtoOAGetPositionUnrealizedPnLRes):
+            raise RuntimeError(
+                f"Unexpected unrealized PnL response: {type(response).__name__}"
+            )
+        digits = int(getattr(response, "moneyDigits", 0) or 0)
+        if digits <= 0:
+            digits = int(fallback_money_digits or 0)
+        scale = money_scale(digits)
+        total = 0.0
+        for position_pnl in response.positionUnrealizedPnL:
+            total += _to_float(getattr(position_pnl, "netUnrealizedPnL", 0))
+        return total / scale
+
     async def get_balance(self) -> tuple[float, float]:
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
         balance = _to_float(getattr(trader, "balance", 0)) / scale
-        equity = balance
         if hasattr(trader, "equity"):
+            # A trader payload that carries its own equity field is trusted to
+            # include unrealized P&L already (ProtoOATrader does not).
             equity = _to_float(getattr(trader, "equity", balance)) / scale
+        else:
+            # ProtoOATrader has no equity field: equity is balance plus the
+            # summed unrealized P&L of open positions. Reporting balance as
+            # equity would hide every open loss from the loss breaker (#301).
+            equity = balance + await self._fetch_position_unrealized_pnl(money_digits)
         return balance, equity
 
     @property

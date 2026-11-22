@@ -60,6 +60,8 @@ from live_runner.exit_signals import (
 )
 from live_runner.loss_breaker import (
     LossBreakerBreachError,
+    account_deployment_trading_pnls,
+    deployment_loss_breaker_limits,
     observe_account_loss_breaker_equity,
     refuse_entry_if_loss_breaker_tripped,
 )
@@ -1919,13 +1921,33 @@ async def prepare_order_with_risk(
     # Loss circuit breaker (#301): per-account and per-deployment daily-loss /
     # drawdown limits, checked at the same chokepoint every entry passes
     # through and *after* the exit branch above, so closing a position is never
-    # blocked - PAUSED semantics, exits stay allowed. The equity is the same
-    # resolved balance sizing uses, so breaker and size cannot disagree. Runs
-    # in a thread: it is several SQLite round-trips and must not stall the loop.
+    # blocked - PAUSED semantics, exits stay allowed. The breaker observes
+    # BROKER equity: when the caller supplied ``account_balance`` (a sizing
+    # input, not broker truth) the persisted equity series must not record it,
+    # so the breaker reads the adapter's equity itself. Runs in a thread: it
+    # is several SQLite round-trips and must not stall the loop.
+    breaker_equity = resolved_balance
+    if account_balance is not None:
+        _, broker_equity = await adapter.get_balance()
+        breaker_equity = float(broker_equity)
+    deployment_equity: float | None = None
+    if deployment_loss_breaker_limits(deployment).enabled:
+        # The deployment scope measures the deployment's own P&L: synthetic
+        # equity = account equity - every OTHER deployment's P&L. ``None``
+        # (unmeasurable) fails closed inside the gate.
+        pnls = await account_deployment_trading_pnls(
+            adapter, deployment.account_id
+        )
+        if pnls is not None:
+            total_pnl = sum(pnls.values())
+            deployment_equity = (
+                breaker_equity - total_pnl + pnls.get(str(deployment.id), 0.0)
+            )
     await asyncio.to_thread(
         refuse_entry_if_loss_breaker_tripped,
         deployment,
-        equity=resolved_balance,
+        equity=breaker_equity,
+        deployment_equity=deployment_equity,
         symbol=signal.symbol,
     )
     if pip_value is None:
@@ -4030,16 +4052,22 @@ async def _poll_adapter_balance(
         await asyncio.to_thread(save_live_balance, record)
         # Loss circuit breaker (#301): advance the account and deployment
         # scopes with the equity just read, so a breach latches and alerts on
-        # the poll even when no entry signal arrives. Off the event loop - it
-        # is several SQLite round-trips per scope. A failure is logged inside
-        # the breaker and never reaches the poll.
+        # the poll even when no entry signal arrives. Deployment scopes need
+        # each deployment's own trading P&L (account equity minus the OTHER
+        # deployments' P&L); ``None`` skips them this round while the account
+        # scope still observes, and the entry gate fails closed on what it
+        # cannot measure. Off the event loop - it is several SQLite
+        # round-trips per scope plus broker quote/pip calls. A failure is
+        # logged inside the breaker and never reaches the poll.
         deployments = current_deployments() if current_deployments is not None else ()
+        deployment_pnls = await account_deployment_trading_pnls(adapter, account_id)
         await asyncio.to_thread(
             observe_account_loss_breaker_equity,
             account_id,
             float(equity),
             now=snapshot_time,
             deployments=deployments,
+            deployment_pnls=deployment_pnls,
         )
         logger.debug(
             "Saved live balance snapshot",
@@ -5236,6 +5264,25 @@ async def sync_deployments_loop(
         await asyncio.sleep(interval_seconds)
 
 
+def _start_balance_poller(
+    active_adapters: dict[str, BaseLiveAdapter],
+    deployment_snapshot: list[LiveDeploymentConfig],
+) -> asyncio.Task[None]:
+    """Start the balance-poll task for ``run_daemon``.
+
+    ``current_deployments`` feeds the loss breaker's per-deployment scopes
+    (#301): without it the poll would only ever observe account scopes and a
+    deployment breaker could never trip between entries.
+    """
+    return asyncio.create_task(
+        _poll_balances(
+            active_adapters,
+            current_deployments=lambda: list(deployment_snapshot),
+        ),
+        name="balance-poller",
+    )
+
+
 async def run_daemon(
     *,
     accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
@@ -5275,13 +5322,7 @@ async def run_daemon(
         ),
         name="service-sync-loop",
     )
-    balance_task = asyncio.create_task(
-        _poll_balances(
-            active_adapters,
-            current_deployments=lambda: list(deployment_snapshot),
-        ),
-        name="balance-poller",
-    )
+    balance_task = _start_balance_poller(active_adapters, deployment_snapshot)
     trailing_task = asyncio.create_task(
         run_trailing_stops_loop(
             LiveTrailingStopManager(),

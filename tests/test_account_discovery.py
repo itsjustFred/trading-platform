@@ -411,7 +411,16 @@ def test_the_adapter_balance_uses_the_same_resolution():
     response = adapter._ProtoOATraderRes()
     response.trader = trader
 
-    async def _send_response(_request, **_kwargs):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    async def _send_response(request, **_kwargs):
+        # get_balance now also asks for open-position unrealized P&L (#301);
+        # an empty P&L book keeps equity == balance for this assertion.
+        if isinstance(request, ProtoOAGetPositionUnrealizedPnLReq):
+            return ProtoOAGetPositionUnrealizedPnLRes()
         return response
 
     adapter._send_request = _send_response

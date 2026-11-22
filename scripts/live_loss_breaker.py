@@ -14,9 +14,17 @@ The daily breaker resets itself at the UTC day boundary; there is no daily
 reset command on purpose. The drawdown breaker needs this explicit reset: it
 clears the latch AND re-bases the peak equity to the current equity, so the
 breaker does not re-trip on the observation that cleared it. The equity used
-for the re-base is the latest recorded balance snapshot for the scope's
-account, or ``--equity`` when the operator wants to state it explicitly (a
-scope with no snapshot and no ``--equity`` is refused rather than guessed).
+for the re-base is the scope's own last observed equity for a deployment
+scope, or the latest recorded balance snapshot for an account scope - refused
+when that snapshot is missing, non-positive or older than
+``STALE_SNAPSHOT_SECONDS`` - or ``--equity`` when the operator wants to state
+it explicitly. Resetting an ACCOUNT scope also resets every deployment scope
+on that account (each re-based to its own last observed equity): with the
+defaults every deployment scope latches together with the account scope, so
+resetting only ``account:<id>`` would leave entries blocked by stale
+deployment latches. ``--equity`` applies to the account scope; deployment
+scopes always re-base to their own last equity because it lives in
+deployment-P&L-adjusted units, not raw account equity.
 
 ``status`` and ``reset-drawdown --help`` never start the daemon and ``status``
 only reads; importing this module starts nothing.
@@ -26,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 
 # --- import-origin guard ---
@@ -64,6 +73,9 @@ from shared.models import LiveLossBreakerRecord
 
 logger = get_logger("live-runner")
 
+#: A balance snapshot older than this is too stale to re-base a peak on.
+STALE_SNAPSHOT_SECONDS = 600.0
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -90,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     target = reset.add_mutually_exclusive_group(required=True)
-    target.add_argument("--account", help="Reset the account:<id> scope.")
+    target.add_argument("--account", help="Reset the account:<id> scope and its deployment scopes.")
     target.add_argument("--deployment", help="Reset the deployment:<id> scope.")
     target.add_argument("--scope", help="Raw scope, e.g. account:alpaca-paper.")
     reset.add_argument(
@@ -182,7 +194,95 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _snapshot_equity(account_id: str, *, now: datetime) -> tuple[float, str] | str:
+    """Latest balance-snapshot equity for ``account_id``, or an error string.
+
+    Refuses a missing, non-positive or stale (> ``STALE_SNAPSHOT_SECONDS``)
+    snapshot: re-basing a peak on an hour-old equity could silently re-arm a
+    breaker that should still be latched.
+    """
+    latest = get_latest_live_balance(account_id)
+    if latest is None:
+        return (
+            f"no balance snapshot for account {account_id!r}; "
+            "pass --equity to state the re-base equity explicitly"
+        )
+    timestamp = latest.timestamp
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    age = (now - timestamp).total_seconds()
+    if age > STALE_SNAPSHOT_SECONDS:
+        return (
+            f"latest balance snapshot for account {account_id!r} is "
+            f"{age:.0f}s old (limit {STALE_SNAPSHOT_SECONDS:.0f}s); "
+            "pass --equity to state the re-base equity explicitly"
+        )
+    equity = float(latest.equity)
+    if not math.isfinite(equity) or equity <= 0:
+        return (
+            f"latest balance snapshot for account {account_id!r} has unusable "
+            f"equity {latest.equity!r}; pass --equity explicitly"
+        )
+    return equity, f"balance_snapshot@{timestamp.isoformat()}"
+
+
+def _reset_equity_for_scope(
+    record: LiveLossBreakerRecord,
+    args: argparse.Namespace,
+    *,
+    now: datetime,
+) -> tuple[float | None, str | None, str | None]:
+    """``(equity, source, error)`` for one scope's drawdown re-base.
+
+    ``--equity`` always wins and applies to the account scope the operator
+    named; deployment scopes re-base to their own last observed equity because
+    that equity lives in deployment-P&L-adjusted units a raw account-equity
+    figure cannot express.
+    """
+    kind = record.scope.split(":", 1)[0]
+    if kind == "deployment":
+        last = record.last_equity
+        if last is not None and math.isfinite(float(last)) and float(last) > 0:
+            return float(last), "last_observed_equity", None
+        return (
+            None,
+            None,
+            (
+                f"deployment scope {record.scope!r} has no usable last observed "
+                "equity; its re-base equity lives in deployment-P&L-adjusted "
+                "units - wait for the next poll observation or inspect the "
+                "row before resetting"
+            ),
+        )
+    if args.equity is not None:
+        equity = float(args.equity)
+        if not math.isfinite(equity) or equity <= 0:
+            return None, None, f"--equity must be a positive finite number, got {args.equity!r}"
+        return equity, "--equity", None
+    resolved = _snapshot_equity(record.account_id, now=now)
+    if isinstance(resolved, str):
+        return None, None, resolved
+    equity, source = resolved
+    return equity, source, None
+
+
+def _still_latched(account_id: str) -> list[dict]:
+    """Scopes on the account still refusing entries after the reset."""
+    out = []
+    for record in list_live_loss_breaker_states(account_id):
+        latched = []
+        if record.daily_breached:
+            latched.append("daily")
+        if record.drawdown_breached:
+            latched.append("drawdown")
+        if latched:
+            out.append({"scope": record.scope, "latched": latched})
+    return out
+
+
 def _cmd_reset_drawdown(args: argparse.Namespace) -> int:
+    from live_runner.loss_breaker import reset_drawdown_breaker
+
     scope = _scope_for_args(args)
     record = get_live_loss_breaker_state(scope)
     if record is None:
@@ -191,44 +291,68 @@ def _cmd_reset_drawdown(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    equity = args.equity
-    if equity is None:
-        latest = get_latest_live_balance(record.account_id)
-        if latest is None:
-            print(
-                f"error: no balance snapshot for account {record.account_id!r}; "
-                "pass --equity to state the re-base equity explicitly",
-                file=sys.stderr,
-            )
-            return 1
-        equity = float(latest.equity)
-    if not equity > 0:
-        print(f"error: --equity must be positive, got {equity!r}", file=sys.stderr)
-        return 1
-    from live_runner.loss_breaker import reset_drawdown_breaker
-
-    updated = reset_drawdown_breaker(
-        scope, equity=equity, now=datetime.now(timezone.utc)
-    )
-    if updated is None:
+    if args.equity is not None and (
+        not math.isfinite(float(args.equity)) or float(args.equity) <= 0
+    ):
         print(
-            f"error: no loss breaker state for scope {scope!r}; nothing to reset",
+            f"error: --equity must be a positive finite number, got {args.equity!r}",
             file=sys.stderr,
         )
         return 1
-    print(
-        json.dumps(
+    now = datetime.now(timezone.utc)
+    # An account scope reset cascades to the account's deployment scopes: with
+    # the default thresholds they latch together, so clearing only the account
+    # row would leave every entry refused by stale deployment latches.
+    records = [record]
+    kind = scope.split(":", 1)[0]
+    if kind == "account":
+        records = [
+            r
+            for r in list_live_loss_breaker_states(record.account_id)
+            if r.scope == scope or r.scope.startswith("deployment:")
+        ]
+        if record not in records:
+            records.insert(0, record)
+    results = []
+    skipped = []
+    failed = False
+    for target in records:
+        equity, source, error = _reset_equity_for_scope(target, args, now=now)
+        if error is not None:
+            skipped.append({"scope": target.scope, "reason": error})
+            if target.scope == scope:
+                failed = True
+            continue
+        updated = reset_drawdown_breaker(target.scope, equity=equity, now=now)
+        if updated is None:
+            skipped.append(
+                {"scope": target.scope, "reason": "state row disappeared mid-reset"}
+            )
+            if target.scope == scope:
+                failed = True
+            continue
+        results.append(
             {
-                "reset": "drawdown",
-                "scope": scope,
+                "scope": target.scope,
                 "rebase_equity": equity,
+                "equity_source": source,
                 "peak_equity": updated.peak_equity,
                 "drawdown_breached": updated.drawdown_breached,
-                "reset_at": datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
+            }
         )
-    )
+    if failed and not results:
+        for entry in skipped:
+            print(f"error: {entry['reason']}", file=sys.stderr)
+        return 1
+    payload = {
+        "reset": "drawdown",
+        "reset_at": now.isoformat(),
+        "scopes": results,
+        "still_latched": _still_latched(record.account_id),
+    }
+    if skipped:
+        payload["skipped"] = skipped
+    print(json.dumps(payload, indent=2, default=str))
     return 0
 
 

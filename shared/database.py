@@ -23,6 +23,8 @@ from sqlalchemy import (
     String,
     TextClause,
     UniqueConstraint,
+    and_,
+    case,
     delete,
     event,
     func,
@@ -4914,8 +4916,9 @@ def observe_live_loss_breaker(
     are not evaluated here; ``latch_live_loss_breaker_breach`` owns them.
 
     ``seed_*`` apply only when the row does not exist yet: a deployment scope
-    created mid-stream inherits the account scope's baselines (both measure
-    the same account equity) instead of starting blind at the current equity.
+    created mid-stream inherits the account scope's baselines (its synthetic
+    equity lives on the same account-equity scale) instead of starting blind
+    at the current equity.
     """
     normalized_scope = str(scope or "").strip()
     normalized_account = str(account_id or "").strip()
@@ -5044,6 +5047,114 @@ def reset_live_loss_breaker_drawdown(
         session.commit()
         session.refresh(row)
         return row.to_record()
+
+
+# ─── Deployment trading flows (loss breaker, #301) ────────────────────────────
+#
+# The deployment loss-breaker scope cannot read a "deployment equity" from the
+# broker: positions on a netted account belong to the account, not to a
+# deployment. What the platform does have is the persisted fill ledger - every
+# execution knows its deployment, symbol, side, quantity, price and commission.
+# From it a deployment's trading P&L (realized AND unrealized, in account
+# currency once marked with the current quote and pip value) is computable:
+#
+#     pnl = pip_value * (cash + net_qty * price_now) - commission
+#
+# where ``cash`` is net cash paid (negative) or received (positive) in
+# qty x price units and ``net_qty`` the signed open quantity. This section only
+# aggregates the ledger; marking to market and the breaker math live in
+# ``live_runner.loss_breaker``.
+
+#: ``actual_price_observed`` verdicts a fill's price may be trusted for P&L.
+#: ``derived`` is the reconcile remainder's estimate - the best available and
+#: excluding it would make every deployment that ever needed a reconcile
+#: unmeasurable. ``sent_bad``/``absent``/``derived_unavailable`` and a
+#: non-positive price are not a price. A NULL verdict is a row written before
+#: the column existed; its ``actual_price`` was still recorded, so it counts
+#: when positive.
+_TRUSTED_FILL_PRICE_OBSERVED = ("observed", "derived")
+
+
+def get_account_deployment_trading_flows(
+    account_id: str,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Per-deployment, per-symbol trading flows for one account's breaker scopes.
+
+    Returns ``{deployment_id: {symbol: flow}}`` where ``flow`` holds:
+
+    * ``net_qty`` - signed filled quantity (buy ``+``, sell ``-``);
+    * ``cash`` - ``-sum(sign * qty * actual_price)`` in qty x price units:
+      net cash paid (negative) or received (positive);
+    * ``commission`` - summed per-fill commission in account currency
+      (``None`` treated as 0);
+    * ``unpriced_fills`` - fills whose ``actual_price`` cannot be trusted
+      (see ``_TRUSTED_FILL_PRICE_OBSERVED``). Any non-zero count means the
+      deployment's P&L cannot be computed exactly and the caller must fail
+      closed rather than mark to market on a partial ledger.
+
+    Every deployment on the account is covered whatever its status - a stopped
+    deployment's ledger still describes positions at the broker. Deployments
+    without fills are absent (their P&L is 0). Fails closed on a stored action
+    other than buy/sell, like the quantity ledger.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        raise ValueError("An account id is required for deployment trading flows")
+    trusted = or_(
+        LiveExecutionModel.actual_price_observed.is_(None),
+        LiveExecutionModel.actual_price_observed.in_(_TRUSTED_FILL_PRICE_OBSERVED),
+    )
+    priced = and_(
+        LiveExecutionModel.actual_price > 0,
+        trusted,
+    )
+    unpriced = ~priced
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.deployment_id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                func.sum(LiveExecutionModel.filled_qty),
+                func.sum(LiveExecutionModel.filled_qty * LiveExecutionModel.actual_price),
+                func.sum(func.coalesce(LiveExecutionModel.commission, 0.0)),
+                func.sum(case((unpriced, 1), else_=0)),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account)
+            .group_by(
+                LiveSignalModel.deployment_id,
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+            )
+        ).all()
+    flows: dict[str, dict[str, dict[str, Any]]] = {}
+    for deployment_id, symbol, action, qty, qty_price, commission, unpriced_count in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(qty or 0.0)
+        qty_at_price = float(qty_price or 0.0)
+        if normalized_action == "buy":
+            sign = 1.0
+        elif normalized_action == "sell":
+            sign = -1.0
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {deployment_id} "
+                f"({symbol}) has no known position sign; the deployment loss "
+                "breaker cannot compute its P&L."
+            )
+        dep = flows.setdefault(str(deployment_id), {})
+        flow = dep.setdefault(
+            str(symbol),
+            {"net_qty": 0.0, "cash": 0.0, "commission": 0.0, "unpriced_fills": 0},
+        )
+        flow["net_qty"] += sign * quantity
+        flow["cash"] += -sign * qty_at_price
+        flow["commission"] += float(commission or 0.0)
+        flow["unpriced_fills"] += int(unpriced_count or 0)
+    return flows
 
 
 def list_live_signal_executions_for_deployments(

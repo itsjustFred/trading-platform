@@ -1612,3 +1612,118 @@ def test_money_digits_fallback_is_logged(caplog) -> None:
     assert any("moneyDigits" in record.getMessage() for record in caplog.records), (
         "the fallback to the default scale was silent"
     )
+
+
+# ─── get_balance: equity must include open-position unrealized P&L (#301) ──────
+#
+# ProtoOATrader has no equity field, so equity = balance + net unrealized P&L
+# from ProtoOAGetPositionUnrealizedPnL. The breaker watches equity; measuring
+# only balance would hide an open losing position until it closes.
+
+
+def _proto_classes():
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+        ProtoOATraderReq,
+        ProtoOATraderRes,
+    )
+    return (
+        ProtoOATraderReq,
+        ProtoOATraderRes,
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+
+def _trader_res(trader_res_cls, *, balance: int, money_digits: int):
+    res = trader_res_cls()
+    res.ctidTraderAccountId = 12345
+    trader = res.trader
+    trader.balance = balance
+    trader.moneyDigits = money_digits
+    return res
+
+
+def _pnl_res(pnl_res_cls, *, money_digits: int, pnl_minor: int):
+    res = pnl_res_cls()
+    res.ctidTraderAccountId = 12345
+    res.moneyDigits = money_digits
+    entry = res.positionUnrealizedPnL.add()
+    entry.positionId = 777
+    entry.grossUnrealizedPnL = pnl_minor
+    entry.netUnrealizedPnL = pnl_minor
+    return res
+
+
+def _wire_get_balance(adapter, trader_res, pnl_res, *, pnl_fails=False):
+    trader_req_cls, trader_res_cls, pnl_req_cls, pnl_res_cls = _proto_classes()
+    adapter._ProtoOATraderReq = trader_req_cls
+    adapter._ProtoOATraderRes = trader_res_cls
+
+    calls = []
+
+    async def _send(request, **kwargs):
+        calls.append(request)
+        if isinstance(request, pnl_req_cls):
+            if pnl_fails:
+                raise RuntimeError("pnl endpoint down")
+            return pnl_res
+        if isinstance(request, trader_req_cls):
+            return trader_res
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    return calls
+
+
+def _connected_adapter():
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    return adapter
+
+
+def test_get_balance_includes_net_unrealized_pnl():
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    trader_req_cls, trader_res_cls, _, _ = _proto_classes()
+    _wire_get_balance(
+        adapter,
+        _trader_res(trader_res_cls, balance=10_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=2, pnl_minor=-300_000),
+    )
+    balance, equity = asyncio.run(adapter.get_balance())
+    # balance 100_000.00 + (-3_000.00) unrealized = equity 97_000.00
+    assert balance == pytest.approx(100_000.0)
+    assert equity == pytest.approx(97_000.0)
+
+
+def test_get_balance_uses_trader_digits_when_pnl_digits_unset():
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    _, trader_res_cls, _, _ = _proto_classes()
+    _wire_get_balance(
+        adapter,
+        _trader_res(trader_res_cls, balance=5_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=0, pnl_minor=-100_000),
+    )
+    _, equity = asyncio.run(adapter.get_balance())
+    # pnl moneyDigits unset (0) -> falls back to trader digits (2): -1_000.00
+    assert equity == pytest.approx(49_000.0)
+
+
+def test_get_balance_fails_closed_when_pnl_request_fails():
+    adapter = _connected_adapter()
+    _, _, _, pnl_res_cls = _proto_classes()
+    _, trader_res_cls, _, _ = _proto_classes()
+    _wire_get_balance(
+        adapter,
+        _trader_res(trader_res_cls, balance=5_000_000, money_digits=2),
+        _pnl_res(pnl_res_cls, money_digits=2, pnl_minor=0),
+        pnl_fails=True,
+    )
+    with pytest.raises(Exception):
+        asyncio.run(adapter.get_balance())
