@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
+from live_runner.alpaca_adapter import resolve_alpaca_credentials
+from live_runner.symbol_class import (
+    UnclassifiableSymbolError,
+    canonical_crypto_symbol,
+    classify_symbol,
+)
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
 
@@ -16,10 +21,33 @@ logger = get_logger("live-runner")
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
-    normalized = str(symbol or "").strip().upper()
-    if not normalized:
-        return False
-    return "/" in normalized or normalized.endswith("USD") and "-" in normalized
+    """True for a known crypto pair in any form; raises if unclassifiable.
+
+    Never falls back to ``False``: an unclassifiable symbol silently routed to the stock
+    feed gets no data (issue #122).
+    """
+    return classify_symbol(symbol) == "crypto"
+
+
+def _bar_key(symbol: str) -> str:
+    """Storage key for bars: crypto pairs share one canonical form (``BTC/USD``).
+
+    An unclassifiable symbol keeps its normalized spelling, which
+    :meth:`refresh_from_deployments` would have refused to subscribe. That
+    acceptance is logged rather than silent: bars keyed under a symbol the
+    refresh loop rejected are invisible to a canonical lookup, and an operator
+    needs to see the key they were stored under (issue #122).
+    """
+    normalized = _normalize_symbol(symbol)
+    try:
+        if classify_symbol(normalized) == "crypto":
+            return canonical_crypto_symbol(normalized)
+    except UnclassifiableSymbolError as exc:
+        logger.warning(
+            "Storing market-data bars under an unclassified symbol key",
+            extra={"data": {"symbol": normalized, "error": str(exc)}},
+        )
+    return normalized
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -113,9 +141,15 @@ class _StreamWorker:
         backoff = 2.0
         while self._running:
             try:
-                self.stream.run()
+                # A failed reconnect setup leaves no stream (set to None below): the
+                # except path then backs off and retries the setup, as it always did
+                # when `.run()` was called on None.
+                stream = self.stream
+                if stream is None:
+                    raise RuntimeError("market data stream is not set up")
+                stream.run()
                 backoff = 2.0
-            except Exception as exc:
+            except Exception as exc:  # except-kind: loop-survival
                 if not self._running:
                     break
                 if _is_connection_limit_error(exc):
@@ -142,11 +176,27 @@ class _StreamWorker:
                         }
                     },
                 )
-                self.stream = self._create_stream()
-                with self._lock:
-                    symbols = sorted(self._symbols)
-                if symbols:
-                    self._subscribe_symbols(symbols)
+                try:
+                    self.stream = self._create_stream()
+                    with self._lock:
+                        symbols = sorted(self._symbols)
+                    if symbols:
+                        self._subscribe_symbols(symbols)
+                except Exception as setup_exc:  # except-kind: loop-survival
+                    # A failed reconnect must not kill the worker: the next
+                    # pass retries stream.run()/recreate on the backoff below.
+                    logger.warning(
+                        "Alpaca market data stream reconnect setup failed, retrying",
+                        extra={
+                            "data": {
+                                "kind": self.kind,
+                                "paper": self.paper,
+                                "error": str(setup_exc),
+                                "retry_in_seconds": backoff,
+                            }
+                        },
+                    )
+                    self.stream = None
                 import time
 
                 time.sleep(backoff)
@@ -166,7 +216,7 @@ class _StreamWorker:
         if hasattr(self.stream, "unsubscribe_bars"):
             try:
                 self.stream.unsubscribe_bars()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
         if normalized:
             self._subscribe_symbols(sorted(normalized))
@@ -177,7 +227,7 @@ class _StreamWorker:
         if stream is not None and hasattr(stream, "stop"):
             try:
                 stream.stop()
-            except Exception:
+            except Exception:  # except-kind: loop-survival
                 pass
 
 
@@ -210,7 +260,9 @@ class LiveMarketDataStreamService:
                 self._refresh_sync, deployments, account_lookup, env_values
             )
         except ModuleNotFoundError:
-            logger.info("alpaca-py market data stream unavailable; install alpaca-py to enable live quotes")
+            logger.info(
+                "alpaca-py market data stream unavailable; install alpaca-py to enable live quotes"
+            )
 
     def _refresh_sync(
         self,
@@ -238,7 +290,22 @@ class LiveMarketDataStreamService:
                 symbol = _normalize_symbol(raw_symbol)
                 if not symbol:
                     continue
-                stream_kind = "crypto" if _is_crypto_symbol(symbol) else "stock"
+                try:
+                    stream_kind = classify_symbol(symbol)
+                except UnclassifiableSymbolError as exc:
+                    logger.error(
+                        "Refusing to subscribe unclassifiable symbol to market data",
+                        extra={
+                            "data": {
+                                "deployment_id": str(deployment.id),
+                                "symbol": symbol,
+                                "error": str(exc),
+                            }
+                        },
+                    )
+                    continue
+                if stream_kind == "crypto":
+                    symbol = canonical_crypto_symbol(symbol)
                 target_symbols[(key, stream_kind)].add(symbol)
 
         # B2: decide under the lock, do network I/O outside it — stop/start/
@@ -298,7 +365,7 @@ class LiveMarketDataStreamService:
         normalized = _normalize_symbol(symbol)
         if not normalized:
             return {"symbol": "", "latest": None, "bars": []}
-        bars = await asyncio.to_thread(self._bars_for_symbol, normalized)
+        bars = await asyncio.to_thread(self._bars_for_symbol, _bar_key(normalized))
         latest = bars[-1] if bars else None
         return {"symbol": normalized, "latest": latest, "bars": bars}
 
@@ -315,7 +382,7 @@ class LiveMarketDataStreamService:
     def _ingest_manual_bars_sync(self, bars: list[dict[str, Any]]) -> None:
         with self._lock:
             for bar in bars:
-                symbol = _normalize_symbol(str(bar.get("symbol") or ""))
+                symbol = _bar_key(str(bar.get("symbol") or ""))
                 if not symbol:
                     continue
                 queue = self._bars[symbol]
@@ -323,7 +390,7 @@ class LiveMarketDataStreamService:
 
     async def _on_bar(self, bar: Any) -> None:
         payload = _serialize_bar_payload(bar)
-        symbol = payload["symbol"]
+        symbol = _bar_key(payload["symbol"])
         if not symbol:
             return
         await asyncio.to_thread(self._append_bar_sync, symbol, payload)

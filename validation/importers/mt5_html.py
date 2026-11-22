@@ -613,7 +613,12 @@ class MT5HTMLImporter(BaseImporter):
                 (MT5HTMLImporter._to_float(r, col_swap, default=0.0) or 0.0)
                 for r in fills.entries + exit_rows
             )
-            fees = commission + swap
+            # MT5 reports commission and swap signed from the account's point
+            # of view (a cost is negative). The Trade contract defines ``fees``
+            # as a positive cost (net_pnl == pnl - fees), so negate at the
+            # importer boundary. A net swap credit therefore yields a
+            # negative fee. ``meta`` keeps the raw MT5-signed values.
+            fees = -(commission + swap)
 
             exits: list[TradeExit] = []
             for exit_row in exit_rows:
@@ -752,7 +757,10 @@ class MT5HTMLImporter(BaseImporter):
         text = raw.strip() if raw else ""
         for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
-                dt = datetime.strptime(text, fmt)
+                # The report carries no zone in the string itself; `source_tz`
+                # is resolved explicitly below and the naive value is then
+                # converted, so a `%z` in the format would reject the input.
+                dt = datetime.strptime(text, fmt)  # noqa: DTZ007
                 if source_tz:
                     import zoneinfo
                     tz = zoneinfo.ZoneInfo(source_tz)

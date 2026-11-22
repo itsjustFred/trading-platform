@@ -10,6 +10,9 @@ dataset is missing locally — but the skip is never silent:
   (Decision Record 2026-08-31);
 - coverage is verified per candidate file (no union of shard extents) and
   unreadable/corrupt parquet files are reported instead of swallowed.
+- ``TP_TEST_OHLCV_DIR`` (opt-in, read-only) points the gate at a local dataset root. The suite's
+  ``DATA_DIR`` is a throwaway directory (see tests/conftest.py), so without it no local dataset is
+  visible and every dataset-backed module skips.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import pytest
 
 from runner.engines.contract import parse_date_bound
 from shared.constants import DATA_DIR
+from tests.helpers import resolve_ohlcv_root
 
 # Opt-in strict mode: missing local market data fails instead of skipping.
 FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip().lower() in {
@@ -33,6 +37,8 @@ FAIL_ON_MISSING_DATA = str(os.environ.get("FAIL_ON_MISSING_DATA", "")).strip().l
     "yes",
     "on",
 }
+
+TEST_OHLCV_DIR_ENV = "TP_TEST_OHLCV_DIR"
 
 _DATA_SKIP_REASONS: list[str] = []
 # Outcomes of the gate under FAIL_ON_MISSING_DATA=1. Kept separate from the
@@ -99,8 +105,19 @@ def _data_gate_result(reason: str) -> None:
     pytest.skip(reason)
 
 
+def _ohlcv_root() -> Path:
+    """Dataset root the gate reads from: the explicit opt-in if set, else ``DATA_DIR/ohlcv``.
+
+    Read-only by design, so pointing it at a real dataset cannot trip the repo data-dir guard.
+    Resolution is shared with the cross-directory dataset users through
+    :func:`tests.helpers.resolve_ohlcv_root`, so the gate and the engine tests
+    can never disagree about which directory the opt-in names.
+    """
+    return resolve_ohlcv_root(DATA_DIR)
+
+
 def _candidate_ohlcv_paths(symbol: str, timeframe: str) -> list[Path]:
-    root = DATA_DIR / "ohlcv"
+    root = _ohlcv_root()
     if not root.exists():
         return []
 
@@ -220,7 +237,8 @@ def _require_ohlcv_coverage(symbol: str, timeframe: str, start: str, end: str) -
     paths = _candidate_ohlcv_paths(symbol, timeframe)
     if not paths:
         _data_gate_result(
-            f"missing OHLCV dataset for {symbol}/{timeframe} under {Path(DATA_DIR) / 'ohlcv'}"
+            f"missing OHLCV dataset for {symbol}/{timeframe} under {_ohlcv_root()} "
+            f"(point {TEST_OHLCV_DIR_ENV} at a local dataset root to use one)"
         )
         return
 

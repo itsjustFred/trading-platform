@@ -3,10 +3,15 @@
 Reproduces the reference side of the strategy-test-audit for
 IntradayVolatilityBreakout without re-running MetaTrader:
 
-  .venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/parse_mt5_reference.py
+  python parse_mt5_reference.py --reference-dir <dir>   (run from this audit/ directory)
+
+The reference directory is taken from ``--reference-dir``, or from the
+``TRADING_PLATFORM_REFERENCES`` environment variable when the flag is absent
+(the flag wins if both are set). There is no built-in default: a missing or
+non-existent directory is an error.
 
 Inputs (read-only):
-  /home/ubuntu/trading-platform-references/{mt5-eurusd-h1,mt5-nas100-m15,mt5-sp500-m1}/*.log
+  <reference-dir>/{mt5-eurusd-h1,mt5-nas100-m15,mt5-sp500-m1}/*.log
   strategy-comparisons/intraday_volatility_breakout/{EURUSD_H1,NAS100_M15,SP500_M1}.xlsx
 
 Outputs (beside this script, git-ignored via data/ — pass --out to override):
@@ -24,11 +29,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import pathlib
 import re
 import sys
 
-REF = pathlib.Path("/home/ubuntu/trading-platform-references")
+REFERENCE_ENV_VAR = "TRADING_PLATFORM_REFERENCES"
 CMP = pathlib.Path(__file__).resolve().parent.parent
 
 JOBS = {
@@ -41,12 +47,37 @@ DEAL_RE = re.compile(
     r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+deal #(\d+) (buy|sell) ([\d.]+) \S+ at ([\d.]+)"
 )
 OPEN_RE = re.compile(
-    r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+(Long|Short) opened @ ([\d.]+) \| Lots: ([\d.]+) \| SL: ([\d.]+)"
+    r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})\s+(Long|Short) opened @ ([\d.]+) "
+    r"\| Lots: ([\d.]+) \| SL: ([\d.]+)"
 )
 
 
 def _read_log(path: pathlib.Path) -> list[str]:
     return path.read_bytes().decode("utf-16", errors="replace").splitlines()
+
+
+def _resolve_reference_dir(raw: str | None) -> pathlib.Path:
+    """Return the MT5 reference directory from ``--reference-dir`` or the env var.
+
+    The CLI value wins over ``TRADING_PLATFORM_REFERENCES``. Raises
+    ``ValueError`` when neither is set, when either is blank (an empty value
+    would resolve to the current working directory and silently audit the
+    wrong logs), or when the directory does not exist, so the audit never
+    reads a machine-specific default by accident.
+    """
+    # Not ``raw or os.environ.get(...)``: an explicitly passed empty flag must
+    # not be read as "flag absent" and resurrect the env var.
+    value = raw if raw is not None else os.environ.get(REFERENCE_ENV_VAR)
+    if not value:
+        raise ValueError(
+            f"no MT5 reference directory: pass --reference-dir or set {REFERENCE_ENV_VAR}"
+        )
+    ref = pathlib.Path(value).expanduser().resolve()
+    if not ref.exists():
+        raise ValueError(f"MT5 reference directory does not exist: {ref}")
+    if not ref.is_dir():
+        raise ValueError(f"MT5 reference directory is not a directory: {ref}")
+    return ref
 
 
 def _resolve_output_dir(raw: str) -> pathlib.Path:
@@ -163,7 +194,7 @@ def parse_log_trades(log_path: pathlib.Path, contract: float) -> list[dict]:
             }
         )
     # final balance cross-check
-    finals = [l for l in lines if "final balance" in l]
+    finals = [line for line in lines if "final balance" in line]
     if finals:
         reported = float(finals[0].split("final balance")[1].split()[0])
         implied = 100000.0 + sum(t["pnl"] for t in trades)
@@ -271,13 +302,22 @@ def parse_xlsx_trades(xlsx_path: pathlib.Path) -> list[dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(CMP / "audit"))
+    ap.add_argument(
+        "--reference-dir",
+        default=None,
+        help=f"directory holding the MT5 reference logs (default: ${REFERENCE_ENV_VAR})",
+    )
     args = ap.parse_args()
+    try:
+        ref = _resolve_reference_dir(args.reference_dir)
+    except ValueError as exc:
+        ap.error(str(exc))
     out = _resolve_output_dir(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     ok = True
     for name, (log_rel, xlsx_name, contract) in JOBS.items():
-        log_trades = parse_log_trades(REF / log_rel, contract)
+        log_trades = parse_log_trades(ref / log_rel, contract)
         xlsx_trades = parse_xlsx_trades(CMP / xlsx_name)
 
         import csv as _csv

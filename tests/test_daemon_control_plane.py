@@ -15,7 +15,7 @@ import pytest
 
 import live_runner.daemon as daemon
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
-from live_runner.base_adapter import ControlOutcome, order_not_submitted
+from live_runner.base_adapter import ControlOutcome, LiveQuote, order_not_submitted
 from shared.database import (
     clear_live_deployment_stopped_enforced,
     get_live_deployment,
@@ -70,6 +70,19 @@ class _ControlAdapter:
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        return LiveQuote(bid=200.0, ask=200.0, timestamp=datetime.now(timezone.utc), source="test")
 
     async def submit_order(self, signal, *, qty: float | None = None) -> str:
         self.submitted.append((signal, qty))
@@ -192,6 +205,107 @@ def test_adapter_that_cannot_cancel_still_flattens_but_does_not_stamp(
     assert adapter.calls == ["flatten", "orphan"]
     assert DEPLOYMENT_ID not in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+
+
+_PENDING = ControlOutcome(completed=1, pending_cancel=("entry-1",))
+
+
+def _stamped(database) -> bool:
+    return DEPLOYMENT_ID in list_stopped_enforced_deployment_ids()
+
+
+def test_pending_cancel_blocks_the_stamp_but_still_flattens(
+    isolated_db_sandbox, caplog
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    adapter = _ControlAdapter(cancel=_PENDING)
+
+    with caplog.at_level("WARNING"):
+        ledger = _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert ledger == set()
+    assert not _stamped(database)
+    warnings = [r for r in caplog.records if "pending_cancel" in r.getMessage()]
+    assert warnings
+    assert all(r.levelname == "WARNING" for r in warnings)
+    assert "entry-1" in warnings[0].getMessage()
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+def test_pending_cancel_that_cancels_is_stamped_next_pass(isolated_db_sandbox) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    _enforce(database, _ControlAdapter(cancel=_PENDING))
+    assert not _stamped(database)
+
+    ledger = _enforce(database, _ControlAdapter())
+
+    assert _stamped(database)
+    assert ledger == {DEPLOYMENT_ID}
+    assert daemon._PENDING_CANCEL_PASSES == {}
+
+
+def test_pending_cancel_that_fills_is_flattened_then_stamped(
+    isolated_db_sandbox,
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    _enforce(database, _ControlAdapter(cancel=_PENDING))
+
+    # The order filled: the book is clean, the flatten now closes the new position.
+    adapter = _ControlAdapter(flatten=ControlOutcome(completed=1))
+    _enforce(database, adapter)
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert _stamped(database)
+
+
+def test_persistent_pending_cancel_escalates_to_error(
+    isolated_db_sandbox, caplog
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    limit = daemon.PENDING_CANCEL_ESCALATION_PASSES
+
+    with caplog.at_level("WARNING"):
+        for _ in range(limit - 1):
+            _enforce(database, _ControlAdapter(cancel=_PENDING))
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+        _enforce(database, _ControlAdapter(cancel=_PENDING))
+
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors
+    assert "entry-1" in errors[-1].getMessage()
+    assert not _stamped(database)
+
+
+def test_pending_cancel_counter_resets_when_deployment_leaves_stopped(
+    isolated_db_sandbox, caplog
+) -> None:
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    daemon._PENDING_CANCEL_PASSES.clear()
+    for _ in range(3):
+        _enforce(database, _ControlAdapter(cancel=_PENDING))
+    assert daemon._PENDING_CANCEL_PASSES[DEPLOYMENT_ID] == 3
+
+    # Resumed (or deleted): the stuck episode is over, so its count must not survive.
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+    _enforce(database, _ControlAdapter())
+    assert DEPLOYMENT_ID not in daemon._PENDING_CANCEL_PASSES
+
+    # A later STOPPED episode starts from pass 1: WARNING, not an inflated ERROR.
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    with caplog.at_level("WARNING"):
+        _enforce(database, _ControlAdapter(cancel=_PENDING))
+    assert daemon._PENDING_CANCEL_PASSES[DEPLOYMENT_ID] == 1
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
 
 def test_incomplete_orphan_sweep_does_not_stamp(isolated_db_sandbox) -> None:
@@ -641,6 +755,104 @@ def test_stamp_is_refused_while_a_live_submission_lease_exists(isolated_db_sandb
     assert retry.calls == ["cancel", "flatten", "orphan"]
     assert DEPLOYMENT_ID in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_a_paused_deployment_takes_a_claim_only_for_an_exit(isolated_db_sandbox) -> None:
+    """#126 decision at the one gate the daemon cannot re-check afterwards.
+
+    The claim is the atomic status decision taken immediately before the broker call,
+    so an exit on a PAUSED deployment has to pass it or the widened dispatch statuses
+    would be undone at the last moment - and an entry must not pass it at all.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-entry") is False
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-exit", allow_paused=True
+    ) is True
+
+    # The lease is still single: an exit may not take a second one while it works, or
+    # two orders could reach the broker for one position.
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-exit-2", allow_paused=True
+    ) is False
+    assert database.release_live_deployment_submission("tok-exit") is True
+
+    # A STOPPED deployment is closed by the sweeps, so the widen applies to no status.
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-stopped", allow_paused=True
+    ) is False
+
+
+def test_an_exit_claim_is_accepted_while_the_deployment_is_active(
+    isolated_db_sandbox,
+) -> None:
+    """The widened claim must not narrow what it widened.
+
+    A running deployment answers an exit through the same `allow_paused=True` claim, and
+    its SQL filter reads `IN ('ACTIVE', 'PAUSED')`. Every exit-path test around this one
+    stubs the claim, so a filter that shrank to PAUSED alone would refuse every close on a
+    running deployment - no order reaching the broker - with a green suite.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+
+    assert (
+        database.claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-active-exit", allow_paused=True
+        )
+        is True
+    )
+    # The lease is still single: an exit may not take a second one while it works.
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-active-exit-2", allow_paused=True
+    ) is False
+    assert database.release_live_deployment_submission("tok-active-exit") is True
+
+    # And an entry on the same ACTIVE row still takes the un-widened filter.
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-entry") is True
+
+
+def test_the_exit_gates_all_read_the_one_status_set(isolated_db_sandbox) -> None:
+    """#311 nit: three modules each carried their own copy of the exit status set.
+
+    The daemon's dispatch statuses, the atomic claim's SQL filter and the halt's exempt
+    set answer the same question ("which statuses may still close a position"), and a copy
+    that forgets to widen stops a close reaching the broker with a green suite. They now
+    derive from one tuple; this pins that they still agree after any change to it.
+    """
+    import live_runner.daemon as daemon
+    from shared.database import LIVE_DISPATCH_EXIT_STATUSES
+
+    assert daemon.EXIT_DISPATCH_STATUSES == frozenset(LIVE_DISPATCH_EXIT_STATUSES)
+    assert daemon.ENTRY_DISPATCH_STATUSES == frozenset({"ACTIVE"})
+
+    # The claim's own filter, through the real SQL: every shared status takes a claim and
+    # anything outside it does not.
+    database, _, _ = isolated_db_sandbox
+    for index, status in enumerate(LIVE_DISPATCH_EXIT_STATUSES):
+        if index == 0:
+            _seed(database, status=status)
+        else:
+            update_live_deployment_status(DEPLOYMENT_ID, status)
+        assert (
+            database.claim_live_deployment_submission(
+                DEPLOYMENT_ID, f"tok-shared-{index}", allow_paused=True
+            )
+            is True
+        )
+        database.release_live_deployment_submission(f"tok-shared-{index}")
+
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert (
+        database.claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-outside", allow_paused=True
+        )
+        is False
+    )
 
 
 def test_stamp_is_refused_while_an_expired_but_unreleased_lease_exists(
