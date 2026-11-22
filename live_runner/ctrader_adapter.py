@@ -3183,7 +3183,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         scale = money_scale(digits)
         total = 0.0
         for position_pnl in response.positionUnrealizedPnL:
-            total += _to_float(getattr(position_pnl, "netUnrealizedPnL", 0))
+            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None))
         return total / scale
 
     async def get_balance(self) -> tuple[float, float]:
@@ -3212,11 +3212,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
-        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        balance = parse_money(getattr(trader, "balance", None)) / scale
         if hasattr(trader, "equity"):
             # A trader payload that carries its own equity field is trusted to
-            # include unrealized P&L already (ProtoOATrader does not).
-            return _to_float(getattr(trader, "equity", balance)) / scale
+            # include unrealized P&L already (ProtoOATrader does not). An
+            # absent field falls back to balance plus unrealized P&L; a
+            # present-but-unreadable one raises via parse_optional.
+            raw_equity = parse_optional(getattr(trader, "equity", None))
+            if raw_equity is not None:
+                return raw_equity / scale
         return balance + await self._fetch_position_unrealized_pnl(money_digits)
 
     @property

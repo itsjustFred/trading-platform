@@ -14,6 +14,7 @@ from live_runner.ctrader_adapter import (
     _is_already_logged_in_error,
     _is_terminal_auth_error,
 )
+from shared.money import MoneyParseError
 
 
 def test_is_already_logged_in_error_detects_code() -> None:
@@ -1995,3 +1996,66 @@ def test_get_equity_trusts_a_trader_equity_field_when_present():
     assert asyncio.run(adapter.get_equity()) == pytest.approx(55_000.0)
     balance, equity = asyncio.run(adapter.get_balance())
     assert (balance, equity) == (pytest.approx(50_000.0), pytest.approx(55_000.0))
+
+
+def test_get_equity_raises_on_an_unreadable_balance() -> None:
+    """A garbage ``balance`` must fail closed: ``_to_float`` used to read it
+    as 0.0, which the loss breaker would have seen as a total loss - or, on
+    the flip side, garbage that parsed to a large number as fake equity."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance="junk", moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_raises_on_an_unreadable_equity_field() -> None:
+    """A trader payload whose own ``equity`` field is garbage raises through
+    ``parse_optional`` rather than falling back or reading as 0."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, equity="junk", moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_raises_on_an_unreadable_net_unrealized_pnl(monkeypatch) -> None:
+    """A position-P&L row whose ``netUnrealizedPnL`` is not readable money is
+    unreadable, not "no unrealized loss": the sum must raise."""
+    import ctrader_open_api.messages.OpenApiMessages_pb2 as pb2
+
+    class _PnlReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+
+    class _PnlRes:
+        moneyDigits = 2
+        positionUnrealizedPnL = [SimpleNamespace(netUnrealizedPnL="junk")]
+
+    # The proto field is int64 and cannot itself hold garbage; patch the
+    # message classes the fetch imports so the row carries an unreadable
+    # value the way a malformed broker payload could.
+    monkeypatch.setattr(pb2, "ProtoOAGetPositionUnrealizedPnLReq", _PnlReq)
+    monkeypatch.setattr(pb2, "ProtoOAGetPositionUnrealizedPnLRes", _PnlRes)
+
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+
+    async def _send(request, **kwargs):
+        if isinstance(request, _PnlReq):
+            return _PnlRes()
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
