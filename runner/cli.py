@@ -30,6 +30,7 @@ from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
 from runner.promotion_cli import add_promote_parser
+from runner.slippage import SLIPPAGE_CAPABLE_ENGINES, assert_slippage_supported
 from runner.stats import merge_canonical_stats
 from runner.universe_provenance import (
     DEFAULT_UNIVERSE_PROVIDER,
@@ -219,6 +220,9 @@ def cmd_run(args):
         **_fee_params_from_args(args),
         **_slippage_params_from_args(args),
     }
+    # #130: an engine outside the slippage scope must refuse a declared
+    # model rather than run gross while the user believes it applied.
+    assert_slippage_supported(engine.name, resolved_parameters)
 
     normalized_timeframe = normalize_timeframe(args.timeframe)
 
@@ -323,6 +327,10 @@ def cmd_run(args):
     result.meta.data["pnl_basis"] = {
         "pnl": "gross",
         "net_pnl": "net_after_fees",
+        # #130: on slippage-capable engines the fill-price model is
+        # embedded in entry/exit prices, so `pnl` is gross of fees but
+        # NET of slippage; out-of-scope engines stay fully gross.
+        "slippage_embedded": engine.name in SLIPPAGE_CAPABLE_ENGINES,
     }
     # #130: every run records the slippage model used. The native and
     # signal-replay adapters record their per-symbol models themselves;

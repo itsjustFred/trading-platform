@@ -42,6 +42,7 @@ from runner.backtest_grid import (
     run_backtest_grid,
 )
 from runner.engines.base import resolve_legacy_max_position_kwarg
+from runner.slippage import assert_slippage_supported
 from shared.constants import DATA_DIR
 from shared.database import save_grid_result
 from shared.logging import get_logger
@@ -495,6 +496,13 @@ def run_backtest_matrix(
         )
     if not entries:
         raise ValueError("No matching strategies found")
+
+    # #130: fail fast when a declared slippage model cannot be honoured —
+    # each strategy may resolve to a different engine (``--engine`` empty
+    # means the strategy's own detected engine), and run_backtest_grid
+    # repeats the check per strategy as a second line of defence.
+    for entry in entries:
+        assert_slippage_supported(engine or entry.engine, params)
 
     all_rows: list[dict[str, Any]] = []
     all_daily_rows: list[dict[str, Any]] = []

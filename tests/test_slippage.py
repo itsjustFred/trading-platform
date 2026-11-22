@@ -147,15 +147,36 @@ class TestResolveSlippageModel:
         )
 
     def test_external_spread_params_degrade_auto_to_fixed_bps(self) -> None:
-        """spread_price_col / ask_ohlc already price the spread — the auto
-        model must not charge the bar spread a second time."""
-        for key in ("spread_price_col", "ask_ohlc"):
-            model = resolve_slippage_model(
-                {"slippage": "auto", key: "spread" if key == "spread_price_col" else True},
-                asset_class="forex",
-            )
-            assert isinstance(model, FixedBpsSlippage), key
-            assert model.bps == pytest.approx(1.0)
+        """spread_price_col already prices the spread — the auto model must
+        not charge the bar spread a second time. ``ask_ohlc`` does NOT
+        degrade: it only moves SHORT triggers onto the ask side, and
+        ask-triggered exits pass ``fill_side="ask"`` instead."""
+        model = resolve_slippage_model(
+            {"slippage": "auto", "spread_price_col": "spread"},
+            asset_class="forex",
+        )
+        assert isinstance(model, FixedBpsSlippage)
+        assert model.bps == pytest.approx(1.0)
+
+    def test_ask_ohlc_keeps_bar_spread_model(self) -> None:
+        model = resolve_slippage_model(
+            {"slippage": "auto", "ask_ohlc": True}, asset_class="forex"
+        )
+        assert isinstance(model, BarSpreadSlippage)
+
+    def test_ask_triggered_short_exit_does_not_double_charge_spread(self) -> None:
+        """``fill_side="ask"`` marks an ask-denominated fill: the bar spread
+        is skipped, but the bps fallback still applies when the bar has no
+        ask columns."""
+        model = BarSpreadSlippage(default_bps=10.0)
+        bar = pd.Series({"open": 100.0, "close": 100.0, "ask_close": 100.4})
+        assert model.slip_price(102.0, "buy", bar, fill_side="ask") == pytest.approx(102.0)
+        # Without ask columns the fallback bps applies symmetrically.
+        plain = pd.Series({"open": 100.0, "close": 100.0})
+        assert model.slip_price(100.0, "buy", plain, fill_side="ask") == pytest.approx(100.1)
+        # fill_side never affects sells or non-ask buys.
+        assert model.slip_price(100.0, "buy", bar) == pytest.approx(100.4)
+        assert model.slip_price(100.0, "sell", bar, fill_side="ask") == pytest.approx(100.0)
 
     def test_explicit_spread_with_external_spread_params_degrades(self) -> None:
         model = resolve_slippage_model(
@@ -169,6 +190,125 @@ class TestResolveSlippageModel:
             resolve_slippage_model({"slippage_bps": float("nan")}, asset_class="equities")
         with pytest.raises(ValueError):
             resolve_slippage_model({"slippage": "auto", "slippage_bps": float("nan")})
+
+    def test_inf_bps_rejected(self) -> None:
+        with pytest.raises(ValueError, match="slippage"):
+            resolve_slippage_model({"slippage_bps": float("inf")}, asset_class="equities")
+        with pytest.raises(ValueError):
+            resolve_slippage_model({"slippage": float("-inf")}, asset_class="equities")
+
+    def test_none_spelling_with_slippage_bps_rejected(self) -> None:
+        """``{"slippage":"none","slippage_bps":10}`` must not silently drop
+        the declared bps — same conflict the CLI layer rejects."""
+        for spelling in ("none", "zero", "off", "parity", "no"):
+            with pytest.raises(ValueError, match="slippage_bps"):
+                resolve_slippage_model(
+                    {"slippage": spelling, "slippage_bps": 10.0},
+                    asset_class="equities",
+                )
+
+    def test_none_spelling_with_tuning_keys_rejected(self) -> None:
+        for extra in (
+            {"slippage_default_bps": 5.0},
+            {"slippage_defaults": {"equities": 5.0}},
+        ):
+            with pytest.raises(ValueError, match="slippage"):
+                resolve_slippage_model(
+                    {"slippage": "none", **extra}, asset_class="equities"
+                )
+
+    def test_non_string_non_numeric_slippage_rejected(self) -> None:
+        """``slippage`` that is neither a spelling nor a number must raise,
+        not fall through to the auto model."""
+        for bad in (True, {"bps": 10}, ["bps"], object()):
+            with pytest.raises(ValueError, match="slippage"):
+                resolve_slippage_model({"slippage": bad}, asset_class="equities")
+
+    def test_numeric_slippage_with_tuning_keys_rejected(self) -> None:
+        """``{"slippage":7,"slippage_bps":20}`` must not silently keep 7."""
+        for extra in (
+            {"slippage_bps": 20.0},
+            {"slippage_default_bps": 20.0},
+            {"slippage_defaults": {"equities": 20.0}},
+        ):
+            with pytest.raises(ValueError, match="slippage"):
+                resolve_slippage_model({"slippage": 7, **extra}, asset_class="equities")
+
+    def test_spread_spelling_uses_slippage_bps_as_fallback(self) -> None:
+        """``slippage='spread'`` + ``slippage_bps``: the bps is the bar-less
+        fallback, not a conflicting declaration."""
+        model = resolve_slippage_model(
+            {"slippage": "spread", "slippage_bps": 10.0}, asset_class="forex"
+        )
+        assert isinstance(model, BarSpreadSlippage)
+        assert model.default_bps == pytest.approx(10.0)
+        bar = pd.Series({"open": 100.0, "close": 100.0})
+        assert model.slip_price(100.0, "buy", bar) == pytest.approx(100.1)
+
+    def test_bps_spelling_without_bps_uses_class_default(self) -> None:
+        model = resolve_slippage_model({"slippage": "bps"}, asset_class="equities")
+        assert isinstance(model, FixedBpsSlippage)
+        assert model.bps == pytest.approx(5.0)
+
+    def test_per_class_defaults_beat_global_default_bps(self) -> None:
+        model = resolve_slippage_model(
+            {
+                "slippage_defaults": {"equities": 20.0},
+                "slippage_default_bps": 3.0,
+            },
+            asset_class="equities",
+        )
+        assert isinstance(model, FixedBpsSlippage)
+        assert model.bps == pytest.approx(20.0)
+        # ...and the global default still applies to other classes.
+        other = resolve_slippage_model(
+            {
+                "slippage_defaults": {"equities": 20.0},
+                "slippage_default_bps": 3.0,
+            },
+            asset_class="crypto",
+        )
+        assert isinstance(other, FixedBpsSlippage)
+        assert other.bps == pytest.approx(3.0)
+
+    def test_slippage_defaults_keys_are_normalized(self) -> None:
+        """``{"Equities": 20}`` must apply to ``equities`` — config names
+        normalize like data columns (strip + lowercase)."""
+        model = resolve_slippage_model(
+            {"slippage_defaults": {" Equities ": 20.0}}, asset_class="equities"
+        )
+        assert isinstance(model, FixedBpsSlippage)
+        assert model.bps == pytest.approx(20.0)
+
+    def test_slippage_defaults_unknown_key_rejected(self) -> None:
+        with pytest.raises(ValueError, match="asset class"):
+            resolve_slippage_model(
+                {"slippage_defaults": {"options": 5.0}}, asset_class="equities"
+            )
+        with pytest.raises(ValueError, match="asset class"):
+            resolve_slippage_model(
+                {"slippage_defaults": {"not_a_class": 5.0}}, asset_class="crypto"
+            )
+
+    def test_slippage_defaults_conflicting_normalized_keys_rejected(self) -> None:
+        with pytest.raises(ValueError, match="conflicting"):
+            resolve_slippage_model(
+                {"slippage_defaults": {"Equities": 20.0, "equities": 30.0}},
+                asset_class="equities",
+            )
+        # Agreeing duplicates are harmless.
+        model = resolve_slippage_model(
+            {"slippage_defaults": {"Equities": 20.0, "equities": 20.0}},
+            asset_class="equities",
+        )
+        assert isinstance(model, FixedBpsSlippage)
+        assert model.bps == pytest.approx(20.0)
+
+    def test_slippage_defaults_non_dict_rejected(self) -> None:
+        with pytest.raises(ValueError, match="slippage_defaults"):
+            resolve_slippage_model(
+                {"slippage_defaults": ["equities"]}, asset_class="equities"
+            )
 
 
 class TestSlipPrice:
@@ -223,6 +363,28 @@ class TestSlipPrice:
         model = BarSpreadSlippage(default_bps=10.0)
         bar = pd.Series({"open": 100.0, "close": 100.0, "ask_close": 100.0})
         assert model.slip_price(100.0, "buy", bar) == pytest.approx(100.1)
+
+    def test_bar_spread_odd_count_median(self) -> None:
+        """Three spread observations -> the middle value, not an average
+        of neighbours (kills the even-count-only median mutant)."""
+        model = BarSpreadSlippage(default_bps=50.0)
+        bar = pd.Series(
+            {
+                "open": 100.0,
+                "high": 100.0,
+                "low": 100.0,
+                # close has no ask counterpart -> 3 diffs: 0.1, 0.3, 0.5
+                "ask_open": 100.1,
+                "ask_high": 100.3,
+                "ask_low": 100.5,
+            }
+        )
+        assert model.slip_price(100.0, "buy", bar) == pytest.approx(100.3)
+        assert model.slip_price(100.0, "sell", bar) == pytest.approx(100.0)
+
+    def test_bar_spread_negative_default_bps_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            BarSpreadSlippage(default_bps=-0.5)
 
 
 def _engine_frame() -> pd.DataFrame:
@@ -360,6 +522,55 @@ class TestNativeAdapterMetadata:
         # Classified equity run defaults to 5bps: entry 100 -> 100.05.
         assert result.trades[0].entry_price == pytest.approx(100.05)
 
+    def test_price_basis_reflects_resolved_model_on_two_sided_data(
+        self, tmp_path: Path
+    ) -> None:
+        """``price_basis`` is 'bid_ask' only when the bar-spread model can
+        use the ask columns; 'bid' when they exist but the model is none."""
+        from runner.engines.base import BacktestConfig
+        from runner.engines.native_adapter import NativeAdapter
+        from tests.helpers import write_ohlcv
+
+        strategy_path = tmp_path / "strat.py"
+        strategy_path.write_text(
+            "import pandas as pd\n"
+            "def generate_signals(df, params):\n"
+            "    n = len(df)\n"
+            "    entries = pd.Series([i == 10 for i in range(n)], index=df.index)\n"
+            "    exits = pd.Series([i == 20 for i in range(n)], index=df.index)\n"
+            "    return entries, exits, {}, []\n"
+        )
+
+        def _config(parameters):
+            return BacktestConfig(
+                strategy_name="slip",
+                symbols=["EURUSD"],
+                timeframe="1h",
+                start_date="2024-01-01",
+                end_date="2024-01-31",
+                initial_capital=100_000,
+                risk_per_trade_pct=0.01,
+                modeling_resolution="main_timeframe",
+                data_dir=str(tmp_path),
+                parameters=parameters,
+            )
+
+        write_ohlcv(tmp_path, "EURUSD", _forex_frame(), asset_class="forex")
+
+        spread_result = NativeAdapter().run(
+            _config({"fees": "zero"}), str(strategy_path)
+        )
+        model_meta = spread_result.meta.data["slippage"]["models"]["EURUSD"]
+        assert model_meta["model"] == "bar_spread"
+        assert model_meta["price_basis"] == "bid_ask"
+
+        none_result = NativeAdapter().run(
+            _config({"fees": "zero", "slippage": "none"}), str(strategy_path)
+        )
+        model_meta = none_result.meta.data["slippage"]["models"]["EURUSD"]
+        assert model_meta["model"] == "none"
+        assert model_meta["price_basis"] == "bid"
+
 
 class TestSignalReplaySlippage:
     def _adapter(self, **kwargs):
@@ -415,6 +626,103 @@ class TestSignalReplaySlippage:
         trade = result.trades[0]
         assert trade.entry_price == pytest.approx(100.5)
         assert trade.exits[-1].price == pytest.approx(100.5)
+
+    def test_metadata_slippage_params_override_adapter_params(self) -> None:
+        """``metadata["slippage_params"]`` must win over the constructor
+        params — the run-level declaration is the most specific one."""
+        adapter = self._adapter(
+            fee_params={"fees": "zero"}, slippage_params={"slippage_bps": 100.0}
+        )
+        result = adapter.run(
+            signals=[self._signal()],
+            ohlcv_by_symbol={"AAA": _engine_frame()},
+            timeframe="1h",
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+            # 50bps overrides the constructor's 100bps (the merge keeps
+            # the declaration consistent: 'bps' consumes slippage_bps).
+            metadata={"slippage_params": {"slippage": "bps", "slippage_bps": 50.0}},
+        )
+        trade = result.trades[0]
+        assert trade.entry_price == pytest.approx(100.5 * 1.005)
+        model_meta = result.meta.data["slippage"]["models"]["AAA"]
+        assert model_meta["model"] == "fixed_bps"
+        assert model_meta["bps"] == pytest.approx(50.0)
+
+    def test_metadata_slippage_params_conflict_is_rejected(self) -> None:
+        """A metadata override that contradicts the constructor params
+        (``none`` vs a declared bps) must fail closed, not silently pick
+        one side — same rule as the params-level resolution."""
+        adapter = self._adapter(
+            fee_params={"fees": "zero"}, slippage_params={"slippage_bps": 100.0}
+        )
+        with pytest.raises(ValueError, match="slippage"):
+            adapter.run(
+                signals=[self._signal()],
+                ohlcv_by_symbol={"AAA": _engine_frame()},
+                timeframe="1h",
+                backtest_start="2024-01-01",
+                backtest_end="2024-01-02",
+                metadata={"slippage_params": {"slippage": "none"}},
+            )
+
+    def test_explicit_slippage_model_object_is_used(self) -> None:
+        adapter = self._adapter(
+            fee_params={"fees": "zero"},
+            slippage_model=FixedBpsSlippage(bps=50.0),
+        )
+        result = adapter.run(
+            signals=[self._signal()],
+            ohlcv_by_symbol={"AAA": _engine_frame()},
+            timeframe="1h",
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+        )
+        trade = result.trades[0]
+        # 50bps on the 10:00 bar close (100.5): 100.5 * 1.005.
+        assert trade.entry_price == pytest.approx(100.5 * 1.005)
+        model_meta = result.meta.data["slippage"]["models"]["AAA"]
+        assert model_meta["model"] == "fixed_bps"
+        assert model_meta["bps"] == pytest.approx(50.0)
+
+    def test_price_basis_bid_ask_only_when_bar_spread_model(self) -> None:
+        """``price_basis`` must describe the basis the resolved model
+        prices on — 'bid_ask' only for the bar-spread model, 'bid' when
+        ask columns exist but the model does not use them."""
+        forex_frame = _forex_frame()
+        # Bar-spread model on ask data -> bid_ask.
+        adapter = self._adapter(
+            fee_params={"fees": "zero"},
+            slippage_params={"slippage": "spread", "slippage_bps": 5.0},
+            asset_class_by_symbol={"AAA": "forex"},
+        )
+        result = adapter.run(
+            signals=[self._signal()],
+            ohlcv_by_symbol={"AAA": forex_frame},
+            timeframe="1h",
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+        )
+        meta = result.meta.data["slippage"]["models"]["AAA"]
+        assert meta["model"] == "bar_spread"
+        assert meta["price_basis"] == "bid_ask"
+
+        # Explicit none on the same ask data -> fills on the bid series.
+        adapter = self._adapter(
+            fee_params={"fees": "zero"},
+            slippage_params={"slippage": "none"},
+            asset_class_by_symbol={"AAA": "forex"},
+        )
+        result = adapter.run(
+            signals=[self._signal()],
+            ohlcv_by_symbol={"AAA": forex_frame},
+            timeframe="1h",
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+        )
+        meta = result.meta.data["slippage"]["models"]["AAA"]
+        assert meta["model"] == "none"
+        assert meta["price_basis"] == "bid"
 
 
 def _forex_frame() -> pd.DataFrame:
@@ -496,6 +804,98 @@ class TestNativeEngineForexSpread:
         assert trade.entry_price == pytest.approx(100.0)
         # SHORT TP buys the ask: 98 + 0.4.
         assert trade.exits[0].price == pytest.approx(98.4)
+
+    def test_long_stop_loss_sells_bid_level(self) -> None:
+        """A LONG stop exits on the bid: the bar spread is NOT subtracted
+        again on the sell side (pins the exit-bar plumbing mutant)."""
+        from runner.engine import TradeEngine
+
+        def stop_strategy(df, params):
+            n = len(df)
+            entries = pd.Series([i == 10 for i in range(n)], index=df.index)
+            exits = pd.Series(False, index=df.index)
+            indicators = {
+                "stop_loss": pd.Series([98.0] * n, index=df.index),
+                "take_profit": pd.Series([200.0] * n, index=df.index),
+            }
+            return entries, exits, indicators, []
+
+        engine = TradeEngine(
+            _engine_config({"fees": "zero"}),
+            symbol="EURUSD",
+            asset_class="forex",
+        )
+        result = engine.run(_forex_frame(), stop_strategy)
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        # Entry buys the ask: 100.0 + 0.4. Stop 98 triggers on bar 25
+        # (bid low 97); the sell stays on the bid — 98.0 exactly, the
+        # spread is not charged a second time on the exit side.
+        assert trade.entry_price == pytest.approx(100.4)
+        assert trade.exits[0].reason == "stop_loss"
+        assert trade.exits[0].price == pytest.approx(98.0)
+
+    def test_short_stop_loss_buys_ask_level_plus_spread(self) -> None:
+        from runner.engine import TradeEngine
+
+        def stop_strategy(df, params):
+            n = len(df)
+            entries = pd.Series([i == 10 for i in range(n)], index=df.index)
+            exits = pd.Series(False, index=df.index)
+            indicators = {
+                "direction": pd.Series(["SHORT"] * n, index=df.index),
+                "stop_loss": pd.Series([102.0] * n, index=df.index),
+                "take_profit": pd.Series([50.0] * n, index=df.index),
+            }
+            return entries, exits, indicators, []
+
+        engine = TradeEngine(
+            _engine_config({"fees": "zero"}),
+            symbol="EURUSD",
+            asset_class="forex",
+        )
+        result = engine.run(_forex_frame(), stop_strategy)
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        # SHORT entry sells the bid at 100.0 (no spread on sells).
+        assert trade.entry_price == pytest.approx(100.0)
+        # Stop 102 triggers on bar 15 (bid high 103); the buy-back lifts
+        # to the ask: 102 + 0.4 spread — charged once via the slippage
+        # model, not again on the sell side.
+        assert trade.exits[0].reason == "stop_loss"
+        assert trade.exits[0].price == pytest.approx(102.4)
+
+    def test_ask_ohlc_short_stop_does_not_double_charge_spread(self) -> None:
+        """``ask_ohlc`` keeps the bar-spread model: an ask-triggered SHORT
+        stop fills at the ask-denominated level WITHOUT paying the spread
+        a second time, while a LONG entry still pays it once."""
+        from runner.engine import TradeEngine
+
+        def stop_strategy(df, params):
+            n = len(df)
+            entries = pd.Series([i == 10 for i in range(n)], index=df.index)
+            exits = pd.Series(False, index=df.index)
+            indicators = {
+                "direction": pd.Series(["SHORT"] * n, index=df.index),
+                # 103.2 sits between the bar's bid high (103.0) and ask
+                # high (103.4): only the ask side can trigger it.
+                "stop_loss": pd.Series([103.2] * n, index=df.index),
+                "take_profit": pd.Series([50.0] * n, index=df.index),
+            }
+            return entries, exits, indicators, []
+
+        engine = TradeEngine(
+            _engine_config({"fees": "zero", "ask_ohlc": True}),
+            symbol="EURUSD",
+            asset_class="forex",
+        )
+        result = engine.run(_forex_frame(), stop_strategy)
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exits[0].reason == "stop_loss"
+        # Ask-triggered level is already ask-denominated: 103.2 exactly,
+        # not 103.2 + 0.4.
+        assert trade.exits[0].price == pytest.approx(103.2)
 
 
 class TestReplayFlipSlippage:

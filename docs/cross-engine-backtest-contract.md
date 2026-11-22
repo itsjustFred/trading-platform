@@ -39,7 +39,9 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close. When a
+- Fill price: the protective **level itself ± the resolved slippage
+  model**, not the bar close (since #130 stop/TP fills slip like every
+  other fill; with `slippage="none"` the level is exact). When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -51,9 +53,14 @@ parent Cleanup 16 record.
 
 ### Slippage (fill-price cost model, #130)
 
-Slippage is applied to the **fill price** in the adverse direction — buys
-fill higher, sells fill lower — never as a separate cost line, so `pnl`,
-`net_pnl`, the equity curve and sizing equity all carry the same cost.
+Slippage is applied to the **fill price** in the adverse direction —
+never as a separate cost line, so `pnl`, `net_pnl`, the equity curve and
+sizing equity all carry the same cost. For the fixed-bps models that
+means buys fill higher and sells fill lower; the bar-spread model
+charges the quoted spread **once per round trip, on the buy side only**
+(canonical OHLC is the bid series: buys lift to the ask, sells stay on
+the bid) — an implementer porting this must not subtract the spread on
+sells as well or the spread is charged twice.
 Scope per the maintainer decision: the **native** engine and **signal
 replay** only (the engines #318 keeps; LEAN stays import-only; vectorbt
 and pynecore do not model slippage and record that fact in
@@ -73,9 +80,12 @@ and pynecore do not model slippage and record that fact in
 - Every run records the resolved model per symbol in
   `meta.data["slippage"]["models"]` (plus the data's `price_basis`), so a
   reader never has to guess which cost model produced the numbers.
-- When a strategy already prices the spread through `spread_price_col` or
-  `ask_ohlc`, the auto model degrades to fixed bps so the quoted spread is
-  not charged twice.
+- When a strategy already prices the spread through `spread_price_col`,
+  the auto model degrades to fixed bps so the quoted spread is not
+  charged twice. `ask_ohlc` does not degrade the model — it only moves
+  SHORT stop/TP *triggers* onto the ask side, and those ask-triggered
+  exits pass `fill_side="ask"` so the bar spread is not charged twice on
+  them either.
 
 ## 2. End-date boundary
 

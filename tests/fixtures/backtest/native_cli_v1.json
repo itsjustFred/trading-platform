@@ -64,7 +64,8 @@
       },
       "pnl_basis": {
         "net_pnl": "net_after_fees",
-        "pnl": "gross"
+        "pnl": "gross",
+        "slippage_embedded": true
       },
       "risk_config": {
         "max_leverage": 1.0,

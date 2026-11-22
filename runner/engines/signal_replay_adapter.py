@@ -16,7 +16,7 @@ from risk.models import realized_risk_amount, realized_risk_percent
 from runner.engines import contract
 from runner.engines.contract import resolve_same_bar_exit
 from runner.fees import resolve_fee_model
-from runner.slippage import resolve_slippage_model
+from runner.slippage import BarSpreadSlippage, resolve_slippage_model
 from runner.stats import compute_stats_for_result
 from shared.constants import DATA_DIR, VALID_TIMEFRAMES, normalize_timeframe
 from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
@@ -480,6 +480,11 @@ class SignalReplayAdapter:
         pnl_pct = (pnl / gross_notional) * 100.0 if gross_notional > 0 else 0.0
         r_multiple = (pnl / risk_amount) if risk_amount > 0 else None
         signal_price = float(position.signal_entry_price)
+        # #130: since the fill-price slippage model landed, entry_price
+        # already carries the model's adverse adjustment, so this
+        # signal-vs-fill difference now includes BOTH the signal's own
+        # price gap AND the resolved slippage model — it is no longer a
+        # pure execution-slippage measurement.
         slippage = float(position.entry_price - signal_price)
         slippage_bps = (slippage / signal_price) * 10_000 if signal_price > 0 else 0.0
         fill_delay_seconds = int(
@@ -985,10 +990,17 @@ class SignalReplayAdapter:
                 slippage_params, asset_class=asset_class
             )
             self._slippage_models[replay_symbol] = model
+            # #130: same price-basis rule as the native adapter —
+            # "bid_ask" only when the bar-spread model can use the ask
+            # columns; fixed/none models fill on the canonical (bid)
+            # series even when ask columns happen to be present.
+            has_two_sided = any(
+                str(col).startswith("ask_") for col in replay_frame.columns
+            )
             price_basis = (
                 "bid_ask"
-                if any(str(col).startswith("ask_") for col in replay_frame.columns)
-                else "single_price"
+                if has_two_sided and isinstance(model, BarSpreadSlippage)
+                else ("bid" if has_two_sided else "single_price")
             )
             self._slippage_meta[replay_symbol] = {
                 **model.describe(),

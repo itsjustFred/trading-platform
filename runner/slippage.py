@@ -37,9 +37,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BarSpreadSlippage",
     "FixedBpsSlippage",
+    "SLIPPAGE_CAPABLE_ENGINES",
     "SlippageModel",
     "ZeroSlippage",
+    "assert_slippage_supported",
     "resolve_slippage_model",
+    "slippage_declared",
     "DEFAULT_SLIPPAGE_BPS",
     "FX_SPREAD_ASSET_CLASSES",
 ]
@@ -51,10 +54,20 @@ class SlippageModel(Protocol):
     ``side`` is ``"buy"`` or ``"sell"`` from the trader's perspective:
     a buy fills higher, a sell fills lower. ``bar`` is the OHLCV row the
     fill was priced from (``None`` when unavailable — spread models then
-    use their configured bps fallback).
+    use their configured bps fallback). ``fill_side`` is ``"ask"`` when the
+    fill price is already denominated on the ask side (an ``ask_ohlc``
+    ask-triggered SHORT exit), ``None`` otherwise; models that price off
+    the bar spread use it to avoid charging the spread twice.
     """
 
-    def slip_price(self, price: float, side: str, bar: Any = None) -> float:
+    def slip_price(
+        self,
+        price: float,
+        side: str,
+        bar: Any = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
         ...
 
     def describe(self) -> dict[str, Any]:
@@ -65,7 +78,9 @@ class SlippageModel(Protocol):
 #: Asset classes whose instruments trade on a quoted two-sided market
 #: (FX, CFDs, metals, indices, energies): the per-bar bid/ask spread is
 #: the dominant cost, so the bar-spread model applies where the data
-#: carries ``ask_*`` columns (Dukascopy ``--price-type both`` feeds).
+#: carries ``ask_*`` columns. In practice only feeds that retain their
+#: quote columns qualify — the repo's grid downloader normalises them
+#: away, so most FX runs take the fixed-bps fallback instead.
 FX_SPREAD_ASSET_CLASSES = frozenset(
     {
         "forex",
@@ -122,11 +137,19 @@ _AUTO_SPELLINGS = frozenset({"auto", "default", "asset_class", "per_asset_class"
 _BPS_SPELLINGS = frozenset({"bps", "fixed", "fixed_bps"})
 
 #: Legacy per-bar spread surcharge columns (``spread_price_col`` strategy
-#: param) and the ask-side trigger flag (``ask_ohlc``) already price the
-#: quoted spread for the fills they cover. When either is configured the
-#: auto model must not add the bar spread a second time, so it degrades to
-#: the fixed-bps leg and records ``spread_source`` accordingly.
-_EXTERNAL_SPREAD_PARAMS = ("spread_price_col", "ask_ohlc")
+#: param) already price the quoted spread for the fills they cover, so
+#: when it is configured the auto model must not add the bar spread a
+#: second time and degrades to the fixed-bps leg. ``ask_ohlc`` does NOT
+#: degrade the model: it only moves SHORT stop/TP *triggers* onto the ask
+#: side, and ask-triggered exits pass ``fill_side="ask"`` so the spread is
+#: not charged twice on those legs either.
+_EXTERNAL_SPREAD_PARAMS = ("spread_price_col",)
+
+#: Engines that apply a fill-price slippage model (#130 scope: the native
+#: engine and signal replay — the engines #318 keeps). Every other engine
+#: must reject an explicit slippage declaration instead of running gross
+#: while the user believes slippage was applied.
+SLIPPAGE_CAPABLE_ENGINES = frozenset({"native", "signal_replay", "signal-replay"})
 
 
 def _normalize_asset_class(asset_class: Any) -> str:
@@ -206,7 +229,14 @@ class ZeroSlippage:
     asset_class: str = ""
     reason: str = "explicit_opt_out"
 
-    def slip_price(self, price: float, _side: str, _bar: Any = None) -> float:
+    def slip_price(
+        self,
+        price: float,
+        side: str,
+        bar: Any = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
         return float(price)
 
     def describe(self) -> dict[str, Any]:
@@ -232,7 +262,14 @@ class FixedBpsSlippage:
             raise ValueError("Slippage bps must be non-negative.")
         object.__setattr__(self, "bps", parsed)
 
-    def slip_price(self, price: float, side: str, _bar: Any = None) -> float:
+    def slip_price(
+        self,
+        price: float,
+        side: str,
+        bar: Any = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
         adjustment = abs(float(price)) * self.bps / 10_000.0
         if side == "buy":
             return float(price) + adjustment
@@ -270,14 +307,26 @@ class BarSpreadSlippage:
             raise ValueError("Slippage default bps must be non-negative.")
         object.__setattr__(self, "default_bps", parsed)
 
-    def slip_price(self, price: float, side: str, bar: Any = None) -> float:
+    def slip_price(
+        self,
+        price: float,
+        side: str,
+        bar: Any = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
         spread = _bar_spread_units(bar)
         if spread is not None:
             # Bid-referenced bar: buys lift to the ask, sells stay on the
-            # bid — the quoted spread is paid once, by the buy side.
+            # bid — the quoted spread is paid once, by the buy side. An
+            # ask-triggered fill (``fill_side="ask"``: an ``ask_ohlc``
+            # SHORT stop/TP whose level already sits on the ask) must not
+            # pay it a second time.
             if side == "buy":
+                if fill_side == "ask":
+                    return float(price)
                 return float(price) + spread
             return float(price)
         adjustment = abs(float(price)) * self.default_bps / 10_000.0
@@ -294,17 +343,49 @@ class BarSpreadSlippage:
         }
 
 
+def _normalized_slippage_defaults(params: dict[str, Any]) -> dict[str, Any]:
+    """``slippage_defaults`` with asset-class keys normalized.
+
+    Config names are normalized the same way ``resolve_bar_spread``
+    normalises data columns (strip + lowercase), so ``{"Equities": 20}``
+    applies to ``equities``. A key that matches no known asset class is a
+    typo that would silently never apply — rejected. Duplicate keys that
+    collide after normalization must agree.
+    """
+    overrides = params.get("slippage_defaults")
+    if overrides is None:
+        return {}
+    if not isinstance(overrides, dict):
+        raise ValueError("slippage_defaults must be a JSON object of asset_class -> bps")
+    normalized: dict[str, Any] = {}
+    for raw_key, raw_value in overrides.items():
+        key = _normalize_asset_class(raw_key)
+        if not key:
+            raise ValueError("slippage_defaults keys must be non-empty asset class names")
+        if key in normalized and normalized[key] != raw_value:
+            raise ValueError(
+                f"slippage_defaults has conflicting entries for asset class {key!r}"
+            )
+        normalized[key] = raw_value
+    unknown = sorted(key for key in normalized if key not in DEFAULT_SLIPPAGE_BPS)
+    if unknown:
+        raise ValueError(
+            f"slippage_defaults keys match no known asset class: {unknown}; "
+            f"known classes: {sorted(DEFAULT_SLIPPAGE_BPS)}"
+        )
+    return normalized
+
+
 def _class_default_bps(asset_class: str, params: dict[str, Any]) -> float:
     """Configured fallback bps for ``asset_class`` (most specific wins)."""
-    overrides = params.get("slippage_defaults")
-    if isinstance(overrides, dict):
-        raw = overrides.get(asset_class)
-        if raw is not None:
-            return _positive_float(raw, field="slippage_defaults entry")
+    overrides = _normalized_slippage_defaults(params)
+    raw = overrides.get(_normalize_asset_class(asset_class))
+    if raw is not None:
+        return _positive_float(raw, field="slippage_defaults entry")
     configured = params.get("slippage_default_bps")
     if configured is not None:
         return _positive_float(configured, field="slippage_default_bps")
-    fallback = DEFAULT_SLIPPAGE_BPS.get(asset_class)
+    fallback = DEFAULT_SLIPPAGE_BPS.get(_normalize_asset_class(asset_class))
     if fallback is None:
         raise ValueError(
             f"No slippage default for asset_class={asset_class!r}; "
@@ -456,13 +537,50 @@ def resolve_slippage_model(
     explicit = params.get("slippage")
     bps_override = params.get("slippage_bps")
 
-    if isinstance(explicit, str):
-        return _resolve_string_slippage(explicit, params, ac, bps_override)
-
-    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+    if explicit is not None and not isinstance(explicit, str):
+        if isinstance(explicit, bool) or not isinstance(explicit, (int, float)):
+            raise ValueError(
+                "params['slippage'] must be a model spelling "
+                "('none', 'spread', 'bps', 'auto') or a fixed bps number, "
+                f"got {explicit!r}."
+            )
+        # A numeric slippage IS the fixed bps — combining it with any
+        # tuning key would silently drop one of the two declarations.
+        stray = [
+            key
+            for key in ("slippage_bps", "slippage_default_bps", "slippage_defaults")
+            if params.get(key) is not None
+        ]
+        if stray:
+            raise ValueError(
+                f"params['slippage']={explicit!r} cannot be combined with "
+                f"{', '.join(stray)}: the numeric spelling already fixes the "
+                "bps. Drop the extra keys or use slippage='bps'."
+            )
         return FixedBpsSlippage(
             bps=_positive_float(explicit, field="slippage"), asset_class=ac
         )
+
+    if isinstance(explicit, str):
+        spelling = explicit.strip().lower()
+        if bps_override is not None and spelling not in _BPS_SPELLINGS and spelling != "spread":
+            raise ValueError(
+                f"params['slippage_bps'] cannot be combined with "
+                f"slippage={explicit!r}: only 'bps'/'spread' spellings consume "
+                "it (as the fixed value / the spread fallback)."
+            )
+        if spelling in _NONE_SPELLINGS:
+            stray = [
+                key
+                for key in ("slippage_default_bps", "slippage_defaults")
+                if params.get(key) is not None
+            ]
+            if stray:
+                raise ValueError(
+                    f"slippage={explicit!r} declares a gross run; "
+                    f"{', '.join(stray)} would be silently ignored. Drop them."
+                )
+        return _resolve_string_slippage(explicit, params, ac, bps_override)
 
     if bps_override is not None:
         return FixedBpsSlippage(
@@ -470,3 +588,59 @@ def resolve_slippage_model(
         )
 
     return _auto_model(params, ac)
+
+
+def _slippage_params_declare_cost(params: dict[str, Any]) -> bool:
+    """True when the params ask for anything other than an explicit gross run."""
+    explicit = params.get("slippage")
+    if "slippage_model" in params and params.get("slippage_model") is not None:
+        model = params["slippage_model"]
+        describe = getattr(model, "describe", None)
+        if callable(describe):
+            try:
+                if describe().get("model") == "none":
+                    return False
+            except Exception:
+                pass
+        return True
+    if isinstance(explicit, str):
+        if explicit.strip().lower() in _NONE_SPELLINGS:
+            # ``none`` plus tuning keys is rejected by resolve_slippage_model;
+            # treat the declaration as gross only when it is clean.
+            return any(
+                params.get(key) is not None
+                for key in ("slippage_bps", "slippage_default_bps", "slippage_defaults")
+            )
+        return True
+    if explicit is not None:
+        return True
+    return any(
+        params.get(key) is not None
+        for key in ("slippage_bps", "slippage_default_bps", "slippage_defaults")
+    )
+
+
+def slippage_declared(params: dict[str, Any] | None) -> bool:
+    """True when ``params`` explicitly declare a non-``none`` slippage cost."""
+    return _slippage_params_declare_cost(dict(params or {}))
+
+
+def assert_slippage_supported(engine_name: str, params: dict[str, Any] | None) -> None:
+    """Fail closed when an engine cannot honour a declared slippage model.
+
+    #130 scopes fill-price slippage to the native engine and signal replay.
+    vectorbt/pynecore (and LEAN, which is import-only per #318) have no
+    slippage code path, so a declared model there would be silently
+    ignored — the run must refuse instead. ``slippage="none"`` declarations
+    are allowed everywhere: they assert the gross behaviour the engine
+    already has.
+    """
+    if str(engine_name) in SLIPPAGE_CAPABLE_ENGINES:
+        return
+    if slippage_declared(params):
+        raise ValueError(
+            f"engine '{engine_name}' does not model slippage (#130 scope: "
+            "native + signal replay); the declared slippage params would be "
+            "silently ignored. Re-run with --engine native or drop the "
+            "slippage flags."
+        )

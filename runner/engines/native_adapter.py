@@ -17,6 +17,7 @@ from runner.engines.base import (
     ProgressCallback,
     resolve_strategy_parameters,
 )
+from runner.slippage import BarSpreadSlippage
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
 
@@ -181,10 +182,18 @@ class NativeAdapter(EngineAdapter):
                 asset_class=asset_class,
             )
             symbol_result = engine.run(data, strategy_module.generate_signals)
+            # #130: report the basis the resolved model actually prices
+            # on — "bid_ask" only when the bar-spread model can use the
+            # ask columns; fixed/none models fill on the canonical (bid)
+            # series even when ask columns happen to be present.
+            has_two_sided = any(
+                str(col).startswith("ask_") for col in data.columns
+            )
             price_basis = (
                 "bid_ask"
-                if any(str(col).startswith("ask_") for col in data.columns)
-                else "single_price"
+                if has_two_sided
+                and isinstance(engine.slippage_model, BarSpreadSlippage)
+                else ("bid" if has_two_sided else "single_price")
             )
             slippage_models[symbol] = {
                 **engine.slippage_model.describe(),

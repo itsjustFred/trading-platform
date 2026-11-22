@@ -488,7 +488,14 @@ class TradeEngine:
             )
         )
 
-    def _slip(self, price: float, side: str, bar: pd.Series | None = None) -> float:
+    def _slip(
+        self,
+        price: float,
+        side: str,
+        bar: pd.Series | None = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
         """Adverse slippage adjustment on one fill price (#130).
 
         ``side`` is the trader's side of the fill: entries buy on LONG /
@@ -497,9 +504,16 @@ class TradeEngine:
         the recorded fill price, the PnL and the equity path all carry the
         same cost. Limit-price clamping is NOT modeled (a slipped limit
         buy could fill above its limit); the engine only submits market
-        orders today, so no live path reaches it.
+        orders today, so no live path reaches it. ``fill_side="ask"``
+        marks an ask-triggered SHORT exit whose level is already
+        ask-denominated (``ask_ohlc``), so the bar-spread model does not
+        charge the spread a second time.
         """
-        return float(self.slippage_model.slip_price(float(price), side, bar))
+        return float(
+            self.slippage_model.slip_price(
+                float(price), side, bar, fill_side=fill_side
+            )
+        )
 
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
         if not self.pending_orders:
@@ -695,6 +709,8 @@ class TradeEngine:
         time_iso: str,
         reason: str,
         bar: pd.Series | None = None,
+        *,
+        fill_side: str | None = None,
     ) -> None:
         qty = max(0.0, min(qty, position.remaining_qty))
         if qty <= 0:
@@ -706,6 +722,7 @@ class TradeEngine:
             price,
             "sell" if position.direction == "LONG" else "buy",
             bar,
+            fill_side=fill_side,
         )
         if position.direction == "LONG":
             pnl = (price - position.entry_price) * qty
@@ -1123,6 +1140,16 @@ class TradeEngine:
                 adverse_cap=excursion_adverse_cap,
             )
 
+            # A-L5/A-H7: with ``ask_ohlc`` a SHORT's protective levels are
+            # ask-denominated — the trigger compared the ask side, so the
+            # exit fill must not pay the quoted spread a second time via
+            # the slippage model (#130).
+            exit_fill_side = (
+                "ask"
+                if position.direction != "LONG"
+                and (ask_high is not None or ask_low is not None)
+                else None
+            )
             if first_event == "stop" and position.stop_loss is not None:
                 # D4 (Phase 3, A-M1 exit convention): the unified convention
                 # is Fill-zum-Trigger-Close for SIGNAL exits; stop/TP legs
@@ -1141,6 +1168,7 @@ class TradeEngine:
                     time_iso=time_iso,
                     reason="stop_loss",
                     bar=row,
+                    fill_side=exit_fill_side,
                 )
             elif first_event == "tp":
                 # A-H7: SHORT TP fills buy the ask (level + spread), LONG TP
@@ -1168,6 +1196,7 @@ class TradeEngine:
                         time_iso=time_iso,
                         reason=str(level.get("name") or "take_profit"),
                         bar=row,
+                        fill_side=exit_fill_side,
                     )
                     level["filled"] = True
 
@@ -1185,6 +1214,7 @@ class TradeEngine:
                         time_iso=time_iso,
                         reason="stop_loss",
                         bar=row,
+                        fill_side=exit_fill_side,
                     )
 
             self._finalize_position(position, i)
