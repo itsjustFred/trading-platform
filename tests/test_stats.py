@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from runner.stats import (
+    _daily_returns,
     _daily_returns_from_equity_curve,
     _daily_returns_series_from_equity_curve,
     _max_consecutive,
@@ -40,7 +41,9 @@ def _trade(pnl: float, holding_bars: int | None = None) -> Trade:
     )
 
 
-def _equity_curve_from_returns(returns: list[float], initial_capital: float = 100000.0) -> list[EquityPoint]:
+def _equity_curve_from_returns(
+    returns: list[float], initial_capital: float = 100000.0
+) -> list[EquityPoint]:
     points = []
     equity = initial_capital
     start = datetime(2021, 1, 1, tzinfo=timezone.utc)
@@ -66,7 +69,9 @@ class TestQuantStatsManualParity:
 
         qs = pytest.importorskip("quantstats.stats")
 
-        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        series = pd.Series(
+            self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns))
+        )
         expected = float(qs.sharpe(series, rf=0.04, periods=252))
 
         assert _sharpe_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
@@ -76,7 +81,9 @@ class TestQuantStatsManualParity:
 
         qs = pytest.importorskip("quantstats.stats")
 
-        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        series = pd.Series(
+            self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns))
+        )
         expected = float(qs.sortino(series, rf=0.04, periods=252))
 
         assert _sortino_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
@@ -542,6 +549,29 @@ class TestMaxDrawdown:
         assert _max_drawdown_pct_manual([100]) == 0.0
 
 
+class TestDailyReturnsHelper:
+    """Pin the raw period-return fallback used when no daily series exists."""
+
+    def test_period_over_period_returns(self):
+        assert _daily_returns([100.0, 110.0, 99.0]) == pytest.approx([0.1, -0.1])
+
+    def test_non_positive_previous_equity_is_flat_not_dropped(self):
+        assert _daily_returns([0.0, 10.0, 5.0]) == pytest.approx([0.0, -0.5])
+
+    def test_short_series_has_no_returns(self):
+        assert _daily_returns([]) == []
+        assert _daily_returns([100.0]) == []
+
+    def test_equity_curve_falls_back_when_no_daily_series_exists(self):
+        curve = [
+            EquityPoint(time="2024-01-01T00:00:00Z", equity=0.0),
+            EquityPoint(time="2024-01-02T00:00:00Z", equity=10.0),
+        ]
+
+        assert _daily_returns_series_from_equity_curve(curve) is None
+        assert _daily_returns_from_equity_curve(curve) == [0.0]
+
+
 class TestComputeStatsForResult:
     def test_convenience_wrapper(self):
         result = BacktestResult(
@@ -882,7 +912,7 @@ def _moments_curve(daily_equities: list[float]) -> list:
     days = pd.date_range("2024-01-01", periods=len(daily_equities), freq="D", tz="UTC")
     return [
         EquityPoint(time=day.isoformat(), equity=value)
-        for day, value in zip(days, daily_equities)
+        for day, value in zip(days, daily_equities, strict=True)
     ]
 
 

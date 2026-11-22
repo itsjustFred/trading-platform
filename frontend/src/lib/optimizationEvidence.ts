@@ -1,5 +1,5 @@
 export type OptimizationOosEvidenceState = "available" | "decayed" | "degraded" | "unavailable";
-export type OptimizationOosStatus = "available" | "insufficient_overlap" | "no_oos_requested" | "unavailable";
+export type OptimizationOosStatus = "available" | "insufficient_oos_bars" | "insufficient_overlap" | "no_oos_requested" | "unavailable";
 
 export interface OptimizationOosEvidence {
   state: OptimizationOosEvidenceState;
@@ -37,6 +37,7 @@ const TARGET_METRIC_ALIASES: Record<string, string> = {
 const SUPPORTED_METRIC_KEYS = new Set(Object.values(TARGET_METRIC_ALIASES));
 const VALID_OOS_STATUSES = new Set<OptimizationOosStatus>([
   "available",
+  "insufficient_oos_bars",
   "insufficient_overlap",
   "no_oos_requested",
   "unavailable",
@@ -109,9 +110,11 @@ export function classifyOptimizationOosEvidence(
     const reason =
       normalizedStatus === "no_oos_requested"
         ? "No out-of-sample window was requested for this optimization."
-        : normalizedStatus === "unavailable"
-          ? "The OOS status is unavailable, so OOS evidence cannot be validated."
-          : "The out-of-sample evaluation did not have sufficient overlap.";
+        : normalizedStatus === "insufficient_oos_bars"
+          ? "The out-of-sample holdout had too few daily observations to support a decision."
+          : normalizedStatus === "unavailable"
+            ? "The OOS status is unavailable, so OOS evidence cannot be validated."
+            : "The out-of-sample evaluation did not have sufficient overlap.";
     return unavailableEvidence(metricKey, reason);
   }
 

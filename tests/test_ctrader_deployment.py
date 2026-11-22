@@ -65,6 +65,54 @@ def test_build_ctrader_deployment_plan_targets_first_ctrader_account() -> None:
     assert deployments[0].signal_config["source_backtest_id"] == "bt-1"
 
 
+def test_build_ctrader_deployment_plan_never_activates_an_unknown_status() -> None:
+    """An unrecognised deployment status must never read as ACTIVE.
+
+    The planner writes only one of the three states the daemon dispatches.
+    Anything else - a typo, a future state, a differently-spelled ACTIVE -
+    falls back to PAUSED, so the plan exists but is not traded until a human
+    maps it. Reading it as ACTIVE would make a typo trade live money.
+    """
+    backtests = [
+        {
+            "id": "bt-1",
+            "strategy_name": "fx_breakout",
+            "symbols": ["EURUSD"],
+            "timeframe": "15m",
+            "sharpe_ratio": 1.5,
+            "cagr": 0.2,
+            "psr": 0.8,
+            "max_drawdown": -0.06,
+            "trade_count": 12,
+            "oos_status": "available",
+        }
+    ]
+    accounts = [LiveAccountConfig(id="ct-1", broker="ctrader", name="cTrader")]
+
+    for unknown in ("LIVE", "active", "", "ACTIVE ", "Stopped", "Pending"):
+        deployments = build_ctrader_deployment_plan(
+            backtests=backtests,
+            accounts=accounts,
+            limit=5,
+            status=unknown,
+        )
+
+        assert len(deployments) == 1
+        assert deployments[0].status == "PAUSED", unknown
+
+    # The three real states still pass through unchanged - the fallback only
+    # catches what the daemon cannot dispatch.
+    for known in ("ACTIVE", "PAUSED", "STOPPED"):
+        deployments = build_ctrader_deployment_plan(
+            backtests=backtests,
+            accounts=accounts,
+            limit=5,
+            status=known,
+        )
+
+        assert deployments[0].status == known
+
+
 def test_top_backtests_require_oos_evidence_by_default() -> None:
     """C5: in-sample-only rows never reach a live shortlist."""
     rows = [

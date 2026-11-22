@@ -35,7 +35,10 @@ FIXTURE_DIR = PROJECT_ROOT / "tests" / "fixtures" / "validation" / "mt5_xlsx"
 # entries carry the write time. ``dcterms:modified`` is stamped with the wall
 # clock by openpyxl itself, so ``_save_with_fixed_timestamp`` re-pins it from
 # the workbook's value after the save.
-_FIXED_TIME = datetime(2024, 1, 1, 0, 0, 0)
+# Deliberately naive: the fixed timestamp is what makes a regeneration byte-stable,
+# and the committed goldens pin this exact serialization (an aware value would
+# change them).
+_FIXED_TIME = datetime(2024, 1, 1, 0, 0, 0)  # noqa: DTZ001
 
 # The one XML element openpyxl overwrites at save time
 # (``openpyxl/writer/excel.py``: ``workbook.properties.modified = now``).

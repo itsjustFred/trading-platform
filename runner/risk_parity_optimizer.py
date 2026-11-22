@@ -364,8 +364,14 @@ def score_risk_parity_universe(
         - (0.5 * avg_abs_corr)
         - (2.0 * rc_error)
     )
-    weights = {symbol: float(weight) for symbol, weight in zip(symbols, weights_array)}
-    risk = {symbol: float(value) for symbol, value in zip(symbols, rc)}
+    # `weights_array` is `solve_risk_parity_weights(cov)` over the same symbol
+    # universe that produced `cov`, so the two are the same length by
+    # construction; `strict=True` makes a universe/covariance mismatch raise
+    # rather than attribute one symbol's risk to another.
+    weights = {
+        symbol: float(weight) for symbol, weight in zip(symbols, weights_array, strict=True)
+    }
+    risk = {symbol: float(value) for symbol, value in zip(symbols, rc, strict=True)}
     return RiskParitySelection(
         symbols=list(symbols),
         weights=weights,

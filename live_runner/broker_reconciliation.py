@@ -315,7 +315,7 @@ def validate_broker_reconciliation_settings(settings: Mapping[str, Any] | None) 
     from live_runner.exit_signals import MAX_QTY_TOLERANCE
 
     values = settings or {}
-    for key, default, minimum, maximum in (
+    for key, _default, minimum, maximum in (
         (
             "broker_reconciliation_interval_seconds",
             DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
@@ -422,7 +422,7 @@ def _position_qty_tolerance(
     if callable(method):
         try:
             precision = usable_qty_tolerance(method(symbol))
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             logger.warning(
                 "Adapter could not report quantity precision; using strict default",
                 extra={"data": {"symbol": symbol, "error": str(exc)}},
@@ -469,10 +469,15 @@ async def _broker_state(
     adapter: BaseLiveAdapter, *, pending: set[asyncio.Task[Any]] | None = None
 ) -> BrokerStateSnapshot:
     """Read positions, working orders and protective stops; any failure is unreadable."""
+    get_positions = getattr(adapter, "get_positions", None)
+    if not callable(get_positions):
+        return BrokerStateSnapshot(
+            error="positions unreadable: adapter cannot report positions"
+        )
     try:
         positions = tuple(
             await _shielded_read(
-                adapter.get_positions(),
+                get_positions(),
                 BROKER_READ_TIMEOUT_SECONDS,
                 pending,
             )
@@ -481,7 +486,7 @@ async def _broker_state(
         return BrokerStateSnapshot(
             error=f"positions unreadable: timed out after {BROKER_READ_TIMEOUT_SECONDS}s"
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         return BrokerStateSnapshot(error=f"positions unreadable: {exc}")
     try:
         orders = tuple(
@@ -500,7 +505,7 @@ async def _broker_state(
                 f"{BROKER_READ_TIMEOUT_SECONDS}s"
             )
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         return BrokerStateSnapshot(error=f"working orders unreadable: {exc}")
 
     stops: tuple[ProtectiveStop, ...] = ()
@@ -525,7 +530,7 @@ async def _broker_state(
                     f"{BROKER_READ_TIMEOUT_SECONDS}s"
                 ),
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return BrokerStateSnapshot(
                 positions=positions,
                 orders=orders,
@@ -730,23 +735,23 @@ def compare_account_state(
             for stop in snapshot.protective_stops
             if str(stop.symbol or "").strip()
         }
-        for symbol in sorted(position_symbols - stop_symbols):
-            findings.append(
-                _finding(
-                    "position_without_protective_stop",
-                    account_id=account_id,
-                    symbol=symbol,
-                    broker_qty=broker_positions[symbol],
-                )
+        findings.extend(
+            _finding(
+                "position_without_protective_stop",
+                account_id=account_id,
+                symbol=symbol,
+                broker_qty=broker_positions[symbol],
             )
-        for symbol in sorted(stop_symbols - position_symbols):
-            findings.append(
-                _finding(
-                    "orphaned_protective_stop",
-                    account_id=account_id,
-                    symbol=symbol,
-                )
+            for symbol in sorted(position_symbols - stop_symbols)
+        )
+        findings.extend(
+            _finding(
+                "orphaned_protective_stop",
+                account_id=account_id,
+                symbol=symbol,
             )
+            for symbol in sorted(stop_symbols - position_symbols)
+        )
 
     return findings, summary
 
@@ -834,7 +839,7 @@ class BrokerReconciliationManager:
                 timeout,
                 pending,
             )
-        except Exception:
+        except Exception:  # except-kind: money-decision
             return None
         return state if state in (ORDER_STATE_WORKING, ORDER_STATE_TERMINAL) else None
 
@@ -949,7 +954,7 @@ class BrokerReconciliationManager:
                     config=config,
                     adapter=adapter,
                 )
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 # A comparison failure (DB error, malformed stored row) is
                 # unreadable broker-vs-ledger state: it must count as a
                 # mismatch pass, not escape the loop and silently skip the
@@ -1013,7 +1018,7 @@ class BrokerReconciliationManager:
                         account_id,
                         consecutive_mismatches=streak,
                     )
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     logger.error(
                         "Broker reconciliation could not halt deployment entries",
                         extra={
@@ -1048,7 +1053,7 @@ class BrokerReconciliationManager:
                             deployment_id,
                             account_id,
                         )
-                except Exception as exc:
+                except Exception as exc:  # except-kind: money-decision
                     resume_failures.append(deployment_id)
                     logger.error(
                         "Broker reconciliation could not release an entry halt; "
@@ -1176,7 +1181,7 @@ async def run_broker_reconciliation_loop(
             interval = manager.next_interval_seconds(deployments)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Broker reconciliation iteration failed",
                 extra={"data": {"error": str(exc)}},

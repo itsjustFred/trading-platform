@@ -673,7 +673,7 @@ def test_get_live_signal_broker_order_id_missing(isolated_db):
 
 
 def test_dedupe_executions_keeps_oldest_row(isolated_db):
-    """When duplicates exist, the oldest row (lowest rowid) is kept."""
+    """When duplicate rows share the broker's fill id, the oldest row (lowest rowid) is kept."""
     database = isolated_db
     signal = LiveSignal(
         deployment_id="dep-1",
@@ -694,7 +694,8 @@ def test_dedupe_executions_keeps_oldest_row(isolated_db):
             commission=0.0,
             timestamp=ts,
             broker_order_id="bo-1",
-            dedupe_key="dup:1",
+            dedupe_key="legacy:content:1",
+            broker_fill_id=9001,
         )
     )
     database.save_live_execution(
@@ -705,7 +706,8 @@ def test_dedupe_executions_keeps_oldest_row(isolated_db):
             commission=0.0,
             timestamp=ts,
             broker_order_id="bo-1",
-            dedupe_key="dup:2",
+            dedupe_key="legacy:fill:1",
+            broker_fill_id=9001,
         )
     )
 
@@ -721,7 +723,7 @@ def test_dedupe_executions_keeps_oldest_row(isolated_db):
     with database.get_session() as session:
         rows = session.exec(database.select(database.LiveExecutionModel)).all()
     assert len(rows) == 1
-    assert rows[0].dedupe_key == "dup:1"  # oldest (first inserted) kept
+    assert rows[0].dedupe_key == "legacy:content:1"  # oldest (first inserted) kept
 
 
 def test_dedupe_executions_dry_run_does_not_delete(isolated_db):
@@ -746,7 +748,8 @@ def test_dedupe_executions_dry_run_does_not_delete(isolated_db):
             commission=0.0,
             timestamp=ts,
             broker_order_id="bo-1",
-            dedupe_key="dup:1",
+            dedupe_key="legacy:content:2",
+            broker_fill_id=9001,
         )
     )
     database.save_live_execution(
@@ -757,7 +760,8 @@ def test_dedupe_executions_dry_run_does_not_delete(isolated_db):
             commission=0.0,
             timestamp=ts,
             broker_order_id="bo-1",
-            dedupe_key="dup:2",
+            dedupe_key="legacy:fill:2",
+            broker_fill_id=9001,
         )
     )
 
@@ -813,6 +817,205 @@ def test_dedupe_executions_idempotent_on_clean_table(isolated_db):
     deleted = dedupe_executions()
 
     assert deleted == 0
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2
+
+
+def test_dedupe_executions_keeps_equal_size_fills_with_distinct_fill_ids(isolated_db):
+    """#233: equal quantity and timestamp do not make two genuine fills duplicates.
+
+    Two partial fills of one signal can have the same size, price and timestamp; what makes
+    them distinct is the broker's own fill id (and the dedupe key derived from it). The old
+    ``(signal_id, filled_qty, timestamp)`` grouping deleted one and understated the position.
+    """
+    database = isolated_db
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal)
+
+    ts = datetime.now(timezone.utc)
+    for key, broker_fill_id in (("alpaca:exec:9101", 9101), ("alpaca:exec:9102", 9102)):
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=key,
+                broker_fill_id=broker_fill_id,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions(confirm=True) == 0
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2
+
+
+def test_dedupe_executions_scopes_broker_fill_ids_to_their_signal(isolated_db):
+    """A broker fill id reused by another signal (another account) is not a duplicate.
+
+    Broker fill ids are only unique per account, and the codebase already treats a dedupe-key
+    collision across signals as an error rather than a redelivery. Deleting across signals would
+    destroy a live fill when two brokers reuse the same numeric id.
+    """
+    database = isolated_db
+    ts = datetime.now(timezone.utc)
+    signal_ids = []
+    for index in range(2):
+        signal = LiveSignal(
+            deployment_id="dep-1",
+            symbol="AAPL",
+            action="buy",
+            theoretical_price=100.0 + index,
+            timestamp=ts,
+            metadata={},
+        )
+        database.save_live_signal(signal)
+        signal_ids.append(signal.id)
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=f"alpaca:exec:{9100 + index}",
+                broker_fill_id=9100,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions(confirm=True) == 0
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2
+    assert {row.signal_id for row in rows} == {str(signal_id) for signal_id in signal_ids}
+
+
+def test_dedupe_executions_defaults_to_dry_run_on_real_rows(isolated_db):
+    """Calling the script without arguments must report, never delete (the default is dry-run)."""
+    database = isolated_db
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal)
+
+    ts = datetime.now(timezone.utc)
+    for key in ("legacy:content:3", "legacy:fill:3"):
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=key,
+                broker_fill_id=9001,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions() == 1  # reports the duplicate it would remove
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2  # unchanged
+
+
+def test_dedupe_executions_treats_zero_broker_fill_id_as_missing(isolated_db):
+    """A broker fill id of 0 is "unknown", not an identity shared by every such row."""
+    database = isolated_db
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal)
+
+    ts = datetime.now(timezone.utc)
+    for key in ("legacy:content:4", "legacy:fill:4"):
+        database.save_live_execution(
+            LiveExecution(
+                signal_id=signal.id,
+                actual_price=100.0,
+                filled_qty=10.0,
+                commission=0.0,
+                timestamp=ts,
+                broker_order_id="bo-1",
+                dedupe_key=key,
+                broker_fill_id=0,
+            )
+        )
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions(confirm=True) == 0
+    with database.get_session() as session:
+        rows = session.exec(database.select(database.LiveExecutionModel)).all()
+    assert len(rows) == 2
+
+
+def test_dedupe_executions_never_deletes_rows_without_an_identity_key(isolated_db):
+    """#233: a row with neither a dedupe key nor a broker fill id cannot be proven a duplicate.
+
+    Legacy rows written before either column existed must be kept out of the delete set, even
+    when they agree on signal, size and timestamp.
+    """
+    database = isolated_db
+    signal = LiveSignal(
+        deployment_id="dep-1",
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=100.0,
+        timestamp=datetime.now(timezone.utc),
+        metadata={},
+    )
+    database.save_live_signal(signal)
+
+    ts = datetime.now(timezone.utc)
+    with database.get_session() as session:
+        for _ in range(2):
+            session.add(
+                database.LiveExecutionModel(
+                    id=str(uuid4()),
+                    signal_id=str(signal.id),
+                    actual_price=100.0,
+                    filled_qty=10.0,
+                    commission=0.0,
+                    timestamp=ts,
+                    broker_order_id="bo-1",
+                    dedupe_key=None,
+                    broker_fill_id=None,
+                )
+            )
+        session.commit()
+
+    from scripts.dedupe_executions import dedupe_executions
+
+    assert dedupe_executions(confirm=True) == 0
     with database.get_session() as session:
         rows = session.exec(database.select(database.LiveExecutionModel)).all()
     assert len(rows) == 2
@@ -1197,6 +1400,78 @@ def test_an_unreadable_order_status_is_detected_from_the_wire() -> None:
     assert adapter._unrecognised_status_wire_value(wire) is None, (
         "an order that never carried a status must not look like an unrecognised one"
     )
+
+
+def test_an_unrecognised_status_is_treated_as_working(caplog) -> None:
+    """A status this client cannot name must still be cancelled, not left resting.
+
+    The broker's unnameable status arrives in the wire's unknown fields while
+    the typed ``orderStatus`` still reads ACCEPTED, so the sweep sends a
+    cancel - the direction that leaves nothing resting - and logs that the
+    status was uninterpretable.
+    """
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    wire = ProtoOAOrder()
+    wire.orderId = 701
+    wire.orderType = ProtoOAOrderType.LIMIT
+    wire.orderStatus = ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED
+    wire.tradeData.CopyFrom(_trade_data())
+    raw = bytearray(wire.SerializeToString())
+    # Field 4 is orderStatus; value 9 is a status this build has no name for.
+    raw += bytes([4 << 3 | 0, 9])
+    parsed = ProtoOAOrder()
+    parsed.ParseFromString(bytes(raw))
+
+    adapter = _control_adapter()
+
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(parsed) is True
+    assert any("no name for" in record.getMessage() for record in caplog.records)
+
+
+def test_no_status_enum_treats_every_order_as_working(caplog) -> None:
+    """Without the enum there is no way to tell working from terminal."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrderType
+
+    adapter = _control_adapter()
+    adapter._ProtoOAOrderStatus = None
+
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(_order(702, ProtoOAOrderType.LIMIT)) is True
+    assert any("no order-status enum" in record.getMessage() for record in caplog.records)
+
+
+def test_an_order_with_no_status_field_is_treated_as_working(caplog) -> None:
+    """A status that was never sent is "cannot tell", so it is cancelled."""
+    adapter = _control_adapter()
+    order = SimpleNamespace(orderId=703, orderType=2)
+
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(order) is True
+    assert any("no status field" in record.getMessage() for record in caplog.records)
+
+
+def test_a_terminal_or_unparsable_status_is_not_working(caplog) -> None:
+    """The one path that resolves *against* cancelling, pinned so it stays loud."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+        ProtoOAOrderType,
+    )
+
+    adapter = _control_adapter()
+
+    filled = _order(704, ProtoOAOrderType.LIMIT, status=ProtoOAOrderStatus.ORDER_STATUS_FILLED)
+    with caplog.at_level("WARNING"):
+        assert adapter._is_working_order(filled) is False
+
+    unparseable = SimpleNamespace(orderId=705, orderType=2, orderStatus="ACCEPTED?")
+    assert adapter._is_working_order(unparseable) is False
+    assert any("not an integer" in record.getMessage() for record in caplog.records)
 
 
 def test_the_base_adapter_does_not_claim_the_controls() -> None:

@@ -74,7 +74,7 @@ class TestHTMLSplitFills:
         xlsx_ref = MT5XLSXImporter().load(_split_fill_xlsx())
 
         assert len(html_ref.trades) == len(xlsx_ref.trades) == 2
-        for html_trade, xlsx_trade in zip(html_ref.trades, xlsx_ref.trades):
+        for html_trade, xlsx_trade in zip(html_ref.trades, xlsx_ref.trades, strict=True):
             assert html_trade.direction == xlsx_trade.direction
             assert html_trade.quantity == pytest.approx(xlsx_trade.quantity)
             assert html_trade.pnl == pytest.approx(xlsx_trade.pnl)
@@ -189,7 +189,7 @@ def test_split_fill_xlsx_fixture_is_deterministic(tmp_path: Path) -> None:
     ref_a = MT5XLSXImporter().load(built)
     ref_b = MT5XLSXImporter().load(_split_fill_xlsx())
     assert len(ref_a.trades) == len(ref_b.trades)
-    for a, b in zip(ref_a.trades, ref_b.trades):
+    for a, b in zip(ref_a.trades, ref_b.trades, strict=True):
         assert a.direction == b.direction
         assert a.quantity == pytest.approx(b.quantity)
         assert a.pnl == pytest.approx(b.pnl)

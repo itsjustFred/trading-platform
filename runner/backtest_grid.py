@@ -31,6 +31,7 @@ from runner.engines.base import (
     BacktestConfig,
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
+    warn_if_engine_frozen,
 )
 from runner.engines.contract import resolve_intrabar_timeframe
 from runner.grid_identity import (
@@ -222,6 +223,7 @@ def build_cli_command(
 
 def get_engine(name: str):
     """Create an engine adapter without importing runner.cli."""
+    warn_if_engine_frozen(name, stacklevel=2)
     if name == "native":
         from runner.engines.native_adapter import NativeAdapter
 
@@ -451,8 +453,8 @@ def _validate_max_workers(max_workers: Any) -> int:
     """Validate the grid fan-out width (C3)."""
     try:
         workers = int(1 if max_workers is None else max_workers)
-    except (TypeError, ValueError):
-        raise ValueError(f"max_workers must be an integer, got {max_workers!r}.")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"max_workers must be an integer, got {max_workers!r}.") from exc
     if workers < 1:
         raise ValueError(f"max_workers must be >= 1, got {workers}.")
     if workers > 64:
@@ -766,6 +768,7 @@ def run_one_backtest(
     try:
         proc = subprocess.run(
             cmd,
+            check=False,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

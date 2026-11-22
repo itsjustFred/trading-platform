@@ -95,6 +95,36 @@ def test_signal_without_sl_uses_atr_fallback_stop() -> None:
     assert sized.position_size > 0
 
 
+def test_rocketfuel_preserves_caller_metadata() -> None:
+    """Caller metadata survives the processor's own stamping.
+
+    The processor seeds its metadata from the caller's dict (when it is one)
+    and then adds its own keys. Dropping the caller's dict lost idempotency
+    keys and trailing-stop config silently: every asserted key on a bare signal
+    is one the processor itself adds, so the loss was invisible.
+    """
+    processor = RocketFuelSignalProcessor(
+        {"rocket_fuel": {"atr_period": 14, "sl_multiplier": 3.0, "variant": "longsonly"}}
+    )
+    signal = processor.process_signal(
+        {
+            "symbol": "AAPL",
+            "action": "BUY",
+            "timestamp": "2026-01-01T12:00:00Z",
+            "metadata": {
+                "idempotency_key": "k1",
+                "trailing_sl_config": {"mode": "percent", "percent": 0.02},
+            },
+        },
+        _sample_market_data(),
+    )
+
+    assert signal.metadata["idempotency_key"] == "k1"
+    assert signal.metadata["trailing_sl_config"] == {"mode": "percent", "percent": 0.02}
+    # The processor's own keys are still stamped, alongside the caller's.
+    assert signal.metadata["source"] == "rocketfuel"
+
+
 def test_trailing_sl_signal_sizes_then_updates_stop() -> None:
     engine = _risk_engine()
     processor = NitroSignalProcessor({"ram_jet": {"atr_period": 14, "sl_multiplier": 2.0}})
@@ -144,3 +174,16 @@ def test_exposure_limit_reduces_position_size() -> None:
     assert reduced.risk_percent < baseline.risk_percent
     assert reduced.position_size < baseline.position_size
     assert reduced.position_size > 0.0
+
+
+@pytest.mark.parametrize("value", [0, -1, 0.5])
+def test_rocketfuel_rejects_non_positive_atr_period(value) -> None:
+    with pytest.raises(ValueError, match="atr_period"):
+        RocketFuelSignalProcessor(
+            {
+                "rocket_fuel": {
+                    "atr_period": value,
+                    "variant": "longsonly",
+                }
+            }
+        )

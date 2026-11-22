@@ -28,7 +28,12 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.backtest_grid import DEFAULT_OUTPUT_DIR, parse_csv_list, parse_params, run_backtest_grid
 from runner.backtest_matrix import MATRIX_OUTPUT_DIR, run_backtest_matrix
 from runner.daily_equity import attach_daily_equity
-from runner.engines.base import BacktestConfig, EngineAdapter, resolve_strategy_parameters
+from runner.engines.base import (
+    BacktestConfig,
+    EngineAdapter,
+    resolve_strategy_parameters,
+    warn_if_engine_frozen,
+)
 from runner.promotion_cli import add_promote_parser
 from runner.stats import merge_canonical_stats
 from runner.universe_provenance import (
@@ -71,6 +76,7 @@ def _emit_progress(
 
 def get_engine(name: str) -> EngineAdapter:
     """Get an engine adapter by name."""
+    warn_if_engine_frozen(name, stacklevel=2)
     if name == "native":
         from runner.engines.native_adapter import NativeAdapter
 
@@ -379,9 +385,21 @@ def cmd_engines(args):
     """List available engines."""
     engines = [
         ("native", "Event-based bar-by-bar simulation engine (default)"),
-        ("vectorbt", "Python vectorized backtesting (simple signal-based strategies)"),
-        ("lean", "QuantConnect LEAN (complex event-driven strategies)"),
-        ("pynecore", "PyneCore Pine-style Python strategies (indicator-rich strategies)"),
+        (
+            "vectorbt",
+            "FROZEN (bug fixes only, #318): Python bar-loop adapter "
+            "(simple signal-based strategies)",
+        ),
+        (
+            "lean",
+            "FROZEN, import-only going forward (#318): QuantConnect LEAN "
+            "(complex event-driven strategies)",
+        ),
+        (
+            "pynecore",
+            "FROZEN, scheduled for deletion (#318): PyneCore Pine-style "
+            "Python strategies (indicator-rich strategies)",
+        ),
     ]
     print("\nAvailable engines:\n")
     for name, desc in engines:
