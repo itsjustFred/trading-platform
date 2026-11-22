@@ -3784,6 +3784,110 @@ def list_live_deployment_net_filled_qty_by_symbol(deployment_id: str) -> dict[st
     return net
 
 
+def list_live_deployment_open_entry_counts_by_symbol(deployment_id: str) -> dict[str, int]:
+    """Open entry count per symbol for one deployment (#360 maintainer decision).
+
+    An *open entry* is a persisted entry signal — not exit-only and not a
+    broker-side close — that still holds quantity: its filled quantity minus
+    the reducing fills attributed to it, allocated oldest-first, is above
+    ``_EXIT_FILL_TOLERANCE``. Reducing fills are every fill on the
+    deployment's exit-only signals plus every broker-side close signal for
+    the symbol: the same rows the net ledger sums with the opposite sign.
+
+    FIFO attribution is an approximation — a deployment-level FULL_EXIT is
+    not tied to one entry — but it is conservative in the direction that
+    matters: a partially closed oldest entry keeps counting until its own
+    residual reaches zero.
+
+    An entry with a broker order id but no fills yet also counts as one open
+    position: its order may still be working, and counting it is the
+    fail-closed direction (a dead order can only over-count, never
+    under-count). Entries with neither fills nor a broker order id never
+    reached the broker and do not count.
+
+    Returns ``{SYMBOL: open entry count}`` for symbols with at least one
+    open entry; flat symbols are absent.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the open entry counts")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for signal_id, symbol, timestamp, broker_order_id, source, metadata in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        by_symbol.setdefault(normalized_symbol, []).append(
+            {
+                "signal_id": str(signal_id),
+                "timestamp": timestamp,
+                "broker_order_id": str(broker_order_id or ""),
+                "source": str(source or ""),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "filled_qty": filled_by_signal.get(str(signal_id), 0.0),
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for symbol, signals in by_symbol.items():
+        reducing_qty = 0.0
+        entries: list[dict[str, Any]] = []
+        for signal in signals:
+            metadata = signal["metadata"]
+            is_close = (
+                _is_exit_only_signal_metadata(metadata)
+                or str(signal["source"] or "") == BROKER_CLOSE_SIGNAL_SOURCE
+            )
+            if is_close:
+                reducing_qty += max(0.0, signal["filled_qty"])
+            else:
+                entries.append(signal)
+        entries.sort(
+            key=lambda item: (
+                item["timestamp"] is None,
+                item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+                item["signal_id"],
+            )
+        )
+        remaining_reduction = reducing_qty
+        open_count = 0
+        for entry in entries:
+            entry_qty = max(0.0, entry["filled_qty"])
+            if entry_qty <= _EXIT_FILL_TOLERANCE:
+                if entry["broker_order_id"]:
+                    open_count += 1
+                continue
+            closed = min(entry_qty, remaining_reduction)
+            remaining_reduction -= closed
+            if entry_qty - closed > _EXIT_FILL_TOLERANCE:
+                open_count += 1
+        if open_count:
+            counts[symbol] = open_count
+    return counts
+
+
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
     """Every deployment's signed net filled quantity for ``symbol`` on one account.
 

@@ -46,29 +46,44 @@ Deployment configuration rules: ``settings["strategy_parameters"]`` and any
 ``signal_processor`` configuration are refused — the internal path always runs
 the strategy file with its ``STRATEGY_META`` defaults and never runs a signal
 processor (processors are a Discord-pipeline concept). Bars come from the
-adapter's ``get_market_data`` feed (Alpaca SIP for equities, the crypto feed
+adapter's ``get_market_data`` feed (Alpaca IEX for equities, the crypto feed
 for pairs). The strategy cache is keyed by deployment id and reloaded when the
 resolved file's mtime changes; helper modules the strategy imports are *not*
 reloaded — restart the daemon to pick those up.
 
-Risk-policy notes (pending maintainer confirmation):
+Opt-in: an internal deployment is only evaluated when
+``settings["internal_runner_enabled"]`` is truthy. Existing ACTIVE internal
+deployments therefore stay inert until an operator sets the flag explicitly
+(maintainer decision 2026-11-22); there is no way to tell a pre-existing row
+from a new one, so the flag gates every internal deployment.
+
+Risk-policy notes (maintainer decision 2026-11-22):
 
 * An entry with **no take-profit level** is emitted with
   ``take_profit_policy=unbounded_exit_on_opposite_signal`` — the strategy's own
   ``exits`` signal is its exit mechanism, matching the backtest.
-* An entry with **no stop loss** is refused (one ERROR per deployment). The
-  engine only uses a fallback stop for sizing; whether live may run a
-  broker-stopless position or must place a stop at the fallback is an open
-  maintainer decision, so the runner fails closed.
+* An entry with **no stop loss** gets a broker stop at the engine's fallback
+  distance (``fallback_stop_pct`` of the entry price — the same fallback the
+  engine uses for sizing). Live never runs unprotected.
 * A **single take-profit with ``tp_pct``/``fraction < 1``** is refused like a
   multi-level ladder: the live bracket carries one full-size TP.
-* An entry is refused while the deployment already holds the symbol (the
-  runner does not pyramid) or when the deployment already holds
-  ``TRADE_ENGINE_MAX_POSITIONS`` distinct symbols, counted from its own
-  execution ledger.
-* **Daily-and-longer bars on session-bound (non-crypto) symbols are refused**:
-  they "close" at midnight ET while the quote feed is closed, so the
-  entry-deviation gate could never confirm them.
+* Entries per symbol are capped by ``internal_max_open_per_symbol``
+  (deployment ``settings``, falling back to a same-named ``STRATEGY_META``
+  parameter): default **1 open position per deployment and symbol**. Only 1
+  is accepted today — N>1 is not supported end-to-end (per-position sizing,
+  protection and exits on the qty-netted live ledger are unresolved; see the
+  PR's "Open decision" section) and any other value fails closed. Open
+  positions are counted from the deployment's own persisted ledger —
+  filled residuals allocated FIFO plus working (filled=0, broker order
+  known) entries — and the total is capped at ``TRADE_ENGINE_MAX_POSITIONS``.
+* **Session-bound symbols** (everything the venue calendar does not resolve
+  to 24/7) are only evaluated while the venue is open, using
+  ``shared.venue_calendar``: daily-and-longer bars are allowed and may be
+  held over the market close; their signals become actionable at the next
+  session open. Intraday bars must open inside a trading interval; a bar
+  that runs into the session close is clipped to it and likewise becomes
+  actionable at the next session open. Bars outside sessions produce no
+  signals.
 
 Submission: intents are handed to the daemon's ``submit_signal`` callback,
 which routes them through ``_trade_signal_to_live_signal`` and
@@ -101,8 +116,12 @@ from live_runner.symbol_class import classify_symbol
 from risk.models import TradeSignal
 from runner.engine_pkg.trading_engine import TRADE_ENGINE_MAX_POSITIONS, TradeEngine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
+from shared import venue_calendar
 from shared.constants import normalize_symbols, normalize_timeframe
-from shared.database import list_live_deployment_net_filled_qty_by_symbol
+from shared.database import (
+    DATA_DIR,
+    list_live_deployment_open_entry_counts_by_symbol,
+)
 from shared.logging import get_logger
 from shared.models import VALID_TIMEFRAMES, LiveDeploymentConfig
 from shared.strategy_registry import load_strategy_module
@@ -123,13 +142,18 @@ INTERNAL_RUNNER_BAR_LIMIT = 1000
 SUBMIT_GRACE_SECONDS = 30.0
 SUBMIT_FEED_LAG_BAR_FRACTION = 0.1
 SUBMIT_FEED_LAG_CAP_SECONDS = 120.0
-#: Daily-and-longer bars on session-bound symbols are refused (see module
-#: docstring). Crypto pairs trade 24/7 and are exempt.
-SESSION_BOUND_MIN_BAR_SECONDS = 86_400
+#: Opt-in flag (deployment ``settings``): internal deployments are inert
+#: until an operator sets it — maintainer decision 2026-11-22 rollout rule.
+INTERNAL_RUNNER_ENABLED_KEY = "internal_runner_enabled"
+#: Per-symbol open-entry cap (deployment ``settings``, falling back to a
+#: same-named ``STRATEGY_META`` parameter). Only 1 is accepted: N>1 per-symbol
+#: entries is not supported end-to-end yet (maintainer decision 2026-11-22,
+#: open decision) and any other value fails closed.
+MAX_OPEN_PER_SYMBOL_KEY = "internal_max_open_per_symbol"
+#: How far ahead the venue calendar is asked to find the next session open.
+SESSION_LOOKAHEAD_DAYS = 14
 #: Consecutive submission failures before a one-time ERROR escalation.
 SUBMIT_FAILURE_ESCALATION = 3
-#: Net filled quantity below this is treated as flat.
-_OPEN_QTY_EPSILON = 1e-9
 
 SubmitSignal = Callable[
     [BaseLiveAdapter, LiveDeploymentConfig, TradeSignal], Awaitable[None]
@@ -173,6 +197,137 @@ def _is_crypto_symbol(symbol: str) -> bool:
         # Unclassifiable symbols are treated as session-bound: refusing a
         # daily+ deployment is the fail-closed direction.
         return False
+
+
+def _internal_runner_opted_in(deployment: LiveDeploymentConfig) -> bool:
+    """Explicit per-deployment opt-in (maintainer decision 2026-11-22).
+
+    ``settings["internal_runner_enabled"]`` must be an unmistakable truthy
+    value; anything else — absent, false, a typo — leaves the deployment
+    inert. There is no creation-time distinction between pre-existing and
+    new ACTIVE internal rows, so the flag gates all of them.
+    """
+    value = (deployment.settings or {}).get(INTERNAL_RUNNER_ENABLED_KEY)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _max_open_per_symbol(
+    deployment: LiveDeploymentConfig, bundle: _StrategyBundle
+) -> int:
+    """Configured per-symbol open-entry cap.
+
+    Deployment ``settings`` win; a same-named ``STRATEGY_META`` parameter is
+    the per-strategy fallback. Default 1. Only 1 is accepted: N>1 per-symbol
+    entries is not supported end-to-end on the qty-netted live ledger
+    (maintainer decision 2026-11-22, open decision) — anything else, or an
+    unreadable value, fails closed (the caller refuses the deployment).
+    """
+    settings = deployment.settings or {}
+    if MAX_OPEN_PER_SYMBOL_KEY in settings:
+        raw = settings[MAX_OPEN_PER_SYMBOL_KEY]
+    else:
+        raw = (bundle.engine.config.parameters or {}).get(MAX_OPEN_PER_SYMBOL_KEY, 1)
+    try:
+        if isinstance(raw, bool):
+            raise ValueError("boolean is not a count")
+        value = int(float(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={raw!r} is not an integer"
+        ) from exc
+    if value != 1:
+        raise ValueError(
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={value} is not supported: only 1 open "
+            "entry per deployment and symbol is implemented end-to-end "
+            "(per-position sizing, protection and exits on the netted live "
+            "ledger are an open maintainer decision)"
+        )
+    return value
+
+
+def _adapter_calendar_source(adapter: BaseLiveAdapter) -> str:
+    """Broker cache namespace for venue-calendar resolution."""
+    name = type(adapter).__name__.lower()
+    if "alpaca" in name:
+        return "alpaca"
+    if "ctrader" in name:
+        return "ctrader"
+    return ""
+
+
+def _interval_containing(
+    calendar: venue_calendar.VenueCalendar, ts: pd.Timestamp
+) -> venue_calendar.TradingInterval | None:
+    """The trading interval containing ``ts``, or ``None`` when closed.
+
+    The query window is padded a full day on both sides so the returned
+    interval is not clipped at the probe edges — callers need the session's
+    true open/close, not the query boundary.
+    """
+    ts = pd.Timestamp(ts)
+    candidates = calendar.trading_intervals(
+        ts - pd.Timedelta(days=1), ts + pd.Timedelta(days=1)
+    )
+    for interval in reversed(candidates):
+        if interval.open <= ts < interval.close:
+            return interval
+    return None
+
+
+def _next_session_open(
+    calendar: venue_calendar.VenueCalendar, ts: pd.Timestamp
+) -> pd.Timestamp | None:
+    """First trading-interval open strictly after ``ts`` (``None`` = none found)."""
+    ts = pd.Timestamp(ts)
+    for interval in calendar.trading_intervals(
+        ts, ts + pd.Timedelta(days=SESSION_LOOKAHEAD_DAYS)
+    ):
+        if interval.open > ts:
+            return interval.open
+        if interval.close > ts:
+            # ``ts`` sits inside a session; the next open is a later interval.
+            continue
+    return None
+
+
+def _effective_bar_close(
+    calendar: venue_calendar.VenueCalendar,
+    bar_open: pd.Timestamp,
+    bar_seconds: int,
+) -> tuple[pd.Timestamp, bool] | None:
+    """Session-aware ``(close, hits_session_end)`` for one bar.
+
+    ``hits_session_end`` is True when the bar's data runs into the session
+    close (or the bar is daily-or-longer, whose close is always a session
+    close): its signal then becomes actionable at the *next* session open,
+    matching the engine's next-bar-open fill. Returns ``None`` for a bar
+    that never overlaps trading time — it produces no signal.
+    """
+    bar_open = pd.Timestamp(bar_open)
+    nominal_close = bar_open + pd.Timedelta(seconds=bar_seconds)
+    if bar_seconds >= 86_400:
+        # Daily+: the stamped bar spans whole sessions; its effective close
+        # is the last session close overlapping the span. The query is
+        # padded so interval bounds are not clipped at the span edges.
+        intervals = calendar.trading_intervals(
+            bar_open - pd.Timedelta(days=1), nominal_close + pd.Timedelta(days=1)
+        )
+        overlapping = [
+            interval
+            for interval in intervals
+            if interval.open < nominal_close and interval.close > bar_open
+        ]
+        if not overlapping:
+            return None
+        return overlapping[-1].close, True
+    interval = _interval_containing(calendar, bar_open)
+    if interval is None:
+        return None
+    if nominal_close >= interval.close:
+        return interval.close, True
+    return nominal_close, False
 
 
 def _has_sizing_only_stop_fields(row: pd.Series) -> bool:
@@ -271,6 +426,8 @@ class InternalStrategyRunner:
         self._last_bar: dict[tuple[str, str], pd.Timestamp] = {}
         # (deployment_id, SYMBOL) -> consecutive submission failures.
         self._submit_failures: dict[tuple[str, str], int] = {}
+        # (broker source, SYMBOL) -> resolved venue calendar (None = unknown).
+        self._calendars: dict[tuple[str, str], venue_calendar.VenueCalendar | None] = {}
         # Throttled one-shot logs: (key, category) already reported.
         self._reported: set[tuple[str, str]] = set()
 
@@ -364,6 +521,26 @@ class InternalStrategyRunner:
         self._reported.discard((key, "strategy_target"))
         return bundle
 
+    def _symbol_calendar(
+        self, adapter: BaseLiveAdapter, symbol: str
+    ) -> venue_calendar.VenueCalendar | None:
+        """Venue calendar for session checks; ``None`` = venue unknown."""
+        source = _adapter_calendar_source(adapter)
+        key = (source, symbol.upper())
+        if key not in self._calendars:
+            asset_class = "crypto" if _is_crypto_symbol(symbol) else "stock"
+            try:
+                calendar = venue_calendar.resolve_venue_calendar(
+                    symbol=symbol,
+                    asset_class=asset_class,
+                    source=source or None,
+                    data_dir=str(DATA_DIR),
+                )
+            except Exception:
+                calendar = None
+            self._calendars[key] = calendar
+        return self._calendars[key]
+
     # ── per-symbol evaluation ────────────────────────────────────────────
 
     async def _evaluate_symbol(
@@ -376,19 +553,64 @@ class InternalStrategyRunner:
         timeframe: str,
         bar_seconds: int,
         moment: datetime,
-        open_positions: Mapping[str, float],
+        open_entries: dict[str, int],
+        max_open_per_symbol: int,
     ) -> None:
         state_key = (str(deployment.id), symbol)
+        calendar = self._symbol_calendar(adapter, symbol)
+        if calendar is None:
+            # The venue cannot be resolved: it may be session-bound, so
+            # evaluating bars blindly is not safe. Fail closed per symbol.
+            self._report_once(
+                state_key[0],
+                f"calendar:{state_key[1]}",
+                "Internal strategy symbol has no resolvable venue calendar; "
+                "session timing cannot be proven and evaluation fails closed",
+                deployment_id=state_key[0],
+                symbol=symbol,
+            )
+            return
+        session_bound = not isinstance(calendar, venue_calendar.ContinuousCalendar)
+        moment_ts = pd.Timestamp(moment)
+        if session_bound:
+            state = calendar.session_state(moment_ts)
+            if state == "closed":
+                # Nothing is actionable while the venue is shut; bars that
+                # closed are re-evaluated at the next session open, when
+                # their entries can actually fill.
+                return
+            if state != "open":
+                self._report_once(
+                    state_key[0],
+                    f"calendar_unknown:{state_key[1]}",
+                    "Internal strategy venue calendar cannot speak for now; "
+                    "evaluation fails closed",
+                    deployment_id=state_key[0],
+                    symbol=symbol,
+                    session_state=state,
+                )
+                return
         last_processed = self._last_bar.get(state_key)
         if last_processed is not None:
             # The newest bar that could carry an actionable signal opens at
             # last_processed + bar_seconds and closes one bar later. Until
             # then there is nothing new to evaluate, so skip the 1000-bar
             # fetch entirely rather than polling it every tick.
-            next_actionable_close = last_processed + pd.Timedelta(
+            nominal_next_close = last_processed + pd.Timedelta(
                 seconds=2 * bar_seconds
             )
-            if moment < next_actionable_close.to_pydatetime():
+            if session_bound:
+                # Bar grids are not contiguous across a session close: the
+                # next close may fall in closed time, in which case the next
+                # actionable moment is the following session open.
+                wake = (
+                    nominal_next_close
+                    if calendar.is_trading_instant(nominal_next_close)
+                    else _next_session_open(calendar, nominal_next_close)
+                )
+                if wake is not None and moment_ts < wake:
+                    return
+            elif moment_ts < nominal_next_close:
                 return
         try:
             frame = await adapter.get_market_data(
@@ -419,14 +641,31 @@ class InternalStrategyRunner:
         if prepared.empty:
             return
 
-        closes = prepared["timestamp"] + pd.Timedelta(seconds=bar_seconds)
-        closed_mask = closes <= pd.Timestamp(moment)
-        if not bool(closed_mask.any()):
-            return
-        # The strategy only ever sees closed bars — the same input the engine
-        # gets. A still-forming bar is dropped before evaluation so it cannot
-        # leak into indicators or signal rows.
-        eval_frame = prepared.loc[closed_mask[closed_mask].index].reset_index(drop=True)
+        if session_bound:
+            # A bar is closed once its *session-aware* close has passed —
+            # for daily+ bars that is the session close, well before the
+            # nominal open+timeframe stamp would suggest. Bars outside
+            # trading time never close and produce no signal.
+            closed_positions: list[int] = []
+            for position in range(len(prepared)):
+                bar_open = pd.Timestamp(prepared.iloc[position]["timestamp"])
+                effective = _effective_bar_close(calendar, bar_open, bar_seconds)
+                if effective is not None and effective[0] <= moment_ts:
+                    closed_positions.append(position)
+            if not closed_positions:
+                return
+            eval_frame = prepared.loc[closed_positions].reset_index(drop=True)
+        else:
+            closes = prepared["timestamp"] + pd.Timedelta(seconds=bar_seconds)
+            closed_mask = closes <= moment_ts
+            if not bool(closed_mask.any()):
+                return
+            # The strategy only ever sees closed bars — the same input the
+            # engine gets. A still-forming bar is dropped before evaluation
+            # so it cannot leak into indicators or signal rows.
+            eval_frame = prepared.loc[
+                closed_mask[closed_mask].index
+            ].reset_index(drop=True)
         latest_open = pd.Timestamp(eval_frame.iloc[-1]["timestamp"])
 
         if last_processed is not None and latest_open <= last_processed:
@@ -471,16 +710,34 @@ class InternalStrategyRunner:
             SUBMIT_FEED_LAG_CAP_SECONDS,
             SUBMIT_FEED_LAG_BAR_FRACTION * bar_seconds,
         )
-        max_age_seconds = SUBMIT_GRACE_SECONDS + feed_lag
+        max_age = pd.Timedelta(seconds=SUBMIT_GRACE_SECONDS + feed_lag)
         for position in candidate_positions:
-            close_time = _bar_close_time(
-                pd.Timestamp(eval_frame.iloc[position]["timestamp"]), bar_seconds
-            )
-            age_seconds = (moment - close_time.to_pydatetime()).total_seconds()
-            if age_seconds > max_age_seconds:
-                # Stale bar: never trade it. Still counts as processed so the
-                # runner does not reconsider it every tick.
-                continue
+            bar_open_ts = pd.Timestamp(eval_frame.iloc[position]["timestamp"])
+            if session_bound:
+                effective = _effective_bar_close(calendar, bar_open_ts, bar_seconds)
+                if effective is None:
+                    continue
+                close_time, hits_session_end = effective
+                if hits_session_end:
+                    # The bar's data ends at the session close; the order can
+                    # only fill at the next session open (engine parity), so
+                    # the actionable window opens there.
+                    next_open = _next_session_open(calendar, close_time)
+                    deadline = (
+                        next_open if next_open is not None else close_time
+                    ) + max_age
+                else:
+                    deadline = close_time + max_age
+                if moment_ts > deadline:
+                    # Stale bar: never trade it. Still counts as processed
+                    # so the runner does not reconsider it every tick.
+                    continue
+            else:
+                close_time = _bar_close_time(bar_open_ts, bar_seconds)
+                if moment_ts - close_time > max_age:
+                    # Stale bar: never trade it. Still counts as processed so
+                    # the runner does not reconsider it every tick.
+                    continue
             row = eval_frame.iloc[position]
             signal_row = (
                 signals_frame.iloc[position]
@@ -585,47 +842,49 @@ class InternalStrategyRunner:
                         tp_levels=[level.get("name") for level in tp_levels],
                     )
                     continue
+                fallback_stop = False
                 if stop_loss is None:
-                    # The engine sizes against a fallback stop but places no
-                    # broker stop; whether live may do the same is an open
-                    # maintainer decision, so the runner fails closed with one
-                    # ERROR per deployment rather than a warning per bar.
-                    self._report_once(
-                        state_key[0],
-                        "no_stop",
-                        "Internal strategy entry has no stop loss; the live path "
-                        "requires a broker-side stop and the signal is skipped "
-                        "(maintainer decision pending)",
-                        deployment_id=state_key[0],
-                        symbol=symbol,
+                    # Maintainer decision (a): a strategy without a stop gets
+                    # a broker stop at the engine's fallback distance —
+                    # fallback_stop_pct of the entry price, the same fallback
+                    # the engine uses for sizing. Live never runs unprotected.
+                    direction_sign = 1.0 if direction == "LONG" else -1.0
+                    fallback_pct = float(
+                        bundle.engine._risk_engine.config.fallback_stop_pct
                     )
-                    continue
+                    stop_loss = close_price - direction_sign * close_price * fallback_pct
+                    fallback_stop = True
                 symbol_key = symbol.upper()
-                if symbol_key in open_positions:
-                    # The deployment already holds this symbol; the runner
-                    # does not pyramid. Exits on the same bar still go out.
+                open_count = int(open_entries.get(symbol_key, 0))
+                if open_count >= max_open_per_symbol:
+                    # The deployment already holds the configured number of
+                    # open entries on this symbol; the runner does not
+                    # pyramid beyond the cap. Exits on the same bar still go
+                    # out.
                     self._report_once(
                         state_key[0],
                         f"already_open:{state_key[1]}",
-                        "Internal strategy entry skipped: the deployment already "
-                        "holds this symbol (net filled qty "
-                        f"{open_positions[symbol_key]:g}); the runner does not pyramid",
+                        "Internal strategy entry skipped: the deployment "
+                        f"already holds {open_count} open entries on this "
+                        f"symbol (cap {max_open_per_symbol})",
                         deployment_id=state_key[0],
                         symbol=symbol,
-                        net_qty=open_positions[symbol_key],
+                        open_entries=open_count,
+                        max_open_per_symbol=max_open_per_symbol,
                         level="warning",
                     )
                     continue
-                if len(open_positions) >= TRADE_ENGINE_MAX_POSITIONS:
+                total_open = sum(open_entries.values())
+                if total_open >= TRADE_ENGINE_MAX_POSITIONS:
                     self._report_once(
                         state_key[0],
                         f"max_positions:{state_key[1]}",
-                        "Internal strategy entry skipped: the deployment already "
-                        f"holds {len(open_positions)} symbols "
+                        "Internal strategy entry skipped: the deployment "
+                        f"already holds {total_open} open entries "
                         f"(engine limit {TRADE_ENGINE_MAX_POSITIONS})",
                         deployment_id=state_key[0],
                         symbol=symbol,
-                        open_symbols=sorted(open_positions),
+                        open_entries_by_symbol=dict(open_entries),
                         level="warning",
                     )
                     continue
@@ -634,6 +893,8 @@ class InternalStrategyRunner:
                 )
                 entry_metadata = dict(common_metadata)
                 entry_metadata["internal_direction"] = direction
+                if fallback_stop:
+                    entry_metadata["internal_stop_source"] = "fallback_pct"
                 if take_profit is None:
                     # No TP level: the strategy's own exits signal is its exit
                     # mechanism — the same unbounded-TP policy the promotion
@@ -693,6 +954,14 @@ class InternalStrategyRunner:
                 )
             else:
                 self._submit_failures.pop(state_key, None)
+                if (signal.metadata or {}).get("internal_direction"):
+                    # Count the submitted entry against this pass's caps so a
+                    # second entry on the same symbol later in the same pass
+                    # cannot slip past the per-symbol or engine limits. The
+                    # persisted ledger recounts it on the next pass.
+                    open_entries[symbol.upper()] = (
+                        open_entries.get(symbol.upper(), 0) + 1
+                    )
 
     async def run_once(
         self,
@@ -704,6 +973,20 @@ class InternalStrategyRunner:
         """One evaluation pass over every eligible ACTIVE internal deployment."""
         for deployment in deployments:
             if not _deployment_is_active_internal(deployment):
+                continue
+            if not _internal_runner_opted_in(deployment):
+                # Maintainer decision (e): existing ACTIVE internal
+                # deployments stay inert until an operator opts in per
+                # deployment. One report per deployment, then silence.
+                self._report_once(
+                    str(deployment.id),
+                    "opt_in",
+                    "Internal deployment is ACTIVE but has not opted into the "
+                    "internal strategy runner; set settings."
+                    f"{INTERNAL_RUNNER_ENABLED_KEY}=true to enable it",
+                    deployment_id=str(deployment.id),
+                    level="warning",
+                )
                 continue
             adapter = adapters.get(str(deployment.account_id))
             if adapter is None:
@@ -754,31 +1037,27 @@ class InternalStrategyRunner:
                 continue
             if not symbols:
                 continue
-            session_bound_symbols = [
-                symbol
-                for symbol in symbols
-                if bar_seconds >= SESSION_BOUND_MIN_BAR_SECONDS
-                and not _is_crypto_symbol(symbol)
-            ]
-            if session_bound_symbols:
+            bundle = self._bundle(deployment, timeframe)
+            if bundle is None:
+                continue
+            try:
+                max_open_per_symbol = _max_open_per_symbol(deployment, bundle)
+            except Exception as exc:
                 self._report_once(
                     deployment_id,
-                    f"session_bars:{timeframe}",
-                    "Internal deployment uses a session-crossing timeframe on "
-                    "non-crypto symbols; daily+ bars close while the quote "
-                    "feed is shut so entries could never be confirmed — "
-                    "refusing (crypto pairs are exempt)",
+                    "deployment_config",
+                    "Internal deployment open-position cap is unusable; "
+                    "skipping",
                     deployment_id=deployment_id,
-                    timeframe=timeframe,
-                    symbols=session_bound_symbols,
+                    error=str(exc),
                 )
                 continue
             try:
-                open_qty = await asyncio.to_thread(
-                    list_live_deployment_net_filled_qty_by_symbol, deployment_id
+                open_entries = await asyncio.to_thread(
+                    list_live_deployment_open_entry_counts_by_symbol, deployment_id
                 )
             except Exception as exc:
-                # Without the ledger the entry cap cannot be enforced; fail
+                # Without the ledger the entry caps cannot be enforced; fail
                 # closed for this deployment rather than trade uncapped.
                 self._report_once(
                     deployment_id,
@@ -788,14 +1067,6 @@ class InternalStrategyRunner:
                     deployment_id=deployment_id,
                     error=str(exc),
                 )
-                continue
-            open_positions = {
-                symbol: qty
-                for symbol, qty in open_qty.items()
-                if abs(float(qty)) > _OPEN_QTY_EPSILON
-            }
-            bundle = self._bundle(deployment, timeframe)
-            if bundle is None:
                 continue
             for symbol in symbols:
                 # Fresh wall-clock per symbol: a pass over many symbols must
@@ -810,7 +1081,8 @@ class InternalStrategyRunner:
                         timeframe=timeframe,
                         bar_seconds=bar_seconds,
                         moment=symbol_moment,
-                        open_positions=open_positions,
+                        open_entries=open_entries,
+                        max_open_per_symbol=max_open_per_symbol,
                     )
                 except asyncio.CancelledError:
                     raise

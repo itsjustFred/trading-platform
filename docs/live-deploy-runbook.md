@@ -261,6 +261,38 @@ evaluated by `live_runner/internal_strategy_runner.py` (daemon task
 `internal-strategy-loop`, 15 s tick). Discord deployments are unaffected —
 their signals still arrive through the channel listeners.
 
+**Opt-in.** An internal deployment is only evaluated when
+`settings["internal_runner_enabled"]` is explicitly truthy (`true`, `1`,
+`yes`, `on`). Deployments that predate the runner stay inert until an
+operator sets the flag per deployment — there is no way to distinguish a
+pre-existing ACTIVE row from a new one, so the flag gates all of them.
+
+**Risk policy (maintainer decision 2026-11-22).**
+
+- An entry with **no take-profit level** is allowed: it is stamped
+  `take_profit_policy=unbounded_exit_on_opposite_signal`, so the strategy's
+  own `exits` signals are its exit mechanism — matching the backtest. A stop
+  is still required.
+- An entry with **no stop loss** gets a broker stop at the engine's fallback
+  distance (`fallback_stop_pct` of the entry price — the same fallback the
+  engine uses for sizing). Live never runs unprotected.
+- Entries per symbol are capped by `settings["internal_max_open_per_symbol"]`
+  (falling back to a same-named `STRATEGY_META` parameter): **default 1 open
+  position per deployment+symbol**. Only `1` is accepted today — N>1 is not
+  supported end-to-end (per-position sizing, protection and exits on the
+  qty-netted live ledger are unresolved; tracked as an open decision on the
+  PR), so any other value fails closed and the deployment is skipped. Open
+  positions are counted from the deployment's own persisted ledger, the
+  count is updated within a pass so same-pass signals cannot exceed the cap,
+  and the deployment total is capped at the engine maximum of 5.
+- **Session-bound symbols** (anything the venue calendar does not resolve to
+  24/7) are only evaluated while the venue is open, using
+  `shared.venue_calendar`. Daily-and-longer bars may be held over the market
+  close; a bar whose data runs into the session close becomes actionable at
+  the next session open, matching the engine's next-bar-open fill. Bars
+  outside trading sessions produce no signals, and an unresolvable venue
+  calendar fails closed.
+
 **What runs.** For each deployment symbol the runner fetches bars through the
 adapter's existing `get_market_data` (no new network client; an adapter that
 cannot serve bars for the timeframe fails closed and the deployment is
@@ -296,9 +328,12 @@ persistence all apply unchanged. A strategy `exits` row becomes a
 reduce-only `FULL_EXIT` against the deployment's own ledger quantity — it can
 never open or extend a position. A `SHORT` entry on a deployment without
 `allow_short` is skipped (it must not be reinterpreted as an exit). Entries
-carrying more than one take-profit level are skipped: the live bracket carries
-a single TP and emitting only the first would silently drop the native
-partial-exit ladder.
+carrying more than one take-profit level — or a single partial (`tp_pct` /
+`fraction < 1`) level — are skipped: the live bracket carries a single
+full-size TP and emitting only the first would silently drop the native
+partial-exit ladder. An entry with no TP level is emitted with the
+unbounded-TP policy above; an entry with no stop gets the fallback-distance
+broker stop, so the daemon's SL/TP guard always sees a real stop.
 
 **Idempotency.** Each emitted intent carries a producer-stable
 `metadata.idempotency_key` derived from deployment, symbol, timeframe, bar

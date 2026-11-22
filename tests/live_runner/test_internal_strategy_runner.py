@@ -19,7 +19,9 @@ from live_runner.internal_strategy_runner import InternalStrategyRunner
 from risk.models import TradeSignal
 from shared.models import LiveDeploymentConfig
 
-BASE = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)  # Monday
+# Monday 10:00 ET — squarely inside the NYSE regular session, so equity
+# symbols resolve to trading bars under the venue calendar.
+BASE = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
 
 
 def _bars(count: int = 30, *, last_open: datetime = BASE, step_seconds: int = 60) -> pd.DataFrame:
@@ -69,7 +71,9 @@ def _deployment(
     timeframe: str = "1m",
     settings: dict[str, Any] | None = None,
     signal_config: dict[str, Any] | None = None,
+    opted_in: bool = True,
 ) -> LiveDeploymentConfig:
+    merged_settings = {"internal_runner_enabled": opted_in, **(settings or {})}
     return LiveDeploymentConfig(
         id=uuid.uuid4(),
         strategy_name="fake_strategy",
@@ -79,7 +83,7 @@ def _deployment(
         status=status,  # type: ignore[arg-type]
         signal_source_type=source_type,  # type: ignore[arg-type]
         signal_source=source,  # type: ignore[arg-type]
-        settings=settings or {},
+        settings=merged_settings,
         signal_config=signal_config or {},
     )
 
@@ -562,10 +566,9 @@ def test_entry_without_take_profit_gets_unbounded_policy(tmp_path: Path) -> None
     )
 
 
-def test_entry_without_stop_loss_is_refused(tmp_path: Path) -> None:
-    """No SL: the engine only uses a fallback stop for sizing; until the
-    maintainer decides whether live may run broker-stopless, the runner
-    fails closed with one ERROR per deployment."""
+def test_entry_without_stop_loss_gets_fallback_broker_stop(tmp_path: Path) -> None:
+    """Maintainer decision (a): no strategy stop -> a broker stop at the
+    engine's fallback distance (fallback_stop_pct of the entry price)."""
 
     def strategy(df: pd.DataFrame, params: dict[str, Any]):
         entries = pd.Series(False, index=df.index)
@@ -577,14 +580,74 @@ def test_entry_without_stop_loss_is_refused(tmp_path: Path) -> None:
     path = _strategy_file(tmp_path, META)
     sent, submit = _collect()
     runner = _runner(submit, path=path, module=_module_with(strategy))
-    deployment = _deployment()
+    now = BASE + timedelta(seconds=70)
+
+    asyncio.run(runner.run_once([_deployment()], {"acct-1": FakeAdapter()}, now=now))
+
+    assert len(sent) == 1
+    signal = sent[0]
+    # Last bar close = 100.5 + 29*0.1 = 103.4; fallback stop = close * 0.98.
+    expected_stop = 103.4 * 0.98
+    assert signal.stop_loss == pytest.approx(expected_stop)
+    assert signal.take_profit == 110.0
+    assert signal.metadata["internal_stop_source"] == "fallback_pct"
+
+
+def test_entry_without_stop_or_tp_exits_on_strategy_signals(tmp_path: Path) -> None:
+    """Maintainer decision (b): no TP is allowed — the position exits on the
+    strategy's exits signal under the unbounded-TP policy, and the fallback
+    stop still protects it."""
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        exits.iloc[-2] = True
+        indicators = _indicators(direction=["LONG"] * 30)
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+    frame = _bars(count=30, last_open=BASE)
+    adapter = FakeAdapter(frame)
+    now = BASE + timedelta(seconds=70)
+
+    asyncio.run(runner.run_once([_deployment()], {"acct-1": adapter}, now=now))
+
+    # Only the newest closed bar is actionable on first evaluation: an
+    # entry with no TP and no strategy stop.
+    assert len(sent) == 1
+    signal = sent[0]
+    assert signal.stop_loss == pytest.approx(103.4 * 0.98)
+    assert signal.take_profit is None
+    assert (
+        signal.metadata["take_profit_policy"]
+        == "unbounded_exit_on_opposite_signal"
+    )
+
+
+def test_short_entry_without_stop_gets_fallback_stop_above_entry(
+    tmp_path: Path,
+) -> None:
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(direction=["SHORT"] * 30)
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+    deployment = _deployment(signal_config={"allow_short": True})
     now = BASE + timedelta(seconds=70)
 
     asyncio.run(runner.run_once([deployment], {"acct-1": FakeAdapter()}, now=now))
-    asyncio.run(runner.run_once([deployment], {"acct-1": FakeAdapter()}, now=now))
 
-    assert sent == []
-    assert (str(deployment.id), "no_stop") in runner._reported
+    assert len(sent) == 1
+    assert sent[0].action == "sell"
+    assert sent[0].stop_loss == pytest.approx(103.4 * 1.02)
 
 
 def test_partial_single_take_profit_is_refused(tmp_path: Path) -> None:
@@ -645,24 +708,82 @@ def test_sizing_only_stop_fields_are_refused(tmp_path: Path) -> None:
     assert sent == []
 
 
-def test_daily_equity_timeframe_is_refused(tmp_path: Path) -> None:
-    """Session-crossing daily bars on equities close while the quote feed is
-    shut — the deployment is refused before any fetch."""
+def test_daily_equity_timeframe_is_allowed_and_fills_at_next_open(
+    tmp_path: Path,
+) -> None:
+    """Maintainer decision (d): daily+ bars on session-bound symbols are
+    allowed — positions may be held over the close, and the signal becomes
+    actionable at the next session open."""
     path = _strategy_file(tmp_path, META)
     sent, submit = _collect()
     runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
-    adapter = FakeAdapter(_bars(count=30, last_open=BASE, step_seconds=86_400))
+    # Daily bars stamped at midnight ET (00:00 ET = 05:00 UTC in January).
+    daily_open = datetime(2026, 1, 5, 5, 0, tzinfo=timezone.utc)
+    adapter = FakeAdapter(_bars(count=30, last_open=daily_open, step_seconds=86_400))
     deployment = _deployment(timeframe="1d")
+    # Tuesday 09:31:10 ET — just after the session open following Monday's
+    # daily bar, inside its actionable window.
+    now = datetime(2026, 1, 6, 14, 31, 10, tzinfo=timezone.utc)
 
-    asyncio.run(
-        runner.run_once(
-            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=86_410)
-        )
-    )
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    assert len(sent) == 1
+    assert sent[0].symbol == "AAPL"
+
+
+def test_daily_equity_is_not_evaluated_while_market_is_closed(
+    tmp_path: Path,
+) -> None:
+    """Same deployment evaluated mid-session-close gap: no fetch, no signal."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    daily_open = datetime(2026, 1, 5, 5, 0, tzinfo=timezone.utc)
+    adapter = FakeAdapter(_bars(count=30, last_open=daily_open, step_seconds=86_400))
+    deployment = _deployment(timeframe="1d")
+    # Monday 21:30 ET = Tuesday 02:30 UTC — venue closed.
+    now = datetime(2026, 1, 6, 2, 30, tzinfo=timezone.utc)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
 
     assert sent == []
     assert adapter.calls == []
-    assert (str(deployment.id), "session_bars:1d") in runner._reported
+
+
+def test_intraday_bar_outside_session_produces_no_signal(tmp_path: Path) -> None:
+    """A 1h equity bar whose open is outside the regular session is not a
+    trading bar — the venue calendar excludes it."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    # Hourly bars stamped 21:00-01:00 UTC = 16:00-20:00 ET: every open is at
+    # or after the 16:00 ET close — outside the regular session.
+    evening = datetime(2026, 1, 6, 1, 0, tzinfo=timezone.utc)
+    adapter = FakeAdapter(_bars(count=5, last_open=evening, step_seconds=3600))
+    deployment = _deployment(timeframe="1h")
+    # Tuesday 10:00 ET = 15:00 UTC, market open.
+    now = datetime(2026, 1, 6, 15, 0, tzinfo=timezone.utc)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    assert sent == []
+
+
+def test_deployment_without_opt_in_is_inert(tmp_path: Path) -> None:
+    """Maintainer decision (e): ACTIVE internal deployments need the explicit
+    per-deployment opt-in flag; without it nothing is fetched or submitted."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter()
+    deployment = _deployment(opted_in=False)
+    now = BASE + timedelta(seconds=70)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    assert sent == []
+    assert adapter.calls == []
+    assert (str(deployment.id), "opt_in") in runner._reported
 
 
 def test_daily_crypto_timeframe_is_allowed(tmp_path: Path) -> None:
@@ -724,8 +845,8 @@ def test_open_position_blocks_pyramiding(tmp_path: Path, monkeypatch: pytest.Mon
     runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
     monkeypatch.setattr(
         runner_mod,
-        "list_live_deployment_net_filled_qty_by_symbol",
-        lambda deployment_id: {"AAPL": 3.0},
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id: {"AAPL": 1},
     )
 
     asyncio.run(
@@ -747,9 +868,9 @@ def test_max_positions_cap_uses_deployment_ledger(
     runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
     monkeypatch.setattr(
         runner_mod,
-        "list_live_deployment_net_filled_qty_by_symbol",
+        "list_live_deployment_open_entry_counts_by_symbol",
         lambda deployment_id: {
-            "AAA": 1.0, "BBB": 1.0, "CCC": 1.0, "DDD": 1.0, "EEE": 1.0,
+            "AAA": 1, "BBB": 1, "CCC": 1, "DDD": 1, "EEE": 1,
         },
     )
 
@@ -762,6 +883,128 @@ def test_max_positions_cap_uses_deployment_ledger(
     )
 
     assert sent == []
+
+
+def test_max_open_per_symbol_above_one_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Maintainer decision (c), revised 2026-11-22: the per-symbol cap is
+    configurable, but N>1 is not supported end-to-end yet — the deployment
+    is refused with a clear error rather than silently faking it."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id: {"AAPL": 1},
+    )
+    adapter = FakeAdapter()
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert adapter.calls == []
+    assert (str(deployment.id), "deployment_config") in runner._reported
+
+
+def test_max_open_per_symbol_above_engine_maximum_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any value other than 1 fails closed — including values that would
+    clamp under the engine maximum."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id: {"AAPL": 5},
+    )
+    adapter = FakeAdapter()
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 99})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert adapter.calls == []
+    assert (str(deployment.id), "deployment_config") in runner._reported
+
+
+def test_max_open_per_symbol_invalid_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": "lots"})
+    adapter = FakeAdapter()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert adapter.calls == []
+    assert (str(deployment.id), "deployment_config") in runner._reported
+
+
+def test_engine_position_cap_counts_same_pass_submits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bundle-39 blocker 4: open_entries is updated after each submit, so a
+    pass cannot exceed TRADE_ENGINE_MAX_POSITIONS within itself."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        # Signal on every symbol: the runner evaluates per symbol, and the
+        # strategy sees the same frame shape for each.
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(
+            sl_price=[95.0] * len(df),
+            tp_price=[110.0] * len(df),
+            direction=["LONG"] * len(df),
+        )
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id: {"H1": 1, "H2": 1, "H3": 1, "H4": 1},
+    )
+    symbols = ["N1", "N2", "N3"]
+    deployment = _deployment(symbols=symbols)
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": FakeAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    # 4 open + engine cap 5 -> exactly one of the three new entries submits.
+    assert len(sent) == 1
 
 
 def test_strategy_parameters_are_refused_at_load(tmp_path: Path) -> None:
