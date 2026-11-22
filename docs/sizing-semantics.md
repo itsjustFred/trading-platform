@@ -76,12 +76,24 @@ documented here.
     pyramiding they can jointly exceed it — the same convention MT5 applies
     to pending orders.
   `fixed_risk_amount` (the MT5-alignment sizing protocol) routes through the
-  same `RiskEngine.calculate_position_size` via `risk_amount_override`:
-  `max_positions` (pending orders included), the aggregate
-  `max_total_exposure` ceiling — which clamps the declared amount to the
-  remaining exposure budget — and input validation all apply; the
-  per-position notional cap and the free-margin leverage clamp are
-  unchanged.
+  same `RiskEngine.calculate_position_size` via `risk_amount_override` on a
+  dedicated engine instance: `max_positions` (pending orders included) and
+  the aggregate `max_total_exposure` ceiling — which clamps the declared
+  amount to the remaining exposure budget — apply, with their own
+  configurable limits (`fixed_risk_max_positions`,
+  `fixed_risk_max_total_exposure`; `None` keeps the 5 / 5% defaults). Open
+  risk is measured in account currency: each position contributes
+  `|entry - stop| * qty * (tick_value / tick_size)`, and positions sized on
+  an explicit `stop_distance` carry their declared per-unit risk instead of
+  being re-measured against `|entry - stop|`. The accepted quantity is
+  recomputed in the legacy MT5 order `(risk / distance) *
+  (tick_size / tick_value)` so unclamped sizes are bit-identical to the
+  pre-#279 formula; the per-position notional cap and the free-margin
+  leverage clamp are unchanged. A configured `fixed_risk_amount` that is
+  NaN/inf/non-positive raises `ValueError` rather than falling through to
+  pct sizing. For the shared-equity replay, an unclamped fixed-risk
+  quantity stays absolute-$ while a clamp-bound one is marked
+  equity-proportional and re-scaled.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.

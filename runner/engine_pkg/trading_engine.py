@@ -23,7 +23,7 @@ import pandas as pd
 
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
-from risk.models import TradeSignal
+from risk.models import SizedOrder, TradeSignal
 from runner.engine_pkg._time import to_iso_utc
 from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
@@ -115,22 +115,55 @@ class TradeEngine:
         max_total_exposure = RiskConfig().max_total_exposure
         max_leverage = float(self.config.max_leverage or 1.0)
         self._max_leverage = max_leverage
-        # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
-        # policy is engine configuration only. It is intentionally NOT read
-        # from ``config.parameters`` — strategy parameters must not silently
-        # rewrite engine risk policy (undocumented cross-talk). Set
-        # ``risk_per_trade_pct`` / ``max_position_pct`` on the config instead.
-        self._risk_engine = RiskEngine(
-            RiskConfig(
+
+        def risk_config(
+            *, total_exposure: float, max_positions: int
+        ) -> RiskConfig:
+            # Risk-policy provenance (Cleanup 16-D1, F22): the engine-level risk
+            # policy is engine configuration only. It is intentionally NOT read
+            # from ``config.parameters`` — strategy parameters must not silently
+            # rewrite engine risk policy (undocumented cross-talk). Set
+            # ``risk_per_trade_pct`` / ``max_position_pct`` on the config instead.
+            return RiskConfig(
                 max_risk_per_trade=configured_risk_pct if configured_risk_pct > 0 else 0.01,
-                max_total_exposure=max_total_exposure,
-                max_positions=TRADE_ENGINE_MAX_POSITIONS,
+                max_total_exposure=total_exposure,
+                max_positions=max_positions,
                 default_sl_atr_multiplier=2.0,
                 max_notional_per_trade=1.0,
                 allow_fallback_stop=bool(self.config.allow_fallback_stop),
                 reject_missing_stop=bool(self.config.reject_missing_stop),
             )
+
+        self._risk_engine = RiskEngine(
+            risk_config(
+                total_exposure=max_total_exposure,
+                max_positions=TRADE_ENGINE_MAX_POSITIONS,
+            )
         )
+        # #279: the fixed-risk protocol gets its own engine instance so its
+        # aggregate-exposure and position limits can be configured
+        # independently (``fixed_risk_max_total_exposure`` /
+        # ``fixed_risk_max_positions``); ``None`` keeps the same defaults the
+        # pct path uses.
+        self._fixed_risk_engine = RiskEngine(
+            risk_config(
+                total_exposure=(
+                    float(self.config.fixed_risk_max_total_exposure)
+                    if self.config.fixed_risk_max_total_exposure is not None
+                    else max_total_exposure
+                ),
+                max_positions=(
+                    int(self.config.fixed_risk_max_positions)
+                    if self.config.fixed_risk_max_positions is not None
+                    else TRADE_ENGINE_MAX_POSITIONS
+                ),
+            )
+        )
+        # The SizedOrder from the most recent ``_calculate_position_size``
+        # engine call (None when no engine sized it). Callers read it
+        # immediately - it carries the realized (possibly clamped) risk
+        # amount and the rejection reason that would otherwise be discarded.
+        self._last_sizing: SizedOrder | None = None
 
     def _emit_progress(self, percent: float, message: str) -> None:
         if self._progress_callback is None:
@@ -278,16 +311,34 @@ class TradeEngine:
         self._sizing_equity = self.config.initial_capital + self._realized_pnl - owed
 
     def _current_risk_exposure(
-        self, reference_price: float, exclude_order: Order | None = None
+        self,
+        reference_price: float,
+        exclude_order: Order | None = None,
+        *,
+        pip: float = 1.0,
     ) -> float:
         # F21 (D2): the aggregate-risk denominator is the same realized cash
         # the sizing call uses — never the mark-to-market reporting equity.
+        # ``pip`` is the caller's ``pip_value`` contract (account-currency P&L
+        # of one unit per 1.0 price move): open risk is measured in account
+        # currency, so a position's ``|entry - stop| * qty`` must be scaled by
+        # it — the fixed-risk path passes ``tick_value / tick_size`` (e.g.
+        # 1e5 for FX), the pct path keeps the share convention 1.0. A position
+        # sized by the fixed-risk protocol carries ``sizing_risk_per_unit``
+        # (the declared distance x pip, so an ATR ``stop_distance`` is not
+        # re-measured against ``|entry - stop|``) and is summed directly.
         if self._sizing_equity <= 0:
             return 0.0
 
         risk_exposure = 0.0
 
         for position in self.positions:
+            per_unit = (position.meta or {}).get("sizing_risk_per_unit")
+            if per_unit is not None:
+                risk_exposure += (
+                    float(position.remaining_qty) * float(per_unit)
+                ) / float(self._sizing_equity)
+                continue
             stop_loss = position.stop_loss
             if stop_loss is None:
                 stop_loss = position.meta.get("sizing_stop_loss")
@@ -296,12 +347,18 @@ class TradeEngine:
                     "Cannot compute exposure for a stopless open position"
                 )
             risk_distance = abs(float(position.entry_price) - float(stop_loss))
-            risk_exposure += (risk_distance * float(position.remaining_qty)) / float(
-                self._sizing_equity
-            )
+            risk_exposure += (
+                risk_distance * float(position.remaining_qty) * pip
+            ) / float(self._sizing_equity)
 
         for order in self.pending_orders:
             if exclude_order is not None and order is exclude_order:
+                continue
+            per_unit = getattr(order, "_sizing_risk_per_unit", None)
+            if per_unit is not None:
+                risk_exposure += (
+                    float(order.quantity) * float(per_unit)
+                ) / float(self._sizing_equity)
                 continue
             stop_loss = order.stop_loss
             if stop_loss is None:
@@ -326,9 +383,9 @@ class TradeEngine:
                     "Cannot compute exposure for a stopless pending order"
                 )
             risk_distance = abs(float(reference_price) - float(stop_loss))
-            risk_exposure += (risk_distance * float(order.quantity)) / float(
-                self._sizing_equity
-            )
+            risk_exposure += (
+                risk_distance * float(order.quantity) * pip
+            ) / float(self._sizing_equity)
 
         return max(0.0, risk_exposure)
 
@@ -410,6 +467,87 @@ class TradeEngine:
             shares = min(shares, leverage_cap)
         return max(shares, 0.0)
 
+    def _fixed_risk_terms(
+        self,
+        *,
+        entry_price: float,
+        stop_loss_price: float | None,
+        stop_distance: float | None,
+    ) -> tuple[float, float, float, float] | None:
+        """``(declared_risk, risk_distance, tick_value, tick_size)`` when the
+        fixed-risk branch sizes this call, else ``None``.
+
+        Mirrors the branch guard in ``_calculate_position_size`` exactly —
+        ``fixed_risk_amount`` configured, a sizing stop present, and a
+        positive declared amount and distance — so callers never attribute
+        fixed-risk metadata (per-unit declared risk, exposure-clamp
+        proportionality) to an order the pct path actually sized.
+        """
+        params = self.config.parameters
+        fixed_risk_amount = params.get("fixed_risk_amount")
+        if fixed_risk_amount is None:
+            fixed_risk_amount = params.get("Fixed_Risk_Amount")
+        if fixed_risk_amount is None or stop_loss_price is None:
+            return None
+        risk_amount = float(fixed_risk_amount)
+        if not (math.isfinite(risk_amount) and risk_amount > 0):
+            # A configured fixed-risk amount that is NaN/inf/non-positive is
+            # a config bug, not "unset" — silently falling through to the
+            # pct path (or sizing off inf) would hide it. Fail closed like
+            # the C1 missing-sizing raise.
+            raise ValueError(
+                f"fixed_risk_amount must be a finite positive number, got "
+                f"{fixed_risk_amount!r}"
+            )
+        # MT5 parity: an explicit stop distance (e.g. ATR-based) sizes from
+        # it directly; otherwise the distance derives from |entry - stop|.
+        if stop_distance is not None and stop_distance > 0:
+            risk_distance = float(stop_distance)
+        else:
+            risk_distance = abs(float(entry_price) - float(stop_loss_price))
+        if not (risk_amount > 0 and risk_distance > 0):
+            return None
+        tick_value = float(params.get("tick_value", 1.0) or 1.0)
+        tick_size = float(params.get("tick_size", 1.0) or 1.0)
+        return risk_amount, risk_distance, tick_value, tick_size
+
+    def _record_fixed_risk_sizing(
+        self,
+        order: Order,
+        *,
+        entry_price: float,
+        stop_loss_price: float | None,
+        stop_distance: float | None,
+    ) -> None:
+        """Stamp the fixed-risk sizing facts onto ``order`` after a size > 0.
+
+        ``_sizing_risk_per_unit`` is the declared risk per unit quantity in
+        account currency (``risk_distance * tick_value / tick_size``) — the
+        aggregate-exposure sum uses it instead of re-measuring
+        ``|entry - stop|``, which drifts from the declared distance when the
+        strategy sized on ``stop_distance``. ``_equity_proportional`` stays
+        False only while the declared amount fits the exposure budget
+        unclamped; a clamp-bound quantity is a function of the sizing equity
+        and must be re-scaled by the shared-equity replay.
+        """
+        terms = self._fixed_risk_terms(
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            stop_distance=stop_distance,
+        )
+        if terms is None:
+            order._equity_proportional = True
+            order._sizing_risk_per_unit = None
+            return
+        declared, risk_distance, tick_value, tick_size = terms
+        order._sizing_risk_per_unit = risk_distance * (tick_value / tick_size)
+        sized = self._last_sizing
+        # Clamped (``risk_amount`` below the declared amount) means the
+        # quantity is a function of the sizing equity - proportional.
+        order._equity_proportional = bool(
+            sized is not None and sized.risk_amount < declared
+        )
+
     def _calculate_position_size(
         self,
         *,
@@ -420,6 +558,7 @@ class TradeEngine:
         stop_distance: float | None = None,
         exclude_order: Order | None = None,
     ) -> float:
+        self._last_sizing = None
         # #347: two different denominators now. The per-position exposure cap
         # stays a sizing rule on realized cash (D2); the leverage/margin
         # check is MT5-style and judges the order against FREE MARGIN
@@ -428,9 +567,13 @@ class TradeEngine:
         # account/asset; unknown → 1x.
         exposure_limit = self._max_position_exposure_pct
         lot_step = float(self.config.parameters.get("lot_step", 0.0) or 0.0)
-        fixed_risk_amount = self.config.parameters.get("fixed_risk_amount")
-        if fixed_risk_amount is None:
-            fixed_risk_amount = self.config.parameters.get("Fixed_Risk_Amount")
+        min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
+        max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
+        terms = self._fixed_risk_terms(
+            entry_price=float(entry_price),
+            stop_loss_price=stop_loss_price,
+            stop_distance=stop_distance,
+        )
 
         pending_positions = sum(
             order is not exclude_order for order in self.pending_orders
@@ -450,76 +593,79 @@ class TradeEngine:
             },
         )
 
-        if fixed_risk_amount is not None and stop_loss_price is not None:
-            risk_amount = float(fixed_risk_amount)
-            # MT5 parity: when the strategy provides an explicit stop distance
-            # (e.g. ATR-based, as the MT5 EA computes lots from the ATR
-            # distance at order time), size from it directly instead of
-            # deriving it from |entry - stop|. The derived form inherits
-            # fill-price noise (bid/ask, next-open gaps) that MT5 lots never
-            # see. Falls back to the derived form when no distance is given.
-            has_stop_distance = stop_distance is not None and stop_distance > 0
-            if has_stop_distance:
-                risk_distance = float(stop_distance)
-            else:
-                risk_distance = abs(float(entry_price) - float(stop_loss_price))
-            if risk_amount > 0 and risk_distance > 0:
-                tick_value = float(self.config.parameters.get("tick_value", 1.0) or 1.0)
-                tick_size = float(self.config.parameters.get("tick_size", 1.0) or 1.0)
-                min_lot = float(self.config.parameters.get("min_lot", 0.0) or 0.0)
-                max_lot = float(self.config.parameters.get("max_lot", 0.0) or 0.0)
-                # #279: the fixed-risk branch used to return before the risk
-                # engine, skipping max_positions, the aggregate exposure
-                # ceiling and input validation. It now sizes through
-                # ``calculate_position_size`` via ``risk_amount_override``;
-                # ``pip_value = tick_value / tick_size`` is the engine's unit
-                # contract (account-currency P&L of one size unit per 1.0
-                # price move) and reproduces the legacy
-                # ``(risk / distance) * (tick_size / tick_value)`` exactly.
-                sized_order = self._risk_engine.calculate_position_size(
-                    signal=signal,
-                    # F21 (D2): realized cash, same basis as the pct path.
-                    account_balance=float(self._sizing_equity),
-                    pip_value=tick_value / tick_size,
-                    current_exposure=self._current_risk_exposure(
-                        float(entry_price), exclude_order=exclude_order
-                    ),
-                    # The per-position notional ceiling stays in
-                    # ``_apply_notional_caps`` below: the engine's notional
-                    # unit (qty * price * pip — true contract notional for
-                    # lot-denominated symbols) differs from the native cap's
-                    # qty * price convention, so an engine-level ceiling here
-                    # would silently tighten MT5-parity sizing. ``inf`` is
-                    # the documented uncapped value.
-                    max_notional_per_trade=math.inf,
-                    risk_amount_override=risk_amount,
-                    stop_distance_override=(
-                        float(stop_distance) if has_stop_distance else None
-                    ),
-                )
-                shares = float(sized_order.position_size)
-                if shares <= 0:
-                    # Engine rejection (max_positions / max_total_exposure)
-                    # or a non-positive size — the same zero the leverage
-                    # clamp produces; callers log the skip.
-                    return 0.0
-                if lot_step > 0:
-                    shares = math.floor((shares / lot_step) + 1e-12) * lot_step
-                if min_lot > 0:
-                    shares = max(shares, min_lot)
-                if max_lot > 0:
-                    shares = min(shares, max_lot)
-                return self._apply_notional_caps(
-                    shares,
-                    entry_price=float(entry_price),
-                    exposure_limit=exposure_limit,
-                    lot_step=lot_step,
-                    cap_by_leverage=bool(
-                        self.config.parameters.get(
-                            "cap_fixed_risk_by_leverage", True
-                        )
-                    ),
-                )
+        if terms is not None:
+            risk_amount, risk_distance, tick_value, tick_size = terms
+            pip_factor = tick_value / tick_size
+            # #279: the fixed-risk branch used to return before the risk
+            # engine, skipping max_positions, the aggregate exposure
+            # ceiling and input validation. It now sizes through
+            # ``calculate_position_size`` via ``risk_amount_override`` on
+            # ``_fixed_risk_engine`` (its own configurable exposure/position
+            # limits); ``pip_value = tick_value / tick_size`` is the engine's
+            # unit contract (account-currency P&L of one size unit per 1.0
+            # price move). The accepted size is then recomputed in the MT5
+            # ``(risk / distance) * (tick_size / tick_value)`` order - the
+            # same value as the engine's ``risk / (distance * pip)`` up to
+            # float reassociation, but bit-identical to the legacy/MT5
+            # formula the parity protocol pins.
+            sized_order = self._fixed_risk_engine.calculate_position_size(
+                signal=signal,
+                # F21 (D2): realized cash, same basis as the pct path.
+                account_balance=float(self._sizing_equity),
+                pip_value=pip_factor,
+                # Open risk is measured in account currency, so the exposure
+                # sum scales |entry - stop| * qty by the same pip factor.
+                current_exposure=self._current_risk_exposure(
+                    float(entry_price),
+                    exclude_order=exclude_order,
+                    pip=pip_factor,
+                ),
+                # The per-position notional ceiling stays in
+                # ``_apply_notional_caps`` below: the engine's notional
+                # unit (qty * price * pip — true contract notional for
+                # lot-denominated symbols) differs from the native cap's
+                # qty * price convention, so an engine-level ceiling here
+                # would silently tighten MT5-parity sizing. ``inf`` is
+                # the documented uncapped value.
+                max_notional_per_trade=math.inf,
+                risk_amount_override=risk_amount,
+                stop_distance_override=(
+                    float(stop_distance)
+                    if stop_distance is not None and stop_distance > 0
+                    else None
+                ),
+            )
+            self._last_sizing = sized_order
+            if (
+                sized_order.decision is None
+                or not sized_order.decision.accepted
+                or sized_order.position_size <= 0
+            ):
+                # Engine rejection (max_positions / max_total_exposure)
+                # or a non-positive size — the same zero the leverage
+                # clamp produces; ``_last_sizing`` keeps the rejection
+                # reason for the caller's skip log.
+                return 0.0
+            shares = (float(sized_order.risk_amount) / risk_distance) * (
+                tick_size / tick_value
+            )
+            if lot_step > 0:
+                shares = math.floor((shares / lot_step) + 1e-12) * lot_step
+            if min_lot > 0:
+                shares = max(shares, min_lot)
+            if max_lot > 0:
+                shares = min(shares, max_lot)
+            return self._apply_notional_caps(
+                shares,
+                entry_price=float(entry_price),
+                exposure_limit=exposure_limit,
+                lot_step=lot_step,
+                cap_by_leverage=bool(
+                    self.config.parameters.get(
+                        "cap_fixed_risk_by_leverage", True
+                    )
+                ),
+            )
 
         if self._risk_enabled:
             sized_order = self._risk_engine.calculate_position_size(
@@ -541,6 +687,7 @@ class TradeEngine:
                     exposure_limit if exposure_limit is not None else math.inf
                 ),
             )
+            self._last_sizing = sized_order
             shares = float(sized_order.position_size)
         else:
             # C1 (owner decision): HARD ERROR without explicit sizing —
@@ -617,14 +764,22 @@ class TradeEngine:
         )
         if qty <= 0:
             # #347: a zero size is usually the free-margin leverage clamp
-            # (no free margin remains) — log the skip like the fill-time
-            # skips instead of dropping the order silently.
+            # (no free margin remains); an engine rejection names its reason
+            # (max_positions / max_total_exposure) — log the skip like the
+            # fill-time skips instead of dropping the order silently.
+            rejection = (
+                self._last_sizing.decision.rejection_reason
+                if self._last_sizing is not None
+                and self._last_sizing.decision is not None
+                else None
+            )
             logger.warning(
-                "Skipping %s %s order at %s: sized quantity %.6g <= 0",
+                "Skipping %s %s order at %s: sized quantity %.6g <= 0%s",
                 self.symbol,
                 direction,
                 self._to_iso(row["timestamp"]),
                 qty,
+                f" ({rejection})" if rejection else "",
             )
             return
 
@@ -643,15 +798,16 @@ class TradeEngine:
         order._sizing_stop_loss = exposure_stop
         order._sizing_only_stop = stop_loss is None and sizing_only_stop is not None
         # A-M4 (D5): fixed-amount sizing is absolute-$ (not equity
-        # proportional), so the shared-equity replay must not re-scale this
-        # order's quantity — it still tracks exposure and credits PnL.
-        fixed_cfg = self.config.parameters.get("fixed_risk_amount")
-        if fixed_cfg is None:
-            fixed_cfg = self.config.parameters.get("Fixed_Risk_Amount")
-        order_equity_proportional = not (
-            fixed_cfg is not None and size_from_stop is not None
+        # proportional) only while the declared amount fits the exposure
+        # budget unclamped — a clamp-bound quantity is a function of the
+        # sizing equity, so the shared-equity replay must re-scale it. The
+        # declared per-unit risk rides along for the aggregate-exposure sum.
+        self._record_fixed_risk_sizing(
+            order,
+            entry_price=entry_price,
+            stop_loss_price=size_from_stop,
+            stop_distance=stop_distance,
         )
-        order._equity_proportional = order_equity_proportional  # transient, not a dataclass field
         # F21 (D2): the realized-cash basis this quantity was computed from. It
         # travels with the order because the quantity that survives to the fill
         # is not always recomputed there — a MARKET order whose only stop is the
@@ -680,6 +836,12 @@ class TradeEngine:
         sizing_stop = getattr(order, "_sizing_stop_loss", None)
         if sizing_stop is not None:
             position_meta["sizing_stop_loss"] = float(sizing_stop)
+        sizing_risk_per_unit = getattr(order, "_sizing_risk_per_unit", None)
+        if sizing_risk_per_unit is not None:
+            # The declared per-unit risk (account currency) the fixed-risk
+            # protocol sized this position with; the aggregate-exposure sum
+            # prefers it over re-measuring |entry - stop|.
+            position_meta["sizing_risk_per_unit"] = float(sizing_risk_per_unit)
         # A-M4 (D5): transient proportionality flag from _create_order
         # (fixed-amount sizing must not be re-scaled by the shared replay).
         position_meta["equity_proportional_sizing"] = bool(
@@ -810,15 +972,28 @@ class TradeEngine:
                         # Usually the free-margin leverage clamp (no free
                         # margin remains) — log like the creation skip
                         # instead of dropping the fill silently.
+                        rejection = (
+                            self._last_sizing.decision.rejection_reason
+                            if self._last_sizing is not None
+                            and self._last_sizing.decision is not None
+                            else None
+                        )
                         logger.warning(
                             "Skipping %s %s order at %s: fill-time sized "
-                            "quantity %.6g <= 0",
+                            "quantity %.6g <= 0%s",
                             order.symbol,
                             order.direction,
                             fill_time,
                             order.quantity,
+                            f" ({rejection})" if rejection else "",
                         )
                         continue
+                    self._record_fixed_risk_sizing(
+                        order,
+                        entry_price=float(fill_price),
+                        stop_loss_price=order.stop_loss,
+                        stop_distance=order.stop_distance,
+                    )
                 if order.order_type == OrderType.MARKET:
                     sizing_stop = order.stop_loss
                     if sizing_stop is None and getattr(order, "_sizing_only_stop", False):
@@ -871,15 +1046,28 @@ class TradeEngine:
                             # Usually the free-margin leverage clamp (no free
                             # margin remains) — log like the creation skip
                             # instead of dropping the fill silently.
+                            rejection = (
+                                self._last_sizing.decision.rejection_reason
+                                if self._last_sizing is not None
+                                and self._last_sizing.decision is not None
+                                else None
+                            )
                             logger.warning(
                                 "Skipping %s %s order at %s: fill-time sized "
-                                "quantity %.6g <= 0",
+                                "quantity %.6g <= 0%s",
                                 order.symbol,
                                 order.direction,
                                 fill_time,
                                 order.quantity,
+                                f" ({rejection})" if rejection else "",
                             )
                             continue
+                        self._record_fixed_risk_sizing(
+                            order,
+                            entry_price=float(fill_price),
+                            stop_loss_price=sizing_stop_value,
+                            stop_distance=order.stop_distance,
+                        )
                 # A-C2 inverted-stop guard (mirrors vectorbt_adapter): a stop
                 # on the wrong side of the entry (LONG stop >= entry, SHORT
                 # stop <= entry) would produce an instantly-triggered,
