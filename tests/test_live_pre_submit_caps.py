@@ -820,3 +820,62 @@ def test_claim_path_submits_the_clamped_qty(monkeypatch):
     _submitted_signal, submitted_qty = broker.submitted[0]
     assert submitted_qty == pytest.approx(2000.0)
     assert submitted_qty != pytest.approx(5000.0)
+
+
+# ── creation-time validation (#302) ──────────────────────────────────────────
+
+
+def _seed_account(database, account_id: str) -> None:
+    database.init_db()
+    with database.get_session() as session:
+        session.add(
+            database.LiveAccountModel(
+                id=account_id, broker="alpaca", name="paper", is_demo=True
+            )
+        )
+        session.commit()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"pre_submit_max_qty": 0},
+        {"pre_submit_max_qty": -5},
+        {"pre_submit_symbol_caps": {"AAPL": {"pre_submit_max_risk_multiple": -1}}},
+        {"pre_submit_symbol_caps": {"AAPL": {"pre_submit_max_qty": 0}}},
+        {"pre_submit_symbol_caps": "not-a-mapping"},
+        {"pre_submit_max_qtyy": 5},
+    ],
+)
+def test_create_live_deployment_rejects_invalid_cap_settings(
+    isolated_db_sandbox, settings
+):
+    """``create_live_deployment`` must refuse malformed cap settings.
+
+    Pins the ``validate_pre_submit_cap_settings(deployment.settings)`` call in
+    ``shared/database.py``: a mutant that drops it would store a cap the first
+    order is only refused by at submit time.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed_account(database, "acc-1")
+    deployment = _deployment(**settings)
+
+    with pytest.raises(ValueError):
+        database.create_live_deployment(deployment)
+
+    assert database.list_live_deployments() == []
+
+
+def test_create_live_deployment_accepts_valid_cap_settings(isolated_db_sandbox):
+    database, _, _ = isolated_db_sandbox
+    _seed_account(database, "acc-1")
+    deployment = _deployment(
+        pre_submit_max_qty=10,
+        pre_submit_max_risk_multiple=3.0,
+        pre_submit_symbol_caps={"AAPL": {"pre_submit_max_qty": 4}},
+    )
+
+    created = database.create_live_deployment(deployment)
+
+    assert created.settings["pre_submit_max_qty"] == 10
+    assert created.settings["pre_submit_symbol_caps"]["AAPL"]["pre_submit_max_qty"] == 4

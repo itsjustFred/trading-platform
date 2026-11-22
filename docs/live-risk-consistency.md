@@ -216,9 +216,12 @@ Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (di
 Prüfung vor dem Broker-Submit der Daemon-Pfade — nach dem Sizing, nach dem
 Submission-Claim, unmittelbar vor `adapter.submit_order()`. Sie wird an beiden
 Submit-Chokepoints aufgerufen (`submit_order_with_risk()` und der Discord-
-Dispatch in `_prepare_claim_and_submit_signal()`); direkte Submits aus
-`scripts/live_smoke.py` und `live_runner/test_signal_trigger.py` umgehen sie
-bewusst — beides Operator-Werkzeuge für manuelle Tests, kein Daemon-Pfad; ein
+Dispatch in `_prepare_claim_and_submit_signal()`). Innerhalb von
+`scripts/live_smoke.py` laufen nur die direkten `adapter.submit_order`-Aufrufe
+(:596 Einstieg, :1481 Close) an den Caps vorbei; die Aufrufe über
+`submit_order_with_risk` (:702, :1130, :1570) unterliegen ihnen wie jeder
+Daemon-Pfad. `live_runner/test_signal_trigger.py:86` ist ein weiterer direkter
+Submit. Alles Operator-Werkzeuge für manuelle Tests, kein Daemon-Pfad; ein
 Fehler dort hat damit kein Cap-Backstop.
 **Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value,
 Balance und die maximale Hebel des Brokers für Account und Asset
@@ -231,7 +234,9 @@ gerechnet — geklemmt an die eigene Account-Hebel `leverageInCents` aus
 uint32 ohne „InCents“-Suffix, nur die Obergrenze für *Änderungen* der
 Hebel, gegen die `leverageInCents` bereits validiert wird; fehlt dem
 Symbol eine `leverageId`, ist die Account-Hebel allein die Obergrenze;
-Alpaca über `account.multiplier`, Crypto bleibt bei
+Alpaca über `min(account.multiplier, 2)` — der 4x-Multiplikator ist nur
+Intraday-Buying-Power, über Nacht gilt Reg T mit 2x, und kein Plattform-Order
+ist als intraday-only markiert; Crypto bleibt bei
 1x; unbekannt → 1x). Die Tier-Hebel ist eine Obergrenze: bei cTrader sinkt
 die Hebel mit dem Volumen, daher gilt der erste (kleinste) Tier — der
 tatsächlich angewandte Hebel kann niedriger sein und wird vom Broker
@@ -249,9 +254,10 @@ Audit-Eintrag über `record_live_control_audit`), wenn
 | `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` (nur wenn der Bruchteil explizit konfiguriert ist) |
 | `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
 
-Die einzige Notional-Obergrenze, die die Plattform selbst setzt, ist die
-maximale Hebel des Brokers für Account und Asset (#240, Entscheidung auf
-#329): braucht ein korrekt gesizter Order mehr Hebel als der Broker
+Die Caps fügen **keine eigene Notional-Obergrenze unter dem Broker-Maximum
+hinzu** — die einzige Notional-Obergrenze dieses Moduls ist die maximale
+Hebel des Brokers für Account und Asset (#240, Entscheidung auf #329):
+braucht ein korrekt gesizter Order mehr Hebel als der Broker
 erlaubt, wird die Menge **auf das Broker-Maximum geklemmt** (abgerundet auf
 den Lot-Step) statt abgelehnt — verbleibende Caps laufen gegen die geklemmte
 Größe. Eine unbekannte Broker-Hebel failt closed auf 1x. Die Klemme wird
@@ -260,11 +266,18 @@ mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert (das Feld
 folgt auf die Klemme eine Verweigerung durch einen anderen Cap, entstehen
 bewusst zwei Audit-Zeilen — Klemme und Verweigerung); lässt das
 Broker-Maximum nicht einmal einen Lot-Step zu, wird abgelehnt
-(`broker_leverage_cap`).
+(`broker_leverage_cap`). Die Klemme ist damit ein Backstop gegen eine
+kaputte Größe, keine Platform-Notional-Policy: das Sizing deckelt den
+Notional pro Order weiterhin bei `max_notional_per_trade` (Default 0.20;
+`RiskConfig` lehnt Werte > 1 ab) — diese Obergrenze bleibt bis zur
+#240-Entscheidung bestehen.
 
-Notional und Stop-Risk rechnen gegen das Account-**Equity**, während das
-Sizing gegen die **Balance** rechnet — bewusst verschiedene Basen: die Caps
-sind ein hartes Backstop gegen kaputte Größen, kein zweites Sizing.
+Notional und Stop-Risk rechnen gegen das Account-**Equity** — und auf dem
+Produktionspfad rechnet auch das Sizing gegen dieselbe Basis:
+`_resolve_account_balance` (`daemon.py`) liefert `get_balance()[1]`, also
+das Equity; nur ein explizit übergebener `account_balance`-Parameter weicht
+ab. Die Caps sind damit kein zweites Sizing, sondern ein hartes Backstop
+gegen kaputte Größen auf derselben Equity-Basis.
 
 Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
 Cap-Settings, Quote/Pip-Value/Balance nicht abrufbar oder unbrauchbar,

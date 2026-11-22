@@ -5,12 +5,14 @@ fallback scale, #184). Every gate upstream of this point is part of, or fed by,
 the sizing path; this module is the independent check that runs after sizing,
 after the submission claim, and immediately before ``adapter.submit_order``.
 It is wired into the daemon's two submit chokepoints (``submit_order_with_risk``
-and ``_prepare_claim_and_submit_signal``); direct submits such as
-``scripts/live_smoke.py`` and ``live_runner/test_signal_trigger.py`` bypass it.
+and ``_prepare_claim_and_submit_signal``); the direct ``adapter.submit_order``
+calls in ``scripts/live_smoke.py`` (:596 entry, :1481 close) and
+``live_runner/test_signal_trigger.py`` bypass it (its
+``submit_order_with_risk`` calls do run the caps).
 
 Only the broker facts are re-derived here — the live quote (with its freshness
 checked against ``max_entry_quote_age_seconds``), the pip value and the
-balance. The quantity and the price levels are the ones sizing resolved and
+account equity. The quantity and the price levels are the ones sizing resolved and
 are taken from the sized signal, never re-invented from payload metadata.
 
 It refuses — fail closed, with an ERROR alert and an audit record — when
@@ -23,12 +25,15 @@ It refuses — fail closed, with an ERROR alert and an audit record — when
 * the risk at the stop exceeds ``pre_submit_max_risk_multiple`` times the
   deployment's configured per-trade risk (``max_risk_per_trade`` of equity).
 
-The only notional ceiling the platform imposes by default is the broker's
-maximum leverage for the account and asset (#240, maintainer decision on
-#329): an order that would need more leverage than the broker allows is not
-refused — its quantity is **clamped down to the broker maximum** (floored to
-the instrument's quantity step) and the remaining caps run against the
-clamped size. An undeterminable broker maximum fails closed to 1x.
+This module adds no notional ceiling below the broker's maximum leverage
+for the account and asset (#240, maintainer decision on #329): an order
+that would need more leverage than the broker allows is not refused — its
+quantity is **clamped down to the broker maximum** (floored to the
+instrument's quantity step) and the remaining caps run against the clamped
+size. An undeterminable broker maximum fails closed to 1x. The clamp is a
+backstop against a broken size, not the platform's notional policy —
+sizing still caps order notional at ``max_notional_per_trade`` (default
+0.20, ``RiskConfig`` refuses values > 1) until #240 decides otherwise.
 
 Any failure to verify (no quote, a stale or missing quote time, no pip value,
 unreadable balance, missing stop, invalid cap config) refuses the order.

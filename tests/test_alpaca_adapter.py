@@ -903,10 +903,23 @@ def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
 # ── get_max_leverage (#240/#302) ──────────────────────────────────────────────
 
 
-def test_get_max_leverage_returns_the_account_multiplier() -> None:
+@pytest.mark.parametrize(
+    ("multiplier", "expected"),
+    [
+        # multiplier=4 is intraday buying power only; Reg T caps overnight
+        # marginable-stock positions at 2x, and no platform order is marked
+        # intraday-only, so the ceiling is the conservative min(multiplier, 2).
+        ("4", 2.0),
+        ("2", 2.0),
+        ("1", 1.0),
+    ],
+)
+def test_get_max_leverage_returns_the_overnight_reg_t_ceiling(
+    multiplier: str, expected: float
+) -> None:
     client = _FakeTradingClient()
-    client.account.multiplier = "4"
-    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) == pytest.approx(4.0)
+    client.account.multiplier = multiplier
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) == pytest.approx(expected)
 
 
 def test_get_max_leverage_crypto_stays_at_the_1x_default() -> None:
