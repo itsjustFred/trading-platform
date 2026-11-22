@@ -93,6 +93,44 @@ def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     assert payload["stats"]["total_return"] == 0.05
 
 
+def test_cmd_run_records_not_modeled_slippage_note_for_out_of_scope_engine(
+    monkeypatch, tmp_path: Path
+):
+    """#130: engines outside native/signal-replay get an explicit 'not
+    modeled' slippage record — never silence."""
+    output_path = tmp_path / "cli-demo.trades.json"
+
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    args = SimpleNamespace(
+        engine="vectorbt",
+        strategy="strategies/demo.py",
+        symbols=["AAPL"],
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-02-01",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        data_dir="",
+        params="{}",
+        name="demo",
+        output=str(output_path),
+        slippage=None,
+        slippage_bps=None,
+        slippage_default_bps=None,
+    )
+
+    runner_cli.cmd_run(args)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    slippage = payload["meta"]["data"]["slippage"]
+    assert slippage["models"] == {}
+    assert "does not apply a slippage model" in slippage["note"]
+
+
 def test_cmd_run_refuses_unapproved_generated_strategy(monkeypatch, tmp_path: Path):
     from runner.approval_gate import StrategyNotApprovedError, mark_generated_strategy
 

@@ -36,6 +36,7 @@ from runner.auto_agent import (  # noqa: F401 - re-exported for viewer/main.py a
     SUPPORTED_MODEL_NAMES,
     run_auto_agent,
 )
+from runner.engines import contract
 from runner.llm_providers import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
     DEFAULT_LLM_PROVIDER_NAME,
     SUPPORTED_LLM_PROVIDER_NAMES,
@@ -809,6 +810,27 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     with _OHLCV_DF_CACHE_LOCK:
         _OHLCV_DF_CACHE[cache_key] = (signature, total_rows, merged)
     return merged.copy(deep=False)
+
+
+def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
+    """Asset class of the OHLCV source ``_load_ohlcv_df`` would read (#130).
+
+    Uses the same candidate selection (source priority, match cap) so the
+    class matches the data actually loaded; ``""`` when the symbol cannot
+    be classified — the slippage model then records an explicit ``none``.
+    """
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if (
+        _OHLCV_SYMBOL_RE.fullmatch(normalized_symbol) is None
+        or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
+    ):
+        return ""
+    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
+    if not matches or len(matches) > _OHLCV_MAX_MATCHES:
+        return ""
+    return contract.ohlcv_path_metadata(matches[0])["asset_class"]
 
 
 def _infer_symbol_data_category(symbol: str) -> str:

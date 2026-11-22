@@ -492,9 +492,12 @@ class TradeEngine:
         """Adverse slippage adjustment on one fill price (#130).
 
         ``side`` is the trader's side of the fill: entries buy on LONG /
-        sell on SHORT; exits are the mirror. Applied to EVERY fill —
-        market, limit, stop and take-profit legs alike — so the recorded
-        fill price, the PnL and the equity path all carry the same cost.
+        sell on SHORT; exits are the mirror. Applied to every fill the
+        engine produces — market, stop, take-profit and signal exits — so
+        the recorded fill price, the PnL and the equity path all carry the
+        same cost. Limit-price clamping is NOT modeled (a slipped limit
+        buy could fill above its limit); the engine only submits market
+        orders today, so no live path reaches it.
         """
         return float(self.slippage_model.slip_price(float(price), side, bar))
 

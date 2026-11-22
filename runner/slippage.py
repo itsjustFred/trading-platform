@@ -17,17 +17,22 @@ recording is mandatory even when the resolved model is ``none``.
 
 Asset classes that cannot be classified (direct engine use in tests and
 tools, data outside the ``ohlcv/{source}/{asset_class}/...`` layout)
-resolve to :class:`ZeroSlippage` and say so in ``describe()``: adapters
-always classify from the parquet path, so an unclassified ``none`` is a
-deliberate, auditable outcome rather than a silent gross default.
+resolve to :class:`ZeroSlippage`, record ``reason=unclassified_asset_class``
+in ``describe()`` and emit a WARNING: adapters always classify from the
+parquet path, so an unclassified ``none`` is a deliberate, auditable gross
+run rather than a silent default.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "BarSpreadSlippage",
@@ -133,9 +138,35 @@ def _positive_float(value: Any, *, field: str) -> float:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid {field}: {value!r}") from exc
-    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+    if math.isnan(parsed) or parsed in (float("inf"), float("-inf")):
         raise ValueError(f"Invalid {field}: {value!r}")
     return parsed
+
+
+def _bar_numeric_values(bar: Any) -> dict[str, float]:
+    """Lowercased column name -> float value for every numeric bar field."""
+    if bar is None:
+        return {}
+    try:
+        items = bar.items() if hasattr(bar, "items") else []
+    except (AttributeError, TypeError):
+        return {}
+    values: dict[str, float] = {}
+    for key, raw in items:
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        try:
+            values[str(key).lower()] = float(raw)
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _median_sorted(values: list[float]) -> float:
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
 
 
 def _bar_spread_units(bar: Any) -> float | None:
@@ -150,22 +181,10 @@ def _bar_spread_units(bar: Any) -> float | None:
     merely repeats the canonical series) are ignored — they carry no
     spread information and must not produce a negative adjustment.
     """
-    if bar is None:
+    values = _bar_numeric_values(bar)
+    if not values:
         return None
     diffs: list[float] = []
-    try:
-        items = bar.items() if hasattr(bar, "items") else []
-    except (AttributeError, TypeError):
-        return None
-    values: dict[str, float] = {}
-    for key, raw in items:
-        col = str(key).lower()
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            continue
-        try:
-            values[col] = float(raw)
-        except (TypeError, ValueError):
-            continue
     for field in ("open", "high", "low", "close"):
         ask = values.get(f"ask_{field}")
         bid = values.get(field)
@@ -177,10 +196,7 @@ def _bar_spread_units(bar: Any) -> float | None:
     if not diffs:
         return None
     diffs.sort()
-    mid = len(diffs) // 2
-    if len(diffs) % 2:
-        return diffs[mid]
-    return (diffs[mid - 1] + diffs[mid]) / 2.0
+    return _median_sorted(diffs)
 
 
 @dataclass(frozen=True)
@@ -190,7 +206,7 @@ class ZeroSlippage:
     asset_class: str = ""
     reason: str = "explicit_opt_out"
 
-    def slip_price(self, price: float, side: str, bar: Any = None) -> float:
+    def slip_price(self, price: float, _side: str, _bar: Any = None) -> float:
         return float(price)
 
     def describe(self) -> dict[str, Any]:
@@ -216,7 +232,7 @@ class FixedBpsSlippage:
             raise ValueError("Slippage bps must be non-negative.")
         object.__setattr__(self, "bps", parsed)
 
-    def slip_price(self, price: float, side: str, bar: Any = None) -> float:
+    def slip_price(self, price: float, side: str, _bar: Any = None) -> float:
         adjustment = abs(float(price)) * self.bps / 10_000.0
         if side == "buy":
             return float(price) + adjustment
@@ -236,10 +252,12 @@ class FixedBpsSlippage:
 class BarSpreadSlippage:
     """Spread from the bar's bid/ask columns, fixed-bps fallback.
 
-    MT5-tester-like: when the bar carries ``ask_*`` columns the quoted
-    spread (ask − bid, in price units) is the adjustment — buys pay it,
-    sells receive it back. Without usable ask data the configured
-    ``default_bps`` applies to the fill price instead.
+    MT5-tester-like and matching the engine's existing ``spread_price_col``
+    convention: canonical OHLC is the BID series, so a buy fills at the ask
+    (``price + spread``) while a sell fills at the bid (``price`` unchanged)
+    — the spread is charged once per round trip, on the buy side only. When
+    the bar carries no usable ``ask_*`` columns the configured
+    ``default_bps`` applies symmetrically per side instead.
     """
 
     default_bps: float
@@ -257,9 +275,12 @@ class BarSpreadSlippage:
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
         spread = _bar_spread_units(bar)
         if spread is not None:
-            adjustment = spread
-        else:
-            adjustment = abs(float(price)) * self.default_bps / 10_000.0
+            # Bid-referenced bar: buys lift to the ask, sells stay on the
+            # bid — the quoted spread is paid once, by the buy side.
+            if side == "buy":
+                return float(price) + spread
+            return float(price)
+        adjustment = abs(float(price)) * self.default_bps / 10_000.0
         if side == "buy":
             return float(price) + adjustment
         return max(float(price) - adjustment, 1e-12)
@@ -295,7 +316,20 @@ def _class_default_bps(asset_class: str, params: dict[str, Any]) -> float:
 def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
     """Per-asset-class default: bar spread for FX/CFD, fixed bps else."""
     ac = _normalize_asset_class(asset_class)
+    if params.get("slippage_bps") is not None:
+        raise ValueError(
+            "slippage_bps cannot be combined with slippage='auto' (or the "
+            "default per-class resolution): the auto model picks the "
+            "per-class cost itself. Pass slippage='bps' to force a fixed "
+            "bps model, or slippage_default_bps/slippage_defaults to tune "
+            "the auto fallback."
+        )
     if not ac:
+        logger.warning(
+            "slippage auto: the asset class could not be determined; fills "
+            "run gross and the run records slippage='none' "
+            "(reason=unclassified_asset_class)."
+        )
         return ZeroSlippage(asset_class="", reason="unclassified_asset_class")
     if ac in _CRYPTO_ASSET_CLASSES or ac in _EQUITY_ASSET_CLASSES:
         bps = _class_default_bps(ac, params)
@@ -308,8 +342,88 @@ def _auto_model(params: dict[str, Any], asset_class: str) -> SlippageModel:
             return FixedBpsSlippage(bps=bps, asset_class=ac)
         return BarSpreadSlippage(default_bps=bps, asset_class=ac)
     # Recognized-but-unmapped class: still record an explicit none rather
-    # than inventing a cost the decision did not specify.
+    # than inventing a cost the decision did not specify — but say so,
+    # because gross fills are the opposite of the fee convention (#84).
+    logger.warning(
+        "slippage auto: asset_class=%r is not mapped to a slippage model; "
+        "fills run gross and the run records slippage='none' "
+        "(reason=unclassified_asset_class).",
+        ac,
+    )
     return ZeroSlippage(asset_class=ac, reason="unclassified_asset_class")
+
+
+def _spread_fallback_bps(
+    params: dict[str, Any], asset_class: str, bps_override: Any
+) -> float:
+    """Fallback bps for ``slippage='spread'`` — never a silent default."""
+    if bps_override is not None:
+        return _positive_float(bps_override, field="slippage_bps")
+    if asset_class:
+        return _class_default_bps(asset_class, params)
+    configured = params.get("slippage_default_bps")
+    if configured is not None:
+        return _positive_float(configured, field="slippage_default_bps")
+    raise ValueError(
+        "slippage='spread' with an unknown asset class requires an "
+        "explicit fallback: pass slippage_bps or slippage_default_bps."
+    )
+
+
+def _spread_model(
+    params: dict[str, Any], asset_class: str, bps_override: Any
+) -> SlippageModel:
+    fallback = _spread_fallback_bps(params, asset_class, bps_override)
+    # Same double-count guard as the auto model: a run that already prices
+    # the spread through spread_price_col / ask_ohlc must not pay it twice.
+    if any(params.get(key) for key in _EXTERNAL_SPREAD_PARAMS):
+        return FixedBpsSlippage(bps=fallback, asset_class=asset_class)
+    return BarSpreadSlippage(default_bps=fallback, asset_class=asset_class)
+
+
+def _bps_model(bps_override: Any, asset_class: str, params: dict[str, Any]) -> SlippageModel:
+    resolved = bps_override
+    if resolved is None:
+        if not asset_class:
+            raise ValueError(
+                "slippage='bps' requires slippage_bps when the asset "
+                "class is unknown."
+            )
+        resolved = _class_default_bps(asset_class, params)
+    return FixedBpsSlippage(
+        bps=_positive_float(resolved, field="slippage_bps"), asset_class=asset_class
+    )
+
+
+def _numeric_slippage_or_raise(explicit: str, asset_class: str) -> SlippageModel:
+    """A ``slippage`` string that is neither a spelling nor a number."""
+    try:
+        return FixedBpsSlippage(
+            bps=_positive_float(explicit, field="slippage"), asset_class=asset_class
+        )
+    except ValueError:
+        raise ValueError(
+            f"Invalid slippage {explicit!r}: use 'none', 'spread', 'bps', "
+            "'auto' or a fixed bps number."
+        ) from None
+
+
+def _resolve_string_slippage(
+    explicit: str,
+    params: dict[str, Any],
+    asset_class: str,
+    bps_override: Any,
+) -> SlippageModel:
+    spelling = explicit.strip().lower()
+    if spelling in _NONE_SPELLINGS:
+        return ZeroSlippage(asset_class=asset_class, reason="explicit_opt_out")
+    if spelling == "spread":
+        return _spread_model(params, asset_class, bps_override)
+    if spelling in _BPS_SPELLINGS:
+        return _bps_model(bps_override, asset_class, params)
+    if spelling in _AUTO_SPELLINGS:
+        return _auto_model(params, asset_class)
+    return _numeric_slippage_or_raise(explicit, asset_class)
 
 
 def resolve_slippage_model(
@@ -343,42 +457,7 @@ def resolve_slippage_model(
     bps_override = params.get("slippage_bps")
 
     if isinstance(explicit, str):
-        spelling = explicit.strip().lower()
-        if spelling in _NONE_SPELLINGS:
-            return ZeroSlippage(asset_class=ac, reason="explicit_opt_out")
-        if spelling == "spread":
-            if bps_override is not None:
-                fallback = _positive_float(bps_override, field="slippage_bps")
-            elif ac:
-                fallback = _class_default_bps(ac, params)
-            else:
-                fallback = _positive_float(
-                    params.get("slippage_default_bps", 5.0),
-                    field="slippage_default_bps",
-                )
-            return BarSpreadSlippage(default_bps=fallback, asset_class=ac)
-        if spelling in _BPS_SPELLINGS:
-            if bps_override is None:
-                if not ac:
-                    raise ValueError(
-                        "slippage='bps' requires slippage_bps when the asset "
-                        "class is unknown."
-                    )
-                bps_override = _class_default_bps(ac, params)
-            return FixedBpsSlippage(
-                bps=_positive_float(bps_override, field="slippage_bps"), asset_class=ac
-            )
-        if spelling in _AUTO_SPELLINGS:
-            return _auto_model(params, ac)
-        try:
-            return FixedBpsSlippage(
-                bps=_positive_float(explicit, field="slippage"), asset_class=ac
-            )
-        except ValueError:
-            raise ValueError(
-                f"Invalid slippage {explicit!r}: use 'none', 'spread', 'bps', "
-                "'auto' or a fixed bps number."
-            ) from None
+        return _resolve_string_slippage(explicit, params, ac, bps_override)
 
     if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
         return FixedBpsSlippage(

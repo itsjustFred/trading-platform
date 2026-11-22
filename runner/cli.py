@@ -628,6 +628,11 @@ def _slippage_params_from_args(args) -> dict:
         params["slippage_default_bps"] = float(args.slippage_default_bps)
     if params.get("slippage") in {"none", "zero"} and "slippage_bps" in params:
         raise ValueError("--slippage none/zero conflicts with --slippage-bps")
+    if params.get("slippage") == "auto" and "slippage_bps" in params:
+        raise ValueError(
+            "--slippage auto conflicts with --slippage-bps: auto picks the "
+            "per-class model; use --slippage bps to force fixed bps"
+        )
     return params
 
 
