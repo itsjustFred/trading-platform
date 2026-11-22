@@ -17,8 +17,10 @@ Two breakers, measured on an equity series per scope:
   rest of the account gains 3 % still trips its own 5 % daily breaker.
 
 * **Daily loss** — equity is down ``daily_loss_fraction`` (default 5 %) of the
-  start-of-day equity. "Start of day" is the first equity observation of the
-  UTC day; the breaker re-bases automatically at the UTC day boundary.
+  start-of-day equity. "Start of day" is the last equity observed before the
+  UTC day boundary (the closest available estimate of start-of-day equity -
+  it also captures an overnight gap a fresh baseline would hide); the first
+  observation of the new day re-bases to it and clears the daily latch.
 * **Overall drawdown** — equity is down ``max_drawdown_fraction`` (default
   20 %) from the peak equity ever observed. The peak rises with every
   observation and is re-based to the equity at reset time only by the
@@ -65,9 +67,9 @@ from typing import Any
 from live_runner.base_adapter import validate_live_quote_prices
 from live_runner.credential_env import load_accounts_env_values
 from shared.database import (
-    account_has_ledger_reconciliation_flags,
     get_account_deployment_trading_flows,
     latch_live_loss_breaker_breach,
+    list_unresolved_ledger_reconciliation_flags,
     list_untrusted_fill_references,
     observe_live_loss_breaker,
     reset_live_loss_breaker_drawdown,
@@ -554,13 +556,17 @@ def _gate_scope(
 #: when the P&L becomes measurable again - is the surface an operator needs.
 _PNL_UNMEASURABLE_ALERTED: set[tuple[str, str]] = set()
 
-#: Pip values cached per ``(symbol, UTC day)``: the poll resolves the pip
-#: value of EVERY symbol the account ever traded, once a minute, and a
-#: long-closed symbol becoming unresolvable must not fail the scopes closed
-#: forever. A pip value is an FX conversion that moves slowly; a day of
-#: staleness is far below the mark-to-market noise the breaker already
-#: tolerates. Entries still resolve pip values fresh through their own path.
-_PIP_VALUE_CACHE: dict[tuple[str, str], float] = {}
+#: Pip values cached per ``(account_id, symbol, UTC day)``: the poll resolves
+#: the pip value of EVERY symbol the account ever traded, once a minute. The
+#: account id is part of the key because a pip value is in the ACCOUNT's
+#: currency - cTrader converts through the account's deposit asset, and two
+#: brokers can quote the same symbol name in different contracts, so one
+#: account's value must never stand in for another's. The day bucket means a
+#: long-closed, unresolvable symbol is NOT skipped forever: the cache only
+#: avoids re-fetching within the same UTC day, and the next day the lookup
+#: fails again (now with an alert). The entry path's deployment-P&L lookup
+#: shares this cache; only sizing resolves pip values truly fresh.
+_PIP_VALUE_CACHE: dict[tuple[str, str, str], float] = {}
 
 
 def _alert_pnl_unmeasurable(
@@ -618,10 +624,10 @@ async def _untrusted_fill_refs(account_id: str) -> list[dict[str, Any]]:
 
 
 async def _pip_value_for_symbol(
-    adapter: Any, symbol: str, *, day_key: str
+    adapter: Any, account_id: str, symbol: str, *, day_key: str
 ) -> float | None:
-    """The symbol's pip value, cached per UTC day (see ``_PIP_VALUE_CACHE``)."""
-    key = (symbol, day_key)
+    """The symbol's pip value for ``account_id``, cached per UTC day."""
+    key = (str(account_id), symbol, day_key)
     cached = _PIP_VALUE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -677,18 +683,21 @@ async def account_deployment_trading_pnls(
     one ERROR ``loss_breaker_pnl_unmeasurable`` alert per episode.
     """
     try:
-        if await asyncio.to_thread(
-            account_has_ledger_reconciliation_flags, account_id
-        ):
+        unresolved_flags = await asyncio.to_thread(
+            list_unresolved_ledger_reconciliation_flags, account_id
+        )
+        if unresolved_flags:
             _alert_pnl_unmeasurable(
                 account_id,
                 "ledger_reconciliation",
                 {
+                    "unresolved_flags": unresolved_flags,
                     "detail": (
                         "an unresolved ledger_reconciliation_required audit "
                         "row exists for this account; the fill ledger may be "
-                        "missing broker-side closes (#277/#330)"
-                    )
+                        "missing broker-side closes (#277/#330). Resolve with "
+                        "`python -m scripts.live_loss_breaker resolve-ledger-flag`"
+                    ),
                 },
             )
             return None
@@ -711,7 +720,9 @@ async def account_deployment_trading_pnls(
     marks: dict[str, tuple[float, float]] = {}
     day_key = datetime.now(timezone.utc).date().isoformat()
     for symbol in symbols:
-        pip = await _pip_value_for_symbol(adapter, symbol, day_key=day_key)
+        pip = await _pip_value_for_symbol(
+            adapter, account_id, symbol, day_key=day_key
+        )
         if pip is None:
             _alert_pnl_unmeasurable(
                 account_id, "missing_pip_value", {"symbol": symbol}
@@ -749,17 +760,22 @@ async def account_deployment_trading_pnls(
         total = 0.0
         for symbol, flow in dep_flows.items():
             if flow["unpriced_fills"]:
-                fills = await _untrusted_fill_refs(account_id)
-                _alert_pnl_unmeasurable(
-                    account_id,
-                    "unpriced_fills",
-                    {
-                        "symbol": symbol,
-                        "deployment_id": deployment_id,
-                        "unpriced_fill_count": int(flow["unpriced_fills"]),
-                        "untrusted_fills": fills,
-                    },
-                )
+                # The untrusted-fill query runs only when this episode has not
+                # alerted yet: the poll reaches this branch every minute, and
+                # the dedupe inside _alert_pnl_unmeasurable makes a repeat
+                # call a no-op anyway.
+                if (str(account_id), "unpriced_fills") not in _PNL_UNMEASURABLE_ALERTED:
+                    fills = await _untrusted_fill_refs(account_id)
+                    _alert_pnl_unmeasurable(
+                        account_id,
+                        "unpriced_fills",
+                        {
+                            "symbol": symbol,
+                            "deployment_id": deployment_id,
+                            "unpriced_fill_count": int(flow["unpriced_fills"]),
+                            "untrusted_fills": fills,
+                        },
+                    )
                 return None
             mark = 0.0
             if flow["net_qty"]:
@@ -797,18 +813,6 @@ def refuse_entry_if_loss_breaker_tripped(
     """
     observed_at = now or datetime.now(timezone.utc)
     equity_value = float(equity)
-    if not math.isfinite(equity_value) or equity_value <= 0:
-        # Unreadable equity fails closed: there is no balance to measure a
-        # loss against, so the breaker cannot prove it is safe to add risk.
-        raise LossBreakerBreachError(
-            f"Refusing a live entry: account equity {equity!r} for "
-            f"'{deployment.account_id}' is not a usable positive finite number; "
-            "the loss breaker cannot measure a loss without it.",
-            scope=account_loss_breaker_scope(deployment.account_id),
-            account_id=deployment.account_id,
-            deployment_id=str(deployment.id),
-            state_unreadable=True,
-        )
     try:
         account_limits = account_loss_breaker_limits(
             deployment.account_id, env_values=env_values
@@ -833,7 +837,22 @@ def refuse_entry_if_loss_breaker_tripped(
             state_unreadable=True,
         ) from exc
     if not (account_limits.enabled or deployment_limits.enabled):
+        # Both scopes disabled: the breaker measures nothing, so it must not
+        # demand an equity read it would never use - the caller skips the
+        # (possibly expensive, e.g. cTrader unrealized-P&L) equity fetch.
         return
+    if not math.isfinite(equity_value) or equity_value <= 0:
+        # Unreadable equity fails closed: there is no balance to measure a
+        # loss against, so the breaker cannot prove it is safe to add risk.
+        raise LossBreakerBreachError(
+            f"Refusing a live entry: account equity {equity!r} for "
+            f"'{deployment.account_id}' is not a usable positive finite number; "
+            "the loss breaker cannot measure a loss without it.",
+            scope=account_loss_breaker_scope(deployment.account_id),
+            account_id=deployment.account_id,
+            deployment_id=str(deployment.id),
+            state_unreadable=True,
+        )
     account_id = deployment.account_id
     account_scope = account_loss_breaker_scope(account_id)
     deployment_scope = deployment_loss_breaker_scope(str(deployment.id))

@@ -494,11 +494,12 @@ uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
 uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id>
 ```
 
-Without `--equity` an account scope re-bases to the latest balance snapshot,
-refused when that snapshot is missing, non-positive or older than 10 minutes
-- pass `--equity` to state the figure explicitly. A deployment scope always
-re-bases to its own last observed (P&L-adjusted) equity; `--equity` does not
-apply to it.
+Without `--equity` a scope re-bases to its OWN last observed breaker equity -
+the same series the breaker measures (on cTrader that includes unrealized
+P&L, which the balance snapshot's equity slot does not carry). An account
+scope refuses an observation older than 10 minutes; pass `--equity` to state
+the figure explicitly. A deployment scope always re-bases to its own last
+observed (P&L-adjusted) equity; `--equity` does not apply to it.
 
 There is deliberately no daily reset command: the daily breaker resets itself
 at the UTC boundary.
@@ -520,24 +521,45 @@ ERROR with `data.alert = "loss_breaker_pnl_unmeasurable"` and a `reason`:
   only with an audit entry. Until then the scope stays refused.
 - `ledger_reconciliation` — an unresolved `ledger_reconciliation_required`
   audit row exists for the account (#277/#330 merge-order dependency: the
-  ledger may be missing broker-side closes). Repair: resolve the flagged
-  reconciliation first; the breaker refuses until no unresolved flag remains.
+  ledger may be missing broker-side closes). The alert's
+  `unresolved_flags` lists the `account:SYMBOL` targets. Repair: reconcile
+  the flagged symbol against the broker by hand, then record the resolution -
+  the audit trail is append-only, so resolving writes a
+  `ledger_reconciliation_resolved` row rather than deleting the flag:
+
+  ```bash
+  uv run python -m scripts.live_loss_breaker resolve-ledger-flag \
+      --account alpaca-paper --symbol AAPL --note "reconciled vs statement"
+  ```
+
+  A flag counts as unresolved only while it is newer than the latest
+  resolution for the same `account:SYMBOL`; a NEW flag after a resolution
+  blocks again. Until every flag on the account is resolved, deployment
+  scopes stay refused (the account scope keeps working).
 - `missing_pip_value` / `unusable_quote` — the broker could not supply a pip
   value or a two-sided quote for a symbol with an open ledger position.
   Usually transient (market closed, symbol halted); if it persists, check the
   symbol's market-data classification and the adapter's quote/pip path.
 - `flows_unreadable` — the ledger query itself raised; check the database.
 
-Pip values are cached per symbol per UTC day: the ledger can name symbols the
-account traded months ago, and re-fetching a pip value for every one of them
-each poll would fail on delisted/closed symbols. Quotes for symbols with an
+Pip values are cached per account+symbol per UTC day (a pip value is in the
+account's currency, so accounts never share one): the ledger can name symbols
+the account traded months ago, and re-fetching a pip value for every one of
+them each poll would fail on delisted/closed symbols. The day bucket means an
+unresolvable symbol fails again the NEXT day (with an alert) - the cache only
+skips re-fetching within the same UTC day. Quotes for symbols with an
 OPEN ledger position are still fetched fresh every evaluation — a closed
 market there fails closed by design.
 
 Ledger limitations the deployment scope inherits: swap/financing charges are
 NOT in the fill ledger (they never appear as fills), so a deployment holding
 overnight FX or swap-accruing positions has a P&L the breaker cannot see;
-treat deployment scopes on such accounts as approximate. Pip values convert
+treat deployment scopes on such accounts as approximate. A NULL commission is
+summed as 0 — a KNOWN APPROXIMATION: Alpaca crypto fees stay NULL until the
+CFEE backfill lands (about two days), so a crypto deployment's P&L is
+overstated by those fees until then. Failing closed instead would stop crypto
+deployments for days after each fill, so this is accepted and documented
+here. Pip values convert
 through the account currency at the day's cached rate — intraday FX moves are
 not tracked.
 

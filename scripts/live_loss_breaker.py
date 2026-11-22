@@ -14,17 +14,26 @@ The daily breaker resets itself at the UTC day boundary; there is no daily
 reset command on purpose. The drawdown breaker needs this explicit reset: it
 clears the latch AND re-bases the peak equity to the current equity, so the
 breaker does not re-trip on the observation that cleared it. The equity used
-for the re-base is the scope's own last observed equity for a deployment
-scope, or the latest recorded balance snapshot for an account scope - refused
-when that snapshot is missing, non-positive or older than
-``STALE_SNAPSHOT_SECONDS`` - or ``--equity`` when the operator wants to state
-it explicitly. Resetting an ACCOUNT scope also resets every deployment scope
-on that account (each re-based to its own last observed equity): with the
-defaults every deployment scope latches together with the account scope, so
-resetting only ``account:<id>`` would leave entries blocked by stale
-deployment latches. ``--equity`` applies to the account scope; deployment
-scopes always re-base to their own last equity because it lives in
-deployment-P&L-adjusted units, not raw account equity.
+for the re-base is the scope's own last observed equity - the same series the
+breaker itself measures (on cTrader that includes unrealized P&L, which the
+balance snapshot's equity slot does NOT) - refused when that observation is
+missing, non-positive or older than ``STALE_SNAPSHOT_SECONDS`` - or
+``--equity`` when the operator wants to state it explicitly. Resetting an
+ACCOUNT scope also resets every deployment scope on that account (each
+re-based to its own last observed equity): with the defaults every
+deployment scope latches together with the account scope, so resetting only
+``account:<id>`` would leave entries blocked by stale deployment latches.
+``--equity`` applies to the account scope; deployment scopes always re-base
+to their own last equity because it lives in deployment-P&L-adjusted units,
+not raw account equity.
+
+An unresolved ``ledger_reconciliation_required`` audit flag (#277) fails
+deployment-scoped entries closed until an operator reconciles it:
+
+    python -m scripts.live_loss_breaker resolve-ledger-flag --account ID --symbol SYM --note "..."
+
+The resolution is itself an append-only audit row; a flag newer than the
+latest resolution blocks again.
 
 ``status`` and ``reset-drawdown --help`` never start the daemon and ``status``
 only reads; importing this module starts nothing.
@@ -67,6 +76,8 @@ from shared.database import (
     get_live_loss_breaker_state,
     list_live_deployments,
     list_live_loss_breaker_states,
+    list_unresolved_ledger_reconciliation_flags,
+    resolve_ledger_reconciliation_flag,
 )
 from shared.logging import get_logger, route_console_logs_to_stderr
 from shared.models import LiveLossBreakerRecord
@@ -110,9 +121,30 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Equity to re-base the peak to. Defaults to the latest recorded "
-            "balance snapshot for the scope's account."
+            "Equity to re-base the peak to. Defaults to the scope's own "
+            "last observed breaker equity."
         ),
+    )
+
+    resolve = sub.add_parser(
+        "resolve-ledger-flag",
+        help=(
+            "Record the operator resolution of an unresolved "
+            "ledger_reconciliation_required flag (#277) for one "
+            "account+symbol, unblocking deployment-scoped entries."
+        ),
+    )
+    resolve.add_argument("--account", required=True, help="Account id.")
+    resolve.add_argument("--symbol", required=True, help="Symbol, e.g. AAPL.")
+    resolve.add_argument(
+        "--note",
+        default="",
+        help="Why the flag is resolved (kept in the audit row).",
+    )
+    resolve.add_argument(
+        "--actor",
+        default="operator",
+        help="Attribution recorded on the audit row.",
     )
     return parser
 
@@ -126,12 +158,20 @@ def _scope_for_args(args: argparse.Namespace) -> str:
 
 
 def _format_state(record: LiveLossBreakerRecord, *, equity: float | None) -> dict:
+    # The "now" fractions measure the breaker's OWN equity series
+    # (``last_equity`` - on cTrader that includes unrealized P&L), never the
+    # balance snapshot's equity slot, which is realized balance by design.
+    now_equity = (
+        float(record.last_equity)
+        if record.last_equity is not None
+        else equity
+    )
     daily_loss = None
     drawdown = None
-    if equity is not None and record.day_start_equity > 0:
-        daily_loss = (record.day_start_equity - equity) / record.day_start_equity
-    if equity is not None and record.peak_equity > 0:
-        drawdown = (record.peak_equity - equity) / record.peak_equity
+    if now_equity is not None and record.day_start_equity > 0:
+        daily_loss = (record.day_start_equity - now_equity) / record.day_start_equity
+    if now_equity is not None and record.peak_equity > 0:
+        drawdown = (record.peak_equity - now_equity) / record.peak_equity
     return {
         "scope": record.scope,
         "account_id": record.account_id,
@@ -194,38 +234,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _snapshot_equity(account_id: str, *, now: datetime) -> tuple[float, str] | str:
-    """Latest balance-snapshot equity for ``account_id``, or an error string.
-
-    Refuses a missing, non-positive or stale (> ``STALE_SNAPSHOT_SECONDS``)
-    snapshot: re-basing a peak on an hour-old equity could silently re-arm a
-    breaker that should still be latched.
-    """
-    latest = get_latest_live_balance(account_id)
-    if latest is None:
-        return (
-            f"no balance snapshot for account {account_id!r}; "
-            "pass --equity to state the re-base equity explicitly"
-        )
-    timestamp = latest.timestamp
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    age = (now - timestamp).total_seconds()
-    if age > STALE_SNAPSHOT_SECONDS:
-        return (
-            f"latest balance snapshot for account {account_id!r} is "
-            f"{age:.0f}s old (limit {STALE_SNAPSHOT_SECONDS:.0f}s); "
-            "pass --equity to state the re-base equity explicitly"
-        )
-    equity = float(latest.equity)
-    if not math.isfinite(equity) or equity <= 0:
-        return (
-            f"latest balance snapshot for account {account_id!r} has unusable "
-            f"equity {latest.equity!r}; pass --equity explicitly"
-        )
-    return equity, f"balance_snapshot@{timestamp.isoformat()}"
-
-
 def _reset_equity_for_scope(
     record: LiveLossBreakerRecord,
     args: argparse.Namespace,
@@ -234,36 +242,62 @@ def _reset_equity_for_scope(
 ) -> tuple[float | None, str | None, str | None]:
     """``(equity, source, error)`` for one scope's drawdown re-base.
 
-    ``--equity`` always wins and applies to the account scope the operator
-    named; deployment scopes re-base to their own last observed equity because
-    that equity lives in deployment-P&L-adjusted units a raw account-equity
-    figure cannot express.
+    Every scope re-bases to its OWN last observed breaker equity - the series
+    the breaker actually measures. On cTrader that includes unrealized P&L,
+    which the balance snapshot's equity slot does NOT carry (it is realized
+    balance by the #267 decision), so re-basing on the snapshot would set the
+    peak ABOVE the observed equity and the next poll would re-latch. An
+    account scope additionally refuses an observation older than
+    ``STALE_SNAPSHOT_SECONDS``: re-basing on an hour-old equity could
+    silently re-arm a breaker that should still be latched. ``--equity``
+    always wins, but only for the account scope the operator named;
+    deployment scopes re-base to their own last observed equity because it
+    lives in deployment-P&L-adjusted units a raw account-equity figure
+    cannot express.
     """
     kind = record.scope.split(":", 1)[0]
-    if kind == "deployment":
-        last = record.last_equity
-        if last is not None and math.isfinite(float(last)) and float(last) > 0:
-            return float(last), "last_observed_equity", None
-        return (
-            None,
-            None,
-            (
-                f"deployment scope {record.scope!r} has no usable last observed "
-                "equity; its re-base equity lives in deployment-P&L-adjusted "
-                "units - wait for the next poll observation or inspect the "
-                "row before resetting"
-            ),
-        )
-    if args.equity is not None:
+    if kind != "deployment" and args.equity is not None:
         equity = float(args.equity)
         if not math.isfinite(equity) or equity <= 0:
             return None, None, f"--equity must be a positive finite number, got {args.equity!r}"
         return equity, "--equity", None
-    resolved = _snapshot_equity(record.account_id, now=now)
-    if isinstance(resolved, str):
-        return None, None, resolved
-    equity, source = resolved
-    return equity, source, None
+    last = record.last_equity
+    if last is None or not math.isfinite(float(last)) or float(last) <= 0:
+        return (
+            None,
+            None,
+            (
+                f"scope {record.scope!r} has no usable last observed equity; "
+                "its re-base equity lives in the breaker's own equity units - "
+                "wait for the next poll observation or pass --equity to state "
+                "it explicitly"
+            ),
+        )
+    observed_at = record.last_observed_at
+    if observed_at is None:
+        return (
+            None,
+            None,
+            (
+                f"scope {record.scope!r} has no recorded observation time; "
+                "wait for the next poll observation or pass --equity to "
+                "state the re-base equity explicitly"
+            ),
+        )
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age = (now - observed_at).total_seconds()
+    if kind != "deployment" and age > STALE_SNAPSHOT_SECONDS:
+        return (
+            None,
+            None,
+            (
+                f"last breaker observation for scope {record.scope!r} is "
+                f"{age:.0f}s old (limit {STALE_SNAPSHOT_SECONDS:.0f}s); "
+                "pass --equity to state the re-base equity explicitly"
+            ),
+        )
+    return float(last), "last_observed_equity", None
 
 
 def _still_latched(account_id: str) -> list[dict]:
@@ -364,6 +398,39 @@ def _cmd_reset_drawdown(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_resolve_ledger_flag(args: argparse.Namespace) -> int:
+    account = str(args.account or "").strip()
+    symbol = str(args.symbol or "").strip().upper()
+    if not account or not symbol:
+        print(
+            "error: --account and --symbol are required and must be non-empty",
+            file=sys.stderr,
+        )
+        return 1
+    target = f"{account}:{symbol}"
+    before = list_unresolved_ledger_reconciliation_flags(account)
+    audit = resolve_ledger_reconciliation_flag(
+        account_id=account,
+        symbol=symbol,
+        actor=args.actor,
+        note=args.note,
+    )
+    after = list_unresolved_ledger_reconciliation_flags(account)
+    print(
+        json.dumps(
+            {
+                "resolved_target": target,
+                "was_unresolved": target in before,
+                "unresolved_flags": after,
+                "audit_id": audit.get("id"),
+            },
+            indent=2,
+            default=str,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     route_console_logs_to_stderr()
     args = _build_parser().parse_args(argv)
@@ -371,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_status(args)
     if args.command == "reset-drawdown":
         return _cmd_reset_drawdown(args)
+    if args.command == "resolve-ledger-flag":
+        return _cmd_resolve_ledger_flag(args)
     return 2
 
 

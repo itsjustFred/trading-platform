@@ -61,6 +61,7 @@ from live_runner.exit_signals import (
 from live_runner.loss_breaker import (
     LossBreakerBreachError,
     account_deployment_trading_pnls,
+    account_loss_breaker_limits,
     account_loss_breaker_scope,
     deployment_loss_breaker_limits,
     observe_account_loss_breaker_equity,
@@ -1928,56 +1929,71 @@ async def prepare_order_with_risk(
     # sizing stays on ``get_balance`` semantics (#267 decision - realized
     # balance), and a caller-supplied ``account_balance`` must never reach the
     # persisted equity series. An adapter without ``get_equity`` (a test
-    # double) falls back to the balance tuple's equity slot. A failed equity
-    # read refuses the entry: unreadable equity is never "no loss".
-    get_equity = getattr(adapter, "get_equity", None)
-    if get_equity is not None:
-        try:
-            breaker_equity = float(await get_equity())
-        except Exception as exc:
-            raise LossBreakerBreachError(
-                f"Refusing a live entry: account equity for "
-                f"'{deployment.account_id}' could not be read ({exc!r}); the "
-                "loss breaker cannot measure a loss without it.",
-                scope=account_loss_breaker_scope(deployment.account_id),
-                account_id=deployment.account_id,
-                deployment_id=str(deployment.id),
-                state_unreadable=True,
-            ) from exc
-    else:
-        _, broker_equity = await adapter.get_balance()
-        breaker_equity = float(broker_equity)
+    # double) falls back to the balance tuple's equity slot. The limits are
+    # resolved FIRST: with both scopes disabled the breaker measures nothing,
+    # so no equity read (a cTrader unrealized-P&L request per entry) and no
+    # deployment-P&L lookup happens at all. A failed equity read refuses the
+    # entry: unreadable equity is never "no loss".
+    breaker_equity: float | None = None
     deployment_equity: float | None = None
+    breaker_config_invalid = False
+    deployment_breaker_enabled = False
     try:
+        # Both limits resolve eagerly: ``or`` would short-circuit and a
+        # malformed deployment setting would slip through as a raw ValueError
+        # instead of the gate's distinct config refusal.
+        account_breaker_enabled = account_loss_breaker_limits(
+            deployment.account_id
+        ).enabled
         deployment_breaker_enabled = deployment_loss_breaker_limits(
             deployment
         ).enabled
+        breaker_scopes_enabled = account_breaker_enabled or deployment_breaker_enabled
     except ValueError:
         # A malformed LOSS_BREAKER_* value is a configuration error, not a
         # breach: still call the gate so it raises the distinct "loss breaker
-        # configuration invalid" refusal instead of the generic handler. The
-        # P&L lookup below is irrelevant then - the gate refuses before it
-        # could matter.
-        deployment_breaker_enabled = True
-    if deployment_breaker_enabled:
-        # The deployment scope measures the deployment's own P&L: synthetic
-        # equity = account equity - every OTHER deployment's P&L. ``None``
-        # (unmeasurable) fails closed inside the gate.
-        pnls = await account_deployment_trading_pnls(
-            adapter, deployment.account_id
-        )
-        if pnls is not None:
-            total_pnl = sum(pnls.values())
-            deployment_equity = (
-                breaker_equity - total_pnl + pnls.get(str(deployment.id), 0.0)
+        # configuration invalid" refusal instead of the generic handler. No
+        # equity or P&L read happens - the gate refuses before either matters.
+        breaker_scopes_enabled = True
+        breaker_config_invalid = True
+    if breaker_scopes_enabled and not breaker_config_invalid:
+        get_equity = getattr(adapter, "get_equity", None)
+        if get_equity is not None:
+            try:
+                breaker_equity = float(await get_equity())
+            except Exception as exc:
+                raise LossBreakerBreachError(
+                    f"Refusing a live entry: account equity for "
+                    f"'{deployment.account_id}' could not be read ({exc!r}); the "
+                    "loss breaker cannot measure a loss without it.",
+                    scope=account_loss_breaker_scope(deployment.account_id),
+                    account_id=deployment.account_id,
+                    deployment_id=str(deployment.id),
+                    state_unreadable=True,
+                ) from exc
+        else:
+            _, broker_equity = await adapter.get_balance()
+            breaker_equity = float(broker_equity)
+        if deployment_breaker_enabled:
+            # The deployment scope measures the deployment's own P&L:
+            # synthetic equity = account equity - every OTHER deployment's
+            # P&L. ``None`` (unmeasurable) fails closed inside the gate.
+            pnls = await account_deployment_trading_pnls(
+                adapter, deployment.account_id
             )
-    await asyncio.to_thread(
-        refuse_entry_if_loss_breaker_tripped,
-        deployment,
-        equity=breaker_equity,
-        deployment_equity=deployment_equity,
-        symbol=signal.symbol,
-    )
+            if pnls is not None:
+                total_pnl = sum(pnls.values())
+                deployment_equity = (
+                    breaker_equity - total_pnl + pnls.get(str(deployment.id), 0.0)
+                )
+    if breaker_scopes_enabled:
+        await asyncio.to_thread(
+            refuse_entry_if_loss_breaker_tripped,
+            deployment,
+            equity=breaker_equity if breaker_equity is not None else 0.0,
+            deployment_equity=deployment_equity,
+            symbol=signal.symbol,
+        )
     if pip_value is None:
         resolved_pip, pip_metadata = await _resolve_live_pip_value(adapter, deployment, signal)
     else:
@@ -4086,30 +4102,57 @@ async def _poll_adapter_balance(
         # scope still observes, and the entry gate fails closed on what it
         # cannot measure. Off the event loop - it is several SQLite
         # round-trips per scope plus broker quote/pip calls. A failure is
-        # logged inside the breaker and never reaches the poll.
+        # logged and never reaches the poll's balance handling.
         deployments = current_deployments() if current_deployments is not None else ()
-        deployment_pnls = await account_deployment_trading_pnls(adapter, account_id)
         # The breaker observes equity-with-unrealized-P&L through the adapter's
         # separate equity path (``get_equity``), NOT the balance snapshot's
         # equity slot: on cTrader that slot is realized balance by design
         # (#267 - sizing stays on balance). An adapter without ``get_equity``
         # (a test double) falls back to the tuple's equity slot. A failed
-        # equity read is logged inside the breaker and skips the observation -
-        # the entry gate re-checks and fails closed.
+        # equity read is logged distinctly here and skips only the breaker
+        # observation - the entry gate re-checks and fails closed.
         get_equity = getattr(adapter, "get_equity", None)
-        breaker_equity = (
-            float(await get_equity())
-            if get_equity is not None
-            else float(equity)
-        )
-        await asyncio.to_thread(
-            observe_account_loss_breaker_equity,
-            account_id,
-            breaker_equity,
-            now=snapshot_time,
-            deployments=deployments,
-            deployment_pnls=deployment_pnls,
-        )
+        try:
+            breaker_equity = (
+                float(await get_equity())
+                if get_equity is not None
+                else float(equity)
+            )
+        except Exception as exc:
+            logger.warning(
+                "Loss breaker equity read failed; skipping breaker observation "
+                "this poll (the entry gate still fails closed)",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "adapter": type(adapter).__name__,
+                        "error": str(exc),
+                    }
+                },
+            )
+            breaker_equity = None
+        if breaker_equity is not None:
+            # The ACCOUNT scope is observed FIRST, before the deployment-P&L
+            # computation: on cTrader that marking can take seconds per open
+            # symbol inside the poll timeout, and observing it only afterwards
+            # would let a slow P&L starve the between-entries alert entirely.
+            # The second call below re-observes the same account equity
+            # (idempotent) and adds the deployment scopes.
+            await asyncio.to_thread(
+                observe_account_loss_breaker_equity,
+                account_id,
+                breaker_equity,
+                now=snapshot_time,
+            )
+            deployment_pnls = await account_deployment_trading_pnls(adapter, account_id)
+            await asyncio.to_thread(
+                observe_account_loss_breaker_equity,
+                account_id,
+                breaker_equity,
+                now=snapshot_time,
+                deployments=deployments,
+                deployment_pnls=deployment_pnls,
+            )
         logger.debug(
             "Saved live balance snapshot",
             extra={

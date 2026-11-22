@@ -771,6 +771,7 @@ def _persist_fill(
     import shared.database as database
     from shared.models import LiveExecution, LiveSignal
 
+    database.init_db()
     with database.get_session() as session:
         if session.get(database.LiveAccountModel, account_id) is None:
             session.add(
@@ -910,7 +911,8 @@ class _PollAdapter:
 def test_poll_adapter_balance_latches_account_and_deployment_scopes():
     """Drives the real ``_poll_adapter_balance``: a 6% equity drop latches
     BOTH the account scope and the deployment scope on the poll itself, and
-    the deployment row inherits the account baseline (it is created mid-stream)."""
+    the deployment row seeds its baseline from its OWN first observation
+    (created mid-stream, never inheriting the account baseline)."""
     dep = _deployment(account_id="acc-pollwire")
     adapter = _PollAdapter([100_000.0, 94_000.0])
     for equity_time in (DAY1, DAY1 + timedelta(minutes=1)):
@@ -1481,3 +1483,289 @@ def test_accounts_env_file_override_is_honoured(tmp_path):
         loss_breaker.set_accounts_env_file(None)
     limits = account_loss_breaker_limits("acc-x", env_values=None)
     assert limits.daily_loss_fraction == pytest.approx(0.05)
+
+
+# ─── Bundle-34 review fixes ───────────────────────────────────────────────────
+
+
+def test_pip_values_are_cached_per_account_not_shared():
+    """A pip value is in the ACCOUNT's currency: two accounts on the same
+    symbol and day must each resolve their own, and a second lookup on the
+    SAME account still hits the cache."""
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+
+    class _CountingAdapter(_PnlAdapter):
+        def __init__(self, pip: float):
+            super().__init__(101.0, pip=pip)
+            self.pip_calls = 0
+
+        async def get_pip_value(self, symbol):
+            self.pip_calls += 1
+            return await super().get_pip_value(symbol)
+
+    dep_a, dep_b = str(uuid4()), str(uuid4())
+    _persist_fill("acc-pip-a", dep_a, "AAPL", "buy", 10.0, 100.0)
+    _persist_fill("acc-pip-b", dep_b, "AAPL", "buy", 10.0, 100.0)
+    adapter_a, adapter_b = _CountingAdapter(1.0), _CountingAdapter(2.0)
+    pnls_a = asyncio.run(account_deployment_trading_pnls(adapter_a, "acc-pip-a"))
+    pnls_b = asyncio.run(account_deployment_trading_pnls(adapter_b, "acc-pip-b"))
+    assert pnls_a is not None and pnls_b is not None
+    # buy 10@100 marked at 101 -> pip * ( -1000 + 1010 ) = pip * 10.
+    assert pnls_a[dep_a] == pytest.approx(10.0)
+    assert pnls_b[dep_b] == pytest.approx(20.0)
+    assert adapter_a.pip_calls == 1 and adapter_b.pip_calls == 1
+    # Same account + symbol + day: cached, no second fetch.
+    again = asyncio.run(account_deployment_trading_pnls(adapter_a, "acc-pip-a"))
+    assert again is not None
+    assert adapter_a.pip_calls == 1
+
+
+def test_poll_observes_get_equity_not_balance_tuple():
+    """cTrader shape: ``get_balance`` reports realized balance in BOTH slots
+    while ``get_equity`` adds unrealized P&L. The breaker must record 94k,
+    not 100k - a ``get_equity = None`` mutant would observe 100k."""
+    account_id = "acc-eqpath-poll"
+    dep = _deployment(account_id=account_id)
+
+    class _CtraderLikePollAdapter(_PollAdapter):
+        async def get_balance(self):
+            return 100_000.0, 100_000.0
+
+        async def get_equity(self):
+            return 94_000.0
+
+    adapter = _CtraderLikePollAdapter([1.0])
+    asyncio.run(
+        daemon._poll_adapter_balance(
+            {account_id: adapter},
+            account_id,
+            adapter,
+            DAY1,
+            current_deployments=lambda: [dep],
+        )
+    )
+    state = get_live_loss_breaker_state(account_loss_breaker_scope(account_id))
+    assert state is not None
+    assert state.last_equity == pytest.approx(94_000.0)
+
+
+def test_base_adapter_get_equity_defaults_to_balance_equity_slot():
+    """The ``BaseLiveAdapter.get_equity`` default is ``get_balance()[1]`` -
+    adapters whose equity slot already carries true equity need no override."""
+    from live_runner.base_adapter import BaseLiveAdapter
+
+    class _MinimalAdapter(BaseLiveAdapter):
+        async def connect(self):
+            pass
+
+        async def submit_order(self, signal, *, qty=None):
+            return "order-1"
+
+        async def listen_executions(self):
+            pass
+
+        async def get_balance(self):
+            return 100.0, 90.0
+
+    assert asyncio.run(_MinimalAdapter().get_equity()) == pytest.approx(90.0)
+
+
+def test_ledger_flag_resolution_unblocks_and_newer_flag_reblocks():
+    """A ``ledger_reconciliation_required`` flag fails deployment P&L closed
+    only until an operator resolution; a flag NEWER than the latest
+    resolution blocks again."""
+    from live_runner.loss_breaker import account_deployment_trading_pnls
+    from shared.database import (
+        account_has_ledger_reconciliation_flags,
+        list_unresolved_ledger_reconciliation_flags,
+        record_live_control_audit,
+        resolve_ledger_reconciliation_flag,
+    )
+
+    dep_id = str(uuid4())
+    _persist_fill("acc-resolve", dep_id, "AAPL", "buy", 10.0, 100.0)
+    record_live_control_audit(
+        action="ledger_reconciliation_required",
+        target_type="account_symbol",
+        target_id="acc-resolve:AAPL",
+        actor="test",
+        detail={"cause": "unattributed close"},
+    )
+    assert account_has_ledger_reconciliation_flags("acc-resolve") is True
+    assert list_unresolved_ledger_reconciliation_flags("acc-resolve") == [
+        "acc-resolve:AAPL"
+    ]
+    assert (
+        asyncio.run(account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-resolve"))
+        is None
+    )
+
+    resolve_ledger_reconciliation_flag(
+        account_id="acc-resolve",
+        symbol="aapl",
+        actor="operator",
+        note="reconciled against broker statement",
+    )
+    assert account_has_ledger_reconciliation_flags("acc-resolve") is False
+    assert list_unresolved_ledger_reconciliation_flags("acc-resolve") == []
+    pnls = asyncio.run(account_deployment_trading_pnls(_PnlAdapter(100.0), "acc-resolve"))
+    assert pnls is not None and pnls[dep_id] == pytest.approx(0.0)
+
+    # A flag written AFTER the resolution is newer: it blocks again.
+    record_live_control_audit(
+        action="ledger_reconciliation_required",
+        target_type="account_symbol",
+        target_id="acc-resolve:AAPL",
+        actor="test",
+        detail={"cause": "second unattributed close"},
+    )
+    assert account_has_ledger_reconciliation_flags("acc-resolve") is True
+    assert list_unresolved_ledger_reconciliation_flags("acc-resolve") == [
+        "acc-resolve:AAPL"
+    ]
+
+
+def test_ledger_flag_resolution_is_per_symbol():
+    """Resolving ``acc-multi:MSFT`` must not clear an unresolved ``AAPL`` flag."""
+    from shared.database import (
+        list_unresolved_ledger_reconciliation_flags,
+        record_live_control_audit,
+        resolve_ledger_reconciliation_flag,
+    )
+
+    for symbol in ("AAPL", "MSFT"):
+        record_live_control_audit(
+            action="ledger_reconciliation_required",
+            target_type="account_symbol",
+            target_id=f"acc-multi:{symbol}",
+            actor="test",
+            detail={},
+        )
+    resolve_ledger_reconciliation_flag(
+        account_id="acc-multi", symbol="MSFT", actor="operator", note="done"
+    )
+    assert list_unresolved_ledger_reconciliation_flags("acc-multi") == [
+        "acc-multi:AAPL"
+    ]
+
+
+def test_ledger_flag_on_acc_10_does_not_flag_acc_1():
+    """LIKE-leak pin in the other direction: ``acc-10``'s flag must not fail
+    ``acc-1``'s scopes closed."""
+    from shared.database import (
+        account_has_ledger_reconciliation_flags,
+        record_live_control_audit,
+    )
+
+    record_live_control_audit(
+        action="ledger_reconciliation_required",
+        target_type="account_symbol",
+        target_id="acc-10:AAPL",
+        actor="test",
+        detail={},
+    )
+    assert account_has_ledger_reconciliation_flags("acc-10") is True
+    assert account_has_ledger_reconciliation_flags("acc-1") is False
+
+
+def test_poll_observes_account_scope_before_pnl_computation(monkeypatch):
+    """The account scope must be observed even when deployment-P&L marking
+    fails or is slow: cTrader quote lookups can eat the whole poll timeout,
+    and observing afterwards would starve the between-entries alert."""
+    account_id = "acc-pollorder"
+    dep = _deployment(account_id=account_id)
+    adapter = _PollAdapter([100_000.0])
+
+    async def _boom(adapter_arg, acct):
+        raise RuntimeError("pnl marking failed")
+
+    monkeypatch.setattr(daemon, "account_deployment_trading_pnls", _boom)
+    asyncio.run(
+        daemon._poll_adapter_balance(
+            {account_id: adapter},
+            account_id,
+            adapter,
+            DAY1,
+            current_deployments=lambda: [dep],
+        )
+    )
+    state = get_live_loss_breaker_state(account_loss_breaker_scope(account_id))
+    assert state is not None
+    assert state.last_equity == pytest.approx(100_000.0)
+    # The deployment scope was skipped (P&L unmeasurable) - not poisoned.
+    assert (
+        get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep.id)))
+        is None
+    )
+
+
+def test_prepare_order_skips_equity_read_when_breakers_disabled(monkeypatch):
+    """Both scopes disabled -> the breaker measures nothing, so dispatch must
+    not pay for a ``get_equity`` read (a cTrader unrealized-P&L request) or a
+    deployment-P&L lookup, and must not refuse on an unreadable equity."""
+    account_id = "acc-brkoff"
+    dep = _deployment(account_id=account_id)
+
+    class _NoEquityAdapter(_Adapter):
+        async def get_equity(self):
+            raise AssertionError("get_equity must not be called")
+
+    monkeypatch.setenv("LOSS_BREAKER_ENABLED", "false")
+    adapter = _NoEquityAdapter(equity=100_000.0)
+    prepared, qty = asyncio.run(
+        daemon.prepare_order_with_risk(adapter, dep, _entry_signal(dep))
+    )
+    assert qty > 0
+    assert list_live_loss_breaker_states(account_id) == []
+
+
+def test_gate_zero_equity_writes_no_state_row():
+    """A refused zero-equity entry must not leave a baseline row behind."""
+    dep = _deployment(account_id="acc-gatezero")
+    with pytest.raises(LossBreakerBreachError):
+        _gate(dep, equity=0.0, now=DAY1)
+    assert get_live_loss_breaker_state(account_loss_breaker_scope("acc-gatezero")) is None
+    assert (
+        get_live_loss_breaker_state(deployment_loss_breaker_scope(str(dep.id)))
+        is None
+    )
+
+
+def test_run_daemon_points_loss_breaker_env_at_accounts_env(monkeypatch, tmp_path):
+    """``run_daemon`` must hand its ``--accounts-env`` file to the loss
+    breaker so per-account LOSS_BREAKER_* values are honoured."""
+    captured = {}
+    monkeypatch.setattr(
+        daemon,
+        "set_accounts_env_file",
+        lambda path: captured.setdefault("path", path),
+    )
+
+    def _noop_sync(*args, **kwargs):
+        return None
+
+    async def _noop_async(*args, **kwargs):
+        return None
+
+    class _Scheduler:
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr(daemon, "_discover_and_register_discord_services", _noop_sync)
+    monkeypatch.setattr(daemon, "_recover_failed_services", _noop_sync)
+    monkeypatch.setattr(daemon, "ServiceScheduler", lambda: _Scheduler())
+    monkeypatch.setattr(daemon, "sync_deployments_loop", _noop_async)
+    monkeypatch.setattr(daemon, "sync_services_loop", _noop_async)
+    monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_async)
+    monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_async)
+    monkeypatch.setattr(
+        daemon,
+        "_start_balance_poller",
+        lambda *a, **k: asyncio.ensure_future(_noop_async()),
+    )
+    env_file = tmp_path / "custom.accounts.env"
+    asyncio.run(daemon.run_daemon(accounts_env=env_file))
+    assert captured["path"] == env_file

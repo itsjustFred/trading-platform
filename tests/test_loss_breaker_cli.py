@@ -52,13 +52,22 @@ def _run(argv: list[str], data_dir: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _seed_state(data_dir: Path) -> None:
-    """Create breaker state in the sandbox: account scope tripped on drawdown."""
+def _seed_state(data_dir: Path, *, stale: bool = False) -> None:
+    """Create breaker state in the sandbox: account scope tripped on drawdown.
+
+    ``stale=True`` back-dates the observation past ``STALE_SNAPSHOT_SECONDS``
+    so the reset's freshness check refuses the scope's own last equity.
+    """
+    when = (
+        "datetime(2020, 1, 1, 12, 0, tzinfo=timezone.utc)"
+        if stale
+        else "datetime.now(timezone.utc)"
+    )
     code = (
         "from datetime import datetime, timezone;"
         "from shared.database import observe_live_loss_breaker,"
         " latch_live_loss_breaker_breach;"
-        "now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc);"
+        f"now = {when};"
         "scope = 'account:acc-cli';"
         "observe_live_loss_breaker(scope, 'acc-cli', 100000.0, now);"
         "observe_live_loss_breaker(scope, 'acc-cli', 80000.0, now);"
@@ -82,6 +91,7 @@ def _seed_state(data_dir: Path) -> None:
         ["--help"],
         ["status", "--help"],
         ["reset-drawdown", "--help"],
+        ["resolve-ledger-flag", "--help"],
     ],
 )
 def test_help_answers_without_touching_the_database(
@@ -141,7 +151,13 @@ def test_reset_drawdown_clears_the_latch_and_rebases_the_peak(tmp_path: Path) ->
     assert state["peak_equity"] == pytest.approx(82_000.0)
 
 
-def test_reset_drawdown_uses_the_latest_balance_snapshot(tmp_path: Path) -> None:
+def test_reset_drawdown_rebases_on_breaker_equity_not_balance_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The re-base equity is the scope's OWN last observed breaker equity -
+    on cTrader that includes unrealized P&L, which the balance snapshot's
+    equity slot does not carry. A snapshot saying 81000 must NOT win over
+    the breaker's observed 80000."""
     data_dir = tmp_path / "data"
     _seed_state(data_dir)
     seed_balance = subprocess.run(
@@ -168,34 +184,15 @@ def test_reset_drawdown_uses_the_latest_balance_snapshot(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     scope = payload["scopes"][0]
-    assert scope["rebase_equity"] == pytest.approx(81_000.0)
-    # The equity source names the snapshot's timestamp for the operator.
-    assert scope["equity_source"].startswith("balance_snapshot@")
+    assert scope["rebase_equity"] == pytest.approx(80_000.0)
+    assert scope["equity_source"] == "last_observed_equity"
 
 
-def test_reset_drawdown_refuses_a_stale_balance_snapshot(tmp_path: Path) -> None:
-    """An hour-old snapshot must not re-base a peak: pass --equity instead."""
+def test_reset_drawdown_refuses_a_stale_breaker_observation(tmp_path: Path) -> None:
+    """An observation older than STALE_SNAPSHOT_SECONDS must not re-base a
+    peak: pass --equity instead."""
     data_dir = tmp_path / "data"
-    _seed_state(data_dir)
-    seed_balance = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from datetime import datetime, timedelta, timezone;"
-            "from shared.database import save_live_balance;"
-            "from shared.models import LiveBalanceRecord;"
-            "save_live_balance(LiveBalanceRecord("
-            "    account_id='acc-cli',"
-            "    timestamp=datetime.now(timezone.utc) - timedelta(hours=1),"
-            "    balance=81000.0, equity=81000.0))",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=str(REPO_ROOT),
-        env=_child_env(data_dir),
-        timeout=300,
-    )
-    assert seed_balance.returncode == 0, seed_balance.stderr
+    _seed_state(data_dir, stale=True)
 
     result = _run(["reset-drawdown", "--account", ACCOUNT], data_dir)
 
@@ -221,16 +218,21 @@ def test_reset_drawdown_rejects_non_finite_equity(tmp_path: Path) -> None:
         assert "positive finite" in result.stderr
 
 
-def _seed_account_with_deployment(data_dir: Path) -> None:
+def _seed_account_with_deployment(data_dir: Path, *, stale: bool = False) -> None:
     """Account + deployment scopes, both drawdown-latched."""
-    code = """
+    when = (
+        "datetime(2020, 1, 1, 12, 0, tzinfo=timezone.utc)"
+        if stale
+        else "datetime.now(timezone.utc)"
+    )
+    code = f"""
 from datetime import datetime, timezone
 from shared.database import observe_live_loss_breaker, latch_live_loss_breaker_breach
-now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+now = {when}
 for scope in ('account:acc-cli', 'deployment:dep-1'):
     observe_live_loss_breaker(scope, 'acc-cli', 100000.0, now)
     observe_live_loss_breaker(scope, 'acc-cli', 80000.0, now)
-    latch_live_loss_breaker_breach(scope, 'drawdown', {'kind': 'drawdown'}, now)
+    latch_live_loss_breaker_breach(scope, 'drawdown', {{'kind': 'drawdown'}}, now)
 """
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -314,9 +316,11 @@ def test_reset_drawdown_refuses_a_scope_with_no_state(tmp_path: Path) -> None:
     assert "no loss breaker state" in result.stderr
 
 
-def test_reset_drawdown_requires_equity_when_no_snapshot_exists(tmp_path: Path) -> None:
+def test_reset_drawdown_requires_equity_when_observation_is_stale(
+    tmp_path: Path,
+) -> None:
     data_dir = tmp_path / "data"
-    _seed_state(data_dir)
+    _seed_state(data_dir, stale=True)
 
     result = _run(["reset-drawdown", "--scope", f"account:{ACCOUNT}"], data_dir)
 
@@ -324,21 +328,23 @@ def test_reset_drawdown_requires_equity_when_no_snapshot_exists(tmp_path: Path) 
     assert "--equity" in result.stderr
 
 
-def test_reset_drawdown_refuses_a_non_positive_balance_snapshot(tmp_path: Path) -> None:
-    """A zero/negative snapshot equity is not a re-base figure: refuse it."""
+def test_reset_drawdown_refuses_a_non_positive_last_observed_equity(
+    tmp_path: Path,
+) -> None:
+    """A zero/negative stored equity is not a re-base figure: refuse it."""
     data_dir = tmp_path / "data"
     _seed_state(data_dir)
-    seed_balance = subprocess.run(
+    zero_it = subprocess.run(
         [
             sys.executable,
             "-c",
-            "from datetime import datetime, timezone;"
-            "from shared.database import save_live_balance;"
-            "from shared.models import LiveBalanceRecord;"
-            "save_live_balance(LiveBalanceRecord("
-            "    account_id='acc-cli',"
-            "    timestamp=datetime.now(timezone.utc),"
-            "    balance=0.0, equity=0.0))",
+            "from shared.database import get_session, LiveLossBreakerStateModel\n"
+            "from sqlalchemy import update\n"
+            "with get_session() as s:\n"
+            "    s.exec(update(LiveLossBreakerStateModel)\n"
+            "        .where(LiveLossBreakerStateModel.scope == 'account:acc-cli')\n"
+            "        .values(last_equity=0.0))\n"
+            "    s.commit()\n",
         ],
         capture_output=True,
         text=True,
@@ -346,12 +352,12 @@ def test_reset_drawdown_refuses_a_non_positive_balance_snapshot(tmp_path: Path) 
         env=_child_env(data_dir),
         timeout=300,
     )
-    assert seed_balance.returncode == 0, seed_balance.stderr
+    assert zero_it.returncode == 0, zero_it.stderr
 
     result = _run(["reset-drawdown", "--account", ACCOUNT], data_dir)
 
     assert result.returncode == 1
-    assert "unusable" in result.stderr
+    assert "no usable last observed equity" in result.stderr
 
     # --equity still works: the operator states the figure explicitly.
     explicit = _run(
@@ -401,3 +407,108 @@ def test_reset_drawdown_exits_nonzero_when_a_cascade_scope_is_skipped(
     skipped = {s["scope"] for s in payload["skipped"]}
     assert "deployment:dep-1" in skipped
     assert "deployment:dep-1" in result.stderr
+
+
+def test_status_reports_fractions_against_breaker_equity(tmp_path: Path) -> None:
+    """``status`` must measure "now" against the breaker's own equity series
+    (``last_equity``), not the balance snapshot - on cTrader those differ by
+    unrealized P&L."""
+    data_dir = tmp_path / "data"
+    _seed_state(data_dir)  # day_start 100000, last_equity 80000 -> -20%
+    seed_balance = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from datetime import datetime, timezone;"
+            "from shared.database import save_live_balance;"
+            "from shared.models import LiveBalanceRecord;"
+            "save_live_balance(LiveBalanceRecord("
+            "    account_id='acc-cli', timestamp=datetime.now(timezone.utc),"
+            "    balance=95000.0, equity=95000.0))",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert seed_balance.returncode == 0, seed_balance.stderr
+
+    result = _run(["status", "--account", ACCOUNT], data_dir)
+
+    assert result.returncode == 0, result.stderr
+    scope = json.loads(result.stdout)["scopes"][0]
+    # Against breaker equity 80000: daily loss = (100000-80000)/100000 = 0.2.
+    # Against the snapshot's 95000 it would wrongly read 0.05.
+    assert scope["daily_loss_fraction_now"] == pytest.approx(0.2)
+    assert scope["drawdown_fraction_now"] == pytest.approx(0.2)
+
+
+def _seed_ledger_flag(data_dir: Path) -> None:
+    code = (
+        "from shared.database import record_live_control_audit;"
+        "record_live_control_audit("
+        "    action='ledger_reconciliation_required',"
+        "    target_type='account_symbol',"
+        "    target_id='acc-cli:AAPL',"
+        "    actor='test', detail={'cause': 'unattributed close'})"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_resolve_ledger_flag_clears_the_unresolved_flag(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _seed_ledger_flag(data_dir)
+
+    result = _run(
+        [
+            "resolve-ledger-flag",
+            "--account", ACCOUNT,
+            "--symbol", "aapl",
+            "--note", "reconciled against broker statement",
+        ],
+        data_dir,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["resolved_target"] == "acc-cli:AAPL"
+    assert payload["was_unresolved"] is True
+    assert payload["unresolved_flags"] == []
+
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from shared.database import account_has_ledger_reconciliation_flags;"
+            "print(account_has_ledger_reconciliation_flags('acc-cli'))",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=_child_env(data_dir),
+        timeout=300,
+    )
+    assert check.returncode == 0, check.stderr
+    assert check.stdout.strip() == "False"
+
+
+def test_resolve_ledger_flag_reports_when_nothing_was_flagged(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+
+    result = _run(
+        ["resolve-ledger-flag", "--account", ACCOUNT, "--symbol", "AAPL"],
+        data_dir,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["was_unresolved"] is False

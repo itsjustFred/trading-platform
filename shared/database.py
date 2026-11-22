@@ -4856,9 +4856,24 @@ def get_latest_live_balances(account_ids: list[str]) -> dict[str, LiveBalanceRec
 # One row per scope in ``live_loss_breaker_state``. The observe/latch/reset
 # helpers are deliberately dumb storage: threshold evaluation lives in
 # ``live_runner.loss_breaker`` so this layer never decides whether trading is
-# allowed. ``observe`` is the only writer of the equity series and it is atomic
-# per scope (read-modify-write inside one transaction), so the balance poll and
-# an entry check observing the same scope cannot lose each other's update.
+# allowed. ``observe`` is the only writer of the equity series; its
+# read-modify-write runs under a per-scope ``threading.Lock`` so the balance
+# poll and an entry check observing the same scope from different worker
+# threads cannot lose each other's update (a lost ``peak_equity`` update would
+# understate drawdown; two first observations at once would raise
+# ``IntegrityError`` on the primary key).
+
+_OBSERVE_LOCKS_GUARD = threading.Lock()
+_OBSERVE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _loss_breaker_observe_lock(scope: str) -> threading.Lock:
+    with _OBSERVE_LOCKS_GUARD:
+        lock = _OBSERVE_LOCKS.get(scope)
+        if lock is None:
+            lock = threading.Lock()
+            _OBSERVE_LOCKS[scope] = lock
+        return lock
 
 
 def _loss_breaker_utc_day(observed_at: datetime) -> str:
@@ -4930,44 +4945,45 @@ def observe_live_loss_breaker(
     utc_day = _loss_breaker_utc_day(observed_at)
 
     init_db()
-    with get_session() as session:
-        row = session.get(LiveLossBreakerStateModel, normalized_scope)
-        if row is None:
-            row = LiveLossBreakerStateModel(
-                scope=normalized_scope,
-                account_id=normalized_account,
-                utc_day=utc_day,
-                day_start_equity=equity_value,
-                peak_equity=equity_value,
-                daily_breached=False,
-                drawdown_breached=False,
-                last_equity=equity_value,
-                last_observed_at=observed_naive,
-                breach_detail_json=None,
-                updated_at=observed_naive,
-            )
-            session.add(row)
-        else:
-            if row.utc_day != utc_day:
-                # UTC day boundary: the daily breaker resets automatically.
-                # The new day's baseline is the equity last seen before the
-                # boundary, not this observation - a gap across midnight is a
-                # loss of the new day, not its starting capital.
-                row.utc_day = utc_day
-                row.day_start_equity = (
-                    float(row.last_equity)
-                    if row.last_equity is not None
-                    else equity_value
+    with _loss_breaker_observe_lock(normalized_scope):
+        with get_session() as session:
+            row = session.get(LiveLossBreakerStateModel, normalized_scope)
+            if row is None:
+                row = LiveLossBreakerStateModel(
+                    scope=normalized_scope,
+                    account_id=normalized_account,
+                    utc_day=utc_day,
+                    day_start_equity=equity_value,
+                    peak_equity=equity_value,
+                    daily_breached=False,
+                    drawdown_breached=False,
+                    last_equity=equity_value,
+                    last_observed_at=observed_naive,
+                    breach_detail_json=None,
+                    updated_at=observed_naive,
                 )
-                row.daily_breached = False
-            row.peak_equity = max(float(row.peak_equity), equity_value)
-            row.last_equity = equity_value
-            row.last_observed_at = observed_naive
-            row.updated_at = observed_naive
-        session.add(row)
-        session.commit()
-        session.refresh(row)
-        return row.to_record()
+                session.add(row)
+            else:
+                if row.utc_day != utc_day:
+                    # UTC day boundary: the daily breaker resets automatically.
+                    # The new day's baseline is the equity last seen before the
+                    # boundary, not this observation - a gap across midnight is a
+                    # loss of the new day, not its starting capital.
+                    row.utc_day = utc_day
+                    row.day_start_equity = (
+                        float(row.last_equity)
+                        if row.last_equity is not None
+                        else equity_value
+                    )
+                    row.daily_breached = False
+                row.peak_equity = max(float(row.peak_equity), equity_value)
+                row.last_equity = equity_value
+                row.last_observed_at = observed_naive
+                row.updated_at = observed_naive
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.to_record()
 
 
 def latch_live_loss_breaker_breach(
@@ -5076,8 +5092,12 @@ def get_account_deployment_trading_flows(
     * ``net_qty`` - signed filled quantity (buy ``+``, sell ``-``);
     * ``cash`` - ``-sum(sign * qty * actual_price)`` in qty x price units:
       net cash paid (negative) or received (positive);
-    * ``commission`` - summed per-fill commission in account currency
-      (``None`` treated as 0);
+    * ``commission`` - summed per-fill commission in account currency.
+      KNOWN APPROXIMATION: a NULL commission is summed as 0. Alpaca crypto
+      fees stay NULL until the CFEE backfill lands (about two days), so a
+      crypto deployment's P&L is overstated by those fees until then.
+      Failing closed instead would stop crypto deployments for days after
+      each fill, so the runbook documents this as accepted;
     * ``unpriced_fills`` - fills whose ``actual_price`` cannot be trusted
       (see ``_TRUSTED_FILL_PRICE_OBSERVED``). Any non-zero count means the
       deployment's P&L cannot be computed exactly and the caller must fail
@@ -5151,44 +5171,124 @@ def get_account_deployment_trading_flows(
 #: ``live_control_audit.action`` written when a broker-side close could not be
 #: attributed to one deployment's ledger (#144; the writer lands with #277).
 #: The loss breaker treats any such row on the account as "the fill ledger may
-#: be incomplete" and fails deployment scopes closed until an operator
-#: reconciles it - a stale ledger P&L would otherwise move every OTHER
-#: deployment's synthetic equity.
+#: be incomplete" and fails deployment scopes closed - a stale ledger P&L
+#: would otherwise move every OTHER deployment's synthetic equity.
 LEDGER_RECONCILIATION_AUDIT_ACTION = "ledger_reconciliation_required"
 
+#: ``live_control_audit.action`` written by the operator resolution path
+#: (``scripts.live_loss_breaker resolve-ledger-flag``): an operator has
+#: reconciled the flagged ``account:symbol`` by hand. A flag counts as
+#: UNRESOLVED only while it is newer than the latest resolution for the same
+#: ``account:symbol`` - audit rows are append-only, so "resolved" can never
+#: delete the flag, only supersede it.
+LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION = "ledger_reconciliation_resolved"
 
-def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
-    """Whether ``account_id`` has an unresolved ledger-reconciliation flag.
 
-    ``flag_live_ledger_reconciliation`` (added by #277) writes one audit row
-    per ``account:symbol`` whose broker position the persisted fill ledger
-    cannot explain. Nothing clears them automatically - periodic broker
-    reconciliation (#330) and the operator act on them - so ANY row means the
-    ledger may be missing fills and deployment P&L derived from it is not
-    trustworthy. ``target_id`` is ``<account_id>:<SYMBOL>``; the trailing colon
-    in the LIKE pattern keeps ``acc-1`` from matching ``acc-10:SYM``.
+def _ledger_flag_account_like(account_id: str) -> str:
+    """The LIKE pattern matching ``<account_id>:*`` audit target ids.
+
+    The trailing colon keeps ``acc-1`` from matching ``acc-10:SYM``.
     """
-    normalized_account = str(account_id or "").strip()
-    if not normalized_account:
-        return False
     escaped_account = (
-        normalized_account.replace("\\", "\\\\")
+        str(account_id).replace("\\", "\\\\")
         .replace("%", "\\%")
         .replace("_", "\\_")
     )
+    return f"{escaped_account}:%"
+
+
+def _latest_audit_timestamps_by_target(
+    session: Session, action: str, like_pattern: str
+) -> dict[str, Any]:
+    """``{target_id: max(created_at)}`` for one audit action on an account."""
+    rows = session.exec(
+        select(
+            LiveControlAuditModel.target_id,
+            func.max(LiveControlAuditModel.created_at),
+        )
+        .where(LiveControlAuditModel.action == action)
+        .where(LiveControlAuditModel.target_id.like(like_pattern, escape="\\"))
+        .group_by(LiveControlAuditModel.target_id)
+    ).all()
+    return {str(target_id): created_at for target_id, created_at in rows}
+
+
+def list_unresolved_ledger_reconciliation_flags(account_id: str) -> list[str]:
+    """The ``<account_id>:<SYMBOL>`` targets with an UNRESOLVED flag.
+
+    ``flag_live_ledger_reconciliation`` (#277) writes one audit row per
+    ``account:symbol`` whose broker position the persisted fill ledger cannot
+    explain. A flag is unresolved while it is newer than the latest
+    ``ledger_reconciliation_resolved`` row for the SAME target: the operator
+    resolution command writes those, and a NEW flag after a resolution flags
+    the target again. ``target_id`` is ``<account_id>:<SYMBOL>``; the LIKE
+    pattern's trailing colon keeps ``acc-1`` from matching ``acc-10:SYM``.
+    """
+    normalized_account = str(account_id or "").strip()
+    if not normalized_account:
+        return []
+    like_pattern = _ledger_flag_account_like(normalized_account)
     init_db()
     with get_session() as session:
-        row = session.exec(
-            select(LiveControlAuditModel.id)
-            .where(LiveControlAuditModel.action == LEDGER_RECONCILIATION_AUDIT_ACTION)
-            .where(
-                LiveControlAuditModel.target_id.like(
-                    f"{escaped_account}:%", escape="\\"
-                )
-            )
-            .limit(1)
-        ).first()
-    return row is not None
+        flagged = _latest_audit_timestamps_by_target(
+            session, LEDGER_RECONCILIATION_AUDIT_ACTION, like_pattern
+        )
+        if not flagged:
+            return []
+        resolved = _latest_audit_timestamps_by_target(
+            session, LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION, like_pattern
+        )
+    return sorted(
+        target_id
+        for target_id, flagged_at in flagged.items()
+        if target_id not in resolved
+        or flagged_at is None
+        or resolved[target_id] is None
+        or flagged_at > resolved[target_id]
+    )
+
+
+def account_has_ledger_reconciliation_flags(account_id: str) -> bool:
+    """Whether ``account_id`` has any UNRESOLVED ledger-reconciliation flag.
+
+    See :func:`list_unresolved_ledger_reconciliation_flags`: ANY unresolved
+    row means the ledger may be missing fills and deployment P&L derived from
+    it is not trustworthy.
+    """
+    return bool(list_unresolved_ledger_reconciliation_flags(account_id))
+
+
+def resolve_ledger_reconciliation_flag(
+    *,
+    account_id: str,
+    symbol: str,
+    actor: str = "operator",
+    note: str = "",
+) -> dict[str, Any]:
+    """Record the operator resolution of one ``account:symbol`` flag.
+
+    Writes a ``ledger_reconciliation_resolved`` audit row against the same
+    ``account:symbol`` target the flag used, so the flag stops counting as
+    unresolved (it is newer-than-resolution that keeps it live - see
+    :func:`list_unresolved_ledger_reconciliation_flags`). The flag row itself
+    is never touched: the audit trail stays append-only. Never raises - the
+    audit writer logs and returns its payload either way.
+    """
+    normalized_account = str(account_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_account or not normalized_symbol:
+        raise ValueError("resolve_ledger_reconciliation_flag requires account and symbol")
+    return record_live_control_audit(
+        action=LEDGER_RECONCILIATION_RESOLVED_AUDIT_ACTION,
+        target_type="account_symbol",
+        target_id=f"{normalized_account}:{normalized_symbol}",
+        actor=actor,
+        detail={
+            "account_id": normalized_account,
+            "symbol": normalized_symbol,
+            "note": str(note or ""),
+        },
+    )
 
 
 def list_untrusted_fill_references(
