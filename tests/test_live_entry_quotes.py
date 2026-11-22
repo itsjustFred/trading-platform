@@ -38,11 +38,13 @@ def test_base_adapter_get_quote_is_unsupported_by_default():
 
 
 def test_live_quote_is_immutable():
+    from dataclasses import FrozenInstanceError
+
     from live_runner.base_adapter import LiveQuote
 
     quote = LiveQuote(bid=1.0, ask=2.0)
     assert quote.timestamp is None
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         quote.bid = 5.0  # type: ignore[misc]
 
 

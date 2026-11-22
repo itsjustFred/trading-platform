@@ -633,6 +633,132 @@ uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date 
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
+## Loss Circuit Breaker (#301)
+
+Every live account and every deployment carries a persisted loss breaker
+(`live_loss_breaker_state`, one row per `account:<id>` and `deployment:<id>`
+scope). The account scope measures the broker account's equity — for cTrader
+that is balance **plus unrealized P&L** of open positions, so an open position
+under water counts before it is closed. The deployment scope cannot read a
+"deployment equity" from the broker (positions on a netted account belong to
+the account), so it observes a synthetic equity: account equity minus every
+OTHER deployment's trading P&L, reconstructed from the persisted fill ledger
+and marked to market. The scope therefore moves only with its own
+deployment's realized+unrealized P&L, on the account-equity scale:
+
+- **Daily loss** — equity down the configured fraction (default 5 %) of the
+  start-of-day equity. The baseline is the last equity observed before the UTC
+  day boundary, so an overnight gap counts as the new day's loss. The breaker
+  re-bases and clears automatically at the UTC day boundary.
+- **Overall drawdown** — equity down the configured fraction (default 20 %)
+  from the peak equity ever observed. The latch only clears on the explicit
+  operator reset, which also re-bases the peak to the current equity.
+
+On breach the breaker blocks **new entries only** — exits are never blocked
+(PAUSED semantics), and resting entry orders already at the broker are NOT
+cancelled; they are the same class of exposure a manual PAUSE leaves. A
+breach latches and alerts once per episode through the `data.alert` log path —
+until #331 lands that is an ERROR log line (picked up by Sentry), not a
+webhook. An unreadable breaker state, unreadable equity, or a deployment P&L
+that cannot be measured (untrusted fill price, missing quote/pip value) fails
+closed and refuses entries.
+
+Deposits and withdrawals are NOT separated from P&L: a 5 % withdrawal trips
+the daily breaker and a 20 % withdrawal latches drawdown. After a planned
+withdrawal, run `reset-drawdown` once the new equity is being observed.
+
+Thresholds, most specific first: deployment `settings` keys
+(`loss_breaker_enabled`, `loss_breaker_daily_loss_fraction`,
+`loss_breaker_max_drawdown_fraction`), then per-account env
+(`LOSS_BREAKER_<ACCOUNT>_ENABLED`, `LOSS_BREAKER_<ACCOUNT>_DAILY_LOSS_FRACTION`,
+`LOSS_BREAKER_<ACCOUNT>_MAX_DRAWDOWN_FRACTION`), then the global env
+(`LOSS_BREAKER_ENABLED`, `LOSS_BREAKER_DAILY_LOSS_FRACTION`,
+`LOSS_BREAKER_MAX_DRAWDOWN_FRACTION`), then the defaults above. Env resolves
+file-first through `.accounts.env`. Malformed values are refused at deployment
+creation and at dispatch.
+
+```bash
+# Read every scope's state, latches and current ratios (read-only):
+uv run python -m scripts.live_loss_breaker status
+uv run python -m scripts.live_loss_breaker status --account alpaca-paper
+
+# The only way to clear a drawdown latch: re-bases the peak to the current
+# equity. Resetting an account scope ALSO resets that account's deployment
+# scopes (each to its own last observed equity) and prints any scopes still
+# latched - the daily latches intentionally survive until the UTC rollover:
+uv run python -m scripts.live_loss_breaker reset-drawdown --account alpaca-paper
+uv run python -m scripts.live_loss_breaker reset-drawdown --deployment <id>
+```
+
+Without `--equity` a scope re-bases to its OWN last observed breaker equity -
+the same series the breaker measures (on cTrader that includes unrealized
+P&L, which the balance snapshot's equity slot does not carry). An account
+scope refuses an observation older than 10 minutes; pass `--equity` to state
+the figure explicitly. A deployment scope always re-bases to its own last
+observed (P&L-adjusted) equity; `--equity` does not apply to it.
+
+There is deliberately no daily reset command: the daily breaker resets itself
+at the UTC boundary.
+
+### When deployment P&L is unmeasurable (`loss_breaker_pnl_unmeasurable`)
+
+Deployment-scoped entries fail closed whenever the fill-ledger P&L cannot be
+measured exactly — that is deliberate: an unmeasurable scope is never "no
+loss". The account scope keeps observing and the account breaker still
+works; only `deployment:<id>` entries are refused. Each episode logs ONE
+ERROR with `data.alert = "loss_breaker_pnl_unmeasurable"` and a `reason`:
+
+- `unpriced_fills` — a fill on the account has no trusted price
+  (`actual_price_observed` is `sent_bad`/`absent`/`derived_unavailable`, or a
+  non-positive `actual_price`). The alert's `untrusted_fills` list names the
+  execution ids, deployments, symbols and quantities involved. Repair: fix or
+  re-derive the fill's price through the normal reconciliation path (the same
+  one that writes `actual_price_observed`), or correct the ledger row by hand
+  only with an audit entry. Until then the scope stays refused.
+- `ledger_reconciliation` — an unresolved `ledger_reconciliation_required`
+  audit row exists for the account (#277/#330 merge-order dependency: the
+  ledger may be missing broker-side closes). The alert's
+  `unresolved_flags` lists the `account:SYMBOL` targets. Repair: reconcile
+  the flagged symbol against the broker by hand, then record the resolution -
+  the audit trail is append-only, so resolving writes a
+  `ledger_reconciliation_resolved` row rather than deleting the flag:
+
+  ```bash
+  uv run python -m scripts.live_loss_breaker resolve-ledger-flag \
+      --account alpaca-paper --symbol AAPL --note "reconciled vs statement"
+  ```
+
+  A flag counts as unresolved only while it is newer than the latest
+  resolution for the same `account:SYMBOL`; a NEW flag after a resolution
+  blocks again. Until every flag on the account is resolved, deployment
+  scopes stay refused (the account scope keeps working).
+- `missing_pip_value` / `unusable_quote` — the broker could not supply a pip
+  value or a two-sided quote for a symbol with an open ledger position.
+  Usually transient (market closed, symbol halted); if it persists, check the
+  symbol's market-data classification and the adapter's quote/pip path.
+- `flows_unreadable` — the ledger query itself raised; check the database.
+
+Pip values are cached per account+symbol per UTC day (a pip value is in the
+account's currency, so accounts never share one): the ledger can name symbols
+the account traded months ago, and re-fetching a pip value for every one of
+them each poll would fail on delisted/closed symbols. The day bucket means an
+unresolvable symbol fails again the NEXT day (with an alert) - the cache only
+skips re-fetching within the same UTC day. Quotes for symbols with an
+OPEN ledger position are still fetched fresh every evaluation — a closed
+market there fails closed by design.
+
+Ledger limitations the deployment scope inherits: swap/financing charges are
+NOT in the fill ledger (they never appear as fills), so a deployment holding
+overnight FX or swap-accruing positions has a P&L the breaker cannot see;
+treat deployment scopes on such accounts as approximate. A NULL commission is
+summed as 0 — a KNOWN APPROXIMATION: Alpaca crypto fees stay NULL until the
+CFEE backfill lands (about two days), so a crypto deployment's P&L is
+overstated by those fees until then. Failing closed instead would stop crypto
+deployments for days after each fill, so this is accepted and documented
+here. Pip values convert
+through the account currency at the day's cached rate — intraday FX moves are
+not tracked.
+
 ### ACTIVE deployments nothing can trade (#242)
 
 The daemon's only signal path is Discord. A deployment whose `signal_source` is `internal` (the default)

@@ -153,7 +153,8 @@ def test_quote_without_a_timestamp_is_rejected():
 @pytest.mark.parametrize(
     "timestamp",
     [
-        datetime(2026, 11, 10, 1, 59, 59),  # naive: no zone, cannot be compared safely
+        # naive: no zone, cannot be compared safely (the case under test)
+        datetime(2026, 11, 10, 1, 59, 59),  # noqa: DTZ001 - naive is the case
         "2026-11-10T01:59:59+00:00",  # not a datetime
         1_762_740_000_000,  # raw epoch number
     ],
