@@ -170,9 +170,14 @@ def replay_shared_equity(
 
     Per-symbol engines size every trade from the FULL starting capital, so a
     3-symbol run risks N x risk_pct with no shared limits. Position size is
-    linear in equity in every sizing branch (risk target, position cap and
-    leverage cap are all equity fractions), therefore each trade carries an
-    exact per-unit coefficient ``quantity / equity_at_entry``. This replay
+    linear in equity in the risk-target and position-cap branches, so each
+    trade carries a per-unit coefficient ``quantity / equity_at_entry``.
+    Exception (#347): the native free-margin leverage clamp judges margin
+    against the engine's own mark-to-market equity and used margin, not the
+    shared-equity basis alone, so a leverage-clamped trade's re-scaled
+    quantity is an approximation of what a shared-account free-margin check
+    would give — see the per-symbol limitation in
+    ``docs/sizing-semantics.md``. This replay
     walks all trades chronologically by entry time, re-scales quantities onto
     the running shared equity, re-prices PnL/fees from the scaled quantities
     and sums open exposure across symbols into ``trade.meta["portfolio"]``.

@@ -16,12 +16,13 @@ Covers Cleanup 16-D1 findings on ``runner/engine.py``:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from runner.engine import TradeEngine
+from runner.engine import Position, TradeEngine
 from runner.engines.base import BacktestConfig
 from tests.helpers import with_zero_fees
 
@@ -144,7 +145,13 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits)
 
-        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        # max_leverage=100 keeps the #347 free-margin clamp non-binding so the
+        # assertion isolates the sizing BASIS (realized vs mark-to-market),
+        # which is what this scenario pins; the clamp itself is covered by
+        # TestFreeMarginLeverageCap.
+        engine = TradeEngine(
+            _config(Path("/tmp"), max_leverage=100.0), symbol="PROBE"
+        )
         engine.run(frame, strategy)
         assert len(engine.closed_trades) >= 2
         return engine.closed_trades[1].quantity
@@ -221,8 +228,14 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits)
 
+        # max_leverage=100 keeps the #347 free-margin clamp non-binding so the
+        # assertions isolate the sizing BASIS (realized vs mark-to-market);
+        # the clamp itself is covered by TestFreeMarginLeverageCap.
         engine = TradeEngine(
-            _config(tmp_path, parameters=parameters or {}), symbol="PROBE"
+            _config(
+                tmp_path, parameters=parameters or {}, max_leverage=100.0
+            ),
+            symbol="PROBE",
         )
         engine.run(frame, strategy)
         assert len(engine.closed_trades) >= 2, "both entries must have filled"
@@ -482,7 +495,10 @@ class TestSizingEquityExcludesUnrealizedPnl:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_distance": stop_distance})
 
-        config = _config(tmp_path, risk_per_trade_pct=0.02)
+        # max_leverage=100 keeps the #347 free-margin clamp non-binding so the
+        # assertion isolates the realized-cash exposure DENOMINATOR; the
+        # clamp itself is covered by TestFreeMarginLeverageCap.
+        config = _config(tmp_path, risk_per_trade_pct=0.02, max_leverage=100.0)
         engine = TradeEngine(config, symbol="PROBE")
         engine.run(frame, strategy)
 
@@ -649,6 +665,503 @@ class TestSizingEquityExcludesUnrealizedPnl:
         assert second.quantity == pytest.approx(989.61 / 1.92, rel=1e-9), (
             "entry 2 sizes from 98,961: 1% of it over the 2% fallback stop "
             "(1.92) = 515.421875 shares"
+        )
+
+
+# ─── #347: leverage/margin check on free margin ─────────────────────────────
+
+
+class TestFreeMarginLeverageCap:
+    """#347 (decisions on #267/#240/#329): the leverage/margin check is
+    MT5-style — an order's margin must fit FREE MARGIN (equity − used
+    margin), sizing itself stays on realized cash (D2), and an order that
+    would need more leverage than the broker maximum is clamped down
+    (floored to the lot step) instead of refused. An unknown broker maximum
+    means 1x."""
+
+    @staticmethod
+    def _engine(tmp_path: Path, *, parameters: dict | None = None, **overrides):
+        engine = TradeEngine(
+            _config(tmp_path, parameters=parameters or {}, **overrides),
+            symbol="PROBE",
+        )
+        engine._refresh_sizing_equity()
+        return engine
+
+    @staticmethod
+    def _open_position(
+        engine: TradeEngine,
+        *,
+        entry_price: float = 100.0,
+        qty: float = 1000.0,
+        direction: str = "LONG",
+        stop_loss: float | None = None,
+    ) -> None:
+        engine.positions.append(
+            Position(
+                symbol="PROBE",
+                direction=direction,
+                entry_index=0,
+                entry_time="2024-01-01T00:00:00+00:00",
+                entry_price=entry_price,
+                order_type="market",
+                quantity=qty,
+                remaining_qty=qty,
+                stop_loss=(
+                    stop_loss
+                    if stop_loss is not None
+                    else entry_price * (1.02 if direction == "SHORT" else 0.98)
+                ),
+            )
+        )
+        engine._refresh_sizing_equity()
+
+    def test_free_margin_is_equity_minus_used_margin(self, tmp_path: Path):
+        engine = self._engine(tmp_path, max_leverage=2.0)
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # Marked at the order price 100: equity = 100k (no unrealized PnL),
+        # used margin = 1000 * 100 / 2 = 50k → free margin = 50k.
+        assert engine._free_margin(100.0) == pytest.approx(50_000.0)
+
+    def test_leverage_cap_uses_free_margin_not_sizing_cash(self, tmp_path: Path):
+        engine = self._engine(tmp_path, max_leverage=2.0)
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # The risk target wants 1000 / 0.1 = 10,000 shares; the realized-cash
+        # cap would allow 200k notional (2,000 shares), but free margin only
+        # affords 50k * 2 / 100 = 1,000 shares → clamped to 1,000.
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(1_000.0)
+
+    def test_unrealized_profit_raises_equity_but_margin_still_binds(
+        self, tmp_path: Path
+    ):
+        engine = self._engine(tmp_path, max_leverage=2.0)
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # New order priced at 120: mark-to-market equity = 100k + 20k = 120k,
+        # used margin = 1000 * 120 / 2 = 60k → free margin = 60k, so the cap
+        # is 60k * 2 / 120 = 1,000 shares. The paper profit lifts equity but
+        # the position's own margin grows with the same mark.
+        qty = engine._calculate_position_size(
+            entry_price=120.0,
+            stop_loss_price=119.9,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(1_000.0)
+
+    def test_unrealized_loss_tightens_free_margin(self, tmp_path: Path):
+        engine = self._engine(tmp_path, max_leverage=2.0)
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # New order priced at 80: equity = 100k − 20k = 80k, used margin =
+        # 1000 * 80 / 2 = 40k → free margin = 40k → cap = 40k * 2 / 80 =
+        # 1,000 shares. The realized-cash cap would have allowed 2,500.
+        qty = engine._calculate_position_size(
+            entry_price=80.0,
+            stop_loss_price=79.9,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(1_000.0)
+
+    def test_no_free_margin_clamps_to_zero(self, tmp_path: Path):
+        engine = self._engine(tmp_path, max_leverage=2.0)
+        # Tight stop keeps aggregate exposure under the cap so the zero
+        # below comes from the leverage check, not the exposure rejection.
+        self._open_position(
+            engine, entry_price=100.0, qty=4000.0, stop_loss=99.9
+        )
+        # Used margin = 4000 * 100 / 2 = 200k > equity 100k → free margin is
+        # negative; the broker refuses and the engine clamps to zero.
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
+    def test_zero_free_margin_skip_is_logged(
+        self, tmp_path: Path, caplog
+    ):
+        """A clamp to zero (no free margin) must not drop the order
+        silently — it is skipped with a warning like the fill-time skips."""
+        engine = self._engine(tmp_path, max_leverage=1.0)
+        # At 1x the whole notional is margin: 1000 * 100 / 1 = 100k = equity,
+        # so free margin is exactly zero for the next order.
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        row = pd.Series(
+            {
+                "close": 100.0,
+                "timestamp": pd.Timestamp("2024-01-02T00:00:00Z"),
+                "stop_loss": 99.0,
+                "stop_distance": 1.0,
+            }
+        )
+        with caplog.at_level(logging.WARNING):
+            engine._create_order(row, 1, "LONG")
+        assert engine.pending_orders == []
+        assert any(
+            "Skipping" in record.getMessage()
+            and "sized quantity" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    def _fill_row(self) -> pd.Series:
+        return pd.Series(
+            {
+                "timestamp": pd.Timestamp("2024-01-02T00:00:00Z"),
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "close": 100.0,
+                "volume": 1000.0,
+            }
+        )
+
+    def test_fill_time_limit_zero_size_skip_is_logged(
+        self, tmp_path: Path, caplog
+    ):
+        """A pending LIMIT sized >0 at creation but clamped to zero at fill
+        (free margin ran out) must not be dropped silently."""
+        from runner.engine import Order, OrderType
+
+        engine = self._engine(tmp_path, max_leverage=1.0)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty > 0, "sized while free margin remains"
+        engine.pending_orders.append(
+            Order(
+                symbol="PROBE",
+                direction="LONG",
+                order_type=OrderType.LIMIT,
+                created_index=0,
+                created_time="2024-01-01T00:00:00+00:00",
+                quantity=qty,
+                limit_price=100.0,
+                stop_loss=99.0,
+            )
+        )
+        # Consume all margin before the fill: at 1x, 1000 * 100 = 100k of
+        # margin against 100k equity leaves free margin at zero.
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        with caplog.at_level(logging.WARNING):
+            engine._fill_pending_orders(self._fill_row(), 1)
+        assert engine.pending_orders == [], "the zero-size fill is cancelled"
+        assert not engine.positions[1:], "no second position opens"
+        assert any(
+            "fill-time sized quantity" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    def test_fill_time_market_zero_size_skip_is_logged(
+        self, tmp_path: Path, caplog
+    ):
+        """Same for a MARKET order re-sized at fill from its sizing stop."""
+        from runner.engine import Order, OrderType
+
+        engine = self._engine(tmp_path, max_leverage=1.0)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty > 0
+        engine.pending_orders.append(
+            Order(
+                symbol="PROBE",
+                direction="LONG",
+                order_type=OrderType.MARKET,
+                created_index=0,
+                created_time="2024-01-01T00:00:00+00:00",
+                quantity=qty,
+                stop_loss=99.0,
+            )
+        )
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        with caplog.at_level(logging.WARNING):
+            engine._fill_pending_orders(self._fill_row(), 1)
+        assert engine.pending_orders == []
+        assert len(engine.positions) == 1, "only the margin-consuming position"
+        assert any(
+            "fill-time sized quantity" in record.getMessage()
+            for record in caplog.records
+        ), [record.getMessage() for record in caplog.records]
+
+    def test_unknown_broker_maximum_means_1x(self, tmp_path: Path):
+        engine = self._engine(tmp_path)
+        assert engine._max_leverage == 1.0
+        self._open_position(engine, entry_price=100.0, qty=500.0)
+        # At 1x the position's whole notional is margin: used = 50k,
+        # free = 50k → cap = 50k * 1 / 100 = 500 shares.
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(500.0)
+
+    def test_leverage_clamp_floors_to_lot_step(self, tmp_path: Path):
+        engine = self._engine(
+            tmp_path,
+            max_leverage=2.0,
+            parameters={"lot_step": 100.0},
+        )
+        self._open_position(engine, entry_price=100.0, qty=1050.0)
+        # used margin = 1050 * 100 / 2 = 52,500 → free = 47,500 → raw cap =
+        # 950 shares; floored to the 100-share lot step → 900.
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(900.0)
+
+    def test_lot_step_floor_does_not_shrink_a_size_leverage_allows(
+        self, tmp_path: Path
+    ):
+        """The floor applies only when leverage is the binding cap: a risk
+        size between the floored and raw cap keeps its exact value."""
+        engine = self._engine(
+            tmp_path,
+            risk_per_trade_pct=0.0092,
+            max_leverage=2.0,
+            parameters={"lot_step": 100.0},
+        )
+        self._open_position(engine, entry_price=100.0, qty=1050.0)
+        # Risk target = 0.92% * 100k / |100 - 99| = 920 shares; the raw
+        # leverage cap is 950 (floored 900) — leverage does not bind, so the
+        # size stays 920, not the floored 900.
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(920.0)
+
+    def test_leverage_clamp_floors_with_the_shared_lot_grid(
+        self, tmp_path: Path
+    ):
+        """The free-margin clamp must floor through ``shared.lot_grid``
+        (#365/#278), not a private ``floor(x / step + eps)``: an exact
+        3-step cap on a 0.1 grid is ``0.3``, not ``0.30000000000000004`` —
+        and the risk-engine path never re-floors, so a private floor's
+        off-grid float would reach the order."""
+        # Balance 30 at 1x with no open position: free margin = 30, so the
+        # leverage cap is exactly 30 * 1 / 100 = 0.3 — three 0.1 steps.
+        risk_engine = self._engine(
+            tmp_path,
+            initial_capital=30.0,
+            max_leverage=1.0,
+            parameters={"lot_step": 0.1},
+        )
+        # 1% of 30 = 0.3 risk over a ~0.1 stop distance → ~3 shares pre-cap.
+        qty = risk_engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.3
+
+        fixed_risk = self._engine(
+            tmp_path,
+            initial_capital=30.0,
+            max_leverage=1.0,
+            parameters={
+                "fixed_risk_amount": 30.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+                "lot_step": 0.1,
+            },
+        )
+        # 30 / ~0.1 ≈ 300 shares pre-cap; the same 0.3 leverage cap binds.
+        qty = fixed_risk._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.3
+
+    def test_exposure_cap_stays_on_realized_cash(self, tmp_path: Path):
+        engine = self._engine(
+            tmp_path, max_leverage=10.0, max_position_exposure_pct=0.4
+        )
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # Mark the open position at 110: reporting equity reads 110k while
+        # realized sizing cash stays 100k. The per-position exposure cap is
+        # a sizing rule on realized cash (D2): 0.4 * 100k / 100 = 400
+        # shares — sizing it off ``self.equity`` would wrongly give 440.
+        # (At 10x free margin allows ~9,000, so the exposure cap binds.)
+        engine.equity = 110_000.0
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(400.0)
+
+    def test_fixed_risk_exposure_cap_stays_on_realized_cash(
+        self, tmp_path: Path
+    ):
+        """The same D2 invariant on the ``fixed_risk_amount`` leg: there the
+        risk engine is bypassed, so the exposure cap inside
+        ``_apply_notional_caps`` is the ONLY realized-cash ceiling — a
+        mutant reading ``self.equity`` would silently resize the MT5-parity
+        fixed-risk strategies this branch exists for."""
+        engine = self._engine(
+            tmp_path,
+            max_leverage=10.0,
+            max_position_exposure_pct=0.4,
+            parameters={
+                "fixed_risk_amount": 5000.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+            },
+        )
+        self._open_position(engine, entry_price=100.0, qty=1000.0)
+        # Fixed size = 5000 / |100 - 99| = 5,000 shares; the exposure cap on
+        # realized cash is 0.4 * 100k / 100 = 400 — sizing it off
+        # ``self.equity`` (110k with the open mark) would give 440. At 10x
+        # free margin allows ~9,000, so only the exposure cap binds.
+        engine.equity = 110_000.0
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(400.0)
+
+    def test_nan_free_margin_fails_closed(self, tmp_path: Path):
+        """A NaN free margin must clamp to zero: ``nan <= 0`` is False, so
+        dropping the ``isfinite`` check would let ``min(qty, nan)`` keep
+        the uncapped size. Here a NaN entry mark on the open position
+        poisons mark-to-market equity inside ``_free_margin``."""
+        engine = self._engine(
+            tmp_path,
+            max_leverage=10.0,
+            parameters={
+                "fixed_risk_amount": 5000.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+            },
+        )
+        self._open_position(engine, entry_price=float("nan"), qty=1000.0)
+        assert engine._free_margin_quantity_cap(100.0) == 0.0
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
+    def test_short_position_margin_and_pnl_signs(self, tmp_path: Path):
+        engine = self._engine(tmp_path, max_leverage=2.0)
+        self._open_position(
+            engine, entry_price=100.0, qty=1000.0, direction="SHORT"
+        )
+        # New SHORT order priced at 80: the open short is up 20 → equity =
+        # 120k; used margin = 1000 * 80 / 2 = 40k → free = 80k → cap =
+        # 80k * 2 / 80 = 2,000 shares.
+        qty = engine._calculate_position_size(
+            entry_price=80.0,
+            stop_loss_price=80.1,
+            direction="SHORT",
+        )
+        assert qty == pytest.approx(2_000.0)
+
+    def test_fixed_risk_branch_clamps_on_free_margin(self, tmp_path: Path):
+        engine = self._engine(
+            tmp_path,
+            max_leverage=2.0,
+            parameters={
+                "fixed_risk_amount": 500.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+            },
+        )
+        self._open_position(engine, entry_price=100.0, qty=2000.0)
+        # Fixed size = 500 / 1 = 500 shares; used margin = 2000 * 100 / 2 =
+        # 100k = equity → free margin 0 → clamped to 0.
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == 0.0
+
+    def test_fixed_risk_leverage_opt_out_keeps_uncapped_size(self, tmp_path: Path):
+        engine = self._engine(
+            tmp_path,
+            max_leverage=2.0,
+            parameters={
+                "fixed_risk_amount": 500.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+                "cap_fixed_risk_by_leverage": False,
+            },
+        )
+        self._open_position(engine, entry_price=100.0, qty=2000.0)
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(500.0)
+
+    def test_sizing_target_still_uses_realized_cash(self, tmp_path: Path):
+        """D2 unchanged: only the leverage check moved to free margin — the
+        risk target itself must still be 1% of realized cash (100k), not of
+        mark-to-market equity (101k with the open profit)."""
+        engine = self._engine(tmp_path, max_leverage=10.0)
+        self._open_position(engine, entry_price=100.0, qty=100.0)
+        # The order prices at 110 while the position entered at 100, so
+        # mark-to-market equity is 101k — but the risk target must still be
+        # 1% of realized cash: 1,000 / |110 - 109| = 1,000 shares, not the
+        # 1,010 a mark-to-market basis would produce. At 10x the free-margin
+        # cap (~9,000 shares) does not bind.
+        qty = engine._calculate_position_size(
+            entry_price=110.0,
+            stop_loss_price=109.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(1_000.0)
+
+    def test_run_clamps_second_entry_on_free_margin(self, tmp_path: Path):
+        """End-to-end: with the default unknown-broker 1x, a second entry
+        sized while the first rides is clamped to what free margin affords.
+
+        Entry 1 keeps 500 shares @ 101 and is marked at 105 when entry 2 is
+        sized: equity = 102k, used margin = 500 * 105 / 1 = 52.5k → free
+        margin = 49.5k → cap = 471.43 shares, below the 476.19 the 1% risk
+        target on realized cash (100k) would want.
+        """
+        frame = _linear_frame(6, start=100.0)
+        for bar in (1, 2, 3):
+            frame.loc[bar, "open"] = 105.0
+            frame.loc[bar, "high"] = 105.5
+            frame.loc[bar, "low"] = 104.5
+            frame.loc[bar, "close"] = 105.0
+        frame.loc[1, "open"] = 101.0  # entry 1's fill bar keeps its open
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)
+
+        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert len(engine.closed_trades) >= 2, "both entries must have filled"
+        assert engine.closed_trades[0].quantity == pytest.approx(500.0)
+        assert engine.closed_trades[1].quantity == pytest.approx(
+            49_500.0 / 105.0, rel=1e-9
+        ), (
+            "the second entry is clamped to free margin (49.5k at 1x), not "
+            "the 476.19 shares the realized-cash risk target would want"
         )
 
 
