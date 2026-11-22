@@ -847,6 +847,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._execution_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=5000)
         self._execution_retry_counts: dict[int, int] = {}
         self._unresolved_execution_events: deque[Any] = deque()
+        # Deal ids already flagged ledger_reconciliation_required this process.
+        # The reconcile pass re-reads the same 7-day window on every connect and
+        # every pending retry; without this each unattributable deal would write
+        # a new audit row and a new ERROR alert per pass, drowning the next real
+        # flag in repeats. Deliberately NOT cleared on disconnect: a reconnect
+        # is exactly when the pass re-runs.
+        self._flagged_broker_close_deals: set[int] = set()
         self._reconciliation_required = False
         self._reconciliation_retry_at = 0.0
         self._connected = False
@@ -3747,6 +3754,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         platform never submitted) and several (a netted book several
         deployments share) are both refusals - the caller flags the ledger
         rather than guessing which shares the close took.
+
+        Known limitation, kept deliberately fail-closed: several opening
+        orders that all resolve to signals of ONE deployment on ONE side are
+        still flagged ``ambiguous_parent``. The ledger is per deployment, so
+        attribution would be exact there - but whether a scaled-in position's
+        close belongs to that deployment alone is a maintainer decision
+        (#277), and until it lands the flag is the honest answer.
         """
         orders = await self._fetch_position_orders(position_id)
         if orders is None:
@@ -3766,16 +3780,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
     @staticmethod
     def _broker_close_dedupe_key(deal: Any | None) -> str | None:
-        """The one dedupe derivation the stream and the reconcile pass share.
+        """The one dedupe derivation every path shares for one deal.
 
-        ``dealId`` is unique per fill by construction; a close deal without one
+        ``dealId`` is unique per fill by construction, and it is the SAME key
+        ``_build_dedupe_key`` derives for the normal fill path: a deal that
+        reaches both paths - booked as a broker-side close, then resolved to a
+        signal once the exit's broker order id is persisted - must collide on
+        one key, or the ledger is reduced twice. A close deal without a dealId
         cannot be told from its own redelivery, so it is refused rather than
         keyed on something that could count it twice.
         """
         deal_id = _deal_id_or_none(deal)
         if deal_id is None:
             return None
-        return f"ctrader:position-close:{deal_id}"
+        return f"ctrader:deal:{deal_id}"
 
     def _close_side_from_payload(self, order: Any | None, deal: Any | None) -> str | None:
         """``buy``/``sell`` of the closing deal, for the insert's side cross-check."""
@@ -3891,7 +3909,30 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         flatten/manual closes). The audit row is what an operator and the
         periodic broker reconciliation (#330) can act on; the ERROR record is
         the alert channel.
+
+        One flag per deal per process: the reconcile pass and the stream's
+        retain-for-reconciliation retries see the same unattributable deal
+        again and again, and each repeat would otherwise add another audit row
+        and another ERROR alert. A deal with no id cannot be deduplicated and
+        is flagged every time.
         """
+        deal_id = detail.get("deal_id")
+        if isinstance(deal_id, int) and deal_id > 0:
+            if deal_id in self._flagged_broker_close_deals:
+                logger.info(
+                    "cTrader broker-side close already flagged for reconciliation; "
+                    "not flagging the same deal again",
+                    extra={
+                        "data": {
+                            "account_id": self.account_config_id,
+                            "symbol": symbol,
+                            "cause": cause,
+                            "deal_id": deal_id,
+                        }
+                    },
+                )
+                return
+            self._flagged_broker_close_deals.add(deal_id)
         flag_live_ledger_reconciliation(
             account_id=self.account_config_id,
             symbol=symbol,
@@ -4186,6 +4227,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 },
             )
             return 0
+        if getattr(response, "hasMore", False):
+            # maxRows truncated the window: older closes in it are silently
+            # missed, so the truncation has to be loud rather than discovered
+            # as a ledger gap weeks later.
+            logger.warning(
+                "cTrader deal list reports hasMore during broker-close reconcile; "
+                "closes older than the returned rows are not reconciled this pass",
+                extra={
+                    "data": {
+                        "account_id": self.account_config_id,
+                        "max_rows": BROKER_CLOSE_RECONCILE_MAX_ROWS,
+                    }
+                },
+            )
         recovered = 0
         parent_cache: dict[int, tuple[str | None, str]] = {}
         order_cache: dict[int, Any | None] = {}

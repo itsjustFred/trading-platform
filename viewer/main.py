@@ -12790,7 +12790,16 @@ async def _live_signals_payload(account_id: str, *, limit: int = 200) -> dict[st
         signal_iso, signal_unix = _serialize_live_timestamp(row.get("signal_timestamp"))
         execution_iso, execution_unix = _serialize_live_timestamp(row.get("execution_timestamp"))
         raw_source = str(row.get("source") or signal_metadata.get("source") or "internal").lower()
-        source = "discord" if raw_source.startswith("discord") else "internal"
+        if raw_source.startswith("discord"):
+            source = "discord"
+        elif raw_source == "broker_close":
+            # A close the broker made (#144): not an entry of ours, so it gets
+            # its own label rather than reading as an internal signal. Its
+            # theoretical_price is 0.0 by construction - the marker price is the
+            # fill's actual_price, which the row already carries.
+            source = "broker_close"
+        else:
+            source = "internal"
         status = _signal_status_from_row(row)
         waiting_seconds = (
             _waiting_countdown(signal_metadata, signal_unix)

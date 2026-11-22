@@ -937,9 +937,11 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if stored_order_id:
             try:
                 from alpaca.trading.requests import GetOrderByIdRequest
-            except ModuleNotFoundError:
+            except ImportError:
                 # An alpaca-py without the nested filter request: the flat fetch below
-                # still carries the parent's own fill.
+                # still carries the parent's own fill. `ImportError`, not
+                # `ModuleNotFoundError`: a missing NAME inside an importable
+                # module raises the former, and the fallback must still fire.
                 GetOrderByIdRequest = None  # type: ignore[assignment]
             if GetOrderByIdRequest is not None:
                 try:

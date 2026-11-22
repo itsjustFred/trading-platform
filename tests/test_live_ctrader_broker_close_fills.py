@@ -201,6 +201,7 @@ def _adapter(
     *,
     position_orders: dict[int, list[Any]] | None = None,
     deal_list: list[Any] | None = None,
+    deal_list_has_more: bool = False,
     order_details: dict[int, Any] | None = None,
 ) -> CTraderLiveAdapter:
     """A cTrader adapter whose broker reads are faked, on the isolated DB."""
@@ -235,7 +236,9 @@ def _adapter(
         if isinstance(request, _OrderListReq):
             return _OrderListRes(orders_by_position.get(int(request.positionId), []))
         if isinstance(request, _DealListReq):
-            return _DealListRes(list(deal_list or []))
+            response = _DealListRes(list(deal_list or []))
+            response.hasMore = deal_list_has_more
+            return response
         if isinstance(request, _OrderDetailsReq):
             order = details_by_order.get(int(request.orderId))
             return _OrderDetailsRes(order=order, deals=[])
@@ -545,6 +548,155 @@ def test_reconcile_flags_an_unattributable_close_once_per_pass(database) -> None
     assert _reconciliation_flags(database)[0]["detail"]["cause"] == "no_opening_order"
 
 
+def test_reconcile_flags_each_unattributable_deal_only_once(database) -> None:
+    """The reconcile pass runs on every connect and every pending retry: one
+    audit row and one alert per deal, not one per pass (#144 review)."""
+    _persist_entry(database, qty=10.0)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: []},
+        deal_list=[_close_deal(deal_id=9001), _close_deal(deal_id=9002, order_id=778)],
+    )
+
+    for _ in range(3):
+        asyncio.run(adapter.reconcile_executions())
+
+    flags = _reconciliation_flags(database)
+    assert sorted(flag["detail"]["deal_id"] for flag in flags) == [9001, 9002]
+
+
+def test_a_closing_order_on_the_position_is_never_an_opener(database) -> None:
+    """``closingOrder`` marks the reduce side: it must not count as a second
+    opening signal, or every scaled position would read ambiguous (#144)."""
+    first = _persist_entry(database, qty=10.0)
+    second = _persist_entry(database, qty=5.0, order_id=556)
+    closer = _entry_order(second, order_id=557)
+    closer.closingOrder = True
+    adapter = _adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(first), closer]},
+    )
+
+    asyncio.run(adapter._persist_execution_event(_event(_closing_order(), _close_deal())))
+
+    assert _ledger(database) == pytest.approx(5.0)
+    assert _reconciliation_flags(database) == []
+
+
+def test_reconcile_ignores_a_deal_that_is_not_filled(database) -> None:
+    """Only FILLED/PARTIALLY_FILLED deals carry volume worth booking (#144)."""
+    signal_id = _persist_entry(database, qty=10.0)
+    deal = _close_deal()
+    deal.dealStatus = 1  # neither FILLED (2) nor PARTIALLY_FILLED (3)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[deal],
+    )
+
+    assert asyncio.run(adapter.reconcile_executions()) == 0
+
+    assert _ledger(database) == pytest.approx(10.0)
+    assert _reconciliation_flags(database) == []
+
+
+def test_reconcile_warns_when_the_deal_list_reports_more_rows(database, caplog) -> None:
+    """``maxRows`` truncates silently at the broker: a busy account's older
+    closes are missed, so the truncation has to be loud (#144 review)."""
+    import logging
+
+    signal_id = _persist_entry(database, qty=10.0)
+    adapter = _reconcilable_adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(signal_id)]},
+        deal_list=[_close_deal()],
+        deal_list_has_more=True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(adapter.reconcile_executions())
+
+    assert any("hasMore" in record.getMessage() for record in caplog.records)
+
+
+def test_a_close_naming_another_accounts_signal_is_flagged_not_booked(database) -> None:
+    """``clientOrderId`` is a bare UUID: it only counts when the signal it names
+    lives on THIS account, or a close would reduce another ledger (#144)."""
+    foreign_account = "ctrader-account-other"
+    foreign_dep = "55555555-5555-4555-8555-eeeeeeeeeeee"
+    seed_live_deployments(database, [foreign_dep], account_id=foreign_account)
+    foreign_signal = _persist_entry(
+        database, deployment_id=foreign_dep, qty=10.0, order_id=999
+    )
+    adapter = _adapter(
+        database,
+        position_orders={POSITION_ID: [_entry_order(foreign_signal, order_id=999)]},
+    )
+
+    with pytest.raises(ValueError, match="could not be mapped"):
+        asyncio.run(adapter._persist_execution_event(_event(_closing_order(), _close_deal())))
+
+    assert _reconciliation_flags(database)[0]["detail"]["cause"] == "no_opening_order"
+    assert _ledger(database) == pytest.approx(0.0)
+    assert _ledger(database, foreign_dep) == pytest.approx(10.0)
+
+
+def test_a_refused_close_on_a_fresh_dedupe_key_is_flagged_and_retained(database) -> None:
+    """``record_live_broker_side_close_fill`` returns 0.0 for a refusal exactly
+    like a duplicate; only a stored dedupe key makes it "handled" (#144)."""
+    signal_id = _persist_entry(database, qty=10.0)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(signal_id)]})
+    order = _closing_order()
+    order.tradeSide = 1  # BUY extends the long the parent opened: refused as a close
+    deal = _close_deal()
+    deal.tradeSide = 1
+
+    with pytest.raises(ValueError, match="could not be mapped"):
+        asyncio.run(adapter._persist_execution_event(_event(order, deal)))
+
+    assert _ledger(database) == pytest.approx(10.0)
+    flags = _reconciliation_flags(database)
+    assert len(flags) == 1
+    assert flags[0]["detail"]["cause"] == "record_refused"
+
+
+def test_one_deal_reaching_both_fill_paths_is_booked_once(database) -> None:
+    """The stream's normal path and the broker-close path must share ONE dedupe
+    key per deal: ``ctrader:deal:{dealId}``, the key ``_build_dedupe_key``
+    already derives (#144). A deal booked as a broker close and then resolved
+    to a signal (the exit's broker order id persisted after a crash) is a skip,
+    never a second row."""
+    import shared.database as db
+
+    signal_id = _persist_entry(database, qty=10.0)
+    adapter = _adapter(database, position_orders={POSITION_ID: [_entry_order(signal_id)]})
+
+    # First the broker-close path books the deal (its order names no signal yet).
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(_closing_order(order_id=999), _close_deal(deal_id=9001, order_id=999))
+        )
+    )
+    assert _ledger(database) == pytest.approx(0.0)
+
+    # Then the same deal arrives resolved to the entry signal itself.
+    asyncio.run(
+        adapter._persist_execution_event(
+            _event(_entry_order(signal_id), _close_deal(deal_id=9001, order_id=ENTRY_ORDER_ID))
+        )
+    )
+
+    with db.get_session() as session:
+        rows = session.exec(
+            db.select(db.LiveExecutionModel).where(
+                db.LiveExecutionModel.dedupe_key == "ctrader:deal:9001"
+            )
+        ).all()
+    assert len(rows) == 1
+    # 10 entry - 10 broker close; the re-resolved deal added nothing.
+    assert _ledger(database) == pytest.approx(0.0)
+
+
 # ─── the flag itself ──────────────────────────────────────────────────────────────────────────
 
 
@@ -588,7 +740,7 @@ def test_the_exit_ledger_mismatch_alert_also_flags_reconciliation(database) -> N
         tolerance=1e-9,
     )
 
-    _alert_ledger_mismatch(deployment, "AAPL", exc, own_qty=10.0, exit_qty=4.0)
+    asyncio.run(_alert_ledger_mismatch(deployment, "AAPL", exc, own_qty=10.0, exit_qty=4.0))
 
     flags = _reconciliation_flags(database)
     assert len(flags) == 1

@@ -1021,6 +1021,48 @@ def test_a_delayed_leg_event_after_reconcile_is_not_double_counted(database) -> 
     assert [row[0] for row in _close_execution_rows(database, parent)] == [10.0]
 
 
+def test_reconcile_books_no_leg_while_the_parent_fill_is_unrecoverable(database) -> None:
+    """A leg closes the position the parent's fill opened: with the parent's own
+    fill unbookable (no usable ``filled_avg_price``), no leg close may be booked
+    on that pass - the ledger would go below zero (#144 review survivor)."""
+    parent = _persist_entry(database, qty=5.0)  # only half the fill is recorded
+    order = _parent_order(legs=[_leg(filled_qty=10.0)])
+    order.filled_qty = 10.0
+    order.filled_avg_price = None
+    adapter = _alpaca_adapter({parent: order})
+
+    assert asyncio.run(adapter.reconcile_executions()) == 0
+
+    assert _close_execution_rows(database, parent) == []
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(5.0)
+
+
+def test_a_leg_stream_event_is_capped_at_the_leg_cumulative(database) -> None:
+    """The event's own quantity is not the leg's remaining quantity (#144 review
+    survivor): 4 of the leg's 6 already recorded, an event claiming 6 books 2."""
+    parent = _persist_entry(database)
+    leg_order = _leg(filled_qty=6.0)
+    adapter = _alpaca_adapter({parent: _parent_order(legs=[leg_order])})
+    adapter._register_bracket_legs(parent, _parent_order(legs=[leg_order]))
+
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(
+                qty=4.0, cumulative=4.0, event="partial_fill", execution_id=""
+            )
+        )
+    )
+    asyncio.run(
+        adapter._on_trade_update(
+            _leg_fill_update(qty=6.0, cumulative=6.0, event="fill", execution_id="")
+        )
+    )
+
+    # The leg filled 6 in total: 4 + the capped 2, never 4 + 6.
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(4.0)
+    assert [row[0] for row in _close_execution_rows(database, parent)] == [4.0, 2.0]
+
+
 def test_a_close_is_capped_at_the_parent_signal_s_unclosed_quantity(database) -> None:
     """No double-booked fill may drive the ledger below zero (#144 review).
 
@@ -1110,3 +1152,29 @@ def test_broker_close_fills_stay_out_of_the_trades_payload(database, monkeypatch
     assert len(close_rows) == 1
     assert close_rows[0]["slippage"] is None
     assert close_rows[0]["slippage_bps"] is None
+
+
+def test_broker_close_rows_carry_their_own_source_and_fill_price(
+    database, monkeypatch
+) -> None:
+    """The signals payload must not pass a broker close off as an internal
+    signal at price 0.0: it gets its own source label and keeps the fill's
+    ``actual_price`` for the chart marker (#144 review)."""
+    import viewer.main as viewer_main
+
+    parent = _persist_entry(database)
+    database.record_live_broker_side_close_fill(**_close_fill_kwargs(database, parent))
+    monkeypatch.setattr(
+        viewer_main,
+        "list_live_deployments_for_account",
+        lambda _a: [SimpleNamespace(id=DEP_ENTRY, strategy_name="", account_id=ACCOUNT)],
+    )
+
+    payload = asyncio.run(viewer_main._live_signals_payload(ACCOUNT))
+
+    by_id = {row["signal_id"]: row for row in payload["signals"]}
+    close = by_id[database.broker_close_signal_id(parent)]
+    assert close["source"] == "broker_close"
+    assert close["theoretical_price"] == pytest.approx(0.0)
+    assert close["actual_price"] == pytest.approx(95.0)
+    assert by_id[parent]["source"] == "internal"

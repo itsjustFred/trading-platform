@@ -1554,7 +1554,7 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
-def _alert_ledger_mismatch(
+async def _alert_ledger_mismatch(
     deployment: LiveDeploymentConfig,
     symbol: str,
     exc: LedgerMismatchError,
@@ -1574,7 +1574,8 @@ def _alert_ledger_mismatch(
     the surface; the durable ``ledger_reconciliation_required`` audit flag is
     what an operator and the periodic broker reconciliation (#330) act on.
     """
-    flag_live_ledger_reconciliation(
+    await asyncio.to_thread(
+        flag_live_ledger_reconciliation,
         account_id=deployment.account_id,
         symbol=symbol,
         cause="exit_ledger_mismatch",
@@ -1711,7 +1712,7 @@ async def prepare_exit_intent_order(
             tolerance=tolerance,
         )
     except LedgerMismatchError as exc:
-        _alert_ledger_mismatch(
+        await _alert_ledger_mismatch(
             deployment, signal.symbol, exc, own_qty=ledger_qty, exit_qty=target_qty
         )
     else:
@@ -1719,7 +1720,7 @@ async def prepare_exit_intent_order(
             # Offsetting ledgers of other deployments hide the overhang from
             # the total, or other working exits leave less than this
             # deployment's share; either way the own quantity exceeds the cap.
-            _alert_ledger_mismatch(
+            await _alert_ledger_mismatch(
                 deployment,
                 signal.symbol,
                 LedgerMismatchError(

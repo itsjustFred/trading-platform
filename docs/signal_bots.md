@@ -280,7 +280,9 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   eröffnenden Orders → Signal** derselben Parent-Deployment zugeordnet und über
   denselben `record_live_broker_side_close_fill`-Pfad gebucht
   (`broker_close_reason=ctrader_position_close`, Dedupe-Key
-  `ctrader:position-close:{dealId}`, gedeckelt am kumulierten Volumen des
+  `ctrader:deal:{dealId}` - derselbe Schlüssel, den der normale Fill-Pfad für
+  dasselbe Deal ableitet, damit ein Deal, der beide Pfade erreicht, nur einmal
+  gebucht wird, gedeckelt am kumulierten Volumen des
   schließenden Orders). Die Zuordnung zählt nur, wenn **genau ein** Signal der
   Position zugeordnet ist: null (manuelle Position, nie eingereichte Orders)
   oder mehrere (genettetes Buch mehrerer Deployments) werden **nicht geraten**,
