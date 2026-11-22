@@ -683,7 +683,6 @@ def test_dispatch_symbol_gate_refusal_is_archived(
     archive_env: SignalArchive, monkeypatch
 ) -> None:
     deployment = _live_deployment()
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
     monkeypatch.setattr(daemon, "_live_account_broker_login", lambda _a: "")
     asyncio.run(
         daemon._dispatch_discord_trade_signal(
