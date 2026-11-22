@@ -108,7 +108,7 @@ python -m runner.cli walkforward --strategy example_sma --train-months 12 --test
 - **Grid Testing:** `runner/backtest_grid.py` - Symbol × Timeframe × ParamSet grid execution (canonical engine); `runner/backtest_matrix.py` - multi-strategy orchestration/aggregation over it
 - **Portfolio Optimization:** `runner/portfolio_optimizer.py` - Multi-strategy allocation with OOS validation
 - **Walk-Forward Analysis:** Stability validation with train/test splits. Note: folds run one fixed parameter set — no in-sample parameter selection happens (see `docs/walk_forward.md`, "Expectation Gap")
-- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for ramjet, rocketfuel, and nitro processors
+- **Signal Bots:** `signal_bots/health_check.py` - Registry/config validation for ramjet, rocketfuel, and nitro processors; run `python -m signal_bots.health_check` or schedule the `signal_bot_health_check` job on the viewer Services page (see `docs/signal_bots.md`)
 - **Live Risk Consistency:** Backtest vs live position sizing behavior and stop-direction validation
 
 Documentation: See `docs/backtest_grid.md`, `docs/portfolio_optimizer.md`, `docs/walk_forward.md`, `docs/signal_bots.md`, and `docs/live-risk-consistency.md`

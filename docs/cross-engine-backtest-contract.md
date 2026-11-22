@@ -21,8 +21,11 @@ parent Cleanup 16 record.
   *N+1*, filling at bar *N+1*'s **open**.
 - Native: orders created on the signal bar are filled by
   `_fill_pending_orders` only on a later bar (`i > created_index`), at
-  `bar_open`. `ExecutionModelSettings.market_order_timing = "next_bar_open"`
-  and `entry_price_side = "open"` document this on every native trade
+  `bar_open`. The same creation-index guard applies to the native engine's
+  LIMIT/STOP/STOP_LIMIT pending-order branches (#288): a pending order may
+  never fill on the bar whose close produced its signal.
+  `ExecutionModelSettings.market_order_timing = "next_bar_open"` and
+  `entry_price_side = "open"` document this on every native trade
   (`trade.meta["execution_model"]`, `trade.meta["entry_fill"]`).
 - Vectorbt: strategy output is shifted one bar by
   `_prepare_next_open_execution_data` and entries fill at the execution bar's
@@ -39,7 +42,10 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself**, not the bar close. When a
+- Fill price: the protective **level itself**, not the bar close — and
+  that holds even when the bar gaps through the level: protective exits
+  are not re-priced to the open on a gap today (gap → open for
+  protective exits is the still-open #208 work). When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -79,6 +85,68 @@ is one place — `_prepare_next_open_execution_data` keeps the exit leg
 unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
 `close`/`open`) selects `open` to fill at the exit bar's open instead for
 MT5-parity runs. Stop/TP exits fill at the level in every engine (§1).
+
+**Explicit exit order type (#243).** A strategy may mark a signal exit with an
+exit-when `exit_order_type` series (signal column or indicator) taking `market`
+or `level` (case-insensitive):
+
+- `market` — the exit fills at the signal-exit convention price
+  (`signal_exit_fill`); any `exit_price` on that bar is ignored for pricing.
+- `level` — the exit fills at the strategy's `exit_price`. A `level` exit
+  without a usable (positive, finite) `exit_price` falls back to the market
+  fill, logs a warning once and flags the trade
+  `meta["exit_level_missing_price"]`.
+- a `level` outside the exit bar's traded range is never booked at the
+  level (`contract.exit_level_disposition`, evaluated on the ask range for
+  a SHORT exit when `ask_ohlc` data is enabled). On the *untraded* side —
+  above the bar's high for a LONG exit, below the low for a SHORT exit —
+  the order could never have filled: it falls back to the market fill,
+  warns once and flags `meta["exit_level_unreachable"]`. On the
+  *marketable* side — below the low for a LONG exit, above the high for a
+  SHORT exit — the resting order was marketable at the open, so under the
+  gap-through-level convention it fills at the bar's **open** and flags
+  `meta["exit_level_gapped"]`. (This is `level`-exit semantics only:
+  protective stop/TP legs fill at their level even on a gap-through —
+  gap → open for them lands with #208.)
+  Direction-specific, like every open fill: a LONG exit sells the bid at
+  the raw open, while a SHORT exit buys the ask at `open + spread` when a
+  spread is configured. With explicit `ask_high`/`ask_low` columns but no
+  `spread_price_col`, reachability is still judged on the ask range while
+  the fill stays the raw open (spread 0) — the same convention every
+  open fill already follows. `level` has **limit-order semantics**: an
+  untraded-side level is "unreachable" and falls back to the market fill.
+  A strategy whose `exit_price` is really a *stop* (e.g. a sell stop
+  above the whole bar after a gap down) should express it through the
+  `stop_loss` legs instead — a stop leg fills at its level whenever the
+  bar trades through it, including on a gap-through (gap → open for
+  protective exits lands with #208), which is the per-bar
+  trigger/fill-at-level behaviour `level` deliberately does not
+  reproduce. This applies to every level fill, explicit `level`
+  and vectorbt's legacy implicit `exit_price` alike.
+- absent or unrecognized — the **legacy fallback** applies per engine:
+  vectorbt treats a usable `exit_price` as a level fill; native fills at the
+  convention price and ignores `exit_price` (an unrecognized non-empty value
+  warns once). PyneCore does not consume the series — its exits are
+  Pine-native orders, re-priced by `_apply_fill_parity` (§5).
+
+Per-engine support for `exit_order_type` / `exit_price` on signal exits:
+
+| engine | `exit_order_type` | `exit_price` without it |
+|---|---|---|
+| native (`TradeEngine`) | `market`/`level` honored; absent/unrecognized → market fill | ignored |
+| vectorbt | `market`/`level` honored; absent/unrecognized → legacy rule | usable value → level fill (legacy) |
+| pynecore | not consumed — Pine-native orders, `_apply_fill_parity` (§5) | n/a |
+| signal_replay | not consumed — replays recorded fills | n/a |
+| lean | not consumed | n/a |
+| live (`live_runner/`) | **not consumed** — every signal exit is a market order, so a strategy emitting `level` diverges between backtest and live | n/a |
+
+The order type is evaluated only on a real exit signal in every consumer: the
+forced end-of-data close fills at the convention price and ignores
+`exit_price`/`exit_order_type` entirely, matching native's `end_of_data`
+close. The parsing lives in `runner.engines.contract`
+(`normalize_exit_order_type`, `usable_exit_price`, `exit_level_disposition`) —
+native and vectorbt read the same spelling table; the other engines listed
+above do not consume the series at all.
 
 **Pynecore CLI bounds.** Pynecore additionally hands each symbol's frame to
 the external `pyne` CLI (`--from`/`--to`). The CLI parses those values with
@@ -185,7 +253,57 @@ Implementation:
 - Native additionally supports `fixed_risk_amount` sizing with MT5 tick
   metadata (`tick_size`, `tick_value`, `lot_step`, `min_lot`, `max_lot`);
   the result is still capped by `max_leverage` unless
-  `cap_fixed_risk_by_leverage = false`.
+  `cap_fixed_risk_by_leverage = false`. With `lot_step > 0`, `max_lot` is
+  floored to `lot_step` once, so an off-grid `max_lot` cannot yield an
+  off-grid size; the documented exception is no grid at all — with
+  `lot_step` absent, null or zero the native engine has no grid, so
+  `max_lot` applies raw and an off-grid maximum stays off-grid. Because the
+  leverage/exposure cap is a raw equity/price ratio, a size that the cap
+  reduces is re-floored to `lot_step` afterwards (Issue #151). With a grid
+  configured, a final size within the grid snap band (relative 1e-9) below
+  `min_lot` is snapped up to `min_lot` — that size came out of the grid
+  floor an ulp low (`3 * 0.3 == 0.8999999999999999 < 0.9`) and the broker
+  accepts it as `min_lot`. Without a grid there is no such float product,
+  so the exception does not apply: a capped size below `min_lot` is a cap
+  the configured minimum exceeds, and raising it would push the size above
+  the cap. Any other final size below `min_lot` is **skipped** (size 0, no
+  trade, with a WARNING log) — it is never raised back up to `min_lot`,
+  since the caps are what make it unaffordable. A size that no cap reduces
+  is not re-floored. `min_lot` is deliberately honoured **off-grid**: the
+  MT5 parity reference (`scripts/regenerate_mt5_parity_artifacts.py`,
+  `_round_mt5_lots`, .mq5 Z.391-393) applies `max(floored, min_lot)` without
+  a second grid floor (MT5 `MathMax`), so the engine reproduces that rule
+  rather than correcting it; a venue that requires volumes to be exact step
+  multiples would reject such a size, and a config for one must set
+  `min_lot` to a grid multiple. `max_lot` is floored to the grid instead;
+  with `min_lot == max_lot == 0.15` and `lot_step = 0.1` that combination is
+  fail-closed — the cap becomes `0.1`, which is below `min_lot`, and the
+  trade is skipped although the same config without `max_lot` trades `0.15`.
+  Non-finite values for the sizing parameters are refused with a `ValueError`
+  naming the parameter: `inf` would crash the grid floor, and `nan` defeats
+  every guard on the sizing path. `fixed_risk_amount` is resolved — and thereby
+  validated — **before any stop-dependent branch**, so a `nan`, `-inf` or
+  negative amount is refused on **every** path: with a stop, without a stop,
+  and with an unusable stop distance. `nan > 0`, `-inf > 0` and a negative
+  amount all compare False, so a value checked after a branch is chosen is
+  checked too late: on the stopful and the stopless path the trade was then
+  sized by `risk_per_trade_pct` instead — a backtest under a risk rule the
+  config does not declare, with no error at all (the unusable-distance path
+  raised, but named the distance, never the amount). A configured
+  `tick_value`/`tick_size` of zero or less is refused as well — `0 or 1.0`
+  used to substitute `1.0` and silently drop that leg of the conversion,
+  oversizing the order — and so is a negative `lot_step`/`min_lot`/`max_lot`,
+  which the `> 0` gates used to discard. Those are parameters of the
+  fixed-risk conversion, so they are resolved with that branch, before the
+  risk-distance gate: an unusable stop distance is refused too (no risk
+  distance means no size), and reporting which of the two is the config error
+  must not depend on the bar data. An absent key, an explicit `null`, and
+  `0.0` for `fixed_risk_amount` ("off", size from `risk_per_trade_pct`) keep
+  their previous meaning. The order's `equity_proportional_sizing` flag reads
+  the same way, so a `0.0` order is **now** re-scaled by the shared-equity
+  replay like a percentage-sized one: the flag used to read the key's presence
+  instead, and stopped the re-scale for a percentage-sized position (Issue
+  #170).
 - **Equity sizing** (no risk config): `qty = equity / entry_price`, capped by
   `max_leverage`.
 - Without an explicit stop, engines fall back to a documented default stop
