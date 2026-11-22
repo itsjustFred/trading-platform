@@ -12,7 +12,21 @@ name: Agent Mutation Testing
 # installs Python, the locked dependencies or anything else, and a cap, rate
 # limit or region refusal there skips the agent job - a grey check, not a red
 # one - while the post job comments "not run: quota" and warns (decision of
-# 2026-11-21, issue #296). A quota error that only appears mid-run takes the
+# 2026-11-21, issue #296). The probe's reply is logged on every path, its
+# quota signature is grepped over stdout and stderr whatever the exit status
+# (opencode has been seen exiting 0 on the cap for this tiny prompt), and
+# `available=true` is only claimed when the reply actually carries the OK
+# token - every other outcome fails open so a genuine failure still fails.
+#
+# The honest limit of the probe: it is a one-word ping, and a cap that is a
+# token budget can still pass it - the ping fits under a ceiling the real run
+# does not. Then the mid-run path below is the usual one: the agent step
+# reports the skip instead of failing and the run's check is green (a job
+# that ran cannot show skipped), with the comment saying "not run: quota".
+# Grey is only reachable on the pre-install skip - which is why the probe
+# still runs before Python and `uv sync`, not after.
+#
+# A quota error that only appears mid-run takes the
 # same path inside the agent step: the run reports the skip instead of
 # failing. Anything the probe cannot classify as quota still runs the agent
 # job, so a genuine failure - a broken install, a misconfigured model, a
@@ -89,9 +103,12 @@ jobs:
 
   # Cheap quota probe: one minimal model call on the configured model, before
   # the agent job installs Python, the locked dependencies or anything else.
-  # A positive quota/rate-limit/model-cap/region-refusal signature means the
-  # agent job is skipped (grey), and the post job reports "not run: quota".
-  # Any other outcome - including the probe itself failing - reports
+  # A positive quota/rate-limit/model-cap/region-refusal signature - grepped
+  # over stdout and stderr, whatever the exit status, because opencode has
+  # been seen exiting 0 on the cap for this tiny prompt - means the agent job
+  # is skipped (grey), and the post job reports "not run: quota".
+  # `available=true` is only claimed when the reply carries the OK token; any
+  # other outcome - including the probe itself failing - reports
   # available=true so a real failure still fails.
   quota-probe:
     needs: resolve
@@ -132,16 +149,10 @@ jobs:
             printf 'description: Read-only model quota probe (CI only)\n'
             printf 'mode: primary\n'
             printf 'model: "%s"\n' "$model"
+            # The ping needs no tool at all: deny everything, so a misbehaving
+            # model reply cannot make the probe act.
             printf 'permissions:\n'
             printf '  - { action: "*", resource: "*", effect: deny }\n'
-            printf '  - { action: read, resource: "*", effect: allow }\n'
-            printf '  - { action: glob, resource: "*", effect: allow }\n'
-            printf '  - { action: grep, resource: "*", effect: allow }\n'
-            printf '  - { action: shell, resource: "*", effect: allow }\n'
-            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
-            printf '  - { action: edit, resource: "*", effect: deny }\n'
-            printf '  - { action: read, resource: "*.env", effect: deny }\n'
-            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
             printf -- '---\n'
             printf 'Reply with the single word OK and nothing else.\n'
           } > "$conf/agents/quota-probe.md"
@@ -154,32 +165,42 @@ jobs:
           set -euo pipefail
           probe_dir="$RUNNER_TEMP/quota-probe"
           mkdir -p "$probe_dir"
-          if raw=$(opencode run --standalone --archived --agent quota-probe \
-            "Reply with the single word: OK" 2> "$probe_dir/stderr"); then
+          # opencode has been seen exiting 0 on the cap for this tiny prompt,
+          # so the exit status alone cannot clear the model: the quota
+          # signature is grepped over BOTH streams whatever the status, and
+          # `available=true` is only claimed when the reply actually carries
+          # the OK token. Every other outcome - a non-quota failure, a zero
+          # exit with no OK, even a dead probe - fails open: the agent job runs
+          # and the genuine failure surfaces there.
+          status=0
+          raw=$(opencode run --standalone --archived --agent quota-probe \
+            "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
+          printf '%s\n' "$raw" > "$probe_dir/stdout"
+          cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
+          # Always logged, bounded like the agent step's echo: run 44962236033
+          # passed this probe and hit "Free usage limit reached" 26 s later,
+          # and with the output unlogged there was no way to tell a real reach
+          # from a capped one - the success path used to log nothing at all.
+          echo "::group::Quota probe output (last 4000 bytes)"
+          tail -c 4000 "$probe_dir/combined"
+          echo "::endgroup::"
+          # Only a positive quota signature skips the agent job - on either
+          # stream, whatever the exit status. The pattern is the transient
+          # class the agent step below classifies with - a cap, a rate limit,
+          # an exhausted quota or a region refusal - and deliberately not the
+          # misconfiguration class (a model or variant that cannot be resolved
+          # at all): that is a genuine failure, and the agent job reports it.
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stdout" "$probe_dir/stderr"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The free model is capped, rate-limited or region-refused; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
+          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Quota probe reached the model; the agent job will run."
           else
-            printf '%s\n' "$raw" > "$probe_dir/raw"
-            cat "$probe_dir/stderr" >> "$probe_dir/raw"
-            # Bounded like the agent step's echo: a runaway probe cannot flood the log.
-            echo "::group::Quota probe output (last 4000 bytes)"
-            tail -c 4000 "$probe_dir/raw"
-            echo "::endgroup::"
-            # Only a positive quota signature skips the agent job. The pattern is
-            # the transient class the agent step below classifies with - a cap,
-            # a rate limit, an exhausted quota or a region refusal - and
-            # deliberately not the misconfiguration class (a model or variant
-            # that cannot be resolved at all): that is a genuine failure, and the
-            # agent job reports it.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stderr"; then
-              echo "available=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::The free model is capped, rate-limited or region-refused; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
-            else
-              # Not a quota signature: fail open. The agent job runs and the genuine
-              # failure surfaces there, exactly as it did before the probe existed.
-              echo "available=true" >> "$GITHUB_OUTPUT"
-              echo "::warning::The quota probe failed for a reason that is not a quota signature; the agent job will run and report the real failure."
-            fi
+            # Inconclusive - a non-quota failure, or a zero exit whose reply
+            # carried no OK. Fail open, exactly as before the probe existed.
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::The quota probe was inconclusive (exit ${status}, no OK token, no quota signature); the agent job will run and report the real failure."
           fi
 
   mutate:
@@ -376,6 +397,7 @@ jobs:
               {
                 printf '**Summary:** Not run: quota - the free model was capped, rate-limited or refused while the agent ran; no mutation testing was produced for this commit.\n\n'
                 printf 'Re-run the job after the quota resets.\n'
+                printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
               } > "$out"
               exit 0
             elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
@@ -386,6 +408,13 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$raw" > "$out.raw"
+          # stderr went to a file for the failure classifier; on success it
+          # would otherwise never reach the log, so it is echoed bounded too.
+          if [ -s "$out.stderr" ]; then
+            echo "::group::Agent stderr (last 4000 bytes)"
+            tail -c 4000 "$out.stderr"
+            echo "::endgroup::"
+          fi
           # opencode prints every assistant message; keep only the final comment,
           # which starts at the last "**Summary:**" line. Drop a closing code
           # fence the model may have wrapped around it.
@@ -469,6 +498,9 @@ jobs:
       # step titled it), so this step is the probe path's alone.
       - name: Write quota comment
         if: needs.quota-probe.outputs.available == 'false'
+        env:
+          BASE_SHA: ${{ needs.resolve.outputs.base }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head }}
         run: |
           set -euo pipefail
           skill_name=$(basename "$(dirname "$SKILL_PATH")")
@@ -476,6 +508,7 @@ jobs:
             printf '# Mutation Testing Action\n\n'
             printf '**Summary:** Not run: quota - the free model was capped, rate-limited or refused before the agent could start; no mutation testing was produced for this commit.\n\n'
             printf 'Re-run the workflow after the quota resets.\n'
+            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
             printf '\n---\n_Automated mutation testing not run: quota (`%s` skill)_\n' "$skill_name"
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"

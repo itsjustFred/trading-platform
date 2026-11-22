@@ -2,7 +2,7 @@
 the job that grades it. Both select the skill the same way, and the selection is the one block in
 the file that decides *whose* rules ran - which is exactly what a PR has an interest in changing.
 
-Nothing in CI parses these workflows. A one-line regression - the standalone base-commit check
+Nothing else in CI parses these workflows. A one-line regression - the standalone base-commit check
 commented out, the path lookup put back inside an `if` where a `git` failure is only a false
 branch, the notice of whose rules ran dropped - would merge silently, and the symptom is a verdict
 produced by rules nobody chose, presented as one produced by the base branch's.
@@ -536,13 +536,18 @@ def test_the_quota_probe_gates_the_agent_job() -> None:
 _STUB_OPENCODE = """#!/usr/bin/env bash
 # A stand-in for the `opencode` the quota probe and the agent step call.
 # $STUB_OPENCODE_MODE selects the reply: ok, verdict (a parseable report),
-# quota (a cap signature on stderr, exit 1), other (a non-quota failure,
-# exit 1).
+# quota (a cap signature on stderr, exit 1), quota-out / quota-err (the same
+# signature on a ZERO exit - the shape run 44962245768 showed the probe
+# cannot currently see), no-ok (a zero exit whose reply carries no OK token),
+# other (a non-quota failure, exit 1).
 set -u
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   verdict) printf '**Summary:** probe verdict\\n**Verdict: PASS**\\n'; exit 0 ;;
   quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
+  quota-out) printf 'Free usage limit reached for this model\\n'; exit 0 ;;
+  quota-err) printf 'Free usage limit reached for this model\\n' >&2; exit 0 ;;
+  no-ok) printf 'Here is the answer you asked for.\\n'; exit 0 ;;
   other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
 esac
 """
@@ -561,15 +566,25 @@ def _stub_bin(tmp_path) -> Path:
 def test_the_quota_probe_step_reports_only_a_positive_quota_signature(tmp_path) -> None:
     """The probe's whole contract is its output: `available=false` only when the
     model's own reply carries a quota signature. Executed against a stub
-    `opencode` in both siblings, because the classification is a grep over
-    stderr and a string assertion cannot tell a pattern that matches from one
+    `opencode` in both siblings, because the classification is a grep over the
+    reply and a string assertion cannot tell a pattern that matches from one
     that does not. A success and a non-quota failure both fail open - the agent
     job runs and the genuine failure surfaces there."""
     for name in SIBLINGS:
         stage = _stage(name)
         job = _load(name)["jobs"]["quota-probe"]
         step = _find_step(job, r"^Probe model quota$")
-        for mode, expected in (("ok", "true"), ("quota", "false"), ("other", "true")):
+        for mode, expected in (
+            ("ok", "true"),
+            ("quota", "false"),
+            # The cap has been observed arriving on a ZERO exit, on either
+            # stream: the signature is grepped over stdout and stderr whatever
+            # the status, so a capped model cannot report `available=true`.
+            ("quota-out", "false"),
+            ("quota-err", "false"),
+            ("no-ok", "true"),
+            ("other", "true"),
+        ):
             case = tmp_path / f"{stage}-{mode}"
             case.mkdir(parents=True, exist_ok=True)
             runner_temp = case / "runner-temp"
@@ -599,6 +614,43 @@ def test_the_quota_probe_step_reports_only_a_positive_quota_signature(tmp_path) 
             assert f"available={expected}" in written, (
                 f"{name} ({mode}): the probe reported {written!r}, expected {expected}"
             )
+            if mode == "ok":
+                # The probe's output is logged on every path, bounded: the
+                # success path used to log nothing, which is why run
+                # 44962245768 could pass the probe and cap 26 s later with no
+                # way to tell a real reach from a capped one.
+                assert "::group::Quota probe output" in result.stdout, (
+                    f"{name}: the probe does not log its output on success"
+                )
+            if mode == "no-ok":
+                assert "::warning::" in result.stdout, (
+                    f"{name}: the inconclusive probe (no OK, no signature) "
+                    "fails open silently"
+                )
+
+
+def test_the_quota_probe_agent_is_denied_every_tool_and_the_probe_is_identical() -> None:
+    """The probe pings the model with a one-word prompt; it needs no tool at
+    all, so its agent config is a deny-all and a misbehaving reply cannot make
+    the probe act. And the probe job is copied into both siblings: the config
+    and the step body must be identical, or a classification fix that lands in
+    one copy and not the other is exactly the drift the bundle-26 review
+    found."""
+    seen: dict[str, set[str]] = {}
+    for name in SIBLINGS:
+        job = _load(name)["jobs"]["quota-probe"]
+        for step_name in ("Configure quota probe agent", "Probe model quota"):
+            body = _run(_find_step(job, rf"^{re.escape(step_name)}$"))
+            seen.setdefault(step_name, set()).add(body)
+            if step_name == "Configure quota probe agent":
+                assert "effect: allow" not in body, (
+                    f"{name}: the quota probe agent is allowed tools it does not need"
+                )
+    for step_name, bodies in seen.items():
+        assert len(bodies) == 1, (
+            f"{step_name} differs between the siblings - the probe "
+            "classification must not drift"
+        )
 
 
 _AGENT_STEP = {
