@@ -6311,8 +6311,9 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
         "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
-        # #349: lets ranking tell pre-#229 rows (fixed sqrt(252)
-        # annualisation, field absent) from measured-density rows.
+        # #349: lets ranking tell pre-#229 rows (fixed sqrt(252) on the
+        # unfiltered calendar-filled series, field absent) from rows on the
+        # asset-class convention (252 equities/FX/CFDs, 365 crypto).
         "equity_return_periods_per_year": stats.get("equity_return_periods_per_year"),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),

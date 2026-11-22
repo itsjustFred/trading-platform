@@ -133,7 +133,9 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
     # trade list cannot support an equity curve — fail closed, never fall
     # back to the printed ratio).
     reference_stats["sharpe_ratio_reported"] = reference_stats.get("sharpe_ratio")
-    reference_stats["sharpe_ratio"] = _reference_sharpe_ratio(reference)
+    reference_stats["sharpe_ratio"] = _reference_sharpe_ratio(
+        reference, **_platform_return_context(case.platform_path)
+    )
     row = _row_payload(
         case_id=case.case_id,
         reference_framework="mt5_xlsx",
@@ -142,18 +144,25 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
         reference_stats=reference_stats,
         platform_stats=platform_stats,
         notes=[
-            "MT5 fills, spread/commission, contract sizing and fixed-risk execution differ from platform fills.",
+            (
+                "MT5 fills, spread/commission, contract sizing and fixed-risk "
+                "execution differ from platform fills."
+            ),
             (
                 "MT5 trade timestamps are the broker's server wall clock "
                 f"({case.broker_clock}, shared/broker_clock.py) and are converted to UTC "
                 "through that clock's historical offset segments."
             ),
-            "MT5 CAGR is derived from report period, initial deposit and net profit because the XLSX summary omits CAGR.",
             (
-                "Sharpe parity applies the platform's observed-day, "
-                "measured-density annualisation to both equity curves; the "
-                "MT5 printed Sharpe-Ratio is reported as "
-                "sharpe_ratio_reported and is not the comparison basis."
+                "MT5 CAGR is derived from report period, initial deposit and "
+                "net profit because the XLSX summary omits CAGR."
+            ),
+            (
+                "Sharpe parity applies the platform's trading-day filtering "
+                "and asset-class annualisation (252 equities/FX/CFDs, 365 "
+                "crypto) to both equity curves; the MT5 printed Sharpe-Ratio "
+                "is reported as sharpe_ratio_reported and is not the "
+                "comparison basis."
             ),
         ],
     )
@@ -161,23 +170,65 @@ def _build_mt5_row(case: MT5ComparisonCase) -> dict[str, Any]:
     return row
 
 
-def _reference_sharpe_ratio(reference: Any) -> float | None:
+def _platform_return_context(platform_path: Path) -> dict[str, Any]:
+    """Venue context of the platform artifact the MT5 curve is compared to.
+
+    Sharpe parity applies OUR formula to both curves, so the imported MT5
+    curve must resolve the same trading-day calendar and annualisation
+    convention (252 equities/FX/CFDs, 365 crypto — #229 maintainer decision
+    2026-11-22) as the platform run. The platform artifact's own
+    ``meta.data`` carries that context (``execution_context`` first, then
+    the top-level ``data`` fields); an absent or unreadable artifact yields
+    an empty context and the reference falls back to its own symbol.
+    """
+    try:
+        payload = json.loads(platform_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    meta_data = ((payload.get("meta") or {}).get("data")) or {}
+    if not isinstance(meta_data, dict):
+        return {}
+    context = meta_data.get("execution_context") or {}
+    if not isinstance(context, dict):
+        context = {}
+    symbols = context.get("symbols") or meta_data.get("symbols") or []
+    data_source = context.get("data_source") or meta_data.get("source")
+    data_dir = context.get("data_dir") or meta_data.get("data_dir")
+    # The platform side recovers a book-level asset class from the OHLCV
+    # path layout when metadata does not carry one; mirror that here so the
+    # imported curve resolves the identical annualisation convention.
+    from runner.stats import _book_asset_class
+
+    symbol_list = [str(symbol) for symbol in symbols if str(symbol or "").strip()]
+    return {
+        "symbols": symbol_list,
+        "data_source": data_source,
+        "asset_class": _book_asset_class(
+            meta_data, context, symbol_list, data_source, data_dir
+        ),
+        "data_dir": data_dir,
+    }
+
+
+def _reference_sharpe_ratio(reference: Any, **context: Any) -> float | None:
     """Platform Sharpe formula applied to the imported MT5 equity curve.
 
     The MT5 XLSX report carries no equity graph, so the curve is rebuilt
     from the trade list: initial capital plus cumulative net PnL booked at
     each position's last exit — the same realized-equity evidence the trade
     list is the primary carrier of. ``compute_stats`` then applies the
-    identical observed-day return series and measured-density annualisation
-    used for the platform artifact, which is what makes the two Sharpes
-    comparable (#229).
+    identical trading-day filtering and asset-class annualisation (252 for
+    equities/FX/CFDs, 365 for 24/7 crypto — the platform artifact's own
+    venue context is passed through ``**context``) used for the platform
+    artifact, which is what makes the two Sharpes comparable (#229).
 
     The rebuilt curve is calendar-filled — one point per calendar day, flat
     between exits — because that is the curve shape production publishes:
-    ``attach_daily_equity`` emits a point for every calendar day, so its
-    measured density is ~365/yr. An exits-only curve would measure the exit
-    frequency instead and annualise on a different basis than the platform
-    side, which is exactly the mismatch this comparison exists to remove.
+    ``attach_daily_equity`` emits a point for every calendar day. An
+    exits-only curve would space its observations by exit frequency and
+    annualise on a different basis than the platform side, which is exactly
+    the mismatch this comparison exists to remove; the venue calendar drops
+    the weekend/holiday filler rows on both sides identically.
 
     Fails closed (``None``) when the trade list cannot support the curve:
     fewer than two exits, an unparseable exit timestamp, or a non-finite
@@ -239,11 +290,18 @@ def _reference_sharpe_ratio(reference: Any) -> float | None:
         )
         day += timedelta(days=1)
 
+    symbols = context.get("symbols") or [
+        getattr(reference, "symbol", "") or ""
+    ]
     stats = compute_stats(
         [],
         initial_capital=initial_capital,
         equity_curve=points,
         risk_free_rate=REFERENCE_RISK_FREE_RATE,
+        symbols=[s for s in symbols if s] or None,
+        data_source=context.get("data_source"),
+        asset_class=context.get("asset_class"),
+        data_dir=context.get("data_dir"),
     )
     sharpe = _safe_float(stats.get("sharpe_ratio"))
     return sharpe

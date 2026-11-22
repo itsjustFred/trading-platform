@@ -76,8 +76,9 @@ def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
     """Resample per-bar returns to daily close-to-close returns.
 
     Sharpe here is annualised with sqrt(252) on daily observations (#87,
-    #129 H8); ``runner/stats.py`` annualises at the measured observation
-    density since #229, so the two conventions intentionally differ.
+    #129 H8); ``runner/stats.py`` drops calendar-filled non-trading rows and
+    annualises at 252 (equities/FX/CFDs) or 365 (crypto) since #229, so the
+    two conventions intentionally differ.
     Per-bar returns inside a UTC
     day are compounded (``prod(1 + r) - 1``), which for an interior day is
     exactly the day's close-to-close return, because each bar return already

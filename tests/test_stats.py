@@ -13,7 +13,7 @@ from runner.stats import (
     _max_drawdown_pct_manual,
     _period_risk_free_rate,
     _resolve_backtest_period_bounds,
-    _return_periods_per_year,
+    _resolve_return_convention,
     _sharpe_manual,
     _sortino_manual,
     compute_stats,
@@ -521,30 +521,28 @@ class TestFirstTradingDayReturn:
         series = _daily_returns_series_from_equity_curve(self._curve())
         assert series is not None
         assert stats["equity_return_frequency"] == "daily"
-        periods = _return_periods_per_year(series)
-        assert periods is not None
+        # No symbol context: the convention falls back to the non-crypto
+        # 252-period annualisation on the Monday–Friday trading-day grid.
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
         assert stats["sharpe_ratio"] == pytest.approx(
             _sharpe_manual(
-                [float(value) for value in series], 0.0, periods_per_year=periods
+                [float(value) for value in series], 0.0, periods_per_year=252
             ),
             abs=1e-4,
         )
         assert stats["sortino_ratio"] == pytest.approx(
             _sortino_manual(
-                [float(value) for value in series], 0.0, periods_per_year=periods
+                [float(value) for value in series], 0.0, periods_per_year=252
             ),
             abs=1e-4,
         )
 
 
-class TestObservedDayAnnualisation:
-    """#229: Sharpe/Sortino annualise at the measured observation density.
-
-    Weekend/holiday zero-fill used to dilute every Mon-Fri curve and the
-    fixed sqrt(252) then understated the ratio by sqrt(252/365) ~= 0.831.
-    The maintainer decision (2026-11-21) is: use only observed days and
-    annualise with the measured observation density (~252 for business-day
-    curves, ~365 for 24/7 crypto).
+class TestTradingDaySharpeConvention:
+    """#229 maintainer decision (2026-11-22): calendar-filled weekend/holiday
+    zero-return rows are dropped before Sharpe/Sortino, which then
+    annualise at 252 for equities/FX/CFDs and 365 for 24/7 crypto, with the
+    asset class taken from the existing venue-calendar classification.
     """
 
     @staticmethod
@@ -561,28 +559,14 @@ class TestObservedDayAnnualisation:
             for ts, eq in zip(bdays, equity)
         ], returns
 
-    def test_business_day_curve_recovers_the_business_day_sharpe(self):
-        curve, returns = self._business_day_curve()
-        mean = float(returns.mean())
-        std = float(returns.std(ddof=1))
-        expected = mean / std * math.sqrt(252)
-
-        stats = compute_stats([], equity_curve=curve)
-
-        # The pre-fix payload read ~0.831 * expected (sqrt(252/365) dilution).
-        assert stats["sharpe_ratio"] == pytest.approx(expected, rel=0.05)
-        assert stats["sortino_ratio"] is not None
-
-    def test_calendar_filled_curve_agrees_with_observed_day_curve(self):
-        """A point every calendar day (flat weekends) must give the same
-        Sharpe as the observed-days-only curve: the zero days dilute the
-        per-observation ratio exactly as much as the higher measured density
-        annualises it."""
+    @staticmethod
+    def _calendar_filled(curve: list[EquityPoint]) -> list[EquityPoint]:
+        """One point per calendar day, flat equity carried across gaps —
+        the shape ``attach_daily_equity`` publishes."""
         import pandas as pd
 
-        observed, _returns = self._business_day_curve(seed=7, days=260)
         by_day = {
-            pd.Timestamp(point.time).normalize(): point.equity for point in observed
+            pd.Timestamp(point.time).normalize(): point.equity for point in curve
         }
         start, end = min(by_day), max(by_day)
         filled = []
@@ -592,19 +576,74 @@ class TestObservedDayAnnualisation:
             if day.normalize() in by_day:
                 last = by_day[day.normalize()]
             filled.append(EquityPoint(time=day.isoformat(), equity=last))
+        return filled
 
-        observed_stats = compute_stats([], equity_curve=observed)
-        filled_stats = compute_stats([], equity_curve=filled)
+    @staticmethod
+    def _series_values(stats_curve: list[EquityPoint], **kwargs) -> list[float]:
+        series = _daily_returns_series_from_equity_curve(stats_curve, **kwargs)
+        assert series is not None
+        return [float(value) for value in series]
 
-        assert observed_stats["sharpe_ratio"] == pytest.approx(
-            filled_stats["sharpe_ratio"], rel=0.02
+    @staticmethod
+    def _expected_sharpe(values: list[float], periods: float) -> float:
+        mean = sum(values) / len(values)
+        std = (sum((value - mean) ** 2 for value in values) / (len(values) - 1)) ** 0.5
+        return mean / std * math.sqrt(periods)
+
+    def test_calendar_filled_curve_drops_weekend_rows(self):
+        """Weekend/holiday filler rows must not reach Sharpe/Sortino: the
+        calendar-filled production shape and the observed-day shape produce
+        the same trading-day return series."""
+        observed, _returns = self._business_day_curve(seed=7, days=260)
+        filled = self._calendar_filled(observed)
+
+        periods, trading_dates = _resolve_return_convention(
+            equity_curve=filled,
+            symbols=None,
+            data_source=None,
+            asset_class=None,
+            data_dir=None,
         )
-        assert observed_stats["sortino_ratio"] == pytest.approx(
-            filled_stats["sortino_ratio"], rel=0.02
+        assert periods == pytest.approx(252.0)
+        filled_series = _daily_returns_series_from_equity_curve(
+            filled, trading_dates=trading_dates
+        )
+        # The observed curve gets the same filter: resampling to daily
+        # forward-fills weekend rows into it just the same, so both shapes
+        # must drop non-trading days before the values are compared.
+        observed_series = _daily_returns_series_from_equity_curve(
+            observed, trading_dates=trading_dates
+        )
+        assert filled_series is not None and observed_series is not None
+        # No Saturday/Sunday survives the filter; the values are identical
+        # because the weekend rows were pure zero-return filler.
+        assert all(ts.weekday() < 5 for ts in filled_series.index)
+        assert list(filled_series.values) == pytest.approx(
+            list(observed_series.values), rel=1e-9
         )
 
-    def test_crypto_24_7_curve_annualises_near_365(self):
-        """A daily 24/7 curve measures ~365 observations/year, not 252."""
+    def test_business_day_curve_annualises_at_252(self):
+        curve, _returns = self._business_day_curve(seed=1, days=500)
+        stats = compute_stats([], equity_curve=curve)
+
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
+        values = self._series_values(
+            curve,
+            trading_dates=_resolve_return_convention(
+                equity_curve=curve,
+                symbols=None,
+                data_source=None,
+                asset_class=None,
+                data_dir=None,
+            )[1],
+        )
+        assert stats["sharpe_ratio"] == pytest.approx(
+            self._expected_sharpe(values, 252.0), abs=1e-4
+        )
+
+    def test_crypto_book_keeps_every_day_and_annualises_at_365(self):
+        """A 24/7 crypto book has no closed days: weekend rows are real
+        observations and stay, and the annualisation is sqrt(365)."""
         import numpy as np
         import pandas as pd
 
@@ -617,102 +656,93 @@ class TestObservedDayAnnualisation:
             for ts, eq in zip(days, equity)
         ]
 
-        stats = compute_stats([], equity_curve=curve)
-        periods = stats["equity_return_periods_per_year"]
+        stats = compute_stats([], equity_curve=curve, symbols=["BTCUSD"])
 
-        assert 340.0 < periods < 380.0
-        # Expected ratio from the series compute_stats itself builds: the
-        # first day's return has no prior close and is legitimately absent.
-        series = _daily_returns_series_from_equity_curve(curve)
-        assert series is not None
-        values = [float(value) for value in series]
-        mean = sum(values) / len(values)
-        std = (sum((value - mean) ** 2 for value in values) / (len(values) - 1)) ** 0.5
+        assert stats["equity_return_periods_per_year"] == pytest.approx(365.0)
+        periods, trading_dates = _resolve_return_convention(
+            equity_curve=curve,
+            symbols=["BTCUSD"],
+            data_source=None,
+            asset_class=None,
+            data_dir=None,
+        )
+        assert periods == pytest.approx(365.0)
+        values = self._series_values(curve, trading_dates=trading_dates)
+        # Every calendar day survives: 400 daily points -> 399 returns.
+        assert len(values) == 399
         assert stats["sharpe_ratio"] == pytest.approx(
-            mean / std * math.sqrt(periods), abs=1e-4
+            self._expected_sharpe(values, 365.0), abs=1e-4
         )
 
-    def test_business_day_curve_reports_density_near_252(self):
-        curve, _returns = self._business_day_curve(seed=11, days=500)
-
-        stats = compute_stats([], equity_curve=curve)
-        periods = stats["equity_return_periods_per_year"]
-
-        assert 235.0 < periods < 270.0
-
-    def test_weekly_curve_annualises_at_the_measured_weekly_density(self):
-        """Sparse curves get their own density: ~52 weekly returns/year."""
-        import numpy as np
+    def test_us_equity_symbol_drops_exchange_holidays(self):
+        """A resolved venue calendar removes holiday rows too, not just
+        weekends: NYSE is closed on 2024-07-04."""
         import pandas as pd
 
-        rng = np.random.default_rng(5)
-        weeks = pd.date_range("2020-01-06", periods=156, freq="W-MON", tz="UTC")
-        returns = rng.normal(0.002, 0.03, len(weeks))
-        equity = 100_000.0 * np.cumprod(1 + returns)
+        days = pd.date_range("2024-06-28", "2024-07-08", freq="D", tz="UTC")
         curve = [
-            EquityPoint(time=ts.isoformat(), equity=float(eq))
-            for ts, eq in zip(weeks, equity)
+            EquityPoint(time=ts.isoformat(), equity=100_000.0 * (1.001**i))
+            for i, ts in enumerate(days)
         ]
 
-        stats = compute_stats([], equity_curve=curve)
-        periods = stats["equity_return_periods_per_year"]
-
-        assert 45.0 < periods < 60.0
-        series = _daily_returns_series_from_equity_curve(curve)
+        stats = compute_stats(
+            [], equity_curve=curve, symbols=["AAPL"], data_source="yfinance"
+        )
+        periods, trading_dates = _resolve_return_convention(
+            equity_curve=curve,
+            symbols=["AAPL"],
+            data_source="yfinance",
+            asset_class=None,
+            data_dir=None,
+        )
+        assert periods == pytest.approx(252.0)
+        assert __import__("datetime").date(2024, 7, 4) not in trading_dates
+        series = _daily_returns_series_from_equity_curve(
+            curve, trading_dates=trading_dates
+        )
         assert series is not None
-        values = [float(value) for value in series]
-        mean = sum(values) / len(values)
-        std = (sum((value - mean) ** 2 for value in values) / (len(values) - 1)) ** 0.5
-        assert stats["sharpe_ratio"] == pytest.approx(
-            mean / std * math.sqrt(periods), abs=1e-4
+        assert all(ts.date() != __import__("datetime").date(2024, 7, 4) for ts in series.index)
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
+
+    def test_unresolvable_venue_falls_back_to_weekday_grid(self):
+        """Unknown venues are never treated as 24/7: weekends still drop
+        and the book annualises at 252."""
+        curve, _returns = self._business_day_curve(seed=13, days=120)
+        filled = self._calendar_filled(curve)
+
+        stats = compute_stats(
+            [], equity_curve=filled, symbols=["NOTASYMBOL"]
         )
 
-    def test_periods_per_year_spans_from_first_equity_observation(self):
-        """#349 review: the density span runs from the first *equity*
-        observation to the last return with no inclusive +1 — n returns
-        over n intervals is the cadence itself (~52/yr weekly), not the
-        inflated value a first-return/+1-day span produced."""
-        import pandas as pd
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
+        series = _daily_returns_series_from_equity_curve(
+            filled,
+            trading_dates=_resolve_return_convention(
+                equity_curve=filled,
+                symbols=["NOTASYMBOL"],
+                data_source=None,
+                asset_class=None,
+                data_dir=None,
+            )[1],
+        )
+        assert series is not None
+        assert all(ts.weekday() < 5 for ts in series.index)
 
-        idx = pd.date_range("2024-01-01", periods=9, freq="7D", tz="UTC")
-        series = pd.Series([0.01 * i for i in range(1, 10)], index=idx)
-        first_equity = idx[0] - pd.Timedelta(days=7)
+    def test_mixed_book_annualises_at_252(self):
+        """Crypto + non-crypto is not a 24/7 book: the conservative 252
+        convention applies."""
+        curve, _returns = self._business_day_curve(seed=17, days=120)
 
-        density = _return_periods_per_year(series, first_observation=first_equity)
-
-        # 9 weekly returns; the span runs from the first equity observation
-        # (one week before the first return) over 63 days — ~52/yr.
-        assert density == pytest.approx(9 * 365.25 / 63.0)
-        # Without the equity anchor the span starts at the first return and
-        # reads high — the inflation this parameter exists to remove.
-        assert _return_periods_per_year(series) == pytest.approx(
-            9 * 365.25 / ((idx[-1] - idx[0]).days + 1.0)
+        stats = compute_stats(
+            [], equity_curve=curve, symbols=["BTCUSD", "EURUSD"]
         )
 
-    def test_friday_start_business_day_curve_reports_business_density(self):
-        """A curve whose first week holds only Friday still measures the
-        business-day density, not an inflated short-span value."""
-        import numpy as np
-        import pandas as pd
-
-        rng = np.random.default_rng(11)
-        bdays = pd.bdate_range("2024-01-05", periods=120, tz="UTC")  # starts Friday
-        returns = rng.normal(0.0008, 0.01, len(bdays))
-        equity = 100_000.0 * np.cumprod(1 + returns)
-        curve = [
-            EquityPoint(time=ts.isoformat(), equity=float(eq))
-            for ts, eq in zip(bdays, equity)
-        ]
-
-        stats = compute_stats([], equity_curve=curve)
-        periods = stats["equity_return_periods_per_year"]
-
-        assert 235.0 < periods < 270.0
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
 
     def test_too_few_returns_publish_undefined_ratios_as_null(self):
-        """#349 review: a metric named in `undefined_metrics` must publish
-        null, not the 0.0 its local variable initialised to — a fabricated
-        0.0 reads as an honest measurement to ranking and parity checks."""
+        """A metric named in `undefined_metrics` must publish null, not the
+        0.0 its local variable initialised to — a fabricated 0.0 reads as
+        an honest measurement to ranking and parity checks."""
         curve = [
             EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0),
             EquityPoint(time="2024-01-01T12:00:00+00:00", equity=100_100.0),
@@ -722,7 +752,6 @@ class TestObservedDayAnnualisation:
 
         assert stats["sharpe_ratio"] is None
         assert "sharpe_ratio" in stats["undefined_metrics"]
-
 
 class TestMaxConsecutiveLosses:
     def test_no_losses(self):
@@ -890,17 +919,23 @@ class TestCalmarAndQsFallback:
             for index, equity in enumerate(_equities())
         ]
 
-        unknown = compute_stats([], equity_curve=unparseable, risk_free_rate=0.04)
-        daily_stats = compute_stats([], equity_curve=daily, risk_free_rate=0.04)
+        # A crypto symbol keeps every calendar day (24/7 venue) and
+        # annualises at 365, so the daily series still carries all twelve
+        # returns and the p-values stay comparable.
+        unknown = compute_stats(
+            [], equity_curve=unparseable, risk_free_rate=0.04, symbols=["BTCUSD"]
+        )
+        daily_stats = compute_stats(
+            [], equity_curve=daily, risk_free_rate=0.04, symbols=["BTCUSD"]
+        )
 
         assert daily_stats["equity_return_frequency"] == "daily"
+        assert daily_stats["equity_return_periods_per_year"] == pytest.approx(365.0)
         assert unknown["equity_return_frequency"].startswith("unknown")
         daily_series = _daily_returns_series_from_equity_curve(daily)
         assert daily_series is not None
-        periods = _return_periods_per_year(daily_series)
-        assert periods is not None
         assert daily_stats["sharpe_ratio"] == pytest.approx(
-            _sharpe_manual(returns, 0.04, periods_per_year=periods), abs=1e-4
+            _sharpe_manual(returns, 0.04, periods_per_year=365.0), abs=1e-4
         )
         assert "sharpe_ratio" not in daily_stats["undefined_metrics"]
         for metric in ("sharpe_ratio", "sortino_ratio", "psr"):
@@ -942,7 +977,7 @@ class TestCalmarAndQsFallback:
         assert _describe_return_frequency("none", None) == "none"
         assert _describe_return_frequency(UNKNOWN_RETURN_FREQUENCY, "why") == "unknown:why"
 
-    def test_sharpe_manual_requires_the_measured_density(self):
+    def test_sharpe_manual_requires_the_annualisation_periods(self):
         """#229: the annualisation density is a required input, not a default.
 
         The old fixed sqrt(252) understated business-day Sharpes by
@@ -988,23 +1023,28 @@ class TestWithoutQuantStats:
     def test_fallback_matches_the_quantstats_definition_for_a_daily_curve(self, monkeypatch):
         """No optional dependency must not mean a different Sharpe.
 
-        Both branches are documented to publish the daily-resampled, 252-period
-        annualized ratio. Force the flag off and compare against the manual
-        helpers directly: a fallback that silently returned the default 0.0
-        would pass any "is a number" assertion but not this one.
+        Both branches are documented to publish the same daily-resampled,
+        asset-class-annualized ratio. Force the flag off and compare against
+        the manual helpers directly: a fallback that silently returned the
+        default 0.0 would pass any "is a number" assertion but not this one.
+        A crypto symbol keeps every calendar day so the eight returns all
+        survive the trading-day filter.
         """
         returns = [0.012, -0.008, 0.004, -0.011, 0.006, 0.002, -0.003, 0.009]
         curve = _equity_curve_from_returns(returns)
 
         stats = self._compute_without_quantstats(
-            monkeypatch, trades=[], equity_curve=curve, risk_free_rate=0.04
+            monkeypatch,
+            trades=[],
+            equity_curve=curve,
+            risk_free_rate=0.04,
+            symbols=["BTCUSD"],
         )
 
         assert stats["equity_return_frequency"] == "daily"
         series = _daily_returns_series_from_equity_curve(curve)
         assert series is not None
-        periods = _return_periods_per_year(series)
-        assert periods is not None
+        periods = 365.0
         # The payload rounds `sharpe_ratio` to four decimals (stats.py),
         # so the tolerance is that rounding floor, not the float equality.
         assert stats["sharpe_ratio"] == pytest.approx(

@@ -329,8 +329,9 @@ def test_reference_sharpe_uses_platform_formula_on_imported_curve():
     assert sharpe is not None
     # Same-formula check, independently rebuilt: the reference curve is
     # calendar-filled (one point per calendar day, flat between exits) —
-    # the shape production publishes via attach_daily_equity — so the
-    # measured density is ~365/yr, not the exit frequency.
+    # the shape production publishes via attach_daily_equity — and the
+    # 2026-11-22 convention drops the weekend filler rows and annualises
+    # at 252 for this unclassified (non-crypto) book.
     from datetime import datetime, timedelta, timezone
 
     from runner.stats import compute_stats
@@ -357,11 +358,13 @@ def test_reference_sharpe_uses_platform_formula_on_imported_curve():
         day += timedelta(days=1)
 
     stats = compute_stats([], initial_capital=100_000.0, equity_curve=points)
-    assert stats["equity_return_periods_per_year"] == pytest.approx(365.25, rel=0.02)
+    assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
     expected = stats["sharpe_ratio"]
     assert sharpe == pytest.approx(expected, abs=1e-4)
-    # An exits-only curve would measure ~10 exits over ~14 days (~260/yr)
-    # and publish a different Sharpe — pinning the calendar-fill choice.
+    # Trading-day filtering makes the fill style irrelevant: an exits-only
+    # curve resamples to the same daily equity and the same trading-day
+    # return series, so it now publishes the SAME Sharpe — the weekend
+    # filler rows that used to distort it are dropped on both shapes.
     exit_only_stats = compute_stats(
         [],
         initial_capital=100_000.0,
@@ -376,7 +379,7 @@ def test_reference_sharpe_uses_platform_formula_on_imported_curve():
             ],
         ],
     )
-    assert exit_only_stats["sharpe_ratio"] != pytest.approx(sharpe, abs=1e-4)
+    assert exit_only_stats["sharpe_ratio"] == pytest.approx(sharpe, abs=1e-4)
 
 
 def test_reference_sharpe_fails_closed_without_enough_exits():

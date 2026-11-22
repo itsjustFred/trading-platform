@@ -55,10 +55,9 @@ class StrategyEquityPoint:
 
 #: Annualization convention for the portfolio Sharpe (Cleanup 16-D1, F36):
 #: daily equity curves are the documented default cadence, annualized with
-#: 252 trading periods. Since #229 ``runner/stats.py`` annualises with the
-#: measured observation density instead (~365 for the calendar-filled
-#: production curves), so this fixed-252 convention is only approximately
-#: aligned — aligning it is tracked as a follow-up (#353).
+#: 252 trading periods — the same convention ``runner/stats.py`` uses for
+#: equities/FX/CFDs. For 24/7 crypto books stats.py annualises at 365, so
+#: this fixed-252 convention diverges there only (tracked in #353).
 PORTFOLIO_PERIODS_PER_YEAR_DEFAULT = 252.0
 
 #: Timestamps (as datetime-like objects) of the equity matrix most recently
@@ -386,9 +385,9 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
     # Equity curves are trading-day series in practice; a calendar-daily
-    # cadence is mapped onto the 252 trading-day convention. Since #229
-    # stats.py annualises calendar-filled curves at ~365 measured density,
-    # this mapping is approximate — realignment is tracked in #353.
+    # cadence is mapped onto the 252 trading-day convention — identical to
+    # stats.py for equities/FX/CFDs; crypto books annualise at 365 there
+    # (realignment tracked in #353).
     if 350.0 <= periods_per_year <= 380.0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
     # Coarser-than-daily cadences (weekly ≈ 52, biweekly ≈ 26, monthly ≈ 12)

@@ -16,10 +16,13 @@ def _metric(row: dict[str, Any], key: str, default: float = 0.0) -> float:
 
 
 # Rows written before #229 carry no `equity_return_periods_per_year` and were
-# annualised at sqrt(252); measured-density rows annualise the same
-# calendar-filled curve at ~sqrt(365.25). Rescaling legacy Sharpes onto the
-# new basis keeps identical performance ranked identically regardless of
-# when the row was computed (#349 review, maintainer Q2 option a).
+# annualised at sqrt(252) on the unfiltered calendar-filled series. Since the
+# 2026-11-22 decision stats.py drops weekend/holiday filler rows and
+# annualises at 252 (equities/FX/CFDs) or 365 (crypto); the residual
+# old-vs-new scale difference is ~sqrt(365/252) either way, so rescaling
+# legacy Sharpes onto the new basis keeps identical performance ranked
+# identically regardless of when the row was computed (#349 review,
+# maintainer Q2 option a).
 _LEGACY_SHARPE_RESCALE = math.sqrt(365.25 / 252.0)
 
 

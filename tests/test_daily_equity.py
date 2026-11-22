@@ -1410,10 +1410,10 @@ class TestAttachDailyEquity:
         """#229: production curves are calendar-filled, not observed-day-only.
 
         A weekday-only strategy still gets one equity point per calendar
-        day (weekends flat), so ``compute_stats`` measures ~365
-        observations/year — the density contract documented in
-        docs/cross-engine-backtest-contract.md. This pins the production
-        reality the Sharpe annualisation actually sees.
+        day (weekends flat). The published curve keeps that shape, but
+        ``compute_stats`` drops the weekend filler rows before Sharpe and
+        annualises at the asset-class convention — 252 here because no
+        symbol context resolves the book to 24/7 crypto.
         """
         from runner.stats import compute_stats
 
@@ -1459,7 +1459,29 @@ class TestAttachDailyEquity:
             initial_capital=result.meta.initial_capital,
             equity_curve=result.equity_curve,
         )
-        assert stats["equity_return_periods_per_year"] == pytest.approx(365.25, rel=0.02)
+        # Unclassified book: conservative non-crypto convention.
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
+
+        # The weekend filler rows are zero-return and must not reach the
+        # ratio series: resolving the trading-day grid and filtering leaves
+        # only weekdays.
+        from runner.stats import (
+            _daily_returns_series_from_equity_curve,
+            _resolve_return_convention,
+        )
+
+        _periods, trading_dates = _resolve_return_convention(
+            equity_curve=result.equity_curve,
+            symbols=None,
+            data_source=None,
+            asset_class=None,
+            data_dir=None,
+        )
+        series = _daily_returns_series_from_equity_curve(
+            result.equity_curve, trading_dates=trading_dates
+        )
+        assert series is not None
+        assert all(ts.weekday() < 5 for ts in series.index)
 
 
 class TestEngineCurveGapFill:
@@ -1959,7 +1981,15 @@ class TestEnginePathMatchesCalendarPath:
         engine_stats = self._stats(engine_points, scoped)
         calendar_stats = self._stats(calendar_points, scoped)
         for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value", "total_return"):
-            assert engine_stats[key] == pytest.approx(calendar_stats[key], abs=1e-6), key
+            engine_value = engine_stats.get(key)
+            calendar_value = calendar_stats.get(key)
+            if engine_value is None or calendar_value is None:
+                # Weekend filler rows no longer count toward the PSR
+                # observation minimum, so a short window can leave it
+                # undefined on BOTH paths — agreement is what matters.
+                assert engine_value == calendar_value, key
+            else:
+                assert engine_value == pytest.approx(calendar_value, abs=1e-6), key
         assert engine_stats["duplicate_equity_timestamps"] == 0
 
     def test_day_one_move_is_counted_exactly_once_when_first_point_is_at_midnight(self):
@@ -2026,7 +2056,12 @@ class TestEnginePathMatchesCalendarPath:
         engine_stats = self._stats(engine_points, result)
         calendar_stats = self._stats(calendar_points, result)
         for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value"):
-            assert engine_stats[key] == pytest.approx(calendar_stats[key], abs=1e-6), key
+            engine_value = engine_stats.get(key)
+            calendar_value = calendar_stats.get(key)
+            if engine_value is None or calendar_value is None:
+                assert engine_value == calendar_value, key
+            else:
+                assert engine_value == pytest.approx(calendar_value, abs=1e-6), key
 
 
 class TestEngineCurvePublishedContract:

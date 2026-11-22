@@ -990,7 +990,15 @@ def test_oracle_calendar_path_agrees_with_the_engine_curve_path(scenario: str) -
         for name, result in (("engine", engine), ("calendar", calendar))
     }
     for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value", "total_return"):
-        assert ratios["engine"][key] == pytest.approx(ratios["calendar"][key], abs=1e-9), key
+        engine_value = ratios["engine"].get(key)
+        calendar_value = ratios["calendar"].get(key)
+        if engine_value is None or calendar_value is None:
+            # Weekend filler rows no longer count toward the PSR
+            # observation minimum, so a short window can leave it
+            # undefined on BOTH paths — agreement is what matters.
+            assert engine_value == calendar_value, key
+        else:
+            assert engine_value == pytest.approx(calendar_value, abs=1e-9), key
     assert ratios["engine"]["duplicate_equity_timestamps"] == 0
 
 

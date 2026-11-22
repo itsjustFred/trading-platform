@@ -99,9 +99,11 @@ by falling through to the manual 252-period path on raw period returns in that
 case instead of staying at 0.0. The dead `_infer_periods_per_year` /
 `_annualize_total_return` helpers of the old fallback path are removed.
 
-> Update (#229): Sharpe/Sortino annualisation later moved to the measured
-> observation density; the sqrt(252) wording above records the D5 decision
-> as made, not the current contract.
+> Update (#229): Sharpe/Sortino annualisation later moved to the asset-class
+> convention — calendar-filled weekend/holiday rows dropped, then 252 for
+> equities/FX/CFDs or 365 for 24/7 crypto (maintainer decision 2026-11-22);
+> the sqrt(252) wording above records the D5 decision as made, not the
+> current contract.
 
 **Daily series includes the first trading day.** The daily equity build writes
 an inception point at the window start (00:00) and a close at
@@ -305,10 +307,16 @@ this code (older persisted artifacts keep their original numbers):
   produced before 16-D1 are per-observation and ~15.9x smaller on daily
   curves.
 - `sharpe_ratio`/`sortino_ratio` are annualized with `sqrt(periods)` on
-  daily returns, on both code paths, where `periods` is the measured
-  observation density of the return series (#229 — ~365 for the
-  calendar-filled production curves, ~252 for observed-day business-day
-  curves). When the equity curve's timestamps cannot be
+  daily returns, on both code paths, where `periods` is the asset-class
+  convention (#229 maintainer decision 2026-11-22): calendar-filled
+  weekend/holiday rows — days the venue was closed, whose forward-filled
+  equity can only produce a zero return — are dropped before the ratio is
+  computed, then 252 applies for equities/FX/CFDs and 365 for an all-crypto
+  (24/7) book, published as `equity_return_periods_per_year`. Trading days
+  come from `shared.venue_calendar` resolved from the run's symbols,
+  source and asset-class metadata; an unresolvable venue falls back to the
+  Monday–Friday grid and is never treated as 24/7. When the equity curve's
+  timestamps cannot be
   parsed the observation spacing is unknown, so the annualisation factor is
   unknown: Sharpe, Sortino and PSR are listed in `undefined_metrics` (and
   published as `0.0`, the repo's convention for an undefined metric) and
