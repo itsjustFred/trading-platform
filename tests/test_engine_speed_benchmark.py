@@ -97,6 +97,56 @@ class TestSummarizeCells:
         assert summary["cells_per_engine"]["vectorbt"]["mean_cell_seconds"] == 2.0
 
 
+class TestTimedCells:
+    def test_each_cell_reaches_the_adapter_with_its_own_params(self, tmp_path):
+        """If cell params were dropped every timing would measure the same
+        config — the speed number cited for phase M would be wrong."""
+        recorded: dict[str, list[dict]] = {"native": [], "vectorbt": []}
+
+        class _Recorder:
+            def __init__(self, name: str):
+                self._name = name
+
+            def run(self, config, strategy_path):
+                recorded[self._name].append(dict(config.parameters))
+                return SimpleNamespace(trades=[])
+
+        adapters = {"native": _Recorder("native"), "vectorbt": _Recorder("vectorbt")}
+        args = SimpleNamespace(
+            repeats=1, capital=100_000.0, risk_pct=0.01, modeling_resolution="open_close"
+        )
+        strategy = _strategy(tmp_path / "s.py", {})
+        cells = [{"fast": 8.0}, {"fast": 12.0}]
+
+        rows = bench._timed_cells(
+            args,
+            adapters,
+            cells,
+            {"fees": "zero"},
+            strategy_path=strategy,
+            symbols=["S"],
+            timeframe="1h",
+            start="2024-01-01",
+            end="2024-02-01",
+            data_dir=str(tmp_path),
+        )
+
+        expected = [
+            {"fees": "zero", "fast": 8.0},
+            {"fees": "zero", "fast": 12.0},
+        ]
+        assert recorded["native"] == expected
+        assert recorded["vectorbt"] == expected
+        # Row order is cell-major, engine-minor; each row names its cell.
+        assert [(r["cell"], r["engine"]) for r in rows] == [
+            (0, "native"),
+            (0, "vectorbt"),
+            (1, "native"),
+            (1, "vectorbt"),
+        ]
+        assert all(r["status"] == "ok" for r in rows)
+
+
 class TestTimeRun:
     def test_adapter_exception_becomes_an_error_row(self):
         class _Boom:

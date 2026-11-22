@@ -88,14 +88,49 @@ DEFAULT_TIMEFRAME = "1h"
 DEFAULT_RISK_PCT = 0.01
 # Fees are declared explicitly (#84 fails closed otherwise). Zero-fee is the
 # default so the report isolates fill/sizing parity; pass --params with
-# fee_rate/fee_flat_per_trade for a cost-inclusive run.
-DEFAULT_PARAMETERS: dict[str, Any] = {"fees": "zero"}
+# fee_rate/fee_flat_per_trade for a cost-inclusive run. ``slippage: none``
+# pins both engines gross — once #354 lands the native engine would
+# otherwise default to the auto slippage model while vectorbt models none.
+DEFAULT_PARAMETERS: dict[str, Any] = {"fees": "zero", "slippage": "none"}
 SYNTHETIC_SOURCE = "engine_migration_gate"
 SYNTHETIC_ASSET_CLASS = "synthetic"
 
-#: Scalar stats keys compared between engines. Non-scalar stats entries
-#: (``extras`` and friends) are skipped — they are diagnostics, not results.
-_STATS_SKIP_KEYS = {"extras"}
+#: Scalar stats keys compared between engines. ``to_dict()`` flattens
+#: ``BacktestStats.extras`` into top-level keys, so the diagnostics live
+#: under these names — they are skipped because they are diagnostics, not
+#: results.
+_STATS_SKIP_KEYS = {
+    "extras",
+    "risk_free_rate",
+    "undefined_metrics",
+    "equity_return_frequency",
+    "duplicate_equity_timestamps",
+    "ruined",
+    "ruin_time",
+}
+
+#: Per-key comparison tolerance for ``_diff_stats`` — the same stored-unit
+#: convention the trade diff uses, sized to the noise recomputing stats from
+#: each engine's own (differently rounded) trades can produce: money stats
+#: get the 2dp stored unit (0.01) and ratio/percent stats get 1e-4, the
+#: coarsest stored ratio precision. Anything unmapped — counts and any new
+#: key — falls back to strict equality so a real difference can never hide.
+_STATS_TOLERANCES: dict[str, float] = {
+    "total_pnl": 0.01,
+    "avg_winner": 0.01,
+    "avg_loser": 0.01,
+    "avg_holding_bars": 0.1,
+    "win_rate": 1e-4,
+    "profit_factor": 1e-4,
+    "sharpe_ratio": 1e-4,
+    "sortino_ratio": 1e-4,
+    "calmar_ratio": 1e-4,
+    "psr": 1e-4,
+    "max_drawdown_pct": 1e-4,
+    "cagr": 1e-4,
+    "total_return": 1e-4,
+    "p_value": 1e-4,
+}
 
 
 @dataclass
@@ -114,6 +149,12 @@ class GateConfig:
     strategies_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "strategies")
     only: tuple[str, ...] = ()
     max_symbols: int = 3
+    # Sizing caps pinned explicitly on BOTH engines: each adapter otherwise
+    # falls back to its own defaults (native 50% notional, vectorbt the
+    # 20% non-equity cap and 2.0x leverage), which would make the default
+    # report config noise instead of engine-logic diffs.
+    max_position_exposure_pct: float = 0.2
+    max_leverage: float = 2.0
 
 
 @dataclass
@@ -239,6 +280,41 @@ def _resolve_data_root(
     )
 
 
+#: Bar spacing per supported synthetic timeframe, mirroring the ``freq_map``
+#: inside ``_write_synthetic_ohlcv`` (kept as Timedeltas so window size can
+#: be estimated without materializing the index).
+_SYNTHETIC_BAR_FREQ: dict[str, str] = {
+    "s1": "1s",
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1D",
+    "1w": "7D",
+}
+
+#: Largest synthetic window the DEFAULT (unbounded) ``--start``/``--end`` may
+#: imply. The six-month default at ``s1`` is ~15.5M rows — several GB — so an
+#: oversized defaulted window refuses and asks for explicit bounds.
+_SYNTHETIC_MAX_DEFAULT_BARS = 2_000_000
+
+
+def _estimate_synthetic_bars(timeframe: str, start: str, end: str) -> int:
+    """Approximate bar count for a synthetic window (0 when unestimable)."""
+    freq = _SYNTHETIC_BAR_FREQ.get(timeframe)
+    if freq is None:
+        return 0
+    try:
+        span = pd.Timestamp(end) - pd.Timestamp(start)
+    except Exception:
+        return 0
+    if span < pd.Timedelta(0):
+        return 0
+    return int(span / pd.Timedelta(freq)) + 1
+
+
 def _write_synthetic_ohlcv(
     data_root: Path,
     symbols: list[str],
@@ -308,6 +384,8 @@ def _backtest_config(gate: GateConfig, slug: str) -> BacktestConfig:
         modeling_resolution=gate.modeling_resolution,
         data_dir=gate.data_dir,
         parameters=dict(gate.parameters),
+        max_position_exposure_pct=gate.max_position_exposure_pct,
+        max_leverage=gate.max_leverage,
     )
 
 
@@ -576,7 +654,11 @@ def _diff_stats(native_result: Any, vectorbt_result: Any) -> dict[str, Any]:
             continue
         a = native_stats.get(key)
         b = vectorbt_stats.get(key)
-        if not _numbers_close(a, b):
+        tolerance = _STATS_TOLERANCES.get(key)
+        if tolerance is not None:
+            if not _within_stored_precision(a, b, tolerance):
+                diffs[key] = {"native": a, "vectorbt": b}
+        elif not _numbers_close(a, b):
             diffs[key] = {"native": a, "vectorbt": b}
     return {
         "stats_identical": not diffs,
@@ -661,6 +743,14 @@ def run_gate(gate: GateConfig) -> dict[str, Any]:
         for entry in iter_strategy_entries(gate.strategies_dir)
         if not gate.only or entry.slug in gate.only
     ]
+    if not entries:
+        # An empty run would exit 0 saying "gate complete: 0 strategies" —
+        # a green-looking report that compared nothing. Refuse instead.
+        raise SystemExit(
+            "no strategy entries to compare "
+            f"(strategies_dir={gate.strategies_dir}, "
+            f"only={','.join(gate.only) if gate.only else 'all'})"
+        )
 
     strategies: list[dict[str, Any]] = []
     total = len(entries)
@@ -705,6 +795,8 @@ def run_gate(gate: GateConfig) -> dict[str, Any]:
                 "capital": gate.capital,
                 "risk_per_trade_pct": gate.risk_pct,
                 "modeling_resolution": gate.modeling_resolution,
+                "max_position_exposure_pct": gate.max_position_exposure_pct,
+                "max_leverage": gate.max_leverage,
                 "parameters": gate.parameters,
                 "ohlcv_root": str(ohlcv_root),
             },
@@ -758,6 +850,17 @@ def _resolve_symbols_and_window(
     if resolution.mode == "synthetic":
         start = start or "2024-01-01"
         end = end or "2024-06-30"
+        if not (args.start and args.end):
+            # The default six-month window is fine at 1h but explodes at s1
+            # (~15.5M rows, several GB). A defaulted oversized window refuses
+            # rather than allocate; an explicit --start/--end is the opt-in.
+            bars_estimate = _estimate_synthetic_bars(timeframe, start, end)
+            if bars_estimate > _SYNTHETIC_MAX_DEFAULT_BARS:
+                raise SystemExit(
+                    f"synthetic default window {start}..{end} at {timeframe} "
+                    f"is ~{bars_estimate:,} bars — pass explicit --start/--end "
+                    "to keep the run small"
+                )
         bars = _write_synthetic_ohlcv(
             resolution.data_root, symbols, timeframe, start, end
         )
@@ -796,6 +899,8 @@ def _build_gate(
         strategies_dir=args.strategies_dir,
         only=tuple(_csv_list(args.only)),
         max_symbols=args.max_symbols,
+        max_position_exposure_pct=args.max_position_exposure_pct,
+        max_leverage=args.max_leverage,
     )
 
 
@@ -828,9 +933,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--params",
         default="",
-        help='Extra engine params JSON, merged over {"fees": "zero"}',
+        help='Extra engine params JSON, merged over the defaults '
+        '(fees zero, slippage none)',
     )
     parser.add_argument("--max-symbols", type=int, default=3)
+    parser.add_argument(
+        "--max-position-exposure-pct",
+        type=float,
+        default=0.2,
+        help="Per-position exposure cap pinned on BOTH engines so the report "
+        "compares engine logic, not each adapter's own default "
+        "(default: 0.2)",
+    )
+    parser.add_argument(
+        "--max-leverage",
+        type=float,
+        default=2.0,
+        help="Broker-max leverage pinned on BOTH engines (default: 2.0; "
+        "native clamps to it on free margin since #347)",
+    )
     parser.add_argument(
         "--only",
         default="",
@@ -841,7 +962,9 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Where synthetic OHLCV is written when no real data source is "
-        "configured (default: a throwaway temporary directory)",
+        "configured (default: a throwaway temporary directory). Unlike "
+        "--output this operator-chosen path is NOT confined to the project "
+        "root — it is used verbatim.",
     )
     parser.add_argument(
         "--output",

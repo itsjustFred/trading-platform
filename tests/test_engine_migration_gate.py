@@ -146,6 +146,63 @@ class TestRunGate:
             gate.write_report(report, tmp_path / "escape.json")
 
 
+class TestAlignedSizingCaps:
+    """The gate must pin the same sizing caps on both engines.
+
+    Without explicit values each adapter falls back to its own defaults
+    (native 50% notional, vectorbt the 20% non-equity cap and 2.0x
+    leverage), so the default report would diff configuration, not engine
+    logic.
+    """
+
+    def test_gate_config_defaults_pin_both_engines(self):
+        cfg = gate.GateConfig(data_dir="x", symbols=["S"])
+        assert cfg.max_position_exposure_pct == 0.2
+        assert cfg.max_leverage == 2.0
+
+    def test_backtest_config_carries_the_pinned_caps(self, gate_env):
+        config = gate._backtest_config(_gate_config(gate_env), "slug")
+        assert config.max_position_exposure_pct == 0.2
+        assert config.max_leverage == 2.0
+
+    def test_cli_overrides_reach_the_config(self, gate_env):
+        config = gate._backtest_config(
+            _gate_config(gate_env, max_position_exposure_pct=0.5, max_leverage=5.0),
+            "slug",
+        )
+        assert config.max_position_exposure_pct == 0.5
+        assert config.max_leverage == 5.0
+
+    def test_report_records_the_pinned_caps(self, gate_env):
+        report = gate.run_gate(_gate_config(gate_env, only=(SMA_STRATEGY,)))
+        assert report["config"]["max_position_exposure_pct"] == 0.2
+        assert report["config"]["max_leverage"] == 2.0
+
+
+class TestDefaultParameters:
+    def test_defaults_declare_fees_and_slippage_explicitly(self, gate_env):
+        # #84 fails closed without a fee declaration; once #354 lands the
+        # native engine defaults to auto slippage while vectorbt models
+        # none — "slippage": "none" keeps the comparison gross on both.
+        assert gate.DEFAULT_PARAMETERS["fees"] == "zero"
+        assert gate.DEFAULT_PARAMETERS["slippage"] == "none"
+        config = _gate_config(gate_env)
+        assert config.parameters["slippage"] == "none"
+        assert config.parameters["fees"] == "zero"
+
+
+class TestEmptyRunRefused:
+    def test_only_matching_nothing_exits_nonzero(self, gate_env):
+        with pytest.raises(SystemExit, match="no strategy entries"):
+            gate.run_gate(_gate_config(gate_env, only=("no_such_slug",)))
+
+    def test_empty_strategies_dir_exits_nonzero(self, gate_env, tmp_path):
+        empty = tmp_path / "empty_strategies"
+        empty.mkdir()
+        with pytest.raises(SystemExit, match="no strategy entries"):
+            gate.run_gate(_gate_config(gate_env, strategies_dir=empty))
+
+
 class TestDataResolution:
     def test_explicit_data_dir_wins(self, tmp_path, monkeypatch):
         monkeypatch.setenv(gate.TEST_OHLCV_DIR_ENV, str(tmp_path / "env_ohlcv"))
@@ -383,6 +440,41 @@ class TestDiffStats:
             "vectorbt": 0.08,
         }
 
+    def test_stored_precision_noise_still_reports_identical(self):
+        """Stats recomputed from each engine's own rounded trades differ by
+        at most one stored unit — that is representation noise, not a diff
+        (the bundle-35 reproduction: total_pnl ±0.01, sortino ±1e-4)."""
+        native = SimpleNamespace(
+            stats={"total_pnl": 9401.36, "sortino_ratio": 1.5482, "total_trades": 219}
+        )
+        vectorbt = SimpleNamespace(
+            stats={"total_pnl": 9401.37, "sortino_ratio": 1.5483, "total_trades": 219}
+        )
+        diff = gate._diff_stats(native, vectorbt)
+        assert diff["stats_identical"] is True
+        assert diff["stats_diffs"] == {}
+
+    def test_real_money_difference_still_diffs(self):
+        native = SimpleNamespace(stats={"total_pnl": 9401.36})
+        vectorbt = SimpleNamespace(stats={"total_pnl": 9402.0})
+        diff = gate._diff_stats(native, vectorbt)
+        assert diff["stats_identical"] is False
+        assert diff["stats_diffs"]["total_pnl"] == {
+            "native": 9401.36,
+            "vectorbt": 9402.0,
+        }
+
+    def test_unmapped_keys_compare_strictly_and_extras_keys_are_skipped(self):
+        native = SimpleNamespace(
+            stats={"custom_count": 5, "ruined": False, "risk_free_rate": 0.0}
+        )
+        vectorbt = SimpleNamespace(
+            stats={"custom_count": 5.00001, "ruined": True, "risk_free_rate": 0.05}
+        )
+        diff = gate._diff_stats(native, vectorbt)
+        # Flattened extras diagnostics never diff; the unmapped count does.
+        assert set(diff["stats_diffs"]) == {"custom_count"}
+
 
 class TestDetectWindow:
     def _write_shard(self, root: Path, symbol: str, start: str, end: str) -> None:
@@ -410,6 +502,30 @@ class TestDetectWindow:
         self._write_shard(tmp_path, "AAA", "2024-01-01", "2024-06-30")
         assert gate._detect_window(tmp_path / "ohlcv", ["AAA", "MISSING"], "1h") is None
 
+    def test_window_comes_from_the_first_shard_the_adapter_reads(self, tmp_path):
+        """Two shards for one symbol: the adapters take ``matches[0]`` of the
+        sorted rglob, so the detected window must be that shard's extent —
+        not the union and not the last shard's."""
+        for name, start, end in (
+            ("a", "2024-01-01", "2024-03-31"),
+            ("b", "2024-06-01", "2024-09-30"),
+        ):
+            folder = tmp_path / "ohlcv" / name / "AAA"
+            folder.mkdir(parents=True)
+            frame = pd.DataFrame(
+                {
+                    "timestamp": pd.date_range(start, end, freq="h", tz="UTC"),
+                    "open": 1.0,
+                    "high": 1.0,
+                    "low": 1.0,
+                    "close": 1.0,
+                    "volume": 1.0,
+                }
+            )
+            frame.to_parquet(folder / "1h.parquet", index=False)
+        window = gate._detect_window(tmp_path / "ohlcv", ["AAA"], "1h")
+        assert window == ("2024-01-01", "2024-03-31")
+
 
 class TestSyntheticOhlcv:
     def test_unmapped_timeframe_refuses_instead_of_guessing(self, tmp_path):
@@ -426,6 +542,48 @@ class TestSyntheticOhlcv:
         bars = gate._write_synthetic_ohlcv(tmp_path, ["X"], timeframe, start, end)
         assert bars > 0
         assert list(tmp_path.rglob(f"{timeframe}.parquet"))
+
+
+class TestSyntheticWindowGuard:
+    def _args(self, **overrides):
+        payload = {"symbols": "", "start": "", "end": "", "max_symbols": 3}
+        payload.update(overrides)
+        return SimpleNamespace(**payload)
+
+    def test_estimate_scales_with_timeframe(self):
+        assert gate._estimate_synthetic_bars("1h", "2024-01-01", "2024-01-08") == 169
+        assert (
+            gate._estimate_synthetic_bars("s1", "2024-01-01", "2024-06-30")
+            > 15_000_000
+        )
+        assert gate._estimate_synthetic_bars("bogus", "2024-01-01", "2024-06-30") == 0
+
+    def test_oversized_default_window_refuses(self, tmp_path):
+        # The six-month default at s1 is ~15.5M rows — several GB.
+        resolution = gate.DataResolution(data_root=tmp_path, mode="synthetic")
+        with pytest.raises(SystemExit, match="--start/--end"):
+            gate._resolve_symbols_and_window(
+                self._args(), resolution, tmp_path / "ohlcv", "s1"
+            )
+
+    def test_explicit_bounds_opt_in_to_the_same_window(self, tmp_path):
+        resolution = gate.DataResolution(data_root=tmp_path, mode="synthetic")
+        symbols, start, end = gate._resolve_symbols_and_window(
+            self._args(start="2024-01-01", end="2024-01-02"),
+            resolution,
+            tmp_path / "ohlcv",
+            "s1",
+        )
+        assert (start, end) == ("2024-01-01", "2024-01-02")
+        assert symbols == ["SYNTH_A", "SYNTH_B"]
+
+    def test_small_default_window_still_runs(self, tmp_path):
+        resolution = gate.DataResolution(data_root=tmp_path, mode="synthetic")
+        symbols, start, end = gate._resolve_symbols_and_window(
+            self._args(), resolution, tmp_path / "ohlcv", "1h"
+        )
+        assert (start, end) == ("2024-01-01", "2024-06-30")
+        assert list((tmp_path / "ohlcv").rglob("*.parquet"))
 
 
 class TestSyntheticDataResolution:

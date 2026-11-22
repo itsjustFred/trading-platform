@@ -11,7 +11,7 @@ The platform carries four engine adapters under `runner/engines/` plus a
 signal-replay product:
 
 - **native** (`native_adapter.py` + `runner/engine_pkg/`): event-based bar-by-bar
-  simulation. CLI/viewer default, the MT5 alignment engine, and the producer of
+  simulation. Viewer default, the MT5 alignment engine, and the producer of
   the MT5 parity artifacts and goldens.
 - **vectorbt** (`vectorbt_adapter.py`, 1685 LOC): despite the name it contains
   **no `import vectorbt`** — it is a second hand-written Python bar loop with
