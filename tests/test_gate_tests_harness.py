@@ -182,6 +182,7 @@ def test_the_roster_check_reports_both_sides_at_once() -> None:
 
 
 @needs_bash
+@pytest.mark.timeout(600)  # runs every gate suite in subprocesses; matches their own timeout
 def test_full_roster(tmp_path: Path) -> None:
     """End to end: every declared gate exists, runs, and passes.
 

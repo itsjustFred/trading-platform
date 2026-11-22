@@ -112,6 +112,13 @@ File: `data_tools/downloaders/dukascopy_native.py`
 
 ### Notable behavior
 
+- `scripts/fetch_differential_slice.py` uses the minute-candle path of this
+  downloader for one fixed purpose: generating the 600-bar EURUSD 15m real-data
+  slice the differential engine tests run on (see
+  `docs/cross-engine-backtest-contract.md`). It fetches the window through
+  `data_tools.downloaders.dukascopy_native.download_minute_candles`, which
+  returns the bars instead of writing them into the catalog, and caches the
+  result under `$DATA_DIR/differential_reference/`.
 - The viewer download API launches `jforex_dl` for source `dukascopy` and falls back to `dukascopy_native` when JForex/JPype/JVM is unavailable.
 - Once the JForex JVM is started it is never explicitly shut down: the process
   exits and the OS reclaims it. JPype's interpreter-exit hook is disabled

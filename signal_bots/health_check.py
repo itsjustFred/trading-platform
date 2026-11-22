@@ -78,11 +78,11 @@ def _run_processor_probe(factory: Any) -> dict[str, Any]:
 
 def check_signal_bots() -> dict[str, Any]:
     """Run signal bot health checks."""
-    results = []
+    results: list[dict[str, Any]] = []
 
     for option in SIGNAL_PROCESSOR_OPTIONS:
         name = option["id"]
-        result = {
+        result: dict[str, Any] = {
             "name": name,
             "description": option.get("description", ""),
             "status": "ok",

@@ -6,9 +6,11 @@ import pytest
 from runner.portfolio_optimizer import (
     StrategyEquityPoint,
     _align_equity_curves,
+    _build_optimization_result,
     _compute_correlation_matrix,
     _compute_oos_metrics,
     _normalize_equity_matrix,
+    _normalize_weights,
     _parse_time_to_ts,
     _period_percentage_returns,
     _persist_optimization_result,
@@ -16,6 +18,7 @@ from runner.portfolio_optimizer import (
     _split_equity_curves_by_boundaries,
     _split_equity_curves_by_time,
     _weighted_correlation_penalty,
+    daily_observation_count,
     optimize_portfolio_allocation,
 )
 from shared.models import BacktestMeta, BacktestResult, EquityPoint
@@ -27,6 +30,40 @@ def test_normalize_equity_matrix_uses_each_strategy_baseline() -> None:
     normalized = _normalize_equity_matrix(matrix)
 
     assert normalized == pytest.approx(np.array([[1.0, 1.0], [1.1, 1.0]]))
+
+
+def test_normalize_weights_sums_to_one() -> None:
+    """Every optimized allocation must be a distribution, not a raw score vector.
+
+    The weights are the persisted allocation a promotion decision is read
+    against, so a vector that does not sum to 1.0 would silently restate the
+    exposure the artifact claims.
+    """
+    weights = _normalize_weights(np.array([2.0, 1.0, 1.0]))
+
+    assert weights == pytest.approx(np.array([0.5, 0.25, 0.25]))
+    assert float(weights.sum()) == pytest.approx(1.0)
+
+    single = _normalize_weights(np.array([7.0]))
+
+    assert single == pytest.approx(np.array([1.0]))
+
+
+def test_normalize_weights_prunes_degenerate_trials_instead_of_equal_weighting() -> None:
+    """Zero / non-finite sums raise; they are never promoted to equal-weight.
+
+    A degenerate trial used to fall back to equal-weight, which let a trial
+    carrying no allocation information win the optimisation (#87).
+    """
+    for degenerate in (
+        np.zeros(3),
+        np.array([0.0, 0.0]),
+        np.array([np.nan, 1.0, 1.0]),
+        np.array([np.inf, 1.0]),
+        np.array([-1.0, -2.0]),
+    ):
+        with pytest.raises(ValueError, match=r"[Dd]egenerate|Non-finite"):
+            _normalize_weights(degenerate)
 
 
 def test_strategy_equity_point_creation() -> None:
@@ -149,22 +186,24 @@ def test_optimize_portfolio_allocation_returns_oos_sharpe_with_test_months(
     tmp_path,
 ) -> None:
     """OOS metrics are returned when test_months is provided."""
-    # Create mock equity curves spanning 18 months for each strategy
-    seconds_per_month = 30 * 24 * 60 * 60
+    # Create mock equity curves spanning 18 months for each strategy.
+    # #133: OOS needs >=20 distinct DAILY observations, so points are
+    # daily-spaced (540 points ~= 18 months).
+    seconds_per_day = 24 * 60 * 60
     base_ts = 1700000000  # Starting timestamp
 
     # Strategy 1: Steady growth (for train period) with different growth in test period
     strategy1_points = []
-    for i in range(18):
-        ts = base_ts + i * seconds_per_month
-        equity = 100000.0 + i * 1000  # Steady growth
+    for i in range(540):
+        ts = base_ts + i * seconds_per_day
+        equity = 100000.0 + i * 10  # Steady growth
         strategy1_points.append(StrategyEquityPoint(time=ts, equity=equity))
 
     # Strategy 2: Opposite pattern (for diversification)
     strategy2_points = []
-    for i in range(18):
-        ts = base_ts + i * seconds_per_month
-        equity = 100000.0 + i * 500  # Slower growth
+    for i in range(540):
+        ts = base_ts + i * seconds_per_day
+        equity = 100000.0 + i * 5  # Slower growth
         strategy2_points.append(StrategyEquityPoint(time=ts, equity=equity))
 
     # Mock the _load_strategy_equity function to return our mock curves
@@ -293,7 +332,7 @@ def test_split_equity_curves_single_curve() -> None:
     curve = [StrategyEquityPoint(time=base_ts + i * seconds_per_month, equity=100.0 + i)
              for i in range(12)]
 
-    train_curves, test_curves = _split_equity_curves_by_time(
+    _train_curves, test_curves = _split_equity_curves_by_time(
         [curve], train_months=None, test_months=3
     )
 
@@ -308,7 +347,7 @@ def test_split_equity_curves_zero_test_months() -> None:
         [StrategyEquityPoint(time=1, equity=100.0)],
         [StrategyEquityPoint(time=2, equity=100.0)],
     ]
-    train, test = _split_equity_curves_by_time(curves, train_months=12, test_months=0)
+    _train, test = _split_equity_curves_by_time(curves, train_months=12, test_months=0)
     assert len(test) == 0
 
 
@@ -380,14 +419,25 @@ def test_align_equity_curves_no_overlap_returns_empty() -> None:
     assert result.size == 0
 
 
-def test_normalize_weights_all_zero_falls_back_to_equal() -> None:
-    """#87: degenerate trials are pruned, never promoted to equal-weight."""
-    from runner.portfolio_optimizer import _normalize_weights
+def test_build_optimization_result_rejects_an_unweighted_backtest() -> None:
+    """A backtest with no weight must fail here, not inherit the next one's.
 
-    with pytest.raises(ValueError, match="pruned"):
-        _normalize_weights(np.zeros(4))
-    with pytest.raises(ValueError, match="pruned"):
-        _normalize_weights(np.array([np.nan, 1.0]))
+    The persisted artifact pairs ids and weights by ``strict=True``: dropping the
+    strictness truncated the zip, publishing a mapping that quietly omits a
+    backtest while the ids still line up with the other numbers.
+    """
+    with pytest.raises(ValueError, match=r"shorter"):
+        _build_optimization_result(
+            backtest_ids=["bt-a", "bt-b"],
+            best_weights=np.array([0.5]),
+            sharpe=1.0,
+            max_drawdown=0.1,
+            correlation_matrix=np.eye(2),
+            n_trials=2,
+            train_months=3,
+            test_months=1,
+            oos_metrics=(1.0, 0.01),
+        )
 
 
 def test_normalize_weights_normal_case() -> None:
@@ -574,17 +624,19 @@ def test_portfolio_optimizer_with_train_months_oos_split(monkeypatch, tmp_path) 
     - Testing (OOS) uses last M months
     - This prevents overfitting and validates strategy robustness.
     """
-    seconds_per_month = 30 * 24 * 60 * 60
+    # #133: daily-spaced points so the OOS holdout clears the 20-daily-
+    # observation minimum (720 points ~= 24 months).
+    seconds_per_day = 24 * 60 * 60
     base_ts = 1700000000
 
     # Create 24 months of data (2 years)
     strategy1_points = [
-        StrategyEquityPoint(time=base_ts + i * seconds_per_month, equity=100000.0 + i * 500)
-        for i in range(24)
+        StrategyEquityPoint(time=base_ts + i * seconds_per_day, equity=100000.0 + i * 10)
+        for i in range(720)
     ]
     strategy2_points = [
-        StrategyEquityPoint(time=base_ts + i * seconds_per_month, equity=100000.0 + i * 300)
-        for i in range(24)
+        StrategyEquityPoint(time=base_ts + i * seconds_per_day, equity=100000.0 + i * 6)
+        for i in range(720)
     ]
 
     # Mock load function
@@ -619,7 +671,7 @@ def test_load_strategy_equity_reads_sqlite_first(isolated_db_sandbox) -> None:
     import runner.portfolio_optimizer as po_module
     import shared.database as database
 
-    _database_module, engine, _data_dir = isolated_db_sandbox
+    _database_module, _engine, _data_dir = isolated_db_sandbox
 
     database.save_result_to_sqlite(
         BacktestResult(
@@ -690,3 +742,164 @@ def test_load_strategy_equity_surfaces_load_errors(monkeypatch) -> None:
     monkeypatch.setattr(database_module, "load_backtest_result", lambda _bid: None)
     with pytest.raises(ValueError, match="no-such-id"):
         po_module._load_strategy_equity("no-such-id")
+
+
+class TestMinOosDailyObservations:
+    """#133: OOS statistics require >=20 distinct daily observations."""
+
+    @staticmethod
+    def _daily_curves(days: int, step_seconds: int = 86400):
+        base = 1700000000
+        return {
+            "a": [
+                StrategyEquityPoint(time=base + i * step_seconds, equity=100000.0 + i)
+                for i in range(days)
+            ],
+            "b": [
+                StrategyEquityPoint(time=base + i * step_seconds, equity=100000.0 + i * 2)
+                for i in range(days)
+            ],
+        }
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path, curves, **kwargs):
+        import runner.portfolio_optimizer as po_module
+
+        monkeypatch.setattr(po_module, "_load_strategy_equity", lambda bt_id: curves[bt_id])
+        monkeypatch.setattr(po_module, "OPTIMIZATIONS_DIR", tmp_path)
+        return optimize_portfolio_allocation(
+            ["a", "b"], n_trials=2, test_months=1, **kwargs
+        )
+
+    def test_sparse_oos_window_is_insufficient(self, monkeypatch, tmp_path) -> None:
+        """A 1-month OOS window with points every 3 days has <20 daily obs."""
+        curves = self._daily_curves(days=40, step_seconds=3 * 86400)
+        result = self._run(monkeypatch, tmp_path, curves)
+        assert result["oos_status"] == "insufficient_oos_bars"
+        assert result["oos_daily_observations"] < 20
+        assert result["min_oos_daily_observations"] == 20
+        assert "oos_sharpe" not in result
+        assert "oos_max_drawdown" not in result
+        assert "oos_split" not in result
+        assert "oos_equity_curve" not in result
+
+    def test_one_bar_oos_window_is_rejected(self, monkeypatch, tmp_path) -> None:
+        """A single OOS observation can never be 'available'."""
+        base = 1700000000
+        # 39 daily IS points, then one lone point ~61 days later so the
+        # 1-month OOS tail contains exactly one daily observation.
+        times = [base + i * 86400 for i in range(39)] + [base + 100 * 86400]
+        curves = {
+            "a": [
+                StrategyEquityPoint(time=t, equity=100000.0 + i)
+                for i, t in enumerate(times)
+            ],
+            "b": [
+                StrategyEquityPoint(time=t, equity=100000.0 + i * 2)
+                for i, t in enumerate(times)
+            ],
+        }
+        result = self._run(monkeypatch, tmp_path, curves)
+        assert result["oos_status"] == "insufficient_oos_bars"
+        assert result["oos_daily_observations"] == 1
+        assert "oos_sharpe" not in result
+
+    def test_minimum_is_configurable(self, monkeypatch, tmp_path) -> None:
+        """Lowering the configured minimum admits the sparse window."""
+        curves = self._daily_curves(days=40, step_seconds=3 * 86400)
+        result = self._run(
+            monkeypatch, tmp_path, curves, min_oos_daily_observations=5
+        )
+        assert result["oos_status"] == "available"
+        assert result["min_oos_daily_observations"] == 5
+        assert "oos_sharpe" in result
+
+    def test_minimum_must_be_positive_int(self, monkeypatch, tmp_path) -> None:
+        curves = self._daily_curves(days=40)
+        for bad in (0, -1, 1.5, True):
+            with pytest.raises(ValueError, match="min_oos_daily_observations"):
+                self._run(monkeypatch, tmp_path, curves, min_oos_daily_observations=bad)
+
+    def test_intraday_points_on_one_day_count_once(self) -> None:
+        """Multiple bars on the same UTC day are ONE daily observation."""
+        times = [
+            "2024-01-02T09:30:00+00:00",
+            "2024-01-02T10:30:00+00:00",
+            "2024-01-02T15:30:00+00:00",
+            "2024-01-03T09:30:00+00:00",
+        ]
+        assert daily_observation_count(times) == 2
+
+    def test_compute_oos_metrics_rejects_below_minimum(self) -> None:
+        """_compute_oos_metrics returns (None, None) under the daily minimum."""
+        curves = [
+            [
+                StrategyEquityPoint(time=1700000000 + i * 86400, equity=100000.0 + i)
+                for i in range(10)
+            ],
+            [
+                StrategyEquityPoint(time=1700000000 + i * 86400, equity=100000.0 + i * 2)
+                for i in range(10)
+            ],
+        ]
+        weights = np.array([0.5, 0.5])
+        assert _compute_oos_metrics(curves, weights, min_daily_observations=20) == (None, None)
+        # Same window passes once the minimum is lowered.
+        sharpe, _dd = _compute_oos_metrics(curves, weights, min_daily_observations=5)
+        assert sharpe is not None
+
+    def test_exactly_minimum_daily_observations_pass(self) -> None:
+        """The daily-observation minimum is inclusive: exactly ``min`` distinct
+        days computes OOS metrics, ``min - 1`` does not."""
+        curves = [
+            [
+                StrategyEquityPoint(time=1700000000 + i * 86400, equity=100000.0 + i)
+                for i in range(5)
+            ],
+            [
+                StrategyEquityPoint(time=1700000000 + i * 86400, equity=100000.0 + i * 2)
+                for i in range(5)
+            ],
+        ]
+        weights = np.array([0.5, 0.5])
+        sharpe, _dd = _compute_oos_metrics(curves, weights, min_daily_observations=5)
+        assert sharpe is not None
+        assert _compute_oos_metrics(curves, weights, min_daily_observations=6) == (
+            None,
+            None,
+        )
+
+
+class TestOosStatusLabels:
+    """#133: no-overlap is not the same failure as too-few-daily-bars."""
+
+    def _build(self, *, oos_daily_observations: int, min_obs: int = 20):
+        from runner.portfolio_optimizer import _build_optimization_result
+
+        return _build_optimization_result(
+            backtest_ids=["a", "b"],
+            best_weights=np.array([0.5, 0.5]),
+            sharpe=1.0,
+            max_drawdown=0.1,
+            correlation_matrix=np.eye(2),
+            n_trials=2,
+            train_months=None,
+            test_months=1,
+            oos_metrics=(None, None),
+            oos_daily_observations=oos_daily_observations,
+            min_oos_daily_observations=min_obs,
+        )[0]
+
+    def test_zero_overlap_reports_insufficient_overlap(self) -> None:
+        result = self._build(oos_daily_observations=0)
+        assert result["oos_status"] == "insufficient_overlap"
+
+    def test_few_daily_observations_reports_insufficient_oos_bars(self) -> None:
+        result = self._build(oos_daily_observations=5)
+        assert result["oos_status"] == "insufficient_oos_bars"
+
+    def test_enough_observations_but_no_metrics_is_insufficient_overlap(
+        self,
+    ) -> None:
+        result = self._build(oos_daily_observations=25)
+        assert result["oos_status"] == "insufficient_overlap"

@@ -52,6 +52,7 @@ PYTHON="${PYTHON:-python3}"
 EXPECTED=(
     "script import origin guard"
     "output path guard"
+    "test suite isolation guard"
     "gate harness self-check"
     "guarded scripts lint (ruff --select F)"
 )
@@ -75,6 +76,16 @@ run_one "script import origin guard" \
 run_one "output path guard" \
     "$PYTHON" -m pytest -q -p no:cacheprovider tests/test_safe_path.py
 
+# The test suite's own isolation. `output path guard` above covers the operator scripts' write
+# paths; it never observes what the *tests* write. Before this gate existed a plain `pytest` run
+# pointed DATA_DIR at the repo's `data/` and wrote the real backtests.db, optimizations/ and a
+# network-downloaded JForex SDK into it, and nothing failed. It also wrote the live-runner log,
+# read the checkout's real `.accounts.env`, and let one Alpaca discovery test reach a live
+# endpoint. conftest now redirects all of them and fails the session if the suite escapes; this
+# pins that behaviour, including in a real xdist run.
+run_one "test suite isolation guard" \
+    "$PYTHON" -m pytest -q -p no:cacheprovider tests/test_suite_isolation.py
+
 # The runner's own rules. The full-roster case is excluded here: it invokes this script, and a gate
 # that runs the gate that runs it is a cycle, not a check.
 run_one "gate harness self-check" \
@@ -90,6 +101,7 @@ GUARDED_SCRIPTS=(
     scripts/adaptive_harvester.py
     scripts/backtest_to_validation_ref.py
     scripts/dedupe_executions.py
+    scripts/fetch_differential_slice.py
     scripts/overnight_strategy_discovery.py
     scripts/recalculate_backtest_stats.py
     scripts/regenerate_backtests.py

@@ -1,7 +1,8 @@
 """
 Centralized logging module for trading-platform services.
 
-Provides structured JSON logging with file rotation and stdout output.
+Provides structured JSON logging with file rotation and console output (stdout,
+or stderr after route_console_logs_to_stderr()).
 
 Usage:
     from shared.logging import get_logger
@@ -104,6 +105,7 @@ _TOKEN_VALUE_RES = (
 )
 
 _loggers: dict[str, logging.Logger] = {}
+_console_stream_name = "stdout"
 
 
 def _is_sensitive_key(key: object) -> bool:
@@ -244,7 +246,8 @@ def get_logger(service: str) -> logging.Logger:
 
     Each service gets:
     - A RotatingFileHandler writing JSON to ~/logs/<service>.log
-    - A StreamHandler writing JSON to stdout
+    - A StreamHandler writing JSON to stdout (stderr after
+      route_console_logs_to_stderr())
     """
     if service in _loggers:
         return _loggers[service]
@@ -266,10 +269,25 @@ def get_logger(service: str) -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Stdout handler
-    stream_handler = logging.StreamHandler(stream=sys.stdout)
+    # Console handler (stdout, or stderr after route_console_logs_to_stderr())
+    stream_handler = logging.StreamHandler(stream=getattr(sys, _console_stream_name))
     stream_handler.setFormatter(formatter)
+    stream_handler._trading_console = True  # type: ignore[attr-defined]
     logger.addHandler(stream_handler)
 
     _loggers[service] = logger
     return logger
+
+
+def route_console_logs_to_stderr() -> None:
+    """Send the console log handlers to stderr, for CLIs whose stdout is data.
+
+    Affects loggers that already exist and any created afterwards. File logging
+    is untouched. Call it before the CLI prints its result document.
+    """
+    global _console_stream_name
+    _console_stream_name = "stderr"
+    for logger in _loggers.values():
+        for handler in logger.handlers:
+            if getattr(handler, "_trading_console", False):
+                handler.setStream(sys.stderr)

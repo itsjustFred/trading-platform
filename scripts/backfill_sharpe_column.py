@@ -138,7 +138,7 @@ def _scan(
     for row in rows:
         # By name, not by position: the select list is built from the same list, and a column added
         # to `SENTINELS` must not silently shift every value one field over.
-        record = dict(zip(names, row))
+        record = dict(zip(names, row, strict=True))
         stats = record["stats"]
         if not stats:
             continue

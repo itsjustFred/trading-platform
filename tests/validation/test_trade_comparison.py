@@ -496,3 +496,41 @@ class TestPnLAndGate:
         act = _make_trade(pnl=0.0)
         result = TradeComparator().compare(_make_matched(ref, act))
         _assert_field_passed(result, "pnl")
+
+
+class TestExitlessTrades:
+    """#138: an open trade is legal; comparing it must report, not raise."""
+
+    @staticmethod
+    def _open(trade_id: int = 1) -> Trade:
+        return Trade(
+            id=trade_id,
+            symbol="EURUSD",
+            direction="LONG",
+            entry_time="2024-01-01T10:00:00Z",
+            entry_price=1.1000,
+            quantity=1000.0,
+            exits=[],
+            pnl=0.0,
+        )
+
+    def _matched_open_vs_closed(self, ref: Trade, act: Trade) -> MatchedTrade:
+        key = MatchKey(
+            entry_time=ref.entry_time,
+            exit_time="",
+            symbol=ref.symbol,
+            direction=ref.direction,
+        )
+        return MatchedTrade(reference=ref, actual=act, key=key)
+
+    def test_open_reference_against_closed_actual_is_exit_mismatch(self):
+        matched = self._matched_open_vs_closed(self._open(), _make_trade())
+        result = TradeComparator().compare(matched)
+        _assert_field_failed(result, "exit_time")
+        assert not result.is_match
+
+    def test_both_open_is_exit_time_match(self):
+        """Mirrors the exit_price convention: both sides absent is agreement."""
+        matched = self._matched_open_vs_closed(self._open(1), self._open(2))
+        result = TradeComparator().compare(matched)
+        _assert_field_passed(result, "exit_time")

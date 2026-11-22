@@ -1,0 +1,1085 @@
+name: Agent Pre-Mortem
+# Quoted: an unquoted "#" after a space starts a YAML comment, which dropped
+# the PR number and SHA from display_title.
+run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.event.inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || github.event.inputs.head_sha || 'current head' }}"
+
+# Our own automated, read-only pre-mortem on every push to a PR, using the
+# `.agents/skills/actions-pre-mortem` skill as the system prompt of an opencode
+# agent. It is one of three independent agent workflows (Agent Code Review,
+# Agent Mutation Testing, Agent Pre-Mortem) that each run on their own on every
+# push to an open PR: none of them starts another, and each upserts one PR
+# comment of its own. SonarCloud runs separately on each push as well; the
+# `platform-pr-verify` skill reads the four together. (The earlier chain, where
+# review -> mutation -> pre-mortem ran one after the other via dispatches, is
+# abandoned.)
+#
+# It runs on `pull_request` itself (opened, a synchronize, a reopen, the moment a
+# draft becomes ready for review, and a base retarget), with a `workflow_dispatch`
+# for a manual rerun of a PR (`pr_number`, and `head_sha` when an older commit has
+# to be re-analysed, e.g. after an infra failure). Its run-name carries the PR
+# number and the analysed SHA, so a run of an older commit is recognisable in the
+# run list.
+#
+# `edited` is subscribed for the retarget and nothing else: a retarget changes
+# base...head, so the diff the last verdict covered no longer exists, and GitHub
+# fires no other action for it (a base branch that advances on the PR's behalf
+# does not fire anything at all, which is a limitation of the event, not of this
+# step). A title, body or label edit fires the same action, and re-analysing for it
+# would spend model quota on a verdict that is already current, so the run is
+# skipped unless the event carries a changed base - see the guard on the resolve
+# job. The concurrency group below is keyed by that analysed SHA, so a
+# re-dispatch of an older commit runs *beside* the current head's run instead of
+# cancelling it - a rerun of the same commit still supersedes its own stale run.
+#
+# The agent is read-only; this job writes no repo code. It reads the PR diff and
+# its blast radius, writes ranked future-failure scenarios, and produces a
+# machine-checkable verdict. For the analysed SHA the workflow sets the commit
+# status `agent/pre-mortem`, advisory by decision of 2026-11-20: `pending` while
+# running, `success` for every verdict - PASS, BLOCK and CHANGES-REQUESTED
+# alike - with the verdict named in the description, and `error` for INCOMPLETE
+# or for a failed run. No verdict reports `failure`: the pre-mortem ranks what
+# could break later and a human decides what to harden, so a red status on the
+# commit a PR is built on would block a merge over a judgement the status cannot
+# carry. The ranked scenarios stay in the comment, and the verdict is still the
+# first thing the status description says. It also upserts one PR comment titled
+# `# Pre-Mortem Action` (hidden marker `<!-- actions-pre-mortem -->`). A result
+# for a commit that is no longer the PR head still lands its status on its own
+# SHA but does not overwrite the comment.
+#
+# Every result it writes names the diff it was computed against: the comment's
+# footer and every terminal status description carry the analysed base and head,
+# short so they fit, and a description whose run never learned the base (a
+# cancelled resolve, or a dispatch) names the head alone rather than an empty
+# " on base ". The one status that names no diff is the `pending` mark "Mark
+# running" writes before there is a result: it links the run computing it instead,
+# which is the same thing at that point. A verdict is only current for its
+# base...head pair, and both can move
+# under it - a retarget (the trigger above), a base branch that advanced, or a
+# head that moved past the commit this run analysed - so a reader has to be able
+# to tell a stale verdict from the current one without opening the run log.
+#
+# The pending-to-error conversions the stop paths make are a read-then-write: the
+# commit status API has no conditional write. They are pinned down as far as the
+# API allows and their residual window is stated rather than denied - see the
+# comments on the reporters themselves.
+#
+# opencode's free Zen models need no login and no API key, so this workflow
+# holds no secret besides the default GITHUB_TOKEN of the jobs that run no repo
+# code. Those models do cap usage, and an exhausted cap must not read as a
+# pre-mortem result: the `quota-probe` job pings the same model before the
+# agent job installs anything, and a cap, rate limit or region refusal there
+# skips the agent job - a grey check, not a red one - while the post job
+# comments "not run: quota" and warns (decision of 2026-11-21, issue #296).
+# The probe's reply is logged on every path, its quota signature is grepped
+# over stdout and stderr whatever the exit status (opencode has been seen
+# exiting 0 on the cap for this tiny prompt), and `available=true` is only
+# claimed when the reply actually carries the OK token - every other outcome
+# fails open so a genuine failure still fails.
+#
+# The honest limit of the probe: it is a one-word ping, and a cap that is a
+# token budget can still pass it - the ping fits under a ceiling the real run
+# does not. Then the mid-run path below is the usual one: the agent step
+# reports the skip instead of failing, the run's check is green (a job that
+# ran cannot show skipped), the comment says "not run: quota" and the pending
+# mark it wrote is rewritten to say so rather than `error`. Grey is only
+# reachable on the pre-install skip; once the agent job has run, green-with-
+# the-skip-commented is the answer the API allows.
+# Anything the probe cannot classify as quota still runs the agent job, so a
+# genuine failure - a broken install, a misconfigured model, a crashed agent -
+# still fails the run and is reported as `error`, like any other transient
+# reason a sibling has (re-run the job; the remedy is the one the siblings
+# document).
+#
+# Trust model:
+# - The rules (the skill) are read from the base branch, so a PR cannot weaken
+#   its own run. Only while the base has no skill yet is another copy used, and
+#   the prompt says so.
+# - The agent is defined in the runner's global opencode config, outside the
+#   checkout. Its edit tool and .env reads are denied, but it has a shell, so
+#   those denies are a hint, not a boundary. The real guards: the agent job
+#   holds no token or secret, and the run fails if HEAD moved or the tree is
+#   dirty.
+# - This workflow file itself is not pinned: on pull_request GitHub runs the
+#   PR's copy. Accepted, since only collaborators with write access can open
+#   same-repo PRs. Fork PRs are skipped, and drafts (the run is skipped until
+#   the PR is ready for review).
+#
+# Manual rerun (a failed or superseded run, or an older commit that never got
+# one): pass the head SHA as well as the PR number when the analysed commit is
+# not the current head; the comment guard then keeps a newer result in place. The
+# SHA must be a full 40-hex SHA that is one of that PR's own commits - a typo or
+# another PR's head is refused, so no foreign diff is ever analysed under this
+# PR's name - and the *current* head is refused too: its bucket is named after
+# the commit, so it would run beside the push analysing that same diff instead of
+# superseding it. Re-running the current head is `-f pr_number=<N>` alone:
+#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N>
+# and re-analysing an older commit of this PR - the case a dispatch exists for -
+# is the same command with that commit's SHA, which is what keeps it in a bucket
+# of its own beside the current head's run:
+#   gh workflow run agent-pre-mortem.yml --ref <pr-branch> -f pr_number=<N> -f head_sha=<head-sha>
+# A dispatch can only name a ref that carries this workflow file. This PR is the
+# one that adds it, so until it merges into the default branch the manual rerun is
+# not reachable and a push is the only re-run - every push re-analyses the new
+# head, which is the normal path anyway. After the merge the commands above work
+# from any branch.
+#
+# Configuration (Settings -> Secrets and variables -> Actions -> Variables):
+#   PREMORTEM_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
+#   PREMORTEM_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the open PR to pre-mortem
+        required: true
+        type: number
+      head_sha:
+        description: Commit to analyse; the result lands on this commit, and a newer head's comment is not overwritten (default the current head)
+        required: false
+        type: string
+
+concurrency:
+  # A rerun of an older commit (`-f head_sha=<old-sha>`) must not cancel the run that
+  # is analysing the current head - that run's cancellation reporter would mark the
+  # head `error` and leave it with no analysis at all - so such a rerun keeps a
+  # bucket of its own. A rerun naming the same commit does cancel a stale run of
+  # that commit; a rerun that omits `head_sha` shares the `current-head` bucket
+  # with the push's run, so it supersedes it instead of running a second analysis
+  # of the same diff beside it (the comment guard keeps whichever result lands
+  # last).
+  #
+  # The bucket carries an analysed commit only when a *dispatch* names one. A push
+  # must not carry its head SHA here: every push would then land in a group of its
+  # own, so N pushes on one PR would run N 30-minute agent sessions side by side
+  # and exhaust the free model's usage cap, after which the stage stops producing
+  # a verdict for any PR at all. Keyed on the PR, pushes supersede one another and
+  # only the current head's analysis survives - which is the one the PR actually
+  # needs - while a dispatch of an older commit keeps its own bucket and still runs
+  # beside the push's run, which is the case the whole keying exists for.
+  #
+  # An `edited` event that changes no base - a title, body or label edit - is a bucket
+  # of its own, named after this run. Its resolve job is skipped (the guard below),
+  # so joining the bucket of the analysis it would cancel leaves that analysis
+  # cancelled with no replacement: the verdict is never posted and the stage stays
+  # `pending` until the next push. Handing the run its own bucket cannot cancel the
+  # running analysis, and a retarget - which *does* re-analyse - still joins
+  # `current-head` and supersedes it, because that is exactly what it invalidates.
+  group: agent-pre-mortem-${{ github.event.pull_request.number || github.event.inputs.pr_number }}-${{ inputs.head_sha || (github.event.action == 'edited' && !github.event.changes.base && format('edited-{0}', github.run_id)) || 'current-head' }}
+  cancel-in-progress: true
+
+env:
+  # Pinned, and the extraction below is written against this pin: `opencode run --standalone
+  # --archived` is expected to print the assistant messages, the report to start at a column-0
+  # `**Summary:**` line and to end with the verdict on its last non-empty line. A release that
+  # prefixes the streamed lines, prints reasoning or reorders the messages breaks all three, and
+  # every PR's stage then fails closed with "does not end with a valid verdict line" until a
+  # human reads a log. So a bump means reading the extraction below against the new version's
+  # output before it lands, not after.
+  OPENCODE_VERSION: "2.2.7"
+  MODEL: ${{ vars.PREMORTEM_MODEL || 'opencode/inkling-2-small-free' }}
+  VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}
+  SKILL_PATH: .agents/skills/actions-pre-mortem/SKILL.md
+  PREMORTEM_CONTEXT: agent/pre-mortem
+
+# The default token scopes, narrowed once for the whole workflow. A job with its own
+# `permissions:` block replaces this one (it does not add to it), so this is only the default for
+# a job that declares none - and without it every job runs on the repository's default scopes,
+# which are whatever Actions is set to grant and not what this workflow needs. No job here needs
+# more than reading the repository: the agent job reads the checkout, resolve reads the PR and
+# writes one status, post writes one comment and one status, the cancellation reporter writes one
+# status, and each of those three declares exactly the scope it uses.
+permissions:
+  contents: read
+
+jobs:
+  # Resolves the PR and writes its metadata (title and body via jq, never via
+  # ${{ }} interpolation into a shell script). On pull_request the event payload
+  # is enough, so the usual path makes no API call and uses no token; the
+  # dispatch path resolves the PR number with the token. Skips drafts. It marks
+  # nothing: the `pending` status is written by the agent job itself, once the
+  # quota probe has cleared it to run - a run skipped for quota must leave no
+  # `pending` behind, and a resolve failure strands none because none exists yet.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # A manual rerun resolves the PR by number; the pull_request path parses
+    # the event payload and needs no API call. The token writes the status
+    # below, and only for a same-repo PR.
+    permissions:
+      # `contents: read` reads the PR's commit list, which the head_sha check
+      # below needs; this job writes no status - the pending mark is the agent
+      # job's, written only once the run is cleared to happen.
+      pull-requests: read
+      contents: read
+    # Drafts are not pre-mortemed: the run resumes when the PR is ready for
+    # review (one of the pull_request types above). Of the `edited` action only a
+    # base retarget re-runs the stage - `changes.base` is present exactly when the
+    # event changed the base - so a title, body or label edit, which fires the same
+    # action, is skipped. The shape inside `changes.base` is deliberately not read:
+    # GitHub fills `ref`/`sha` differently between retargets, and presence alone is
+    # what the skip needs. A skipped resolve skips every job that needs its outputs.
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft == false && (github.event.action != 'edited' || github.event.changes.base)) }}
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      base: ${{ steps.pr.outputs.base }}
+      head: ${{ steps.pr.outputs.head }}
+      same_repo: ${{ steps.pr.outputs.same_repo }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          INPUT_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          head=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq '.pull_request' "$GITHUB_EVENT_PATH" > pr.json
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}" > pr.json
+            if [ "$(jq -r .state pr.json)" != "open" ]; then
+              echo "::error::PR #${INPUT_PR} is not open."
+              exit 1
+            fi
+            # A dispatch is the only path that reaches what a push never opens: a fork PR, which
+            # is never pre-mortemed (its head commit is not one this repository can write a status
+            # for, and its comment belongs to no branch here), or one still a draft. Refusing
+            # either is what keeps a run from going green while grading nothing: the skip for them
+            # is implicit on the other paths - `same_repo` skips the agent and post jobs, and a
+            # draft never fires at all - so an explicit request that is silently skipped reads as
+            # "no findings" to the operator who asked for it.
+            if [ "$(jq -r .head.repo.full_name pr.json)" != "$GITHUB_REPOSITORY" ]; then
+              echo "::error::PR #${INPUT_PR} is a fork PR; fork PRs are not pre-mortemed. Push a branch to this repository to have it analysed."
+              exit 1
+            fi
+            if [ "$(jq -r .draft pr.json)" = "true" ]; then
+              echo "::error::PR #${INPUT_PR} is still a draft; it is pre-mortemed when it is ready for review."
+              exit 1
+            fi
+            # A dispatch may name an older commit (a rerun after an infra
+            # failure, or one the head moved past). It is analysed on purpose:
+            # its status lands on that commit, and the comment guard below
+            # keeps a newer result's comment in place. What it may not name is a
+            # commit this PR does not contain: that would post a pre-mortem of a
+            # foreign diff on this PR, and would put a verdict on another PR's
+            # gate. So the input is checked, and a check that cannot be made
+            # refuses the run rather than analysing whatever was typed.
+            if [ -n "$INPUT_SHA" ]; then
+              if ! printf '%s' "$INPUT_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+                echo "::error::head_sha must be a full 40-character commit SHA (lowercase hex); got '${INPUT_SHA}'."
+                exit 1
+              fi
+              # Only a dispatch may name a commit other than the head, so the
+              # head is compared first and the commit list is read only when it
+              # has to be. The list is captured before it is matched: under
+              # `set -o pipefail` a `grep -q` that matches exits at once and
+              # closes the pipe, `gh` then dies of SIGPIPE writing the next page,
+              # and the whole pipeline is non-zero - so piping straight into the
+              # match refuses a commit this PR does contain. This PR's own
+              # documented rerun is exactly that case: an older commit sits on
+              # the first page of a commit list that pages at 30.
+              head_now=$(jq -r .head.sha pr.json)
+              # The bucket a dispatch lands in carries the commit it names, so naming the
+              # current head does not share the `current-head` bucket of the push analysing that
+              # same diff right now: the rerun would run beside it instead of superseding it, a
+              # second 30-minute session on an unchanged diff, and every repetition of the
+              # remedy a capped run prints spends the free model's quota for nothing. Omitting
+              # head_sha is what re-runs the current head in the bucket that supersedes.
+              if [ "$head_now" = "$INPUT_SHA" ]; then
+                echo "::error::head_sha ${INPUT_SHA} is the current head of PR #${INPUT_PR}; omit head_sha to re-run it in the bucket that supersedes the push's run, or name an older commit of this PR to analyse it beside them."
+                exit 1
+              fi
+              if [ "$head_now" != "$INPUT_SHA" ]; then
+                if ! commits=$(gh api --paginate \
+                  "repos/${GITHUB_REPOSITORY}/pulls/${INPUT_PR}/commits" --jq '.[].sha'); then
+                  echo "::error::Could not read the commit list of PR #${INPUT_PR}; refusing to analyse ${INPUT_SHA}."
+                  exit 1
+                fi
+                if ! printf '%s\n' "$commits" | grep -qxF "$INPUT_SHA"; then
+                  echo "::error::Commit ${INPUT_SHA} is not a commit of PR #${INPUT_PR}; nothing to analyse."
+                  exit 1
+                fi
+                # Only when the input really is another commit: a rerun that names
+                # the current head must not log that it is not the head.
+                echo "::notice::PR head is ${head_now}, not ${INPUT_SHA}; analysing the requested commit."
+              fi
+            fi
+          fi
+          head=${INPUT_SHA:-$(jq -r .head.sha pr.json)}
+          # The metadata names the commit that is analysed, not the PR's current
+          # head: a manual rerun of an older commit hands the agent a file that
+          # agrees with the prompt instead of a stale SHA.
+          jq --arg head "$head" '{number, title, body, base: .base.sha, head: $head}' pr.json > meta.json
+          {
+            echo "number=$(jq -r .number pr.json)"
+            echo "base=$(jq -r .base.sha pr.json)"
+            echo "head=${head}"
+            echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-pre-mortem-meta
+          path: meta.json
+          retention-days: 1
+
+  # A cheap probe of the free model's quota, run after resolve and before the
+  # agent job installs anything: an exhausted cap, a rate limit or a region
+  # refusal is an infrastructure state, not a pre-mortem result, so it must not
+  # turn the run red. The probe pings the same model and variant the agent will
+  # use; only a positive quota signature - grepped over stdout and stderr,
+  # whatever the exit status, because opencode has been seen exiting 0 on the
+  # cap for this tiny prompt - reports `available=false`, and `available=true`
+  # is only claimed when the reply actually carries the OK token. Everything
+  # else - a success without OK, a failure of any other kind, even a dead probe
+  # job - leaves the agent job to run and surface the genuine failure itself.
+  # The agent job is gated on the output, so a quota skip shows as a skipped
+  # (grey) check, and the post job comments "not run: quota" and warns.
+  quota-probe:
+    needs: resolve
+    # Same gates as the agent job's resolve half: a fork PR or a skipped resolve
+    # (a draft, a text-only edit) never reaches the model at all.
+    if: ${{ needs.resolve.result == 'success' && needs.resolve.outputs.same_repo == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No checkout and no token: the probe needs neither the repository nor a
+    # credential - the free models take no key.
+    permissions: {}
+    outputs:
+      available: ${{ steps.probe.outputs.available }}
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install opencode CLI
+        run: |
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
+          opencode --version
+
+      # The probe agent lives in the global config, like the real one, so the
+      # ping exercises the same model resolution the agent run will.
+      - name: Configure quota probe agent
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Read-only model quota probe (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            # The ping needs no tool at all: deny everything, so a misbehaving
+            # model reply cannot make the probe act.
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf -- '---\n'
+            printf 'Reply with the single word OK and nothing else.\n'
+          } > "$conf/agents/quota-probe.md"
+
+      - name: Probe model quota
+        id: probe
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          probe_dir="$RUNNER_TEMP/quota-probe"
+          mkdir -p "$probe_dir"
+          # opencode has been seen exiting 0 on the cap for this tiny prompt,
+          # so the exit status alone cannot clear the model: the quota
+          # signature is grepped over BOTH streams whatever the status, and
+          # `available=true` is only claimed when the reply actually carries
+          # the OK token. Every other outcome - a non-quota failure, a zero
+          # exit with no OK, even a dead probe - fails open: the agent job runs
+          # and the genuine failure surfaces there.
+          status=0
+          raw=$(opencode run --standalone --archived --agent quota-probe \
+            "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
+          printf '%s\n' "$raw" > "$probe_dir/stdout"
+          cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
+          # Always logged, bounded like the agent step's echo: run 44962236033
+          # passed this probe and hit "Free usage limit reached" 26 s later,
+          # and with the output unlogged there was no way to tell a real reach
+          # from a capped one - the success path used to log nothing at all.
+          echo "::group::Quota probe output (last 4000 bytes)"
+          tail -c 4000 "$probe_dir/combined"
+          echo "::endgroup::"
+          # Only a positive quota signature skips the agent job - on either
+          # stream, whatever the exit status. The pattern is the transient
+          # class the agent step below classifies with - a cap, a rate limit,
+          # an exhausted quota or a region refusal - and deliberately not the
+          # misconfiguration class (a model or variant that cannot be resolved
+          # at all): that is a genuine failure, and the agent job reports it.
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$probe_dir/stdout" "$probe_dir/stderr"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
+          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Quota probe reached the model; the agent job will run."
+          else
+            # Inconclusive - a non-quota failure, or a zero exit whose reply
+            # carried no OK. Fail open, exactly as before the probe existed.
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::The quota probe was inconclusive (exit ${status}, no OK token, no quota signature); the agent job will run and report the real failure."
+          fi
+
+  premortem:
+    needs: [resolve, quota-probe]
+    # Fork PRs are not pre-mortemed, and a skipped resolve (a draft) skips this
+    # job with it. The probe's `available` output is the quota gate: only a
+    # positive "the model is capped" skips the agent - a probe that failed, was
+    # skipped or never ran leaves `available` empty, which is not 'false', so the
+    # agent job still runs and a genuine failure still fails. `!cancelled()`
+    # keeps the expression from implying `success()`, which would skip the agent
+    # on a failed probe - the fail-open case above.
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.resolve.outputs.same_repo == 'true' && needs.quota-probe.outputs.available != 'false' }}
+    runs-on: ubuntu-latest
+    # The skill stops starting new scenarios at about 20 minutes of work.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # The pending mark below is this job's only write.
+      statuses: write
+    outputs:
+      verdict: ${{ steps.verdict.outputs.verdict }}
+      quota: ${{ steps.run.outputs.quota }}
+    env:
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # The analysed commit is marked `pending` here, not in resolve: a run the
+      # quota probe skips never reaches this job, so it leaves no `pending`
+      # status behind - the "not run: quota" path is genuinely neutral. Written
+      # first so the mark covers the whole agent run, checkout included.
+      - name: Mark running
+        run: |
+          # The one status whose description names no analysed pair: there is no result yet, so it
+          # links the run that is computing it instead (see the header).
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=pending -f context="$PREMORTEM_CONTEXT" -f description="Running" \
+            -f target_url="$RUN_URL" > /dev/null
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-pre-mortem-meta
+          path: ${{ runner.temp }}/premortem
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # --ignore-scripts keeps every dependency's lifecycle scripts from running;
+      # only @opencode/cli's own postinstall (it links the platform binary from
+      # the optional dependency) is then run explicitly.
+      - name: Install opencode
+        run: |
+          npm install -g --ignore-scripts "@opencode/cli@${OPENCODE_VERSION}"
+          (cd "$(npm root -g)/@opencode/cli" && node ./postinstall.mjs)
+          opencode --version
+
+      # Rules: the base branch's skill if it has one. Otherwise (only while the
+      # skill is not merged yet) the PR's own copy. A base commit that
+      # cannot be read aborts the step before the `if`, at the standalone
+      # `git cat-file -e`: that check is the guard, because GitHub's default
+      # shell for a `run:` block is already `bash -e {0}` and fail-fast needs no
+      # help - and inside the `if` condition that follows, a failure is a false
+      # branch, not an abort. `set -euo pipefail` adds `pipefail` and `-u` (an
+      # unset variable now fails the step instead of expanding to nothing) and
+      # states the strictness, so it is not the guard and must not be read as
+      # one.
+      #
+      # The path lookup inside the `if` is a plain assignment rather than a command
+      # in a condition, so `errexit` does apply to it: `git ls-tree` is asked for
+      # the path and the *result* decides the branch, instead of `git cat-file`
+      # being run as the condition with its failure suppressed. The distinction
+      # matters: a suppressed failure inside a condition is only a false branch, so
+      # any `git` error - a missing object, an unreadable repository, a wrong
+      # revision syntax - fell through to the PR's own copy under a prompt that
+      # said the rules came from the base branch. Now only an empty listing
+      # (the base genuinely has no skill at that path) takes that branch, and every
+      # other failure stops the job.
+      - name: Select skill revision
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/premortem"
+          skill="$RUNNER_TEMP/premortem/skill.md"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          listing=$(git ls-tree "$BASE_SHA" -- "$SKILL_PATH")
+          if [ -n "$listing" ]; then
+            git show "${BASE_SHA}:${SKILL_PATH}" > "$skill"
+            echo "SKILL_SOURCE=base branch" >> "$GITHUB_ENV"
+          elif [ -f "$SKILL_PATH" ]; then
+            cp "$SKILL_PATH" "$skill"
+            echo "SKILL_SOURCE=this PR (not on the base branch yet)" >> "$GITHUB_ENV"
+          else
+            echo "::error::No pre-mortem skill found at base or PR head."
+            exit 1
+          fi
+
+      # The agent lives in the global config, not in the checkout. Its system
+      # prompt is the skill body (the skill's own frontmatter is dropped). It is
+      # read-only; .env reads stay denied.
+      - name: Configure pre-mortem agent
+        run: |
+          conf="$HOME/.config/opencode"
+          mkdir -p "$conf/agents"
+          printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
+          model="$MODEL"
+          if [ -n "$VARIANT" ]; then model="${MODEL}#${VARIANT}"; fi
+          {
+            printf -- '---\n'
+            printf 'description: Read-only automated PR pre-mortem (CI only)\n'
+            printf 'mode: primary\n'
+            printf 'model: "%s"\n' "$model"
+            printf 'permissions:\n'
+            printf '  - { action: "*", resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*", effect: allow }\n'
+            printf '  - { action: glob, resource: "*", effect: allow }\n'
+            printf '  - { action: grep, resource: "*", effect: allow }\n'
+            printf '  - { action: shell, resource: "*", effect: allow }\n'
+            printf '  - { action: external_directory, resource: "*", effect: allow }\n'
+            printf '  - { action: edit, resource: "*", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env", effect: deny }\n'
+            printf '  - { action: read, resource: "*.env.*", effect: deny }\n'
+            printf -- '---\n'
+            awk 'BEGIN { n = 0 } /^---$/ && n < 2 { n++; next } n >= 2' "$RUNNER_TEMP/premortem/skill.md"
+          } > "$conf/agents/pr-premortem.md"
+          # The system prompt must not be empty (e.g. a skill without frontmatter).
+          if [ "$(awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2' "$conf/agents/pr-premortem.md" | tr -d '[:space:]' | wc -c)" -eq 0 ]; then
+            echo "::error::Pre-mortem agent has an empty system prompt."
+            exit 1
+          fi
+          OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
+            | jq -e '.[] | select(.id == "pr-premortem") | .model' > /dev/null
+
+      - name: Run pre-mortem agent
+        id: run
+        env:
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/premortem/comment.md"
+          # Captured through a variable, never a file the agent can reach: it
+          # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
+          # would otherwise be posted as the verdict. stderr goes to a file so
+          # a failed run's reason stays greppable below.
+          # Whose rules ran is the one thing the report itself cannot show, and it is the
+          # fallback's whole point: while the base branch has no skill, the PR's own copy
+          # runs. Name it in the log and in the comment footer (below), so a verdict produced
+          # by a PR's own rules is never indistinguishable from one the base produced.
+          # The quota path is one body reached from three places: the non-zero-exit
+          # classifier below, and the two zero-exit dead ends (no summary line, no
+          # valid verdict) where the cap has been seen arriving on a zero exit -
+          # opencode exiting 0 on "Free usage limit reached" is exactly the run
+          # shape that used to reach "no summary line" and go red, the outcome
+          # the decision of 2026-11-21 forbids. It writes the same "not run:
+          # quota" report the probe-skip path posts, sets the `quota` output the
+          # post job reads, and exits clean, so the step does not fail.
+          report_quota_skip() {
+            echo "::warning::The pre-mortem agent could not run - the free model was capped, rate-limited, refused or unavailable (see the group above for the exact reason). That is a transient infra failure, not a pre-mortem result: not run: quota. Re-run this job after the quota resets."
+            # The same report the probe-skip path posts, written here because the agent
+            # job already ran: the comment is the PR's view either way, and the `quota`
+            # output is what keeps the post job from mapping an empty verdict to `error`.
+            {
+              printf '# Pre-Mortem Action\n\n'
+              printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable while the agent ran; no pre-mortem was produced for this commit.\n\n'
+              printf 'Re-run the job after the quota resets.\n'
+              printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+              printf '\n---\n_Automated pre-mortem not run: quota (%s)_\n' "${MODEL#*/}${VARIANT:+ (${VARIANT})}"
+            } > "$RUNNER_TEMP/premortem/comment.md"
+            echo "quota=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          echo "::notice::Pre-mortem rules from: ${SKILL_SOURCE}."
+          if ! raw=$(opencode run --standalone --archived --agent pr-premortem \
+            "Pre-mortem PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/premortem/meta.json. Rules loaded from: ${SKILL_SOURCE}." 2> "$out.stderr"); then
+            printf '%s\n' "$raw" > "$out.raw"
+            cat "$out.stderr" >> "$out.raw"
+            # The reason the agent failed is only in stderr, and a file no one
+            # reads is not a diagnosis: a failed run of this job has ended with
+            # a bare "Process completed with exit code 1" and no cause, which
+            # cannot tell a capped free model from a broken prompt. So the
+            # captured output is echoed, bounded so a runaway agent cannot flood
+            # the log, before the classification below reads it.
+            echo "::group::Agent stdout and stderr (last 4000 bytes)"
+            tail -c 4000 "$out.raw"
+            echo "::endgroup::"
+            # Two causes share this grep and need opposite remedies, so they are classified
+            # separately. A cap, a rate limit, an exhausted quota or a region refusal is
+            # transient infra, not a pre-mortem result: by the decision of 2026-11-21 the run
+            # does not go red for it - the step writes the "not run: quota" comment and the
+            # `quota` output instead of failing, the post job comments it and rewrites this
+            # run's pending mark to say so, and the remedy is to re-run the job once the quota
+            # resets. A model or variant that cannot be resolved at all (a typo'd
+            # PREMORTEM_MODEL, a variant the model does not offer, no provider for it, a
+            # rejected token) is not transient: the run cannot succeed until the repository
+            # variable changes, and telling an operator to re-run it would send them into a
+            # loop while the stage stays `error` for everyone. So only the first class takes
+            # the quota path; the second fails with its own message, and a reason in neither
+            # class (an `unauthorized` that could be either) is left to the bare failure and
+            # the captured stderr above it, which is the reason itself - better than guessing
+            # for it.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.stderr"; then
+              report_quota_skip
+            elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
+              echo "::error::The pre-mortem agent could not resolve its model - PREMORTEM_MODEL / PREMORTEM_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes. The stage status is reported as \`error\`."
+            else
+              echo "::error::The pre-mortem agent run failed."
+            fi
+            exit 1
+          fi
+          printf '%s\n' "$raw" > "$out.raw"
+          # stderr went to a file for the failure classifier; on success it
+          # would otherwise never reach the log, so it is echoed bounded too.
+          if [ -s "$out.stderr" ]; then
+            echo "::group::Agent stderr (last 4000 bytes)"
+            tail -c 4000 "$out.stderr"
+            echo "::endgroup::"
+          fi
+          # opencode prints every assistant message; keep only the final comment,
+          # which starts at the last "**Summary:**" line. Drop a closing code
+          # fence the model may have wrapped around it.
+          start=$(grep -n '^\*\*Summary:' "$out.raw" | tail -n 1 | cut -d: -f1 || true)
+          if [ -z "$start" ]; then
+            # opencode has been seen exiting 0 on the cap, with the signature on
+            # stdout: a zero exit is not a clean run, so this dead end is
+            # classified before it fails. The grep covers the raw stream and
+            # stderr both, and runs only here - a real report's own text may
+            # mention "quota", so a produced report is never re-classified.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.raw" "$out.stderr"; then
+              echo "::group::Agent output (last 4000 bytes)"
+              tail -c 4000 "$out.raw"
+              echo "::endgroup::"
+              report_quota_skip
+            fi
+            echo "::error::Pre-mortem output has no summary line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          tail -n "+${start}" "$out.raw" | sed -e '${/^```[[:space:]]*$/d}' > "$out"
+          # The posted report is the tail of the agent's stream, and the anchor above is a
+          # heuristic: it takes the *last* line starting `**Summary:**` anywhere in the stream,
+          # so a later one at column 0 - the skill's own template quoted back inside a
+          # Mitigation block, say - moves the anchor down and the comment then starts at the
+          # quote instead of at the report. That is the shared extraction all three agent
+          # workflows carry (the two siblings' identical line is on main here), so it is not
+          # changed in this PR. What *is* diagnosable has to be diagnosable without the stream:
+          # the raw output is uploaded with the comment below, and the byte counts are logged, so
+          # a comment that lost its opening sections is a run someone can reconstruct and read
+          # rather than one whose report silently changed shape.
+          kept=$(wc -c < "$out" | tr -d '[:space:]')
+          total=$(wc -c < "$out.raw" | tr -d '[:space:]')
+          echo "::notice::The pre-mortem report is ${kept} of the agent's ${total} bytes of output; $((total - kept)) bytes of streamed messages and tool output are not posted (the raw output is an artifact of this run)."
+          # The verdict must be the last non-empty line (a verdict quoted from the
+          # diff elsewhere in the output does not count), and it must be one of
+          # the four the skill allows. What follows the verdict word must start with
+          # something that is not a letter, an underscore or a hyphen, so
+          # `Verdict: PASSed` and `Verdict: BLOCKED` - a word the skill does not
+          # allow, wearing a suffix that reads like the reason - are refused instead
+          # of matching as PASS and BLOCK: posting a verdict the model never wrote
+          # and mapping it to a state is a status nobody can explain. An annotation
+          # that begins with a space, a dash or punctuation is still accepted.
+          # A sign-off note the model put on its own line after the verdict (the
+          # skill asks for it on the verdict line) is tolerated: it is skipped
+          # when looking for the verdict, and stays in the posted comment.
+          last=$(grep -v '^[[:space:]]*$' "$out" \
+            | grep -vxE '[[:space:]*_]*Human sign-off required\.[[:space:]*_]*' \
+            | tail -n 1)
+          verdict=$(printf '%s\n' "$last" | tr -d '*' \
+            | sed -nE 's/^Verdict:[[:space:]]*(BLOCK|CHANGES-REQUESTED|PASS|INCOMPLETE)([^[:alpha:]_-].*)?$/\1/p')
+          if [ -z "$verdict" ]; then
+            # Same zero-exit cap as above: a report that starts but never reaches
+            # a valid verdict can still be the quota signature, on either stream.
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded' "$out.raw" "$out.stderr"; then
+              echo "::group::Agent output (last 4000 bytes)"
+              tail -c 4000 "$out.raw"
+              echo "::endgroup::"
+              report_quota_skip
+            fi
+            echo "::error::Pre-mortem output does not end with a valid verdict line; not posting."
+            cat "$out.raw"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$HEAD_SHA" ] || [ -n "$(git status --porcelain)" ]; then
+            echo "::error::The pre-mortem agent modified the checkout; not posting."
+            git status --porcelain
+            exit 1
+          fi
+          # A file, not $GITHUB_OUTPUT: the agent shares this step's
+          # environment and could otherwise append its own verdict.
+          printf '%s\n' "$verdict" > "$RUNNER_TEMP/premortem/verdict.txt"
+          # Footer: which diff was analysed, then the model, its variant and the skill
+          # the rules came from (the skill directory's name, not its path), so a
+          # reader can map the verdict to the rules that produced it. The pair comes
+          # first because it is the one thing that cannot be re-derived from the
+          # comment: a verdict is current for its base...head and nothing else, and a
+          # retarget, a base branch that moved or a head that moved on can each leave
+          # this comment describing a diff nobody is looking at any more.
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          {
+            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+            printf '\n---\n_Automated pre-mortem using %s with `%s` skill (rules from %s)_\n' \
+              "${MODEL#*/}${VARIANT:+ (${VARIANT})}" "$skill_name" "${SKILL_SOURCE}"
+          } >> "$out"
+          # Title first, so the comment is recognisable among the other bots'.
+          { printf '# Pre-Mortem Action\n\n'; cat "$out"; } > "$out.titled"
+          mv "$out.titled" "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+      # A separate step, so the verdict reaches $GITHUB_OUTPUT from a file the
+      # agent never had this step's env file to append to. A quota skip wrote no
+      # verdict - the agent step's `quota` output is what the post job reads
+      # instead, so an empty verdict is never mapped to `error`.
+      - name: Read verdict
+        id: verdict
+        if: steps.run.outputs.quota != 'true'
+        run: |
+          set -euo pipefail
+          echo "verdict=$(cat "$RUNNER_TEMP/premortem/verdict.txt")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-pre-mortem
+          # The posted comment, and the agent's raw stdout beside it. The comment is the tail of
+          # that stream, so a run whose report lost its opening sections is only diagnosable
+          # against what the stream actually carried - and the stream is not in the log, which
+          # carries the bounded 4000-byte echo of a failed run's output instead.
+          path: |
+            ${{ runner.temp }}/premortem/comment.md
+            ${{ runner.temp }}/premortem/comment.md.raw
+          retention-days: 14
+
+  # Posts the comment and sets the status. Runs no repo code. Also reports a
+  # failed run (an infra failure, e.g. the free model's usage limit) as `error`,
+  # and a quota skip - the probe's or the agent step's - as "not run: quota",
+  # which is never `error` and never a verdict `success`.
+  post:
+    needs: [resolve, premortem, quota-probe]
+    # Runs for a finished agent job (success or failure), and for the quota skip
+    # the probe produced: the agent job is then `skipped`, which is exactly the
+    # grey check the decision asks for, and this job is what still tells the PR
+    # why. `!cancelled()` keeps the expression from implying `success()`, so a
+    # failed agent job still reaches the reporters below.
+    if: ${{ !cancelled() && (needs.premortem.result == 'success' || needs.premortem.result == 'failure' || (needs.resolve.outputs.same_repo == 'true' && needs.quota-probe.outputs.available == 'false')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Verified on PR #178 for the review workflow's identical steps:
+    # pull-requests: write is enough for the issues/{n}/comments endpoints on a
+    # pull request; issues: write is not needed.
+    permissions:
+      pull-requests: write
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ needs.resolve.outputs.number }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head }}
+      BASE_SHA: ${{ needs.resolve.outputs.base }}
+      VERDICT: ${{ needs.premortem.outputs.verdict }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report failed pre-mortem run
+        if: needs.premortem.result == 'failure'
+        run: |
+          set -euo pipefail
+          # Pending only, as every other reporter here, and only when this run wrote
+          # that pending mark: another run of this same commit - the documented
+          # side-by-side dispatch of an older commit, or a rerun of this one - may
+          # already have written its final status, and an infra failure of this run
+          # must not replace it. The commit status API has no conditional write, so
+          # what it allows is pinned down instead: the *newest* status of the context
+          # (the API's own ordering is not documented, hence the sort by creation time
+          # rather than `[0]`) and the run that wrote it, so only this run's own
+          # `pending` mark is converted. Both reads are `gh api --paginate ... | jq -sr
+          # --arg ...`: `gh api` itself has no `--arg`, and a status list is one page per
+          # 30 entries, so the mark to convert is not guaranteed to be on the page the
+          # API returns first. The target URL is compared for equality, since
+          # `.../runs/123` is a prefix of `.../runs/1234`. The read-then-write window between them
+          # cannot be closed by this API, so this is best effort, not an atomic
+          # conversion.
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Pre-mortem run failed for ${HEAD_SHA:0:8}${pair}; see the run log" \
+              -f target_url="$RUN_URL" > /dev/null
+          else
+            # A terminal status (a verdict of its own, or an earlier error) stands;
+            # say so instead of leaving the run silent about what it did not do.
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; this failed run did not replace it."
+          fi
+
+      # The probe-skip path has no agent artifact: the agent job never ran, so
+      # the "not run: quota" comment is written here instead. The mid-run quota
+      # path already wrote the same body into the artifact, so this step is the
+      # probe path's alone.
+      - name: Write quota comment
+        if: needs.quota-probe.outputs.available == 'false'
+        run: |
+          set -euo pipefail
+          skill_name=$(basename "$(dirname "$SKILL_PATH")")
+          {
+            printf '# Pre-Mortem Action\n\n'
+            printf '**Summary:** Not run: quota - the free model was capped, rate-limited, refused or unavailable before the agent could start; no pre-mortem was produced for this commit.\n\n'
+            printf 'Re-run the workflow after the quota resets.\n'
+            printf '\n_Analysed base `%s` ... head `%s`._\n' "${BASE_SHA:0:8}" "${HEAD_SHA:0:8}"
+            printf '\n---\n_Automated pre-mortem not run: quota (%s skill)_\n' "$skill_name"
+          } > comment.md
+
+      - uses: actions/download-artifact@v4
+        if: needs.premortem.result == 'success'
+        with:
+          name: agent-pre-mortem
+
+      # One comment per PR, identified by a hidden marker and updated in place.
+      # Uses the REST API only. A result for a commit that is no longer the PR
+      # head does not overwrite the comment (its status still lands on its SHA).
+      - name: Post or update pre-mortem comment
+        if: needs.premortem.result == 'success' || needs.quota-probe.outputs.available == 'false'
+        env:
+          # True when the body being posted is the "not run: quota" report -
+          # the probe path's or the mid-run path's - so the guard below can
+          # keep it from overwriting a real verdict for this same head.
+          QUOTA_SKIP: ${{ needs.premortem.outputs.quota == 'true' || needs.quota-probe.outputs.available == 'false' }}
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$current" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${current}; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
+          marker='<!-- actions-pre-mortem -->'
+          { echo "$marker"; cat comment.md; } > body.md
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id")
+          # The head is read again with the body in hand, immediately before the write. The guard
+          # above ran before the body was assembled and before the comment-list fetch, and a
+          # synchronize event landing inside that window would still have been written over: a
+          # comment describing a diff nobody is looking at any more, presented as the current
+          # result. Reading it here narrows the window to the write itself, which no API closes -
+          # there is no conditional comment update - and the comment's footer names the base...head
+          # it was computed from, so a result that still slips through is readable rather than
+          # silently current.
+          moved=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
+          if [ "$moved" != "$HEAD_SHA" ]; then
+            echo "::notice::PR head moved to ${moved} while this comment was being posted; not updating the comment for ${HEAD_SHA}."
+            exit 0
+          fi
+          # A quota skip must not overwrite a real verdict for this same head:
+          # a manual re-run of an unchanged head after the cap resets is exactly
+          # the case where the "not run: quota" body would replace a verdict
+          # that is still current. A quota body over an older quota comment, or
+          # any real verdict, still writes.
+          if [ "$QUOTA_SKIP" = "true" ] && [ -n "$existing" ]; then
+            for id in $existing; do
+              prior=$(gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" --jq .body)
+              if printf '%s\n' "$prior" | grep -q 'Verdict:' \
+                && printf '%s\n' "$prior" | grep -q "${HEAD_SHA:0:8}"; then
+                echo "::notice::The existing pre-mortem comment is a real verdict for ${HEAD_SHA}; the quota skip did not overwrite it."
+                exit 0
+              fi
+            done
+          fi
+          if [ -n "$existing" ]; then
+            # More than one comment can carry the marker (a duplicate from an
+            # interrupted run, or one created outside the workflow). Patching
+            # only the newest would leave the stale one readable forever, so say
+            # it and update every match with the same current result.
+            count=$(printf '%s\n' "$existing" | grep -c '[0-9]' || true)
+            if [ "$count" -gt 1 ]; then
+              echo "::warning::${count} pre-mortem comments carry the marker; updating all of them with the current result."
+            fi
+            for id in $existing; do
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${id}" -F body=@body.md > /dev/null
+            done
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -F body=@body.md > /dev/null
+          fi
+
+      - name: Set status
+        if: needs.premortem.result == 'success' && needs.premortem.outputs.quota != 'true'
+        run: |
+          set -euo pipefail
+          # Advisory, by decision of 2026-11-20: every verdict the agent can
+          # produce is a `success` state, and the verdict is what the description
+          # says. A BLOCK or CHANGES-REQUESTED pre-mortem is a ranked list of
+          # scenarios with a sign-off note, not a mechanical gate - a `failure`
+          # would fail the commit status of the very head a PR is asking to be
+          # reviewed, blocking a merge over a judgement a human makes after
+          # reading the comment. Only a run that could not produce a verdict at
+          # all (INCOMPLETE, or the failed run reported above) is not a success.
+          case "$VERDICT" in
+            PASS|BLOCK|CHANGES-REQUESTED) state=success ;;
+            *) state=error ;;
+          esac
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state="$state" -f context="$PREMORTEM_CONTEXT" \
+            -f description="Verdict: ${VERDICT} (advisory, see the comment) - head ${HEAD_SHA:0:8} on base ${BASE_SHA:0:8} - PR #${PR_NUMBER}" -f target_url="$RUN_URL" > /dev/null
+
+      # A quota skip is not a verdict and not a failure: the commit status API
+      # has no neutral state, so this run's own pending mark - when the agent
+      # job wrote one before hitting the cap mid-run - is rewritten as `pending`
+      # with the reason, which is the non-green, non-red answer the decision of
+      # 2026-11-21 asks for. The probe-skip path wrote no mark at all (the agent
+      # job never started), so the common outcome there is the notice. The same
+      # identity-bearing read-then-write as the reporters: only this run's own
+      # pending mark is touched, never another run's terminal status.
+      - name: Report quota skip
+        if: needs.premortem.outputs.quota == 'true' || (needs.resolve.outputs.same_repo == 'true' && needs.quota-probe.outputs.available == 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Pre-mortem not run: quota - the free model was capped, rate-limited or refused. Re-run the workflow after the quota resets."
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=pending -f context="$PREMORTEM_CONTEXT" \
+              -f description="Not run: quota - re-run after the quota resets - head ${HEAD_SHA:0:8}${pair} - PR #${PR_NUMBER}" \
+              -f target_url="$RUN_URL" > /dev/null
+          else
+            # The probe path leaves no mark of this run's to rewrite (the agent
+            # job never started), and another run's status is never this one's
+            # to replace - say so instead of writing where nothing is owed.
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; the quota skip did not replace it."
+          fi
+
+      # A failure above (artifact download, comment POST/PATCH, status write)
+      # would otherwise leave the status `pending` on this SHA forever. Only this
+      # run's own pending mark is converted, so another run's terminal verdict
+      # stands (as far as the API allows: see the reporter above).
+      - name: Report post failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The same identity-bearing, best-effort conversion the other reporters make:
+          # the newest status of the context, and only when this run wrote it.
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Post step failed for ${HEAD_SHA:0:8}${pair}; see the run log" \
+              -f target_url="$RUN_URL" > /dev/null
+          else
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; this failure did not replace it."
+          fi
+
+  # A cancelled run (a hand-cancel, or a superseding run through the
+  # concurrency group) skips every reporter above, which would leave the status
+  # `pending` with no signal. This job runs only on cancellation and turns this
+  # run's own pending mark of the analysed commit into an error. What another run
+  # wrote is not touched.
+  report-cancelled:
+    needs: [resolve, premortem, post]
+    if: ${{ cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The commit the cancelled run analysed, with the resolve reporter's fallback chain
+      # behind it: a job that is cancelled publishes no outputs, yet "Mark running"
+      # inside it may already have written the `pending` mark this job exists to clear - so
+      # an in-flight resolve leaves that mark stranded on its SHA with nothing but a
+      # warning in a log nobody opens. The event's head (or the dispatch input) is what
+      # keeps the mark clearable.
+      HEAD_SHA: ${{ needs.resolve.outputs.head || github.event.pull_request.head.sha || inputs.head_sha }}
+      # The base of the analysed pair, for the error description below; a cancelled job
+      # publishes no outputs, so a cancelled resolve leaves it empty and the description
+      # names the head alone.
+      BASE_SHA: ${{ needs.resolve.outputs.base || github.event.pull_request.base.sha }}
+      # A cancelled run publishes no outputs, so `needs.resolve.outputs.same_repo` is empty
+      # exactly when the resolve job was the one cancelled - and an empty value is not "false":
+      # reading it as such sent a fork run's head SHA to the commit-status API of a commit
+      # this repository cannot read, and the reporter failed on the 404. The event's own head
+      # repository is what keeps a cancelled same-repo run's mark clearable and a fork's run
+      # clean.
+      SAME_REPO: ${{ needs.resolve.outputs.same_repo || github.event.pull_request.head.repo.full_name == github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Report cancelled pre-mortem run
+        run: |
+          set -euo pipefail
+          # Fork PRs are never pre-mortemed: the resolve job guards its pending mark and the
+          # agent job on the same `same_repo` output, and a fork's head commit is not one this
+          # repository can write a status for - the read below would 404 on it. A cancelled run
+          # publishes no outputs, so the value is derived from the event above; anything short
+          # of a confirmed same-repo PR leaves the reporter alone rather than 404ing on a
+          # commit this repository cannot read.
+          #
+          # Two things a cancelled `workflow_dispatch` cannot resolve, and this reporter does not
+          # pretend otherwise. Its payload carries no `pull_request` at all, so
+          # `github.event.pull_request.head.repo.full_name` is null and the comparison above is
+          # false rather than a confirmation; and a dispatch that omitted `head_sha` names no
+          # commit, while "Mark running" ran under the resolved one. A dispatch cancelled inside
+          # resolve can therefore leave a `pending` mark this job cannot find: the only way to
+          # find it is reading `pulls/N` by number, which needs a token scope this job does not
+          # hold (it writes one status and nothing else), and widening a cancellation reporter's
+          # scopes for a window of seconds is not a trade worth making. So the mark can strand,
+          # and the log says that - it does not claim a fork ran, and it does not claim this run
+          # marked nothing pending, because both are false in exactly the case that matters.
+          if [ "$SAME_REPO" != "true" ]; then
+            echo "::warning::Could not confirm from the event that this run's PR is in this repository; a pending mark, if this run wrote one, is left pending until a later run of that commit clears it."
+            exit 0
+          fi
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::warning::Resolve wrote no head SHA and the event named none; a pending mark, if this run wrote one, is left pending until a later run of that commit clears it."
+            exit 0
+          fi
+          # A cancelled run is the case the identity check exists for: what cancelled it
+          # is usually another run of the same commit, which then writes its own status.
+          # The pending mark that is converted is this run's own - the newest status of
+          # the context, and the one this run wrote - and the read-then-write window the
+          # API cannot close is stated as best effort rather than denied.
+          status=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" \
+            | jq -sr --arg ctx "$PREMORTEM_CONTEXT" --arg url "$RUN_URL" \
+              '[.[].statuses[] | select(.context == $ctx)] | sort_by(.created_at) | last as $s | ($s.state // "unset") + "|" + ((($s.target_url // "") == $url) | tostring)')
+          state=${status%%|*}
+          owner=${status#*|}
+          pair=""
+          if [ -n "$BASE_SHA" ]; then pair=" on base ${BASE_SHA:0:8}"; fi
+          if [ "$state" = "pending" ] && [ "$owner" = "true" ]; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+              -f state=error -f context="$PREMORTEM_CONTEXT" \
+              -f description="Pre-mortem run cancelled for ${HEAD_SHA:0:8}${pair}; re-dispatch to run it" \
+              -f target_url="$RUN_URL" > /dev/null
+          else
+            echo "::notice::agent/pre-mortem on ${HEAD_SHA} is '${state}', not this run's pending mark; the cancellation did not replace it."
+          fi

@@ -9917,7 +9917,7 @@
           "quantity": 2.84,
           "pnl": -206.72,
           "reason": null,
-          "fees": 7.41,
+          "fees": null,
           "tags": []
         }
       ],
@@ -9927,8 +9927,8 @@
       "risk_percent": null,
       "exit_reason": null,
       "pnl_pct": null,
-      "fees": 7.41,
-      "net_pnl": -214.13,
+      "fees": -7.41,
+      "net_pnl": -199.31,
       "r_multiple": null,
       "mae": null,
       "mfe": null,

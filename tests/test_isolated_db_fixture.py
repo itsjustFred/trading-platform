@@ -45,7 +45,7 @@ def _count_real_backtest_rows() -> int:
 
 
 def test_isolated_db_redirects_module_at_tmp_database(isolated_db, tmp_path: Path) -> None:
-    db_module, engine, data_dir = isolated_db
+    db_module, _engine, data_dir = isolated_db
 
     assert db_module is database
     assert data_dir == tmp_path / "data"

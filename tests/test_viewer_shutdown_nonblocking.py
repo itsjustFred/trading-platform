@@ -99,16 +99,23 @@ def test_interpreter_exit_is_not_pinned_by_inflight_prewarm():
     """A blocking prewarm on the pool must not delay interpreter shutdown."""
     script = textwrap.dedent(
         """
-        import asyncio, sys, time
+        import asyncio, sys, threading, time
         sys.path.insert(0, {repo!r})
         from viewer import main as viewer_main
 
         async def main():
             loop = asyncio.get_running_loop()
+            started = threading.Event()
+
+            def blocking_prewarm():
+                started.set()
+                time.sleep(60)
+
             future = loop.run_in_executor(
-                viewer_main._BACKGROUND_PREWARM_EXECUTOR, lambda: time.sleep(60)
+                viewer_main._BACKGROUND_PREWARM_EXECUTOR, blocking_prewarm
             )
-            await asyncio.sleep(0.3)
+            if not await asyncio.to_thread(started.wait, 5):
+                raise RuntimeError("prewarm did not start")
             future.cancel()
 
         asyncio.run(main())

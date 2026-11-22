@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import BaseLiveAdapter, LiveQuote
 from live_runner.daemon import submit_order_with_risk
 from risk.config import RiskConfig
 from risk.engine import RiskEngine
@@ -239,6 +239,40 @@ def test_calculate_position_size_notional_cap_edge_is_inclusive():
     assert sized.decision.metadata["capped_by_notional"] is False
 
 
+def test_calculate_position_size_math_inf_notional_is_documented_uncapped():
+    """#347: engines that apply their own post-size caps pass math.inf as the
+    caller ceiling — no engine-level cap binds and the decision metadata
+    records the JSON-safe "uncapped" sentinel, never 1.8e308."""
+    engine = RiskEngine(RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05))
+    signal = TradeSignal(
+        action="buy", symbol="INF", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+    )
+
+    # Risk sizing alone: 100 / 1 = 100 shares; nothing caps it.
+    assert sized.position_size == pytest.approx(100.0)
+    assert sized.decision.metadata["capped_by_notional"] is False
+    assert sized.decision.metadata["max_notional_per_trade"] == "uncapped"
+
+    for bad in (math.nan, math.inf * -1, 0.0, -1.0, True, False):
+        with pytest.raises(ValueError, match="max_notional_per_trade"):
+            engine.calculate_position_size(
+                signal=signal,
+                account_balance=10_000.0,
+                pip_value=1.0,
+                current_exposure=0.0,
+                max_notional_per_trade=bad,
+            )
+
+
 def test_calculate_position_size_exposure_limit_hit():
     engine = RiskEngine(
         RiskConfig(
@@ -332,6 +366,83 @@ def test_calculate_position_size_zero_distance_wrong_side_returns_rejection():
     assert sized.decision.accepted is False
     assert sized.decision.rejection_reason == "bad_stop_direction"
     assert sized.decision.risk_distance is None
+
+
+def test_wrong_side_stop_reports_the_absolute_risk_distance():
+    """A rejected wrong-side stop still reports the distance, as an absolute.
+
+    The rejection is sized from ``abs(entry - stop)``: a buy at 100 with a stop
+    at 105 is 5.0 away, not -105.0, so the diagnostic a reviewer reads against a
+    rejected order names the real separation rather than a signed difference.
+    """
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=105.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+
+    sized = RiskEngine().calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+    )
+
+    assert sized.position_size == 0.0
+    assert sized.decision is not None
+    assert sized.decision.accepted is False
+    assert sized.decision.rejection_reason == "bad_stop_direction"
+    assert sized.decision.risk_distance == pytest.approx(5.0)
+
+
+def test_a_non_finite_entry_price_is_refused_at_the_model():
+    """The signal model refuses a non-finite entry at construction.
+
+    Together with the engine's stop re-validation below, this is what makes the
+    wrong-side branch's ``math.isfinite`` guard defence in depth: neither price
+    can be non-finite once sizing starts, so no reachable outcome depends on it.
+    """
+    with pytest.raises(ValueError, match="entry_price must be finite"):
+        TradeSignal(
+            action="buy",
+            symbol="AAPL",
+            entry_price=math.inf,
+            stop_loss=105.0,
+            take_profit=110.0,
+            timeframe="1h",
+            metadata={"current_positions": 0, "enforce_stop_direction": True},
+        )
+
+
+def test_a_non_finite_stop_is_refused_before_the_distance_is_computed():
+    """A stop the fallback path rewrote to a non-finite value never gets sized.
+
+    The engine assigns ``signal.stop_loss`` itself when resolving a fallback, so
+    pin that it re-validates the price before the wrong-side distance maths
+    rather than reporting an ``inf`` risk distance.
+    """
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=105.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={"current_positions": 0, "enforce_stop_direction": True},
+    )
+    signal.stop_loss = math.inf
+
+    with pytest.raises(ValueError, match="stop_loss must be finite"):
+        RiskEngine().calculate_position_size(
+            signal=signal,
+            account_balance=10_000.0,
+            pip_value=1.0,
+            current_exposure=0.0,
+        )
 
 
 def test_calculate_position_size_missing_stop_loss_uses_fallback():
@@ -497,6 +608,9 @@ def test_risk_decision_rejects_malformed_wire_values():
 @dataclass(slots=True)
 class _DummyAdapter(BaseLiveAdapter):
     submitted_signal: LiveSignal | None = None
+    # A double has to prove it is a demo account (`_adapter_is_demo`); without
+    # the flag it is real money and the promotion gate (#165) refuses entries.
+    demo: bool = True
 
     async def connect(self) -> None:
         return None
@@ -511,6 +625,19 @@ class _DummyAdapter(BaseLiveAdapter):
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_pip_value(self, symbol):
+        # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
+        from live_runner.base_adapter import LivePipValue
+
+        return LivePipValue(
+            value=1.0, units_per_qty=1.0, conversion_rate=1.0,
+            quote_asset="USD", account_asset="USD", source="test",
+        )
+
+    async def get_quote(self, symbol: str) -> LiveQuote:
+        # #125 entry-deviation gate: a quote at the signal entry passes.
+        return LiveQuote(bid=100.0, ask=100.0, timestamp=datetime.now(timezone.utc), source="test")
 
 
 def test_submit_order_with_risk_applies_qty_before_submit():
@@ -544,7 +671,7 @@ def test_submit_order_with_risk_applies_qty_before_submit():
 
 
 class TestIssueC1FallbackGuards:
-    """C1: no silent healing of bad ATR; unsupported trailing warns."""
+    """C1: no silent healing of bad ATR; #150: unsupported trailing rejects."""
 
     def _engine(self) -> RiskEngine:
         return RiskEngine(
@@ -569,7 +696,7 @@ class TestIssueC1FallbackGuards:
 
     @pytest.mark.parametrize("bad_atr", [float("nan"), float("inf"), -1.5, 0.0, "nonsense"])
     def test_non_finite_atr_rejected(self, bad_atr) -> None:
-        with pytest.raises(ValueError, match="[Aa][Tt][Rr]"):
+        with pytest.raises(ValueError, match=r"[Aa][Tt][Rr]"):
             self._engine().calculate_position_size(
                 signal=self._signal(atr=bad_atr),
                 account_balance=10000.0,
@@ -577,14 +704,56 @@ class TestIssueC1FallbackGuards:
                 current_exposure=0.0,
             )
 
-    def test_unsupported_trailing_mode_warns_and_leaves_stop(self, caplog) -> None:
-        import logging
+    def test_unsupported_trailing_mode_rejected(self) -> None:
+        """#150 (decided behaviour change): the old warned no-op is gone.
 
-        signal = self._signal(
-            trailing_sl_config={"mode": "supertrend_flip"},
-        )
+        supertrend_flip is a known mode no executing path supports yet (#168);
+        the engine refuses it instead of trading the signal untrailed.
+        """
+        signal = self._signal(trailing_sl_config={"mode": "supertrend_flip"})
         signal.stop_loss = 98.0
-        with caplog.at_level(logging.WARNING, logger="risk.engine"):
-            result = self._engine().apply_trailing_stop(signal, market_price=101.0)
+        engine = self._engine()
+        with pytest.raises(ValueError, match="supertrend_flip"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+
+    def test_unknown_trailing_mode_rejected(self) -> None:
+        signal = self._signal(trailing_sl_config={"mode": "martingale_trail"})
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="Unknown trailing stop mode"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+
+    def test_none_trailing_mode_keeps_initial_stop(self) -> None:
+        """#150: mode 'none' means initial stop only — no trailing, no error."""
+        signal = self._signal(trailing_sl_config={"mode": "none"})
+        signal.stop_loss = 98.0
+        result = self._engine().apply_trailing_stop(signal, market_price=101.0)
         assert result == pytest.approx(98.0)
-        assert any("supertrend_flip" in record.message for record in caplog.records)
+        assert signal.stop_loss == pytest.approx(98.0)
+
+    @pytest.mark.parametrize("percent", [float("nan"), float("inf"), 0.0, 1.0, None])
+    def test_percent_trailing_mode_rejects_non_finite_or_out_of_range_percent(
+        self, percent
+    ) -> None:
+        """A NaN percent passed the old range check and left the stop untrailed."""
+        signal = self._signal(trailing_sl_config={"mode": "percent", "percent": percent})
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="percent"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+        assert signal.stop_loss == pytest.approx(98.0)
+
+    @pytest.mark.parametrize("malformed", [{}, "", [], "percent"])
+    def test_malformed_trailing_sl_config_rejected(self, malformed) -> None:
+        """Survivor: a falsy/malformed config must not fall back to 'no trailing'."""
+        signal = self._signal(trailing_sl_config=malformed)
+        signal.stop_loss = 98.0
+        engine = self._engine()
+        with pytest.raises(ValueError, match="trailing_sl_config"):
+            engine.apply_trailing_stop(signal, market_price=101.0)
+
+    def test_percent_trailing_mode_still_trails(self) -> None:
+        signal = self._signal(trailing_sl_config={"mode": "percent", "percent": 0.02})
+        signal.stop_loss = 98.0
+        result = self._engine().apply_trailing_stop(signal, market_price=101.0)
+        assert result == pytest.approx(101.0 * 0.98)

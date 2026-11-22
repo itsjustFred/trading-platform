@@ -451,6 +451,7 @@ class PyneCoreAdapter(EngineAdapter):
         try:
             result = subprocess.run(
                 cmd,
+                check=False,
                 capture_output=True,
                 text=True,
                 cwd=str(tmpdir_path),
@@ -1330,6 +1331,15 @@ def _initial_exit_reason(raw_signal: str) -> str | None:
     return "_".join(signal.lower().split())
 
 
+def _csv_trade_direction(trade_type: str) -> str:
+    """LONG/SHORT from a lower-cased "entry long"/"entry short" cell, else raise."""
+    if "long" in trade_type and "short" not in trade_type:
+        return "LONG"
+    if "short" in trade_type and "long" not in trade_type:
+        return "SHORT"
+    raise ValueError(f"unknown trade direction in trade CSV type {trade_type!r}")
+
+
 def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]:
     trades: list[Trade] = []
     entries: dict[int, dict[str, Any]] = {}
@@ -1348,7 +1358,7 @@ def _parse_trade_csv(csv_path: Path, symbol: str, id_offset: int) -> list[Trade]
                         "time": row["Date/Time"],
                         "price": 0.0,
                         "contracts": 0.0,
-                        "direction": "LONG" if "long" in trade_type else "SHORT",
+                        "direction": _csv_trade_direction(trade_type),
                     },
                 )
                 quantity = float(row["Contracts"])

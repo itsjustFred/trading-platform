@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 import runner.optimizer as optimizer_module
 from data_tools.auto_download import has_ohlcv_bars_in_range
-from shared.models import BacktestMeta, BacktestResult, Trade, TradeExit
+from shared.models import BacktestMeta, BacktestResult, EquityPoint, Trade, TradeExit
 
 
 def _optimization_config(*, train_split_pct: float) -> optimizer_module.OptimizationConfig:
@@ -48,22 +48,38 @@ def test_optimization_config_enforces_inclusive_train_split_upper_bound():
 
 
 def test_split_backtest_period_returns_positive_non_overlapping_segments():
-    train_period, test_period = optimizer_module._split_backtest_period(
+    split = optimizer_module._split_backtest_period(
         "2024-01-01",
         "2024-01-10",
-        0.7,
+        0.6,
+        validation_split_pct=0.2,
+        test_split_pct=0.2,
     )
 
-    train_start = datetime.fromisoformat(train_period["start"])
-    train_end = datetime.fromisoformat(train_period["end"])
-    test_start = datetime.fromisoformat(test_period["start"])
-    test_end = datetime.fromisoformat(test_period["end"])
+    train_start = datetime.fromisoformat(split.train["start"])
+    train_end = datetime.fromisoformat(split.train["end"])
+    validation_start = datetime.fromisoformat(split.validation["start"])
+    validation_end = datetime.fromisoformat(split.validation["end"])
+    test_start = datetime.fromisoformat(split.test["start"])
+    test_end = datetime.fromisoformat(split.test["end"])
 
-    assert train_start < train_end < test_start < test_end
+    assert train_start < train_end < validation_start < validation_end < test_start < test_end
 
 
-def test_split_backtest_period_rejects_range_too_short_for_both_segments():
-    with pytest.raises(ValueError, match="empty train or test period"):
+def test_split_backtest_period_derives_equal_validation_and_test_shares():
+    split = optimizer_module._split_backtest_period("2024-01-01", "2024-01-10", 0.7)
+
+    validation = datetime.fromisoformat(split.validation["end"]) - datetime.fromisoformat(
+        split.validation["start"]
+    )
+    test = datetime.fromisoformat(split.test["end"]) - datetime.fromisoformat(
+        split.test["start"]
+    )
+    assert validation == test
+
+
+def test_split_backtest_period_rejects_range_too_short_for_all_segments():
+    with pytest.raises(ValueError, match="train segment would be empty"):
         optimizer_module._split_backtest_period(
             "2024-01-01T00:00:00+00:00",
             "2024-01-01T00:00:00.000001+00:00",
@@ -267,6 +283,15 @@ def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
         "total_return": round(metric * 0.05, 6),
         "max_drawdown_pct": -0.1 if trade_count > 0 else 0.0,
     }
+    # #133: the OOS holdout needs >=20 distinct DAILY observations before its
+    # statistics are trusted; the mock curve carries 25 daily points.
+    equity_curve = [
+        EquityPoint(
+            time=f"2024-02-{day:02d}T00:00:00+00:00",
+            equity=100_000.0 + day,
+        )
+        for day in range(1, 26)
+    ]
     return BacktestResult(
         meta=BacktestMeta(
             id="trial-demo",
@@ -280,7 +305,7 @@ def _trial_result(config, *, metric: float, trade_count: int) -> BacktestResult:
             parameters=config.parameters,
         ),
         trades=trades,
-        equity_curve=[],
+        equity_curve=equity_curve,
         stats=stats,
     )
 
@@ -293,12 +318,14 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    # #86: dense train coverage (01-01..01-07 daily) so the TRAIN gate
-    # passes and the TEST gate (01-07..01-10, empty) is the one that fails.
+    # #86: dense TRAIN and VALIDATION coverage so their gates pass and the
+    # TEST gate is the one that fails. #133: weekend-dated stamps are surplus
+    # under the venue calendar, so validation's Jan-08 boundary bar must be a
+    # real weekday stamp.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
-        [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)],
+        [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 9)],
     )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
@@ -329,7 +356,9 @@ def test_run_optimization_rejects_empty_test_bar_segment_before_study(
         _forbid_call("Backtest started before exact bar coverage validation"),
     )
 
-    config = _optimization_config(train_split_pct=0.7)
+    # 60/20/20 puts train on 01-01..01-04, validation on 01-06..01-07 and the
+    # empty test holdout on 01-09..01-10.
+    config = _optimization_config(train_split_pct=0.6)
     with pytest.raises(ValueError, match=r"test.*AAPL 1d"):
         optimizer_module.run_optimization(config)
 
@@ -379,15 +408,16 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
     data_dir = tmp_path / "market-data"
     backtests_dir.mkdir(parents=True, exist_ok=True)
     _write_base_backtest(backtests_dir, data_dir=data_dir)
-    # #86: AAPL dense across the full window (passes both gates);
-    # MSFT dense in train only (01-01..01-07) so the TEST gate names MSFT.
+    # #86: AAPL dense across the full window (passes every gate);
+    # MSFT dense in train and validation only (01-01..01-07) so the TEST gate
+    # names MSFT.
     _write_ohlcv_bars(
         data_dir,
         "AAPL",
         [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 11)],
     )
     _write_ohlcv_bars(
-        data_dir, "MSFT", [f"2024-01-0{d}T00:00:00+00:00" for d in range(1, 8)]
+        data_dir, "MSFT", [f"2024-01-{d:02d}T00:00:00+00:00" for d in range(1, 9)]
     )
 
     monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
@@ -415,7 +445,7 @@ def test_run_optimization_checks_every_candidate_universe_symbol_before_study(
         base_backtest_id="base-demo",
         target_metric="sharpe",
         n_trials=1,
-        train_split_pct=0.7,
+        train_split_pct=0.6,
         parameter_ranges={"window": {"type": "int", "min": 2, "max": 2}},
         symbol_universes=[["AAPL", "MSFT"]],
     )
@@ -477,7 +507,9 @@ def test_run_optimization_saves_best_params_and_oos_stats(monkeypatch, tmp_path:
     assert len(payload["top_trials"]) == 4
     assert payload["top_trials"][0]["params"] == {"window": 3}
     assert any(trial["penalty_applied"] for trial in payload["top_trials"])
-    assert len(calls) == 5
+    # 4 train runs + 4 validation runs + 1 test run for the top-set winner
+    # (10% of 4 trials rounds up to one).
+    assert len(calls) == 9
     assert progress_updates[0] == (0.0, "Starting Optuna optimization.")
     assert any("✅ Trial" in message for _, message in progress_updates)
     assert progress_updates[-1][0] == 100.0
@@ -554,7 +586,7 @@ def test_run_optimization_rejects_legacy_base_before_study(monkeypatch, tmp_path
         _forbid_call("study must not be created for a legacy artifact"),
     )
 
-    with pytest.raises(ValueError, match="legacy artifact.*risk_per_trade_pct"):
+    with pytest.raises(ValueError, match=r"legacy artifact.*risk_per_trade_pct"):
         optimizer_module.run_optimization(
             optimizer_module.OptimizationConfig(
                 base_backtest_id="legacy-demo",
@@ -703,6 +735,9 @@ def test_run_risk_parity_covariance_optimization_saves_weights(monkeypatch, tmp_
     weights = payload["effective_best_parameters"]["risk_parity_weights"].values()
     assert sum(weights) == pytest.approx(1.0)
     assert payload["risk_parity"]["evaluated_universes"]
+    # #129 H8: market-data frames carry timestamps, so Sharpe is daily-annualised.
+    assert payload["train_stats"]["risk_parity_score_basis"] == "sharpe_and_structure"
+    assert payload["train_stats"]["risk_parity_sharpe"] is not None
     saved_files = list(optimizations_dir.glob("rp_cov_rp-base_*.json"))
     assert len(saved_files) == 1
 
@@ -740,6 +775,179 @@ def test_no_trade_trials_lose_against_honest_negative_trials(monkeypatch, tmp_pa
     assert penalties == {1: True, 2: False}
     no_trade_trial = next(t for t in payload["top_trials"] if t["params"]["window"] == 1)
     assert no_trade_trial["value"] is None or no_trade_trial["value"] < -0.5
+
+
+def test_undefined_target_metric_trial_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """#132: a ruined trial publishes sharpe_ratio=None; it is unrankable, not 0.0.
+
+    0.0 would beat the honest losing trial (-0.5), so the ruined parameter set
+    would be selected as "best".
+    """
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+    studies = []
+    create_study = optimizer_module.optuna.create_study
+
+    def capturing_create_study(*args, **kwargs):
+        study = create_study(*args, **kwargs)
+        studies.append(study)
+        return study
+
+    monkeypatch.setattr(optimizer_module.optuna, "create_study", capturing_create_study)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["sharpe_ratio"] = None
+            result.stats["ruined"] = True
+            result.stats["undefined_metrics"] = ["sharpe_ratio"]
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert payload["best_value"] == -0.5
+    penalties = {
+        trial["params"]["window"]: trial["penalty_applied"]
+        for trial in payload["top_trials"]
+    }
+    assert penalties == {1: True, 2: False}
+    recorded = {t.params["window"]: t.user_attrs["metric_value"] for t in studies[0].trials}
+    assert recorded[1] == optimizer_module._no_trade_penalty_value([-0.5], direction="maximize")
+    assert recorded[1] != 0.0
+
+
+def test_zero_target_metric_trial_is_rankable(monkeypatch, tmp_path: Path):
+    """A measured 0.0 is a metric value, not an undefined one: it can win."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        return _trial_result(config, metric=0.0 if window == 1 else -0.5, trade_count=1)
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="sharpe",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 1}
+    assert payload["best_value"] == 0.0
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: False,
+        2: False,
+    }
+
+
+def test_ruined_cagr_target_trial_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """#132: a ruined trial's CAGR is undefined (None), so it cannot beat an honest loser."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        result.stats["cagr"] = None if window == 1 else -0.5
+        result.stats["ruined"] = window == 1
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="cagr",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
+def test_degenerate_curve_total_return_target_never_wins_the_study(monkeypatch, tmp_path: Path):
+    """A published 0.0 that `undefined_metrics` names is unrankable, not a score."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["total_return"] = 0.0
+            result.stats["undefined_metrics"] = ["total_return"]
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="total_return",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
+
+
+def test_ruined_negative_equity_trial_with_raw_target_is_penalised_not_failed(
+    monkeypatch, tmp_path: Path
+):
+    """A ruined run can report max_drawdown_pct beyond 1.0; it must not crash the trial."""
+    _patch_optimizer_env(monkeypatch, tmp_path, grid_choices=[1, 2], pass_through_stats=True)
+
+    def fake_run_backtest(config, strategy_path):
+        window = int(config.parameters["window"])
+        result = _trial_result(config, metric=-0.5, trade_count=1)
+        if window == 1:
+            result.stats["ruined"] = True
+            result.stats["win_rate"] = 0.9
+            result.stats["max_drawdown_pct"] = -1.5
+        return result
+
+    monkeypatch.setattr(optimizer_module, "_run_vectorbt_backtest", fake_run_backtest)
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="base-demo",
+            target_metric="win_rate",
+            n_trials=2,
+            train_split_pct=0.7,
+            parameter_ranges={"window": {"type": "int", "min": 1, "max": 2, "step": 1}},
+        ),
+    )
+
+    assert payload["best_params"] == {"window": 2}
+    assert {t["params"]["window"]: t["penalty_applied"] for t in payload["top_trials"]} == {
+        1: True,
+        2: False,
+    }
 
 
 def _patch_grid_sampler(monkeypatch, choices: list[int]) -> None:
@@ -936,6 +1144,92 @@ class TestRiskAdjustedObjective:
             )
             assert value == 1.5
 
+    def test_unmeasurable_drawdown_gets_worst_case_haircut(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #286: since #250 a run whose equity is unreadable stores
+        # max_drawdown_pct=None (and names it in undefined_metrics). Reading it
+        # with `or 0.0` gave such a run FULL drawdown credit; an unmeasurable
+        # drawdown must instead take the worst-case haircut.
+        for stats in (
+            {"total_trades": 30, "max_drawdown_pct": None},
+            {
+                "total_trades": 30,
+                "max_drawdown_pct": 0.0,
+                "undefined_metrics": ["max_drawdown_pct"],
+            },
+            {"total_trades": 30, "max_drawdown_pct": float("nan")},
+            {"total_trades": 30, "max_drawdown_pct": float("inf")},
+        ):
+            value, terms = _risk_adjusted_metric_value(
+                100.0,
+                stats,
+                metric_key="total_pnl",
+                direction="maximize",
+            )
+            assert terms["drawdown_factor"] == 0.0
+            assert value == 0.0
+
+    def test_unparseable_drawdown_is_unmeasurable(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #320: a value that does not parse is as unmeasurable as None.
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": "abc"},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.0
+        assert value == 0.0
+
+    def test_absent_drawdown_key_is_unmeasurable(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #320: "unmeasurable" is broader than corrupt artifacts - a stats
+        # dict with no max_drawdown_pct key at all takes the same worst-case
+        # haircut. (runner/stats.py itself never omits the key: a run whose
+        # equity curve has fewer than two points publishes the 0.0 placeholder
+        # and names the metric in `undefined_metrics` - covered above.)
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.0
+        assert value == 0.0
+
+    def test_drawdown_unmeasurable_classifier(self) -> None:
+        from runner.optimizer import _drawdown_unmeasurable
+
+        assert _drawdown_unmeasurable({"max_drawdown_pct": -0.25}) is False
+        assert _drawdown_unmeasurable({"max_drawdown_pct": "0.1"}) is False
+        assert _drawdown_unmeasurable({"max_drawdown_pct": "abc"}) is True
+        assert _drawdown_unmeasurable({"max_drawdown_pct": float("nan")}) is True
+        assert _drawdown_unmeasurable({"max_drawdown_pct": None}) is True
+        assert _drawdown_unmeasurable({}) is True
+        assert (
+            _drawdown_unmeasurable(
+                {"max_drawdown_pct": 0.0, "undefined_metrics": ["max_drawdown_pct"]}
+            )
+            is True
+        )
+        # Percent-scale stays "measurable" so the scale guard still raises.
+        assert _drawdown_unmeasurable({"max_drawdown_pct": -40.0}) is False
+
+    def test_measured_drawdown_still_haircuts(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": -0.25},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.75
+        assert value == 75.0
+
     def test_percent_scaled_drawdown_fails_loud(self) -> None:
         import pytest
 
@@ -951,21 +1245,22 @@ class TestRiskAdjustedObjective:
                 direction="maximize",
             )
 
-    def test_embargo_separates_train_and_test(self) -> None:
+    def test_embargo_separates_train_and_validation(self) -> None:
         from datetime import datetime
 
-        train, test = optimizer_module._split_backtest_period(
-            "2024-01-01", "2024-01-10", 0.7, embargo_days=1
+        split = optimizer_module._split_backtest_period(
+            "2024-01-01", "2024-01-10", 0.6, embargo_days=1
         )
-        test_start = datetime.fromisoformat(test["start"])
-        train_end = datetime.fromisoformat(train["end"])
-        assert (test_start - train_end).days >= 1
+        validation_start = datetime.fromisoformat(split.validation["start"])
+        train_end = datetime.fromisoformat(split.train["end"])
+        assert (validation_start - train_end).days >= 1
 
     def test_zero_embargo_keeps_adjacent_segments(self) -> None:
-        train, test = optimizer_module._split_backtest_period(
-            "2024-01-01", "2024-01-10", 0.7, embargo_days=0
+        split = optimizer_module._split_backtest_period(
+            "2024-01-01", "2024-01-10", 0.6, embargo_days=0
         )
-        assert train["end"] < test["start"]
+        assert split.train["end"] < split.validation["start"]
+        assert split.validation["end"] < split.test["start"]
 
 
 class TestGridHardening:
@@ -1066,3 +1361,125 @@ class TestMatrixOverviewContracts:
         assert "avg_sharpe" not in entry
         assert entry["best_sharpe"] == 2.0
         assert entry["total_trades"] == 30
+
+
+def test_risk_parity_withholds_test_stats_below_oos_minimum(
+    monkeypatch, tmp_path: Path
+):
+    """#133: with no overfitting verdict to carry the failure, the risk-parity
+    path withholds OOS statistics instead of publishing them as evidence."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 3
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["oos_status"] == "insufficient_oos_bars"
+    assert payload["oos_daily_observations"] == 3
+    assert payload["min_oos_daily_observations"] == 20
+    # Risk-adjusted ratios are withheld; factual fields remain for diagnostics.
+    assert "sharpe_ratio" not in payload["test_stats"]
+    assert "max_drawdown_pct" not in payload["test_stats"]
+    assert payload["test_stats"]["total_pnl"] is not None
+
+
+@pytest.mark.parametrize(
+    "observations,expected_status",
+    [(19, "insufficient_oos_bars"), (20, "available")],
+)
+def test_risk_parity_oos_daily_observation_boundary(
+    monkeypatch, tmp_path: Path, observations: int, expected_status: str
+):
+    """The risk-parity OOS minimum is inclusive: exactly 20 daily observations
+    is available, 19 is insufficient. Pins the ``>=`` against ``>`` mutants."""
+    backtests_dir = tmp_path / "backtests"
+    optimizations_dir = tmp_path / "optimizations"
+    backtests_dir.mkdir(parents=True, exist_ok=True)
+    _write_risk_parity_base_backtest(backtests_dir, data_dir=backtests_dir)
+    for symbol in ("SPY", "TLT", "GLD"):
+        _write_ohlcv_bars(
+            backtests_dir,
+            symbol,
+            [f"2024-01-{day:02d}T00:00:00+00:00" for day in range(1, 11)],
+        )
+    monkeypatch.setattr(optimizer_module, "BACKTESTS_DIR", backtests_dir)
+    monkeypatch.setattr(optimizer_module, "OPTIMIZATIONS_DIR", optimizations_dir)
+    monkeypatch.setattr(
+        optimizer_module,
+        "find_strategy_entry",
+        lambda _: SimpleNamespace(
+            file_path=tmp_path / "strategies" / "risk_parity.py",
+            slug="risk_parity",
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "_run_vectorbt_backtest",
+        lambda config, strategy_path: _trial_result(config, metric=1.25, trade_count=1),
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "compute_stats_for_result",
+        lambda result: dict(result.stats),
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: observations
+    )
+
+    payload = optimizer_module.run_optimization(
+        optimizer_module.OptimizationConfig(
+            base_backtest_id="rp-base",
+            target_metric="sharpe",
+            n_trials=5,
+            train_split_pct=0.7,
+            optimization_mode="risk_parity_covariance",
+            symbol_universes=[["SPY", "TLT"], ["SPY", "GLD"], ["SPY", "TLT", "GLD"]],
+        )
+    )
+
+    assert payload["oos_status"] == expected_status
+    assert payload["oos_daily_observations"] == observations
+    if expected_status == "available":
+        assert "sharpe_ratio" in payload["test_stats"]
+    else:
+        assert "sharpe_ratio" not in payload["test_stats"]
+        assert payload["test_stats"]["total_pnl"] is not None

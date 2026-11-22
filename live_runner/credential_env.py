@@ -24,6 +24,28 @@ from shared.logging import get_logger
 
 logger = get_logger("live-runner")
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_ACCOUNTS_ENV = PROJECT_ROOT / ".accounts.env"
+
+
+def resolve_accounts_env_path(named: Path | str | None = None, *, default: Path | str) -> Path:
+    """The accounts-env file to use for a caller whose default is ``default``.
+
+    Resolved at call time, NOT frozen as a default *argument*. ``def f(path=DEFAULT_ACCOUNTS_ENV)``
+    binds the value when the module is imported: every later redirect of the constant is invisible
+    to that signature, and the call reads the original file anyway. That is how the test suite came
+    to read the checkout's real credential file from a signature nobody touched.
+
+    A path the caller named is used verbatim (it is the caller's own configuration); with none,
+    ``default`` - which every caller passes as its module constant, looked up at call time - wins.
+    There is deliberately no environment override: an env var honoured by only some readers gave
+    two components different views of the accounts file, and the readers that missed it (the
+    viewer, deployment-save validation, the smoke scripts) kept trading against the project file.
+    """
+    if named is not None:
+        return Path(named)
+    return Path(default)
+
 TRUE_BOOL_TOKENS = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_BOOL_TOKENS = frozenset({"0", "false", "no", "n", "off"})
 
@@ -84,7 +106,35 @@ def load_accounts_env_values(
     the file does not define. A present-but-empty file value stays empty (it
     is still "defined" by the file and must not be shadowed).
     """
+    return overlay_process_env(read_accounts_env_file(accounts_env), environ)
+
+
+def overlay_process_env(
+    file_values: Mapping[str, str],
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Overlay *environ* (default ``os.environ``) under already-read file values.
+
+    Split out so a caller that needs both the file-only view and the overlaid
+    view reads the file once and derives the second from the first.
+    """
     env_source = os.environ if environ is None else environ
+    values = dict(file_values)
+    for key, value in env_source.items():
+        if key in values:
+            continue
+        if isinstance(value, str):
+            values[key] = value.strip()
+    return values
+
+
+def read_accounts_env_file(accounts_env: Path | str) -> dict[str, str]:
+    """Values `.accounts.env` defines, stripped. No process-environment fill.
+
+    A file that does not exist is an empty result; one that exists but cannot
+    be read warns and is also an empty result, so the caller decides what a
+    missing key means.
+    """
     values: dict[str, str] = {}
     try:
         loaded = dotenv_values(accounts_env)
@@ -103,11 +153,6 @@ def load_accounts_env_values(
         loaded = {}
     for key, value in loaded.items():
         if key and isinstance(value, str):
-            values[key] = value.strip()
-    for key, value in env_source.items():
-        if key in values:
-            continue
-        if isinstance(value, str):
             values[key] = value.strip()
     return values
 

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from runner.stats import (
+    _daily_returns,
     _daily_returns_from_equity_curve,
     _daily_returns_series_from_equity_curve,
     _max_consecutive,
@@ -40,7 +41,9 @@ def _trade(pnl: float, holding_bars: int | None = None) -> Trade:
     )
 
 
-def _equity_curve_from_returns(returns: list[float], initial_capital: float = 100000.0) -> list[EquityPoint]:
+def _equity_curve_from_returns(
+    returns: list[float], initial_capital: float = 100000.0
+) -> list[EquityPoint]:
     points = []
     equity = initial_capital
     start = datetime(2021, 1, 1, tzinfo=timezone.utc)
@@ -66,7 +69,9 @@ class TestQuantStatsManualParity:
 
         qs = pytest.importorskip("quantstats.stats")
 
-        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        series = pd.Series(
+            self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns))
+        )
         expected = float(qs.sharpe(series, rf=0.04, periods=252))
 
         assert _sharpe_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
@@ -76,7 +81,9 @@ class TestQuantStatsManualParity:
 
         qs = pytest.importorskip("quantstats.stats")
 
-        series = pd.Series(self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns)))
+        series = pd.Series(
+            self.returns, index=pd.date_range("2024-01-01", periods=len(self.returns))
+        )
         expected = float(qs.sortino(series, rf=0.04, periods=252))
 
         assert _sortino_manual(self.returns, 0.04) == pytest.approx(expected, rel=1e-12)
@@ -542,6 +549,29 @@ class TestMaxDrawdown:
         assert _max_drawdown_pct_manual([100]) == 0.0
 
 
+class TestDailyReturnsHelper:
+    """Pin the raw period-return fallback used when no daily series exists."""
+
+    def test_period_over_period_returns(self):
+        assert _daily_returns([100.0, 110.0, 99.0]) == pytest.approx([0.1, -0.1])
+
+    def test_non_positive_previous_equity_is_flat_not_dropped(self):
+        assert _daily_returns([0.0, 10.0, 5.0]) == pytest.approx([0.0, -0.5])
+
+    def test_short_series_has_no_returns(self):
+        assert _daily_returns([]) == []
+        assert _daily_returns([100.0]) == []
+
+    def test_equity_curve_falls_back_when_no_daily_series_exists(self):
+        curve = [
+            EquityPoint(time="2024-01-01T00:00:00Z", equity=0.0),
+            EquityPoint(time="2024-01-02T00:00:00Z", equity=10.0),
+        ]
+
+        assert _daily_returns_series_from_equity_curve(curve) is None
+        assert _daily_returns_from_equity_curve(curve) == [0.0]
+
+
 class TestComputeStatsForResult:
     def test_convenience_wrapper(self):
         result = BacktestResult(
@@ -872,3 +902,92 @@ class TestPeriodBounds:
         )
 
         assert end_dt.isoformat() == "2024-12-31T12:00:00+00:00"
+
+
+def _moments_curve(daily_equities: list[float]) -> list:
+    import pandas as pd
+
+    from shared.models import EquityPoint
+
+    days = pd.date_range("2024-01-01", periods=len(daily_equities), freq="D", tz="UTC")
+    return [
+        EquityPoint(time=day.isoformat(), equity=value)
+        for day, value in zip(days, daily_equities, strict=True)
+    ]
+
+
+def test_daily_returns_moments_match_a_hand_built_series():
+    """Issue #164: the moments feed the deflated Sharpe ratio."""
+    from runner.stats import _daily_returns_series_from_equity_curve, daily_returns_moments
+
+    curve = _moments_curve([100.0, 101.0, 100.5, 102.0, 101.0, 103.5, 103.0, 105.0])
+    returns = _daily_returns_series_from_equity_curve(curve)
+    values = [float(v) for v in returns]
+    n = len(values)
+    mean = sum(values) / n
+    sample_std = (sum((v - mean) ** 2 for v in values) / (n - 1)) ** 0.5
+
+    moments = daily_returns_moments(curve)
+
+    assert moments["count"] == n
+    assert moments["sharpe_per_obs"] == pytest.approx(mean / sample_std)
+    assert moments["skew"] == pytest.approx(float(returns.skew()))
+    assert moments["kurtosis"] == pytest.approx(float(returns.kurtosis()) + 3.0)
+    # Not annualised: far below the sqrt(252)-scaled figure.
+    assert abs(moments["sharpe_per_obs"]) < abs(mean / sample_std) * 252**0.5
+
+
+def test_daily_returns_moments_agree_with_the_reported_psr():
+    """One trial, no selection: DSR from these moments equals the stats PSR."""
+    from runner.optimization_diagnostics import deflated_sharpe_ratio
+    from runner.stats import (
+        _daily_returns_series_from_equity_curve,
+        _probabilistic_sharpe,
+        daily_returns_moments,
+    )
+
+    equities = [100.0]
+    for step in [0.4, -0.2, 0.7, 0.1, -0.5, 0.9, 0.3, -0.1, 0.6, 0.2, -0.3, 0.8]:
+        equities.append(equities[-1] * (1 + step / 100))
+    curve = _moments_curve(equities)
+    moments = daily_returns_moments(curve)
+    dsr = deflated_sharpe_ratio(
+        sr=moments["sharpe_per_obs"],
+        t=moments["count"],
+        skew=moments["skew"],
+        kurt=moments["kurtosis"],
+        n=1,
+        var_sr=0.0,
+    )
+    psr = _probabilistic_sharpe(_daily_returns_series_from_equity_curve(curve), 0.0)
+    assert psr is not None
+    assert dsr == pytest.approx(psr)
+
+
+def test_daily_returns_moments_undefined_cases_return_none():
+    from runner.stats import daily_returns_moments
+
+    assert daily_returns_moments([]) is None
+    assert daily_returns_moments(_moments_curve([100.0])) is None
+    assert daily_returns_moments(_moments_curve([100.0, 100.0, 100.0, 100.0, 100.0])) is None
+
+
+def test_daily_returns_moments_need_four_observations_for_kurtosis():
+    """Sample skew needs 3 and sample kurtosis 4 daily returns: fewer are undefined.
+
+    Pins the documented minimum so a two- or three-return curve is reported as
+    uncomputable rather than getting NaN moments.
+    """
+    from runner.stats import daily_returns_moments
+    from shared.models import EquityPoint
+
+    def curve(values):
+        return [
+            EquityPoint(time=f"2024-01-{day:02d}T00:00:00+00:00", equity=value)
+            for day, value in enumerate(values, start=1)
+        ]
+
+    assert daily_returns_moments(curve([100.0, 101.0, 100.5])) is None  # 2 returns
+    assert daily_returns_moments(curve([100.0, 101.0, 100.5, 102.0])) is None  # 3
+    four = daily_returns_moments(curve([100.0, 101.0, 100.5, 102.0, 101.0]))
+    assert four is not None and four["count"] == 4
