@@ -26,6 +26,17 @@ uv run mypy
 
 `mypy` takes no arguments: the scope comes from `files` in `[tool.mypy]`. Run both before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog), a blocking `ruff check --select <the enabled bug-class families>` (the advisory step cannot catch a new hit there), and mypy (blocking, same `uv run mypy` command and the same pinned version from `uv.lock`).
 
+## Lint and type checking
+
+Ruff and mypy are configured in `pyproject.toml` (`[tool.ruff.lint]`, `[tool.mypy]`). Install the tooling with `uv sync --frozen --extra dev` (both tools are dev dependencies; `--frozen` keeps the local environment on the committed `uv.lock`, which is what CI checks out, so a run cannot quietly re-resolve a different mypy or ruff) and run, from the repo root:
+
+```
+uv run ruff check <changed files>
+uv run mypy
+```
+
+`mypy` takes no arguments: the scope comes from `files` in `[tool.mypy]`. Run both before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `signal_bots`, `strategies`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog), a blocking `ruff check --select <the enabled bug-class families>` (the advisory step cannot catch a new hit there), and mypy (blocking, same `uv run mypy` command and the same pinned version from `uv.lock`).
+
 ## Issues
 
 When creating an issue, give the appropriate labels. If things are unclear, give the `needs-decision` label. This signals that a maintainer needs to look at the issue and decide on unclear points, like open questions.

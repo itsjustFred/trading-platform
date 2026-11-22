@@ -104,13 +104,14 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
         if _OR_START_MINUTES <= mins < or_end:
             hi = float(high.iloc[i])
             lo = float(low.iloc[i])
-            if cur_or_high is None:
+            # cur_or_high/cur_or_low are always set and reset together.
+            if cur_or_high is None or cur_or_low is None:
                 cur_or_high, cur_or_low = hi, lo
             else:
                 cur_or_high = max(cur_or_high, hi)
                 cur_or_low = min(cur_or_low, lo)
 
-        if cur_or_high is not None:
+        if cur_or_high is not None and cur_or_low is not None:
             or_high.iloc[i] = cur_or_high
             or_low.iloc[i] = cur_or_low
             rng = cur_or_high - cur_or_low
@@ -146,7 +147,12 @@ def build_trade_context(df: pd.DataFrame, params: dict | None = None) -> dict[st
                 trailing_stop_at_exit.iloc[i] = lwm + lwm * reversion_multiple
                 position = 0
                 lwm = None
-        elif mins >= or_end and not traded and cur_or_high is not None:
+        elif (
+            mins >= or_end
+            and not traded
+            and cur_or_high is not None
+            and cur_or_low is not None
+        ):
             rng = cur_or_high - cur_or_low
             if rng > 0:
                 if price > cur_or_high + rng * breakout_buffer:
