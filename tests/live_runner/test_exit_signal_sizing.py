@@ -1823,3 +1823,26 @@ def test_a_stale_exit_is_logged_at_warning_an_entry_at_info(caplog, exit_signal)
     level = logging.WARNING if exit_signal else logging.INFO
     assert _records_at(caplog, level, "stale discord signal")
     assert not _records_at(caplog, logging.INFO if exit_signal else logging.WARNING, "stale")
+
+
+def test_ledger_net_qty_by_symbol_groups_the_same_attribution(isolated_db) -> None:
+    """The by-symbol ledger the internal runner's entry caps read nets buys
+    and sells per symbol over this deployment's own fills only (#348)."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    seed_live_deployments(database, [mine, other])
+
+    _save_signal_with_fill(database, deployment_id=mine, symbol="AAPL", action="buy", qty=10.0)
+    _save_signal_with_fill(database, deployment_id=mine, symbol="aapl", action="sell", qty=4.0)
+    _save_signal_with_fill(database, deployment_id=mine, symbol="MSFT", action="buy", qty=7.0)
+    _save_signal_with_fill(database, deployment_id=other, symbol="AAPL", action="buy", qty=100.0)
+
+    by_symbol = database.list_live_deployment_net_filled_qty_by_symbol(mine)
+    assert by_symbol["AAPL"] == pytest.approx(6.0)
+    assert by_symbol["MSFT"] == pytest.approx(7.0)
+    assert "TSLA" not in by_symbol
+    other_by_symbol = database.list_live_deployment_net_filled_qty_by_symbol(other)
+    assert other_by_symbol == {"AAPL": pytest.approx(100.0)}

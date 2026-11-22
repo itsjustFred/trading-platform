@@ -521,3 +521,316 @@ def test_daemon_submit_allows_short_entry_when_enabled(
     assert len(calls) == 1
     assert calls[0]["is_exit"] is False
     assert calls[0]["action"] == "sell"
+
+
+# ── review follow-ups: risk policy, freshness, caps, config refusal ──────
+
+
+def _indicators(**columns: Any) -> dict[str, Any]:
+    return {name: pd.Series(values, index=range(30)) for name, values in columns.items()}
+
+
+def test_entry_without_take_profit_gets_unbounded_policy(tmp_path: Path) -> None:
+    """No TP level: the strategy's exits signal is the exit mechanism, so the
+    entry is emitted with the unbounded-TP policy (engine parity)."""
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(
+            sl_price=[95.0] * 30, direction=["LONG"] * 30
+        )
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+
+    asyncio.run(
+        runner.run_once(
+            [_deployment()], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].take_profit is None
+    assert sent[0].stop_loss == 95.0
+    assert (
+        sent[0].metadata["take_profit_policy"]
+        == "unbounded_exit_on_opposite_signal"
+    )
+
+
+def test_entry_without_stop_loss_is_refused(tmp_path: Path) -> None:
+    """No SL: the engine only uses a fallback stop for sizing; until the
+    maintainer decides whether live may run broker-stopless, the runner
+    fails closed with one ERROR per deployment."""
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(tp_price=[110.0] * 30, direction=["LONG"] * 30)
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+    deployment = _deployment()
+    now = BASE + timedelta(seconds=70)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": FakeAdapter()}, now=now))
+    asyncio.run(runner.run_once([deployment], {"acct-1": FakeAdapter()}, now=now))
+
+    assert sent == []
+    assert (str(deployment.id), "no_stop") in runner._reported
+
+
+def test_partial_single_take_profit_is_refused(tmp_path: Path) -> None:
+    """tp_pct < 1 on a single TP level is a partial exit the live bracket
+    cannot express — refused like a multi-level ladder."""
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(
+            sl_price=[95.0] * 30,
+            tp_price=[110.0] * 30,
+            tp_pct=[0.5] * 30,
+            direction=["LONG"] * 30,
+        )
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+
+    asyncio.run(
+        runner.run_once(
+            [_deployment()], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+
+
+def test_sizing_only_stop_fields_are_refused(tmp_path: Path) -> None:
+    """sizing_sl_price/stop_distance are engine sizing hints, never live
+    stops — an entry carrying them cannot be sized like the engine, refused."""
+
+    def strategy(df: pd.DataFrame, params: dict[str, Any]):
+        entries = pd.Series(False, index=df.index)
+        exits = pd.Series(False, index=df.index)
+        entries.iloc[-1] = True
+        indicators = _indicators(
+            sl_price=[95.0] * 30,
+            tp_price=[110.0] * 30,
+            stop_distance=[5.0] * 30,
+            direction=["LONG"] * 30,
+        )
+        return entries, exits, indicators, []
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(strategy))
+
+    asyncio.run(
+        runner.run_once(
+            [_deployment()], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+
+
+def test_daily_equity_timeframe_is_refused(tmp_path: Path) -> None:
+    """Session-crossing daily bars on equities close while the quote feed is
+    shut — the deployment is refused before any fetch."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter(_bars(count=30, last_open=BASE, step_seconds=86_400))
+    deployment = _deployment(timeframe="1d")
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=86_410)
+        )
+    )
+
+    assert sent == []
+    assert adapter.calls == []
+    assert (str(deployment.id), "session_bars:1d") in runner._reported
+
+
+def test_daily_crypto_timeframe_is_allowed(tmp_path: Path) -> None:
+    """Crypto pairs trade 24/7, so the session-bound refusal does not apply."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter(_bars(count=30, last_open=BASE, step_seconds=86_400))
+    deployment = _deployment(timeframe="1d", symbols=["BTC/USD"])
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=86_410)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].symbol == "BTC/USD"
+
+
+def test_staleness_window_is_grace_plus_feed_lag_not_a_full_bar(tmp_path: Path) -> None:
+    """A 4h signal 200s after close was inside the old bar+grace window but is
+    now stale: the actionable window is grace + min(120s, 10% of bar)."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter(_bars(count=30, last_open=BASE, step_seconds=14_400))
+    deployment = _deployment(timeframe="4h")
+    # Bar opened at BASE closes at BASE+4h; evaluated 200s later.
+    now = BASE + timedelta(seconds=14_400 + 200)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    assert sent == []
+
+
+def test_no_market_data_refetch_until_next_bar_closes(tmp_path: Path) -> None:
+    """After processing a bar the runner sleeps until the *next* bar closes —
+    it must not re-fetch 1000 bars every 15s tick."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter()
+    deployment = _deployment()
+    now = BASE + timedelta(seconds=70)
+
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+    asyncio.run(runner.run_once([deployment], {"acct-1": adapter}, now=now))
+
+    assert len(sent) == 1
+    assert len(adapter.calls) == 1
+
+
+def test_open_position_blocks_pyramiding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_net_filled_qty_by_symbol",
+        lambda deployment_id: {"AAPL": 3.0},
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [_deployment()], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+
+
+def test_max_positions_cap_uses_deployment_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_net_filled_qty_by_symbol",
+        lambda deployment_id: {
+            "AAA": 1.0, "BBB": 1.0, "CCC": 1.0, "DDD": 1.0, "EEE": 1.0,
+        },
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [_deployment(symbols=["NVDA"])],
+            {"acct-1": FakeAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert sent == []
+
+
+def test_strategy_parameters_are_refused_at_load(tmp_path: Path) -> None:
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"strategy_parameters": {"fast": 9}})
+    adapter = FakeAdapter()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert adapter.calls == []
+    assert (str(deployment.id), "deployment_config") in runner._reported
+
+
+def test_signal_processor_config_is_refused(tmp_path: Path) -> None:
+    """Processors are a Discord-pipeline concept; the internal path never runs
+    one, so a deployment carrying processor config fails closed."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(signal_config={"signal_processor": "rsi_reversal"})
+
+    asyncio.run(
+        runner.run_once([deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70))
+    )
+
+    assert sent == []
+
+
+def test_nan_close_row_is_skipped(tmp_path: Path) -> None:
+    """A NaN close on the signal bar must not become an order price."""
+    frame = _bars(count=30, last_open=BASE)
+    frame.loc[frame.index[-1], "close"] = float("nan")
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+
+    asyncio.run(
+        runner.run_once(
+            [_deployment()], {"acct-1": FakeAdapter(frame)}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+
+
+def test_consecutive_submit_failures_escalate_once(tmp_path: Path) -> None:
+    """Three consecutive submission failures produce one escalation marker;
+    the counter resets on success."""
+    path = _strategy_file(tmp_path, META)
+    deployment = _deployment()
+
+    async def failing_submit(adapter: Any, dep: LiveDeploymentConfig, signal: TradeSignal) -> None:
+        raise RuntimeError("broker down")
+
+    runner = _runner(failing_submit, path=path, module=_module_with(_entry_strategy))
+    for offset in (70, 130, 190):
+        feed = _bars(count=30 + offset // 60, last_open=BASE + timedelta(seconds=offset - 10))
+        asyncio.run(
+            runner.run_once(
+                [deployment], {"acct-1": FakeAdapter(feed)}, now=BASE + timedelta(seconds=offset)
+            )
+        )
+
+    assert runner._submit_failures[(str(deployment.id), "AAPL")] == 3
+    assert (str(deployment.id), "submit_failures:AAPL") in runner._reported

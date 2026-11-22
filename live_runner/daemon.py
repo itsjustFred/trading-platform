@@ -2731,6 +2731,14 @@ async def _prepare_claim_and_submit_signal(
     *,
     is_exit: bool,
 ) -> None:
+    # This chokepoint serves Discord and internal-strategy signals alike;
+    # refusal logs name the actual metadata source, not a hardcoded "Discord".
+    _metadata = getattr(live_signal, "metadata", None) or {}
+    source_label = (
+        "Internal strategy"
+        if str(_metadata.get("source") or "").strip().lower() == "internal"
+        else "Discord"
+    )
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -2798,7 +2806,7 @@ async def _prepare_claim_and_submit_signal(
             )
             return
         logger.warning(
-            "Discord signal refused before submission; nothing was sent to the broker",
+            f"{source_label} signal refused before submission; nothing was sent to the broker",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -2824,7 +2832,8 @@ async def _prepare_claim_and_submit_signal(
     )
     if not claimed:
         logger.info(
-            "Skipping discord signal: deployment no longer ACTIVE at submission claim",
+            f"Skipping {source_label.lower()} signal: deployment no longer "
+            "ACTIVE at submission claim",
             extra={
                 "data": {
                     "account_id": account_id,

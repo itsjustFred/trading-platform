@@ -42,6 +42,34 @@ native engine's own ``TradeEngine._call_strategy`` /
 ``_normalize_strategy_output`` / ``_resolve_direction`` / ``_extract_levels`` —
 not a reimplementation.
 
+Deployment configuration rules: ``settings["strategy_parameters"]`` and any
+``signal_processor`` configuration are refused — the internal path always runs
+the strategy file with its ``STRATEGY_META`` defaults and never runs a signal
+processor (processors are a Discord-pipeline concept). Bars come from the
+adapter's ``get_market_data`` feed (Alpaca SIP for equities, the crypto feed
+for pairs). The strategy cache is keyed by deployment id and reloaded when the
+resolved file's mtime changes; helper modules the strategy imports are *not*
+reloaded — restart the daemon to pick those up.
+
+Risk-policy notes (pending maintainer confirmation):
+
+* An entry with **no take-profit level** is emitted with
+  ``take_profit_policy=unbounded_exit_on_opposite_signal`` — the strategy's own
+  ``exits`` signal is its exit mechanism, matching the backtest.
+* An entry with **no stop loss** is refused (one ERROR per deployment). The
+  engine only uses a fallback stop for sizing; whether live may run a
+  broker-stopless position or must place a stop at the fallback is an open
+  maintainer decision, so the runner fails closed.
+* A **single take-profit with ``tp_pct``/``fraction < 1``** is refused like a
+  multi-level ladder: the live bracket carries one full-size TP.
+* An entry is refused while the deployment already holds the symbol (the
+  runner does not pyramid) or when the deployment already holds
+  ``TRADE_ENGINE_MAX_POSITIONS`` distinct symbols, counted from its own
+  execution ledger.
+* **Daily-and-longer bars on session-bound (non-crypto) symbols are refused**:
+  they "close" at midnight ET while the quote feed is closed, so the
+  entry-deviation gate could never confirm them.
+
 Submission: intents are handed to the daemon's ``submit_signal`` callback,
 which routes them through ``_trade_signal_to_live_signal`` and
 ``_prepare_claim_and_submit_signal`` — the same prepare/claim/submit path as
@@ -61,14 +89,20 @@ from typing import Any
 
 import pandas as pd
 
-from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.base_adapter import UNBOUNDED_TP_POLICY, BaseLiveAdapter
 from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
-from live_runner.promotion import strategy_target
+from live_runner.promotion import (
+    STRATEGY_PARAMETERS_KEY,
+    deployment_signal_processor_name,
+    strategy_target,
+)
 from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.symbol_class import classify_symbol
 from risk.models import TradeSignal
-from runner.engine_pkg.trading_engine import TradeEngine
+from runner.engine_pkg.trading_engine import TRADE_ENGINE_MAX_POSITIONS, TradeEngine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
 from shared.constants import normalize_symbols, normalize_timeframe
+from shared.database import list_live_deployment_net_filled_qty_by_symbol
 from shared.logging import get_logger
 from shared.models import VALID_TIMEFRAMES, LiveDeploymentConfig
 from shared.strategy_registry import load_strategy_module
@@ -81,10 +115,21 @@ INTERNAL_RUNNER_TICK_SECONDS = 15
 #: the request (Alpaca: 1000). A strategy needing deeper history than the feed
 #: serves is a documented limitation, not silently truncated further.
 INTERNAL_RUNNER_BAR_LIMIT = 1000
-#: Grace past the next bar's open during which a just-closed signal may still
-#: be submitted. Covers feed publication delay and tick scheduling jitter; the
-#: entry-deviation gate (#125) still bounds how far the fill may drift.
+#: Grace past the bar close during which a just-closed signal may still be
+#: submitted. Covers feed publication delay and tick scheduling jitter; the
+#: entry-deviation gate (#125) still bounds how far the fill may drift. The
+#: actionable window is this grace *plus* a small feed-lag allowance — never a
+#: full extra bar — so a signal is only live while bar T+1 is forming.
 SUBMIT_GRACE_SECONDS = 30.0
+SUBMIT_FEED_LAG_BAR_FRACTION = 0.1
+SUBMIT_FEED_LAG_CAP_SECONDS = 120.0
+#: Daily-and-longer bars on session-bound symbols are refused (see module
+#: docstring). Crypto pairs trade 24/7 and are exempt.
+SESSION_BOUND_MIN_BAR_SECONDS = 86_400
+#: Consecutive submission failures before a one-time ERROR escalation.
+SUBMIT_FAILURE_ESCALATION = 3
+#: Net filled quantity below this is treated as flat.
+_OPEN_QTY_EPSILON = 1e-9
 
 SubmitSignal = Callable[
     [BaseLiveAdapter, LiveDeploymentConfig, TradeSignal], Awaitable[None]
@@ -119,6 +164,29 @@ def _adapter_serves_bars(adapter: BaseLiveAdapter, timeframe: str) -> bool:
     if callable(serves) and not serves(timeframe):
         return False
     return True
+
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    try:
+        return classify_symbol(symbol) == "crypto"
+    except Exception:
+        # Unclassifiable symbols are treated as session-bound: refusing a
+        # daily+ deployment is the fail-closed direction.
+        return False
+
+
+def _has_sizing_only_stop_fields(row: pd.Series) -> bool:
+    """True when the signal row carries engine sizing-stop hints.
+
+    The engine uses ``sizing_sl_price``/``sizing_stop``/``sizing_sl``/
+    ``stop_distance`` for position sizing only — they must never become a live
+    broker stop, and the live path cannot reproduce the engine's sizing math,
+    so any entry carrying them is refused.
+    """
+    for key in ("sizing_sl_price", "sizing_stop", "sizing_sl", "stop_distance"):
+        if key in row.index and pd.notna(row.get(key)):
+            return True
+    return False
 
 
 def _prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -178,6 +246,7 @@ class _StrategyBundle:
     """Cached strategy module + the engine helpers that interpret its output."""
 
     mtime_ns: int
+    path: str
     engine: TradeEngine
     generate_signals: Any
 
@@ -200,17 +269,27 @@ class InternalStrategyRunner:
         self._bundles: dict[str, _StrategyBundle] = {}
         # (deployment_id, SYMBOL) -> open time of the newest bar already acted on.
         self._last_bar: dict[tuple[str, str], pd.Timestamp] = {}
+        # (deployment_id, SYMBOL) -> consecutive submission failures.
+        self._submit_failures: dict[tuple[str, str], int] = {}
         # Throttled one-shot logs: (key, category) already reported.
         self._reported: set[tuple[str, str]] = set()
 
     # ── strategy resolution ──────────────────────────────────────────────
 
-    def _report_once(self, key: str, category: str, message: str, **extra: Any) -> None:
+    def _report_once(
+        self,
+        key: str,
+        category: str,
+        message: str,
+        *,
+        level: str = "error",
+        **extra: Any,
+    ) -> None:
         marker = (key, category)
         if marker in self._reported:
             return
         self._reported.add(marker)
-        logger.error(message, extra={"data": extra})
+        getattr(logger, level)(message, extra={"data": extra})
 
     def _bundle(self, deployment: LiveDeploymentConfig, timeframe: str) -> _StrategyBundle | None:
         """Resolve + load the deployment's strategy, cached by file mtime."""
@@ -241,7 +320,11 @@ class InternalStrategyRunner:
             )
             return None
         cached = self._bundles.get(key)
-        if cached is not None and cached.mtime_ns == mtime_ns:
+        if (
+            cached is not None
+            and cached.mtime_ns == mtime_ns
+            and cached.path == str(path)
+        ):
             return cached
         try:
             module = self._load_module(path, strategies_dir=target.root)
@@ -272,7 +355,10 @@ class InternalStrategyRunner:
             )
             return None
         bundle = _StrategyBundle(
-            mtime_ns=mtime_ns, engine=engine, generate_signals=generate_signals
+            mtime_ns=mtime_ns,
+            path=str(path),
+            engine=engine,
+            generate_signals=generate_signals,
         )
         self._bundles[key] = bundle
         self._reported.discard((key, "strategy_target"))
@@ -290,8 +376,20 @@ class InternalStrategyRunner:
         timeframe: str,
         bar_seconds: int,
         moment: datetime,
+        open_positions: Mapping[str, float],
     ) -> None:
         state_key = (str(deployment.id), symbol)
+        last_processed = self._last_bar.get(state_key)
+        if last_processed is not None:
+            # The newest bar that could carry an actionable signal opens at
+            # last_processed + bar_seconds and closes one bar later. Until
+            # then there is nothing new to evaluate, so skip the 1000-bar
+            # fetch entirely rather than polling it every tick.
+            next_actionable_close = last_processed + pd.Timedelta(
+                seconds=2 * bar_seconds
+            )
+            if moment < next_actionable_close.to_pydatetime():
+                return
         try:
             frame = await adapter.get_market_data(
                 symbol, timeframe=timeframe, limit=self._bar_limit
@@ -331,7 +429,6 @@ class InternalStrategyRunner:
         eval_frame = prepared.loc[closed_mask[closed_mask].index].reset_index(drop=True)
         latest_open = pd.Timestamp(eval_frame.iloc[-1]["timestamp"])
 
-        last_processed = self._last_bar.get(state_key)
         if last_processed is not None and latest_open <= last_processed:
             return
         if last_processed is None:
@@ -367,7 +464,14 @@ class InternalStrategyRunner:
 
         signals_frame = bundle.engine._signals_frame
         intents: list[tuple[int, TradeSignal]] = []
-        max_age_seconds = bar_seconds + SUBMIT_GRACE_SECONDS
+        # A signal is actionable only while the next bar is still forming:
+        # grace for feed/tick jitter plus a small feed-lag allowance — never
+        # a full extra bar, which would let a signal trade an hour late.
+        feed_lag = min(
+            SUBMIT_FEED_LAG_CAP_SECONDS,
+            SUBMIT_FEED_LAG_BAR_FRACTION * bar_seconds,
+        )
+        max_age_seconds = SUBMIT_GRACE_SECONDS + feed_lag
         for position in candidate_positions:
             close_time = _bar_close_time(
                 pd.Timestamp(eval_frame.iloc[position]["timestamp"]), bar_seconds
@@ -449,18 +553,80 @@ class InternalStrategyRunner:
                         },
                     )
                     continue
-                if len(tp_levels) > 1:
-                    # The live bracket carries a single take profit. Emitting
-                    # only the first level would silently drop the native
-                    # engine's partial-exit ladder, so this entry fails closed.
+                if _has_sizing_only_stop_fields(merged_row):
+                    # Engine sizing hints cannot become a live stop and the
+                    # live path cannot reproduce the engine's sizing math.
+                    self._report_once(
+                        state_key[0],
+                        f"sizing_stop:{state_key[1]}",
+                        "Internal strategy entry carries sizing-only stop fields "
+                        "(sizing_sl_price/sizing_stop/sizing_sl/stop_distance); "
+                        "the live path cannot honor them and the signal is skipped",
+                        deployment_id=state_key[0],
+                        symbol=symbol,
+                        level="warning",
+                    )
+                    continue
+                if len(tp_levels) > 1 or (
+                    tp_levels and float(tp_levels[0].get("fraction", 1.0)) < 1.0
+                ):
+                    # The live bracket carries a single full-size take profit.
+                    # Emitting only the first level would silently drop the
+                    # native engine's partial-exit ladder, so this entry fails
+                    # closed.
                     self._report_once(
                         state_key[0],
                         f"multi_tp:{state_key[1]}",
-                        "Internal strategy entry has multiple take-profit levels; "
-                        "the live path supports one and the signal is skipped",
+                        "Internal strategy entry has multiple or partial "
+                        "take-profit levels; the live path supports one full-size "
+                        "level and the signal is skipped",
                         deployment_id=state_key[0],
                         symbol=symbol,
                         tp_levels=[level.get("name") for level in tp_levels],
+                    )
+                    continue
+                if stop_loss is None:
+                    # The engine sizes against a fallback stop but places no
+                    # broker stop; whether live may do the same is an open
+                    # maintainer decision, so the runner fails closed with one
+                    # ERROR per deployment rather than a warning per bar.
+                    self._report_once(
+                        state_key[0],
+                        "no_stop",
+                        "Internal strategy entry has no stop loss; the live path "
+                        "requires a broker-side stop and the signal is skipped "
+                        "(maintainer decision pending)",
+                        deployment_id=state_key[0],
+                        symbol=symbol,
+                    )
+                    continue
+                symbol_key = symbol.upper()
+                if symbol_key in open_positions:
+                    # The deployment already holds this symbol; the runner
+                    # does not pyramid. Exits on the same bar still go out.
+                    self._report_once(
+                        state_key[0],
+                        f"already_open:{state_key[1]}",
+                        "Internal strategy entry skipped: the deployment already "
+                        "holds this symbol (net filled qty "
+                        f"{open_positions[symbol_key]:g}); the runner does not pyramid",
+                        deployment_id=state_key[0],
+                        symbol=symbol,
+                        net_qty=open_positions[symbol_key],
+                        level="warning",
+                    )
+                    continue
+                if len(open_positions) >= TRADE_ENGINE_MAX_POSITIONS:
+                    self._report_once(
+                        state_key[0],
+                        f"max_positions:{state_key[1]}",
+                        "Internal strategy entry skipped: the deployment already "
+                        f"holds {len(open_positions)} symbols "
+                        f"(engine limit {TRADE_ENGINE_MAX_POSITIONS})",
+                        deployment_id=state_key[0],
+                        symbol=symbol,
+                        open_symbols=sorted(open_positions),
+                        level="warning",
                     )
                     continue
                 take_profit = (
@@ -468,6 +634,11 @@ class InternalStrategyRunner:
                 )
                 entry_metadata = dict(common_metadata)
                 entry_metadata["internal_direction"] = direction
+                if take_profit is None:
+                    # No TP level: the strategy's own exits signal is its exit
+                    # mechanism — the same unbounded-TP policy the promotion
+                    # path stamps for Discord signals without a target.
+                    entry_metadata["take_profit_policy"] = UNBOUNDED_TP_POLICY
                 entry_metadata["idempotency_key"] = _intent_idempotency_key(
                     deployment, symbol, timeframe, close_time, kind=f"entry:{direction}"
                 )
@@ -497,6 +668,18 @@ class InternalStrategyRunner:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                failures = self._submit_failures.get(state_key, 0) + 1
+                self._submit_failures[state_key] = failures
+                if failures == SUBMIT_FAILURE_ESCALATION:
+                    self._report_once(
+                        state_key[0],
+                        f"submit_failures:{state_key[1]}",
+                        "Internal strategy signal submission keeps failing; "
+                        "the deployment is effectively not trading",
+                        deployment_id=state_key[0],
+                        symbol=symbol,
+                        consecutive_failures=failures,
+                    )
                 logger.error(
                     "Internal strategy signal submission failed",
                     extra={
@@ -508,6 +691,8 @@ class InternalStrategyRunner:
                         }
                     },
                 )
+            else:
+                self._submit_failures.pop(state_key, None)
 
     async def run_once(
         self,
@@ -517,14 +702,28 @@ class InternalStrategyRunner:
         now: datetime | None = None,
     ) -> None:
         """One evaluation pass over every eligible ACTIVE internal deployment."""
-        moment = now or datetime.now(timezone.utc)
         for deployment in deployments:
             if not _deployment_is_active_internal(deployment):
                 continue
             adapter = adapters.get(str(deployment.account_id))
             if adapter is None:
                 continue
+            deployment_id = str(deployment.id)
             try:
+                if STRATEGY_PARAMETERS_KEY in (deployment.settings or {}):
+                    # Nothing applies this override on the internal path; the
+                    # strategy always runs its STRATEGY_META defaults.
+                    raise ValueError(
+                        f"settings.{STRATEGY_PARAMETERS_KEY} is not applied by "
+                        "the internal strategy runner; promote the parameters "
+                        "by writing them into STRATEGY_META"
+                    )
+                if deployment_signal_processor_name(deployment):
+                    raise ValueError(
+                        "signal_processor configuration is not applied by the "
+                        "internal strategy runner; remove it or use a Discord "
+                        "signal-source deployment"
+                    )
                 timeframe = normalize_timeframe(deployment.timeframe)
                 if timeframe not in VALID_TIMEFRAMES:
                     raise ValueError(f"unsupported timeframe {deployment.timeframe!r}")
@@ -534,7 +733,7 @@ class InternalStrategyRunner:
                 symbols = _deployment_symbols(deployment)
             except Exception as exc:
                 self._report_once(
-                    str(deployment.id),
+                    deployment_id,
                     "deployment_config",
                     "Internal deployment configuration is unusable; skipping",
                     deployment_id=str(deployment.id),
@@ -543,11 +742,11 @@ class InternalStrategyRunner:
                 continue
             if not _adapter_serves_bars(adapter, timeframe):
                 self._report_once(
-                    str(deployment.id),
+                    deployment_id,
                     f"adapter_bars:{timeframe}",
                     "Adapter cannot serve market data for this timeframe; "
                     "internal strategy evaluation fails closed",
-                    deployment_id=str(deployment.id),
+                    deployment_id=deployment_id,
                     account_id=str(deployment.account_id),
                     adapter=type(adapter).__name__,
                     timeframe=timeframe,
@@ -555,10 +754,53 @@ class InternalStrategyRunner:
                 continue
             if not symbols:
                 continue
+            session_bound_symbols = [
+                symbol
+                for symbol in symbols
+                if bar_seconds >= SESSION_BOUND_MIN_BAR_SECONDS
+                and not _is_crypto_symbol(symbol)
+            ]
+            if session_bound_symbols:
+                self._report_once(
+                    deployment_id,
+                    f"session_bars:{timeframe}",
+                    "Internal deployment uses a session-crossing timeframe on "
+                    "non-crypto symbols; daily+ bars close while the quote "
+                    "feed is shut so entries could never be confirmed — "
+                    "refusing (crypto pairs are exempt)",
+                    deployment_id=deployment_id,
+                    timeframe=timeframe,
+                    symbols=session_bound_symbols,
+                )
+                continue
+            try:
+                open_qty = await asyncio.to_thread(
+                    list_live_deployment_net_filled_qty_by_symbol, deployment_id
+                )
+            except Exception as exc:
+                # Without the ledger the entry cap cannot be enforced; fail
+                # closed for this deployment rather than trade uncapped.
+                self._report_once(
+                    deployment_id,
+                    "ledger",
+                    "Internal deployment ledger is unreadable; entry caps "
+                    "cannot be enforced and evaluation fails closed",
+                    deployment_id=deployment_id,
+                    error=str(exc),
+                )
+                continue
+            open_positions = {
+                symbol: qty
+                for symbol, qty in open_qty.items()
+                if abs(float(qty)) > _OPEN_QTY_EPSILON
+            }
             bundle = self._bundle(deployment, timeframe)
             if bundle is None:
                 continue
             for symbol in symbols:
+                # Fresh wall-clock per symbol: a pass over many symbols must
+                # not judge the last ones by the pass's start time.
+                symbol_moment = now if now is not None else datetime.now(timezone.utc)
                 try:
                     await self._evaluate_symbol(
                         adapter=adapter,
@@ -567,7 +809,8 @@ class InternalStrategyRunner:
                         symbol=symbol,
                         timeframe=timeframe,
                         bar_seconds=bar_seconds,
-                        moment=moment,
+                        moment=symbol_moment,
+                        open_positions=open_positions,
                     )
                 except asyncio.CancelledError:
                     raise

@@ -3190,6 +3190,45 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     return net
 
 
+def list_live_deployment_net_filled_qty_by_symbol(deployment_id: str) -> dict[str, float]:
+    """``{SYMBOL: signed net filled qty}`` over one deployment's own ledger (#348).
+
+    Same attribution rules as :func:`get_live_deployment_net_filled_qty`,
+    grouped by symbol so callers can enforce per-symbol and total position
+    caps without one query per symbol. Symbols whose net is exactly zero are
+    still listed; callers filter on magnitude.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the ledger quantities")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                func.upper(LiveSignalModel.symbol),
+                LiveSignalModel.action,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(func.upper(LiveSignalModel.symbol), LiveSignalModel.action)
+        ).all()
+    net: dict[str, float] = {}
+    for symbol, action, filled in rows:
+        normalized_action = str(action or "").strip().lower()
+        quantity = float(filled or 0.0)
+        if normalized_action == "buy":
+            net[symbol] = net.get(symbol, 0.0) + quantity
+        elif normalized_action == "sell":
+            net[symbol] = net.get(symbol, 0.0) - quantity
+        else:
+            raise ValueError(
+                f"Live signal action {action!r} for deployment {normalized_deployment_id} "
+                f"({symbol}) has no known position sign; refusing to size an exit."
+            )
+    return net
+
+
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
     """Every deployment's signed net filled quantity for ``symbol`` on one account.
 
