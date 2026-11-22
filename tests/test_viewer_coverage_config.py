@@ -12,7 +12,28 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+@pytest.fixture(autouse=True)
+def _restore_coverage_windows():
+    """``reload_coverage_windows`` mutates module globals that ``monkeypatch``
+    cannot undo: a test that sets ``HF_INTRADAY_COVERAGE_END`` and reloads
+    leaves the shrunk window behind for every later test in the worker. Save
+    and restore the globals so the module state cannot leak across tests."""
+    from data_tools import auto_download
+
+    saved = (
+        auto_download.HF_INTRADAY_COVERAGE_END,
+        auto_download.ALPACA_INTRADAY_START,
+    )
+    yield
+    (
+        auto_download.HF_INTRADAY_COVERAGE_END,
+        auto_download.ALPACA_INTRADAY_START,
+    ) = saved
 
 
 def test_coverage_windows_are_configurable(monkeypatch):
