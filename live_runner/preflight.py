@@ -18,7 +18,11 @@ from pydantic import ValidationError
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
-from live_runner.credential_env import overlay_process_env, read_accounts_env_file
+from live_runner.credential_env import (
+    overlay_process_env,
+    read_accounts_env_file,
+    resolve_accounts_env_path,
+)
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from runner.promotion_gate import StrategyNotPromotedError
@@ -608,14 +612,14 @@ def _config_error_message(exc: Exception, *, redact: Mapping[str, str]) -> str:
 def run_live_preflight(
     config_path: str | Path,
     *,
-    accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env_path: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     check_connectivity: bool = False,
     check_db: bool = False,
     db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
-    accounts_env = Path(accounts_env_path)
+    accounts_env = resolve_accounts_env_path(accounts_env_path, default=DEFAULT_ACCOUNTS_ENV)
     # ${VAR} references in the YAML resolve exactly like credentials: the accounts
     # env file first, the process environment only for keys the file does not
     # define. An explicit ``env`` mapping is used as-is (hermetic callers). The
@@ -770,8 +774,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--accounts-env",
-        default=str(DEFAULT_ACCOUNTS_ENV),
-        help="Path to .accounts.env-style credential file.",
+        default=None,
+        help=(
+            "Path to .accounts.env-style credential file "
+            "(default: the project file)."
+        ),
     )
     parser.add_argument(
         "--check-connectivity",
@@ -799,13 +806,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A named database is a request to validate it; ignoring the flag would print the same
         # green document as a run that never looked at the DB.
         args.check_db = True
+    # Resolve once here so the preflight, the crash redaction and the result document all name the
+    # same file: --accounts-env applies only when given, else the module default.
+    accounts_env = resolve_accounts_env_path(args.accounts_env, default=DEFAULT_ACCOUNTS_ENV)
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
     try:
         result = run_live_preflight(
             args.config,
-            accounts_env_path=args.accounts_env,
+            accounts_env_path=accounts_env,
             check_connectivity=args.check_connectivity,
             check_db=args.check_db,
             db_path=args.db_path,
@@ -815,7 +825,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the stdout contract: a failed result document, traceback on stderr. Both
         # the traceback and the document are redacted, so an expanded value that
         # reached the exception text is printed nowhere.
-        redact = _crash_redaction(Path(args.accounts_env))
+        redact = _crash_redaction(accounts_env)
         crash_traceback = _crash_traceback(exc, redact=redact)
         crash_log = "Live preflight crashed"
         if crash_traceback is not None:
@@ -839,7 +849,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = LivePreflightResult(
             ok=False,
             config_path=str(args.config),
-            accounts_env_path=str(args.accounts_env),
+            accounts_env_path=str(accounts_env),
             accounts=[],
             deployment_errors=[_crash_message(exc, redact=redact)],
             db_deployments=db_report,

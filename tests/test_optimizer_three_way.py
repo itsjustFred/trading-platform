@@ -59,10 +59,11 @@ def _write_base_backtest(backtests_dir: Path) -> None:
 
 
 def _equity_curve(start: str) -> list[EquityPoint]:
-    values = [100_000.0, 101_000.0, 100_500.0, 102_000.0, 101_500.0, 103_000.0]
-    day = 1 if start.startswith("2024-01") else 10
+    # #133: the OOS holdout needs >=20 distinct DAILY observations; the mock
+    # curve carries 25 daily points regardless of the (short) test period.
+    values = [100_000.0 + index for index in range(25)]
     return [
-        EquityPoint(time=f"2024-02-{day + index:02d}T00:00:00+00:00", equity=value)
+        EquityPoint(time=f"2024-02-{index + 1:02d}T00:00:00+00:00", equity=value)
         for index, value in enumerate(values)
     ]
 
@@ -989,3 +990,113 @@ def test_old_two_way_optimization_payload_still_loads(
     assert summary["test_stats"] == {"sharpe_ratio": 1.2}
     assert summary["oos_comparison"] == old_payload["oos_comparison"]
     assert "three_way" not in summary, "an old artifact must not gain a new section"
+
+
+def test_insufficient_oos_daily_observations_fail_the_overfitting_verdict(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#133: an undersized OOS holdout must fail the verdict, not just label."""
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 3.0, 2: 4.0},
+            "test": {1: 5.0, 2: 6.0},
+        },
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 5
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["oos_status"] == "insufficient_oos_bars"
+    assert payload["oos_daily_observations"] == 5
+    overfitting = payload["three_way"]["overfitting"]
+    assert overfitting["passed"] is False
+    assert overfitting["checks"]["oos_daily_observations"] == {
+        "value": 5,
+        "threshold": 20,
+        "passed": False,
+        "computable": True,
+    }
+    assert any("daily observations" in reason for reason in overfitting["reasons"])
+    # Risk-adjusted ratios are withheld from the headline holdout; the
+    # factual fields stay for diagnostics.
+    assert "sharpe_ratio" not in payload["final_test_stats"]
+    assert payload["final_test_stats"]["total_pnl"] is not None
+    assert "sharpe_ratio" not in payload["three_way"]["winner"]["test_metrics"]
+    assert payload["three_way"]["oos_metrics_withheld"] is True
+
+
+@pytest.mark.parametrize(
+    "observations,expected_status",
+    [(19, "insufficient_oos_bars"), (20, "available")],
+)
+def test_oos_daily_observation_boundary(
+    monkeypatch, tmp_path: Path, observations: int, expected_status: str
+) -> None:
+    """The minimum is inclusive: exactly ``min_oos_daily_observations`` daily
+    observations is available; one fewer is insufficient. Pins the ``>=`` at
+    the boundary against ``>`` mutants."""
+    config = _config(n_trials=2)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 3.0, 2: 4.0},
+            "test": {1: 5.0, 2: 6.0},
+        },
+    )
+    monkeypatch.setattr(
+        optimizer_module,
+        "daily_observation_count",
+        lambda *args, **kwargs: observations,
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["oos_status"] == expected_status
+    assert payload["oos_daily_observations"] == observations
+    overfitting = payload["three_way"]["overfitting"]
+    if expected_status == "available":
+        assert "oos_daily_observations" not in overfitting["checks"]
+        assert "sharpe_ratio" in payload["final_test_stats"]
+    else:
+        assert overfitting["checks"]["oos_daily_observations"] == {
+            "value": 19,
+            "threshold": 20,
+            "passed": False,
+            "computable": True,
+        }
+        assert "sharpe_ratio" not in payload["final_test_stats"]
+
+
+def test_configurable_oos_minimum_admits_a_smaller_holdout(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = _config(n_trials=2, min_oos_daily_observations=3)
+    _patch_environment(
+        monkeypatch,
+        tmp_path,
+        config=config,
+        metrics={
+            "train": {1: 1.0, 2: 2.0},
+            "validation": {1: 3.0, 2: 4.0},
+            "test": {1: 5.0, 2: 6.0},
+        },
+    )
+    monkeypatch.setattr(
+        optimizer_module, "daily_observation_count", lambda *args, **kwargs: 5
+    )
+
+    payload = optimizer_module.run_optimization(config)
+
+    assert payload["oos_status"] == "available"
+    overfitting = payload["three_way"]["overfitting"]
+    assert "oos_daily_observations" not in overfitting["checks"]
