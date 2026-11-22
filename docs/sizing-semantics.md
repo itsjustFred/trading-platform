@@ -97,8 +97,11 @@ documented here.
   recomputed in the legacy MT5 order `(risk / distance) *
   (tick_size / tick_value)` so unclamped sizes are bit-identical to the
   pre-#279 formula; the per-position notional cap and the free-margin
-  leverage clamp are unchanged. For the shared-equity replay, an unclamped
-  fixed-risk quantity stays absolute-$ while a clamp-bound one is marked
+  leverage clamp are unchanged. `min_lot` is applied after the exposure
+  clamp, so a sub-minimum size can be raised back above the remaining
+  risk budget — pre-existing behaviour shared with the pct path. For the
+  shared-equity replay, an unclamped fixed-risk
+  quantity stays absolute-$ while a clamp-bound one is marked
   equity-proportional and re-scaled.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
