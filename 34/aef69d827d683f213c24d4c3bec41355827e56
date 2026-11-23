@@ -1,0 +1,19 @@
+tests/indicators/test_private_copy_guard.py
+  s_8062bb3623a719::t_e62be2fd4d0ed4 52,181,190-194,197,220-227,242-244,379-395,397-398,402,404,407,411-412,415,418-420,441-445,494-555
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "34aef69d827d683f213c24d4c3bec41355827e56",
+  "prompts": {},
+  "sessions": {
+    "s_8062bb3623a719": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_8062bb3623a719",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
