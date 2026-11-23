@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from runner.engines import contract
 from shared.models import VALID_TIMEFRAMES, BacktestResult
-from shared.strategy_registry import load_strategy_meta
+from shared.strategy_registry import load_strategy_meta, read_strategy_source
 
 #: Deprecated alias of :attr:`BacktestConfig.max_position_exposure_pct`.
 #: Kept so old invocations keep working during the Cleanup 16-E migration.
@@ -115,23 +115,16 @@ def _parameter_requests_trailing_sl(value: Any) -> bool:
     return bool(value)
 
 
-def _literal_default(node: ast.AST) -> Any:
+def _literal_default(node: ast.AST | None) -> Any:
+    if node is None:
+        return None
     try:
         return ast.literal_eval(node)
     except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
         return None
 
 
-def strategy_parameter_default(strategy_path: str | Path, name: str) -> Any:
-    """Return a literal ``generate_signals`` default without executing the file.
-
-    Returns ``None`` when the parameter has no literal default; the adapter's
-    imported-signature check remains the authority for non-literal defaults.
-    """
-    try:
-        tree = ast.parse(Path(strategy_path).read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, UnicodeDecodeError):
-        return None
+def _generate_signals_defaults(tree: ast.AST) -> dict[str, ast.AST]:
     for node in tree.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -142,14 +135,32 @@ def strategy_parameter_default(strategy_path: str | Path, name: str) -> Any:
         defaults: list[ast.AST | None] = [None] * (
             len(positional) - len(args.defaults)
         ) + list(args.defaults)
+        found: dict[str, ast.AST] = {}
         for arg, default in zip(positional, defaults, strict=True):
-            if arg.arg == name and default is not None:
-                return _literal_default(default)
+            if default is not None:
+                found[arg.arg] = default
         for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
-            if arg.arg == name and default is not None:
-                return _literal_default(default)
+            if default is not None:
+                found[arg.arg] = default
+        return found
+    return {}
+
+
+def strategy_parameter_default(strategy_path: str | Path, name: str) -> Any:
+    """Return a literal ``generate_signals`` default without executing the file.
+
+    Returns ``None`` when the parameter has no literal default; the adapter's
+    imported-signature check remains the authority for non-literal defaults.
+    """
+    resolved = Path(strategy_path).resolve()
+    source = read_strategy_source(resolved, resolved.parent)
+    if source is None:
         return None
-    return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    return _literal_default(_generate_signals_defaults(tree).get(name))
 
 
 def native_parameter_errors(parameters: dict[str, Any] | None) -> list[str]:

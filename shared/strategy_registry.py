@@ -192,6 +192,17 @@ def load_strategy_meta(
     return dict(meta) if isinstance(meta, dict) else {}
 
 
+def read_strategy_source(path: Path, strategies_dir: Path | None = None) -> str | None:
+    """Return a strategy file's source without executing it.
+
+    Uses the same containment rule as :func:`load_strategy_meta`: the default
+    root is the repository strategy tree, while engine runs for an explicit
+    user-selected path pass the file's own directory (the run already trusts
+    that path — see :func:`runner.engines.base.resolve_strategy_parameters`).
+    """
+    return _contained_strategy_source(path, strategies_dir or DEFAULT_STRATEGIES_DIR)
+
+
 def _strategy_type_from_meta(meta: dict[str, Any]) -> StrategyType | None:
     candidates: list[Any] = [
         meta.get("strategy_type"),

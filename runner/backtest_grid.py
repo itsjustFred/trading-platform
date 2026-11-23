@@ -865,6 +865,14 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _assert_native_strategy_parameters(engine: str, strategy: str, params: dict[str, Any]) -> None:
+    if str(engine).strip().lower() != "native":
+        return
+    parameter_errors = native_strategy_parameter_errors(strategy, params)
+    if parameter_errors:
+        raise ValueError("; ".join(parameter_errors))
+
+
 def run_backtest_grid(
     *,
     strategy: str,
@@ -917,10 +925,7 @@ def run_backtest_grid(
     # believes slippage was applied (grid/walk-forward/matrix default to
     # vectorbt, which has no slippage code path).
     assert_slippage_supported(engine, params)
-    if str(engine).strip().lower() == "native":
-        parameter_errors = native_strategy_parameter_errors(strategy, params)
-        if parameter_errors:
-            raise ValueError("; ".join(parameter_errors))
+    _assert_native_strategy_parameters(engine, strategy, params)
 
     summary: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(),
