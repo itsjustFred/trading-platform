@@ -307,7 +307,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
         if period in allocation.index:
             target = allocation.loc[period]
             if pd.notna(target):
-                allocation_at.iloc[int(np.where(is_month_end)[0][position])] = str(target)
+                allocation_at.iloc[int(np.nonzero(is_month_end)[0][position])] = str(target)
 
     entries = pd.Series(False, index=close.index, dtype=bool)
     exits = pd.Series(False, index=close.index, dtype=bool)

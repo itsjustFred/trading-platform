@@ -120,9 +120,9 @@ def wilder_rsi(close: pd.Series, period: int) -> pd.Series:
     #   no down change at all            -> RSI = 100
     #   no up change at all              -> RSI = 0
     #   neither up nor down (flat window)-> undefined, stays NaN
-    flat = (avg_gain == 0.0) & (avg_loss == 0.0)
-    only_losses = (avg_gain == 0.0) & (avg_loss > 0.0)
-    only_gains = (avg_gain > 0.0) & (avg_loss == 0.0)
+    flat = (avg_gain <= 0.0) & (avg_loss <= 0.0)
+    only_losses = (avg_gain <= 0.0) & (avg_loss > 0.0)
+    only_gains = (avg_gain > 0.0) & (avg_loss <= 0.0)
     rsi = rsi.where(~only_gains, 100.0)
     rsi = rsi.where(~only_losses, 0.0)
     rsi = rsi.where(~flat, np.nan)
