@@ -589,6 +589,20 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     printf 'OK\\n'
     exit 0
     ;;
+  nvidia-cut)
+    for n in 1 2 3; do
+      printf '! retrying (attempt %s): HTTP 429: Too Many Requests\\n' "$n" >&2
+    done
+    exit 1
+    ;;
+  leak)
+    printf '**Summary:** leaked %s\\n**Verdict: PASS**\\n' "${NVIDIA_API_KEY:-}"
+    exit 0
+    ;;
+  leak-fail)
+    printf 'Error: env says NVIDIA_API_KEY=%s\\n' "${NVIDIA_API_KEY:-}" >&2
+    exit 1
+    ;;
 esac
 """
 
@@ -758,6 +772,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             "kilo-429",
             "kilo-signup",
             "nvidia-429",
+            "nvidia-cut",
             "verdict",
             "garbage",
             "other",
@@ -797,7 +812,13 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             )
             comment = runner_temp / stage / "comment.md"
             if mode in (
-                "quota", "quota-zero", "quota-verdict", "kilo-429", "kilo-signup", "nvidia-429"
+                "quota",
+                "quota-zero",
+                "quota-verdict",
+                "kilo-429",
+                "kilo-signup",
+                "nvidia-429",
+                "nvidia-cut",
             ):
                 assert result.returncode == 0, (
                     f"{name}: the quota path failed the step:\n{result.stderr}"
@@ -841,3 +862,62 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
                 assert not comment.is_file() or "Not run: quota" not in (
                     comment.read_text(encoding="utf-8") if comment.is_file() else ""
                 ), f"{name}: a genuine failure took the quota path"
+
+
+@needs_bash
+def test_an_agent_output_carrying_the_nvidia_key_is_never_kept(tmp_path) -> None:
+    """The agent has a shell and its stdout becomes a public PR comment, so an `nvidia/...`
+    run whose output carries the key - on a clean report or a failed run - must fail the
+    step and leave neither a comment nor the raw stream behind to upload."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "--initial-branch=main", ".")
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "head")
+    head = _git(repo, "rev-parse", "HEAD")
+    key = "nvapi-test-0123456789"
+    for name in SIBLINGS:
+        agent_name, step_name = _AGENT_STEP[name]
+        stage = _stage(name)
+        body = _run(_find_step(_load(name)["jobs"][agent_name], rf"^{re.escape(step_name)}$"))
+        for mode in ("leak", "leak-fail"):
+            case = tmp_path / f"{stage}-{mode}"
+            runner_temp = case / "runner-temp"
+            (runner_temp / stage).mkdir(parents=True)
+            (runner_temp / stage / "meta.json").write_text("{}", encoding="utf-8")
+            (runner_temp / stage / "scope.txt").write_text("f.txt\n", encoding="utf-8")
+            env = {
+                **os.environ,
+                "PATH": os.pathsep.join([str(_stub_bin(case)), os.environ["PATH"]]),
+                "STUB_OPENCODE_MODE": mode,
+                "RUNNER_TEMP": str(runner_temp),
+                "GITHUB_OUTPUT": str(case / "out"),
+                "GITHUB_STEP_SUMMARY": str(case / "step-summary"),
+                "PR_NUMBER": "409",
+                "BASE_SHA": "1" * 40,
+                "HEAD_SHA": head,
+                "SKILL_SOURCE": "base branch",
+                "SKILL_PATH": f".agents/skills/{stage}/SKILL.md",
+                "MODEL": "nvidia/stepfun-ai/step-5-preview",
+                "VARIANT": "high",
+                "NVIDIA_API_KEY": key,
+                "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+                "SCOPE_EMPTY": "false",
+            }
+            script = case / "step.sh"
+            script.write_text(body, encoding="utf-8")
+            result = subprocess.run(
+                [shutil.which("bash") or "bash", str(script)],
+                cwd=repo,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 1, f"{name} ({mode}): the step kept a leaked key"
+            assert "contains the NVIDIA API key" in result.stdout, (
+                f"{name} ({mode}): the failure does not say why"
+            )
+            left = [p.name for p in (runner_temp / stage).iterdir() if p.name.startswith("comment")]
+            assert left == [], f"{name} ({mode}): {left} left behind for upload"
+            assert key not in result.stdout, f"{name} ({mode}): the step echoed the key"

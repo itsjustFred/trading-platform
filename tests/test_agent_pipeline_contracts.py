@@ -1924,6 +1924,20 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     printf 'OK\\n'
     exit 0
     ;;
+  nvidia-cut)
+    for n in 1 2 3; do
+      printf '! retrying (attempt %s): HTTP 429: Too Many Requests\\n' "$n" >&2
+    done
+    exit 1
+    ;;
+  leak)
+    printf '**Summary:** leaked %s\\n**Verdict: PASS**\\n' "${NVIDIA_API_KEY:-}"
+    exit 0
+    ;;
+  leak-fail)
+    printf 'Error: env says NVIDIA_API_KEY=%s\\n' "${NVIDIA_API_KEY:-}" >&2
+    exit 1
+    ;;
 esac
 """
 
@@ -2351,6 +2365,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         ("kilo-429", True),
         ("kilo-signup", True),
         ("nvidia-429", True),
+        ("nvidia-cut", True),
         ("garbage", False),
         ("other", False),
         ("kilo-400", False),
@@ -2891,3 +2906,18 @@ def test_pre_mortem_verdict_extraction(output: str, expected: str, tmp_path) -> 
     disagree. The `**Verdict:**` line must be the last non-empty line - a verdict quoted from
     the diff earlier in the output does not count."""
     assert _premortem_verdict(output, tmp_path) == expected
+
+
+def test_every_agent_step_checks_both_captured_streams_for_the_key() -> None:
+    """The leak check is executed in test_agent_sibling_hardening for the review and the
+    mutation copy; the pre-mortem copy carries the same calls - once after a failed run's
+    streams are captured and once after a clean run's - so none of the three can post or
+    upload an output that carries the NVIDIA key."""
+    for name in AGENT_WORKFLOWS:
+        body = _run(_find_step(_agent_job(_load(name))[1], r"^Run .* agent$"))
+        calls = [line.strip() for line in body.splitlines() if line.strip() == "refuse_leaked_key"]
+        assert len(calls) == 2, f"{name}: the key check runs {len(calls)} times, not on both paths"
+        failed = body.index('cat "$out.stderr" >> "$out.raw"\n')
+        assert body[failed:].split("\n", 2)[1].strip() == "refuse_leaked_key", (
+            f"{name}: a failed run's output is echoed before the key check"
+        )

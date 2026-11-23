@@ -136,7 +136,8 @@ def test_agent_workflows_skip_drafts_and_keep_free_model_defaults() -> None:
 
     # Per-stage default models were considered and deferred to a separate
     # change; until then both workflows must keep a quoted free-tier
-    # default — they hold no API key.
+    # default, which needs no API key (only an `nvidia/...` stage variable
+    # brings ACTIONS_NVIDIA_API_KEY, gated in the probe and agent steps).
     for label, expr in (
         ("REVIEW_MODEL", review["env"]["MODEL"]),
         ("MUTATION_MODEL", mutation["env"]["MODEL"]),
