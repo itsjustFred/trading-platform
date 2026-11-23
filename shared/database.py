@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from sqlalchemy import (
     Column,
     Float,
     String,
+    Text,
     TextClause,
     UniqueConstraint,
     and_,
@@ -667,6 +669,126 @@ def _normalize_optional_id(value: Any) -> str | None:
     return normalized or None
 
 
+def _lift_optional_float(value: Any) -> float | None:
+    """A metadata value as a float column, or ``None`` when it is not one.
+
+    The quote snapshot columns are a projection of untrusted signal metadata:
+    a malformed value must degrade to NULL (the raw value stays in
+    ``metadata_json``), never raise inside ``save_live_signal`` and never be
+    stored as a number the broker did not send.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _lift_optional_text(value: Any) -> str | None:
+    """A metadata value as a text column, or ``None`` when absent/blank."""
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
+def _lift_optional_datetime(value: Any) -> datetime | None:
+    """A metadata timestamp (datetime or ISO-8601 text) as a datetime column.
+
+    Naive values are read as UTC, the same convention ``timestamp`` uses on
+    the way in. Anything unparseable degrades to ``None``: a timestamp that
+    cannot be read is "unknown", not "now".
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError, TypeError):
+        # Producer-controlled stamps can name dates no datetime can hold
+        # (e.g. year 1 with a non-UTC offset); "unknown", never a raise.
+        return None
+
+
+#: Metadata keys projected into the ``live_signals`` quote-snapshot columns
+#: (#134). The #125 entry-deviation gate writes all of them on accepted
+#: entries; exits and pre-gate refusals leave them absent, which the columns
+#: record as NULL.
+_LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS = (
+    "entry_quote_bid",
+    "entry_quote_ask",
+    "entry_quote_price",
+)
+_LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS = (
+    "entry_quote_side",
+    "entry_quote_source",
+    "entry_quote_time_source",
+)
+
+#: Metadata keys projected into the ``live_signals`` timing columns (#134).
+#: ``received_at`` is the producer-stated time (Discord message ``created_at``);
+#: ``signal_timestamp`` is the fallback producer stamp internal/replay signals
+#: carry. ``received_at_local`` is stamped by the Discord source when this
+#: process handled the message. ``timestamp`` is deliberately NOT a fallback:
+#: it is ambiguous producer-vs-processing time.
+_LIVE_SIGNAL_PRODUCER_AT_METADATA_KEYS = ("received_at", "signal_timestamp")
+_LIVE_SIGNAL_TIMING_METADATA_KEYS = {
+    "producer_at": _LIVE_SIGNAL_PRODUCER_AT_METADATA_KEYS,
+    "message_received_at": ("received_at_local",),
+}
+
+
+def _live_signal_quote_snapshot_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Column values for the #134 quote snapshot, lifted from signal metadata.
+
+    Analytics only: this projection runs inside the order path, so it must
+    never raise - a malformed producer value degrades the whole snapshot to
+    NULLs with a warning rather than vetoing the trade.
+    """
+    field_names = (
+        list(_LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS)
+        + list(_LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS)
+        + ["entry_quote_time"]
+        + list(_LIVE_SIGNAL_TIMING_METADATA_KEYS)
+    )
+    fields: dict[str, Any] = {name: None for name in field_names}
+    try:
+        for key in _LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS:
+            fields[key] = _lift_optional_float(metadata.get(key))
+        for key in _LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS:
+            fields[key] = _lift_optional_text(metadata.get(key))
+        fields["entry_quote_time"] = _lift_optional_datetime(
+            metadata.get("entry_quote_time")
+        )
+        for column, keys in _LIVE_SIGNAL_TIMING_METADATA_KEYS.items():
+            value = None
+            for key in keys:
+                value = _lift_optional_datetime(metadata.get(key))
+                if value is not None:
+                    break
+            fields[column] = value
+    except Exception:
+        logger.warning(
+            "Live signal quote snapshot projection failed; storing NULLs",
+            extra={"data": {"error": "projection_failed"}},
+            exc_info=True,
+        )
+        return {name: None for name in field_names}
+    return fields
+
+
 class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
@@ -706,6 +828,32 @@ class LiveSignalModel(SQLModel, table=True):
         default=None,
         sa_column=Column("idempotency_key", String, nullable=True, index=True),
     )
+    # ── Quote snapshot and timing (#134) ──────────────────────────────────────
+    #
+    # The #125 entry-deviation gate already writes the broker quote it judged
+    # into signal metadata (`entry_quote_*`). These columns project the same
+    # values so the slippage decomposition can join on them without parsing
+    # JSON, and so a fill whose signal carries no snapshot is visibly flagged
+    # rather than silently zero. All nullable: exits never see the gate, and
+    # rows written before this change have no snapshot - "no snapshot" must
+    # stay distinguishable from "snapshot at zero".
+    entry_quote_bid: float | None = Field(default=None, nullable=True)
+    entry_quote_ask: float | None = Field(default=None, nullable=True)
+    entry_quote_side: str | None = Field(default=None, nullable=True)
+    entry_quote_price: float | None = Field(default=None, nullable=True)
+    entry_quote_time: datetime | None = Field(default=None, nullable=True)
+    entry_quote_source: str | None = Field(default=None, nullable=True)
+    entry_quote_time_source: str | None = Field(default=None, nullable=True)
+    # Timing chain for one order: when the producer stamped the signal
+    # (Discord message ``created_at``), when this process received it, when the
+    # order request was sent to the broker and when the broker answered. The
+    # last two are written by ``set_live_signal_broker_order_id`` after the
+    # submit call returns; a signal whose order outcome is unknown keeps them
+    # NULL, which is exactly the flag a later audit needs.
+    producer_at: datetime | None = Field(default=None, nullable=True)
+    message_received_at: datetime | None = Field(default=None, nullable=True)
+    order_submitted_at: datetime | None = Field(default=None, nullable=True)
+    broker_ack_at: datetime | None = Field(default=None, nullable=True)
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
     )
@@ -741,6 +889,7 @@ class LiveSignalModel(SQLModel, table=True):
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
             idempotency_key=idempotency_key,
+            **_live_signal_quote_snapshot_fields(signal.metadata),
             metadata_json=metadata,
         )
 
@@ -790,6 +939,12 @@ class LiveExecutionModel(SQLModel, table=True):
     # Nullable and with no database default: a row written before this column existed has no
     # verdict, and "no verdict" must not be fabricated into "observed".
     actual_price_observed: str | None = Field(default=None, nullable=True)
+    # Order context for the slippage decomposition (#134): the broker's own
+    # order-type label and the quantity the order requested, in the same qty
+    # units as `filled_qty`. Both stay NULL when the broker payload does not
+    # state them - never an invented value.
+    order_type: str | None = Field(default=None, nullable=True)
+    requested_qty: float | None = Field(default=None, nullable=True)
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -811,6 +966,12 @@ class LiveExecutionModel(SQLModel, table=True):
             else None,
             broker_fill_id=execution.broker_fill_id,
             actual_price_observed=execution.actual_price_observed,
+            order_type=_lift_optional_text(execution.order_type),
+            requested_qty=(
+                _lift_optional_float(execution.requested_qty)
+                if execution.requested_qty is not None
+                else None
+            ),
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -835,7 +996,68 @@ class LiveExecutionModel(SQLModel, table=True):
             dedupe_key=self.dedupe_key,
             broker_fill_id=self.broker_fill_id,
             actual_price_observed=self.actual_price_observed,
+            order_type=self.order_type,
+            requested_qty=self.requested_qty,
         )
+
+
+class LiveSignalRejectionModel(SQLModel, table=True):
+    """A live signal refused before its order reached the broker (#134).
+
+    Rejections are part of the cost picture a later slippage model needs: a
+    signal the entry-deviation gate refused still carries the quote it was
+    judged against, and a signal refused earlier still carries its provenance
+    and timing. These rows deliberately live OUTSIDE ``live_signals``: a
+    ``live_signals`` row asserts "an order may exist for this signal", which
+    dedupe, reconciliation and recovery all rely on. A rejection has no order,
+    so it gets its own table rather than a status column that every one of
+    those readers would have to learn to ignore.
+
+    The quote/timing columns mirror the ``live_signals`` #134 projection so a
+    rejection and an accepted signal answer the same questions. All nullable:
+    a refusal before the gate ran has no quote, and "no quote" must stay
+    distinguishable from "quote at zero".
+    """
+
+    __tablename__ = "live_signal_rejections"
+
+    id: str = Field(primary_key=True, default_factory=lambda: str(uuid4()))
+    deployment_id: str = Field(foreign_key="live_deployments.id", index=True)
+    # The in-memory ``LiveSignal.id`` that was refused. Not a foreign key:
+    # refused signals never get a ``live_signals`` row.
+    signal_id: str = Field(index=True)
+    symbol: str = Field(index=True)
+    action: str
+    theoretical_price: float = Field(default=0.0)
+    # When the daemon evaluated the signal (``LiveSignal.timestamp``).
+    timestamp: datetime = Field(index=True)
+    # Where the refusal happened (e.g. ``prepare``, ``prepare_exit``) and why
+    # (``str(exc)``). ``gate_rejection_rule`` carries the entry-deviation
+    # gate's rule name when the refusal came from it.
+    stage: str
+    reason: str = Field(sa_column=Column("reason", Text, nullable=False))
+    gate_rejection_rule: str | None = Field(default=None, nullable=True)
+    source: str = Field(default="internal")
+    discord_message_id: str | None = Field(default=None, nullable=True)
+    idempotency_key: str | None = Field(default=None, nullable=True)
+    producer_at: datetime | None = Field(default=None, nullable=True)
+    message_received_at: datetime | None = Field(default=None, nullable=True)
+    entry_quote_bid: float | None = Field(default=None, nullable=True)
+    entry_quote_ask: float | None = Field(default=None, nullable=True)
+    entry_quote_side: str | None = Field(default=None, nullable=True)
+    entry_quote_price: float | None = Field(default=None, nullable=True)
+    entry_quote_time: datetime | None = Field(default=None, nullable=True)
+    entry_quote_source: str | None = Field(default=None, nullable=True)
+    entry_quote_time_source: str | None = Field(default=None, nullable=True)
+    # Content hash making a redelivery of the same refused signal a no-op
+    # instead of a second row (same contract as ``live_signals`` dedupe).
+    dedupe_key: str | None = Field(
+        default=None,
+        sa_column=Column("dedupe_key", String, nullable=True, unique=True, index=True),
+    )
+    metadata_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
+    )
 
 
 class LiveBalanceModel(SQLModel, table=True):
@@ -2066,6 +2288,57 @@ def _add_live_executions_actual_price_observed(connection: Connection) -> None:
         )
 
 
+def _add_live_signal_quote_snapshot_columns(connection: Connection) -> None:
+    """Add the #134 quote-snapshot and timing columns to ``live_signals``.
+
+    The #125 entry-deviation gate already persists the broker quote it judged
+    into signal metadata; these columns project it (plus the order timing
+    chain) so the slippage decomposition does not have to parse JSON. Every
+    column is nullable with no default: exits never pass the gate, rows
+    predating this change have no snapshot, and "no snapshot" must stay
+    distinguishable from a snapshot at zero. Additive only - no existing row
+    changes. No-ops when the columns already exist.
+    """
+    column_names = _table_column_names(connection, "live_signals")
+    if not column_names:
+        return
+    additions = {
+        "entry_quote_bid": "FLOAT",
+        "entry_quote_ask": "FLOAT",
+        "entry_quote_side": "TEXT",
+        "entry_quote_price": "FLOAT",
+        "entry_quote_time": "DATETIME",
+        "entry_quote_source": "TEXT",
+        "entry_quote_time_source": "TEXT",
+        "producer_at": "DATETIME",
+        "message_received_at": "DATETIME",
+        "order_submitted_at": "DATETIME",
+        "broker_ack_at": "DATETIME",
+    }
+    for name, ddl in additions.items():
+        if name not in column_names:
+            connection.execute(
+                text(f"ALTER TABLE live_signals ADD COLUMN {name} {ddl}")
+            )
+
+
+def _add_live_executions_order_context_columns(connection: Connection) -> None:
+    """Add the #134 order-context columns to ``live_executions``.
+
+    ``order_type`` is the broker's own label for the order a fill belongs to
+    and ``requested_qty`` the quantity it asked for, both in the fill's qty
+    units. Nullable with no default: a broker payload that does not state
+    them leaves NULL, which is "unknown", never an invented value.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "order_type" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN order_type TEXT"))
+    if "requested_qty" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN requested_qty FLOAT"))
+
+
 _COMMISSION_NOT_NULL_RE = re.compile(
     r"((?:\"commission\"|`commission`|\[commission\]|\bcommission\b)\s+[A-Za-z]+(?:\s*\([^)]*\))?)"
     r"\s+NOT\s+NULL",
@@ -2667,11 +2940,13 @@ def _migrate_schema() -> None:
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)
         _migrate_live_submission_claim_uniqueness(connection)
+        _add_live_signal_quote_snapshot_columns(connection)
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
         _add_live_executions_broker_fill_id(connection)
         _add_live_executions_actual_price_observed(connection)
+        _add_live_executions_order_context_columns(connection)
         # Last: the rebuild copies every column, so the additive ones must already exist.
         _make_live_executions_commission_nullable(connection)
         # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
@@ -3004,6 +3279,132 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             _reconcile_existing_live_signal(session, existing, record)
             return str(existing.id), False
     return record_id, True
+
+
+def _live_signal_rejection_dedupe_key(
+    signal: LiveSignal,
+    *,
+    stage: str,
+    metadata: Mapping[str, Any],
+) -> str | None:
+    """Stable identity for one refused signal, or ``None`` when there is none.
+
+    Same contract as the signal dedupe: a Discord redelivery or an internal
+    replay of the same refused signal must not multiply rows. The category is
+    the refusal *kind* (the gate's rule name, else the stage) - two refusals
+    of the same signal for different reasons are different data points, while
+    the quote snapshot inside each row is what actually differs per attempt.
+    """
+    identity = _normalize_optional_id(metadata.get("discord_message_id")) or (
+        _normalize_optional_id(metadata.get("idempotency_key"))
+    )
+    if identity is None:
+        producer_stamp = None
+        for key in ("signal_timestamp", "received_at"):
+            producer_stamp = canonical_utc_timestamp(metadata.get(key))
+            if producer_stamp is not None:
+                break
+        if producer_stamp is None:
+            # No stable identity: every refusal is recorded (NULL dedupe keys
+            # never collide), which is the honest answer for a signal nothing
+            # can tell apart from its redelivery.
+            return None
+        identity = producer_stamp
+    category = _normalize_optional_id(metadata.get("entry_gate_rejection_rule")) or stage
+    material = "|".join(
+        [
+            str(signal.deployment_id),
+            identity,
+            str(signal.symbol or "").upper(),
+            str(signal.action or "").lower(),
+            str(stage or ""),
+            str(category or ""),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def save_live_signal_rejection(
+    signal: LiveSignal,
+    *,
+    stage: str,
+    reason: str,
+    extra_metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    """Persist a live signal refused before its order reached the broker (#134).
+
+    Rejections are part of the cost picture: the entry-deviation gate's refusal
+    still carries the quote the signal was judged against (passed via
+    ``extra_metadata`` - the gate attaches its record to the exception it
+    raises), and earlier refusals still carry provenance and timing. The row
+    lands in ``live_signal_rejections``, never ``live_signals``: a signal row
+    asserts an order may exist, which dedupe, reconciliation and recovery all
+    rely on, and a refusal has no order.
+
+    Returns True when the row was written, False when the same refusal was
+    already recorded. Never raises for a duplicate; any other failure
+    propagates to the caller, which must treat persistence as best-effort and
+    never let it reach the order path.
+    """
+    init_db()
+    metadata = dict(signal.metadata or {})
+    if extra_metadata:
+        # The refusal-stage record wins over payload values under the same
+        # keys, the same rule the accepted path applies to the gate's figures.
+        metadata.update(dict(extra_metadata))
+    timestamp = (
+        signal.timestamp.replace(tzinfo=timezone.utc)
+        if signal.timestamp.tzinfo is None
+        else signal.timestamp.astimezone(timezone.utc)
+    )
+    record = LiveSignalRejectionModel(
+        deployment_id=str(signal.deployment_id),
+        signal_id=str(signal.id),
+        symbol=str(signal.symbol or ""),
+        action=str(signal.action or ""),
+        theoretical_price=(
+            _lift_optional_float(signal.theoretical_price) or 0.0
+        ),
+        timestamp=timestamp,
+        stage=str(stage or ""),
+        reason=str(reason or ""),
+        gate_rejection_rule=_normalize_optional_id(
+            metadata.get("entry_gate_rejection_rule")
+        ),
+        source=str(metadata.get("source", "internal")),
+        discord_message_id=_normalize_optional_id(metadata.get("discord_message_id")),
+        idempotency_key=_normalize_optional_id(metadata.get("idempotency_key")),
+        dedupe_key=_live_signal_rejection_dedupe_key(
+            signal, stage=str(stage or ""), metadata=metadata
+        ),
+        metadata_json=metadata,
+        **_live_signal_quote_snapshot_fields(metadata),
+    )
+    with get_session() as session:
+        session.add(record)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            # The only unique constraint on this table is dedupe_key: a
+            # conflict is a redelivery of an already-recorded refusal. Any
+            # other integrity failure (e.g. a dangling deployment_id) is a
+            # real error and must not masquerade as a skip.
+            if record.dedupe_key is None:
+                raise
+            raced = session.exec(
+                select(LiveSignalRejectionModel)
+                .where(LiveSignalRejectionModel.dedupe_key == record.dedupe_key)
+                .limit(1)
+            ).first()
+            if raced is None:
+                raise
+            logger.info(
+                "Skipping duplicate live signal rejection (dedupe_key=%s)",
+                record.dedupe_key,
+            )
+            return False
+    return True
 
 
 def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
@@ -3648,6 +4049,8 @@ def record_live_broker_side_close_fill(
     close_side: str | None = None,
     cumulative_filled_qty: float | None = None,
     cumulative_avg_price: float | None = None,
+    order_type: str | None = None,
+    requested_qty: float | None = None,
 ) -> float:
     """Record a broker-side close against the parent signal's deployment ledger (#144).
 
@@ -3689,6 +4092,9 @@ def record_live_broker_side_close_fill(
     missing slice's price is derived from the broker's cumulative average exactly the way
     :func:`save_live_execution_up_to_cumulative` does (``derived``, or
     ``derived_unavailable`` with the quantity still recorded).
+
+    ``order_type`` and ``requested_qty`` carry the closing order's own context onto the fill
+    row (#134) when the caller's broker payload states them; both stay ``None`` otherwise.
     """
     normalized_parent = str(parent_signal_id or "").strip()
     normalized_reason = str(close_reason or "").strip()
@@ -3920,6 +4326,8 @@ def record_live_broker_side_close_fill(
                 broker_order_id=str(broker_order_id or ""),
                 broker_fill_id=broker_fill_id,
                 dedupe_key=dedupe_key,
+                order_type=order_type,
+                requested_qty=requested_qty,
             )
             record = LiveExecutionModel.from_live_execution(execution)
             if not record.dedupe_key:
@@ -4491,12 +4899,27 @@ def _list_unfilled_exit_orders(
     return pending
 
 
-def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
-    """Persist the broker order id on a signal right after submission (crash recovery)."""
+def set_live_signal_broker_order_id(
+    signal_id: str,
+    broker_order_id: str,
+    *,
+    submitted_at: datetime | None = None,
+    acknowledged_at: datetime | None = None,
+) -> bool:
+    """Persist the broker order id on a signal right after submission (crash recovery).
+
+    ``submitted_at``/``acknowledged_at`` are the #134 order-timing stamps: the
+    adapters capture them around the broker submit call and pass them here so
+    the signal row records when the request left and when the broker answered,
+    in the same write that records the order id. ``None`` leaves the stored
+    value alone, so a recovery re-persist never erases a known time.
+    """
     normalized_signal_id = str(signal_id or "").strip()
     normalized_order_id = str(broker_order_id or "").strip()
     if not normalized_signal_id or not normalized_order_id:
         return False
+    submitted_utc = _lift_optional_datetime(submitted_at) if submitted_at is not None else None
+    ack_utc = _lift_optional_datetime(acknowledged_at) if acknowledged_at is not None else None
     init_db()
     with get_session() as session:
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -4506,11 +4929,17 @@ def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> boo
         existing_order_id = str(record.broker_order_id or "").strip()
         if existing_order_id and existing_order_id != normalized_order_id:
             return False
-        if existing_order_id == normalized_order_id:
+        if existing_order_id == normalized_order_id and submitted_utc is None and ack_utc is None:
             return True
         record.broker_order_id = normalized_order_id
         metadata = dict(record.metadata_json or {})
         metadata["broker_order_id"] = normalized_order_id
+        if submitted_utc is not None:
+            record.order_submitted_at = submitted_utc
+            metadata["order_submitted_at"] = submitted_utc.isoformat()
+        if ack_utc is not None:
+            record.broker_ack_at = ack_utc
+            metadata["broker_ack_at"] = ack_utc.isoformat()
         record.metadata_json = metadata
         session.add(record)
         session.commit()
@@ -7258,6 +7687,101 @@ def _optional_commission(execution: LiveExecutionModel | None) -> float | None:
     return float(execution.commission)
 
 
+def _usable_quote_price(value: Any) -> float | None:
+    """A quote-snapshot price as a usable number, or None (#134).
+
+    Same rule as ``execution_price_is_usable`` applied to a quote side: only a
+    finite, positive number counts. A missing or malformed snapshot value must
+    read as "no snapshot", never as a quote at zero.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _live_slippage_decomposition(
+    signal: LiveSignalModel,
+    *,
+    theoretical: float,
+    actual: float | None,
+) -> dict[str, Any]:
+    """Split one fill's cost into signal delay, execution slippage and spread (#134).
+
+    The legacy ``slippage``/``slippage_bps`` (``actual - theoretical``) mixes
+    two different things: the market moving between the signal price and the
+    quote at submit time (delay), and the fill landing away from that quote
+    (execution). The spread is inside both. This decomposition separates them
+    using the #125 quote snapshot persisted on the signal:
+
+    * ``signal_delay_bps``: the same-side quote at submit vs the signal's
+      theoretical price, in basis points of the theoretical price.
+    * ``execution_slippage_bps``: the fill price vs that same-side quote.
+    * ``spread_bps``: ``(ask - bid) / mid`` at submit - the quote width, a
+      separate measure that is *not* additive to the other two.
+
+    All three are **adverse-positive**: a positive value is a cost, for buys
+    and sells alike (for a sell the direction is applied). Only
+    ``signal_delay_bps + execution_slippage_bps`` reconstructs the
+    adverse-positive total cost - ``slippage_bps`` for a buy,
+    ``-slippage_bps`` for a sell under the legacy signed
+    ``actual - theoretical`` convention. The spread sits *inside* both terms,
+    so adding ``spread_bps`` would double-count it.
+    Each is ``None`` independently when its inputs are missing -
+    an unusable fill price hides only ``execution_slippage_bps``, and a signal
+    with no quote snapshot hides all three and sets ``quote_snapshot_missing``.
+    Exits never pass the entry quote gate, so a missing snapshot on an exit is
+    expected rather than a gap: ``quote_snapshot_missing`` is ``None`` there.
+    """
+    bid = _usable_quote_price(signal.entry_quote_bid)
+    ask = _usable_quote_price(signal.entry_quote_ask)
+    quote_price = _usable_quote_price(signal.entry_quote_price)
+    has_snapshot = bid is not None and ask is not None and quote_price is not None
+    metadata = signal.metadata_json or {}
+    is_exit = _is_exit_only_signal_metadata(metadata) or str(
+        metadata.get("signal_intent") or ""
+    ) == "exit"
+    result: dict[str, Any] = {
+        "signal_delay_bps": None,
+        "execution_slippage_bps": None,
+        "spread_bps": None,
+        "quote_snapshot_missing": (
+            False if has_snapshot else (None if is_exit else True)
+        ),
+        "quote_bid": bid,
+        "quote_ask": ask,
+        "quote_price": quote_price,
+        "quote_time": signal.entry_quote_time,
+        "quote_source": signal.entry_quote_source,
+    }
+    if not has_snapshot:
+        return result
+    if ask < bid:
+        # A crossed book is not a snapshot a model can decompose against; the
+        # gate refuses these, so a persisted one is corrupt data, not a quote.
+        result["quote_snapshot_missing"] = True
+        result.update(
+            {"quote_bid": None, "quote_ask": None, "quote_price": None}
+        )
+        return result
+    mid = (bid + ask) / 2.0
+    if mid > 0:
+        result["spread_bps"] = ((ask - bid) / mid) * 10000.0
+    if theoretical and math.isfinite(theoretical) and theoretical > 0:
+        direction = 1.0 if str(signal.action or "").lower() == "buy" else -1.0
+        result["signal_delay_bps"] = (
+            direction * (quote_price - theoretical) / theoretical * 10000.0
+        )
+        if actual is not None:
+            result["execution_slippage_bps"] = (
+                direction * (actual - quote_price) / theoretical * 10000.0
+            )
+    return result
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -7290,11 +7814,24 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "actual_price": actual,
                 "slippage": slippage,
                 "slippage_bps": slippage_bps,
+                **_live_slippage_decomposition(
+                    signal, theoretical=theoretical, actual=actual
+                ),
                 "actual_price_observed": execution.actual_price_observed,
                 "filled_qty": float(execution.filled_qty or 0.0),
+                "requested_qty": (
+                    float(execution.requested_qty)
+                    if execution.requested_qty is not None
+                    else None
+                ),
+                "order_type": execution.order_type,
                 "commission": _optional_commission(execution),
                 "signal_timestamp": signal.timestamp,
                 "execution_timestamp": execution.timestamp,
+                "producer_at": signal.producer_at,
+                "message_received_at": signal.message_received_at,
+                "order_submitted_at": signal.order_submitted_at,
+                "broker_ack_at": signal.broker_ack_at,
                 "broker_order_id": execution.broker_order_id,
                 "signal_metadata": signal.metadata_json or {},
             }

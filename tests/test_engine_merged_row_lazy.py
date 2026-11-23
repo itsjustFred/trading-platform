@@ -56,8 +56,10 @@ def _strategy(df: pd.DataFrame, params: dict):
     exits = pd.Series(False, index=df.index)
     for bar in (30, 90, 150, 210, 270, 330):
         entries.iloc[bar] = True
-    # Market exits a few bars after each entry, plus two explicit level exits.
-    for bar in (40, 100, 160, 220, 280, 340, 250, 360):
+    # Market exits a few bars after each entry, plus exit-only bars while flat.
+    # Bars 35/95 carry exit_order_type="level" + exit_price (set below) — they
+    # sit inside the positions opened by entries 30/90.
+    for bar in (35, 40, 95, 100, 160, 220, 250, 280, 340, 360):
         exits.iloc[bar] = True
 
     idx = df.index
@@ -73,12 +75,18 @@ def _strategy(df: pd.DataFrame, params: dict):
         "sl_price": pd.Series(np.nan, index=idx),
         "tp_price": pd.Series(np.nan, index=idx),
     }
-    # Two exits are explicit level exits priced inside the signal bar.
-    for bar in (250, 360):
+    # Two exits are explicit level exits priced inside the signal bar — placed
+    # INSIDE open positions (entry 30 fills ~31, market exit is 40; entry 90
+    # fills ~91, market exit is 100) so the level path is really exercised. A
+    # level exit while flat would never read merged_row's exit_order_type and
+    # could not catch a stale-row regression.
+    for bar in (35, 95):
         indicators["exit_order_type"].iloc[bar] = "level"
         indicators["exit_price"].iloc[bar] = float(df.iloc[bar]["close"])
-    # Protective levels on the first two entries so _check_stops fires too.
-    for bar in (30, 90):
+    # Protective levels on two LATER entries (150, 210) so _check_stops fires
+    # too — kept off entries 30/90 so those positions survive to their level
+    # exits at 35/95.
+    for bar in (150, 210):
         indicators["sl_price"].iloc[bar] = float(df.iloc[bar]["low"]) - 0.5
         indicators["tp_price"].iloc[bar] = float(df.iloc[bar]["high"]) + 0.5
     return entries, exits, indicators, []
@@ -145,7 +153,9 @@ def test_lazy_and_eager_identical_with_fixed_risk():
 
 def test_scenario_actually_trades():
     """Guard against a vacuous pass: the fixture must produce real trades,
-    market exits, level exits and protective-stop activity."""
+    market exits, level exits INSIDE open positions and protective-stop
+    activity — the defect class this file exists for is an exit-only bar
+    reusing a stale ``merged_row``."""
     data = _frame()
     cfg = BacktestConfig(
         strategy_name="lazy-equiv",
@@ -161,4 +171,108 @@ def test_scenario_actually_trades():
     assert len(result.trades) >= 3
     reasons = {t.meta.get("exit_reason") for t in result.trades}
     assert "signal" in reasons
-    assert len(result.equity_curve) == len(data)
+
+    level_prices = {35: float(data.iloc[35]["close"]), 95: float(data.iloc[95]["close"])}
+    level_fills = [
+        ex
+        for t in result.trades
+        for ex in t.exits
+        if ex.reason == "signal" and ex.price in level_prices.values()
+    ]
+    # At least one signal-bar level exit filled at its explicit exit_price
+    # while a position was open (the level exits sit inside entries 30/90).
+    assert level_fills, "no level exit filled at its exit_price"
+
+    protective = [
+        ex
+        for t in result.trades
+        for ex in t.exits
+        if ex.reason in {"stop_loss", "take_profit", "tp"}
+    ]
+    assert protective, "no protective stop/TP exit fired"
+
+
+def _intrabar_frame() -> pd.DataFrame:
+    """6 hourly bars; bar 2 trades through BOTH the stop (95) and the
+    take-profit (105) so the same-bar ambiguity needs intrabar chronology."""
+    idx = pd.date_range("2026-01-01", periods=6, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {
+            "timestamp": idx,
+            "open": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            "high": [100.2, 100.2, 106.0, 100.2, 100.2, 100.2],
+            "low": [99.8, 99.8, 94.0, 99.8, 99.8, 99.8],
+            "close": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            "volume": 1000.0,
+        }
+    )
+
+
+def _intrabar_for_bar2() -> pd.DataFrame:
+    """15m sub-bars of the 02:00 bar: the rally through tp (105) happens
+    BEFORE the dip through the stop (95), so the chronological first event
+    is the take-profit."""
+    return pd.DataFrame(
+        {
+            "timestamp": pd.date_range(
+                "2026-01-01 02:00", periods=4, freq="15min", tz="UTC"
+            ),
+            "open": [100.0, 100.2, 105.5, 96.0],
+            "high": [100.4, 106.0, 105.8, 96.0],
+            "low": [99.6, 100.0, 94.5, 95.5],
+            "close": [100.2, 105.5, 96.0, 95.8],
+            "volume": [100.0] * 4,
+        }
+    )
+
+
+def _intrabar_strategy(df: pd.DataFrame, params: dict):
+    entries = pd.Series(False, index=df.index)
+    entries.iloc[0] = True
+    exits = pd.Series(False, index=df.index)
+    exits.iloc[5] = True
+    idx = df.index
+    indicators = {
+        "direction": pd.Series("LONG", index=idx),
+        "sl_price": pd.Series(np.nan, index=idx),
+        "tp_price": pd.Series(np.nan, index=idx),
+    }
+    indicators["sl_price"].iloc[0] = 95.0
+    indicators["tp_price"].iloc[0] = 105.0
+    return entries, exits, indicators, []
+
+
+def test_intrabar_next_time_isolation():
+    """Pin the ``next_time`` optimisation separately from the lazy
+    ``merged_row`` one: ``_intrabar_window`` bounds sub-bars by
+    ``[bar_time, next_time)``, so a wrong ``next_time`` empties the window
+    and the stop-first fallback fires instead of the chronological tp.
+
+    Lazy and eager must agree AND the run must really resolve the ambiguity
+    via intrabar data (a tp fill at 105, not the stop-first 95)."""
+    data = _intrabar_frame()
+    intrabar = _intrabar_for_bar2()
+    cfg = BacktestConfig(
+        strategy_name="lazy-equiv-intrabar",
+        symbols=["TEST"],
+        timeframe="1h",
+        modeling_resolution="15m",
+        start_date="2026-01-01",
+        end_date="2026-01-01",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        parameters={"fees": "zero", "slippage": "none"},
+    )
+    lazy = TradeEngine(cfg, symbol="TEST", intrabar_data=intrabar)
+    lazy_result = lazy.run(data, _intrabar_strategy)
+    eager = TradeEngine(cfg, symbol="TEST", intrabar_data=intrabar)
+    eager._eager_signal_rows = True
+    eager_result = eager.run(data, _intrabar_strategy)
+
+    assert _dump(lazy_result) == _dump(eager_result)
+    assert len(lazy_result.trades) == 1
+    exits = lazy_result.trades[0].exits
+    assert [ex.price for ex in exits] == pytest.approx([105.0]), (
+        "the intrabar chronology must resolve the same-bar stop/tp "
+        "ambiguity to the take-profit, not the stop-first fallback"
+    )
