@@ -308,6 +308,8 @@ export function LiveHubPage() {
   const [dashboard, setDashboard] = useState<LiveDashboardResponse | null>(null);
   const [killSwitch, setKillSwitch] = useState<LiveKillSwitchState | null>(null);
   const [killSwitchError, setKillSwitchError] = useState("");
+  const [killSwitchStale, setKillSwitchStale] = useState(false);
+  const [killSwitchReadAt, setKillSwitchReadAt] = useState<string | null>(null);
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -362,10 +364,16 @@ export function LiveHubPage() {
           .then((payload) => {
             setKillSwitch(payload);
             setKillSwitchError("");
+            setKillSwitchStale(false);
+            setKillSwitchReadAt(new Date().toISOString());
           })
-          .catch(() =>
-            setKillSwitchError("Could not load the kill-switch state."),
-          );
+          .catch(() => {
+            // A failed refresh must not leave the last good state rendering as
+            // current: mark it stale so the panel shows "last known" instead of
+            // a fresh-looking "Trading allowed".
+            setKillSwitchError("Could not load the kill-switch state.");
+            setKillSwitchStale(true);
+          });
         const statsEntries = await Promise.all(
           accountPayload.map(async (account) => {
             const [statsResult, balancesResult, positionsResult] = await Promise.allSettled([
@@ -1317,8 +1325,16 @@ export function LiveHubPage() {
       <LiveKillSwitchPanel
         state={killSwitch}
         loadError={killSwitchError}
+        stale={killSwitchStale}
+        staleSince={killSwitchReadAt}
         accounts={accounts}
-        onStateChange={setKillSwitch}
+        onStateChange={(next) => {
+          // A halt/resume write returns the server's read-back state, which is
+          // a fresh read: it clears the stale mark a failed poll left behind.
+          setKillSwitch(next);
+          setKillSwitchStale(false);
+          setKillSwitchReadAt(new Date().toISOString());
+        }}
       />
 
       {loading && (

@@ -61,6 +61,11 @@ function haltDetailFor(
   return state.halt_details.find((detail) => detail.scope === scope);
 }
 
+function formatReadTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString();
+}
+
 function describeHalt(detail: LiveKillSwitchHaltDetail | undefined, mode: string): string {
   const parts = [`HALTED · ${mode}`];
   if (detail?.halted_by && detail.halted_by !== "unknown") {
@@ -75,14 +80,90 @@ function describeHalt(detail: LiveKillSwitchHaltDetail | undefined, mode: string
   return parts.join(" ");
 }
 
+function unlistedHaltedScopes(
+  state: LiveKillSwitchState,
+  accounts: LiveAccount[],
+): Array<{ scope: string; label: string; isGlobal: boolean }> {
+  // A halt on a scope the account list does not name - a filtered list, a
+  // failed accounts fetch, a deleted account's leftover row - is still
+  // enforced by the daemon, so the panel must show it rather than
+  // under-report what is halted.
+  const listed = new Set<string>([
+    state.global_scope,
+    ...accounts.map((account) => account.id),
+  ]);
+  const seen = new Set<string>();
+  const rows: Array<{ scope: string; label: string; isGlobal: boolean }> = [];
+  for (const halt of state.halts) {
+    if (listed.has(halt.scope) || seen.has(halt.scope)) {
+      continue;
+    }
+    seen.add(halt.scope);
+    rows.push({
+      scope: halt.scope,
+      label: `unknown account ${halt.scope}`,
+      isGlobal: false,
+    });
+  }
+  return rows;
+}
+
+// A standing halt can be escalated in place to a stricter mode; the server
+// refuses a weaker one. `entries` is the weakest mode, so nothing sits below
+// it; `flatten` is the strongest, so nothing sits above it.
+const STRICTER_HALT_MODES: Record<string, LiveKillSwitchMode[]> = {
+  entries: ["orders", "flatten"],
+  orders: ["flatten"],
+  flatten: [],
+};
+
+const ALL_HALT_MODES: LiveKillSwitchMode[] = HALT_MODES.map(({ mode }) => mode);
+
+function haltModesForScope(ownMode: string | null): LiveKillSwitchMode[] {
+  if (ownMode === null) {
+    // Not halted on this scope: every mode is available, including on an
+    // unreadable state - halting is always safe, and fail-closed operators
+    // must be able to halt even when the state cannot be read.
+    return ALL_HALT_MODES;
+  }
+  // Halted: only the stricter modes, which the server accepts as an
+  // in-place escalation. An unrecognised stored mode falls back to the full
+  // set and lets the server refuse what it must.
+  return STRICTER_HALT_MODES[ownMode] ?? ALL_HALT_MODES;
+}
+
+function rowStatusText(
+  state: LiveKillSwitchState,
+  ownMode: string | null,
+  coveredByGlobal: boolean,
+  detail: LiveKillSwitchHaltDetail | undefined,
+  stale: boolean,
+): string {
+  const prefix = stale ? "last known: " : "";
+  if (ownMode) {
+    return `${prefix}${describeHalt(detail, ownMode)}`;
+  }
+  if (!state.readable) {
+    return "Halt state unreadable - the daemon refuses entries (fail closed)";
+  }
+  if (coveredByGlobal) {
+    return `${prefix}Covered by the global halt`;
+  }
+  return `${prefix}Trading allowed`;
+}
+
 export function LiveKillSwitchPanel({
   state,
   loadError,
+  stale = false,
+  staleSince = null,
   accounts,
   onStateChange,
 }: {
   state: LiveKillSwitchState | null;
   loadError?: string;
+  stale?: boolean;
+  staleSince?: string | null;
   accounts: LiveAccount[];
   onStateChange: (state: LiveKillSwitchState) => void;
 }) {
@@ -99,6 +180,7 @@ export function LiveKillSwitchPanel({
           label: `${accountLabel(account)} · ${account.broker} · ${account.is_demo ? "Demo" : "Live"}`,
           isGlobal: false,
         })),
+        ...unlistedHaltedScopes(state, accounts),
       ]
     : [];
 
@@ -111,7 +193,7 @@ export function LiveKillSwitchPanel({
   // the dialog is the UI's half of the server's confirmed_scope requirement.
   const requestHalt = (scope: string, mode: LiveKillSwitchMode) => {
     if (mode === "entries") {
-      void runHalt(scope, mode, "");
+      void runHalt(scope, mode, undefined, "");
       return;
     }
     setReason("");
@@ -127,15 +209,17 @@ export function LiveKillSwitchPanel({
     scope: string,
     mode: LiveKillSwitchMode,
     confirmedScope: string | undefined,
+    reasonText: string,
   ) => {
     setBusy(true);
     try {
       const result = await haltLiveKillSwitch(scope, mode, {
         confirmedScope,
-        reason: reason.trim(),
+        reason: reasonText.trim(),
       });
       onStateChange(result.state);
-      showToast(`Kill switch halt written for ${scope} (${mode}).`, "success");
+      const label = scopes.find((entry) => entry.scope === scope)?.label ?? scope;
+      showToast(`Kill switch halt written for ${label} (${mode}).`, "success");
       setPending(null);
     } catch (error_: unknown) {
       const message =
@@ -151,10 +235,11 @@ export function LiveKillSwitchPanel({
     try {
       const result = await resumeLiveKillSwitch(scope, scope);
       onStateChange(result.state);
+      const label = scopes.find((entry) => entry.scope === scope)?.label ?? scope;
       showToast(
         result.lifted
-          ? `Kill switch halt lifted for ${scope}.`
-          : `No kill switch halt was in force for ${scope}.`,
+          ? `Kill switch halt lifted for ${label}.`
+          : `No kill switch halt was in force for ${label}.`,
         "success",
       );
       setPending(null);
@@ -172,7 +257,7 @@ export function LiveKillSwitchPanel({
       return;
     }
     if (pending.kind === "halt") {
-      void runHalt(pending.scope, pending.mode, pending.scope);
+      void runHalt(pending.scope, pending.mode, pending.scope, reason);
     } else {
       void runResume(pending.scope);
     }
@@ -206,6 +291,11 @@ export function LiveKillSwitchPanel({
           {state?.readable && state.global_halted && (
             <span style={haltedChipStyle}>GLOBAL HALT IN FORCE</span>
           )}
+          {state && stale && (
+            <span style={staleChipStyle} title="A refresh failed; this is the last state the server confirmed.">
+              STATE STALE{staleSince ? ` - last read ${formatReadTime(staleSince)}` : ""}
+            </span>
+          )}
         </div>
         {loadError && (
           <span style={{ color: "var(--color-red)", fontSize: "0.78rem" }}>{loadError}</span>
@@ -216,8 +306,9 @@ export function LiveKillSwitchPanel({
         <div style={{ color: "#fecaca", fontSize: "0.8rem" }}>
           The halt state could not be read
           {state.unreadable_reason ? `: ${state.unreadable_reason}` : ""}. The daemon
-          treats this as halted and refuses new entries; controls are disabled until
-          the state reads cleanly.
+          treats this as halted and refuses new entries. Halt controls stay
+          available - halting is always safe - but Resume is hidden until the
+          state reads cleanly.
         </div>
       )}
 
@@ -227,15 +318,19 @@ export function LiveKillSwitchPanel({
         </div>
       )}
 
-      {state?.readable &&
+      {state &&
         scopes.map(({ scope, label, isGlobal }) => {
           const ownMode = haltModeFor(scope);
           const detail = haltDetailFor(state, scope);
-          const coveredByGlobal = !isGlobal && ownMode === null && state.global_halted;
-          const controlsDisabled = busy || !state.readable;
+          const coveredByGlobal =
+            !isGlobal && ownMode === null && state.readable && state.global_halted;
+          const haltModes = haltModesForScope(ownMode);
+          const showResume = ownMode !== null && state.readable;
+          const controlsDisabled = busy;
           return (
             <div
               key={scope}
+              data-kill-switch-scope={scope}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -255,38 +350,41 @@ export function LiveKillSwitchPanel({
                     marginTop: "2px",
                   }}
                 >
-                  {ownMode
-                    ? describeHalt(detail, ownMode)
-                    : coveredByGlobal
-                      ? "Covered by the global halt"
-                      : "Trading allowed"}
+                  {rowStatusText(state, ownMode, coveredByGlobal, detail, stale)}
                 </div>
               </div>
               <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                {ownMode ? (
+                {showResume && (
                   <button
                     type="button"
                     onClick={() => requestResume(scope)}
                     style={resumeBtnStyle}
-                    disabled={controlsDisabled}
-                    title="Lift the halt on this scope. Re-enables trading; requires confirmation."
+                    disabled={controlsDisabled || stale}
+                    title="Lift the halt on this scope. Re-enables trading; requires confirmation. Disabled while the state is stale."
                   >
                     Resume
                   </button>
-                ) : (
-                  HALT_MODES.map(({ mode, label: modeLabel, title }) => (
+                )}
+                {haltModes.map((mode) => {
+                  const { label: modeLabel, title } =
+                    HALT_MODES.find((entry) => entry.mode === mode) ?? HALT_MODES[0];
+                  return (
                     <button
                       key={mode}
                       type="button"
                       onClick={() => requestHalt(scope, mode)}
                       style={mode === "flatten" ? flattenBtnStyle : haltBtnStyle}
                       disabled={controlsDisabled}
-                      title={title}
+                      title={
+                        ownMode
+                          ? `${title} Escalates the standing '${ownMode}' halt in place.`
+                          : title
+                      }
                     >
                       {modeLabel}
                     </button>
-                  ))
-                )}
+                  );
+                })}
               </div>
             </div>
           );
@@ -297,6 +395,7 @@ export function LiveKillSwitchPanel({
         onClose={() => {
           if (!busy) {
             setPending(null);
+            setReason("");
           }
         }}
         title={pendingTitle(pending)}
@@ -322,7 +421,10 @@ export function LiveKillSwitchPanel({
             <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
               <button
                 type="button"
-                onClick={() => setPending(null)}
+                onClick={() => {
+                  setPending(null);
+                  setReason("");
+                }}
                 style={dialogSecondaryBtnStyle}
                 disabled={busy}
               >
@@ -382,7 +484,7 @@ function pendingDescription(
         ? " It also cancels every working order on this scope."
         : "";
   return (
-    `Halt ${scopeLabel} in '${pending.mode}' mode.${consequence} The halt is ` +
+    `Halt ${scopeLabel} (${pending.scope}) in '${pending.mode}' mode.${consequence} The halt is ` +
     `persisted and the daemon enforces it on every tick, across restarts.`
   );
 }
@@ -404,6 +506,16 @@ const haltedChipStyle: React.CSSProperties = {
   border: "1px solid rgba(248, 113, 113, 0.5)",
   background: "rgba(248, 113, 113, 0.18)",
   color: "#fecaca",
+  letterSpacing: "0.04em",
+};
+
+const staleChipStyle: React.CSSProperties = {
+  fontSize: "0.68rem",
+  borderRadius: "999px",
+  padding: "3px 8px",
+  border: "1px solid rgba(234, 179, 8, 0.5)",
+  background: "rgba(234, 179, 8, 0.16)",
+  color: "#fde68a",
   letterSpacing: "0.04em",
 };
 
