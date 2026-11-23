@@ -10,7 +10,6 @@ import {
   getLiveBalances,
   getLiveDashboard,
   getLiveDeployments,
-  getLiveKillSwitch,
   getLivePositions,
   getSignalProcessors,
   getLiveStats,
@@ -26,6 +25,7 @@ import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
 import { useLiveAccountsStream } from "../hooks/liveStreams";
+import { useLiveKillSwitch } from "../hooks/useLiveKillSwitch";
 import { useDebouncedCallback } from "../hooks/useDebouncedValue";
 import type {
   LiveAccount,
@@ -34,7 +34,6 @@ import type {
   LiveDashboardResponse,
   LiveDeploymentConfig,
   LiveDeploymentStatus,
-  LiveKillSwitchState,
   LiveTradeSlippage,
   SignalProcessorOption,
   Service,
@@ -306,10 +305,17 @@ export function LiveHubPage() {
   const [cards, setCards] = useState<DeploymentCard[]>([]);
   const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
   const [dashboard, setDashboard] = useState<LiveDashboardResponse | null>(null);
-  const [killSwitch, setKillSwitch] = useState<LiveKillSwitchState | null>(null);
-  const [killSwitchError, setKillSwitchError] = useState("");
-  const [killSwitchStale, setKillSwitchStale] = useState(false);
-  const [killSwitchReadAt, setKillSwitchReadAt] = useState<string | null>(null);
+  // The kill-switch state reads on its own mount effect and timer (see the
+  // hook): it must keep refreshing even when the accounts/deployments fetch
+  // below fails, and a halt written elsewhere still surfaces without waiting
+  // for account-stream traffic.
+  const {
+    state: killSwitch,
+    error: killSwitchError,
+    stale: killSwitchStale,
+    readAt: killSwitchReadAt,
+    onStateChange: handleKillSwitchStateChange,
+  } = useLiveKillSwitch();
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -357,23 +363,6 @@ export function LiveHubPage() {
         void getLiveDashboard()
           .then(setDashboard)
           .catch(() => setDashboard(null));
-        // The kill-switch state is a single read the daemon enforces; a failure
-        // here must not take the deployments view down with it, so it resolves
-        // on its own and reports through the panel instead of `error`.
-        void getLiveKillSwitch()
-          .then((payload) => {
-            setKillSwitch(payload);
-            setKillSwitchError("");
-            setKillSwitchStale(false);
-            setKillSwitchReadAt(new Date().toISOString());
-          })
-          .catch(() => {
-            // A failed refresh must not leave the last good state rendering as
-            // current: mark it stale so the panel shows "last known" instead of
-            // a fresh-looking "Trading allowed".
-            setKillSwitchError("Could not load the kill-switch state.");
-            setKillSwitchStale(true);
-          });
         const statsEntries = await Promise.all(
           accountPayload.map(async (account) => {
             const [statsResult, balancesResult, positionsResult] = await Promise.allSettled([
@@ -1328,13 +1317,7 @@ export function LiveHubPage() {
         stale={killSwitchStale}
         staleSince={killSwitchReadAt}
         accounts={accounts}
-        onStateChange={(next) => {
-          // A halt/resume write returns the server's read-back state, which is
-          // a fresh read: it clears the stale mark a failed poll left behind.
-          setKillSwitch(next);
-          setKillSwitchStale(false);
-          setKillSwitchReadAt(new Date().toISOString());
-        }}
+        onStateChange={handleKillSwitchStateChange}
       />
 
       {loading && (

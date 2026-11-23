@@ -7,7 +7,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { build, type Plugin } from "esbuild";
 import { JSDOM } from "jsdom";
 import { act, createElement, type ComponentType } from "react";
-import { createRoot } from "react-dom/client";
 
 import type { LiveAccount, LiveKillSwitchState } from "../src/api/types";
 
@@ -148,6 +147,12 @@ for (const key of [
 globalThis.window = window;
 globalThis.document = window.document;
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+// react-dom must be imported AFTER the DOM globals exist: it decides at module
+// init whether `input` events are supported (canUseDOM), and without them it
+// falls back to the IE propertychange path where onChange can never fire -
+// which would make typeReason() a silent no-op.
+const { createRoot } = await import("react-dom/client");
 
 // ── fixtures and helpers ─────────────────────────────────────────────────────
 
@@ -352,6 +357,42 @@ test("an unreadable state still offers halt buttons and hides Resume", async () 
   assert.doesNotMatch(container.textContent ?? "", /Trading allowed/);
 });
 
+test("an unreadable state with partial halts hides Resume but keeps escalation", async () => {
+  // The server reports readable:false WITH the halts it could still see
+  // (live_runner/kill_switch.py). A halted row must then offer only the
+  // stricter escalation modes - Resume would claim a lift the unreadable
+  // state cannot confirm.
+  await renderPanel({
+    state: killSwitchState({
+      readable: false,
+      unreadable_reason: "db down",
+      halts: [{ scope: "acc-1", mode: "entries" }],
+      halt_details: [
+        {
+          scope: "acc-1",
+          mode: "entries",
+          halted_at: "2026-11-23T10:00:00+00:00",
+          halted_by: "operator",
+          reason: "",
+          history_available: true,
+        },
+      ],
+    }),
+    accounts: [ACCOUNT],
+  });
+
+  assert.match(container.textContent ?? "", /STATE UNREADABLE - FAIL CLOSED/);
+  assert.deepEqual(buttonLabels("acc-1").sort(), [
+    "Halt + flatten",
+    "Halt + orders",
+  ]);
+  assert.equal(
+    row("acc-1").textContent?.includes("Resume"),
+    false,
+    "Resume must not render while the state is unreadable, even on a halted row",
+  );
+});
+
 // ── stale state (should-fix: a failed refresh is not "Trading allowed") ──────
 
 test("a stale state marks rows last-known and disables Resume", async () => {
@@ -436,6 +477,27 @@ test("flatten goes through the dialog and echoes the scope", async () => {
     (call.options as Record<string, unknown>).confirmedScope,
     "acc-1",
     "the confirmed halt must echo the scope the server demands",
+  );
+});
+
+test("the one-click entries halt never carries a dialog reason", async () => {
+  // `reason` state is only non-empty while a halt dialog is open, and every
+  // close path resets it - so the entries path must not read it at all. The
+  // click below lands while the orders dialog is still open (jsdom does not
+  // hit-test the modal overlay): if requestHalt ever forwards `reason`
+  // instead of "", this pins it.
+  await renderPanel({ accounts: [ACCOUNT] });
+
+  await click(findButton("acc-1", "Halt + orders"));
+  await typeReason("typed for orders, not entries");
+  await click(findButton("acc-1", "Halt entries"));
+
+  const entriesCall = globalThis.__ksApiCalls.find((call) => call.mode === "entries");
+  assert.ok(entriesCall, "expected an entries halt call");
+  assert.equal(
+    ((entriesCall.options as Record<string, unknown>).reason as string).trim(),
+    "",
+    "the one-click entries halt must send an empty reason",
   );
 });
 
