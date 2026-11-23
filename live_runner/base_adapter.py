@@ -469,6 +469,22 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
 
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        """The broker position id that ``entry_signal_id``'s order opened (#382).
+
+        Per-lot exits name the entry signal they close; on a hedging broker
+        each entry is its own position, so the close must be pinned to that
+        position rather than sized off an ambiguous book. Adapters whose
+        positions carry no addressable id (netting books) return ``None`` and
+        the caller sizes the close off the single symbol position as before.
+        Implementations must return ``None`` only when no open position
+        resolves - never guess - and may raise when the lookup itself is
+        unreadable, which fails the exit closed.
+        """
+        return None
+
     async def get_max_leverage(self, symbol: str) -> float | None:
         """The broker's maximum leverage for this account and ``symbol``.
 

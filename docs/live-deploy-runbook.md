@@ -367,22 +367,29 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   engine uses for sizing). Live never runs unprotected.
 - Entries per symbol are capped by `settings["internal_max_open_per_symbol"]`
   (falling back to a same-named `STRATEGY_META` parameter): **default 1 open
-  position per deployment+symbol**. Only `1` is accepted today — N>1 is not
-  supported end-to-end (per-position sizing, protection and exits on the
-  qty-netted live ledger are unresolved; maintainer decision 2026-11-22:
-  N=1, N>1 is #382), so any other value fails closed: **entries are disabled
-  for the deployment but exits keep flowing** — a bad cap must never
-  suppress an exit on an open position. Open positions are counted from the
-  deployment's own persisted ledger with oldest-first FIFO attribution of
-  reducing fills; an entry with no fills counts only while the broker still
-  lists its order as working or holds a non-zero position in the symbol
-  (a filled-but-unbooked entry is not working, so the position is what
-  proves it open), so a canceled or expired unfilled order does not lock
-  the symbol. The count is updated within a pass so same-pass signals
-  cannot exceed the cap, and the deployment total is capped at the engine
-  maximum of 5. If the ledger, the broker's working-order list or its
-  positions cannot be read, entries fail closed the same way — exits still
-  evaluate.
+  position per deployment+symbol**. Integer values `1` through
+  `TRADE_ENGINE_MAX_POSITIONS` (5) are accepted (#382); each entry is an
+  independent lot with its own persisted fills, bracket, stop and TP. A
+  strategy exit closes **every** open lot for the deployment+symbol: when
+  more than one filled lot is open the runner emits one targeted exit per
+  lot (`exit_target_signal_id` names the entry it closes), so a hedging
+  broker can pin each close to the position its entry opened and a netting
+  broker still nets the aggregate. Anything else — 0, negatives,
+  non-integers, booleans, or values above 5 — fails closed: **entries are
+  disabled for the deployment but exits keep flowing** — a bad cap must
+  never suppress an exit on an open position. Open positions are counted
+  from the deployment's own persisted ledger with oldest-first FIFO
+  attribution of reducing fills; an entry with no fills counts only while
+  the broker still lists its order as working or holds a non-zero position
+  in the symbol (a filled-but-unbooked entry is not working, so the
+  position is what proves it open), so a canceled or expired unfilled
+  order does not lock the symbol. The count is updated within a pass so
+  same-pass signals cannot exceed the cap, and the deployment total is
+  capped at the engine maximum of 5. If the ledger, the broker's
+  working-order list or its positions cannot be read, entries fail closed
+  the same way — exits still evaluate; if the per-lot ledger cannot be
+  read, exits fall back to a single untargeted close (a hedging broker
+  then refuses the ambiguous close rather than guess).
   A same-bar reversal (exit + new entry on one bar) emits the exit but the
   entry waits one bar: the closing position still counts against the cap
   until the next evaluation.

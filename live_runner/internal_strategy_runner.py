@@ -74,17 +74,21 @@ Risk-policy notes (maintainer decision 2026-11-22):
   multi-level ladder: the live bracket carries one full-size TP.
 * Entries per symbol are capped by ``internal_max_open_per_symbol``
   (deployment ``settings``, falling back to a same-named ``STRATEGY_META``
-  parameter): default **1 open position per deployment and symbol**. Only 1
-  is accepted today — N>1 is not supported end-to-end (per-position sizing,
-  protection and exits on the qty-netted live ledger are unresolved;
-  maintainer decision 2026-11-22: N=1, N>1 is #382) and any other value
-  fails closed. Open
+  parameter): default **1 open position per deployment and symbol**. Values
+  1..``TRADE_ENGINE_MAX_POSITIONS`` are accepted (#382): each entry signal is
+  one position lot with its own persisted fills, its own bracket (stop/TP) at
+  the broker, and its own slice of the deployment ledger. A strategy ``exits``
+  signal closes **every** open lot of that deployment and symbol — the same
+  all-positions close the native engine performs — by emitting one targeted
+  exit intent per filled lot when more than one is open, each carrying the
+  entry signal it closes (``exit_target_signal_id``). When the cap or the
+  ledger cannot be read, entries are disabled for the deployment while exits
+  keep flowing (a single untargeted exit intent, sized by the shared
+  chokepoint). Open
   positions are counted from the deployment's own persisted ledger —
   filled residuals allocated FIFO plus unfilled entries the broker still
   lists as working or holds a non-zero position for — and the total is
   capped at ``TRADE_ENGINE_MAX_POSITIONS``.
-  When the cap or the ledger cannot be read, entries are disabled for the
-  deployment while exits keep flowing.
 * **Session-bound symbols** (everything the venue calendar does not resolve
   to 24/7) are only *evaluated* while the venue is open, using
   ``shared.venue_calendar``. Only actionability is session-gated, never the
@@ -142,6 +146,7 @@ from shared.constants import normalize_symbols, normalize_timeframe
 from shared.database import (
     DATA_DIR,
     list_live_deployment_open_entry_counts_by_symbol,
+    list_live_deployment_open_position_lots,
     list_live_deployment_unfilled_entry_order_refs,
 )
 from shared.logging import get_logger
@@ -168,9 +173,8 @@ SUBMIT_FEED_LAG_CAP_SECONDS = 120.0
 #: until an operator sets it — maintainer decision 2026-11-22 rollout rule.
 INTERNAL_RUNNER_ENABLED_KEY = "internal_runner_enabled"
 #: Per-symbol open-entry cap (deployment ``settings``, falling back to a
-#: same-named ``STRATEGY_META`` parameter). Only 1 is accepted: N>1 per-symbol
-#: entries is not supported end-to-end yet (maintainer decision 2026-11-22:
-#: N=1; N>1 is #382) and any other value fails closed.
+#: same-named ``STRATEGY_META`` parameter). 1..TRADE_ENGINE_MAX_POSITIONS are
+#: accepted (#382); anything else fails closed.
 MAX_OPEN_PER_SYMBOL_KEY = "internal_max_open_per_symbol"
 #: How far ahead the venue calendar is asked to find the next session open.
 SESSION_LOOKAHEAD_DAYS = 14
@@ -263,11 +267,10 @@ def _max_open_per_symbol(
     """Configured per-symbol open-entry cap.
 
     Deployment ``settings`` win; a same-named ``STRATEGY_META`` parameter is
-    the per-strategy fallback. Default 1. Only 1 is accepted: N>1 per-symbol
-    entries is not supported end-to-end on the qty-netted live ledger
-    (maintainer decision 2026-11-22: N=1; N>1 is #382) — anything else, or
-    an unreadable value, fails closed (the caller disables entries while
-    exits keep flowing).
+    the per-strategy fallback. Default 1. Values 1..``TRADE_ENGINE_MAX_POSITIONS``
+    are accepted (#382); anything else — including 0, negatives, non-integers
+    and values above the engine maximum — fails closed (the caller disables
+    entries while exits keep flowing).
     """
     settings = deployment.settings or {}
     if MAX_OPEN_PER_SYMBOL_KEY in settings:
@@ -287,12 +290,11 @@ def _max_open_per_symbol(
             f"{MAX_OPEN_PER_SYMBOL_KEY}={raw!r} is not an integer"
         )
     value = int(number)
-    if value != 1:
+    if value < 1 or value > TRADE_ENGINE_MAX_POSITIONS:
         raise ValueError(
-            f"{MAX_OPEN_PER_SYMBOL_KEY}={value} is not supported: only 1 open "
-            "entry per deployment and symbol is implemented end-to-end "
-            "(per-position sizing, protection and exits on the netted live "
-            "ledger; maintainer decision 2026-11-22: N=1, N>1 is #382)"
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={value} is outside "
+            f"1..{TRADE_ENGINE_MAX_POSITIONS}; the per-symbol open-entry cap "
+            "must be a positive integer no larger than the engine maximum"
         )
     return value
 
@@ -763,6 +765,7 @@ class InternalStrategyRunner:
         moment: datetime,
         open_entries: dict[str, int],
         max_open_per_symbol: int,
+        open_lots: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         state_key = (str(deployment.id), symbol)
         calendar = self._symbol_calendar(adapter, symbol)
@@ -1004,25 +1007,64 @@ class InternalStrategyRunner:
                 "internal_strategy": deployment.strategy_name,
             }
             if bool(exits.iloc[position]):
-                exit_metadata = dict(common_metadata)
-                exit_metadata.update(exit_intent_metadata(FULL_EXIT))
-                exit_metadata["idempotency_key"] = _intent_idempotency_key(
-                    deployment, symbol, timeframe, close_time, kind="exit"
-                )
-                intents.append(
-                    (
-                        position,
-                        TradeSignal(
-                            action="sell",
-                            symbol=symbol,
-                            entry_price=close_price,
-                            stop_loss=None,
-                            take_profit=None,
-                            timeframe=timeframe,
-                            metadata=exit_metadata,
-                        ),
+                lots = list((open_lots or {}).get(symbol.upper(), ()))
+                if len(lots) > 1:
+                    # #382: the strategy's exits signal closes every open
+                    # position of this deployment and symbol — the same
+                    # all-positions close the native engine performs. Emit one
+                    # targeted exit per filled lot so each order names the
+                    # entry it closes (stable idempotency per lot) and a
+                    # hedging broker can address the right position. Lots that
+                    # are still unfilled working orders have no position to
+                    # close and are not listed here.
+                    for lot in lots:
+                        target_signal_id = str(lot.get("signal_id") or "")
+                        if not target_signal_id:
+                            continue
+                        exit_metadata = dict(common_metadata)
+                        exit_metadata.update(exit_intent_metadata(FULL_EXIT))
+                        exit_metadata["exit_target_signal_id"] = target_signal_id
+                        exit_metadata["idempotency_key"] = _intent_idempotency_key(
+                            deployment,
+                            symbol,
+                            timeframe,
+                            close_time,
+                            kind=f"exit:{target_signal_id}",
+                        )
+                        intents.append(
+                            (
+                                position,
+                                TradeSignal(
+                                    action="sell",
+                                    symbol=symbol,
+                                    entry_price=close_price,
+                                    stop_loss=None,
+                                    take_profit=None,
+                                    timeframe=timeframe,
+                                    metadata=exit_metadata,
+                                ),
+                            )
+                        )
+                else:
+                    exit_metadata = dict(common_metadata)
+                    exit_metadata.update(exit_intent_metadata(FULL_EXIT))
+                    exit_metadata["idempotency_key"] = _intent_idempotency_key(
+                        deployment, symbol, timeframe, close_time, kind="exit"
                     )
-                )
+                    intents.append(
+                        (
+                            position,
+                            TradeSignal(
+                                action="sell",
+                                symbol=symbol,
+                                entry_price=close_price,
+                                stop_loss=None,
+                                take_profit=None,
+                                timeframe=timeframe,
+                                metadata=exit_metadata,
+                            ),
+                        )
+                    )
             # ``max_open_per_symbol == 0`` means entries are disabled for this
             # deployment (cap or ledger unreadable): exits still flow, entries
             # do not — the fail-closed direction for new exposure.
@@ -1305,6 +1347,7 @@ class InternalStrategyRunner:
                 )
                 max_open_per_symbol = 0
             open_entries: dict[str, int] = {}
+            open_lots: dict[str, list[dict[str, Any]]] | None = None
             if max_open_per_symbol > 0:
                 try:
                     unfilled_refs = await asyncio.to_thread(
@@ -1371,6 +1414,41 @@ class InternalStrategyRunner:
                             error=str(exc),
                         )
                         max_open_per_symbol = 0
+            # #382: when more than one position lot may be open for a symbol -
+            # or when entries are disabled so the counts were never read - a
+            # strategy exit must close every lot: one targeted exit per filled
+            # entry so each order names its target. When the cap is usable the
+            # lots are only needed for symbols the count already reports as
+            # multi-position; if the lots read fails the exit falls back to
+            # the single untargeted intent (the hedging adapter then fails
+            # closed rather than guess, and the netting adapter still closes
+            # the aggregate).
+            need_lots = max_open_per_symbol == 0 or any(
+                count > 1 for count in open_entries.values()
+            )
+            if need_lots:
+                open_lots = {}
+                for symbol in symbols:
+                    try:
+                        open_lots[str(symbol).upper()] = await asyncio.to_thread(
+                            list_live_deployment_open_position_lots,
+                            deployment_id,
+                            symbol,
+                        )
+                    except Exception as exc:  # except-kind: money-decision
+                        self._report_once(
+                            deployment_id,
+                            "position_lots",
+                            "Internal deployment position-lot ledger is "
+                            "unreadable; exits fall back to untargeted close "
+                            "intents (hedging brokers fail closed on "
+                            "ambiguity)",
+                            deployment_id=deployment_id,
+                            symbol=str(symbol),
+                            error=str(exc),
+                        )
+                        open_lots = None
+                        break
             for symbol in symbols:
                 # Fresh wall-clock per symbol: a pass over many symbols must
                 # not judge the last ones by the pass's start time.
@@ -1386,6 +1464,7 @@ class InternalStrategyRunner:
                         moment=symbol_moment,
                         open_entries=open_entries,
                         max_open_per_symbol=max_open_per_symbol,
+                        open_lots=open_lots,
                     )
                 except asyncio.CancelledError:
                     raise

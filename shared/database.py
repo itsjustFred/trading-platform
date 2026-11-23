@@ -4638,6 +4638,107 @@ def list_live_deployment_open_entry_counts_by_symbol(
     return counts
 
 
+def list_live_deployment_open_position_lots(
+    deployment_id: str,
+    symbol: str,
+) -> list[dict[str, Any]]:
+    """The deployment's open position lots for ``symbol`` (#382).
+
+    One lot is one persisted *entry* signal whose residual filled quantity —
+    its fills minus the deployment's reducing fills for the symbol, allocated
+    FIFO exactly as
+    :func:`list_live_deployment_open_entry_counts_by_symbol` does — is still
+    above ``_EXIT_FILL_TOLERANCE``. FIFO attribution is an approximation (a
+    deployment-level exit is not tied to one entry), but it is the same
+    approximation the open-entry count uses, so the lots returned here always
+    sum to the count that function reports for the symbol.
+
+    Only *filled* residuals are returned: an unfilled entry is a working
+    order, not a position, and there is nothing for an exit to close. Each
+    row carries ``signal_id`` (the entry's stable identity — also the broker
+    client order id), ``symbol``, ``action`` (``buy``/``sell``, the side the
+    lot opens), ``qty`` (the residual quantity, always positive) and
+    ``timestamp``. Flat symbols return an empty list.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_deployment_id or not normalized_symbol:
+        raise ValueError("A deployment id and a symbol are required for position lots")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .where(func.upper(LiveSignalModel.symbol) == normalized_symbol)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    reducing_qty = 0.0
+    entries: list[dict[str, Any]] = []
+    for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            reducing_qty += max(0.0, filled_by_signal.get(str(signal_id), 0.0))
+        else:
+            entries.append(
+                {
+                    "signal_id": str(signal_id),
+                    "symbol": str(sig_symbol or "").strip().upper(),
+                    "timestamp": timestamp,
+                    "action": str(action or "").strip().lower(),
+                    "broker_order_id": str(broker_order_id or ""),
+                    "filled_qty": max(0.0, filled_by_signal.get(str(signal_id), 0.0)),
+                }
+            )
+    entries.sort(
+        key=lambda item: (
+            item["timestamp"] is None,
+            item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+            item["signal_id"],
+        )
+    )
+    lots: list[dict[str, Any]] = []
+    remaining_reduction = reducing_qty
+    for entry in entries:
+        entry_qty = entry["filled_qty"]
+        closed = min(entry_qty, remaining_reduction)
+        remaining_reduction -= closed
+        residual = entry_qty - closed
+        if residual > _EXIT_FILL_TOLERANCE:
+            lots.append(
+                {
+                    "signal_id": entry["signal_id"],
+                    "symbol": entry["symbol"],
+                    "action": entry["action"],
+                    "qty": residual,
+                    "timestamp": entry["timestamp"],
+                    "broker_order_id": entry["broker_order_id"],
+                }
+            )
+    return lots
+
+
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
     """Every deployment's signed net filled quantity for ``symbol`` on one account.
 
@@ -4894,6 +4995,9 @@ def _list_unfilled_exit_orders(
                 "requested_qty": requested_qty,
                 "filled_qty": filled_qty,
                 "action": str(action or "").strip().lower(),
+                # ``exit_target_signal_id`` (#382) lets the in-flight guard
+                # tell a per-lot exit of one position from a close of another.
+                "metadata": metadata,
             }
         )
     return pending

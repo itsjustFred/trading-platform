@@ -11,6 +11,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from shared.models import LiveExecution, LiveSignal
 
 BASE_TS = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
@@ -395,6 +397,108 @@ def test_held_position_leaves_equity_symbols_untouched(isolated_db) -> None:
 
     assert _counts(database, mine, set(), held={"BRK.B"}) == {"BRK.B": 1}
     assert _counts(database, mine, set(), held={"BRKB"}) == {}
+
+
+def _lots(database, deployment_id: str, symbol: str = "AAPL") -> list[dict]:
+    return database.list_live_deployment_open_position_lots(deployment_id, symbol)
+
+
+def test_position_lots_lists_each_open_entry(isolated_db) -> None:
+    """#382: every filled entry with residual quantity is its own lot,
+    carrying the entry's signal id - the identity per-lot exits target."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    first = _entry(database, mine, filled_qty=4.0, timestamp=BASE_TS)
+    second = _entry(
+        database, mine, filled_qty=6.0, timestamp=BASE_TS + timedelta(minutes=10)
+    )
+
+    lots = _lots(database, mine)
+    assert [lot["signal_id"] for lot in lots] == [first, second]
+    assert [lot["qty"] for lot in lots] == [4.0, 6.0]
+    assert all(lot["action"] == "buy" for lot in lots)
+    assert all(lot["symbol"] == "AAPL" for lot in lots)
+
+
+def test_position_lots_apply_fifo_reduction(isolated_db) -> None:
+    """#382: reducing fills close the oldest lot first, exactly like the
+    open-entry count - the lots always sum to what the count reports."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    older = _entry(database, mine, filled_qty=10.0, timestamp=BASE_TS)
+    newer = _entry(
+        database, mine, filled_qty=5.0, timestamp=BASE_TS + timedelta(minutes=10)
+    )
+    # 12 reducing: wipes the 10-share oldest lot, takes 2 of the newer one.
+    _exit(
+        database, mine, filled_qty=12.0,
+        timestamp=BASE_TS + timedelta(minutes=20),
+    )
+
+    lots = _lots(database, mine)
+    assert [lot["signal_id"] for lot in lots] == [newer]
+    assert lots[0]["qty"] == pytest.approx(3.0)
+    assert older not in {lot["signal_id"] for lot in lots}
+
+
+def test_position_lots_exclude_unfilled_and_closed_entries(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    _entry(database, mine, filled_qty=None, broker_order_id="bo-working")
+    _entry(database, mine, symbol="MSFT", filled_qty=2.0)
+    closed = _entry(database, mine, symbol="TSLA", filled_qty=3.0)
+    _exit(
+        database, mine, symbol="TSLA", filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=5),
+    )
+
+    assert [lot["signal_id"] for lot in _lots(database, mine)] == []
+    msft = _lots(database, mine, "MSFT")
+    assert len(msft) == 1 and msft[0]["qty"] == pytest.approx(2.0)
+    assert closed not in {lot["signal_id"] for lot in msft}
+
+
+def test_position_lots_preserve_short_side(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    short = _entry(database, mine, action="sell", filled_qty=8.0)
+
+    lots = _lots(database, mine)
+    assert [lot["signal_id"] for lot in lots] == [short]
+    assert lots[0]["action"] == "sell"
+    assert lots[0]["qty"] == pytest.approx(8.0)
+
+
+def test_position_lots_are_scoped_to_deployment_and_symbol(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    seed_live_deployments(database, [mine, other])
+
+    mine_lot = _entry(database, mine, filled_qty=4.0)
+    _entry(database, other, filled_qty=9.0)
+    _entry(database, mine, symbol="MSFT", filled_qty=2.0)
+
+    assert [lot["signal_id"] for lot in _lots(database, mine)] == [mine_lot]
+    assert _lots(database, other)[0]["qty"] == pytest.approx(9.0)
 
 
 def test_unfilled_entry_refs_cover_both_id_kinds(isolated_db) -> None:

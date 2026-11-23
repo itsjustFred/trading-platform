@@ -1524,6 +1524,48 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             )
         return position_ids[0]
 
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        """The open position ``entry_signal_id``'s order opened (#382).
+
+        Each candidate position's orders are read and the opening order's
+        ``clientOrderId`` (the persisted signal id, account-validated by
+        :meth:`_signal_id_for_position_order`) decides the match. ``None``
+        means no open position resolves to that entry - the caller then
+        fails closed on a multi-position book. An unreadable order list or a
+        signal matching several positions raises: guessing which lot a close
+        belongs to is exactly what this method exists to prevent.
+        """
+        upper = str(symbol or "").strip().upper()
+        position_ids = self._position_ids_by_symbol.get(upper, ())
+        if not position_ids:
+            return None
+        wanted = str(entry_signal_id or "").strip()
+        if not wanted:
+            return None
+        matches: list[int] = []
+        for position_id in position_ids:
+            orders = await self._fetch_position_orders(position_id)
+            if orders is None:
+                raise ValueError(
+                    f"cTrader position {position_id} order list is unreadable; "
+                    "cannot resolve the exit target for "
+                    f"{wanted} on {upper}."
+                )
+            for order in getattr(orders, "order", []) or []:
+                if bool(getattr(order, "closingOrder", False)):
+                    continue
+                if await self._signal_id_for_position_order(order) == wanted:
+                    matches.append(position_id)
+                    break
+        if len(matches) > 1:
+            raise ValueError(
+                f"cTrader entry {wanted} matches several open positions on "
+                f"{upper} ({matches}); refusing to guess the exit target."
+            )
+        return matches[0] if matches else None
+
     def _requested_exit_position_id(self, metadata: Mapping[str, Any]) -> int | None:
         raw_position_id = metadata.get("position_id")
         raw_position_ids = metadata.get("position_ids")
