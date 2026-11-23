@@ -451,6 +451,107 @@ def test_portfolio_rename_handler_rejects_traversal_id(security_client, tmp_path
     assert secret.read_text(encoding="utf-8") == original
 
 
+def test_portfolio_rename_missing_id_returns_404_and_creates_no_file(
+    security_client, tmp_path
+):
+    """Rename of an id with no portfolio file or DB record 404s and writes nothing."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    missing_id = f"missing-{uuid.uuid4().hex}"
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                missing_id,
+                viewer_app_module.NameUpdateRequest(name="new-name"),
+            )
+        )
+    assert exc_info.value.status_code == 404
+    assert list(portfolios_dir.glob("*.json")) == []
+
+
+def test_portfolio_rename_updates_enumerated_portfolio_file(
+    security_client, tmp_path, monkeypatch
+):
+    """The rename write target comes from the directory listing, and the
+    updated JSON is persisted under the same enumerated path."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    portfolio_id = f"pf-{uuid.uuid4().hex[:12]}"
+    target = portfolios_dir / f"{portfolio_id}.json"
+    target.write_text(
+        json.dumps({"id": portfolio_id, "name": "old-name", "components": []}),
+        encoding="utf-8",
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    result = asyncio.run(
+        viewer_app_module.rename_portfolio(
+            portfolio_id,
+            viewer_app_module.NameUpdateRequest(name="new-name"),
+        )
+    )
+
+    assert result == {"id": portfolio_id, "name": "new-name", "status": "updated"}
+    assert len(saved) == 1
+    rewritten = json.loads(target.read_text(encoding="utf-8"))
+    assert rewritten["name"] == "new-name"
+    assert rewritten["id"] == portfolio_id
+
+
+def test_portfolio_rename_db_only_portfolio_skips_file_write(
+    security_client, tmp_path, monkeypatch
+):
+    """A portfolio that exists only as a DB record still renames: the record
+    save persists it and no new JSON file is created for it."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    portfolio_id = f"dbonly-{uuid.uuid4().hex[:12]}"
+    record_payload = {
+        "id": portfolio_id,
+        "name": "db-name",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "account_capital": 100000.0,
+        "components": [],
+        "combined_stats": {},
+        "combined_equity": [],
+        "trades": [],
+    }
+    monkeypatch.setattr(
+        viewer_app_module, "load_portfolio_record", lambda _id: record_payload
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    result = asyncio.run(
+        viewer_app_module.rename_portfolio(
+            portfolio_id,
+            viewer_app_module.NameUpdateRequest(name="renamed"),
+        )
+    )
+
+    assert result["status"] == "updated"
+    assert len(saved) == 1
+    assert list(portfolios_dir.glob("*.json")) == []
+
+
 # ---------------------------------------------------------------------------
 # Seam 6: CSV signal replay containment
 # ---------------------------------------------------------------------------

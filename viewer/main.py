@@ -12818,6 +12818,26 @@ async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     return payload
 
 
+def _existing_portfolio_json_path(portfolio_id: str) -> Path | None:
+    """The on-disk ``{id}.json`` for an already-validated portfolio id.
+
+    The target is found by enumerating ``PORTFOLIOS_DIR`` and matching the
+    file stem, so the returned ``Path`` is a directory-listing fact rather
+    than a join of client-supplied input — the write sink never receives a
+    tainted path (SonarCloud pythonsecurity:S2083). Symlinked entries are
+    skipped: the read side (``_contained_asset_path``) already refuses them,
+    so a symlink must not become writable through the rename path.
+    """
+    base = PORTFOLIOS_DIR.resolve()
+    for path in PORTFOLIOS_DIR.glob("*.json"):
+        if path.stem != portfolio_id or path.is_symlink():
+            continue
+        resolved = path.resolve()
+        if resolved.parent == base:
+            return resolved
+    return None
+
+
 @app.patch(
     "/api/portfolios/{portfolio_id}",
     responses={
@@ -12836,20 +12856,24 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     normalized_portfolio = _normalize_portfolio_payload(portfolio_payload)
     normalized_portfolio["name"] = updated_name
 
-    # Resolve and containment-check before the DB write so an unsafe id
-    # cannot half-apply — the same ordering as create_portfolio. The
-    # shared helper is the single implementation of the id→path
-    # containment contract (#344); SonarCloud's S2083 on the write below
-    # is a known false positive (the flagged flow starts at the read in
-    # _load_portfolio_payload, which this same helper already contained).
-    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
-    if output_path is None:
+    # Resolve the write target by enumerating PORTFOLIOS_DIR instead of
+    # joining the client-supplied id, so the Path handed to write_text is a
+    # filesystem fact, not a tainted join. The safe-id guard keeps the same
+    # fail-closed ordering as create_portfolio: an id that cannot name a
+    # file inside PORTFOLIOS_DIR 404s before the DB write. A portfolio that
+    # exists only as a DB record has no JSON to update — the record save
+    # below already persists the rename, so the file write is skipped
+    # rather than 404ing a rename that succeeded.
+    safe_id = _safe_asset_id(portfolio_id)
+    if not safe_id:
         raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
+    output_path = _existing_portfolio_json_path(safe_id)
 
     try:
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+        if output_path is not None:
+            output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
         logger.exception(
             "Failed to rename portfolio",
