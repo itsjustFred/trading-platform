@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -500,6 +501,22 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
 
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        """The broker position id that ``entry_signal_id``'s order opened (#382).
+
+        Per-lot exits name the entry signal they close; on a hedging broker
+        each entry is its own position, so the close must be pinned to that
+        position rather than sized off an ambiguous book. Adapters whose
+        positions carry no addressable id (netting books) return ``None`` and
+        the caller sizes the close off the single symbol position as before.
+        Implementations must return ``None`` only when no open position
+        resolves - never guess - and may raise when the lookup itself is
+        unreadable, which fails the exit closed.
+        """
+        return None
+
     async def get_max_leverage(self, symbol: str) -> float | None:
         """The broker's maximum leverage for this account and ``symbol``.
 
@@ -621,6 +638,25 @@ class BaseLiveAdapter(ABC):
         silent no-op for "nothing was open".
         """
         raise NotImplementedError(f"{type(self).__name__} cannot cancel open orders")
+
+    async def cancel_orders(
+        self, order_refs: Collection[str], *, symbol: str
+    ) -> ControlOutcome:
+        """Cancel the working orders ``order_refs`` names on ``symbol``.
+
+        ``order_refs`` carries broker order ids and client order ids (the
+        persisted signal id) of orders the caller owns - the internal
+        strategy runner uses it to retire one deployment's still-working
+        entry orders before a strategy exit (#382). The adapter cancels
+        exactly the working orders it can match on either id, on the named
+        symbol, and nothing else: other deployments' orders and position
+        protections are never touched. Raises NotImplementedError when the
+        broker cannot cancel a named subset, so a caller cannot mistake a
+        silent no-op for "the orders are gone".
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot cancel named orders"
+        )
 
     async def close_all_positions(self) -> ControlOutcome:
         """Flatten every open position for this account.

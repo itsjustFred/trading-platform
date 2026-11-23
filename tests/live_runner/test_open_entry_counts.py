@@ -11,6 +11,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from shared.models import LiveExecution, LiveSignal
 
 BASE_TS = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
@@ -397,6 +399,109 @@ def test_held_position_leaves_equity_symbols_untouched(isolated_db) -> None:
     assert _counts(database, mine, set(), held={"BRKB"}) == {}
 
 
+def _lots(database, deployment_id: str, symbol: str = "AAPL") -> list[dict]:
+    return database.list_live_deployment_open_position_lots(deployment_id, symbol)
+
+
+def test_position_lots_lists_each_open_entry(isolated_db) -> None:
+    """#382: every filled entry with residual quantity is its own lot,
+    carrying the entry's signal id - the identity per-lot exits target."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    first = _entry(database, mine, filled_qty=4.0, timestamp=BASE_TS)
+    second = _entry(
+        database, mine, filled_qty=6.0, timestamp=BASE_TS + timedelta(minutes=10)
+    )
+
+    lots = _lots(database, mine)
+    assert [lot["signal_id"] for lot in lots] == [first, second]
+    assert [lot["qty"] for lot in lots] == [4.0, 6.0]
+    assert all(lot["action"] == "buy" for lot in lots)
+    assert all(lot["symbol"] == "AAPL" for lot in lots)
+
+
+def test_position_lots_apply_fifo_reduction(isolated_db) -> None:
+    """#382: reducing fills close the oldest lot first, exactly like the
+    open-entry count - the lots always sum to what the count reports."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    older = _entry(database, mine, filled_qty=10.0, timestamp=BASE_TS)
+    newer = _entry(
+        database, mine, filled_qty=5.0, timestamp=BASE_TS + timedelta(minutes=10)
+    )
+    # 12 reducing: wipes the 10-share oldest lot, takes 2 of the newer one.
+    _exit(
+        database, mine, filled_qty=12.0,
+        timestamp=BASE_TS + timedelta(minutes=20),
+    )
+
+    lots = _lots(database, mine)
+    assert [lot["signal_id"] for lot in lots] == [newer]
+    assert lots[0]["qty"] == pytest.approx(3.0)
+    assert older not in {lot["signal_id"] for lot in lots}
+
+
+def test_position_lots_exclude_unfilled_and_closed_entries(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    _entry(database, mine, filled_qty=None, broker_order_id="bo-working")
+    _entry(database, mine, symbol="MSFT", filled_qty=2.0)
+    closed = _entry(database, mine, symbol="TSLA", filled_qty=3.0)
+    _exit(
+        database, mine, symbol="TSLA", filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=5),
+    )
+
+    assert [lot["signal_id"] for lot in _lots(database, mine)] == []
+    msft = _lots(database, mine, "MSFT")
+    assert len(msft) == 1
+    assert msft[0]["qty"] == pytest.approx(2.0)
+    assert closed not in {lot["signal_id"] for lot in msft}
+
+
+def test_position_lots_preserve_short_side(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    short = _entry(database, mine, action="sell", filled_qty=8.0)
+
+    lots = _lots(database, mine)
+    assert [lot["signal_id"] for lot in lots] == [short]
+    assert lots[0]["action"] == "sell"
+    assert lots[0]["qty"] == pytest.approx(8.0)
+
+
+def test_position_lots_are_scoped_to_deployment_and_symbol(isolated_db) -> None:
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    seed_live_deployments(database, [mine, other])
+
+    mine_lot = _entry(database, mine, filled_qty=4.0)
+    _entry(database, other, filled_qty=9.0)
+    _entry(database, mine, symbol="MSFT", filled_qty=2.0)
+
+    assert [lot["signal_id"] for lot in _lots(database, mine)] == [mine_lot]
+    assert _lots(database, other)[0]["qty"] == pytest.approx(9.0)
+
+
 def test_unfilled_entry_refs_cover_both_id_kinds(isolated_db) -> None:
     """The refs set carries signal ids and broker order ids of unfilled
     entries only — never exits, broker closes, or filled entries."""
@@ -419,3 +524,167 @@ def test_unfilled_entry_refs_cover_both_id_kinds(isolated_db) -> None:
     assert "bo-open" in refs
     assert filled not in refs
     assert _refs(database, mine).isdisjoint({"bo-exit", "bo-close"})
+
+
+def _targeted_exit(database, deployment_id: str, target: str, *,
+                   filled_qty: float, symbol: str = "AAPL",
+                   timestamp: datetime | None = None) -> str:
+    return _save_signal(
+        database,
+        deployment_id=deployment_id,
+        symbol=symbol,
+        action="sell",
+        filled_qty=filled_qty,
+        timestamp=timestamp,
+        metadata={
+            "exit_only": True,
+            "risk_sizing_mode": "exit_only",
+            "exit_target_signal_id": target,
+        },
+    )
+
+
+def _broker_close(database, deployment_id: str, parent: str, *,
+                  filled_qty: float, symbol: str = "AAPL",
+                  timestamp: datetime | None = None) -> str:
+    return _save_signal(
+        database,
+        deployment_id=deployment_id,
+        symbol=symbol,
+        action="sell",
+        filled_qty=filled_qty,
+        timestamp=timestamp,
+        metadata={
+            "source": "broker_close",
+            "broker_side_close": True,
+            "broker_close_reason": "test_close",
+            "parent_signal_id": parent,
+        },
+    )
+
+
+def test_targeted_exit_reduces_only_the_named_lot(isolated_db) -> None:
+    """#382 blocker: a targeted exit credits the entry it names. FIFO would
+    have shaved the oldest lot instead and left the named one fully open."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    a = _entry(database, mine, filled_qty=5.0, timestamp=BASE_TS)
+    b = _entry(
+        database, mine, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=5),
+    )
+    _targeted_exit(
+        database, mine, b, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=9),
+    )
+
+    lots = {lot["signal_id"]: lot["qty"] for lot in _lots(database, mine)}
+    assert lots == {a: 5.0}
+    assert _counts(database, mine) == {"AAPL": 1}
+
+
+def test_broker_close_reduces_only_the_parent_lot(isolated_db) -> None:
+    """#382 blocker: a broker-side close names its parent entry, so a stop
+    that fires on a younger lot does not eat the oldest one's residual."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    a = _entry(database, mine, filled_qty=5.0, timestamp=BASE_TS)
+    b = _entry(
+        database, mine, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=5),
+    )
+    c = _entry(
+        database, mine, filled_qty=4.0,
+        timestamp=BASE_TS + timedelta(minutes=10),
+    )
+    _broker_close(
+        database, mine, b, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=15),
+    )
+
+    lots = {lot["signal_id"]: lot["qty"] for lot in _lots(database, mine)}
+    assert lots == {a: 5.0, c: 4.0}
+    assert _counts(database, mine) == {"AAPL": 2}
+
+
+def test_unattributed_exit_still_consumes_fifo(isolated_db) -> None:
+    """A deployment-level exit names no lot: FIFO remains the fallback."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    a = _entry(database, mine, filled_qty=5.0, timestamp=BASE_TS)
+    b = _entry(
+        database, mine, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=5),
+    )
+    _exit(
+        database, mine, filled_qty=4.0,
+        timestamp=BASE_TS + timedelta(minutes=9),
+    )
+
+    lots = {lot["signal_id"]: lot["qty"] for lot in _lots(database, mine)}
+    assert lots == {a: pytest.approx(1.0), b: pytest.approx(3.0)}
+    assert _counts(database, mine) == {"AAPL": 2}
+
+
+def test_attributed_reduction_is_deducted_before_fifo(isolated_db) -> None:
+    """The named lot's own closes come off first; the unattributed pool then
+    consumes what remains, oldest first."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    a = _entry(database, mine, filled_qty=5.0, timestamp=BASE_TS)
+    b = _entry(
+        database, mine, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=5),
+    )
+    _targeted_exit(
+        database, mine, a, filled_qty=3.0,
+        timestamp=BASE_TS + timedelta(minutes=9),
+    )
+    _exit(
+        database, mine, filled_qty=4.0,
+        timestamp=BASE_TS + timedelta(minutes=12),
+    )
+
+    # a: 5 - 3 attributed - 2 fifo = 0; b: 3 - 2 fifo = 1.
+    lots = {lot["signal_id"]: lot["qty"] for lot in _lots(database, mine)}
+    assert lots == {b: pytest.approx(1.0)}
+    assert _counts(database, mine) == {"AAPL": 1}
+
+
+def test_unfilled_entry_refs_can_be_narrowed_to_one_symbol(isolated_db) -> None:
+    """#382: a strategy exit retires only the exited symbol's still-working
+    entries, so the refs read takes an optional symbol filter."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    aapl = _entry(database, mine, symbol="AAPL", broker_order_id="bo-aapl")
+    msft = _entry(database, mine, symbol="MSFT", broker_order_id="bo-msft")
+
+    all_refs = _refs(database, mine)
+    aapl_refs = database.list_live_deployment_unfilled_entry_order_refs(
+        mine, "AAPL"
+    )
+
+    assert aapl_refs == {aapl, "bo-aapl"}
+    assert msft not in aapl_refs
+    assert "bo-msft" not in aapl_refs
+    assert aapl_refs < all_refs

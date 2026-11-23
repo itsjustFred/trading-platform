@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -883,6 +883,17 @@ def _classify_deferred_response_timeout(
     return True, seconds
 _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 
+#: ``ProtoOAAccountType`` numbers -> lowercase names. Mirrored here so the
+#: account-type read does not depend on the proto enum object being bound
+#: (tests stub ``_fetch_trader`` without loading the openapi types).
+_CTRADER_ACCOUNT_TYPES = {0: "hedged", 1: "netted", 2: "spread_betting"}
+
+#: Seconds an unreadable ``account_type`` read is negatively cached. Every
+#: runner pass on an ``internal_max_open_per_symbol > 1`` cTrader deployment
+#: asks again; without the window an unreachable broker would cost a full
+#: request timeout on every pass while the refusal already fails closed.
+_ACCOUNT_TYPE_RETRY_SECONDS = 60.0
+
 
 def _reason_to_text(reason: Any) -> str:
     if hasattr(reason, "getErrorMessage"):
@@ -1163,6 +1174,28 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._asset_names: dict[int, str] = {}
         self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
         self._position_ids_by_symbol: dict[str, tuple[int, ...]] = {}
+        # Broker volume per open position id, refreshed by ``get_positions``
+        # alongside ``_position_ids_by_symbol``. The exit-target resolver's
+        # order cache uses it to prove its read is not stale: a cached order
+        # list may never be the proof that pins a lot to a position when the
+        # position's volume has moved since the fetch (#382 maintainer
+        # decision - a netted book's opener set only grows).
+        self._position_volumes: dict[int, int] = {}
+        # #382: position id -> (monotonic timestamp, order list, volume at
+        # fetch) for the exit-target resolver. A per-lot exit fan-out would
+        # otherwise spend one broker round trip per open position *per exit*
+        # inside the account lock; the TTL bounds staleness and the recorded
+        # volume invalidates the entry the moment the position's size moves,
+        # which is the only way a netted position's opener set can change.
+        self._position_orders_cache: dict[int, tuple[float, Any, int | None]] = {}
+        # ``ProtoOAAccountType`` name ("hedged"/"netted"/"spread_betting"),
+        # cached after the first successful ``_fetch_trader`` read. An
+        # unreadable read is negatively cached for
+        # ``_ACCOUNT_TYPE_RETRY_SECONDS`` (monotonic timestamp below) so a
+        # broker outage cannot stall every runner pass; "unknown" is never
+        # pinned permanently - the next read after the window retries.
+        self._account_type: str | None = None
+        self._account_type_unreadable_at: float | None = None
         self._order_id_to_signal_id: dict[int, str] = {}
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
@@ -1750,6 +1783,74 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 "refusing to submit an unaddressed close."
             )
         return position_ids[0]
+
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        """The open position ``entry_signal_id``'s order opened (#382).
+
+        Each candidate position's orders are read and the opening order's
+        ``clientOrderId`` (the persisted signal id, account-validated by
+        :meth:`_signal_id_for_position_order`) decides the match. ``None``
+        means no open position resolves to that entry - the caller then
+        fails closed on a multi-position book. An unreadable order list or a
+        signal matching several positions raises: guessing which lot a close
+        belongs to is exactly what this method exists to prevent.
+        """
+        upper = str(symbol or "").strip().upper()
+        position_ids = self._position_ids_by_symbol.get(upper, ())
+        if not position_ids:
+            return None
+        wanted = str(entry_signal_id or "").strip()
+        if not wanted:
+            return None
+        matches = await self._entry_matching_position_ids(position_ids, wanted, upper)
+        if len(matches) > 1:
+            raise ValueError(
+                f"cTrader entry {wanted} matches several open positions on "
+                f"{upper} ({matches}); refusing to guess the exit target."
+            )
+        return matches[0] if matches else None
+
+    async def _entry_matching_position_ids(
+        self, position_ids: tuple[int, ...], wanted: str, upper: str
+    ) -> list[int]:
+        """The positions whose opening orders belong exclusively to ``wanted``.
+
+        A position resolves only when its distinct opening-order identities
+        are exactly ``{wanted}``: every non-closing order must resolve to that
+        one entry signal, and no other opener - a sibling lot's signal, a
+        manual order, an exit signal this build cannot attribute - may share
+        the position (#382 maintainer decision). On a netted book several
+        entries merge into one position; matching it for one lot would let a
+        broker-sized full exit close the siblings' quantity too, so a shared
+        position returns no match and the exit sizes off the lot residual
+        instead. On a hedging book each position has exactly one opening
+        order, so the rule is a no-op there.
+        """
+        matches: list[int] = []
+        for position_id in position_ids:
+            orders = await self._position_orders_for_exit_target(position_id)
+            if orders is None:
+                raise ValueError(
+                    f"cTrader position {position_id} order list is unreadable; "
+                    "cannot resolve the exit target for "
+                    f"{wanted} on {upper}."
+                )
+            openers: set[str] = set()
+            for index, order in enumerate(getattr(orders, "order", []) or []):
+                if bool(getattr(order, "closingOrder", False)):
+                    continue
+                signal_id = await self._signal_id_for_position_order(order)
+                if signal_id:
+                    openers.add(signal_id)
+                else:
+                    # An opener this build cannot attribute still counts: it
+                    # is proof the position is NOT exclusively ``wanted``'s.
+                    openers.add(f"__unresolved_opener__{index}")
+            if openers == {wanted}:
+                matches.append(position_id)
+        return matches
 
     def _requested_exit_position_id(self, metadata: Mapping[str, Any]) -> int | None:
         raw_position_id = metadata.get("position_id")
@@ -2716,6 +2817,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._symbol_name_to_id.clear()
         self._order_id_to_signal_id.clear()
         self._position_ids_by_symbol.clear()
+        self._position_volumes.clear()
+        self._position_orders_cache.clear()
         # #80: props and order-symbol mappings are session state — a
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
@@ -3664,6 +3767,51 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise RuntimeError(f"Unexpected trader response: {type(trader_res).__name__}")
         return trader_res.trader
 
+    async def account_type(self) -> str | None:
+        """The account's ``ProtoOAAccountType`` as ``hedged``/``netted``/``spread_betting``.
+
+        ``None`` when the trader record cannot be read or carries a type this
+        build does not know - callers must treat "not proven hedged" as the
+        unsafe case (#382: ``internal_max_open_per_symbol > 1`` is refused on
+        cTrader accounts that cannot prove they hedge positions). Only a
+        successful read is cached permanently; an unreadable read is
+        negatively cached for ``_ACCOUNT_TYPE_RETRY_SECONDS`` so a broker
+        outage does not cost a request timeout on every runner pass, and
+        never pins "unknown" past the window.
+        """
+        if self._account_type is not None:
+            return self._account_type
+        now = time.monotonic()
+        if (
+            self._account_type_unreadable_at is not None
+            and now - self._account_type_unreadable_at < _ACCOUNT_TYPE_RETRY_SECONDS
+        ):
+            return None
+        try:
+            trader = await self._fetch_trader()
+        except Exception:  # except-kind: money-decision
+            self._account_type_unreadable_at = now
+            return None
+        # ``accountType`` is a proto2 optional whose declared default is
+        # HEDGED: a trader record that does not carry the field reads as
+        # ``0`` -> "hedged", which would fail OPEN on exactly the guard this
+        # read exists for. ``HasField`` is the only proof the broker stated
+        # a type; stubs without it (SimpleNamespace) keep the getattr path.
+        if hasattr(trader, "HasField") and not trader.HasField("accountType"):
+            self._account_type_unreadable_at = time.monotonic()
+            return None
+        try:
+            raw_type = int(getattr(trader, "accountType", -1))
+        except (TypeError, ValueError):
+            self._account_type_unreadable_at = time.monotonic()
+            return None
+        name = _CTRADER_ACCOUNT_TYPES.get(raw_type)
+        if name is None:
+            self._account_type_unreadable_at = time.monotonic()
+            return None
+        self._account_type = name
+        return name
+
     async def _fetch_position_unrealized_pnl(self, fallback_money_digits: int) -> float:
         """Summed net unrealized P&L of all open positions, in account currency.
 
@@ -4263,6 +4411,95 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             failed=tuple(failed),
         )
 
+    async def cancel_orders(
+        self, order_refs: Collection[str], *, symbol: str
+    ) -> ControlOutcome:
+        """Cancel the working orders ``order_refs`` names on ``symbol`` (#382).
+
+        Matches a working order on its broker ``orderId`` or its
+        ``clientOrderId`` (the persisted signal id) and only when the order's
+        symbol is ``symbol``. The same type gate as
+        :meth:`cancel_open_orders` applies, so attached position protections
+        (``STOP_LOSS_TAKE_PROFIT``) can never be caught by a ref that
+        happens to collide: they are not in the cancellable set at all.
+        """
+        wanted_symbol = str(symbol or "").strip().upper()
+        refs = {str(ref).strip() for ref in order_refs if str(ref or "").strip()}
+        if not refs or not wanted_symbol:
+            return ControlOutcome()
+        reconcile_res = await self._reconcile_state()
+        cancellable = {
+            int(self._ProtoOAOrderType.LIMIT),
+            int(self._ProtoOAOrderType.STOP),
+            int(self._ProtoOAOrderType.STOP_LIMIT),
+        }
+        cancelled = 0
+        unidentified: list[str] = []
+        failed: list[str] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            if order_type not in cancellable:
+                continue
+            if not self._is_working_order(order):
+                continue
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            matched = (
+                (order_id is not None and str(order_id) in refs)
+                or (client_order_id and client_order_id in refs)
+            )
+            if not matched:
+                continue
+            trade_data = getattr(order, "tradeData", None)
+            symbol_id = (
+                self._positive_int(getattr(trade_data, "symbolId", 0))
+                if trade_data is not None
+                else None
+            )
+            try:
+                order_symbol = (
+                    self._symbol_name_for_id(symbol_id).strip().upper()
+                    if symbol_id is not None
+                    else ""
+                )
+            except ValueError:
+                order_symbol = ""
+            if not order_symbol:
+                # A matched ref whose symbol cannot be resolved can be
+                # neither proven ours-for-this-symbol nor safely cancelled:
+                # report it rather than skip it silently.
+                unidentified.append(
+                    f"order:{order_id if order_id is not None else client_order_id}"
+                )
+                continue
+            if order_symbol != wanted_symbol:
+                continue
+            if order_id is None:
+                unidentified.append(
+                    f"order:{client_order_id or getattr(order, 'orderId', None)!r}"
+                )
+                continue
+            try:
+                await self._cancel_order_id(order_id)
+            except CTraderApiError as exc:
+                self._raise_terminal_auth_from_api_error(exc)
+                failed.append(str(order_id))
+                logger.warning(
+                    "cTrader refused to cancel named order %s: %s.",
+                    order_id,
+                    exc,
+                )
+                continue
+            cancelled += 1
+        return ControlOutcome(
+            completed=cancelled,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
+        )
+
     async def cancel_orphaned_protections(self) -> ControlOutcome:
         """Cancel attached SL/TP orders whose position no longer exists.
 
@@ -4392,7 +4629,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         }
         payload: list[dict[str, Any]] = []
         observed_position_ids: dict[str, list[int]] = {}
+        observed_volumes: dict[int, int] = {}
         self._position_ids_by_symbol = {}
+        self._position_volumes = observed_volumes
         for position in open_positions:
             trade_data = getattr(position, "tradeData", None)
             if trade_data is None:
@@ -4423,6 +4662,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if position_id > 0:
                 row["position_id"] = position_id
                 observed_position_ids.setdefault(normalized_symbol, []).append(position_id)
+                observed_volumes[position_id] = int(volume)
             payload.append(row)
         self._position_ids_by_symbol = {
             symbol: tuple(position_ids)
@@ -4920,6 +5160,49 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if position_id is not None:
                 return position_id
         return None
+
+    #: How long a position's order list may be reused by the exit-target
+    #: resolver. The TTL alone cannot prove a netted position's opener set is
+    #: unchanged - a second opening order can appear at any time - so a cache
+    #: hit is only honoured while the position's broker volume still equals
+    #: the volume recorded at fetch time (``_position_volumes``, refreshed by
+    #: ``get_positions``). Any fill moves the volume and forces a refetch;
+    #: a cached list may therefore never be the stale proof that pins a lot
+    #: to a shared position (#382 maintainer decision).
+    _POSITION_ORDERS_CACHE_TTL_SECONDS = 300.0
+    _POSITION_ORDERS_CACHE_MAX = 512
+
+    async def _position_orders_for_exit_target(self, position_id: int) -> Any | None:
+        """``_fetch_position_orders`` with a bounded, volume-checked cache (#382).
+
+        Only successful reads are cached; an unreadable list stays a fresh
+        failure every call so a transient broker error cannot pin a stale
+        answer. The cache is keyed on the broker position id, which is never
+        reused for a different position, and an entry is only reused while
+        both the TTL holds and the position's volume - as last reported by
+        ``get_positions`` - still matches the volume seen at fetch time.
+        """
+        key = int(position_id)
+        cached = self._position_orders_cache.get(key)
+        if cached is not None:
+            fetched_at, orders, volume_at_fetch = cached
+            if (
+                time.monotonic() - fetched_at
+                < self._POSITION_ORDERS_CACHE_TTL_SECONDS
+                and self._position_volumes.get(key) == volume_at_fetch
+            ):
+                return orders
+            del self._position_orders_cache[key]
+        orders = await self._fetch_position_orders(position_id)
+        if orders is not None:
+            if len(self._position_orders_cache) >= self._POSITION_ORDERS_CACHE_MAX:
+                self._position_orders_cache.clear()
+            self._position_orders_cache[key] = (
+                time.monotonic(),
+                orders,
+                self._position_volumes.get(key),
+            )
+        return orders
 
     async def _fetch_position_orders(self, position_id: int) -> Any | None:
         """Every order the broker ties to one position, opening and closing."""

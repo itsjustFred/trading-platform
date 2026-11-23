@@ -1925,6 +1925,9 @@ class LiveSupertrendFlipManager:
             "supertrend_flip": True,
             "flip_role": kind,
             "flip_parent_signal_id": signal_id,
+            # #382: name the entry lot this close reduces so the ledger
+            # credits it to that entry instead of FIFO-pooling it.
+            "exit_target_signal_id": signal_id,
         }
         if event:
             metadata["flip_bar_time"] = event

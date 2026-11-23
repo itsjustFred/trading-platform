@@ -383,6 +383,39 @@ def test_tp1_partial_close_fires_on_quote_and_confirms_by_quantity(
     assert surfaced == []
 
 
+def test_flip_close_names_the_entry_lot_for_attribution(live: _Live) -> None:
+    """#382: a flip close carries ``exit_target_signal_id`` naming the entry
+    signal, so the lot ledger credits the reduction to that entry instead of
+    FIFO-pooling it."""
+    manager = LiveSupertrendFlipManager()
+
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))
+    signal, qty = live.adapter.orders[0]
+    assert signal.metadata["exit_target_signal_id"] == str(live.entry.id)
+
+    # Persist the close the way the daemon's fill path does - the signal row
+    # plus its execution - then the lot ledger must show the entry's residual
+    # reduced by exactly the TP1 tranche.
+    live.database.save_live_signal(signal)
+    live.database.save_live_execution(
+        LiveExecution(
+            signal_id=signal.id,
+            actual_price=ENTRY_PRICE,
+            filled_qty=qty,
+            commission=0.0,
+            timestamp=_at(0.2),
+            broker_order_id="ord-1",
+        )
+    )
+    lots = live.database.list_live_deployment_open_position_lots(
+        str(live.deployment.id), SYMBOL
+    )
+    assert [(lot["signal_id"], lot["qty"]) for lot in lots] == [
+        (str(live.entry.id), POSITION_QTY - TRANCHE)
+    ]
+
+
 def test_tp1_waits_for_broker_confirmation_before_arming(live: _Live) -> None:
     manager = LiveSupertrendFlipManager()
     live.adapter.auto_fill = False

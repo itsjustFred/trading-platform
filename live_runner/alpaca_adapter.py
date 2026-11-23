@@ -5,7 +5,7 @@ import inspect
 import math
 import os
 import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any, NamedTuple
@@ -3107,6 +3107,61 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             unidentified=tuple(unidentified),
             failed=tuple(failed),
             pending_cancel=tuple(pending_cancel),
+        )
+
+    async def cancel_orders(
+        self, order_refs: Collection[str], *, symbol: str
+    ) -> ControlOutcome:
+        """Cancel the working orders ``order_refs`` names on ``symbol`` (#382).
+
+        Matches a working order on its broker ``id`` or ``client_order_id``
+        (the persisted signal id) and only when the order's symbol is
+        ``symbol``. Only top-level orders are considered - never nested
+        bracket legs, which are position protection, not entries. The order
+        book lock is held so the read and the cancels see one snapshot.
+        """
+        wanted_symbol = str(symbol or "").strip().upper()
+        refs = {str(ref).strip() for ref in order_refs if str(ref or "").strip()}
+        if not refs or not wanted_symbol:
+            return ControlOutcome()
+        async with self._order_book_lock():
+            client = await self._require_trading_client()
+            orders = await self._list_open_orders(client)
+            completed = 0
+            unidentified: list[str] = []
+            failed: list[str] = []
+            for order in orders:
+                if _order_symbol(order) != wanted_symbol:
+                    continue
+                order_id = _control_order_id(_order_attr(order, "id"))
+                client_order_id = _control_order_id(
+                    _order_attr(order, "client_order_id")
+                )
+                matched = (order_id is not None and order_id in refs) or (
+                    client_order_id is not None and client_order_id in refs
+                )
+                if not matched:
+                    continue
+                if order_id is None:
+                    unidentified.append(
+                        f"order:{client_order_id or _order_attr(order, 'id', None)!r}"
+                    )
+                    continue
+                try:
+                    await self._cancel_one(client, order_id)
+                except Exception as exc:  # except-kind: money-decision
+                    failed.append(f"{order_id}:{exc}")
+                    logger.warning(
+                        "Alpaca refused to cancel named order %s: %s.",
+                        order_id,
+                        exc,
+                    )
+                    continue
+                completed += 1
+        return ControlOutcome(
+            completed=completed,
+            unidentified=tuple(unidentified),
+            failed=tuple(failed),
         )
 
     @staticmethod
