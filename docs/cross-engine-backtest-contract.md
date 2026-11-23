@@ -702,9 +702,12 @@ python -m scripts.fetch_differential_slice
 
 * `DIFFERENTIAL_REAL_SLICE_CSV` overrides that path (CI points it at a path it
   restores from `actions/cache`, keyed on the fetch script and `data_tools/`).
-* `REQUIRE_REAL_DATA_SLICE=1` turns a missing slice into a test failure. CI sets
-  it, so the real-data scenarios can never be skipped silently; locally a
-  missing slice skips them with a message naming the script.
+* `REQUIRE_REAL_DATA_SLICE=1` turns a missing slice into a test failure. On pull
+  requests CI sets it only after the fetch step succeeds, so a Dukascopy
+  download failure warns and skips the real-data scenarios instead of failing
+  the job; on push to main the fetch step fails on a download error, so the
+  slice is always required there. Locally a missing slice skips them with a
+  message naming the script.
 * A slice that is present but malformed (wrong row count, non-monotonic stamps,
   non-finite OHLC, `high < max(open, close)`, `low > min(open, close)`) always
   fails - see `data_tools/differential_slice.py`, which owns the window, the
