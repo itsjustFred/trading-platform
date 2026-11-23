@@ -287,7 +287,14 @@ def test_portfolio_delete_rejects_path_traversal_id(security_client, tmp_path):
     assert secret.exists()
 
 
-def test_optimization_get_rejects_path_traversal_id(security_client, tmp_path):
+def test_optimization_get_encoded_slash_never_reaches_handler(
+    security_client, tmp_path
+):
+    """Routing smoke test: %2F decodes to '/' and the router 404s first.
+
+    The handler-level regression coverage lives in
+    test_optimization_get_handler_rejects_traversal_id below.
+    """
     secret = tmp_path / "secret.json"
     secret.write_text(
         json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
@@ -300,7 +307,31 @@ def test_optimization_get_rejects_path_traversal_id(security_client, tmp_path):
     assert secret.exists()
 
 
-def test_portfolio_get_rejects_path_traversal_id(security_client, tmp_path):
+def test_optimization_get_handler_rejects_traversal_id(security_client, tmp_path):
+    """Handler-level containment: '../secret' must not read tmp/secret.json."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(viewer_app_module.get_optimization("../secret"))
+    assert exc_info.value.status_code == 404
+    assert secret.exists()
+
+
+def test_portfolio_get_encoded_slash_never_reaches_handler(
+    security_client, tmp_path
+):
+    """Routing smoke test: %2F decodes to '/' and the router 404s first.
+
+    The handler-level regression coverage lives in
+    test_portfolio_get_handler_rejects_traversal_id below.
+    """
     secret = tmp_path / "secret.json"
     secret.write_text(
         json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
@@ -310,6 +341,23 @@ def test_portfolio_get_rejects_path_traversal_id(security_client, tmp_path):
 
     assert response.status_code in {404, 422}
     assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_portfolio_get_handler_rejects_traversal_id(security_client, tmp_path):
+    """Handler-level containment: '../secret' must not read tmp/secret.json."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(viewer_app_module.get_portfolio("../secret"))
+    assert exc_info.value.status_code == 404
     assert secret.exists()
 
 
@@ -361,7 +409,14 @@ def test_portfolio_payload_loader_rejects_path_traversal_id(security_client, tmp
         viewer_app_module._load_portfolio_payload("..\\secret")
 
 
-def test_portfolio_rename_rejects_path_traversal_id(security_client, tmp_path):
+def test_portfolio_rename_encoded_slash_never_reaches_handler(
+    security_client, tmp_path
+):
+    """Routing smoke test: %2F decodes to '/' and the router 404s first.
+
+    The handler-level regression coverage lives in
+    test_portfolio_rename_handler_rejects_traversal_id below.
+    """
     secret = tmp_path / "secret.json"
     original = json.dumps({"id": "secret", "name": "original"})
     secret.write_text(original, encoding="utf-8")
@@ -372,6 +427,27 @@ def test_portfolio_rename_rejects_path_traversal_id(security_client, tmp_path):
     )
 
     assert response.status_code in {404, 422}
+    assert secret.read_text(encoding="utf-8") == original
+
+
+def test_portfolio_rename_handler_rejects_traversal_id(security_client, tmp_path):
+    """Handler-level containment: '../secret' must not rewrite tmp/secret.json."""
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    secret = tmp_path / "secret.json"
+    original = json.dumps({"id": "secret", "name": "original"})
+    secret.write_text(original, encoding="utf-8")
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                "../secret",
+                viewer_app_module.NameUpdateRequest(name="pwned"),
+            )
+        )
+    assert exc_info.value.status_code == 404
     assert secret.read_text(encoding="utf-8") == original
 
 

@@ -12650,7 +12650,17 @@ def _portfolio_combined_metrics(
     return correlation_matrix, combined_equity_points, stats_result
 
 
-@app.post("/api/portfolios", status_code=201)
+_PORTFOLIO_NOT_FOUND_DETAIL = "Portfolio not found"
+
+
+@app.post(
+    "/api/portfolios",
+    status_code=201,
+    responses={
+        400: {"description": "Invalid account_capital or no valid components"},
+        500: {"description": "Failed to resolve the portfolio output path"},
+    },
+)
 async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     name = str(payload.name or "Untitled").strip() or "Untitled"
     account_capital = float(payload.account_capital or 100000.0)
@@ -12680,6 +12690,14 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     portfolio_id = _portfolio_identifier(name, now=now)
+    # Resolve and containment-check the output path before any DB write, so
+    # an id that cannot map inside PORTFOLIOS_DIR fails before half-applying
+    # (same ordering as rename_portfolio). The explicit parent check keeps
+    # the sanitiser visible at the write sink for static analysis.
+    portfolios_base = PORTFOLIOS_DIR.resolve()
+    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if output_path is None or output_path.parent != portfolios_base:
+        raise HTTPException(status_code=500, detail="Failed to resolve portfolio path")
     all_trades_timed.sort(key=_component_trade_time)
 
     portfolio = {
@@ -12755,9 +12773,6 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
-    if output_path is None:
-        raise HTTPException(status_code=500, detail="Failed to resolve portfolio path")
     output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return normalized_portfolio
@@ -12770,7 +12785,7 @@ def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
 
     record = load_portfolio_record(portfolio_id)
     if record is None:
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     return _portfolio_record_to_payload(record)
 
 
@@ -12791,7 +12806,10 @@ async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[s
     return {"deleted": deleted, "items": items}
 
 
-@app.get("/api/portfolios/{portfolio_id}")
+@app.get(
+    "/api/portfolios/{portfolio_id}",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     payload = _load_portfolio_payload(portfolio_id)
     payload["combined_stats"] = legacy_viewer.PortfolioStats.from_dict(
@@ -12800,7 +12818,14 @@ async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.patch("/api/portfolios/{portfolio_id}")
+@app.patch(
+    "/api/portfolios/{portfolio_id}",
+    responses={
+        400: {"description": "Portfolio name cannot be empty"},
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio rename failed"},
+    },
+)
 async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     updated_name = str(payload.name or "").strip()
     if not updated_name:
@@ -12811,9 +12836,13 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     normalized_portfolio = _normalize_portfolio_payload(portfolio_payload)
     normalized_portfolio["name"] = updated_name
 
+    # Resolve and containment-check before the DB write so an unsafe id
+    # cannot half-apply; the explicit parent check keeps the sanitiser
+    # visible at the write sink for static analysis.
+    portfolios_base = PORTFOLIOS_DIR.resolve()
     output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
-    if output_path is None:
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+    if output_path is None or output_path.parent != portfolios_base:
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
 
     try:
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
@@ -12830,12 +12859,22 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
 
 
-@app.put("/api/portfolios/{portfolio_id}/name")
+@app.put(
+    "/api/portfolios/{portfolio_id}/name",
+    responses={
+        400: {"description": "Portfolio name cannot be empty"},
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio rename failed"},
+    },
+)
 async def rename_portfolio_name(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_portfolio(portfolio_id, payload)
 
 
-@app.get("/api/portfolios/{portfolio_id}/contributions")
+@app.get(
+    "/api/portfolios/{portfolio_id}/contributions",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio_contributions(
     portfolio_id: str,
     group_by: str = Query(default="component"),
@@ -12844,7 +12883,10 @@ async def get_portfolio_contributions(
     return _compute_portfolio_contributions(portfolio=portfolio, group_by=group_by)
 
 
-@app.get("/api/portfolios/{portfolio_id}/trades")
+@app.get(
+    "/api/portfolios/{portfolio_id}/trades",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio_trades(
     portfolio_id: str,
     strategy: str = Query(default=""),
@@ -12860,11 +12902,18 @@ async def get_portfolio_trades(
     )
 
 
-@app.delete("/api/portfolios/{portfolio_id}")
+@app.delete(
+    "/api/portfolios/{portfolio_id}",
+    responses={
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio deletion failed"},
+        503: {"description": "Portfolio deletion is pending cleanup"},
+    },
+)
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     result = _delete_portfolio_with_artifacts(portfolio_id)
     if result.get("status") == "not_found":
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     if result.get("status") == "cleanup_pending":
         raise HTTPException(
             status_code=503,
