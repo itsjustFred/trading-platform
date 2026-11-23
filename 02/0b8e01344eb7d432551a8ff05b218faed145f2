@@ -1,0 +1,37 @@
+live_runner/alpaca_adapter.py
+  s_0537fbc9c050e0::t_877a6cdf6bc34a 8,3105-3159
+live_runner/base_adapter.py
+  s_0537fbc9c050e0::t_5a326fb2c9c39c 5,627-645
+live_runner/ctrader_adapter.py
+  s_0537fbc9c050e0::t_d366dbc2ea629c 12,952-958,1568,3994-4082,4443-4477
+live_runner/daemon.py
+  s_0537fbc9c050e0::t_c76d992bffc694 1955-1966,1993,2008,2019-2041
+live_runner/internal_strategy_runner.py
+  s_0537fbc9c050e0::t_8ae2a1a9b12bb5 89-96,137,139-143,312-368,710-776,1348-1357,1493-1508
+shared/database.py
+  s_0537fbc9c050e0::t_0d683adb4beac6 4434-4436,4443-4445,4450,4453-4464,4504-4513,4564,4581-4583,4586,4589,4591,4613,4620-4635,4639-4649,4651-4652,4661-4668,4687-4700,4710-4717,4756,4759
+tests/live_runner/test_internal_strategy_runner.py
+  s_0537fbc9c050e0::t_d7130b38d14a48 1965-2144
+tests/live_runner/test_open_entry_counts.py
+  s_0537fbc9c050e0::t_f62719f510473b 527-690
+tests/test_ctrader_adapter.py
+  s_0537fbc9c050e0::t_7a9053a7f8c4b1 2545-2705
+tests/test_live_execution_safety.py
+  s_0537fbc9c050e0::t_9aeea0584267cb 6012-6114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "020b8e01344eb7d432551a8ff05b218faed145f2",
+  "prompts": {},
+  "sessions": {
+    "s_0537fbc9c050e0": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_0537fbc9c050e0",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
