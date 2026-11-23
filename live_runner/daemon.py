@@ -3547,29 +3547,36 @@ async def _prepare_claim_and_submit_signal(
             # The lock wait is bounded but can still be long: re-run the age
             # gate now that the section has started, so a signal that was fresh
             # at dispatch cannot be sized and submitted after it expired (#362).
-            try:
-                _validate_signal_age_before_wait(
-                    normalized_signal,
-                    deployment,
-                    timeframe=(
-                        normalized_signal.timeframe
-                        or str(
-                            (live_signal.metadata or {}).get("timeframe")
-                            or deployment.timeframe
-                        )
-                    ),
-                    require_producer_timestamp=False,
-                )
-            except ValueError as exc:
-                return await _refuse_signal_aged_out_after_lock(
-                    account_id,
-                    deployment,
-                    live_signal,
-                    is_exit=is_exit,
-                    decision=decision,
-                    exc=exc,
-                    source_label=source_label,
-                )
+            # ``received_at`` absent means the gate is a no-op anyway
+            # (require_producer_timestamp=False), so skip the call rather than
+            # touch attributes a minimal signal stand-in may not have.
+            normalized_metadata = getattr(normalized_signal, "metadata", None)
+            if isinstance(normalized_metadata, Mapping) and normalized_metadata.get(
+                "received_at"
+            ):
+                try:
+                    _validate_signal_age_before_wait(
+                        normalized_signal,
+                        deployment,
+                        timeframe=(
+                            getattr(normalized_signal, "timeframe", None)
+                            or str(
+                                (live_signal.metadata or {}).get("timeframe")
+                                or deployment.timeframe
+                            )
+                        ),
+                        require_producer_timestamp=False,
+                    )
+                except ValueError as exc:
+                    return await _refuse_signal_aged_out_after_lock(
+                        account_id,
+                        deployment,
+                        live_signal,
+                        is_exit=is_exit,
+                        decision=decision,
+                        exc=exc,
+                        source_label=source_label,
+                    )
             return await _prepare_claim_and_submit_signal_locked(
                 account_id,
                 adapter,
