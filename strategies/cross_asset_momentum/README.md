@@ -18,6 +18,8 @@ Opt-in Exits (default OFF, keine Quelllogik — muessen explizit per Parameter a
 2. `use_momentum_exit=true`: Momentum-Bruch `Composite_Momentum < -0.01`.
 3. `use_drawdown_exit=true`: Drawdown-Schutz `Rolling_Drawdown < -0.08`.
 
+**Fill-Konvention (Version 1.2.0):** Marktausstiege auf Close-Basis (Signal-, Momentum- und Drawdown-Exit) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Das ATR-Stop-Level reist in `sl_price` (der protective Stop fuellt es); das `exit_price` der Exit-Bar ist nur mit `exit_order_type="level"` ein Level (wird hier nicht gesetzt).
+
 ### Stop-Loss
 Kein Stop-Loss im Standard (die Quelle nutzt keinen ATR-Stop).
 Opt-in via `use_atr_stop=true`: `sl_price = entry_close - ATR_Wilder(14) * 2.0`.
