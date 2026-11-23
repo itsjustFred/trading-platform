@@ -757,7 +757,7 @@ def _run_engine(frame, mod, params, signal_exit_fill):
         max_leverage=100.0,
         modeling_resolution="main_timeframe",
         signal_exit_fill=signal_exit_fill,
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
     return TradeEngine(config, symbol="T").run(frame, strategy_fn)
 

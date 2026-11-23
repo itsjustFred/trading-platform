@@ -86,7 +86,7 @@ def _parity_config(data_dir: Path) -> BacktestConfig:
         max_leverage=10.0,
         modeling_resolution="main_timeframe",
         data_dir=str(data_dir),
-        parameters={"fees": "zero", "fast_length": 5, "slow_length": 20},
+        parameters={"fees": "zero", "slippage": "none", "fast_length": 5, "slow_length": 20},
     )
 
 

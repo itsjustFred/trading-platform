@@ -12,7 +12,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+@pytest.fixture(autouse=True)
+def _restore_coverage_windows():
+    yield
+    from data_tools import auto_download
+
+    auto_download.reload_coverage_windows()
 
 
 def test_coverage_windows_are_configurable(monkeypatch):

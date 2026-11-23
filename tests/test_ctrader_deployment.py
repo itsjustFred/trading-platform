@@ -138,6 +138,7 @@ def test_score_is_unit_normalized() -> None:
 
     modest = {
         "sharpe_ratio": 1.5,
+        "equity_return_periods_per_year": 365.25,
         "cagr": 0.2,
         "psr": 0.8,
         "max_drawdown": -0.06,
@@ -158,7 +159,13 @@ def test_drawdown_penalty_reads_max_drawdown_as_fraction() -> None:
     """
     from live_runner.ctrader_deployment import score_backtest_for_live
 
-    base = {"sharpe_ratio": 1.5, "cagr": 0.2, "psr": 0.8, "trade_count": 12}
+    base = {
+        "sharpe_ratio": 1.5,
+        "cagr": 0.2,
+        "psr": 0.8,
+        "trade_count": 12,
+        "equity_return_periods_per_year": 365.25,
+    }
     smooth = score_backtest_for_live({**base, "max_drawdown": -0.05})
     deep = score_backtest_for_live({**base, "max_drawdown": -0.25})
 
@@ -170,9 +177,40 @@ def test_drawdown_penalty_is_capped_at_one() -> None:
     """A drawdown of 100 % or more costs at most 1.0 (documented 0..1 penalty)."""
     from live_runner.ctrader_deployment import score_backtest_for_live
 
-    base = {"sharpe_ratio": 1.5, "cagr": 0.2, "psr": 0.8, "trade_count": 12}
+    base = {
+        "sharpe_ratio": 1.5,
+        "cagr": 0.2,
+        "psr": 0.8,
+        "trade_count": 12,
+        "equity_return_periods_per_year": 365.25,
+    }
     total = score_backtest_for_live({**base, "max_drawdown": -1.0})
     beyond = score_backtest_for_live({**base, "max_drawdown": -3.0})
 
     assert total == pytest.approx(1.5 / 3.0 + 0.2 + 0.8 - 1.0)
     assert beyond == pytest.approx(total)
+
+
+def test_legacy_rows_rescale_sharpe_onto_measured_density_basis() -> None:
+    """#349: rows stored before #229 were annualised at sqrt(252); the same
+    performance now measures ~sqrt(365.25). Ranking must compare them on one
+    basis, so a legacy row's Sharpe term is rescaled by sqrt(365.25/252)
+    while a row carrying `equity_return_periods_per_year` is not."""
+    import math
+
+    from live_runner.ctrader_deployment import _LEGACY_SHARPE_RESCALE, score_backtest_for_live
+
+    base = {
+        "sharpe_ratio": 1.5,
+        "cagr": 0.2,
+        "psr": 0.8,
+        "max_drawdown": -0.06,
+        "trade_count": 12,
+    }
+    legacy = score_backtest_for_live(base)
+    current = score_backtest_for_live({**base, "equity_return_periods_per_year": 365.25})
+
+    assert _LEGACY_SHARPE_RESCALE == pytest.approx(math.sqrt(365.25 / 252.0))
+    assert legacy - current == pytest.approx(
+        (1.5 * (_LEGACY_SHARPE_RESCALE - 1.0)) / 3.0
+    )
