@@ -1,0 +1,18 @@
+live_runner/signal_archive.py
+  h_f251b30ae7fbf6 50-51,619-623,637-638
+tests/indicators/test_private_copy_guard.py
+  h_f251b30ae7fbf6 1-354
+tests/live_runner/test_signal_archive.py
+  h_f251b30ae7fbf6 417-495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0c28fa059e7531cc135e0453a4b733bf18355b8c",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
