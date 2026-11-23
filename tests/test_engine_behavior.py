@@ -1957,7 +1957,8 @@ class TestOrderTypeSizingSemantics:
     """Documented policy (16-D1): every order is sized exactly once, at fill.
 
     MARKET fills at next-bar open → sized from the fill price.
-    LIMIT/STOP fill at their trigger price → sized from that trigger price.
+    LIMIT/STOP/STOP_LIMIT fill at their level (or the bar open on a stop
+    gap-through) → sized from that fill price.
     The pre-fill creation sizing must not survive into the position.
     """
 
@@ -2024,11 +2025,13 @@ class TestOrderTypeSizingSemantics:
         """STOP orders (short side, trigger above) size at the trigger price."""
         frame = _linear_frame(6)
         # Bar 2 rallies through the stop of a SHORT stop order at 101.5.
+        # Open 101.7 stays above the stop so this is an intrabar touch, not
+        # a gap-through-open fill (covered by TestPendingStopGapPricing).
         frame.loc[2, "high"] = 102.5
-        frame.loc[2, "open"] = 101.0
+        frame.loc[2, "open"] = 101.7
 
         entries = pd.Series([False] * len(frame), index=frame.index)
-        entries.iloc[0] = True
+        entries.iloc[1] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits)  # noqa: E731
@@ -2217,8 +2220,8 @@ class TestPendingOrderCreationBarGuard:
 
         # Bar 2 high (102.5) still trades through -> fills at the limit.
         # Bar 2 opens at 102.0, above the 101.0 sell limit, so a real fill
-        # would price-improve to the open; the engine deliberately does not
-        # model gap price improvement for pending orders (#371).
+        # would price-improve to the open; LIMIT deliberately keeps the
+        # conservative level fill (#371).
         engine._fill_pending_orders(frame.iloc[2], 2)
         assert len(engine.positions) == 1
         assert engine.positions[0].entry_price == pytest.approx(101.0)
@@ -2228,10 +2231,9 @@ class TestPendingOrderCreationBarGuard:
 
         engine = self._engine(tmp_path)
         frame = _linear_frame(4)
-        # Bar 2 must not gap through the buy stop: a stop whose bar opens
-        # above 101.0 fills at the open (gap -> open), not at the level —
-        # that fill-price gap is tracked in #371. Open 100.8 keeps this a
-        # plain through-trade so the fill lands on the stop price.
+        # Bar 2 must not gap through the buy stop in this guard test: open
+        # 100.8 is below the 101.0 stop, so the intrabar touch fills at the
+        # level. Gap-through-open pricing is covered by TestPendingStopGapPricing.
         frame.loc[2, "open"] = 100.8
         frame.loc[2, "low"] = 100.7
         order = self._order(
@@ -2312,7 +2314,7 @@ class TestPendingOrderCreationBarGuard:
         frame = _linear_frame(4)
         # Only bar 2 dips through the sell stop (low 100.0 <= 100.6) while
         # its high still reaches the limit. Bar 2 opens at 102.0, above the
-        # 100.6 stop, so this is not a gap case (#371).
+        # 100.6 stop, so the gap-through-open rule does not apply.
         frame.loc[2, "low"] = 100.0
         order = self._order(
             OrderType.STOP_LIMIT,

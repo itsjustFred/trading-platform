@@ -1313,6 +1313,43 @@ class TradeEngine:
             )
         )
 
+    @staticmethod
+    def _pending_stop_fill_price(
+        direction: str, stop_price: float, bar_open: float
+    ) -> float:
+        """Fill price for a pending stop-market order on one bar.
+
+        Owner decision 2026-11-13 (gap -> open): a LONG buy-stop that gaps up
+        fills at the open above the stop; a SHORT sell-stop that gaps down
+        fills at the open below it. An intrabar touch keeps the stop price.
+        """
+        if direction == "LONG":
+            return max(float(bar_open), float(stop_price))
+        return min(float(bar_open), float(stop_price))
+
+    @staticmethod
+    def _pending_stop_limit_fill_price(
+        direction: str,
+        stop_price: float,
+        limit_price: float,
+        bar_open: float,
+    ) -> float:
+        """Fill price for a pending stop-limit order on one bar.
+
+        When the bar opens through the stop, the stop leg fires at the open;
+        if that makes the limit marketable at the open, the fill is the open.
+        Otherwise the resting limit keeps its limit price.
+        """
+        if direction == "LONG":
+            gapped_through_stop = bar_open >= stop_price
+            limit_marketable_at_open = bar_open <= limit_price
+        else:
+            gapped_through_stop = bar_open <= stop_price
+            limit_marketable_at_open = bar_open >= limit_price
+        if gapped_through_stop and limit_marketable_at_open:
+            return float(bar_open)
+        return float(limit_price)
+
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
         if not self.pending_orders:
             return
@@ -1349,14 +1386,20 @@ class TradeEngine:
             elif order.order_type == OrderType.STOP:
                 if order.direction == "LONG" and order.stop_price is not None:
                     filled = i > order.created_index and bar_high >= order.stop_price
-                    fill_price = order.stop_price
+                    if filled:
+                        fill_price = self._pending_stop_fill_price(
+                            order.direction, order.stop_price, bar_open
+                        )
                 elif order.direction == "SHORT" and order.stop_price is not None:
                     filled = i > order.created_index and bar_low <= order.stop_price
-                    fill_price = order.stop_price
+                    if filled:
+                        fill_price = self._pending_stop_fill_price(
+                            order.direction, order.stop_price, bar_open
+                        )
             elif order.order_type == OrderType.STOP_LIMIT:
                 # The trigger is evaluated per bar, not latched: trigger and
                 # limit must both be reached on the same bar. Whether #339
-                # needs a latched trigger is tracked in #371.
+                # needs a latched trigger is #339's contract decision.
                 trigger = i > order.created_index
                 if order.direction == "LONG" and order.stop_price is not None:
                     trigger = trigger and bar_high >= order.stop_price
@@ -1365,6 +1408,13 @@ class TradeEngine:
                         and order.limit_price is not None
                         and bar_low <= order.limit_price
                     )
+                    if filled and order.limit_price is not None:
+                        fill_price = self._pending_stop_limit_fill_price(
+                            order.direction,
+                            order.stop_price,
+                            order.limit_price,
+                            bar_open,
+                        )
                 elif order.direction == "SHORT" and order.stop_price is not None:
                     trigger = trigger and bar_low <= order.stop_price
                     filled = (
@@ -1372,7 +1422,13 @@ class TradeEngine:
                         and order.limit_price is not None
                         and bar_high >= order.limit_price
                     )
-                fill_price = order.limit_price if order.limit_price is not None else bar_open
+                    if filled and order.limit_price is not None:
+                        fill_price = self._pending_stop_limit_fill_price(
+                            order.direction,
+                            order.stop_price,
+                            order.limit_price,
+                            bar_open,
+                        )
 
             if filled:
                 # Fail closed on an unpriced fill bar (e.g. an all-NaN OHLC
@@ -1426,9 +1482,10 @@ class TradeEngine:
                 if (
                     order.order_type in {OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT}
                 ):
-                    # LIMIT/STOP/STOP_LIMIT orders fill at their trigger price,
-                    # so they are re-sized from that trigger price instead of
-                    # keeping the creation-price estimate (the creation-price
+                    # LIMIT/STOP/STOP_LIMIT orders fill at their level (or at
+                    # the bar open when a stop gaps through), so they are
+                    # re-sized from that fill price instead of keeping the
+                    # creation-price estimate (the creation-price
                     # sizing on the signal bar is only the pending-order
                     # estimate; market orders fill at the next bar's open and
                     # are re-sized there).
