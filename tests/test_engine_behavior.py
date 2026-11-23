@@ -2372,6 +2372,320 @@ class TestPendingOrderCreationBarGuard:
         )
 
 
+class TestPendingStopGapPricing:
+    """#371: pending STOP/STOP_LIMIT fills honour gap-through-open pricing.
+
+    A bar that opens through a stop fills at the open (the worse price for a
+    stop-market entry), never at the trigger level. STOP_LIMIT applies the
+    same open fill only when the bar opens through the stop AND the resulting
+    limit is marketable at that open; otherwise the limit price stands.
+    Plain LIMIT orders keep the conservative level fill (no favourable-gap
+    price improvement).
+    """
+
+    @staticmethod
+    def _engine(tmp_path: Path, **param_overrides) -> TradeEngine:
+        return TradeEngine(
+            _config(tmp_path, parameters=dict(param_overrides)), symbol="PROBE"
+        )
+
+    @staticmethod
+    def _order(order_type, direction: str, created_index: int, **kwargs):
+        from runner.engine import Order
+
+        return Order(
+            symbol="PROBE",
+            direction=direction,
+            order_type=order_type,
+            created_index=created_index,
+            created_time="2024-01-01T01:00:00+00:00",
+            quantity=10.0,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _fill(engine: TradeEngine, frame: pd.DataFrame, idx: int = 1) -> None:
+        engine._fill_pending_orders(frame.iloc[idx], idx)
+
+    def test_stop_long_gap_up_fills_at_open(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 105.0
+        frame.loc[1, "high"] = 106.0
+        frame.loc[1, "low"] = 104.0
+        frame.loc[1, "close"] = 105.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP,
+                "LONG",
+                created_index=0,
+                stop_price=101.0,
+                stop_loss=100.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(105.0)
+
+    def test_stop_short_gap_down_fills_at_open(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 95.0
+        frame.loc[1, "high"] = 96.0
+        frame.loc[1, "low"] = 94.0
+        frame.loc[1, "close"] = 95.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP,
+                "SHORT",
+                created_index=0,
+                stop_price=100.0,
+                stop_loss=110.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(95.0)
+
+    def test_stop_long_no_gap_fills_at_trigger(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 100.8
+        frame.loc[1, "high"] = 101.5
+        frame.loc[1, "low"] = 100.7
+        frame.loc[1, "close"] = 101.2
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP,
+                "LONG",
+                created_index=0,
+                stop_price=101.0,
+                stop_loss=100.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(101.0)
+
+    def test_stop_short_no_gap_fills_at_trigger(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 101.0
+        frame.loc[1, "high"] = 101.5
+        frame.loc[1, "low"] = 100.0
+        frame.loc[1, "close"] = 100.5
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP,
+                "SHORT",
+                created_index=0,
+                stop_price=100.6,
+                stop_loss=102.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(100.6)
+
+    def test_stop_limit_long_gap_with_marketable_limit_fills_at_open(
+        self, tmp_path
+    ):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 102.0
+        frame.loc[1, "high"] = 104.0
+        frame.loc[1, "low"] = 101.5
+        frame.loc[1, "close"] = 103.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP_LIMIT,
+                "LONG",
+                created_index=0,
+                stop_price=101.0,
+                limit_price=103.0,
+                stop_loss=100.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(102.0)
+
+    def test_stop_limit_long_gap_with_unmarketable_limit_fills_at_limit(
+        self, tmp_path
+    ):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 104.0
+        frame.loc[1, "high"] = 105.0
+        frame.loc[1, "low"] = 102.5
+        frame.loc[1, "close"] = 103.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP_LIMIT,
+                "LONG",
+                created_index=0,
+                stop_price=101.0,
+                limit_price=103.0,
+                stop_loss=100.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(103.0)
+
+    def test_stop_limit_short_gap_with_marketable_limit_fills_at_open(
+        self, tmp_path
+    ):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 99.0
+        frame.loc[1, "high"] = 99.5
+        frame.loc[1, "low"] = 98.5
+        frame.loc[1, "close"] = 99.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP_LIMIT,
+                "SHORT",
+                created_index=0,
+                stop_price=100.0,
+                limit_price=98.0,
+                stop_loss=105.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(99.0)
+
+    def test_stop_limit_short_gap_with_unmarketable_limit_fills_at_limit(
+        self, tmp_path
+    ):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 97.5
+        frame.loc[1, "high"] = 98.5
+        frame.loc[1, "low"] = 97.0
+        frame.loc[1, "close"] = 98.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP_LIMIT,
+                "SHORT",
+                created_index=0,
+                stop_price=100.0,
+                limit_price=98.0,
+                stop_loss=105.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(98.0)
+
+    def test_stop_limit_long_no_gap_fills_at_limit(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 100.5
+        frame.loc[1, "high"] = 102.0
+        frame.loc[1, "low"] = 100.0
+        frame.loc[1, "close"] = 101.5
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP_LIMIT,
+                "LONG",
+                created_index=0,
+                stop_price=101.0,
+                limit_price=103.0,
+                stop_loss=100.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(103.0)
+
+    def test_stop_limit_short_no_gap_fills_at_limit(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 101.0
+        frame.loc[1, "high"] = 101.5
+        frame.loc[1, "low"] = 99.5
+        frame.loc[1, "close"] = 100.0
+        engine.pending_orders.append(
+            self._order(
+                OrderType.STOP_LIMIT,
+                "SHORT",
+                created_index=0,
+                stop_price=100.0,
+                limit_price=98.0,
+                stop_loss=105.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(98.0)
+
+    def test_limit_long_favorable_gap_stays_at_limit(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(3)
+        frame.loc[1, "open"] = 100.5
+        frame.loc[1, "high"] = 101.0
+        frame.loc[1, "low"] = 100.0
+        frame.loc[1, "close"] = 100.8
+        engine.pending_orders.append(
+            self._order(
+                OrderType.LIMIT,
+                "LONG",
+                created_index=0,
+                limit_price=101.5,
+                stop_loss=100.0,
+            )
+        )
+
+        self._fill(engine, frame)
+
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(101.5)
+
+
 # ─── Mutation hardening: reporting equity curve ─────────────────────────────
 
 
