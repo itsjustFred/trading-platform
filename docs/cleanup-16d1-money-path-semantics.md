@@ -432,18 +432,24 @@ documented semantics fixes.
 `_infer_portfolio_periods_per_year` annualises at the measured observation
 density of the aligned equity curve's actual timestamps (#353,
 `runner.stats.return_periods_per_year`): each consecutive equity pair is
-one return observation, and the density is that observation count over the
-span measured in calendar years (365, or 366 across a leap day). A
-calendar-daily crypto book therefore measures ~365/366, a business-day
-equity book its observed trading-day density (~250-262 depending on the
-calendar), an intraday book its measured intraday density, and a mixed
-book whatever the combined timestamps carry. When the timestamps carry no
-usable cadence the fallback is 252. There is no artificial ceiling:
-clamping an intraday curve's period count (the earlier `252 × 4` ≈ 1008
-cap) would understate the annualization relative to the daily-resampled
-convention stats.py reports. Sub-hourly curves still need enough bars for
-the per-observation mean/std to be meaningful, which is a sample-size
-question the cadence cap never addressed.
+one return observation stamped at the later point, and the density is the
+interval count over the span measured in calendar years (365, or 366
+across a leap day) — intervals, not a padded day-count, so an hourly
+curve measures ~8760/8784 and a weekly curve ~52 rather than a biased
+span ratio. A calendar-daily crypto book therefore measures ~365/366, a
+business-day equity book its observed trading-day density (~250-262
+depending on the calendar), an intraday book its measured intraday
+density, and a mixed book whatever the combined timestamps carry. When
+the timestamps carry no usable cadence the fallback is 252. There is no
+artificial ceiling: clamping an intraday curve's period count (the
+earlier `252 × 4` ≈ 1008 cap) would understate the annualization. Note
+this measured density is deliberately NOT the convention `runner.stats`
+uses for its own reported Sharpe, which keeps the fixed #229
+asset-class factors (252 equities/FX, 365 all-crypto): an FX book
+therefore annualises ~1.6% higher here than in the reported stats, and a
+leap-year crypto book 366 vs 365. Sub-hourly curves still need enough
+bars for the per-observation mean/std to be meaningful, which is a
+sample-size question the cadence cap never addressed.
 
 ## D11 appendix — vectorbt bar-count reload
 

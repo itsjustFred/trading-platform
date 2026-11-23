@@ -80,8 +80,10 @@ def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
     Sharpe here is annualised at the measured observation density of the
     resampled daily index (#353, ``runner.stats.return_periods_per_year``):
     ~365/366 for a calendar-daily crypto book, the observed trading-day
-    density for equities/FX — the same measured-density convention
-    ``runner/stats.py`` reports.
+    density for equities/FX. Note this measured density is NOT the same
+    convention ``runner/stats.py`` uses for its own reported Sharpe,
+    which keeps the fixed #229 asset-class factors (252 equities/FX,
+    365 all-crypto).
     Per-bar returns inside a UTC
     day are compounded (``prod(1 + r) - 1``), which for an interior day is
     exactly the day's close-to-close return, because each bar return already
@@ -341,8 +343,10 @@ def score_risk_parity_universe(
     volatility = float(np.std(portfolio_returns) + 1e-12)
     # #87 / #129 H8 / #353: annualized Sharpe on the measured observation
     # density of the daily index (``runner.stats.return_periods_per_year``),
-    # consistent with runner/stats.py and runner/portfolio_optimizer.py. That
-    # factor is only correct for daily returns, so it is applied only when the
+    # shared with runner/portfolio_optimizer.py — NOT the convention
+    # runner/stats.py uses for its own reported Sharpe, which keeps the
+    # fixed #229 asset-class factors. That factor is only correct for
+    # daily returns, so it is applied only when the
     # caller says the input is daily; otherwise the Sharpe is undefined rather
     # than guessed (e.g. per-trade rows have no fixed observation frequency).
     sharpe: float | None
@@ -504,6 +508,25 @@ def select_best_risk_parity_universe(
     if not selections:
         raise ValueError("No risk parity universe had enough return history")
 
+    # A universe scored with a real Sharpe and one scored on structure
+    # only are NOT comparable: the Sharpe term can dominate the score, so
+    # ranking them together lets a measured-Sharpe universe win or lose on
+    # a term the other never had. They are never ranked against each other;
+    # when both bases are present the Sharpe-scored universes are kept —
+    # they carry strictly more information, and no structure-only score
+    # can be shown to beat a measured one.
+    sharpe_scored = [item for item in selections if item.sharpe is not None]
+    structure_only = [item for item in selections if item.sharpe is None]
+    if sharpe_scored and structure_only:
+        logger.info(
+            "Risk parity: %d universe(s) scored on structure only are not "
+            "ranked against %d Sharpe-scored universe(s); the Sharpe-scored "
+            "basis wins",
+            len(structure_only),
+            len(sharpe_scored),
+        )
+        selections = sharpe_scored
+
     selections.sort(
         key=lambda item: (
             item.score,
@@ -532,10 +555,18 @@ def select_best_risk_parity_universe(
         # considered and skipped, so evaluated_universes alone under-reports the
         # search.
         "infeasible_skipped": infeasible_skipped,
+        # Structure-only universes evaluated but never ranked, because a
+        # Sharpe-scored basis was present (see the partition above).
+        "unranked_structure_only": len(structure_only),
         "evaluated_universes": [
             {
                 "symbols": item.symbols,
                 "score": item.score,
+                "score_basis": (
+                    "sharpe_and_structure"
+                    if item.sharpe is not None
+                    else "structure_only"
+                ),
                 "sharpe": item.sharpe,
                 "volatility": item.volatility,
                 "diversification_ratio": item.diversification_ratio,

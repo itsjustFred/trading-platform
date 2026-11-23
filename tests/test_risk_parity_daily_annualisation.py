@@ -303,6 +303,43 @@ def test_datetime_frame_reports_sharpe_basis() -> None:
     assert result["best_sharpe"] is not None
 
 
+def test_mixed_score_bases_are_never_ranked_together() -> None:
+    """A universe whose Sharpe is undefined (structure-only score) must
+    never be ranked against one carrying a real Sharpe term: the two
+    scores are not comparable. When both bases are present the
+    Sharpe-scored universes are the only eligible ones."""
+    rng = np.random.default_rng(88)
+    days = 120
+    index = pd.bdate_range("2024-01-02", periods=days, tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "SPY": rng.normal(0.0008, 0.01, days),
+            "TLT": rng.normal(0.0004, 0.008, days),
+            # Weekly-only observations: NaN except every 7th business day,
+            # so its universe resamples to a weekly index and its Sharpe
+            # is undefined (structure-only score).
+            "WEEKLY": [
+                value if i % 7 == 0 else np.nan
+                for i, value in enumerate(rng.normal(0.002, 0.01, days))
+            ],
+        },
+        index=index,
+    )
+
+    result = select_best_risk_parity_universe(
+        frame, [["SPY", "TLT"], ["WEEKLY", "TLT"]]
+    )
+
+    assert result["unranked_structure_only"] == 1
+    assert result["best_sharpe"] is not None
+    assert result["score_basis"] == "sharpe_and_structure"
+    assert result["best_symbols"] == ["SPY", "TLT"]
+    assert all(
+        entry["score_basis"] == "sharpe_and_structure"
+        for entry in result["evaluated_universes"]
+    )
+
+
 def test_trade_pnl_fallback_frame_has_no_datetime_index() -> None:
     """Per-trade rows are not a time grid: the fallback frame drops the index."""
     trades = []

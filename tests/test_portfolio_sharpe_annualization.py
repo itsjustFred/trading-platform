@@ -194,10 +194,11 @@ class TestAnnualizationCadenceCalibration:
             periods = portfolio_optimizer._infer_portfolio_periods_per_year(
                 equity_matrix
             )
-            assert periods == pytest.approx(8134.285714, rel=1e-3), (
+            assert periods == pytest.approx(8760.0, rel=1e-3), (
                 "hourly curves must annualize with the measured hourly "
-                "observation density — a ~8766 value means the old median-"
-                "spacing inference survived, ~252 means the density was dropped"
+                "observation density — 8760 (365 days x 24h, all timestamps "
+                "in common-year 2023); ~8134 was the biased padded-span "
+                "value, ~252 means the density was dropped"
             )
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
@@ -326,7 +327,10 @@ class TestCoarserThanDailyCadence:
             sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), matrix)
             returns = np.diff(equity) / equity[:-1]
             per_obs = float(np.mean(returns) / (np.std(returns) + 1e-10))
-            assert sharpe == pytest.approx(per_obs * math.sqrt(52.3337), rel=1e-3), (
+            # Interval-measured weekly density: 298 weekly intervals over
+            # ~2086 days touching leap years 2024/2028 -> ~52.18/year.
+            # (The old padded-span value 52.3337 was itself biased.)
+            assert sharpe == pytest.approx(per_obs * math.sqrt(52.1837), rel=1e-3), (
                 "weekly curves must annualize with the measured weekly "
                 "observation density (~52), not the daily convention"
             )

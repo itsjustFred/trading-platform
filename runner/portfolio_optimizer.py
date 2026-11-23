@@ -368,12 +368,14 @@ def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
     """Measured observation density of the combined equity curve (#353).
 
     Annualisation follows ``runner.stats.return_periods_per_year`` — the
-    measured-density convention stats.py reports — applied to the aligned
-    curve's actual timestamps: each consecutive equity pair is one return
-    observation stamped at the later point, so a crypto book measures
-    ~365/366 calendar days per year, an equity book its observed
-    trading-day density, and a mixed book whatever the combined
-    timestamps carry. Falls back to
+    measured observation density of the combined curve's actual
+    timestamps: each consecutive equity pair is one return observation
+    stamped at the later point, so a crypto book measures ~365/366
+    calendar days per year, an equity book its observed trading-day
+    density, and a mixed book whatever the combined timestamps carry.
+    This measured density is deliberately NOT the convention
+    ``runner.stats`` uses for its own reported Sharpe, which keeps the
+    fixed #229 asset-class factors. Falls back to
     ``PORTFOLIO_PERIODS_PER_YEAR_DEFAULT`` when the timestamps carry no
     usable cadence.
     """
