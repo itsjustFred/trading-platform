@@ -103,6 +103,7 @@ GUARDED_SCRIPTS=(
     scripts/db_backup.py
     scripts/dedupe_executions.py
     scripts/fetch_differential_slice.py
+    scripts/fetch_parity_web_data.py
     scripts/overnight_strategy_discovery.py
     scripts/recalculate_backtest_stats.py
     scripts/regenerate_backtests.py
