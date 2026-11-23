@@ -9,7 +9,11 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from risk.config import RiskConfig, effective_max_notional_per_trade
+from risk.config import (
+    RiskConfig,
+    effective_max_leverage,
+    effective_max_notional_per_trade,
+)
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
@@ -338,6 +342,66 @@ class SignalReplayAdapter:
             self._position_risk_amount(position) for position in open_positions.values()
         )
         return max(0.0, risk_amount / equity)
+
+    def _open_position_notionals(
+        self,
+        open_positions: dict[str, _OpenPosition],
+        frames: dict[str, pd.DataFrame],
+        as_of: pd.Timestamp,
+    ) -> float:
+        """Aggregate open notional marked at each symbol's latest close.
+
+        Same marking convention as :meth:`_sizing_account_balance`: the last
+        bar at or before ``as_of`` per symbol, falling back to the entry
+        price when a symbol has no frame coverage (fail toward the larger,
+        already-committed notional).
+        """
+        total = 0.0
+        for symbol, position in open_positions.items():
+            mark = float(position.entry_price)
+            frame = frames.get(symbol)
+            if frame is not None and not frame.empty:
+                bars = frame[frame["timestamp"] <= as_of]
+                if not bars.empty:
+                    mark = float(bars.iloc[-1]["close"])
+            total += float(position.quantity) * mark
+        return total
+
+    def _free_margin_quantity_cap(
+        self,
+        *,
+        open_positions: dict[str, _OpenPosition],
+        frames: dict[str, pd.DataFrame],
+        as_of: pd.Timestamp,
+        equity: float,
+        entry_price: float,
+    ) -> float:
+        """Largest quantity the declared-leverage free-margin rule affords (#240).
+
+        Mirrors the native engine's MT5-style check (#347): a new position's
+        notional must fit in ``free_margin * L`` — equity minus used margin,
+        times the declared broker maximum ``L`` (1x when unknown). Used margin
+        is open notional / ``L``, so the bound reduces to
+        ``notional_new <= equity * L - sum(open_notional)``. Replay has no
+        broker connection, so ``L`` is the operator-declared ``max_leverage``;
+        an undeterminable one fails closed to 1x. Returns 0.0 when nothing
+        fits — the caller skips the entry, matching the native "clamped to
+        zero" outcome.
+        """
+        if (
+            not math.isfinite(entry_price)
+            or entry_price <= 0
+            or not math.isfinite(equity)
+            or equity <= 0
+        ):
+            return 0.0
+        leverage = effective_max_leverage(self._max_leverage)
+        open_notional = self._open_position_notionals(open_positions, frames, as_of)
+        available_notional = equity * leverage - open_notional
+        if available_notional <= 0:
+            return 0.0
+        # pip_value is 1.0 in replay, so notional = qty * price.
+        return available_notional / entry_price
 
     def _sizing_account_balance(
         self,
@@ -1232,6 +1296,20 @@ class SignalReplayAdapter:
                 ),
             )
             quantity = float(sized.position_size)
+            # #240: the per-trade ceiling alone does not bound the AGGREGATE —
+            # the same free-margin rule the native engine and the live
+            # pre-submit caps apply: total open notional stays within
+            # equity * declared leverage. Clamped to zero skips the entry.
+            quantity = min(
+                quantity,
+                self._free_margin_quantity_cap(
+                    open_positions=open_positions,
+                    frames=frames,
+                    as_of=fill_time,
+                    equity=account_balance,
+                    entry_price=fill_price,
+                ),
+            )
             if quantity <= 0:
                 emit(10.0 + ((index / total_signals) * 80.0), _REPLAY_PROGRESS_MESSAGE)
                 continue
@@ -1355,6 +1433,13 @@ class SignalReplayAdapter:
                 "max_positions": int(self.risk_config.max_positions),
                 "max_notional_per_trade": float(self.risk_config.max_notional_per_trade),
                 "max_leverage": self._max_leverage,
+                # #240: the ceilings that actually bound sizing — the
+                # configured cap clamped by the declared broker maximum
+                # (1x when unknown), recorded next to the raw declarations.
+                "effective_max_notional_per_trade": effective_max_notional_per_trade(
+                    self.risk_config.max_notional_per_trade, self._max_leverage
+                ),
+                "effective_max_leverage": effective_max_leverage(self._max_leverage),
                 "signal_processor": self.signal_processor_name or None,
                 **(metadata or {}),
             },

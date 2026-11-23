@@ -102,6 +102,17 @@ class TestLeverageSemantics:
         assert risk_math["max_leverage"] == 1.0
         assert risk_math["max_leverage_notional"] == pytest.approx(100_000.0)
 
+    def test_position_cap_above_one_is_refused(self, sizing_env):
+        """#240: the frozen vectorbt engine has no broker-leverage concept —
+        its unset max_leverage resolves to the 2.0x migration-gate default,
+        so a per-position cap above 1x would size past 1x equity with no
+        declared broker maximum. It refuses outright, the same fail-closed
+        rule PyneCore applies; use the native engine for leverage."""
+        tmp_path, strategy_path = sizing_env
+        config = _config(tmp_path, max_position_pct=5.0)  # max_leverage unset
+        with pytest.raises(ValueError, match="max_position_exposure_pct"):
+            VectorbtAdapter().run(config, str(strategy_path))
+
 
 # ─── F6: total_bars is the bar count ────────────────────────────────────────
 
@@ -612,3 +623,5 @@ class TestInvertedSizingStop:
         result = VectorbtAdapter().run(config, str(strategy_path))
         assert result.trades == []
         assert result.meta.data["inverted_stop_drops"] == 1
+
+

@@ -346,7 +346,7 @@ async def _record_refusal_audit(data: Mapping[str, Any]) -> None:
     await _record_cap_audit(data, action="pre_submit_cap_refusal", succeeded=False)
 
 
-async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | None:
+async def safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | None:
     """The broker's maximum leverage, or ``None`` when it cannot be determined.
 
     A leverage lookup failure degrades to the 1x ceiling (#240) — it never
@@ -447,7 +447,7 @@ async def _verify_broker_facts(
     # already carries true equity the default ``get_equity`` returns the same
     # value.
     equity_task = asyncio.create_task(adapter.get_equity())
-    leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
+    leverage_task = asyncio.create_task(safe_max_leverage(adapter, signal.symbol))
     margin_task = asyncio.create_task(_safe_used_margin(adapter))
     try:
         quote, pip_value, equity, max_leverage, used_margin = (

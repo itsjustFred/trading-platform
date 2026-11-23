@@ -35,6 +35,8 @@ import pytest
 
 import live_runner.daemon as daemon
 from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.pre_submit_caps import enforce_pre_submit_caps
+from risk.config import RiskConfig
 from risk.live import resolve_live_levels
 from shared.models import LiveDeploymentConfig, LiveSignal
 
@@ -1245,3 +1247,71 @@ def test_size_live_signal_broker_max_leverage_parameter_bounds_the_cap():
         signal, deployment, account_balance=100_000.0
     )
     assert sized.metadata["qty"] == pytest.approx(1000.0)
+
+
+@dataclass
+class _HangingLeverageAdapter(_MaxLeverageAdapter):
+    """Broker whose leverage read never answers (#240 timeout path)."""
+
+    async def get_max_leverage(self, symbol: str):
+        await asyncio.sleep(60)
+        return 50.0
+
+
+def test_daemon_leverage_read_timeout_fails_closed_to_1x(monkeypatch):
+    """#240: the broker-leverage read is bounded — a hung call must not stall
+    the entry; the timeout degrades to unknown -> the 1x ceiling."""
+    monkeypatch.setattr(daemon, "PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS", 0.05)
+    deployment = _deployment(max_notional_per_trade=5.0)
+    adapter = _HangingLeverageAdapter(quote=_at_entry())
+
+    _, qty = _prepare(adapter, deployment, _leverage_signal(deployment))
+
+    assert qty == pytest.approx(1000.0)
+
+
+def test_sized_leverage_quantity_further_clamped_by_used_margin():
+    """#240 interplay: sizing bounds the quantity at min(cfg, broker max) x
+    EQUITY, then the pre-submit caps re-derive the same leverage ceiling
+    against the broker's USED margin — free margin, not equity — and clamp
+    the sized quantity further before submission."""
+    @dataclass
+    class _MarginBroker(_GateAdapter):
+        max_leverage: float | None = 3.0
+        used_margin: float | None = 50_000.0
+
+        async def get_max_leverage(self, symbol: str):
+            return self.max_leverage
+
+        async def get_used_margin(self):
+            return self.used_margin
+
+        async def get_equity(self):
+            return 100_000.0
+
+        def exit_qty_step(self, symbol: str) -> float:
+            return 1e-9
+
+    deployment = _deployment(max_notional_per_trade=5.0)
+    signal = _leverage_signal(deployment)
+    sized = daemon.size_live_signal_for_submission(
+        signal, deployment, account_balance=100_000.0, broker_max_leverage=3.0
+    )
+    sized_qty = float(sized.metadata["qty"])
+    # min(5, 3) x 100k equity / 100 = 3_000 units — the leverage ceiling binds.
+    assert sized_qty == pytest.approx(3000.0)
+
+    broker = _MarginBroker(quote=_at_entry())
+    clamped = asyncio.run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            sized,
+            qty=sized_qty,
+            risk_config=RiskConfig(max_risk_per_trade=0.5),
+        )
+    )
+    # Free margin = 100k equity - 50k used = 50k; the 3x leverage ceiling is
+    # 150k notional -> 1_500 units, half the sized quantity.
+    assert clamped == pytest.approx(1500.0)
+    assert clamped < sized_qty

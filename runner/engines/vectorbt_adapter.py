@@ -823,6 +823,22 @@ class VectorbtAdapter(EngineAdapter):
         strategy_path: str,
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
+        # #240: the frozen vectorbt engine has no broker-leverage concept —
+        # its sizing resolves an unset max_leverage to the 2.0x migration-gate
+        # default, so a per-position cap above 1x could size past 1x equity
+        # with no declared broker maximum. Refuse it outright, the same
+        # fail-closed rule PyneCore applies; use the native engine for
+        # leverage. (The 2.0x aggregate default itself is unchanged — it is
+        # migration-gate parity behaviour.)
+        if (
+            config.max_position_exposure_pct is not None
+            and config.max_position_exposure_pct > 1
+        ):
+            raise ValueError(
+                "vectorbt max_position_exposure_pct must be <= 1 "
+                "(per-position leverage above 1x is not supported by the "
+                "frozen vectorbt engine; use the native engine)"
+            )
         require_generated_strategy_approval(strategy_path)
         strategy_mod = _load_strategy_module(strategy_path)
         if not hasattr(strategy_mod, "generate_signals"):

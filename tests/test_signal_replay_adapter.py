@@ -426,3 +426,166 @@ def test_replay_bounds_notional_cap_above_one_by_max_leverage() -> None:
 def test_replay_sub_one_notional_cap_unchanged_by_max_leverage() -> None:
     result = _run_tight_stop_replay(max_leverage=50.0, max_notional_per_trade=0.2)
     assert result.trades[0].quantity == pytest.approx(20_000.0 / 100.5, rel=0.01)
+
+
+def _two_symbol_replay_signal(symbol: str, *, stop_loss: float) -> ReplaySignal:
+    return ReplaySignal.from_payload(
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "symbol": symbol,
+            "action": "buy",
+            "entry_price": 100.0,
+            "stop_loss": stop_loss,
+            "timeframe": "1m",
+            "source": "csv:signals.csv",
+            "metadata": {},
+        },
+        default_timeframe="1m",
+    )
+
+
+def _run_two_symbol_replay(*, max_leverage, max_notional_per_trade):
+    adapter = SignalReplayAdapter(
+        risk_config=RiskConfig(
+            max_risk_per_trade=0.01,
+            max_total_exposure=0.05,
+            max_positions=5,
+            max_notional_per_trade=max_notional_per_trade,
+        ),
+        max_leverage=max_leverage,
+        initial_capital=100000.0,
+        default_timeframe="1m",
+        fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
+    )
+    return adapter.run(
+        signals=[
+            # AAA's wide stop sizes risk-bound at ~1x equity; BBB's tight
+            # stop wants far past every ceiling and must be clamped by the
+            # aggregate free-margin rule against AAA's open position.
+            _two_symbol_replay_signal("AAA", stop_loss=99.0),
+            _two_symbol_replay_signal("BBB", stop_loss=99.9),
+        ],
+        ohlcv_by_symbol={"AAA": _one_bar_frame(), "BBB": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+
+
+def test_replay_aggregate_open_notional_bounded_by_declared_leverage() -> None:
+    """#240: the per-trade ceiling alone does not bound the aggregate — with
+    cap 5 and declared leverage 3, the second entry is clamped so total open
+    notional stays within 3x equity (same free-margin rule as live)."""
+    result = _run_two_symbol_replay(max_leverage=3.0, max_notional_per_trade=5.0)
+    by_symbol = {trade.symbol: trade for trade in result.trades}
+    assert set(by_symbol) == {"AAA", "BBB"}
+
+    # AAA is risk-bound at ~1x equity (0.01 * 100k / 1.0 stop distance).
+    assert by_symbol["AAA"].quantity == pytest.approx(1000.0, rel=0.05)
+
+    # BBB alone could take the full per-trade ceiling (~3x equity); the
+    # aggregate cap leaves only ~2x equity of headroom, so its quantity must
+    # land well below the ~2985 units the per-trade cap alone would allow.
+    bbb_qty = by_symbol["BBB"].quantity
+    assert 1500.0 < bbb_qty < 2400.0
+
+    # The invariant the finding demands: aggregate open notional never
+    # exceeds equity * declared leverage.
+    total_open_notional = sum(
+        trade.quantity * trade.entry_price for trade in result.trades
+    )
+    assert total_open_notional <= 3.0 * 100000.0 * 1.05
+    assert result.meta.parameters["effective_max_leverage"] == 3.0
+
+
+def test_replay_aggregate_open_notional_bounded_at_one_x_when_leverage_unset() -> None:
+    """#240: an undeclared broker maximum fails closed — the aggregate open
+    notional stays within 1x equity, so the second entry is refused."""
+    result = _run_two_symbol_replay(max_leverage=None, max_notional_per_trade=5.0)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.symbol == "AAA"
+    total_open_notional = trade.quantity * trade.entry_price
+    assert total_open_notional <= 100000.0 * 1.05
+
+
+def test_replay_fallback_stop_entry_still_bounded_by_leverage() -> None:
+    """#190 with #240: a stopless signal sized on the ATR fallback stop must
+    still respect min(configured cap, declared leverage) — the fallback stop
+    only supplies a distance, it never lifts the ceiling."""
+    adapter = SignalReplayAdapter(
+        risk_config=RiskConfig(
+            max_risk_per_trade=0.01,
+            max_total_exposure=0.05,
+            max_positions=5,
+            max_notional_per_trade=5.0,
+        ),
+        max_leverage=3.0,
+        initial_capital=100_000.0,
+        default_timeframe="1m",
+        fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
+    )
+    # No stop_loss: the risk engine resolves the ATR fallback
+    # (atr 0.05 * 2.0 = 0.1 distance -> risk sizing alone wants ~10x equity).
+    signal = ReplaySignal.from_payload(
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "symbol": "AAPL",
+            "action": "buy",
+            "entry_price": 100.0,
+            "timeframe": "1m",
+            "source": "csv:signals.csv",
+            "metadata": {"atr": 0.05},
+        },
+        default_timeframe="1m",
+    )
+    result = adapter.run(
+        signals=[signal],
+        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+    assert len(result.trades) == 1
+    # ceiling = min(5, 3) = 3 -> qty = 3 * 100_000 / fill (~100.5).
+    assert result.trades[0].quantity == pytest.approx(300_000.0 / 100.5, rel=0.01)
+
+
+def test_replay_fallback_stop_entry_fails_closed_without_leverage() -> None:
+    """Same fallback-stop entry with no declared broker maximum caps at 1x."""
+    adapter = SignalReplayAdapter(
+        risk_config=RiskConfig(
+            max_risk_per_trade=0.01,
+            max_total_exposure=0.05,
+            max_positions=5,
+            max_notional_per_trade=5.0,
+        ),
+        max_leverage=None,
+        initial_capital=100_000.0,
+        default_timeframe="1m",
+        fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
+    )
+    signal = ReplaySignal.from_payload(
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "symbol": "AAPL",
+            "action": "buy",
+            "entry_price": 100.0,
+            "timeframe": "1m",
+            "source": "csv:signals.csv",
+            "metadata": {"atr": 0.05},
+        },
+        default_timeframe="1m",
+    )
+    result = adapter.run(
+        signals=[signal],
+        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+    assert len(result.trades) == 1
+    assert result.trades[0].quantity == pytest.approx(100_000.0 / 100.5, rel=0.01)

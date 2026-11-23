@@ -100,6 +100,24 @@ class RiskConfig:
         raise ValueError(f"{field_name} must be boolean")
 
 
+def effective_max_leverage(broker_max_leverage: float | None) -> float:
+    """The broker's maximum leverage for sizing, fail-closed to 1x (#240).
+
+    ``broker_max_leverage`` is the broker's maximum leverage for the account
+    and asset; ``None`` or any unusable value means the maximum cannot be
+    determined and fails closed to 1x — never a guessed ceiling.
+    """
+    leverage = 1.0
+    if broker_max_leverage is not None and not isinstance(broker_max_leverage, bool):
+        try:
+            candidate = float(broker_max_leverage)
+        except (TypeError, ValueError, OverflowError):
+            candidate = math.nan
+        if math.isfinite(candidate) and candidate > 0:
+            leverage = candidate
+    return leverage
+
+
 def effective_max_notional_per_trade(
     configured: float, broker_max_leverage: float | None
 ) -> float:
@@ -114,12 +132,4 @@ def effective_max_notional_per_trade(
     caller ceiling of ``RiskEngine.calculate_position_size``, which re-validates
     it.
     """
-    leverage = 1.0
-    if broker_max_leverage is not None and not isinstance(broker_max_leverage, bool):
-        try:
-            candidate = float(broker_max_leverage)
-        except (TypeError, ValueError, OverflowError):
-            candidate = math.nan
-        if math.isfinite(candidate) and candidate > 0:
-            leverage = candidate
-    return min(float(configured), leverage)
+    return min(float(configured), effective_max_leverage(broker_max_leverage))

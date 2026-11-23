@@ -114,7 +114,11 @@ from live_runner.loss_breaker import (
     refuse_entry_if_loss_breaker_tripped,
     set_accounts_env_file,
 )
-from live_runner.pre_submit_caps import _safe_max_leverage, enforce_pre_submit_caps
+from live_runner.pre_submit_caps import (
+    PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+    enforce_pre_submit_caps,
+    safe_max_leverage,
+)
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
@@ -2336,8 +2340,18 @@ async def prepare_order_with_risk(
         )
     # #240: the broker maximum leverage bounds max_notional_per_trade above
     # 1x. Same fail-closed read the pre-submit caps use: an undeterminable or
-    # failing lookup degrades to None -> the 1x ceiling, never a guess.
-    broker_max_leverage = await _safe_max_leverage(adapter, signal.symbol)
+    # failing lookup degrades to None -> the 1x ceiling, never a guess. The
+    # read is bounded like the pre-submit one — a hung broker call must not
+    # stall the entry; timeout degrades to None -> 1x. This is a second
+    # round-trip for the same value the caps re-read moments later; that is
+    # deliberate — the caps need a fresh figure at submit time.
+    try:
+        broker_max_leverage = await asyncio.wait_for(
+            safe_max_leverage(adapter, signal.symbol),
+            timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        broker_max_leverage = None
     sized_signal = size_live_signal_for_submission(
         signal,
         deployment,
