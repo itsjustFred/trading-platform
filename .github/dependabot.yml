@@ -1,0 +1,23 @@
+# Dependency update policy (decision on #298): weekly, grouped, no
+# auto-merge. Each ecosystem opens at most one PR per week containing all of
+# its pending updates, so the review cost stays flat no matter how many
+# releases land. Merging is always a human step - Dependabot never
+# auto-merges here.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python:
+        patterns:
+          - "*"
