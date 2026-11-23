@@ -42,6 +42,7 @@ from runner.backtest_grid import (
     run_backtest_grid,
 )
 from runner.engines.base import resolve_legacy_max_position_kwarg
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.slippage import assert_slippage_supported
 from shared.constants import DATA_DIR
 from shared.database import save_grid_result
@@ -115,6 +116,9 @@ def run_strategy_grid(
                     end_date=end,
                     initial_capital=capital,
                     risk_per_trade_pct=risk_per_trade_pct,
+                    # Frozen engines refuse next_open; declare the legacy
+                    # close fill they simulate so meta stays truthful.
+                    signal_exit_fill=default_signal_exit_fill_for_engine(getattr(engine, "name", "")),
                 )
                 result = engine.run(config, str(entry.file_path))
 
