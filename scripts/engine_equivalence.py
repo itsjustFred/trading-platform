@@ -34,13 +34,21 @@ from runner.engines.native_adapter import _load_ohlcv, _load_strategy_module  # 
 
 # name: (strategy, symbol, timeframe, start, end, extra parameters)
 CASES: dict[str, tuple[str, str, str, str, str, dict]] = {
-    "ivb_usatech_1m": ("intraday_volatility_breakout", "USATECH", "1m", "2026-03-20", "2026-05-01", {}),
-    "ivb_usa500_1m": ("intraday_volatility_breakout", "USA500", "1m", "2026-03-20", "2026-04-15", {}),
-    "ivb_eurusd_1m": ("intraday_volatility_breakout", "EURUSD", "1m", "2026-02-20", "2026-04-02", {}),
+    "ivb_usatech_1m": (
+        "intraday_volatility_breakout", "USATECH", "1m", "2026-03-20", "2026-05-01", {},
+    ),
+    "ivb_usa500_1m": (
+        "intraday_volatility_breakout", "USA500", "1m", "2026-03-20", "2026-04-15", {},
+    ),
+    "ivb_eurusd_1m": (
+        "intraday_volatility_breakout", "EURUSD", "1m", "2026-02-20", "2026-04-02", {},
+    ),
     "trend_btc_1d": ("trend_following", "BTCUSDT", "1d", "2023-01-01", "2026-06-18", {}),
     "volbreak_eth_1d": ("volatility_breakout", "ETHUSDT", "1d", "2023-01-01", "2026-06-18", {}),
     "channel_xau_1h": ("channel_breakout", "XAUUSD", "1h", "2006-01-01", "2007-12-31", {}),
-    "supertrend_dema_sol_1h": ("pine_supertrend_dema", "SOLUSDT", "1h", "2026-04-19", "2026-06-18", {}),
+    "supertrend_dema_sol_1h": (
+        "pine_supertrend_dema", "SOLUSDT", "1h", "2026-04-19", "2026-06-18", {},
+    ),
     "meanrev_eth_1h": ("mean_reversion_rsi_bb", "ETHUSDT", "1h", "2026-04-19", "2026-06-18", {}),
     "ivb_usatech_1m_tpq": (
         "intraday_volatility_breakout", "USATECH", "1m", "2026-03-25", "2026-04-10",
@@ -61,7 +69,9 @@ def _build(name: str, data_dir: Path):
     cfg = BacktestConfig(
         strategy_name=strat, symbols=[symbol], timeframe=tf, start_date=start,
         end_date=end, initial_capital=100_000.0, risk_per_trade_pct=0.01,
-        parameters=resolve_strategy_parameters(str(path), {"fees": "zero", **params}), data_dir=str(data_dir), **cfg_kwargs,
+        parameters=resolve_strategy_parameters(str(path), {"fees": "zero", **params}),
+        data_dir=str(data_dir),
+        **cfg_kwargs,
     )
     return TradeEngine(cfg, symbol=symbol), data, module.generate_signals
 
@@ -108,7 +118,7 @@ def _same(a, b, tol: float) -> bool:
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(_same(a[k], b[k], tol) for k in a)
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(_same(x, y, tol) for x, y in zip(a, b))
+        return len(a) == len(b) and all(_same(x, y, tol) for x, y in zip(a, b, strict=True))
     return a == b
 
 
@@ -116,15 +126,21 @@ def _compare(args) -> int:
     a = json.loads(Path(args.a).read_text())
     b = json.loads(Path(args.b).read_text())
     bad = 0
-    print(f"{'case':24s} {'trades':>7s} {'curve':>7s} {'before s':>9s} {'after s':>9s} {'x':>6s}  result")
+    header = (
+        f"{'case':24s} {'trades':>7s} {'curve':>7s} "
+        f"{'before s':>9s} {'after s':>9s} {'x':>6s}  result"
+    )
+    print(header)
     for name in a:
         if name not in b:
-            print(f"{name}: missing in B"); bad += 1; continue
+            print(f"{name}: missing in B")
+            bad += 1
+            continue
         ok_t = _same(a[name]["trades"], b[name]["trades"], args.tol)
         ok_e = _same(a[name]["equity"], b[name]["equity"], args.tol)
         sa, sb = a[name]["seconds"], b[name]["seconds"]
         status = "IDENTICAL" if (ok_t and ok_e) else "DIFF"
-        bad += status == "DIFF"
+        bad += int(status == "DIFF")
         print(f"{name:24s} {len(a[name]['trades']):7d} {len(a[name]['equity']):7d} "
               f"{sa:9.2f} {sb:9.2f} {sa / sb if sb else 0:6.1f}  {status}")
     return 1 if bad else 0
@@ -143,9 +159,21 @@ def _profile(args) -> int:
 def main() -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
-    d = sub.add_parser("dump"); d.add_argument("out"); d.add_argument("--data-dir", default=str(REPO / "data" / "data")); d.add_argument("--only", nargs="*"); d.set_defaults(fn=_dump)
-    c = sub.add_parser("compare"); c.add_argument("a"); c.add_argument("b"); c.add_argument("--tol", type=float, default=0.0); c.set_defaults(fn=_compare)
-    pr = sub.add_parser("profile"); pr.add_argument("case"); pr.add_argument("--data-dir", default=str(REPO / "data" / "data")); pr.add_argument("--top", type=int, default=30); pr.set_defaults(fn=_profile)
+    d = sub.add_parser("dump")
+    d.add_argument("out")
+    d.add_argument("--data-dir", default=str(REPO / "data" / "data"))
+    d.add_argument("--only", nargs="*")
+    d.set_defaults(fn=_dump)
+    c = sub.add_parser("compare")
+    c.add_argument("a")
+    c.add_argument("b")
+    c.add_argument("--tol", type=float, default=0.0)
+    c.set_defaults(fn=_compare)
+    pr = sub.add_parser("profile")
+    pr.add_argument("case")
+    pr.add_argument("--data-dir", default=str(REPO / "data" / "data"))
+    pr.add_argument("--top", type=int, default=30)
+    pr.set_defaults(fn=_profile)
     args = p.parse_args()
     return args.fn(args)
 
