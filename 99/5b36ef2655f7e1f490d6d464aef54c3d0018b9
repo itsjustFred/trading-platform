@@ -1,0 +1,19 @@
+frontend/tests/liveKillSwitchRefresh.test.ts
+  s_8554c8a10d4912::t_aaac39262917b4 164-185,235-237,280,286,321-322,330,353,359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "995b36ef2655f7e1f490d6d464aef54c3d0018b9",
+  "prompts": {},
+  "sessions": {
+    "s_8554c8a10d4912": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_8554c8a10d4912",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
