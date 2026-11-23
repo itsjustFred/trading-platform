@@ -2301,3 +2301,218 @@ def test_entry_cancel_waits_on_the_account_lock(
     asyncio.run(scenario())
 
     assert cancelled == [({"sig-open"}, "AAPL")]
+
+
+class _PositionMappingAdapter(FakeAdapter):
+    """FakeAdapter that can prove lot->position mapping like a hedging book.
+
+    Overrides ``resolve_exit_position_target`` so the runner's #382 orphan
+    guard treats it as position-addressable; ``mapping`` gives the position
+    id each entry signal resolves to (absent -> ``None``, proven no
+    position).
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        mapping: dict[str, int | None] | None = None,
+        resolver_error: Exception | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._mapping = dict(mapping or {})
+        self._resolver_error = resolver_error
+        self.resolver_calls: list[tuple[str, str]] = []
+
+    async def resolve_exit_position_target(
+        self, symbol: str, entry_signal_id: str
+    ) -> int | None:
+        self.resolver_calls.append((symbol, entry_signal_id))
+        if self._resolver_error is not None:
+            raise self._resolver_error
+        return self._mapping.get(entry_signal_id)
+
+
+def _symbol_lots(mapping: dict[str, list[str]]):
+    def _lots(deployment_id: str, symbol: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "signal_id": signal_id,
+                "symbol": symbol,
+                "action": "buy",
+                "qty": 1.0,
+                "timestamp": None,
+                "broker_order_id": "",
+            }
+            for signal_id in mapping.get(str(symbol).upper(), ())
+        ]
+
+    return _lots
+
+
+def _two_symbol_lot_setup(
+    monkeypatch: pytest.MonkeyPatch, mapping: dict[str, list[str]]
+) -> list[dict[str, Any]]:
+    """Two open lots on N1 (at cap), N2 free; returns the flag recorder."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    flags: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        runner_mod,
+        "flag_live_ledger_reconciliation",
+        lambda **kwargs: flags.append(kwargs) or {},
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {
+            "N1": 2
+        },
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_position_lots",
+        _symbol_lots(mapping),
+    )
+    return flags
+
+
+def test_lot_position_map_mismatch_disables_entries_and_flags_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382 orphan guard: a ledger-open lot with no broker position (the
+    shape an unattributed close consumed from the wrong lot leaves) fails
+    the deployment's entries closed and raises the reconciliation flag."""
+    flags = _two_symbol_lot_setup(
+        monkeypatch, {"N1": ["entry-a", "entry-b"]}
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        symbols=["N1", "N2"], settings={"internal_max_open_per_symbol": 2}
+    )
+    # entry-b resolves to no open position: proven mismatch.
+    adapter = _PositionMappingAdapter(mapping={"entry-a": 101})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert [flag["cause"] for flag in flags] == ["lot_position_map_mismatch"]
+    assert flags[0]["symbol"] == "N1"
+    assert flags[0]["detail"]["deployment_id"] == str(deployment.id)
+    assert (str(deployment.id), "lot_position_map_mismatch:N1") in runner._reported
+
+
+def test_lot_position_map_consistent_book_keeps_entries_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: every lot resolving to its own position leaves entries on."""
+    flags = _two_symbol_lot_setup(
+        monkeypatch, {"N1": ["entry-a", "entry-b"]}
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        symbols=["N1", "N2"], settings={"internal_max_open_per_symbol": 2}
+    )
+    adapter = _PositionMappingAdapter(
+        mapping={"entry-a": 101, "entry-b": 102}
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].symbol == "N2"
+    assert flags == []
+
+
+def test_lot_position_map_duplicate_position_is_a_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two lots resolving to the same broker position cannot both be right -
+    on a hedging book each entry is its own position."""
+    flags = _two_symbol_lot_setup(
+        monkeypatch, {"N1": ["entry-a", "entry-b"]}
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        symbols=["N1", "N2"], settings={"internal_max_open_per_symbol": 2}
+    )
+    adapter = _PositionMappingAdapter(
+        mapping={"entry-a": 101, "entry-b": 101}
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert [flag["cause"] for flag in flags] == ["lot_position_map_mismatch"]
+
+
+def test_lot_position_map_unreadable_fails_closed_without_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable order list is unproven, not mismatched: entries fail
+    closed and report once, but no reconciliation flag is raised."""
+    flags = _two_symbol_lot_setup(
+        monkeypatch, {"N1": ["entry-a", "entry-b"]}
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        symbols=["N1", "N2"], settings={"internal_max_open_per_symbol": 2}
+    )
+    adapter = _PositionMappingAdapter(
+        resolver_error=RuntimeError("order list unreadable")
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert flags == []
+    assert (str(deployment.id), "lot_position_map:N1") in runner._reported
+
+
+def test_lot_position_map_skipped_for_single_lot_symbols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With at most one open lot per symbol FIFO cannot misattribute, so the
+    guard does not spend broker reads proving the map."""
+    _two_symbol_lot_setup(monkeypatch, {"N1": ["entry-a"]})
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        symbols=["N1", "N2"], settings={"internal_max_open_per_symbol": 2}
+    )
+    adapter = _PositionMappingAdapter(mapping={})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert adapter.resolver_calls == []
+    assert len(sent) == 1
+    assert sent[0].symbol == "N2"

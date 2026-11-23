@@ -155,6 +155,7 @@ from shared import venue_calendar
 from shared.constants import normalize_symbols, normalize_timeframe
 from shared.database import (
     DATA_DIR,
+    flag_live_ledger_reconciliation,
     list_live_deployment_open_entry_counts_by_symbol,
     list_live_deployment_open_position_lots,
     list_live_deployment_unfilled_entry_order_refs,
@@ -890,6 +891,167 @@ class InternalStrategyRunner:
             ):
                 held.add(symbol)
         return held
+
+    async def _lot_position_map_blocks_entries(
+        self,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        open_lots: Mapping[str, list[dict[str, Any]]],
+    ) -> bool:
+        """Whether the multi-lot symbols' lots fail to map 1:1 onto positions.
+
+        #382 hedging orphan guard: an unattributed broker close is consumed
+        from the lots' residuals oldest-first, which on a hedging N>1 book can
+        credit the wrong lot - its ledger then says closed while its broker
+        position stays open (or the reverse). Before entries are allowed to
+        add another lot, every open lot of a multi-lot symbol must resolve to
+        its own broker position through ``resolve_exit_position_target``: a
+        lot that resolves to nothing, or two lots that resolve to the same
+        position, means the ledger and the book disagree.
+
+        Returns ``True`` when entries must be disabled for this deployment
+        (exits still flow). Only adapters that override the base
+        ``resolve_exit_position_target`` can prove the mapping; on every
+        other adapter - and on symbols with at most one lot, where FIFO
+        cannot misattribute - this is a no-op. An unreadable position book or
+        order list cannot prove the mapping either, so it fails closed the
+        same way without raising the reconciliation alert: unproven is not
+        the same as mismatched.
+        """
+        resolver = getattr(adapter, "resolve_exit_position_target", None)
+        if resolver is None or getattr(resolver, "__func__", resolver) is (
+            BaseLiveAdapter.resolve_exit_position_target
+        ):
+            return False
+        pending = {
+            str(symbol).upper(): lots
+            for symbol, lots in open_lots.items()
+            if lots and len(lots) > 1
+        }
+        if not pending:
+            return False
+        deployment_id = str(deployment.id)
+        get_positions = getattr(adapter, "get_positions", None)
+        if not callable(get_positions):
+            self._report_once(
+                deployment_id,
+                "lot_position_map",
+                "Adapter cannot list broker positions; the open lots cannot "
+                "be proven to map onto them, so entries are disabled "
+                "(exits still evaluated)",
+                deployment_id=deployment_id,
+                adapter=type(adapter).__name__,
+            )
+            return True
+        try:
+            # The resolver reads the position-id map ``get_positions``
+            # refreshes; a stale map would report every lot unpositioned.
+            await get_positions()
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                "lot_position_map",
+                "Broker positions could not be read; the open lots cannot "
+                "be proven to map onto them, so entries are disabled "
+                "(exits still evaluated)",
+                deployment_id=deployment_id,
+                error=str(exc),
+            )
+            return True
+        blocked = False
+        for symbol, lots in pending.items():
+            resolved: dict[str, int] = {}
+            unresolved: list[str] = []
+            try:
+                for lot in lots:
+                    signal_id = str(lot.get("signal_id") or "").strip()
+                    if not signal_id:
+                        raise ValueError("open lot carries no signal id")
+                    position_id = await resolver(symbol, signal_id)
+                    if position_id is None:
+                        # Proven: the ledger calls this lot open but no
+                        # broker position resolves to its entry - the shape
+                        # an unattributed close consumed from the wrong lot
+                        # leaves behind.
+                        unresolved.append(signal_id)
+                    else:
+                        resolved[signal_id] = int(position_id)
+            except Exception as exc:  # except-kind: money-decision
+                # Unreadable is unproven, not mismatched: fail closed on
+                # entries without flagging a reconciliation that may be a
+                # transient broker read failure.
+                self._report_once(
+                    deployment_id,
+                    f"lot_position_map:{symbol}",
+                    "Open position lots could not be proven to map onto "
+                    "broker positions; entries are disabled (exits still "
+                    "evaluated)",
+                    deployment_id=deployment_id,
+                    symbol=symbol,
+                    error=str(exc),
+                )
+                blocked = True
+                continue
+            position_owners: dict[int, str] = {}
+            duplicate: str | None = None
+            for signal_id, position_id in resolved.items():
+                owner = position_owners.get(position_id)
+                if owner is not None:
+                    duplicate = (
+                        f"lots {owner} and {signal_id} both resolve to "
+                        f"broker position {position_id}"
+                    )
+                    break
+                position_owners[position_id] = signal_id
+            reasons: list[str] = []
+            if unresolved:
+                reasons.append(
+                    f"lots with no open broker position: {sorted(unresolved)}"
+                )
+            if duplicate is not None:
+                reasons.append(duplicate)
+            if not reasons and len(resolved) != len(lots):
+                reasons.append(
+                    f"{len(lots)} open lots resolved to {len(resolved)} "
+                    "broker positions"
+                )
+            mismatch = "; ".join(reasons) if reasons else None
+            if mismatch is None:
+                continue
+            marker = (deployment_id, f"lot_position_map_mismatch:{symbol}")
+            if marker not in self._reported:
+                self._reported.add(marker)
+                await asyncio.to_thread(
+                    flag_live_ledger_reconciliation,
+                    account_id=str(deployment.account_id),
+                    symbol=symbol,
+                    cause="lot_position_map_mismatch",
+                    detail={
+                        "deployment_id": deployment_id,
+                        "resolved_lots": sorted(resolved),
+                        "unresolved_lots": sorted(unresolved),
+                        "reason": mismatch,
+                    },
+                )
+                logger.error(
+                    "ALERT: internal deployment open lots do not map 1:1 "
+                    "onto the symbol's broker positions; a broker-side "
+                    "close was likely consumed from the wrong lot. Entries "
+                    "are disabled until the ledgers are reconciled",
+                    extra={
+                        "data": {
+                            "alert": "lot_position_map_mismatch",
+                            "account_id": str(deployment.account_id),
+                            "deployment_id": deployment_id,
+                            "symbol": symbol,
+                            "reason": mismatch,
+                            "resolved_lots": sorted(resolved),
+                            "unresolved_lots": sorted(unresolved),
+                        }
+                    },
+                )
+            blocked = True
+        return blocked
 
     def _symbol_calendar(
         self, adapter: BaseLiveAdapter, symbol: str
@@ -1641,6 +1803,13 @@ class InternalStrategyRunner:
                         )
                         open_lots = None
                         break
+            if open_lots and await self._lot_position_map_blocks_entries(
+                adapter, deployment, open_lots
+            ):
+                # #382 orphan guard: the lots and the broker positions
+                # disagree, so a new lot could entrench the misattribution.
+                # Entries fail closed; exits still flow.
+                max_open_per_symbol = 0
             for symbol in symbols:
                 # Fresh wall-clock per symbol: a pass over many symbols must
                 # not judge the last ones by the pass's start time.

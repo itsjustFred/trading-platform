@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from live_runner.ctrader_adapter import (
+    _ACCOUNT_TYPE_RETRY_SECONDS,
     _EXECUTION_RECONCILE_WAKE,
     CTraderApiError,
     CTraderAuthTerminalError,
@@ -2894,7 +2895,7 @@ def test_account_type_maps_proto_values_and_caches(monkeypatch) -> None:
     assert reads["n"] == 1
 
 
-def test_account_type_unreadable_is_none_and_not_cached(monkeypatch) -> None:
+def test_account_type_unreadable_is_none_and_negatively_cached(monkeypatch) -> None:
     adapter = CTraderLiveAdapter(
         app_id="app",
         app_secret="secret",
@@ -2902,8 +2903,10 @@ def test_account_type_unreadable_is_none_and_not_cached(monkeypatch) -> None:
         account_id="46736452",
     )
     outcomes = [RuntimeError("trader down"), SimpleNamespace(accountType=0)]
+    reads = {"n": 0}
 
     async def _fetch_trader():
+        reads["n"] += 1
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -2912,8 +2915,52 @@ def test_account_type_unreadable_is_none_and_not_cached(monkeypatch) -> None:
     adapter._fetch_trader = _fetch_trader
 
     assert asyncio.run(adapter.account_type()) is None
-    # The failure is not pinned: the next read can still prove the type.
+    # The failure is negatively cached for the retry window: an unreachable
+    # broker must not cost a request timeout on every runner pass.
+    assert asyncio.run(adapter.account_type()) is None
+    assert reads["n"] == 1
+    # Once the window lapses the next read retries and can still prove the
+    # type - "unknown" is never pinned permanently.
+    adapter._account_type_unreadable_at = (
+        time.monotonic() - _ACCOUNT_TYPE_RETRY_SECONDS - 1.0
+    )
     assert asyncio.run(adapter.account_type()) == "hedged"
+
+
+def test_account_type_unset_proto_field_is_none_not_hedged() -> None:
+    """A ``ProtoOATrader`` without ``accountType`` must not read as hedged.
+
+    The field is proto2 ``optional`` with ``[default = HEDGED]``: ``getattr``
+    returns 0 and ``HasField`` is False, so only the presence check proves
+    the broker stated a type (#382 fail-open hole).
+    """
+    from ctrader_open_api.messages import OpenApiModelMessages_pb2 as m
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._account_type = None
+    adapter._account_type_unreadable_at = None
+
+    async def _fetch_trader():
+        return m.ProtoOATrader()
+
+    adapter._fetch_trader = _fetch_trader
+    assert asyncio.run(adapter.account_type()) is None
+
+
+def test_account_type_set_proto_field_maps() -> None:
+    from ctrader_open_api.messages import OpenApiModelMessages_pb2 as m
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._account_type = None
+    adapter._account_type_unreadable_at = None
+    trader = m.ProtoOATrader()
+    trader.accountType = 1  # ProtoOAAccountType.NETTED
+
+    async def _fetch_trader():
+        return trader
+
+    adapter._fetch_trader = _fetch_trader
+    assert asyncio.run(adapter.account_type()) == "netted"
 
 
 def test_account_type_unknown_value_is_none() -> None:

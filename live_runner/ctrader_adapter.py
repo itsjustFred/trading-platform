@@ -678,6 +678,12 @@ _CTRADER_AUTH_FAILURE_FALLBACK = "cTrader account authorization failed"
 #: (tests stub ``_fetch_trader`` without loading the openapi types).
 _CTRADER_ACCOUNT_TYPES = {0: "hedged", 1: "netted", 2: "spread_betting"}
 
+#: Seconds an unreadable ``account_type`` read is negatively cached. Every
+#: runner pass on an ``internal_max_open_per_symbol > 1`` cTrader deployment
+#: asks again; without the window an unreachable broker would cost a full
+#: request timeout on every pass while the refusal already fails closed.
+_ACCOUNT_TYPE_RETRY_SECONDS = 60.0
+
 
 def _reason_to_text(reason: Any) -> str:
     if hasattr(reason, "getErrorMessage"):
@@ -969,10 +975,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # which is the only way a netted position's opener set can change.
         self._position_orders_cache: dict[int, tuple[float, Any, int | None]] = {}
         # ``ProtoOAAccountType`` name ("hedged"/"netted"/"spread_betting"),
-        # cached after the first successful ``_fetch_trader`` read; ``None``
-        # until then and after an unreadable read (never cached as unknown -
-        # a transient failure must not pin the answer).
+        # cached after the first successful ``_fetch_trader`` read. An
+        # unreadable read is negatively cached for
+        # ``_ACCOUNT_TYPE_RETRY_SECONDS`` (monotonic timestamp below) so a
+        # broker outage cannot stall every runner pass; "unknown" is never
+        # pinned permanently - the next read after the window retries.
         self._account_type: str | None = None
+        self._account_type_unreadable_at: float | None = None
         self._order_id_to_signal_id: dict[int, str] = {}
         # #80: order id -> upper symbol name (for order-only fills whose
         # payload carries no symbolId).
@@ -3438,21 +3447,40 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         build does not know - callers must treat "not proven hedged" as the
         unsafe case (#382: ``internal_max_open_per_symbol > 1`` is refused on
         cTrader accounts that cannot prove they hedge positions). Only a
-        successful read is cached: account type is a property of the account,
-        but a transient broker failure must not pin "unknown" forever.
+        successful read is cached permanently; an unreadable read is
+        negatively cached for ``_ACCOUNT_TYPE_RETRY_SECONDS`` so a broker
+        outage does not cost a request timeout on every runner pass, and
+        never pins "unknown" past the window.
         """
         if self._account_type is not None:
             return self._account_type
+        now = time.monotonic()
+        if (
+            self._account_type_unreadable_at is not None
+            and now - self._account_type_unreadable_at < _ACCOUNT_TYPE_RETRY_SECONDS
+        ):
+            return None
         try:
             trader = await self._fetch_trader()
         except Exception:  # except-kind: money-decision
+            self._account_type_unreadable_at = now
+            return None
+        # ``accountType`` is a proto2 optional whose declared default is
+        # HEDGED: a trader record that does not carry the field reads as
+        # ``0`` -> "hedged", which would fail OPEN on exactly the guard this
+        # read exists for. ``HasField`` is the only proof the broker stated
+        # a type; stubs without it (SimpleNamespace) keep the getattr path.
+        if hasattr(trader, "HasField") and not trader.HasField("accountType"):
+            self._account_type_unreadable_at = time.monotonic()
             return None
         try:
             raw_type = int(getattr(trader, "accountType", -1))
         except (TypeError, ValueError):
+            self._account_type_unreadable_at = time.monotonic()
             return None
         name = _CTRADER_ACCOUNT_TYPES.get(raw_type)
         if name is None:
+            self._account_type_unreadable_at = time.monotonic()
             return None
         self._account_type = name
         return name
