@@ -12248,8 +12248,8 @@ async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     portfolio_ids = [item.strip() for item in ids.split(",") if item.strip()]
     portfolios: list[dict[str, Any]] = []
     for portfolio_id in portfolio_ids:
-        path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-        if path.exists():
+        path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+        if path is not None and path.exists():
             portfolios.append(_normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8"))))
             continue
         record = load_portfolio_record(portfolio_id)
@@ -12755,15 +12755,17 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
+    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if output_path is None:
+        raise HTTPException(status_code=500, detail="Failed to resolve portfolio path")
     output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return normalized_portfolio
 
 
 def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
-    path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-    if path.exists():
+    path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if path is not None and path.exists():
         return _normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8")))
 
     record = load_portfolio_record(portfolio_id)
@@ -12809,10 +12811,13 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     normalized_portfolio = _normalize_portfolio_payload(portfolio_payload)
     normalized_portfolio["name"] = updated_name
 
+    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if output_path is None:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+
     try:
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
         output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     except Exception as exc:
         logger.exception(

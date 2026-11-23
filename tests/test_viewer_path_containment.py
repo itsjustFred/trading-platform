@@ -287,6 +287,94 @@ def test_portfolio_delete_rejects_path_traversal_id(security_client, tmp_path):
     assert secret.exists()
 
 
+def test_optimization_get_rejects_path_traversal_id(security_client, tmp_path):
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
+    )
+
+    response = security_client.get("/api/optimizations/..%2Fsecret")
+
+    assert response.status_code in {404, 422}
+    assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_portfolio_get_rejects_path_traversal_id(security_client, tmp_path):
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    response = security_client.get("/api/portfolios/..%2Fsecret")
+
+    assert response.status_code in {404, 422}
+    assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_portfolio_compare_rejects_query_string_traversal(security_client, tmp_path):
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    response = security_client.get("/api/portfolios/compare", params={"ids": "../secret"})
+
+    assert response.status_code == 200
+    assert "LEAKED" not in response.text
+    assert secret.exists()
+
+
+def test_optimization_loader_rejects_path_traversal_id(security_client, tmp_path):
+    from viewer import core as legacy_viewer
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    optimizations_dir = tmp_path / "optimizations"
+    optimizations_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "secret_marker": "LEAKED"}), encoding="utf-8"
+    )
+
+    assert legacy_viewer._load_optimization_payload("../secret") is None
+    assert legacy_viewer._load_optimization_payload("..\\secret") is None
+
+
+def test_portfolio_payload_loader_rejects_path_traversal_id(security_client, tmp_path):
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    secret = tmp_path / "secret.json"
+    secret.write_text(
+        json.dumps({"id": "secret", "name": "LEAKED"}), encoding="utf-8"
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        viewer_app_module._load_portfolio_payload("../secret")
+    assert exc_info.value.status_code == 404
+    with pytest.raises(viewer_app_module.HTTPException):
+        viewer_app_module._load_portfolio_payload("..\\secret")
+
+
+def test_portfolio_rename_rejects_path_traversal_id(security_client, tmp_path):
+    secret = tmp_path / "secret.json"
+    original = json.dumps({"id": "secret", "name": "original"})
+    secret.write_text(original, encoding="utf-8")
+
+    response = security_client.patch(
+        "/api/portfolios/..%2Fsecret",
+        json={"name": "pwned"},
+    )
+
+    assert response.status_code in {404, 422}
+    assert secret.read_text(encoding="utf-8") == original
+
+
 # ---------------------------------------------------------------------------
 # Seam 6: CSV signal replay containment
 # ---------------------------------------------------------------------------
