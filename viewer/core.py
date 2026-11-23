@@ -312,16 +312,16 @@ def _load_result(backtest_id: str) -> BacktestResult | None:
     return BacktestResult.load(path, root=BACKTESTS_DIR)
 
 
-def _optimization_path(optimization_id: str) -> Path:
+def _optimization_path(optimization_id: str) -> Path | None:
     normalized_id = str(optimization_id or "").strip()
     if normalized_id.endswith(".json"):
         normalized_id = normalized_id[:-5]
-    return OPTIMIZATIONS_DIR / f"{normalized_id}.json"
+    return _contained_asset_path(OPTIMIZATIONS_DIR, normalized_id, ".json")
 
 
 def _load_optimization_payload(optimization_id: str) -> dict[str, Any] | None:
     path = _optimization_path(optimization_id)
-    if not path.exists():
+    if path is None or not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 

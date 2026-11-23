@@ -18,6 +18,7 @@ or is renamed, must not be reported as passed. The roster is compared by name fo
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -179,6 +180,30 @@ def test_the_roster_check_reports_both_sides_at_once() -> None:
     )
     assert "declared but did not run: two" in result.stdout, result.stdout + result.stderr
     assert "ran but was not declared: surprise" in result.stdout, result.stdout
+
+
+def _guarded_scripts_roster() -> list[str]:
+    """The GUARDED_SCRIPTS entries as written in `scripts/gate-tests.sh`."""
+    text = GATE_SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"GUARDED_SCRIPTS=\(\n(?P<body>.*?)\n\)", text, re.DOTALL)
+    assert match, "GUARDED_SCRIPTS array not found in gate-tests.sh"
+    return re.findall(r"^\s*(\S+\.py)\s*$", match.group("body"), re.MULTILINE)
+
+
+def test_guarded_scripts_roster_keeps_every_entry() -> None:
+    """The roster is the F-lint scope; a wholesale overwrite drops entries silently.
+
+    Restoring a file by copying an old version of this script once removed
+    `fetch_differential_slice.py` while re-adding `signal_archive_market_features.py`, and
+    nothing failed: ruff exits 0 on a shorter list, so the dropped script's lint coverage was
+    gone with a green gate. This pins both members and that every listed file exists, so the
+    roster can only change by editing this list deliberately.
+    """
+    roster = _guarded_scripts_roster()
+    assert "scripts/fetch_differential_slice.py" in roster
+    assert "scripts/signal_archive_market_features.py" in roster
+    missing = [entry for entry in roster if not (REPO_ROOT / entry).is_file()]
+    assert not missing, f"GUARDED_SCRIPTS lists files that do not exist: {missing}"
 
 
 @needs_bash
