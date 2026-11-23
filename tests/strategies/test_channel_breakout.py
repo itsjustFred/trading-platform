@@ -41,7 +41,7 @@ EXPECTED_NET_PROFIT = -688.18
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"},
+    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="channel_breakout",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
@@ -173,4 +173,6 @@ def test_session_close_exit_fires_without_gap_filter():
     assert len(exit_idx) >= 1, "Session-Close muss flatten"
     last = exit_idx[-1]
     assert indicators["exit_reason"].loc[last] == "session_close"
-    assert df.loc[last, "timestamp"] == df["timestamp"].iloc[-1]
+    # next_open: signal on the SECOND-TO-LAST bar of the session so the fill is the
+    # last bar's open (a last-bar signal would fill in the next session).
+    assert df.loc[last, "timestamp"] == df["timestamp"].iloc[-2]

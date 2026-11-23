@@ -10,8 +10,9 @@ The native ``TradeEngine`` evaluates ``generate_signals`` once over the whole
 frame, then walks bars in order. On the signal bar it records the bar ``close``
 as the order's entry reference and creates a *pending* market order that only
 fills on a later bar (``i > order.created_index``) — i.e. the **next bar's
-open**. Signal exits fill at the trigger bar's ``close``
-(``BacktestConfig.signal_exit_fill="close"`` default).
+open**. Signal exits fill at the **next bar's open** too
+(``BacktestConfig.signal_exit_fill="next_open"`` default; the legacy
+``"close"``/``"open"`` opt-ins fill on the signal bar itself).
 
 Live cannot know the next open in advance, so the mapping is:
 
@@ -21,8 +22,8 @@ Live cannot know the next open in advance, so the mapping is:
   and sizing geometry use bar T's ``close``, the same reference the engine
   records on the pending order.
 * **Exits** — evaluated on the just-closed bar T and submitted immediately;
-  the market close fills at approximately the trigger bar's close, matching
-  the engine's default signal-exit fill.
+  the market order fills at approximately the open of bar T+1, matching the
+  engine's default ``next_open`` signal-exit fill.
 
 A signal is only actionable while bar T+1 is still forming: the window is
 ``SUBMIT_GRACE_SECONDS`` (30 s) plus a small feed-lag allowance of

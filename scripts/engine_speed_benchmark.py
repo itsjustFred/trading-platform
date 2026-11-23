@@ -58,6 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import FROZEN_SIGNAL_EXIT_ENGINES
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from scripts import engine_migration_gate as gate
@@ -234,6 +235,10 @@ def _summarize_cells(
 
 
 def _time_run(adapter: Any, config: BacktestConfig, strategy_path: Path) -> dict[str, Any]:
+    if getattr(adapter, "name", "") in FROZEN_SIGNAL_EXIT_ENGINES:
+        # The frozen adapter refuses next_open; run its legacy close fill so
+        # the meta records the model actually simulated (unchanged behaviour).
+        config = config.model_copy(update={"signal_exit_fill": "close"})
     started = time.perf_counter()
     try:
         result = adapter.run(config, str(strategy_path))

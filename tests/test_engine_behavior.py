@@ -292,9 +292,10 @@ class TestSizingEquityExcludesUnrealizedPnl:
         Entry 2 is a fallback-sized MARKET order with no stop; like every
         other order it is re-sized at its fill on bar 3 (89), by which point
         entry 1 has stopped out on that same bar and the realized basis reads
-        99k. Recording the creation-time 100k would hand the shared-equity
-        replay a coefficient ``quantity / equity_at_entry`` that no longer
-        matches the quantity it is re-scaling.
+        98.9k (the 90 stop gaps through the 89 open and fills there). Recording
+        the creation-time 100k would hand the shared-equity replay a
+        coefficient ``quantity / equity_at_entry`` that no longer matches the
+        quantity it is re-scaling.
         """
         frame = pd.DataFrame(
             {
@@ -328,15 +329,16 @@ class TestSizingEquityExcludesUnrealizedPnl:
         )
         assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 3"
         second = engine.closed_trades[1]
-        assert second.quantity == pytest.approx(990.0 / 1.78, rel=1e-9), (
+        assert second.quantity == pytest.approx(989.0 / 1.78, rel=1e-9), (
             "entry 2 is re-sized at its fill like every other order: 1% of "
-            "the 99k fill-time basis over the 2% fallback stop of the 89 "
-            "fill (1.78) = 556.18 shares"
+            "the 98.9k fill-time basis over the 2% fallback stop of the 89 "
+            "fill (1.78) = 555.62 shares"
         )
-        assert second.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+        assert second.meta["equity_at_entry"] == pytest.approx(98_900.0, rel=1e-9), (
             "the basis must be the one the surviving quantity was sized from "
-            "(99k at the fill, after entry 1's stop); the creation-time 100k "
-            "would corrupt the replay's per-unit coefficient"
+            "(98.9k at the fill, after entry 1's stop gapped through 90 to "
+            "the 89 open); the creation-time 100k would corrupt the replay's "
+            "per-unit coefficient"
         )
 
     def test_resized_order_records_its_fill_time_basis(self, tmp_path: Path):
@@ -346,9 +348,11 @@ class TestSizingEquityExcludesUnrealizedPnl:
 
         Entry 2 carries an explicit ``stop_distance`` (5), so its MARKET fill
         re-sizes it from the fill bar (89) — by which point entry 1 has stopped
-        out on that same bar and the realized basis reads 99k. Its quantity is
-        therefore 1% of 99k over the 5-point stop = 198 shares, and the basis
-        must be 99k (the creation-time 100k would no longer match).
+        out on that same bar and the realized basis reads 98.9k (the 90 stop
+        gaps through the 89 open and fills there, −1,100 not −1,000). Its
+        quantity is therefore 1% of 98.9k over the 5-point stop = 197.8 shares,
+        and the basis must be 98.9k (the creation-time 100k would no longer
+        match).
         """
         frame = pd.DataFrame(
             {
@@ -375,13 +379,13 @@ class TestSizingEquityExcludesUnrealizedPnl:
 
         assert len(engine.closed_trades) == 2, "both entries must have filled"
         second = engine.closed_trades[1]
-        assert second.quantity == pytest.approx(198.0, rel=1e-9), (
+        assert second.quantity == pytest.approx(197.8, rel=1e-9), (
             "the fill-time re-size uses the realized basis in force on the "
-            "fill bar: 1% of 99k over the 5-point stop = 198 shares"
+            "fill bar: 1% of 98.9k over the 5-point stop = 197.8 shares"
         )
-        assert second.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+        assert second.meta["equity_at_entry"] == pytest.approx(98_900.0, rel=1e-9), (
             "a re-sized order records the basis its quantity was computed "
-            "from (99k at fill), not the creation-time figure (100k)"
+            "from (98.9k at fill), not the creation-time figure (100k)"
         )
 
     def test_resized_limit_order_records_its_fill_time_basis(self, tmp_path: Path):
@@ -520,17 +524,18 @@ class TestSizingEquityExcludesUnrealizedPnl:
         been paid for the legs it has already taken — so the next entry may
         not size on cash that is still owed to it.
 
-        Entry 1 (500 shares @ 100, fee_rate 0.001) takes half off at 105: the
-        realized leg books 1,250 gross. By the time entry 2 is sized on the
-        next bar the fee model has incurred, and nothing else:
+        Entry 1 (500 shares @ 100, fee_rate 0.001) takes half off at 105: bar
+        2 OPENS at 106, beyond the level, so the rung gaps through and fills
+        at the open — 250 x 6 = 1,500 gross. By the time entry 2 is sized on
+        the next bar the fee model has incurred, and nothing else:
 
         - the entry leg on the ORIGINAL 500 shares, 0.001 x 100 x 500 = 50,
-        - the exit leg of the 250 shares that closed, 0.001 x 105 x 250
-          = 26.25.
+        - the exit leg of the 250 shares that closed, 0.001 x 106 x 250
+          = 26.5.
 
         The exit leg of the 250 still-open shares is a future cost the
         position has not incurred, so it is NOT held back. Basis = 100,000 +
-        1,250 − 76.25 = 101,173.75, and entry 2 risks 1% of that over the 2%
+        1,500 − 76.5 = 101,423.5, and entry 2 risks 1% of that over the 2%
         fallback stop (2.1).
         """
         frame = pd.DataFrame(
@@ -580,13 +585,13 @@ class TestSizingEquityExcludesUnrealizedPnl:
             "the 50% rung closes 250 of the 500 shares"
         )
         second = engine.closed_trades[1]
-        assert second.meta["equity_at_entry"] == pytest.approx(101_173.75, rel=1e-9), (
+        assert second.meta["equity_at_entry"] == pytest.approx(101_423.5, rel=1e-9), (
             "the sizing basis is realized cash less the fees already incurred: "
-            "100,000 + 1,250 gross − 50 entry − 26.25 exit = 101,173.75"
+            "100,000 + 1,500 gross − 50 entry − 26.5 exit = 101,423.5"
         )
-        assert second.quantity == pytest.approx(1011.7375 / 2.1, rel=1e-9), (
-            "entry 2 sizes from 101,173.75, not from the gross 101,250 the "
-            "ledger holds before any fee is charged, and not from 101,147.5 "
+        assert second.quantity == pytest.approx(1014.235 / 2.1, rel=1e-9), (
+            "entry 2 sizes from 101,423.5, not from the gross 101,550 the "
+            "ledger holds before any fee is charged, and not from 101,397 "
             "which would wrongly hold back the remainder's future exit fee"
         )
 

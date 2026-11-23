@@ -115,9 +115,10 @@ def _apply_fill_parity(
       column is configured AND the entry bar is locatable — otherwise the
       engine price stands (default off = unchanged behavior).
     - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
-      follow ``signal_exit_fill``: "close" (default) fills at the exit bar's
-      close, "open" at its open; SHORT open-exits pay the spread (ask).
-      Level exits keep the engine price (stop-market fills at the level).
+      follow the ``close`` fill: the recorded leg bar's close (the only
+      mode this frozen adapter accepts — ``next_open`` is refused and the
+      ``open`` mode was removed, issue #153). Level exits keep the engine
+      price (stop-market fills at the level).
     - Touched legs get their pnl recomputed from the new prices so
       trade.pnl stays consistent ahead of risk sizing.
 
@@ -129,7 +130,14 @@ def _apply_fill_parity(
     """
     if not trades or df is None or df.empty or "timestamp" not in df.columns:
         return
-    fill_at_open = str(getattr(config, "signal_exit_fill", "close") or "close").lower() == "open"
+    # Only the legacy "close" fill reaches this frozen adapter:
+    # _frozen_signal_exit_fill refuses "next_open" and normalize_signal_exit_fill
+    # rejects the removed "open" mode (issue #153), so non-level legs always
+    # re-price at the recorded leg bar's close. Normalizing here keeps the
+    # helper loud even when the config bypassed pydantic validation.
+    contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
     timestamp_series = df["timestamp"]
     for trade in trades:
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
@@ -153,14 +161,9 @@ def _apply_fill_parity(
                 continue
             row = df.iloc[exit_idx]
             try:
-                if fill_at_open:
-                    base = float(row["open"])
-                else:
-                    base = float(row["close"])
+                base = float(row["close"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if fill_at_open and trade.direction == "SHORT":
-                base += _pyne_bar_spread(row, parameters)
             leg.price = round(base, 6)
         try:
             total = 0.0
@@ -242,6 +245,31 @@ def _pyne_cli_start_bound(start_date: str) -> str:
     return raw
 
 
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Refuse the native-only ``next_open`` exit model on this frozen adapter.
+
+    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    keep their existing semantics until removal and get fail-loud guards, not
+    silent re-interpretation. ``next_open`` is the native default, so a
+    ``BacktestConfig`` that never touched the field would otherwise simulate
+    the legacy signal-bar fill while the persisted meta claimed otherwise —
+    refuse instead of warn-and-run.
+    """
+    # normalize first: a config that bypassed BacktestConfig validation still
+    # fails loudly on the removed "open" mode (issue #153) instead of silently
+    # keeping an unsupported fill.
+    mode = contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
+    if mode == contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
+        raise ValueError(
+            "engine 'pynecore' does not implement signal_exit_fill='next_open'; "
+            "frozen engines keep their legacy signal-bar fill — pass "
+            "signal_exit_fill='close' explicitly, or run the native engine"
+        )
+    return config
+
+
 class PyneCoreAdapter(EngineAdapter):
     """Adapter for PyneCore-based Pine-style backtesting."""
 
@@ -256,6 +284,7 @@ class PyneCoreAdapter(EngineAdapter):
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         # #84: missing fee/slippage config is a hard error, never silent gross.

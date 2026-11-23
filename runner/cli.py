@@ -34,6 +34,7 @@ from runner.engines.base import (
     resolve_strategy_parameters,
     warn_if_engine_frozen,
 )
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.promotion_cli import add_promote_parser
 from runner.slippage import SLIPPAGE_CAPABLE_ENGINES, assert_slippage_supported
 from runner.stats import merge_canonical_stats
@@ -270,6 +271,14 @@ def cmd_run(args):
             max_position_exposure_pct=getattr(args, "max_position_exposure_pct", None),
             max_leverage=getattr(args, "max_leverage", None),
             modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
+            # Frozen engines refuse next_open; when the operator did not pick
+            # a fill, declare the legacy close fill they actually simulate so
+            # the persisted meta stays truthful. An explicit --signal-exit-fill
+            # is passed through (next_open on a frozen engine then fails loud).
+            signal_exit_fill=(
+                str(getattr(args, "signal_exit_fill", "") or "").strip().lower()
+                or default_signal_exit_fill_for_engine(engine.name)
+            ),
             data_dir=args.data_dir or "",
             parameters=resolved_parameters,
         )
@@ -730,6 +739,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Intrabar exit modeling: main_timeframe, open_close, or explicit finer timeframe",
     )
     run_p.add_argument("--name", "-n", help="Strategy name (default: filename)")
+    run_p.add_argument(
+        "--signal-exit-fill",
+        default="",
+        choices=["", "next_open", "close"],
+        help=(
+            "Signal-exit fill convention. Default: 'next_open' on native; the "
+            "frozen engines (vectorbt, pynecore, lean) only implement the legacy "
+            "signal-bar fills and default to 'close' — they refuse 'next_open'"
+        ),
+    )
     run_p.add_argument("--output", "-o", help="Output file path")
     run_p.add_argument("--result-id", help="Persisted BacktestMeta.id override")
     run_p.add_argument(

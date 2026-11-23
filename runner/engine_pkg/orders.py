@@ -48,3 +48,7 @@ class Position:
     mae: float = 0.0
     mfe: float = 0.0
     meta: dict[str, Any] = field(default_factory=dict)
+    # Set once ``_finalize_position`` has booked the trade: the parked
+    # signal-exit remainder path finalizes inside ``_close_at_open_for_signal``
+    # and the caller's shared finalize must not book it a second time.
+    finalized: bool = False

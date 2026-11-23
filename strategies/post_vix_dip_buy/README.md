@@ -3,7 +3,7 @@
 ## Quelle
 - Original: Pine Script v5 `post vix dip buy pine.txt` (Post-VIX Panic Intraday Long v4 [Dip + ORB Hybrid])
 - Discord: `https://discord.com/channels/1230977283888648315/1458625986039119982/1458626059988762696`
-- Konvertiert: 2026-03-08, source-faithful Rewrite: 2026-09-09
+- Konvertiert: 2026-03-08, source-faithful Rewrite: 2026-09-09; Version 1.2.0: Clock-Exits eine Bar frueher fuer Next-Open-Fills
 
 ## Kernlogik
 
@@ -21,8 +21,8 @@ Die VIX-Reihe wird aus lokalem `VIX/1d.parquet` auf die SPY-Bars gemappt.
 
 ### Exit
 1. Stop-Loss `-0.3%` ab Entry (`low <= entry * 0.997`), Take-Profit `+2%` (`high >= entry * 1.02`); gleichbarige Treffer: Stop zuerst (konservativ).
-2. Power-Hour-Scale ab 14:00 NY: als **Voll**-Exit mit Reason `scale_50pct_power_hour` modelliert (vectorbt kennt keine Partial Fills; dokumentierte Approximation der 50 %-Skalierung).
-3. EOD-Flatten ab 15:50 NY (`eod_flatten`).
+2. Power-Hour-Scale zum 14:00-NY-Open (Signal-Exits fuellen am naechsten Bar-Open, `next_open`; das Signal geht auf der ersten Bar raus, deren Ende 14:00 erreicht, Bar-Abstand je NY-Tag; kein expliziter `exit_price`): als **Voll**-Exit mit Reason `scale_50pct_power_hour` modelliert (vectorbt kennt keine Partial Fills; dokumentierte Approximation der 50 %-Skalierung).
+3. EOD-Flatten zum 15:50-NY-Open (`eod_flatten`, gleiche Regel). Eine am naechsten NY-Tag noch offene Position (fehlende Bars) wird auf dessen erster Bar geflattet (`eod_flatten`).
 
 ### Stop-Loss
 `sl_price = entry * (1 - 0.3 %)`, `tp_price = entry * (1 + 2 %)` stehen als Indikatoren fuer Sizing/intrabar-Aufloesung bereit.

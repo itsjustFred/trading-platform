@@ -946,23 +946,14 @@ def attach_daily_equity(
     preserved_curve = _windowed_curve(result, effective_start, effective_end)
     result.meta.data = result.meta.data or {}
     result.meta.data["daily_equity_curve"] = [point.to_dict() for point in daily_points]
-    if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):
-        result.equity_curve = preserved_curve
-        _attach_daily_stats(
-            result,
-            daily_returns,
-            equity_frequency=_curve_frequency(preserved_curve),
-        )
-        return result
-
-    # The engine curve may still be worth adopting even when it is too sparse
-    # to pass the density gate above: a reconciling curve carries the
-    # mark-to-market path of open positions, which the calendar fill (built
-    # from closed trades only) cannot see. Gated on being non-endpoint-only and
-    # on reconciling with the net ledger within the derived tolerance.
-    # The window end is the explicit bound when one was requested, else the
-    # artifact's own `backtest_end` — the same window `build_daily_equity_curve`
-    # filled, so both paths publish the same period.
+    # An engine curve is mark-to-market. Compact it to the published daily
+    # series up front: whichever of the two adoption paths below applies, the
+    # published `daily_returns` / `daily_equity_curve` must describe the SAME
+    # equity path as `result.equity_curve` (the calendar fill only sees closed
+    # trades, so on its own it would publish a realized-only series next to a
+    # mark-to-market curve). The window end is the explicit bound when one was
+    # requested, else the artifact's own `backtest_end` — the same window
+    # `build_daily_equity_curve` filled, so both paths publish the same period.
     window_end = end_bound if end_bound is not None else _parse_ts(result.meta.backtest_end)
     engine_reconciliation: dict[str, Any] = {}
     engine_daily = _daily_points_from_engine_curve(
@@ -972,6 +963,27 @@ def attach_daily_equity(
         starting_equity=window_start.equity,
         reconciliation=engine_reconciliation,
     )
+    if _preserves_engine_curve(preserved_curve, daily_points, scoped_result.trades):
+        result.equity_curve = preserved_curve
+        published_returns = daily_returns
+        if engine_daily is not None:
+            engine_points, published_returns = engine_daily
+            result.meta.data[ENGINE_CURVE_RECONCILIATION_KEY] = engine_reconciliation
+            result.meta.data["daily_equity_curve"] = [
+                point.to_dict() for point in engine_points
+            ]
+        _attach_daily_stats(
+            result,
+            published_returns,
+            equity_frequency=_curve_frequency(preserved_curve),
+        )
+        return result
+
+    # The engine curve may still be worth adopting even when it is too sparse
+    # to pass the density gate above: a reconciling curve carries the
+    # mark-to-market path of open positions, which the calendar fill (built
+    # from closed trades only) cannot see. Gated on being non-endpoint-only and
+    # on reconciling with the net ledger within the derived tolerance.
     if engine_daily is not None:
         engine_points, engine_returns = engine_daily
         result.equity_curve = engine_points

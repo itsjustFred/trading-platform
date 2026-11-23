@@ -37,12 +37,14 @@ and regime multipliers; none of that is single-symbol-expressible:
 
 STRATEGY_META = {
     "name": "Gold Momentum",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://github.com/desenyon/quantconnect-strategies/blob/main/gold_momentum_strategy.py",
     "notes": (
         "Single-symbol proxy of desenyon's GoldMomentumStrategy. "
         "Source-exact: MACD 12/26/9, Wilder RSI14, Wilder ATR14, "
         "BB(20, 2), continuous momentum score with source weights. "
+        "1.2.0: the score-reversal exit is a market exit with no "
+        "exit_price=close (fills at the next open). "
         "Dropped (not single-symbol-expressible): TLT leg, "
         "volatility targeting, regime multipliers, 40 % position cap. "
         "ATR stop is opt-in only (default OFF)."
@@ -155,11 +157,15 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if stop_hit or score_exit_hit:
                 in_trade = False
                 exits.iloc[i] = True
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The score reversal is a close-triggered MARKET exit:
+                # no explicit exit_price, so it fills at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
                 else:
-                    exit_price.iloc[i] = float(close.iloc[i])
                     exit_reason.iloc[i] = "score_reversal"
                 active_stop = np.nan
 
