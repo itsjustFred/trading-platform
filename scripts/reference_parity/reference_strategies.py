@@ -272,10 +272,10 @@ def run_reference(
     unsettled, _ = _run_once(
         strategy, data, commission=commission, fractional=fractional, finalize_trades=False
     )
-    unsettled_keys = set(zip(unsettled["EntryTime"], unsettled["EntryPrice"]))
+    unsettled_keys = set(zip(unsettled["EntryTime"], unsettled["EntryPrice"], strict=True))
     forced_keys = {
         key
-        for key in zip(trades["EntryTime"], trades["EntryPrice"])
+        for key in zip(trades["EntryTime"], trades["EntryPrice"], strict=True)
         if key not in unsettled_keys
     }
 
@@ -287,11 +287,11 @@ def run_reference(
     trades["quantity"] = trades["Size"].abs()
     trades["gross_pnl"] = trades["PnL"] + trades["Commission"]
     is_forced = np.array(
-        [key in forced_keys for key in zip(trades["EntryTime"], trades["EntryPrice"])]
+        [key in forced_keys for key in zip(trades["EntryTime"], trades["EntryPrice"], strict=True)]
     )
     trades["exit_kind"] = [
         _classify_exit(frame, row, forced)
-        for (_, row), forced in zip(trades.iterrows(), is_forced)
+        for (_, row), forced in zip(trades.iterrows(), is_forced, strict=True)
     ]
     trades = trades[
         [

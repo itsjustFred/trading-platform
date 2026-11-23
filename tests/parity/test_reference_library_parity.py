@@ -186,7 +186,7 @@ def test_bracket_trades_match_the_reference_exactly(runs, slug):
     engine = runs[slug]
     assert len(full) == MANIFEST["runs"][slug]["trades"]
     assert len(engine.trades) == len(ref), "only the stopped-at-entry round trips may be absent"
-    for number, (trade, (_, row)) in enumerate(zip(engine.trades, ref.iterrows())):
+    for number, (trade, (_, row)) in enumerate(zip(engine.trades, ref.iterrows(), strict=True)):
         context = f"{slug} trade {number}"
         assert trade.direction == row["side"], context
         assert _ts(trade.entry_time) == row["entry_time"], context
@@ -259,7 +259,7 @@ def test_smacross_entries_and_signal_exits_match_exactly(runs, slug):
     ref = _reference(slug)
     engine = runs[slug]
     assert len(engine.trades) == len(ref) == MANIFEST["runs"][slug]["trades"]
-    for number, (trade, (_, row)) in enumerate(zip(engine.trades, ref.iterrows())):
+    for number, (trade, (_, row)) in enumerate(zip(engine.trades, ref.iterrows(), strict=True)):
         context = f"{slug} trade {number}"
         assert trade.direction == row["side"] == "LONG", context
         # entry: both frameworks fill the next bar's open -> identical time and price
@@ -278,7 +278,7 @@ def test_zero_fee_run_is_identical_trade_by_trade_and_in_final_equity(runs):
     ref = _reference("smacross_zero_fee")
     engine = runs["smacross_zero_fee"]
     cash = CASH
-    for number, (trade, (_, row)) in enumerate(zip(engine.trades, ref.iterrows())):
+    for number, (trade, (_, row)) in enumerate(zip(engine.trades, ref.iterrows(), strict=True)):
         assert trade.quantity == pytest.approx(cash / trade.entry_price, rel=1e-9)
         assert trade.quantity == pytest.approx(row["quantity"], rel=1e-6), number
         assert float(trade.net_pnl) == pytest.approx(row["net_pnl"], rel=1e-6, abs=1e-3), number

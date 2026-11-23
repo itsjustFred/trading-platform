@@ -323,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             "library_strategy": strategy_name,
             "commission": commission,
             "size_fraction": reference_size_fraction(strategy),
-            "trades": int(len(trades)),
+            "trades": len(trades),
             "final_equity": float(final_equity),
             "exit_kinds": {
                 str(kind): int(count)
