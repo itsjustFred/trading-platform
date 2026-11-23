@@ -167,6 +167,110 @@ def test_unscored_everywhere_is_unknown() -> None:
     assert rows[0].blocked
 
 
+def _fetch_by_id(records_by_id: dict[str, Any], failures: dict[str, Exception]):
+    """fetch_json fake keyed on the candidate id at the end of the URL."""
+
+    def fetch(url: str) -> Any:
+        candidate = url.rsplit("/", 1)[-1]
+        if candidate in failures:
+            raise failures[candidate]
+        return records_by_id[candidate]
+
+    return fetch
+
+
+def test_unfetchable_alias_fails_closed_despite_low_scored_primary() -> None:
+    """#298 review: a candidate that cannot be fetched may carry the HIGH
+    score, so the finding is UNKNOWN (blocked) even though the resolved
+    primary scores below the threshold."""
+    import urllib.error
+
+    report = _report(("demo", "1.0", [_vuln("PYSEC-1", ["GHSA-x"])]))
+    fetch = _fetch_by_id(
+        {"PYSEC-1": _osv_record(MODERATE_VECTOR, vuln_id="PYSEC-1")},
+        {"GHSA-x": urllib.error.URLError("timed out")},
+    )
+    rows = gate.evaluate(
+        gate._findings_from_report(report),
+        threshold=7.0,
+        osv_url="https://osv.test",
+        fetch_json=fetch,
+    )
+    assert rows[0].score is None
+    assert rows[0].blocked
+
+
+def test_osv_404_is_absence_not_a_fetch_failure() -> None:
+    """A 404 means OSV has no such id: the finding is scored on the
+    primary alone instead of going UNKNOWN."""
+    import urllib.error
+
+    report = _report(("demo", "1.0", [_vuln("PYSEC-1", ["GHSA-gone"])]))
+    fetch = _fetch_by_id(
+        {"PYSEC-1": _osv_record(MODERATE_VECTOR, vuln_id="PYSEC-1")},
+        {
+            "GHSA-gone": urllib.error.HTTPError(
+                "https://osv.test/v1/vulns/GHSA-gone", 404, "Not Found", {}, None
+            )
+        },
+    )
+    rows = gate.evaluate(
+        gate._findings_from_report(report),
+        threshold=7.0,
+        osv_url="https://osv.test",
+        fetch_json=fetch,
+    )
+    assert rows[0].score == pytest.approx(3.1)
+    assert not rows[0].blocked
+
+
+def test_osv_5xx_fails_closed() -> None:
+    """A server error is not absence: the unseen record may score HIGH."""
+    import urllib.error
+
+    report = _report(("demo", "1.0", [_vuln("PYSEC-1", ["GHSA-x"])]))
+    fetch = _fetch_by_id(
+        {"PYSEC-1": _osv_record(MODERATE_VECTOR, vuln_id="PYSEC-1")},
+        {
+            "GHSA-x": urllib.error.HTTPError(
+                "https://osv.test/v1/vulns/GHSA-x", 503, "Unavailable", {}, None
+            )
+        },
+    )
+    rows = gate.evaluate(
+        gate._findings_from_report(report),
+        threshold=7.0,
+        osv_url="https://osv.test",
+        fetch_json=fetch,
+    )
+    assert rows[0].score is None
+    assert rows[0].blocked
+
+
+@pytest.mark.parametrize("bad_threshold", ["nan", "inf", "-inf", "-0.1", "10.1", "1e309"])
+def test_main_rejects_non_cvss_threshold(tmp_path, bad_threshold) -> None:
+    """NaN makes every `score >= threshold` comparison False - a silent
+    off switch - and out-of-range bounds are meaningless for CVSS. The
+    report is valid and clean, so without the check the gate would exit 0."""
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps(_report(("demo", "1.0", [_vuln("PYSEC-ok")]))),
+        encoding="utf-8",
+    )
+    records = {
+        "PYSEC-ok": _osv_record(
+            "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:L"
+        )
+    }
+    assert (
+        gate.main(
+            [str(report_path), f"--threshold={bad_threshold}"],
+            records=records,
+        )
+        == 2
+    )
+
+
 def test_main_exit_codes(tmp_path, capsys) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(

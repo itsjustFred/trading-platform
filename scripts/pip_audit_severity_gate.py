@@ -194,41 +194,67 @@ def _fetch_json(url: str) -> Any:
 def _make_lookup(
     osv_url: str,
     fetch_json: Callable[[str], Any],
-) -> Callable[[str, tuple[str, ...]], list[dict[str, Any]]]:
+) -> Callable[[str, tuple[str, ...]], tuple[list[dict[str, Any]], bool]]:
     """OSV record lookup by vuln id with alias fallback, cached across calls.
 
-    Returns *every* candidate record that resolved, not just the first:
-    aliases are scored alongside the primary id (see :func:`_best_score`).
+    Returns ``(records, fetch_failed)``: *every* candidate record that
+    resolved (aliases are scored alongside the primary id, see
+    :func:`_best_score`) plus whether any candidate could not be fetched
+    at all. A 404 means OSV has no such id, so the candidate is skipped;
+    any other failure - timeout, 5xx, connection error, undecodable or
+    non-object body - means a possibly higher-scored record went unseen,
+    so the finding's severity is UNKNOWN and the gate fails closed.
     """
     cache: dict[str, dict[str, Any] | None] = {}
+    failed: set[str] = set()
     lock = threading.Lock()
 
-    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> list[dict[str, Any]]:
+    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> tuple[list[dict[str, Any]], bool]:
         candidates = tuple(dict.fromkeys((vuln_id, *aliases)))
         with lock:
             pending = [c for c in candidates if c not in cache]
         for candidate in pending:
+            candidate_failed = False
             try:
                 record = fetch_json(f"{osv_url}/v1/vulns/{candidate}")
+                if not isinstance(record, dict):
+                    record = None
+                    candidate_failed = True
+            except urllib.error.HTTPError as exc:
+                # 404 = OSV has no such id: a real "no record", skip it.
+                # Anything else (5xx, ...) is a fetch failure, not absence.
+                record = None
+                candidate_failed = exc.code != 404
             except (urllib.error.URLError, TimeoutError, ValueError):
                 record = None
+                candidate_failed = True
             with lock:
-                cache[candidate] = record if isinstance(record, dict) else None
+                cache[candidate] = record
+                if candidate_failed:
+                    failed.add(candidate)
         with lock:
-            return [cache[c] for c in candidates if cache.get(c) is not None]
+            return (
+                [cache[c] for c in candidates if cache.get(c) is not None],
+                any(c in failed for c in candidates),
+            )
 
     return lookup
 
 
 def _records_lookup(
     records: dict[str, dict[str, Any] | None],
-) -> Callable[[str, tuple[str, ...]], list[dict[str, Any]]]:
-    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> list[dict[str, Any]]:
-        return [
-            record
-            for candidate in dict.fromkeys((vuln_id, *aliases))
-            if (record := records.get(candidate)) is not None
-        ]
+) -> Callable[[str, tuple[str, ...]], tuple[list[dict[str, Any]], bool]]:
+    """Injected-record lookup: a missing key is OSV-absent, never a fetch failure."""
+
+    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> tuple[list[dict[str, Any]], bool]:
+        return (
+            [
+                record
+                for candidate in dict.fromkeys((vuln_id, *aliases))
+                if (record := records.get(candidate)) is not None
+            ],
+            False,
+        )
 
     return lookup
 
@@ -248,14 +274,18 @@ def evaluate(
         else _make_lookup(osv_url, fetch_json)
     )
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
-        osv_records = list(pool.map(lambda f: lookup(f.vuln_id, f.aliases), findings))
+        lookups = list(pool.map(lambda f: lookup(f.vuln_id, f.aliases), findings))
     return [
         FindingResult(
             finding=finding,
-            score=_best_score(records_for_finding),
+            # A candidate that could not be fetched may carry a higher
+            # score than the ones that resolved: UNKNOWN, fail closed.
+            score=None if fetch_failed else _best_score(records_for_finding),
             threshold=threshold,
         )
-        for finding, records_for_finding in zip(findings, osv_records, strict=True)
+        for finding, (records_for_finding, fetch_failed) in zip(
+            findings, lookups, strict=True
+        )
     ]
 
 
@@ -274,6 +304,16 @@ def main(
     )
     parser.add_argument("--osv-url", default=DEFAULT_OSV_URL)
     args = parser.parse_args(argv)
+
+    # CVSS base scores span 0.0-10.0; a NaN comparison is always False and
+    # an out-of-range bound is a silent off switch, so refuse both.
+    if not math.isfinite(args.threshold) or not 0.0 <= args.threshold <= 10.0:
+        print(
+            f"--threshold must be a finite CVSS base score in [0, 10], "
+            f"got {args.threshold!r}",
+            file=sys.stderr,
+        )
+        return 2
 
     report_path = args.report.expanduser().resolve()
     if report_path.suffix.lower() != ".json":
