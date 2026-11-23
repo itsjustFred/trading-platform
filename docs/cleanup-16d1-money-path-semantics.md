@@ -312,9 +312,12 @@ Sharpe though both surface under the name "sharpe".
 
 **Decision:** per-observation mean/std scaled by
 `sqrt(periods_per_year)`, with the cadence inferred from the aligned equity
-timestamps (median spacing; calendar-daily curves map to the 252
-trading-period convention; sub-daily scales proportionally; fallback 252).
-Both `sharpe` and `oos_sharpe` in the payload are annualized.
+timestamps. Since #353 the periods-per-year is the *measured* observation
+density of the combined curve's actual timestamps
+(``runner.stats.return_periods_per_year``): crypto books measure ~365/366
+calendar days, equity books their observed trading-day density, and mixed
+books whatever the combined timestamps carry; unmeasurable timestamps fall
+back to 252. Both `sharpe` and `oos_sharpe` in the payload are annualized.
 
 **Pinned by:** `tests/test_portfolio_sharpe_annualization.py::TestPortfolioSharpeAnnualized`.
 
@@ -427,16 +430,27 @@ documented semantics fixes.
 
 ## D8 appendix — annualization cadence
 
-`_infer_portfolio_periods_per_year` infers the annualization period count
-from the median equity-point spacing: equity points spaced more than ~8.7
-hours apart are treated as daily-or-coarser and map to the 252 convention;
-faster cadences scale linearly (4-hourly points → ≈2192, hourly → ≈8766).
-There is no artificial ceiling: clamping an intraday curve's period count
-(the earlier `252 × 4` ≈ 1008 cap) would understate the annualization
-relative to the daily-resampled convention stats.py reports — a 4-hourly
-curve annualized with sqrt(1008) ≈ sqrt(6) too small. Sub-hourly curves
-still need enough bars for the per-observation mean/std to be meaningful,
-which is a sample-size question the cadence cap never addressed.
+`_infer_portfolio_periods_per_year` annualises at the measured observation
+density of the aligned equity curve's actual timestamps (#353,
+`runner.stats.return_periods_per_year`): each consecutive equity pair is
+one return observation stamped at the later point, and the density is the
+interval count over the span measured in calendar years (365, or 366
+across a leap day) — intervals, not a padded day-count, so an hourly
+curve measures ~8760/8784 and a weekly curve ~52 rather than a biased
+span ratio. A calendar-daily crypto book therefore measures ~365/366, a
+business-day equity book its observed trading-day density (~250-262
+depending on the calendar), an intraday book its measured intraday
+density, and a mixed book whatever the combined timestamps carry. When
+the timestamps carry no usable cadence the fallback is 252. There is no
+artificial ceiling: clamping an intraday curve's period count (the
+earlier `252 × 4` ≈ 1008 cap) would understate the annualization. Note
+this measured density is deliberately NOT the convention `runner.stats`
+uses for its own reported Sharpe, which keeps the fixed #229
+asset-class factors (252 equities/FX, 365 all-crypto): an FX book
+therefore annualises ~1.6% higher here than in the reported stats, and a
+leap-year crypto book 366 vs 365. Sub-hourly curves still need enough
+bars for the per-observation mean/std to be meaningful, which is a
+sample-size question the cadence cap never addressed.
 
 ## D11 appendix — vectorbt bar-count reload
 
