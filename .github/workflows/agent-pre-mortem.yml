@@ -197,7 +197,7 @@ env:
   # human reads a log. So a bump means reading the extraction below against the new version's
   # output before it lands, not after.
   OPENCODE_VERSION: "2.2.7"
-  MODEL: nvidia/stepfun-ai/step-5-preview  # TEMP: PR-only NVIDIA trial, reverted before merge
+  MODEL: nvidia/nvidia/nemotron-3-ultra-550b-a55b  # TEMP: PR-only NVIDIA trial, reverted before merge
   VARIANT: ${{ vars.PREMORTEM_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-pre-mortem/SKILL.md
   PREMORTEM_CONTEXT: agent/pre-mortem
