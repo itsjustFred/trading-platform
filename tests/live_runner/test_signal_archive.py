@@ -14,6 +14,7 @@ import pytest
 
 import live_runner.daemon as daemon
 import live_runner.signal_archive as sa
+from live_runner.shutdown import ShutdownCoordinator
 from live_runner.signal_archive import (
     SignalArchive,
     SignalDecisionRecorder,
@@ -24,6 +25,15 @@ from live_runner.signal_archive import (
 from live_runner.signal_sources.discord_source import DiscordSignalSource
 from risk import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_wide_coordinator(monkeypatch: pytest.MonkeyPatch) -> ShutdownCoordinator:
+    """``run_daemon`` leaves the process-wide gate closed; never leak that to other tests."""
+    fresh = ShutdownCoordinator(force_exit_fn=lambda code: pytest.fail("forced exit"))
+    monkeypatch.setattr(daemon, "_SHUTDOWN", fresh)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", fresh)
+    return fresh
 
 
 @pytest.fixture
@@ -491,7 +501,7 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     )
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", _Scheduler)
-    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda: object())
+    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda **_kwargs: object())
     monkeypatch.setattr(daemon, "sync_deployments_loop", _sync_loop)
     monkeypatch.setattr(daemon, "sync_services_loop", _noop_loop)
     monkeypatch.setattr(daemon, "_poll_balances", _noop_loop)

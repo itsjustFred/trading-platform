@@ -119,10 +119,15 @@ class TestArgumentParsing:
         from live_runner import daemon
 
         started: list[str] = []
+        exits: list[int] = []
         monkeypatch.setattr(daemon, "run_daemon", _recording_run_daemon(started))
+        # ``daemon.main`` leaves through ``os._exit`` on every real path; record
+        # the verdict instead of exiting the test process.
+        monkeypatch.setattr(daemon, "_leave_the_process", lambda code: exits.append(code))
 
         assert daemon_cli.main([]) == 0
         assert started == ["run_daemon"]
+        assert exits == [0]
 
 
 class TestSingleInstanceGuard:
