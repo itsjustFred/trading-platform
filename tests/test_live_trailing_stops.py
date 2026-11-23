@@ -654,13 +654,12 @@ def test_capability_and_central_broker_table_agree() -> None:
     assert adapter_live_trailing_modes(alpaca) == {"none", "percent"}
 
     assert CTraderLiveAdapter.broker_name == "ctrader"
-    assert CTraderLiveAdapter.supports_stop_amendment is BaseLiveAdapter.supports_stop_amendment
-    ctrader = SimpleNamespace(broker_name="ctrader", supports_stop_amendment=False)
+    # cTrader can amend a stop in place (#168), but that capability exists for
+    # the supertrend-flip workflow only: the central trailing-mode table still
+    # keeps cTrader on {"none"}, so `percent` trailing stays off for it.
+    assert CTraderLiveAdapter.supports_stop_amendment is not BaseLiveAdapter.supports_stop_amendment
+    ctrader = SimpleNamespace(broker_name="ctrader", supports_stop_amendment=True)
     assert adapter_live_trailing_modes(ctrader) == {"none"}
-    # Even a cTrader adapter that claimed the capability stays on the table's answer.
-    assert adapter_live_trailing_modes(
-        SimpleNamespace(broker_name="ctrader", supports_stop_amendment=True)
-    ) == {"none"}
 
     assert "percent" in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER[AlpacaLiveAdapter.broker_name]
     assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["ctrader"] == {"none"}
