@@ -1096,6 +1096,11 @@ def _build_signal_metadata(
         # requires the key -- refuses with an operator-visible warning rather
         # than trading a message whose age nobody can establish.
         metadata["discord_received_at_unreadable"] = True
+    # #134: the local receipt time, distinct from the Discord message time
+    # above. Stamped here, at the moment this process handles the message -
+    # the candle-close wait and dispatch happen later, so the two must not
+    # share one timestamp.
+    metadata["received_at_local"] = datetime.now(timezone.utc).isoformat()
     return metadata
 
 
@@ -1248,6 +1253,7 @@ def _parse_trade_signal_from_message(
         take_profit=levels.take_profit,
         timeframe=str(metadata["timeframe"]),
         metadata=metadata,
+        received_at_local=metadata.get("received_at_local"),
     )
 
 
@@ -1329,6 +1335,7 @@ def _build_exit_signal(
         take_profit=None,
         timeframe=str(metadata["timeframe"]),
         metadata=metadata,
+        received_at_local=metadata.get("received_at_local"),
     )
 
 

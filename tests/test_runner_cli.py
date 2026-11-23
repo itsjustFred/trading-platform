@@ -21,11 +21,12 @@ class _DummyEngine:
             meta=BacktestMeta(
                 id="cli-demo",
                 created_at="2026-03-09T10:00:00Z",
-                engine="vectorbt",
+                engine=self.name,
                 strategies=[config.strategy_name],
                 backtest_start=config.start_date,
                 backtest_end=config.end_date,
                 initial_capital=config.initial_capital,
+                signal_exit_fill=config.signal_exit_fill,
                 data={
                     "symbols": config.symbols,
                     "timeframes": [config.timeframe],
@@ -58,6 +59,42 @@ class _DummyEngine:
             ],
             stats={"engine_metric": 99, "total_pnl": -1.0},
         )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("fee_rate", -0.001),
+        ("fee_rate", float("nan")),
+        ("fee_rate", float("inf")),
+        ("fee_flat_per_trade", -1.0),
+        ("fee_flat_per_trade", float("nan")),
+        ("fee_flat_per_trade", float("inf")),
+    ],
+)
+def test_fee_cli_rejects_invalid_fee_values(attribute: str, value: float) -> None:
+    args = SimpleNamespace(
+        fee_rate=None,
+        fee_flat_per_trade=None,
+        fees_zero=False,
+    )
+    setattr(args, attribute, value)
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        runner_cli._fee_params_from_args(args)
+
+
+def test_fee_cli_accepts_valid_fee_values() -> None:
+    args = SimpleNamespace(
+        fee_rate=0.001,
+        fee_flat_per_trade=2.0,
+        fees_zero=False,
+    )
+
+    assert runner_cli._fee_params_from_args(args) == {
+        "fee_rate": 0.001,
+        "fee_flat_per_trade": 2.0,
+    }
 
 
 def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
@@ -577,3 +614,79 @@ def test_help_mentions_max_leverage_separately(capsys, monkeypatch):
     assert "--max-leverage controls leverage separately" in text, (
         "the help must route leverage semantics to --max-leverage"
     )
+
+
+def _cmd_run_args(output_path: Path, *, engine: str, signal_exit_fill: str = "") -> SimpleNamespace:
+    return SimpleNamespace(
+        engine=engine,
+        strategy="strategies/demo.py",
+        symbols=["AAPL"],
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-02-01",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        data_dir="",
+        params="{}",
+        name="demo",
+        output=str(output_path),
+        signal_exit_fill=signal_exit_fill,
+    )
+
+
+class _NativeDummyEngine(_DummyEngine):
+    name = "native"
+
+
+def test_cmd_run_vectorbt_defaults_signal_exit_fill_close(monkeypatch, tmp_path: Path):
+    """#208: a frozen engine with no explicit flag declares the legacy close
+    fill it actually simulates, and the persisted meta records it."""
+    output_path = tmp_path / "vbt-default.trades.json"
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    runner_cli.cmd_run(_cmd_run_args(output_path, engine="vectorbt"))
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["meta"]["signal_exit_fill"] == "close"
+
+
+def test_cmd_run_native_defaults_signal_exit_fill_next_open(monkeypatch, tmp_path: Path):
+    output_path = tmp_path / "native-default.trades.json"
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _NativeDummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    runner_cli.cmd_run(_cmd_run_args(output_path, engine="native"))
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["meta"]["signal_exit_fill"] == "next_open"
+
+
+def test_cmd_run_vectorbt_explicit_next_open_fails_loud(monkeypatch, tmp_path: Path):
+    """#208: ``--engine vectorbt --signal-exit-fill next_open`` must raise in
+    the real adapter guard, not silently simulate the legacy fill."""
+    from runner.engines.vectorbt_adapter import VectorbtAdapter
+
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: VectorbtAdapter())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    with pytest.raises(ValueError, match="next_open"):
+        runner_cli.cmd_run(
+            _cmd_run_args(
+                tmp_path / "vbt-next-open.trades.json",
+                engine="vectorbt",
+                signal_exit_fill="next_open",
+            )
+        )
+
+
+def test_default_signal_exit_fill_for_engine_covers_frozen_and_native():
+    from runner.engines.contract import default_signal_exit_fill_for_engine
+
+    assert default_signal_exit_fill_for_engine("native") == "next_open"
+    assert default_signal_exit_fill_for_engine("vectorbt") == "close"
+    assert default_signal_exit_fill_for_engine("pynecore") == "close"
+    assert default_signal_exit_fill_for_engine("lean") == "close"
+    assert default_signal_exit_fill_for_engine("something-else") == "next_open"

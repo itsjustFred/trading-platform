@@ -221,13 +221,35 @@ live, so its receive time bounds its age).
 Persisted on the signal metadata: `entry_quote_bid`, `entry_quote_ask`,
 `entry_quote_side`, `entry_quote_price`, `entry_quote_time` (ISO-8601),
 `entry_quote_time_source` (`broker` / `receive`), `entry_quote_age_seconds`,
-`max_entry_quote_age_seconds`, `entry_quote_source`,
-`entry_deviation_sl_fraction` (with sign), `entry_deviation_direction`
-(`toward_stop_loss` / `away_from_stop_loss` / `none`),
-`max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` for accepted
-signals; refused ones are not persisted yet, only logged).
-On entries, payload values under these keys are overwritten; on exits (which run no gate)
-they are removed. A schema for quote snapshots (of refused signals too) is #134.
+`max_entry_quote_age_seconds`, `entry_quote_source`, `entry_deviation_sl_fraction` (mit Vorzeichen),
+`entry_deviation_direction` (`toward_stop_loss` / `away_from_stop_loss` / `none`),
+`max_entry_deviation_sl_fraction`, `entry_gate_rejection_rule` (`None` bei
+akzeptierten Signalen).
+Bei Entries werden Payload-Werte unter diesen Keys überschrieben; bei Exits (die kein Gate durchlaufen) werden sie entfernt.
+
+Seit #134 ist das Quote-Snapshot zusätzlich als eigene Spalten auf
+`live_signals` projiziert (`entry_quote_bid/ask/side/price/time/source`,
+`entry_quote_time_source`), zusammen mit der Timing-Kette `producer_at`
+(Produktionszeitpunkt, z. B. Discord `created_at`), `message_received_at`
+(lokaler Empfang im Daemon) sowie `order_submitted_at`/`broker_ack_at`, die
+die Broker-Adapter um den Submit-Aufruf setzen und über
+`set_live_signal_broker_order_id` persistieren. Abgelehnte Signale landen in
+einer eigenen Tabelle `live_signal_rejections` (gleiche Quote-/Timing-Spalten,
+plus `stage`, `reason`, `gate_rejection_rule` und `dedupe_key`), nie in
+`live_signals` - eine Signal-Zeile behauptet, dass eine Order existieren
+kann, was Dedupe, Reconciliation und Recovery voraussetzen. Die Persistenz
+der Rejections ist best-effort: ein Fehler wird geloggt und ändert die
+Ablehnung nicht. Pro Fill werden `live_executions.order_type` und
+`requested_qty` gespeichert, soweit die Broker-Payload sie liefert.
+`list_live_signal_executions_for_deployments` zerlegt den Legacy-Slippage
+(`actual - theoretical`) in `signal_delay_bps` (Quote beim Submit vs.
+Signalpreis), `execution_slippage_bps` (Fill vs. dasselbe Quote) und
+`spread_bps` (die Spreadbreite, nicht additiv); alle drei sind
+adverse-positiv und einzeln `NULL`, wenn ihre Eingaben fehlen. Nur
+`signal_delay_bps + execution_slippage_bps` ergibt die Gesamtkosten - die
+Spread liegt in beiden Termen und würde doppelt gezählt. Ein Fill ohne nutzbares Quote-Snapshot setzt
+`quote_snapshot_missing=true` - fehlende Daten werden markiert, nie als 0
+gedeutet.
 
 ## Pre-Submit-Hart-Caps (#302)
 
