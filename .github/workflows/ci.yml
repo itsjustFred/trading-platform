@@ -29,6 +29,11 @@ jobs:
       # always required there and a permanent outage is noticed. A present
       # malformed slice still fails inside the tests either way.
       DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
+      # The web-strategy parity vendor data is downloaded, not committed (see
+      # scripts/fetch_parity_web_data.py and tests/parity/vendor_data.py). Same
+      # contract as the differential slice: cached path, warn-and-skip on pull
+      # requests when the download fails, required on push to main.
+      PARITY_VENDOR_DATA_DIR: ${{ github.workspace }}/.cache/parity-vendor
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -108,10 +113,41 @@ jobs:
             exit 0
           fi
           exit "$status"
+      - name: Restore the parity vendor data
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/parity-vendor
+          # The key hashes the fetch script and the code that defines the data
+          # contract (vendor_data.py read/validate rules, the Dukascopy
+          # downloader, the resampler and the session calendar the RTH filter
+          # uses). A change to any of them must regenerate the cache, not reuse
+          # files built under the old rules.
+          key: parity-vendor-${{ hashFiles('scripts/fetch_parity_web_data.py', 'tests/parity/vendor_data.py', 'data_tools/**/*.py', 'shared/market_calendar.py') }}
+      - name: Fetch the parity vendor data
+        if: runner.os == 'Linux'
+        id: fetch-parity
+        shell: bash
+        run: |
+          set +e
+          uv run --no-sync --no-build python -m scripts.fetch_parity_web_data --skip-if-valid
+          status=$?
+          set -e
+          # Exit 3 is a download failure with no usable cache. On pull requests
+          # (and workflow_dispatch) that warns and skips the real-data parity
+          # tests; on push to main the data is required, so the step - and the
+          # job - fails instead.
+          if [ "$status" -eq 3 ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "::warning::parity vendor data download failed; the real-data parity tests will skip."
+            echo "download_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$status"
       - name: Tests
         if: runner.os == 'Linux'
         env:
           REQUIRE_REAL_DATA_SLICE: ${{ steps.fetch-slice.outputs.download_failed == 'true' && '0' || '1' }}
+          REQUIRE_PARITY_VENDOR_DATA: ${{ steps.fetch-parity.outputs.download_failed == 'true' && '0' || '1' }}
         run: >-
           uv run --no-sync --no-build pytest -q -p no:cacheprovider -m "not slow"
           --ignore=tests/strategies

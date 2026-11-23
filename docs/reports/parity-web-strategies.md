@@ -22,8 +22,14 @@ Tolerances: price 1e-6, quantity 1e-6 relative, PnL 0.005, curve 0.02.
 `channel_breakout`, `trend_following` and `intraday_volatility_breakout` were reviewed
 and are not Turtle/ORB/Williams ideas. Data: SPY and GLD daily unadjusted OHLC
 2005-01-03..2023-12-29 (yfinance, 4781 bars each); Dukascopy USA500 CFD 1-minute data
-resampled to 5-minute regular-session bars, 2026-03-20..2026-05-15 (38 full sessions,
-2 partial sessions dropped). Fixtures are gzip CSVs in `tests/parity/fixtures/parity/` (210 KB total).
+resampled to 5-minute regular-session bars, 2026-03-20..2026-05-15 (every complete
+78-bar RTH session is kept; the retired committed fixture had dropped two days Dukascopy
+served partial — the regenerated window has 40 sessions). The vendor data is fetched on demand and cached, not
+committed (vendor data is licensed to be queried, not redistributed): run
+`python -m scripts.fetch_parity_web_data` to populate `$PARITY_VENDOR_DATA_DIR`
+(or `$DATA_DIR/parity_vendor`), which the tests read via `tests/parity/vendor_data.py`.
+A missing file skips on pull requests and fails when `REQUIRE_PARITY_VENDOR_DATA`
+is set (pushes to main).
 
 ## Parity results
 
@@ -54,13 +60,15 @@ v2 base with the old reference: 30 failed / 5 passed / 8 xfailed; before that on
 |---|---|---|---|---|---|
 | Turtle S1, SPY daily, 2 % risk, pyramiding | 355 | 355 | 0 | 49,215.24 | 52,508.22 |
 | Turtle S1, GLD daily | 318 | 318 | 0 | 78,117.72 | 103,326.02 |
-| ORB, USA500 5 min | 24 | 24 | 0 | 91,484.50 | 98,078.65 |
-| volatility_breakout v1.2.0, USA500 5 min | 125 | 125 | 0 | 104,329.46 | 102,067.12 (v1.1.0 timing, see below) |
+| ORB, USA500 5 min | 26 | 26 | 0 | 104,461.59 | 98,078.65 (retired 38-session fixture) |
+| volatility_breakout v1.2.0, USA500 5 min | 133 | 133 | 0 | 100,821.39 | 102,067.12 (v1.1.0 timing, retired fixture) |
 | Turtle single-unit synthetic, 12 seeds x 420 bars | match | match | 0 | | |
 | Turtle pyramiding synthetic, 6 seeds | match | match | 0 | | |
 | ORB / volatility_breakout synthetic sessions, 8 seeds each | match | match | 0 | | |
 | ORB legacy `signal_exit_fill="close"` opt-in, 2 seeds | match | match | 0 | | |
 | ORB last-bar signal exit -> flagged end-of-data close | match | match | 0 | | |
+
+USA500 rows regenerated on the on-demand fixture (40 complete RTH sessions; the retired committed fixture had 38), so the 5-minute trade counts and equity levels differ from the originally reported run — engine and reference still agree exactly on every trade and curve point.
 
 Event classes exercised and compared (counts from the reference):
 

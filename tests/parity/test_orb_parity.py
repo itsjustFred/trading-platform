@@ -50,8 +50,11 @@ def _run(tmp_path, frame, label, *, signal_exit_fill="next_open"):
 def test_orb_real_usa500_5m_parity(tmp_path):
     frame = frame_from_fixture("usa500_5m_rth.csv.gz")
     _sim, trades, run = _run(tmp_path, frame, "usa500")
-    assert len(trades) == 24
-    assert len(run.trades) == 24
+    # 26 trades on the fetched window: the on-demand fixture keeps every
+    # complete 78-bar RTH session (40 sessions, 2026-03-20..2026-05-15); the
+    # retired committed fixture had dropped two days Dukascopy served partial.
+    assert len(trades) == 26
+    assert len(run.trades) == 26
     reasons = {t.legs[-1].reason for t in trades}
     assert reasons == {"stop_loss", "signal"}
     # the published 4x leverage ceiling binds: notional == 4 x equity on most entries

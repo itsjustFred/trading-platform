@@ -554,7 +554,7 @@ def parse_bars(rows: Sequence[tuple[str, float, float, float, float]]) -> list[B
 
 
 def read_bars_csv(path) -> list[Bar]:
-    """Read a committed fixture (``timestamp,open,high,low,close,volume``)."""
+    """Read an OHLCV fixture CSV (``timestamp,open,high,low,close,volume``)."""
     import csv
 
     with open(path, newline="", encoding="utf-8") as handle:

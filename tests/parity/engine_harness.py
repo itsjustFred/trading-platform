@@ -1,7 +1,7 @@
 """Engine plumbing for the web-strategy parity tests.
 
 Everything in this module IS platform code (``runner.engines``): it loads a
-ported strategy and runs it through the native engine on a committed fixture,
+ported strategy and runs it through the native engine on a cached vendor fixture,
 then normalises the trades into the same shape the INDEPENDENT reference
 simulator in ``tests/parity/reference_execution.py`` produces, so a test can
 compare the two trade by trade without either side importing the other.
@@ -20,12 +20,16 @@ import pytest
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
 from tests.parity.reference_execution import Bar, RefLeg, RefTrade
+from tests.parity.vendor_data import load_vendor_frame
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STRATEGIES_DIR = REPO_ROOT / "strategies"
-FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "parity"
+
+#: Vendor fixtures are cached, not committed — see tests/parity/vendor_data.py.
+FETCH_HINT = "python -m scripts.fetch_parity_web_data"
+SUITE = "web"
 
 #: ``RiskConfig.max_total_exposure`` — the engine's aggregate open-risk ceiling.
 MAX_TOTAL_EXPOSURE = 0.05
@@ -41,12 +45,25 @@ class EngineRun:
     deferred_to_end: int = 0
 
 
+def _fixture_stem(name: str) -> str:
+    for suffix in (".csv.gz", ".csv"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def load_fixture(name: str) -> list[Bar]:
-    return _read_bars(FIXTURES_DIR / name)
-
-
-def _read_bars(path: Path) -> list[Bar]:
-    return pd.read_csv(path, parse_dates=["timestamp"])
+    frame = load_vendor_frame(SUITE, _fixture_stem(name), fetch_hint=FETCH_HINT)
+    return [
+        Bar(
+            time=_iso(row["timestamp"]),
+            open=float(row["open"]),
+            high=float(row["high"]),
+            low=float(row["low"]),
+            close=float(row["close"]),
+        )
+        for _, row in frame.iterrows()
+    ]
 
 
 def write_data_dir(tmp_path: Path, frame: pd.DataFrame, *, symbol: str, timeframe: str) -> Path:
@@ -199,7 +216,7 @@ def _iso(value) -> str:
 
 
 def frame_from_fixture(name: str) -> pd.DataFrame:
-    frame = pd.read_csv(FIXTURES_DIR / name, parse_dates=["timestamp"])
+    frame = load_vendor_frame(SUITE, _fixture_stem(name), fetch_hint=FETCH_HINT)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     return frame
 
