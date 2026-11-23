@@ -20,7 +20,10 @@ network access when every file is already present and valid, which is what CI
 uses on a cache hit. Exit status 3 specifically means a download failed, the
 signal CI uses to warn and skip the real-data parity scenarios on pull
 requests; on push to main the fetch step fails on a download error so the data
-is always required there. Validation failures and any other error exit 1 —
+is always required there. Incomplete downloads — missing sessions, missing
+rows, a truncated window — are download failures too (exit 3): the source did
+not deliver the data. Structural contract violations (bad columns,
+unparseable timestamps, bars on unexpected days) and any other error exit 1 —
 they are never a skip.
 """
 
@@ -148,16 +151,18 @@ def _validate_daily(stem: str, frame, start: str, end: str) -> None:
     if not expected:
         raise ParityFetchError(f"{stem}: no exchange sessions in {start}..{end}")
     # Exact completeness: a throttled or truncated yfinance answer must never
-    # be cached as valid — every scheduled session needs exactly one daily bar.
+    # be cached as valid — every scheduled session needs exactly one daily
+    # bar. Missing data is a download failure (exit 3), not a contract
+    # violation: the source simply did not deliver the window.
     if len(frame) != len(expected):
-        raise ParityFetchError(
+        raise ParityDownloadError(
             f"{stem}: {len(frame)} rows, expected exactly {len(expected)} "
             f"(one per exchange session {expected[0]}..{expected[-1]})"
         )
     first = pd.Timestamp(frame["timestamp"].iloc[0]).date()
     last = pd.Timestamp(frame["timestamp"].iloc[-1]).date()
     if first != expected[0] or last != expected[-1]:
-        raise ParityFetchError(
+        raise ParityDownloadError(
             f"{stem}: window {first}..{last} does not cover "
             f"{expected[0]}..{expected[-1]}"
         )
@@ -257,7 +262,9 @@ def _validate_usa500(frame) -> None:
         want = _expected_rth_bars(day)
         got = int(counts.get(day, 0))
         if got != want:
-            raise ParityFetchError(
+            # Missing session data is an incomplete download (exit 3): the
+            # downloader drops days whose .bi5 fetch failed after retries.
+            raise ParityDownloadError(
                 f"{USA500_FIXTURE}: session {day} has {got} bars, expected "
                 f"exactly {want} — the Dukascopy download is incomplete"
             )
