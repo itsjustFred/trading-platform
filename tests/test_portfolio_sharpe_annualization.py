@@ -26,6 +26,7 @@ from runner.engines.signal_replay_adapter import (
     _OpenPosition,
 )
 from runner.portfolio_optimizer import _portfolio_sharpe_from_weights
+from runner.stats import return_periods_per_year
 
 # ─── F36: portfolio sharpe is annualized ────────────────────────────────────
 
@@ -34,7 +35,6 @@ class TestPortfolioSharpeAnnualized:
     def test_daily_curve_sharpe_is_annualized(self):
         """252 daily points of constant per-day drift must give sqrt(252) * sr_obs."""
         rng_values = [1 + 0.001 * math.sin(i) + 0.0002 * i for i in range(253)]
-        times = list(range(1_700_000_000, 1_700_000_000 + 253 * 86_400, 86_400))
         equity = np.array([100_000.0 * v for v in rng_values])
         matrix = equity.reshape(-1, 1)
         weights = np.array([1.0])
@@ -99,7 +99,7 @@ class TestReplaySizingEquity:
                 "volume": [1000.0] * 3,
             }
         )
-        signal = ReplaySignal(
+        ReplaySignal(
             timestamp=timestamps[2],
             symbol="PROBE",
             action="buy",
@@ -149,12 +149,12 @@ class TestReplaySizingEquity:
 
 
 class TestAnnualizationCadenceCalibration:
-    def test_calendar_daily_maps_to_252(self):
-        """Calendar-daily cadence must map onto the 252 trading convention.
+    def test_calendar_daily_measures_calendar_density(self):
+        """Calendar-daily cadence annualizes at its measured density (#353).
 
-        Kills the mutant that skips the 350-380 mapping: a calendar-daily
-        curve would then annualize with 365.25 instead of 252, inflating the
-        Sharpe by ~20% versus runner.stats' daily Sharpe.
+        The timestamps span Nov 2023 - Jul 2024, touching a leap year, so
+        the measured density is ~365.5 observations/year — NOT the old
+        fixed 252 mapping and not a flat 365.25.
         """
         times = list(range(1_700_000_000, 1_700_000_000 + 300 * 86_400, 86_400))
         equity = np.array([100_000.0 * (1 + 0.0005 * math.sin(i)) for i in range(300)])
@@ -165,10 +165,14 @@ class TestAnnualizationCadenceCalibration:
             sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), equity.reshape(-1, 1))
             returns = np.diff(equity) / equity[:-1]
             per_obs = float(np.mean(returns) / (np.std(returns) + 1e-10))
-            assert sharpe == pytest.approx(per_obs * math.sqrt(252), rel=1e-6), (
-                "calendar-daily curves must annualize with 252, not the "
-                "calendar count"
+            expected_ppy = portfolio_optimizer._infer_portfolio_periods_per_year(
+                equity.reshape(-1, 1)
             )
+            assert 360.0 < expected_ppy < 370.0, (
+                "calendar-daily curves must annualize at the measured "
+                "calendar-day density (~365), not the fixed 252 convention"
+            )
+            assert sharpe == pytest.approx(per_obs * math.sqrt(expected_ppy), rel=1e-6)
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
 
@@ -176,7 +180,7 @@ class TestAnnualizationCadenceCalibration:
         """Hourly cadence scales periods-per-year with no artificial ceiling.
 
         Kills the ceiling mutant (min(ppy, 252*4) instead of ppy): an hourly
-        curve must annualize with the true calendar count (~8766), not a
+        curve must annualize with its measured hourly density (~8k), not a
         clamped 1008 — the cap understated intraday Sharpe by
         sqrt(8766/1008) ≈ 2.9x relative to the daily-resampled convention.
         """
@@ -190,10 +194,10 @@ class TestAnnualizationCadenceCalibration:
             periods = portfolio_optimizer._infer_portfolio_periods_per_year(
                 equity_matrix
             )
-            assert periods == pytest.approx(365.25 * 24), (
-                "hourly curves must annualize with the true hourly period "
-                "count (~8766) — a 1008-ish value means the 252*4 ceiling "
-                "was reintroduced, 252 means the sub-daily scaling was dropped"
+            assert periods == pytest.approx(8134.285714, rel=1e-3), (
+                "hourly curves must annualize with the measured hourly "
+                "observation density — a ~8766 value means the old median-"
+                "spacing inference survived, ~252 means the density was dropped"
             )
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
@@ -322,9 +326,125 @@ class TestCoarserThanDailyCadence:
             sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), matrix)
             returns = np.diff(equity) / equity[:-1]
             per_obs = float(np.mean(returns) / (np.std(returns) + 1e-10))
-            assert sharpe == pytest.approx(per_obs * math.sqrt(52.178571), rel=1e-3), (
-                "weekly curves must annualize with the weekly period count "
-                "(~52), not the 252 daily convention"
+            assert sharpe == pytest.approx(per_obs * math.sqrt(52.3337), rel=1e-3), (
+                "weekly curves must annualize with the measured weekly "
+                "observation density (~52), not the daily convention"
             )
         finally:
             portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
+
+
+class TestMeasuredDensityAnnualization:
+    """#353: the portfolio Sharpe annualises at the measured observation
+    density of the combined equity curve's actual timestamps
+    (``runner.stats.return_periods_per_year``) — crypto ~365/366 calendar
+    days, equities their observed trading-day density — not a fixed 252.
+    """
+
+    @staticmethod
+    def _times(index: pd.DatetimeIndex) -> list[int]:
+        return [int(ts.timestamp()) for ts in index]
+
+    @staticmethod
+    def _equity(n: int) -> np.ndarray:
+        return np.array(
+            [100_000.0 * (1 + 0.0005 * math.sin(i)) for i in range(n)],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _per_obs_sharpe(equity: np.ndarray) -> float:
+        returns = np.diff(equity) / equity[:-1]
+        return float(np.mean(returns) / (np.std(returns) + 1e-10))
+
+    def _density_for_times(self, times: list[int]) -> float:
+        index = pd.DatetimeIndex(
+            pd.to_datetime(pd.Series(times), unit="s", utc=True).iloc[1:]
+        )
+        measured = return_periods_per_year(index)
+        assert measured is not None
+        return measured
+
+    def test_crypto_only_calendar_daily_uses_measured_calendar_days(self):
+        """A 24/7 crypto book measures calendar days: 366 in leap 2024,
+        365 in common 2023 — the fixed 252 convention cannot produce either.
+        """
+        for start, periods, expected_ppy in (
+            ("2024-01-01", 366, 366.0),  # leap year
+            ("2023-01-01", 365, 365.0),  # common year
+        ):
+            index = pd.date_range(start, periods=periods, freq="D", tz="UTC")
+            times = self._times(index)
+            equity = self._equity(periods)
+            portfolio_optimizer._record_portfolio_timestamps(
+                _curves_from_times(times), times
+            )
+            try:
+                matrix = equity.reshape(-1, 1)
+                ppy = portfolio_optimizer._infer_portfolio_periods_per_year(matrix)
+                sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), matrix)
+            finally:
+                portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
+            assert ppy == pytest.approx(expected_ppy, rel=1e-6), (
+                f"{start}: crypto calendar-daily density must measure "
+                f"{expected_ppy}, got {ppy}"
+            )
+            assert sharpe == pytest.approx(
+                self._per_obs_sharpe(equity) * math.sqrt(expected_ppy), rel=1e-6
+            )
+
+    def test_equity_only_uses_measured_trading_day_density(self):
+        """A business-day equity book measures its observed trading-day
+        density (~261), not the fixed 252 nor the crypto calendar count.
+        """
+        index = pd.date_range("2024-01-02", periods=262, freq="B", tz="UTC")
+        times = self._times(index)
+        equity = self._equity(len(times))
+        portfolio_optimizer._record_portfolio_timestamps(
+            _curves_from_times(times), times
+        )
+        try:
+            matrix = equity.reshape(-1, 1)
+            ppy = portfolio_optimizer._infer_portfolio_periods_per_year(matrix)
+            sharpe, _ = _portfolio_sharpe_from_weights(np.array([1.0]), matrix)
+        finally:
+            portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
+        expected_ppy = self._density_for_times(times)
+        assert 250.0 < expected_ppy < 270.0
+        assert ppy == pytest.approx(expected_ppy, rel=1e-9)
+        assert sharpe == pytest.approx(
+            self._per_obs_sharpe(equity) * math.sqrt(expected_ppy), rel=1e-6
+        )
+
+    def test_mixed_book_uses_combined_curve_timestamps(self):
+        """A crypto leg (every calendar day) combined with an equity leg
+        (weekdays) aligns onto the weekday intersection; the density is
+        measured on THOSE combined timestamps — the trading-day density,
+        not the crypto calendar count.
+        """
+        days = pd.date_range("2024-01-01", periods=90, freq="D", tz="UTC")
+        all_times = self._times(days)
+        weekday_times = [
+            t for t, ts in zip(all_times, days, strict=True) if ts.dayofweek < 5
+        ]
+        crypto_curve = [
+            portfolio_optimizer.StrategyEquityPoint(time=t, equity=float(e))
+            for t, e in zip(all_times, self._equity(len(all_times)), strict=True)
+        ]
+        equity_curve = [
+            portfolio_optimizer.StrategyEquityPoint(time=t, equity=float(e))
+            for t, e in zip(weekday_times, self._equity(len(weekday_times)), strict=True)
+        ]
+        curves = [crypto_curve, equity_curve]
+        common = portfolio_optimizer._common_timestamps(curves, require_overlap=True)
+        matrix = portfolio_optimizer._align_equity_curves(curves, require_overlap=True)
+        portfolio_optimizer._record_portfolio_timestamps(curves, common)
+        try:
+            ppy = portfolio_optimizer._infer_portfolio_periods_per_year(matrix)
+        finally:
+            portfolio_optimizer._LAST_PORTFOLIO_TIMESTAMPS.clear()
+        # The combined curve observes only weekdays: ~13 weeks of them.
+        assert 240.0 < ppy < 280.0, (
+            f"mixed book must measure the combined curve's trading-day "
+            f"density, got {ppy}"
+        )

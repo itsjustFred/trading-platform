@@ -22,6 +22,7 @@ import numpy as np
 import optuna
 import pandas as pd
 
+from runner.stats import return_periods_per_year
 from shared.atomic_io import write_text_atomically
 from shared.constants import OPTIMIZATIONS_DIR
 
@@ -54,11 +55,13 @@ class StrategyEquityPoint:
     equity: float
 
 
-#: Annualization convention for the portfolio Sharpe (Cleanup 16-D1, F36):
-#: daily equity curves are the documented default cadence, annualized with
-#: 252 trading periods — the same convention ``runner/stats.py`` uses for
-#: equities/FX/CFDs. For 24/7 crypto books stats.py annualises at 365, so
-#: this fixed-252 convention diverges there only (tracked in #353).
+#: Fallback annualization convention for the portfolio Sharpe (Cleanup
+#: 16-D1, F36) when the aligned equity curve's timestamps cannot be
+#: measured: 252 trading periods, the convention ``runner/stats.py`` uses
+#: for equities/FX/CFDs. Measurable curves annualise at their measured
+#: observation density instead (``_infer_portfolio_periods_per_year``,
+#: #353): crypto books ~365/366 calendar days, equity books their
+#: observed trading-day density.
 PORTFOLIO_PERIODS_PER_YEAR_DEFAULT = 252.0
 
 #: Timestamps (as datetime-like objects) of the equity matrix most recently
@@ -362,45 +365,36 @@ def _average_off_diagonal(correlation_matrix: np.ndarray) -> float:
 
 
 def _infer_portfolio_periods_per_year(equity_matrix: np.ndarray) -> float:
-    """Infer annualization periods from the median point spacing.
+    """Measured observation density of the combined equity curve (#353).
 
-    Daily-spaced equity points → 252 trading periods per year (calendar 365
-    spacing → 365); sub-daily spacing scales proportionally. Falls back to
-    252 when the timestamps carry no usable cadence.
+    Annualisation follows ``runner.stats.return_periods_per_year`` — the
+    measured-density convention stats.py reports — applied to the aligned
+    curve's actual timestamps: each consecutive equity pair is one return
+    observation stamped at the later point, so a crypto book measures
+    ~365/366 calendar days per year, an equity book its observed
+    trading-day density, and a mixed book whatever the combined
+    timestamps carry. Falls back to
+    ``PORTFOLIO_PERIODS_PER_YEAR_DEFAULT`` when the timestamps carry no
+    usable cadence.
     """
     if equity_matrix.shape[0] < 3 or len(_LAST_PORTFOLIO_TIMESTAMPS) < 3:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    timestamps = pd.to_datetime(pd.Series(_LAST_PORTFOLIO_TIMESTAMPS), utc=True)
-    if len(timestamps) != equity_matrix.shape[0]:
+    try:
+        timestamps = pd.to_datetime(
+            pd.Series(_LAST_PORTFOLIO_TIMESTAMPS), utc=True, errors="coerce"
+        )
+    except (TypeError, ValueError):
+        return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
+    if len(timestamps) != equity_matrix.shape[0] or timestamps.isna().any():
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
 
-    spacings = timestamps.diff().dt.total_seconds().dropna()
-    spacing = float(spacings.median()) if not spacings.empty else 0.0
-    if not math.isfinite(spacing) or spacing <= 0:
+    # Return observations are stamped at the later point of each pair.
+    observation_index = pd.DatetimeIndex(timestamps.iloc[1:])
+    measured = return_periods_per_year(observation_index)
+    if measured is None or not math.isfinite(measured) or measured <= 0:
         return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
-
-    seconds_per_year = 365.25 * 24 * 60 * 60
-    periods_per_year = seconds_per_year / spacing
-    if not math.isfinite(periods_per_year) or periods_per_year <= 0:
-        return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
-
-    # Equity curves are trading-day series in practice; a calendar-daily
-    # cadence is mapped onto the 252 trading-day convention — identical to
-    # stats.py for equities/FX/CFDs; crypto books annualise at 365 there
-    # (realignment tracked in #353).
-    if 350.0 <= periods_per_year <= 380.0:
-        return PORTFOLIO_PERIODS_PER_YEAR_DEFAULT
-    # Coarser-than-daily cadences (weekly ≈ 52, biweekly ≈ 26, monthly ≈ 12)
-    # are legitimate period counts and scale proportionally — sqrt(52) for a
-    # weekly curve is the correct annualization, NOT 252 (CodeRabbit round:
-    # the earlier framing suggested anything above ~8.7h should collapse to
-    # 252, which would misstate weekly Sharpe by sqrt(252/52) ≈ 2.2x).
-    # Sub-daily cadences scale too. No artificial ceiling: clamping an
-    # intraday curve's period count (e.g. 2192 for 4-hourly points) would
-    # understate the annualization relative to the daily-resampled
-    # convention that stats.py reports, so the inferred count is used as is.
-    return float(periods_per_year)
+    return float(measured)
 
 
 def _portfolio_sharpe_from_weights(
@@ -411,10 +405,12 @@ def _portfolio_sharpe_from_weights(
 
     Sharpe definition (Cleanup 16-D1, F36): per-observation mean excess
     return / standard deviation, ANNUALIZED by the square root of the
-    number of observation periods per year (inferred from the equity-curve
-    cadence, 252 for daily curves). The previous raw mean/std was not
-    annualized and therefore not comparable with ``runner.stats``' Sharpe
-    even though both surface under the same name.
+    measured observation density of the combined equity curve's actual
+    timestamps (``runner.stats.return_periods_per_year``, #353 — crypto
+    ~365/366 calendar days, equities their observed trading-day density).
+    The previous raw mean/std was not annualized and therefore not
+    comparable with ``runner.stats``' Sharpe even though both surface
+    under the same name.
     """
     if equity_matrix.size == 0 or equity_matrix.shape[0] < 2 or len(weights) == 0:
         return 0.0, 1.0

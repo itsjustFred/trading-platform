@@ -16,13 +16,15 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+from runner.stats import DAILY_RETURN_PERIODS_PER_YEAR, return_periods_per_year
+
 logger = logging.getLogger(__name__)
 
 # #129: float slack for the bound-feasibility checks (n * bound vs 1.0).
 _FEASIBILITY_TOL = 1e-12
 # #129 H8: a resampled series whose median observation spacing is wider than this
-# is not a daily series (weekly bars resample to one row per week), so the
-# sqrt(252) annualisation does not apply to it.
+# is not a daily series (weekly bars resample to one row per week), so no
+# daily-return annualisation applies to it.
 _MAX_DAILY_SPACING_SECONDS = 1.5 * 24 * 60 * 60
 
 
@@ -75,10 +77,11 @@ def _is_daily_spaced(index: pd.DatetimeIndex) -> bool:
 def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
     """Resample per-bar returns to daily close-to-close returns.
 
-    Sharpe here is annualised with sqrt(252) on daily observations (#87,
-    #129 H8); ``runner/stats.py`` drops calendar-filled non-trading rows and
-    annualises at 252 (equities/FX/CFDs) or 365 (crypto) since #229, so the
-    two conventions intentionally differ.
+    Sharpe here is annualised at the measured observation density of the
+    resampled daily index (#353, ``runner.stats.return_periods_per_year``):
+    ~365/366 for a calendar-daily crypto book, the observed trading-day
+    density for equities/FX — the same measured-density convention
+    ``runner/stats.py`` reports.
     Per-bar returns inside a UTC
     day are compounded (``prod(1 + r) - 1``), which for an interior day is
     exactly the day's close-to-close return, because each bar return already
@@ -89,9 +92,10 @@ def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
 
     Returns ``None`` when the caller must not apply the daily annualisation:
     the frame has no ``DatetimeIndex`` (frequency unknown), or the observations
-    are spaced wider than a day - weekly bars resample to one row per week, and
-    sqrt(252) would overstate their Sharpe by sqrt(252/52) ~ 2.2x. The caller
-    then keeps its own frame and reports the Sharpe as undefined.
+    are spaced wider than a day - weekly bars resample to one row per week,
+    and a fixed daily factor would overstate their Sharpe by
+    sqrt(252/52) ~ 2.2x. The caller then keeps its own frame and reports the
+    Sharpe as undefined.
     """
     if not isinstance(returns_frame.index, pd.DatetimeIndex):
         return None
@@ -313,15 +317,19 @@ def score_risk_parity_universe(
     min_weight: float = 0.0,
     max_weight: float = 0.6,
     daily: bool = False,
+    periods_per_year: float | None = None,
 ) -> RiskParitySelection:
     """Score one asset universe using covariance risk parity diagnostics.
 
     ``returns`` must already be DAILY close-to-close returns when ``daily`` is
-    true (see :func:`daily_returns_frame`); only then is Sharpe annualised with
-    sqrt(252). With ``daily=False`` no daily annualisation applies - the
-    observation frequency is unknown (no datetime index) or coarser than daily
-    (weekly bars) - so Sharpe is left undefined (``None``) and the score uses
-    only the scale-invariant structure terms. Weights, diversification ratio,
+    true (see :func:`daily_returns_frame`); only then is Sharpe annualised, at
+    ``periods_per_year`` — the measured observation density of the daily
+    index (#353, ``runner.stats.return_periods_per_year``), falling back to
+    ``DAILY_RETURN_PERIODS_PER_YEAR`` when the caller cannot measure it. With
+    ``daily=False`` no daily annualisation applies - the observation frequency
+    is unknown (no datetime index) or coarser than daily (weekly bars) - so
+    Sharpe is left undefined (``None``) and the score uses only the
+    scale-invariant structure terms. Weights, diversification ratio,
     correlation and risk contributions do not depend on the return scale.
     """
     if len(symbols) < 2:
@@ -331,14 +339,26 @@ def score_risk_parity_universe(
     portfolio_returns = returns @ weights_array
     mean_return = float(np.mean(portfolio_returns)) if len(portfolio_returns) else 0.0
     volatility = float(np.std(portfolio_returns) + 1e-12)
-    # #87 / #129 H8: annualized Sharpe on the daily convention (sqrt(252)),
+    # #87 / #129 H8 / #353: annualized Sharpe on the measured observation
+    # density of the daily index (``runner.stats.return_periods_per_year``),
     # consistent with runner/stats.py and runner/portfolio_optimizer.py. That
     # factor is only correct for daily returns, so it is applied only when the
     # caller says the input is daily; otherwise the Sharpe is undefined rather
     # than guessed (e.g. per-trade rows have no fixed observation frequency).
     sharpe: float | None
     if daily:
-        sharpe = float(mean_return / volatility * math.sqrt(252)) if volatility > 0 else 0.0
+        measured = (
+            float(periods_per_year)
+            if periods_per_year is not None
+            and math.isfinite(float(periods_per_year))
+            and float(periods_per_year) > 0
+            else DAILY_RETURN_PERIODS_PER_YEAR
+        )
+        sharpe = (
+            float(mean_return / volatility * math.sqrt(measured))
+            if volatility > 0
+            else 0.0
+        )
     else:
         sharpe = None
 
@@ -439,6 +459,14 @@ def select_best_risk_parity_universe(
         # returns when the timestamps say the bars are daily (None => no
         # datetime index, or observations spaced wider than a day).
         daily_subset = daily_returns_frame(subset)
+        # #353: annualise at the measured density of THIS universe's daily
+        # index — crypto books ~365/366 calendar days, equity books their
+        # observed trading-day density, mixed books the combined timestamps.
+        periods_per_year = (
+            return_periods_per_year(daily_subset.index)
+            if daily_subset is not None
+            else None
+        )
         if daily_subset is not None:
             subset = daily_subset
         if len(subset) < 2:
@@ -465,6 +493,7 @@ def select_best_risk_parity_universe(
                 min_weight=min_weight,
                 max_weight=max_weight,
                 daily=daily_subset is not None,
+                periods_per_year=periods_per_year,
             )
         )
     if not selections and infeasible_skipped:
