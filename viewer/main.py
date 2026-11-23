@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -274,6 +275,7 @@ _STATIC_ASSET_SUFFIXES = {
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOG_DIR / "tasks"
 OPTIMIZATIONS_DIR = legacy_viewer.OPTIMIZATIONS_DIR
+JSON_FILE_GLOB = legacy_viewer.JSON_FILE_GLOB
 ALL_LOGS_NAME = legacy_viewer.ALL_LOGS_NAME
 BARS_BEFORE = legacy_viewer.BARS_BEFORE
 BARS_AFTER = legacy_viewer.BARS_AFTER
@@ -2786,7 +2788,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
+    for file_path in sorted(PORTFOLIOS_DIR.glob(JSON_FILE_GLOB)):
         try:
             data = _normalize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
         except (OSError, TypeError, ValueError) as exc:
@@ -12392,7 +12394,7 @@ async def list_optimizations() -> list[dict[str, Any]]:
     if not OPTIMIZATIONS_DIR.exists():
         return results
 
-    for path in sorted(OPTIMIZATIONS_DIR.glob("*.json")):
+    for path in sorted(OPTIMIZATIONS_DIR.glob(JSON_FILE_GLOB)):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             results.append(_optimization_summary_payload(payload, path))
@@ -12433,8 +12435,8 @@ async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     portfolio_ids = [item.strip() for item in ids.split(",") if item.strip()]
     portfolios: list[dict[str, Any]] = []
     for portfolio_id in portfolio_ids:
-        path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-        if path.exists():
+        path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+        if path is not None and path.exists():
             portfolios.append(_normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8"))))
             continue
         record = load_portfolio_record(portfolio_id)
@@ -12835,7 +12837,17 @@ def _portfolio_combined_metrics(
     return correlation_matrix, combined_equity_points, stats_result
 
 
-@app.post("/api/portfolios", status_code=201)
+_PORTFOLIO_NOT_FOUND_DETAIL = "Portfolio not found"
+
+
+@app.post(
+    "/api/portfolios",
+    status_code=201,
+    responses={
+        400: {"description": "Invalid account_capital or no valid components"},
+        500: {"description": "Failed to resolve the portfolio output path"},
+    },
+)
 async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     name = str(payload.name or "Untitled").strip() or "Untitled"
     account_capital = float(payload.account_capital or 100000.0)
@@ -12865,6 +12877,14 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     portfolio_id = _portfolio_identifier(name, now=now)
+    # Resolve and containment-check the output path before any DB write, so
+    # an id that cannot map inside PORTFOLIOS_DIR fails before half-applying
+    # (same ordering as rename_portfolio). The explicit parent check keeps
+    # the sanitiser visible at the write sink for static analysis.
+    portfolios_base = PORTFOLIOS_DIR.resolve()
+    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if output_path is None or output_path.parent != portfolios_base:
+        raise HTTPException(status_code=500, detail="Failed to resolve portfolio path")
     all_trades_timed.sort(key=_component_trade_time)
 
     portfolio = {
@@ -12940,20 +12960,19 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
     output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return normalized_portfolio
 
 
 def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
-    path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-    if path.exists():
+    path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if path is not None and path.exists():
         return _normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8")))
 
     record = load_portfolio_record(portfolio_id)
     if record is None:
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     return _portfolio_record_to_payload(record)
 
 
@@ -12974,7 +12993,10 @@ async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[s
     return {"deleted": deleted, "items": items}
 
 
-@app.get("/api/portfolios/{portfolio_id}")
+@app.get(
+    "/api/portfolios/{portfolio_id}",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     payload = _load_portfolio_payload(portfolio_id)
     payload["combined_stats"] = legacy_viewer.PortfolioStats.from_dict(
@@ -12983,7 +13005,67 @@ async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.patch("/api/portfolios/{portfolio_id}")
+def _existing_portfolio_json_path(portfolio_id: str) -> Path | None:
+    """The on-disk ``{id}.json`` for an already-validated portfolio id.
+
+    The target is found by enumerating ``PORTFOLIOS_DIR`` and matching the
+    file stem, so the returned ``Path`` is a directory-listing fact rather
+    than a join of client-supplied input — the write sink never receives a
+    tainted path (SonarCloud pythonsecurity:S2083). Symlinked entries are
+    skipped: the read side (``_contained_asset_path``) already refuses them,
+    so a symlink must not become writable through the rename path.
+    """
+    base = PORTFOLIOS_DIR.resolve()
+    for path in PORTFOLIOS_DIR.glob(JSON_FILE_GLOB):
+        if path.stem != portfolio_id or path.is_symlink():
+            continue
+        resolved = path.resolve()
+        if resolved.parent == base:
+            return resolved
+    return None
+
+
+def _write_portfolio_json_atomically(output_path: Path, payload: dict[str, Any]) -> None:
+    """Serialise ``payload`` onto ``output_path`` without a torn write.
+
+    ``json.dump`` used to run before the file was opened on main, so a
+    non-serialisable value left the original intact; streaming into
+    ``open("w")`` truncates first and a mid-dump ``TypeError`` leaves a
+    permanently unreadable portfolio JSON (``_load_portfolio_payload`` has
+    no DB fallback once the file is corrupt). The document is serialised
+    into a temp file in the same directory and ``os.replace``d, so readers
+    see the old file or the new one, never a fragment. The temp file is
+    unlinked on any failure. ``output_path`` is the directory-enumerated
+    handle from ``_existing_portfolio_json_path``, never a join of client
+    input (SonarCloud pythonsecurity:S2083).
+    """
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_path, output_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+@app.patch(
+    "/api/portfolios/{portfolio_id}",
+    responses={
+        400: {"description": "Portfolio name cannot be empty"},
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio rename failed"},
+    },
+)
 async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     updated_name = str(payload.name or "").strip()
     if not updated_name:
@@ -12994,11 +13076,30 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     normalized_portfolio = _normalize_portfolio_payload(portfolio_payload)
     normalized_portfolio["name"] = updated_name
 
+    # Resolve the write target by enumerating PORTFOLIOS_DIR instead of
+    # joining the client-supplied id, so the Path handed to write_text is a
+    # filesystem fact, not a tainted join. The safe-id guard keeps the same
+    # fail-closed ordering as create_portfolio: an id that cannot name a
+    # file inside PORTFOLIOS_DIR 404s before the DB write. A portfolio that
+    # exists only as a DB record has no JSON to update — the record save
+    # below already persists the rename, so the file write is skipped
+    # rather than 404ing a rename that succeeded.
+    safe_id = _safe_asset_id(portfolio_id)
+    if not safe_id:
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
+    output_path = _existing_portfolio_json_path(safe_id)
+
     try:
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-        output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+        if output_path is not None:
+            # Off the event loop: the serialise-and-swap is synchronous file
+            # I/O (SonarCloud pythonsecurity:S7493), and the temp-file +
+            # os.replace inside keeps the write atomic and the sink
+            # enumerated rather than client-derived (S2083).
+            await asyncio.to_thread(
+                _write_portfolio_json_atomically, output_path, normalized_portfolio
+            )
     except Exception as exc:
         logger.exception(
             "Failed to rename portfolio",
@@ -13010,12 +13111,22 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
 
 
-@app.put("/api/portfolios/{portfolio_id}/name")
+@app.put(
+    "/api/portfolios/{portfolio_id}/name",
+    responses={
+        400: {"description": "Portfolio name cannot be empty"},
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio rename failed"},
+    },
+)
 async def rename_portfolio_name(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_portfolio(portfolio_id, payload)
 
 
-@app.get("/api/portfolios/{portfolio_id}/contributions")
+@app.get(
+    "/api/portfolios/{portfolio_id}/contributions",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio_contributions(
     portfolio_id: str,
     group_by: str = Query(default="component"),
@@ -13024,7 +13135,10 @@ async def get_portfolio_contributions(
     return _compute_portfolio_contributions(portfolio=portfolio, group_by=group_by)
 
 
-@app.get("/api/portfolios/{portfolio_id}/trades")
+@app.get(
+    "/api/portfolios/{portfolio_id}/trades",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio_trades(
     portfolio_id: str,
     strategy: str = Query(default=""),
@@ -13040,11 +13154,18 @@ async def get_portfolio_trades(
     )
 
 
-@app.delete("/api/portfolios/{portfolio_id}")
+@app.delete(
+    "/api/portfolios/{portfolio_id}",
+    responses={
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio deletion failed"},
+        503: {"description": "Portfolio deletion is pending cleanup"},
+    },
+)
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     result = _delete_portfolio_with_artifacts(portfolio_id)
     if result.get("status") == "not_found":
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     if result.get("status") == "cleanup_pending":
         raise HTTPException(
             status_code=503,
