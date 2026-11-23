@@ -1,0 +1,31 @@
+tests/test_live_supertrend_flip.py
+  s_2bf89379757a94::t_d927c6fc8d2cf1 1113-1223
+live_runner/base_adapter.py
+  s_907b3e2c1d0363::t_ad477a6ec3f4f6 655-657,659-661
+live_runner/supertrend_flip.py
+  s_907b3e2c1d0363::t_a857293e963b4b 1163-1172
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5dd76c51172bdf46c1af5ba80726e5df5b769563",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_907b3e2c1d0363": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_907b3e2c1d0363",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
