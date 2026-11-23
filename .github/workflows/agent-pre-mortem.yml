@@ -321,7 +321,7 @@ jobs:
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-pre-mortem-meta
           path: meta.json
@@ -476,7 +476,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: agent-pre-mortem-meta
           path: ${{ runner.temp }}/premortem
@@ -754,7 +754,7 @@ jobs:
           set -euo pipefail
           echo "verdict=$(cat "$RUNNER_TEMP/premortem/verdict.txt")" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-pre-mortem
           # The posted comment, and the agent's raw stdout beside it. The comment is the tail of
@@ -848,7 +848,7 @@ jobs:
             printf '\n---\n_Automated pre-mortem not run: quota (%s skill)_\n' "$skill_name"
           } > comment.md
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.premortem.result == 'success'
         with:
           name: agent-pre-mortem

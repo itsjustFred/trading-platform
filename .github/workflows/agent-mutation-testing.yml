@@ -101,7 +101,7 @@ jobs:
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-mutation-testing-meta
           path: meta.json
@@ -235,7 +235,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: agent-mutation-testing-meta
           path: ${{ runner.temp }}/mutation
@@ -258,7 +258,7 @@ jobs:
             echo "empty=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.scope.outputs.empty == 'false'
         with:
           python-version: "3.12"
@@ -508,7 +508,7 @@ jobs:
           mv "$out.titled" "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-mutation-testing
           path: ${{ runner.temp }}/mutation/comment.md
@@ -548,7 +548,7 @@ jobs:
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.mutate.result == 'success'
         with:
           name: agent-mutation-testing

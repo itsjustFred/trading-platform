@@ -100,7 +100,7 @@ jobs:
             echo "same_repo=$(jq -r --arg r "$GITHUB_REPOSITORY" '.head.repo.full_name == $r' pr.json)"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-code-review-meta
           path: meta.json
@@ -319,7 +319,7 @@ jobs:
           OPENCODE_DISABLE_PROJECT_CONFIG=1 opencode debug agents --standalone \
             | jq -e '.[] | select(.id == "pr-review") | .model' > /dev/null
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: agent-code-review-meta
           path: ${{ runner.temp }}/review
@@ -448,7 +448,7 @@ jobs:
           mv "$out.titled" "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-code-review
           path: ${{ runner.temp }}/review/comment.md
@@ -490,7 +490,7 @@ jobs:
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.review.result == 'success'
         with:
           name: agent-code-review
