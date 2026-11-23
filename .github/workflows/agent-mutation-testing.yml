@@ -44,7 +44,8 @@ name: Agent Mutation Testing
 #   never reported as a clean result.
 # - This workflow file itself is not pinned: on pull_request GitHub runs the
 #   PR's copy. Accepted, since only collaborators with write access can open
-#   same-repo PRs. Fork PRs are skipped.
+#   same-repo PRs. Fork PRs and drafts are skipped - a draft is tested when it
+#   is marked ready for review (`ready_for_review` is a trigger type).
 #
 # A run that failed for a transient reason other than quota (e.g. a provider
 # outage) is restarted with "Re-run jobs" on the run page or
@@ -56,7 +57,7 @@ name: Agent Mutation Testing
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: agent-mutation-testing-${{ github.event.pull_request.number }}
@@ -74,6 +75,11 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Drafts are not mutation-tested: the run resumes when the PR is marked
+    # ready for review, one of the pull_request types above. A skipped resolve
+    # skips every job that needs its outputs, so no install time or quota is
+    # spent on a draft.
+    if: ${{ github.event.pull_request.draft == false }}
     # Reads only the event payload; needs no token scope.
     permissions: {}
     outputs:
