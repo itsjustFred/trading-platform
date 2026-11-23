@@ -8,7 +8,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -4638,6 +4638,47 @@ def list_live_deployment_open_entry_counts_by_symbol(
     return counts
 
 
+def _position_lot_entries(
+    signal_rows: Iterable[tuple[Any, ...]],
+    filled_by_signal: dict[str, float],
+) -> tuple[list[dict[str, Any]], float]:
+    """Split signal rows into FIFO-ordered entry lots and the reducing quantity.
+
+    Every row is either an entry (kept for the caller's residual allocation)
+    or a reducing fill whose filled quantity is summed so the caller can
+    consume it across the entries oldest-first.
+    """
+    reducing_qty = 0.0
+    entries: list[dict[str, Any]] = []
+    for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            reducing_qty += max(0.0, filled_by_signal.get(str(signal_id), 0.0))
+        else:
+            entries.append(
+                {
+                    "signal_id": str(signal_id),
+                    "symbol": str(sig_symbol or "").strip().upper(),
+                    "timestamp": timestamp,
+                    "action": str(action or "").strip().lower(),
+                    "broker_order_id": str(broker_order_id or ""),
+                    "filled_qty": max(0.0, filled_by_signal.get(str(signal_id), 0.0)),
+                }
+            )
+    entries.sort(
+        key=lambda item: (
+            item["timestamp"] is None,
+            item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+            item["signal_id"],
+        )
+    )
+    return entries, reducing_qty
+
+
 def list_live_deployment_open_position_lots(
     deployment_id: str,
     symbol: str,
@@ -4690,34 +4731,7 @@ def list_live_deployment_open_position_lots(
         ).all()
     filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
 
-    reducing_qty = 0.0
-    entries: list[dict[str, Any]] = []
-    for signal_id, sig_symbol, timestamp, action, broker_order_id, source, metadata in signal_rows:
-        metadata_dict = metadata if isinstance(metadata, dict) else {}
-        is_close = (
-            _is_exit_only_signal_metadata(metadata_dict)
-            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
-        )
-        if is_close:
-            reducing_qty += max(0.0, filled_by_signal.get(str(signal_id), 0.0))
-        else:
-            entries.append(
-                {
-                    "signal_id": str(signal_id),
-                    "symbol": str(sig_symbol or "").strip().upper(),
-                    "timestamp": timestamp,
-                    "action": str(action or "").strip().lower(),
-                    "broker_order_id": str(broker_order_id or ""),
-                    "filled_qty": max(0.0, filled_by_signal.get(str(signal_id), 0.0)),
-                }
-            )
-    entries.sort(
-        key=lambda item: (
-            item["timestamp"] is None,
-            item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
-            item["signal_id"],
-        )
-    )
+    entries, reducing_qty = _position_lot_entries(signal_rows, filled_by_signal)
     lots: list[dict[str, Any]] = []
     remaining_reduction = reducing_qty
     for entry in entries:

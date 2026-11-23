@@ -1069,12 +1069,13 @@ def test_targeted_exit_for_a_short_lot_buys_back(monkeypatch):
 def test_targeted_exit_without_an_open_lot_closes_nothing(monkeypatch):
     from live_runner.exit_signals import NothingToExitError
 
+    lots = [_lot("entry-2")]
     with pytest.raises(NothingToExitError, match="no open residual"):
         _prepare_targeted_exit(
             monkeypatch,
             [{"symbol": "EURUSD", "qty": 2.0}],
             ledger_qty=2.0,
-            lots=[_lot("entry-2")],
+            lots=lots,
             target="entry-1",
         )
 
@@ -1124,9 +1125,56 @@ def test_targeted_exit_unresolved_on_multi_position_book_fails_closed(monkeypatc
         raising=False,
     )
     signal = _exit_only_sell(str(deployment.id), exit_target_signal_id="entry-1")
+    coro = prepare_order_with_risk(_NoResolverAdapter(), deployment, signal)
 
     with pytest.raises(ValueError, match="2 broker positions"):
-        asyncio.run(prepare_order_with_risk(_NoResolverAdapter(), deployment, signal))
+        asyncio.run(coro)
+
+
+def _assert_targeted_exit_in_flight(
+    monkeypatch,
+    *,
+    positions: list[dict[str, Any]],
+    working_ids: set[str],
+    pending_exits: list[dict[str, Any]],
+) -> None:
+    """Shared #382 rig: ledger/lot patches around a working exit, then the
+    targeted exit must be refused as ``ExitInFlightError``."""
+    import live_runner.daemon as daemon
+    from live_runner.daemon import ExitInFlightError, prepare_order_with_risk
+
+    class _Adapter:
+        async def get_positions(self):
+            return list(positions)
+
+        async def working_order_ids(self):
+            return set(working_ids)
+
+    deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, 5.0)
+    monkeypatch.setattr(
+        daemon,
+        "list_live_deployment_unfilled_exit_orders",
+        lambda _d, _s: [{**row, "deployment_id": str(_d)} for row in pending_exits],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "list_account_unfilled_exit_orders",
+        lambda _a, _s, **_k: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "list_live_deployment_open_position_lots",
+        lambda _d, _s: [_lot("entry-1", qty=2.0)],
+        raising=False,
+    )
+    signal = _exit_only_sell(str(deployment.id), exit_target_signal_id="entry-1")
+    coro = prepare_order_with_risk(_Adapter(), deployment, signal)
+
+    with pytest.raises(ExitInFlightError):
+        asyncio.run(coro)
 
 
 def test_targeted_exits_of_different_lots_do_not_block_each_other(monkeypatch):
@@ -1158,105 +1206,41 @@ def test_targeted_exits_of_different_lots_do_not_block_each_other(monkeypatch):
 def test_same_lot_exit_still_blocked_while_working(monkeypatch):
     """#382: a second exit naming the SAME lot while the first still works
     is refused - sizing off a ledger without its fills would double-close."""
-    from live_runner.daemon import ExitInFlightError
-
-    pending = [
-        {
-            "signal_id": "exit-a",
-            "deployment_id": None,  # filled below with the real id
-            "broker_order_id": "bo-exit-a",
-            "requested_qty": 2.0,
-            "filled_qty": 0.0,
-            "action": "sell",
-            "metadata": {"exit_target_signal_id": "entry-1"},
-        }
-    ]
-
-    import live_runner.daemon as daemon
-    from live_runner.daemon import prepare_order_with_risk
-
-    class _Adapter:
-        async def get_positions(self):
-            return [{"symbol": "EURUSD", "qty": 5.0}]
-
-        async def working_order_ids(self):
-            return {"bo-exit-a"}
-
-    deployment = _deployment()
-    pending[0]["deployment_id"] = str(deployment.id)
-    _patch_exit_ledger(monkeypatch, deployment, 5.0)
-    monkeypatch.setattr(
-        daemon,
-        "list_live_deployment_unfilled_exit_orders",
-        lambda _d, _s: list(pending),
-        raising=False,
+    _assert_targeted_exit_in_flight(
+        monkeypatch,
+        positions=[{"symbol": "EURUSD", "qty": 5.0}],
+        working_ids={"bo-exit-a"},
+        pending_exits=[
+            {
+                "signal_id": "exit-a",
+                "broker_order_id": "bo-exit-a",
+                "requested_qty": 2.0,
+                "filled_qty": 0.0,
+                "action": "sell",
+                "metadata": {"exit_target_signal_id": "entry-1"},
+            }
+        ],
     )
-    monkeypatch.setattr(
-        daemon,
-        "list_account_unfilled_exit_orders",
-        lambda _a, _s, **_k: [],
-        raising=False,
-    )
-    monkeypatch.setattr(
-        daemon,
-        "list_live_deployment_open_position_lots",
-        lambda _d, _s: [_lot("entry-1", qty=2.0)],
-        raising=False,
-    )
-    signal = _exit_only_sell(str(deployment.id), exit_target_signal_id="entry-1")
-
-    with pytest.raises(ExitInFlightError):
-        asyncio.run(prepare_order_with_risk(_Adapter(), deployment, signal))
 
 
 def test_untargeted_pending_exit_blocks_targeted_exit(monkeypatch):
     """#382: an untargeted working exit may close any lot, so it still
     blocks a targeted one of the same deployment."""
-    import live_runner.daemon as daemon
-    from live_runner.daemon import ExitInFlightError, prepare_order_with_risk
-
-    class _Adapter:
-        async def get_positions(self):
-            return [{"symbol": "EURUSD", "qty": 5.0}]
-
-        async def working_order_ids(self):
-            return {"bo-exit-x"}
-
-    deployment = _deployment()
-    pending = [
-        {
-            "signal_id": "exit-x",
-            "deployment_id": str(deployment.id),
-            "broker_order_id": "bo-exit-x",
-            "requested_qty": 2.0,
-            "filled_qty": 0.0,
-            "action": "sell",
-            "metadata": {},
-        }
-    ]
-    _patch_exit_ledger(monkeypatch, deployment, 5.0)
-    monkeypatch.setattr(
-        daemon,
-        "list_live_deployment_unfilled_exit_orders",
-        lambda _d, _s: list(pending),
-        raising=False,
+    _assert_targeted_exit_in_flight(
+        monkeypatch,
+        positions=[{"symbol": "EURUSD", "qty": 5.0}],
+        working_ids={"bo-exit-x"},
+        pending_exits=[
+            {
+                "signal_id": "exit-x",
+                "broker_order_id": "bo-exit-x",
+                "requested_qty": 2.0,
+                "filled_qty": 0.0,
+                "action": "sell",
+                "metadata": {},
+            }
+        ],
     )
-    monkeypatch.setattr(
-        daemon,
-        "list_account_unfilled_exit_orders",
-        lambda _a, _s, **_k: [],
-        raising=False,
-    )
-    monkeypatch.setattr(
-        daemon,
-        "list_live_deployment_open_position_lots",
-        lambda _d, _s: [_lot("entry-1", qty=2.0)],
-        raising=False,
-    )
-    signal = _exit_only_sell(str(deployment.id), exit_target_signal_id="entry-1")
-
-    with pytest.raises(ExitInFlightError):
-        asyncio.run(prepare_order_with_risk(_Adapter(), deployment, signal))
 
 
 # ── B-10: exposure fed to the risk engine is risk-at-stake in balance units ───

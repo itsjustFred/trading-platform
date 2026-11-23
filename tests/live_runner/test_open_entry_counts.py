@@ -466,7 +466,8 @@ def test_position_lots_exclude_unfilled_and_closed_entries(isolated_db) -> None:
 
     assert [lot["signal_id"] for lot in _lots(database, mine)] == []
     msft = _lots(database, mine, "MSFT")
-    assert len(msft) == 1 and msft[0]["qty"] == pytest.approx(2.0)
+    assert len(msft) == 1
+    assert msft[0]["qty"] == pytest.approx(2.0)
     assert closed not in {lot["signal_id"] for lot in msft}
 
 

@@ -1544,6 +1544,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         wanted = str(entry_signal_id or "").strip()
         if not wanted:
             return None
+        matches = await self._entry_matching_position_ids(position_ids, wanted, upper)
+        if len(matches) > 1:
+            raise ValueError(
+                f"cTrader entry {wanted} matches several open positions on "
+                f"{upper} ({matches}); refusing to guess the exit target."
+            )
+        return matches[0] if matches else None
+
+    async def _entry_matching_position_ids(
+        self, position_ids: tuple[int, ...], wanted: str, upper: str
+    ) -> list[int]:
+        """The positions whose opening order carries ``wanted`` as client id."""
         matches: list[int] = []
         for position_id in position_ids:
             orders = await self._fetch_position_orders(position_id)
@@ -1559,12 +1571,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 if await self._signal_id_for_position_order(order) == wanted:
                     matches.append(position_id)
                     break
-        if len(matches) > 1:
-            raise ValueError(
-                f"cTrader entry {wanted} matches several open positions on "
-                f"{upper} ({matches}); refusing to guess the exit target."
-            )
-        return matches[0] if matches else None
+        return matches
 
     def _requested_exit_position_id(self, metadata: Mapping[str, Any]) -> int | None:
         raw_position_id = metadata.get("position_id")
