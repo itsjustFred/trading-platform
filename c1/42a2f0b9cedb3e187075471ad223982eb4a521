@@ -1,0 +1,21 @@
+frontend/src/hooks/useLiveKillSwitch.ts
+  s_51991837c77fb4::t_beb7f21e677eac 1,22-26,32,35,43,67-69,71,73
+frontend/tests/liveKillSwitchRefresh.test.ts
+  s_51991837c77fb4::t_8a6ec1743fe84c 32,70-80,87,176,296-374
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c142a2f0b9cedb3e187075471ad223982eb4a521",
+  "prompts": {},
+  "sessions": {
+    "s_51991837c77fb4": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_51991837c77fb4",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
