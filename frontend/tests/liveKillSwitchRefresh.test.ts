@@ -6,10 +6,9 @@ import test, { after, beforeEach } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build, type Plugin } from "esbuild";
-import { JSDOM } from "jsdom";
 import { act, createElement } from "react";
 
-import type { LiveKillSwitchState } from "../src/api/types";
+import { installJsdom, killSwitchState } from "./killSwitchTestEnv.ts";
 
 // Behavioural tests for useLiveKillSwitch, the hook LiveHubPage uses for the
 // kill-switch panel. The defects this pins were structural: the state read
@@ -113,52 +112,9 @@ const { Harness, KILL_SWITCH_POLL_MS } = (await import(pathToFileURL(outfile).hr
   KILL_SWITCH_POLL_MS: number;
 };
 
-// ── jsdom globals (same set the panel test installs) ─────────────────────────
+// ── jsdom globals (shared install; react-dom is imported after it) ───────────
 
-const dom = new JSDOM("<!doctype html><html><body></body></html>", {
-  url: "http://localhost/",
-  pretendToBeVisual: true,
-});
-const { window } = dom;
-for (const key of [
-  "window",
-  "document",
-  "navigator",
-  "HTMLElement",
-  "Element",
-  "Node",
-  "Event",
-  "CustomEvent",
-  "MouseEvent",
-  "KeyboardEvent",
-  "InputEvent",
-  "FocusEvent",
-  "DocumentFragment",
-  "SVGElement",
-  "MutationObserver",
-  "getComputedStyle",
-  "requestAnimationFrame",
-  "cancelAnimationFrame",
-  "localStorage",
-  "sessionStorage",
-  "HTMLInputElement",
-  "HTMLButtonElement",
-  "NodeFilter",
-  "DOMParser",
-  "XMLSerializer",
-]) {
-  const value = (window as unknown as Record<string, unknown>)[key];
-  if (value !== undefined) {
-    Object.defineProperty(globalThis, key, {
-      value,
-      configurable: true,
-      writable: true,
-    });
-  }
-}
-globalThis.window = window;
-globalThis.document = window.document;
-globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+const window = installJsdom();
 
 // react-dom must be imported AFTER the DOM globals exist: it decides at module
 // init whether `input` events are supported (canUseDOM), and without them it
@@ -166,19 +122,6 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const { createRoot } = await import("react-dom/client");
 
 // ── fixtures and helpers ─────────────────────────────────────────────────────
-
-function killSwitchState(overrides: Partial<LiveKillSwitchState> = {}): LiveKillSwitchState {
-  return {
-    readable: true,
-    global_scope: "global",
-    modes: ["entries", "orders", "flatten"],
-    halts: [],
-    halted_accounts: [],
-    global_halted: false,
-    halt_details: [],
-    ...overrides,
-  };
-}
 
 type CapturedInterval = { fn: () => void; ms: number };
 let intervals: CapturedInterval[] = [];

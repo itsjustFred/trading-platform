@@ -5,10 +5,10 @@ import test, { after, beforeEach } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build, type Plugin } from "esbuild";
-import { JSDOM } from "jsdom";
 import { act, createElement, type ComponentType } from "react";
 
 import type { LiveAccount, LiveKillSwitchState } from "../src/api/types";
+import { installJsdom, killSwitchState } from "./killSwitchTestEnv.ts";
 
 // Behavioural tests for the kill-switch panel: the real component is bundled
 // with esbuild (so the .tsx imports resolve the way Vite resolves them), the
@@ -100,53 +100,9 @@ const { LiveKillSwitchPanel } = (await import(pathToFileURL(outfile).href)) as {
   LiveKillSwitchPanel: ComponentType<Record<string, unknown>>;
 };
 
-// ── jsdom globals ────────────────────────────────────────────────────────────
+// ── jsdom globals (shared install; react-dom is imported after it) ───────────
 
-const dom = new JSDOM("<!doctype html><html><body></body></html>", {
-  url: "http://localhost/",
-  pretendToBeVisual: true,
-});
-const { window } = dom;
-for (const key of [
-  "window",
-  "document",
-  "navigator",
-  "HTMLElement",
-  "Element",
-  "Node",
-  "Event",
-  "CustomEvent",
-  "MouseEvent",
-  "KeyboardEvent",
-  "InputEvent",
-  "FocusEvent",
-  "DocumentFragment",
-  "SVGElement",
-  "MutationObserver",
-  "getComputedStyle",
-  "requestAnimationFrame",
-  "cancelAnimationFrame",
-  "localStorage",
-  "sessionStorage",
-  "HTMLInputElement",
-  "HTMLButtonElement",
-  "NodeFilter",
-  "DOMParser",
-  "XMLSerializer",
-]) {
-  const value = (window as unknown as Record<string, unknown>)[key];
-  if (value !== undefined) {
-    // Some globals (navigator) are getter-only on Node's globalThis.
-    Object.defineProperty(globalThis, key, {
-      value,
-      configurable: true,
-      writable: true,
-    });
-  }
-}
-globalThis.window = window;
-globalThis.document = window.document;
-globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+const window = installJsdom();
 
 // react-dom must be imported AFTER the DOM globals exist: it decides at module
 // init whether `input` events are supported (canUseDOM), and without them it
@@ -163,19 +119,6 @@ const ACCOUNT: LiveAccount = {
   balance: 100_000,
   is_demo: true,
 };
-
-function killSwitchState(overrides: Partial<LiveKillSwitchState> = {}): LiveKillSwitchState {
-  return {
-    readable: true,
-    global_scope: "global",
-    modes: ["entries", "orders", "flatten"],
-    halts: [],
-    halted_accounts: [],
-    global_halted: false,
-    halt_details: [],
-    ...overrides,
-  };
-}
 
 function haltedState(scope: string, mode: string): LiveKillSwitchState {
   return killSwitchState({
