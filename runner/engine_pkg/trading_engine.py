@@ -251,6 +251,11 @@ class TradeEngine:
         # bar) and before pending entry orders fill (so a reversal's exit leg
         # closes the OLD position, never the position the same open creates).
         self._pending_signal_exit = False
+        # Test/diagnostic hook (#210): when True the run loop builds the merged
+        # signal row on EVERY bar, reproducing the pre-optimization eager path
+        # so equivalence tests can diff lazy vs eager dumps. Never set outside
+        # tests — it only costs performance, never changes results.
+        self._eager_signal_rows = False
         # Fail loudly even if the config bypassed pydantic validation (#153).
         self._signal_exit_next_open = (
             contract.normalize_signal_exit_fill(
@@ -2271,7 +2276,7 @@ class TradeEngine:
             # special case here.
             self._check_stops(row, i, next_time, only_entry_index=i)
 
-            if entries_arr[i] or exits_arr[i]:
+            if self._eager_signal_rows or entries_arr[i] or exits_arr[i]:
                 # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
                 # (aligned by label). The previous ``pd.concat([row, signal_row])``
                 # stacked the two Series vertically, producing a row of length
