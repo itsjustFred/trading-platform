@@ -2698,188 +2698,60 @@ class TestPendingStopGapPricing:
         frame["spread_price"] = 0.5
         return frame
 
-    def test_stop_long_gap_up_fills_at_open_plus_spread(self, tmp_path):
-        from runner.engine import OrderType
-
-        engine = self._engine(tmp_path, spread_price_col="spread_price")
-        frame = self._spread_frame()
-        frame.loc[1, "open"] = 105.0
-        frame.loc[1, "high"] = 106.0
-        frame.loc[1, "low"] = 104.0
-        frame.loc[1, "close"] = 105.0
-        engine.pending_orders.append(
-            self._order(
-                OrderType.STOP,
-                "LONG",
-                created_index=0,
-                stop_price=101.0,
-                stop_loss=100.0,
-            )
-        )
-
-        self._fill(engine, frame)
-
-        assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(105.5)
-
-    def test_stop_long_intrabar_touch_keeps_stop_price_despite_spread(
-        self, tmp_path
+    @pytest.mark.parametrize(
+        "order_type_name,direction,open_,high,low,stop_price,limit_price,expected",
+        [
+            # STOP: gap fill at the open — LONG pays ask, SHORT pays bid.
+            ("STOP", "LONG", 105.0, 106.0, 104.0, 101.0, None, 105.5),
+            ("STOP", "SHORT", 95.0, 96.0, 94.0, 100.0, None, 95.0),
+            # STOP intrabar touch keeps the stop price despite the spread.
+            ("STOP", "LONG", 100.8, 101.5, 100.7, 101.0, None, 101.0),
+            # STOP_LIMIT marketable-at-open gap fills.
+            ("STOP_LIMIT", "LONG", 102.0, 104.0, 101.5, 101.0, 103.0, 102.5),
+            ("STOP_LIMIT", "SHORT", 99.0, 99.5, 98.5, 100.0, 98.0, 99.0),
+            # STOP_LIMIT boundary: open == stop is marketable at the open
+            # (>= / <=) — mutating to strict inequality flips to the limit.
+            ("STOP_LIMIT", "LONG", 101.0, 102.0, 100.5, 101.0, 103.0, 101.5),
+            ("STOP_LIMIT", "SHORT", 100.0, 100.5, 99.0, 100.0, 98.0, 100.0),
+        ],
+    )
+    def test_pending_stop_gap_fill_prices_with_spread(
+        self,
+        tmp_path,
+        order_type_name,
+        direction,
+        open_,
+        high,
+        low,
+        stop_price,
+        limit_price,
+        expected,
     ):
         from runner.engine import OrderType
 
         engine = self._engine(tmp_path, spread_price_col="spread_price")
         frame = self._spread_frame()
-        frame.loc[1, "open"] = 100.8
-        frame.loc[1, "high"] = 101.5
-        frame.loc[1, "low"] = 100.7
-        frame.loc[1, "close"] = 101.2
+        frame.loc[1, "open"] = open_
+        frame.loc[1, "high"] = high
+        frame.loc[1, "low"] = low
+        frame.loc[1, "close"] = open_
+        kwargs = {"stop_price": stop_price, "limit_price": limit_price}
+        # A protective stop far enough from every fill keeps the fill-time
+        # re-size positive without steering the price assertion.
+        kwargs["stop_loss"] = 90.0 if direction == "LONG" else 120.0
         engine.pending_orders.append(
             self._order(
-                OrderType.STOP,
-                "LONG",
+                getattr(OrderType, order_type_name),
+                direction,
                 created_index=0,
-                stop_price=101.0,
-                stop_loss=100.0,
+                **{k: v for k, v in kwargs.items() if v is not None},
             )
         )
 
         self._fill(engine, frame)
 
         assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(101.0)
-
-    def test_stop_short_gap_down_fills_at_bid_open_despite_spread(self, tmp_path):
-        """Sell-side symmetry: a MARKET SHORT also fills at the bid open."""
-        from runner.engine import OrderType
-
-        engine = self._engine(tmp_path, spread_price_col="spread_price")
-        frame = self._spread_frame()
-        frame.loc[1, "open"] = 95.0
-        frame.loc[1, "high"] = 96.0
-        frame.loc[1, "low"] = 94.0
-        frame.loc[1, "close"] = 95.0
-        engine.pending_orders.append(
-            self._order(
-                OrderType.STOP,
-                "SHORT",
-                created_index=0,
-                stop_price=100.0,
-                stop_loss=110.0,
-            )
-        )
-
-        self._fill(engine, frame)
-
-        assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(95.0)
-
-    def test_stop_limit_long_gap_marketable_fills_at_open_plus_spread(
-        self, tmp_path
-    ):
-        from runner.engine import OrderType
-
-        engine = self._engine(tmp_path, spread_price_col="spread_price")
-        frame = self._spread_frame()
-        frame.loc[1, "open"] = 102.0
-        frame.loc[1, "high"] = 104.0
-        frame.loc[1, "low"] = 101.5
-        frame.loc[1, "close"] = 103.0
-        engine.pending_orders.append(
-            self._order(
-                OrderType.STOP_LIMIT,
-                "LONG",
-                created_index=0,
-                stop_price=101.0,
-                limit_price=103.0,
-                stop_loss=100.0,
-            )
-        )
-
-        self._fill(engine, frame)
-
-        assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(102.5)
-
-    def test_stop_limit_short_gap_marketable_fills_at_bid_open(self, tmp_path):
-        from runner.engine import OrderType
-
-        engine = self._engine(tmp_path, spread_price_col="spread_price")
-        frame = self._spread_frame()
-        frame.loc[1, "open"] = 99.0
-        frame.loc[1, "high"] = 99.5
-        frame.loc[1, "low"] = 98.5
-        frame.loc[1, "close"] = 99.0
-        engine.pending_orders.append(
-            self._order(
-                OrderType.STOP_LIMIT,
-                "SHORT",
-                created_index=0,
-                stop_price=100.0,
-                limit_price=98.0,
-                stop_loss=105.0,
-            )
-        )
-
-        self._fill(engine, frame)
-
-        assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(99.0)
-
-    def test_stop_limit_long_open_equal_to_stop_fills_at_open_plus_spread(
-        self, tmp_path
-    ):
-        """Boundary: ``open == stop`` is marketable at the open (``>=``), so
-        the fill is the open — plus the ask spread for a LONG — not the
-        limit. Mutating ``>=`` to ``>`` flips this to the limit price."""
-        from runner.engine import OrderType
-
-        engine = self._engine(tmp_path, spread_price_col="spread_price")
-        frame = self._spread_frame()
-        frame.loc[1, "open"] = 101.0
-        frame.loc[1, "high"] = 102.0
-        frame.loc[1, "low"] = 100.5
-        frame.loc[1, "close"] = 101.5
-        engine.pending_orders.append(
-            self._order(
-                OrderType.STOP_LIMIT,
-                "LONG",
-                created_index=0,
-                stop_price=101.0,
-                limit_price=103.0,
-                stop_loss=100.0,
-            )
-        )
-
-        self._fill(engine, frame)
-
-        assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(101.5)
-
-    def test_stop_limit_short_open_equal_to_stop_fills_at_open(self, tmp_path):
-        """SHORT boundary mirror: ``open == stop`` fills at the bid open."""
-        from runner.engine import OrderType
-
-        engine = self._engine(tmp_path, spread_price_col="spread_price")
-        frame = self._spread_frame()
-        frame.loc[1, "open"] = 100.0
-        frame.loc[1, "high"] = 100.5
-        frame.loc[1, "low"] = 99.0
-        frame.loc[1, "close"] = 99.5
-        engine.pending_orders.append(
-            self._order(
-                OrderType.STOP_LIMIT,
-                "SHORT",
-                created_index=0,
-                stop_price=100.0,
-                limit_price=98.0,
-                stop_loss=105.0,
-            )
-        )
-
-        self._fill(engine, frame)
-
-        assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(100.0)
+        assert engine.positions[0].entry_price == pytest.approx(expected)
 
     def test_gap_filled_stop_is_resized_from_the_spread_adjusted_open(
         self, tmp_path
