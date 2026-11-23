@@ -184,16 +184,16 @@ def test_flat_opening_range_and_forced_exit(tmp_path: Path):
     # The flat range produces no trade at all, so nothing on 2024-01-02.
     assert not any(row["Date/Time"].startswith("2024-01-02") for row in rows)
 
-    # The second day opens one long position and the 15:45 ET bar closes it:
-    # the position is not carried past the session, and it is the forced-exit
-    # bar that closes it rather than the end of the data (16:00/16:30 ET bars
-    # follow it here).
+    # The second day opens one long position and the forced exit (raised on
+    # the bar whose end reaches 15:45 ET) closes it at the 15:45 open: the
+    # position is not carried past the session.
     assert len(entries) == 1
     assert entries[0]["Type"] == "Entry long"
     assert exits, "the forced exit must flatten the open position"
     assert exits[-1]["Signal"] == "time_exit", exits[-1]
-    # Filled on the bar after the 15:45 ET exit bar (16:00 ET = 21:00 UTC).
-    assert exits[-1]["Date/Time"] == "2024-01-03T21:00:00+0000", exits[-1]
+    # The order is raised on the bar whose end reaches 15:45 ET, so the
+    # next-open fill lands AT the 15:45 ET open (20:45 UTC), not one bar later.
+    assert exits[-1]["Date/Time"] == "2024-01-03T20:45:00+0000", exits[-1]
 
 
 if __name__ == "__main__":
