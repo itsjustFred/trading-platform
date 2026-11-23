@@ -14,9 +14,7 @@ Multi-unit (pyramiding) scenarios size every concurrent unit on REALIZED cash
 
 from __future__ import annotations
 
-import math
 import random
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -76,7 +74,7 @@ def _check(tmp_path, frame, label, *, params=None, risk=0.02, **ref_kwargs):
 @pytest.mark.parametrize("fixture", ["spy_1d.csv.gz", "gld_1d.csv.gz"])
 def test_turtle_system1_real_etf_parity(tmp_path, fixture):
     frame = frame_from_fixture(fixture)
-    sim, trades, run = _check(tmp_path, frame, fixture)
+    _sim, trades, run = _check(tmp_path, frame, fixture)
     assert len(trades) > 250  # the real-data run is substantial, not a handful
     assert len(run.trades) == len(trades)
 
@@ -170,7 +168,7 @@ def test_turtle_single_unit_synthetic_covers_event_classes(tmp_path):
 @pytest.mark.parametrize("seed", SEEDS[:6])
 def test_turtle_pyramiding_synthetic_parity(tmp_path, seed):
     frame = synthetic_frame(seed)
-    sim, trades, run = _check(tmp_path, frame, f"seed{seed}", params=dict(SHORT_PARAMS), **SHORT_PARAMS)
+    _sim, trades, _result = _check(tmp_path, frame, f"seed{seed}", params=dict(SHORT_PARAMS), **SHORT_PARAMS)
     assert trades
 
 

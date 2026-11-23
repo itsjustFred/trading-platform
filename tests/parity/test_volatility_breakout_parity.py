@@ -44,7 +44,7 @@ def _run(tmp_path, frame, label):
 
 def test_volatility_breakout_real_usa500_parity(tmp_path):
     frame = frame_from_fixture("usa500_5m_rth.csv.gz")
-    sim, trades, run = _run(tmp_path, frame, "usa500")
+    _sim, trades, run = _run(tmp_path, frame, "usa500")
     assert len(trades) >= 20
     assert len(run.trades) == len(trades)
     assert {t.legs[-1].reason for t in trades} >= {"stop_loss", "signal"}

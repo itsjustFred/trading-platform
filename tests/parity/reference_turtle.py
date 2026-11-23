@@ -87,10 +87,10 @@ class TurtleRef:
 
             c20, c10, c55 = channel(self.entry_len), channel(self.exit_len), channel(self.failsafe_len)
 
-            def exit_channel_hit(s: int) -> bool:
-                if c10 is None:
+            def exit_channel_hit(s: int, *, _bar=bar, _c10=c10) -> bool:
+                if _c10 is None:
                     return False
-                return bar.close < c10[1] if s > 0 else bar.close > c10[0]
+                return _bar.close < _c10[1] if s > 0 else _bar.close > _c10[0]
 
             # protective stops on units signalled before this bar
             if units:

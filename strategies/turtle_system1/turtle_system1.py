@@ -36,7 +36,6 @@ Deviations from the original rules (platform execution model, documented):
 
 import math
 
-import numpy as np
 import pandas as pd
 
 STRATEGY_META = {
@@ -96,7 +95,7 @@ def _prior_extreme(values, length, fn):
     return out
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     entry_len = int(params.get("entry_len", 20))
     exit_len = int(params.get("exit_len", 10))

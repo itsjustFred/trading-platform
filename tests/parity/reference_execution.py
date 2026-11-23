@@ -536,12 +536,12 @@ class ReferenceSimulator:
 
     @property
     def curve_by_time(self) -> dict[str, float]:
-        return {bar.time: value for bar, value in zip(self._bars, self.curve)}
+        return {bar.time: value for bar, value in zip(self._bars, self.curve, strict=True)}
 
     @property
     def realized_by_time(self) -> dict[str, float]:
         """Realized cash at the end of each bar (the engine's published curve basis)."""
-        return {bar.time: value for bar, value in zip(self._bars, self.realized_curve)}
+        return {bar.time: value for bar, value in zip(self._bars, self.realized_curve, strict=True)}
 
     @property
     def realized_equity(self) -> float:
@@ -559,18 +559,16 @@ def read_bars_csv(path) -> list[Bar]:
 
     with open(path, newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
-        bars = []
-        for row in reader:
-            bars.append(
-                Bar(
-                    time=str(row["timestamp"]),
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                )
+        return [
+            Bar(
+                time=str(row["timestamp"]),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
             )
-    return bars
+            for row in reader
+        ]
 
 
 __all__ = [

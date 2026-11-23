@@ -26,7 +26,7 @@ def compare_trades(engine: list[RefTrade], ref: list[RefTrade]) -> list[str]:
     exp = sorted(ref, key=lambda t: t.entry_time)
     if len(eng) != len(exp):
         diffs.append(f"trade count: engine={len(eng)} reference={len(exp)}")
-    for k, (a, b) in enumerate(zip(eng, exp)):
+    for k, (a, b) in enumerate(zip(eng, exp, strict=True)):
         tag = f"#{k} {b.entry_time[:10]} {b.direction}"
         if a.entry_time != b.entry_time or a.direction != b.direction:
             diffs.append(f"{tag}: entry engine={a.entry_time}/{a.direction}")

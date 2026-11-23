@@ -61,7 +61,7 @@ STRATEGY_META = {
 }
 
 
-def generate_signals(df: pd.DataFrame, params: dict = None):
+def generate_signals(df: pd.DataFrame, params: dict | None = None):
     params = params or {}
     atr_len = int(params.get("atr_len", 14))
     stop_frac = float(params.get("stop_atr_frac", 0.10))

@@ -49,7 +49,7 @@ def _run(tmp_path, frame, label, *, signal_exit_fill="next_open"):
 
 def test_orb_real_usa500_5m_parity(tmp_path):
     frame = frame_from_fixture("usa500_5m_rth.csv.gz")
-    sim, trades, run = _run(tmp_path, frame, "usa500")
+    _sim, trades, run = _run(tmp_path, frame, "usa500")
     assert len(trades) == 24
     assert len(run.trades) == 24
     reasons = {t.legs[-1].reason for t in trades}
@@ -93,7 +93,7 @@ def test_orb_synthetic_covers_event_classes():
 @pytest.mark.parametrize("seed", [1, 2])
 def test_orb_legacy_close_exit_parity(tmp_path, seed):
     """Explicit opt-in ``signal_exit_fill="close"``: flat at the session's last close."""
-    sim, trades, run = _run(
+    _sim, trades, _result = _run(
         tmp_path, synthetic_sessions(seed), f"close-seed{seed}", signal_exit_fill="close"
     )
     assert any(t.legs[-1].reason == "signal" for t in trades)
@@ -102,7 +102,7 @@ def test_orb_legacy_close_exit_parity(tmp_path, seed):
 def test_orb_default_signal_exit_is_next_session_open(tmp_path):
     """Rule B: the session-end signal exit fills at the NEXT bar's open (overnight)."""
     frame = synthetic_sessions(1)
-    sim, trades, run = _run(tmp_path, frame, "next-open")
+    _sim, trades, _result = _run(tmp_path, frame, "next-open")
     by_time = {b.time: b for b in bar_list(frame)}
     signal_trades = [t for t in trades if t.legs[-1].reason == "signal"]
     assert signal_trades

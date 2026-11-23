@@ -31,6 +31,7 @@ signal contract.
 from __future__ import annotations
 
 from collections import Counter
+from itertools import pairwise
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -55,7 +56,7 @@ def _bar_spacing_minutes(times: list[datetime]) -> float:
     Returns 0.0 when the spacing cannot be determined.
     """
     gaps: Counter = Counter()
-    for earlier, later in zip(times, times[1:]):
+    for earlier, later in pairwise(times):
         seconds = int((later - earlier).total_seconds())
         if seconds > 0:
             gaps[seconds] += 1
