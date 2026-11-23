@@ -60,6 +60,42 @@ class _DummyEngine:
         )
 
 
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("fee_rate", -0.001),
+        ("fee_rate", float("nan")),
+        ("fee_rate", float("inf")),
+        ("fee_flat_per_trade", -1.0),
+        ("fee_flat_per_trade", float("nan")),
+        ("fee_flat_per_trade", float("inf")),
+    ],
+)
+def test_fee_cli_rejects_invalid_fee_values(attribute: str, value: float) -> None:
+    args = SimpleNamespace(
+        fee_rate=None,
+        fee_flat_per_trade=None,
+        fees_zero=False,
+    )
+    setattr(args, attribute, value)
+
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        runner_cli._fee_params_from_args(args)
+
+
+def test_fee_cli_accepts_valid_fee_values() -> None:
+    args = SimpleNamespace(
+        fee_rate=0.001,
+        fee_flat_per_trade=2.0,
+        fees_zero=False,
+    )
+
+    assert runner_cli._fee_params_from_args(args) == {
+        "fee_rate": 0.001,
+        "fee_flat_per_trade": 2.0,
+    }
+
+
 def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     output_path = tmp_path / "cli-demo.trades.json"
 
