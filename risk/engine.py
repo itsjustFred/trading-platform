@@ -227,8 +227,11 @@ class RiskEngine:
         - ``config.max_total_exposure``: aggregate open-risk ceiling, fraction.
         - ``config.max_risk_per_trade``: maximum loss on this trade, fraction.
         - ``config.max_notional_per_trade``: default notional ceiling for the
-          resulting position, as a fraction of balance. The position's notional
-          is ``position_size * entry_price * pip_value`` in account currency.
+          resulting position, as a fraction of balance; values above 1 are
+          leverage and callers bound them by the broker maximum (#240 —
+          ``risk.config.effective_max_notional_per_trade``). The position's
+          notional is ``position_size * entry_price * pip_value`` in account
+          currency.
         - ``pip_value``: account-currency P&L of one ``position_size`` unit per
           1.0 price move (1.0 for shares in the account currency; cTrader
           EURUSD on a USD account: 1000 per 0.01 lot).

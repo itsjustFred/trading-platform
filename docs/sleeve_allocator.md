@@ -94,10 +94,12 @@ reported. The report (`result.report`) always contains `equal_weight` and
 volatility, Sharpe, max drawdown), rebalance counts (carried /
 fallback-equal-weight / cash), per-sleeve `sources`, and average turnover.
 Metrics annualise at the measured observation density of each chained
-curve (#349 convention: observations per calendar year), falling back to
-sqrt(252) only when the density cannot be measured — so a calendar-filled
-curve annualises at ~365.25 and a business-day curve at ~261, not a fixed
-252.
+curve (#349/#353 convention: observations per calendar year, via
+`runner.stats.return_periods_per_year`), falling back to
+`DAILY_RETURN_PERIODS_PER_YEAR` only when the density cannot be measured —
+so a calendar-filled curve annualises at ~365 (366 across a leap day) and
+a business-day curve at its observed trading-day density (~261), not a
+fixed 252.
 
 ## CLI
 

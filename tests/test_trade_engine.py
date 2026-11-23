@@ -30,7 +30,7 @@ def _to_utc_datetime(value: object) -> datetime | None:
     return None
 
 
-@pytest.mark.parametrize("exposure", [0.0, -0.01, 1.01])
+@pytest.mark.parametrize("exposure", [0.0, -0.01])
 def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposure: float):
     with pytest.raises(ValueError):
         BacktestConfig(
@@ -41,6 +41,21 @@ def test_backtest_config_rejects_position_exposure_outside_fraction_range(exposu
             end_date="2024-01-02",
             max_position_exposure_pct=exposure,
         )
+
+
+@pytest.mark.parametrize("exposure", [1.01, 2.5, 50.0])
+def test_backtest_config_accepts_position_exposure_above_one(exposure: float):
+    """#240: a per-position notional cap above 1x is leverage; the broker
+    maximum (``max_leverage``) bounds it at sizing time, not at config time."""
+    cfg = BacktestConfig(
+        strategy_name="bounds",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        max_position_exposure_pct=exposure,
+    )
+    assert cfg.max_position_exposure_pct == exposure
 
 
 def _time_bounds(path: Path) -> tuple[datetime | None, datetime | None]:
@@ -339,6 +354,57 @@ def test_trade_engine_can_anchor_market_stop_to_fill_price_with_stop_distance():
     assert trade.exits[-1].price == pytest.approx(118.0)
     assert trade.exits[-1].reason == "stop_loss"
     assert trade.pnl == pytest.approx(-1000.0, abs=0.5)
+
+
+def _tight_stop_strategy(df: pd.DataFrame, params: dict):
+    """One LONG entry at bar 10 with a 0.1 stop distance: risk sizing wants
+    10_000 units (1% of 100k / 0.1), so only the notional/leverage caps bind."""
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    entries.iloc[10] = True
+    indicators = {
+        "direction": pd.Series("LONG", index=df.index),
+        "sl_price": pd.Series(pd.NA, index=df.index),
+    }
+    indicators["sl_price"].iloc[10] = 110.9
+    return entries, exits, indicators, []
+
+
+def _run_tight_stop(**overrides) -> float:
+    cfg = BacktestConfig(
+        strategy_name="leverage-test",
+        symbols=["TEST"],
+        timeframe="1h",
+        start_date="2024-01-01",
+        end_date="2024-01-31",
+        initial_capital=100_000,
+        risk_per_trade_pct=0.01,
+        modeling_resolution="main_timeframe",
+        parameters={"fees": "zero", "slippage": "none"},
+        **overrides,
+    )
+    result = TradeEngine(cfg, symbol="TEST").run(_synthetic_ohlcv(100), _tight_stop_strategy)
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    # Entry fills at the bar-11 open (111.0); notional = qty * entry.
+    return trade.quantity * trade.entry_price
+
+
+def test_native_engine_bounds_notional_above_one_by_max_leverage():
+    """#240: max_position_exposure_pct > 1 is leverage; the broker maximum
+    (max_leverage) bounds the notional — an unset maximum fails closed to 1x."""
+    # Risk sizing wants ~11.1x equity of notional; the 3x broker maximum binds.
+    assert _run_tight_stop(max_position_exposure_pct=5.0, max_leverage=3.0) == pytest.approx(
+        300_000.0, rel=0.01
+    )
+    # Unknown broker maximum -> 1x, even with a 5x configured cap.
+    assert _run_tight_stop(max_position_exposure_pct=5.0, max_leverage=None) == pytest.approx(
+        100_000.0, rel=0.01
+    )
+    # A configured cap below the broker maximum still binds.
+    assert _run_tight_stop(max_position_exposure_pct=0.5, max_leverage=10.0) == pytest.approx(
+        50_000.0, rel=0.01
+    )
 
 
 def test_stop_distance_only_order_gets_fill_anchored_live_stop():

@@ -70,9 +70,13 @@ class _DummyEngine:
         ("fee_flat_per_trade", -1.0),
         ("fee_flat_per_trade", float("nan")),
         ("fee_flat_per_trade", float("inf")),
+        ("fee_rate", True),
+        ("fee_rate", False),
+        ("fee_flat_per_trade", True),
+        ("fee_flat_per_trade", False),
     ],
 )
-def test_fee_cli_rejects_invalid_fee_values(attribute: str, value: float) -> None:
+def test_fee_cli_rejects_invalid_fee_values(attribute: str, value: object) -> None:
     args = SimpleNamespace(
         fee_rate=None,
         fee_flat_per_trade=None,
