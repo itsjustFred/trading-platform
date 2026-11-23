@@ -25,18 +25,25 @@ from typing import Any
 
 def canonical_utc_timestamp(value: Any) -> str | None:
     """Return the canonical UTC ISO-8601 text for ``value``, or ``None`` if it is not a time."""
-    if isinstance(value, datetime):
-        moment = value
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
+    try:
+        if isinstance(value, datetime):
+            moment = value
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                moment = datetime.fromisoformat(
+                    text.replace("Z", "+00:00").replace("z", "+00:00")
+                )
+            except (ValueError, OverflowError):
+                return None
+        else:
             return None
-        try:
-            moment = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
-        except ValueError:
-            return None
-    else:
+        if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat()
+    except (OverflowError, ValueError, TypeError):
+        # Producer-controlled stamps can name dates no datetime can hold
+        # (e.g. year 1 with a non-UTC offset); "not a time" reads as None.
         return None
-    if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc).isoformat()
