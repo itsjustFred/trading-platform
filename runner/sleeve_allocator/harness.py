@@ -112,12 +112,12 @@ def _equity_from_returns(returns: pd.Series) -> pd.Series:
 def _return_periods_per_year(returns: pd.Series) -> float:
     """Measured observation density: return observations per calendar year.
 
-    Mirrors the ``runner.stats`` convention landing with #349 (pending
-    merge — the function does not exist on main yet): a
-    calendar-filled curve observes ~365.25 rows a year, a business-day
-    curve ~261, so annualising at a fixed sqrt(252) understates both
-    Sharpe and the ``ann_return``/``ann_volatility`` figures. The span is
-    first-to-last observation plus one day bucket; series too short to
+    This module's own convention for bare return series (the sleeve harness
+    has no venue/asset-class context, so it cannot use the #229 asset-class
+    rule): a calendar-filled series observes ~365.25 rows a year, a
+    business-day series ~261, so annualising at a fixed sqrt(252) understates
+    both Sharpe and the ``ann_return``/``ann_volatility`` figures. The span
+    is first-to-last observation plus one day bucket; series too short to
     measure fall back to the platform's ``DAILY_RETURN_PERIODS_PER_YEAR``.
     """
     index = returns.index
@@ -133,9 +133,9 @@ def curve_metrics(returns: pd.Series) -> dict[str, Any]:
     """Standard metrics for one chained daily-return series.
 
     Sharpe/volatility/annualised return use the measured observation
-    density (``_return_periods_per_year``, the #349 convention) rather
-    than a fixed sqrt(252); series too short to measure fall back to
-    ``runner.stats.DAILY_RETURN_PERIODS_PER_YEAR``.
+    density (``_return_periods_per_year``, this module's convention for
+    bare return series) rather than a fixed sqrt(252); series too short to
+    measure fall back to ``runner.stats.DAILY_RETURN_PERIODS_PER_YEAR``.
     """
     n = len(returns)
     metrics: dict[str, Any] = {"n_days": n}
