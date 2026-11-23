@@ -4,12 +4,16 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-# All exposure values are FRACTIONS OF ACCOUNT EQUITY in [0, 1]:
+# All exposure values are FRACTIONS OF ACCOUNT EQUITY:
 #   - max_risk_per_trade: maximum loss on a single trade (as a fraction of
-#     account balance) if the stop is hit.
+#     account balance) if the stop is hit. Bounded to [0, 1].
 #   - max_total_exposure: aggregate open risk across all positions (same unit).
+#     Bounded to [0, 1].
 #   - max_notional_per_trade: upper bound on a single position's notional value
-#     as a fraction of account balance (leverage guard).
+#     as a fraction of account balance. Values above 1 are leverage and are
+#     bounded per sizing path by the broker's maximum leverage for the account
+#     and asset (#240); an undeterminable broker maximum fails closed to 1x —
+#     see ``effective_max_notional_per_trade``.
 # Sizing quantities (SizedOrder.position_size) are in ACCOUNT-CURRENCY UNITS of
 # the traded symbol (shares/lots). Never mix the two unit domains; conversions
 # happen only inside RiskEngine.calculate_position_size.
@@ -58,8 +62,8 @@ class RiskConfig:
             raise ValueError("default_sl_atr_multiplier must be > 0")
         if not (0 < self.fallback_stop_pct < 1):
             raise ValueError("fallback_stop_pct must be between 0 and 1")
-        if not 0 < self.max_notional_per_trade <= 1:
-            raise ValueError("max_notional_per_trade must be > 0 and <= 1")
+        if not 0 < self.max_notional_per_trade:
+            raise ValueError("max_notional_per_trade must be > 0")
 
     @staticmethod
     def _finite_float(value: Any, field_name: str) -> float:
@@ -94,3 +98,28 @@ class RiskConfig:
         if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
             return value.strip().lower() == "true"
         raise ValueError(f"{field_name} must be boolean")
+
+
+def effective_max_notional_per_trade(
+    configured: float, broker_max_leverage: float | None
+) -> float:
+    """Effective per-trade notional ceiling (#240): ``min(configured, broker max)``.
+
+    ``configured`` is ``RiskConfig.max_notional_per_trade`` — a fraction of
+    account equity that may exceed 1 (leverage). ``broker_max_leverage`` is the
+    broker's maximum leverage for the account and asset; ``None`` or any
+    unusable value means the maximum cannot be determined and fails closed to
+    1x — never a guessed ceiling. The result is always finite and positive for
+    a valid ``RiskConfig``; callers pass it as the ``max_notional_per_trade``
+    caller ceiling of ``RiskEngine.calculate_position_size``, which re-validates
+    it.
+    """
+    leverage = 1.0
+    if broker_max_leverage is not None and not isinstance(broker_max_leverage, bool):
+        try:
+            candidate = float(broker_max_leverage)
+        except (TypeError, ValueError, OverflowError):
+            candidate = math.nan
+        if math.isfinite(candidate) and candidate > 0:
+            leverage = candidate
+    return min(float(configured), leverage)

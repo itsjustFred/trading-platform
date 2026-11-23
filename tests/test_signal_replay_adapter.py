@@ -359,3 +359,70 @@ def test_build_risk_signal_maps_direction_levels_and_metadata() -> None:
     )
     assert long_signal.action == "buy"
     assert long_signal.metadata["current_positions"] == 0
+
+
+# ─── #240: max_notional_per_trade above 1x, bounded by declared max_leverage ──
+
+
+def _tight_stop_replay_signal() -> ReplaySignal:
+    return ReplaySignal.from_payload(
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "symbol": "AAPL",
+            "action": "buy",
+            "entry_price": 100.0,
+            "stop_loss": 99.9,
+            "timeframe": "1m",
+            "source": "csv:signals.csv",
+            "metadata": {},
+        },
+        default_timeframe="1m",
+    )
+
+
+def _run_tight_stop_replay(*, max_leverage, max_notional_per_trade):
+    adapter = SignalReplayAdapter(
+        risk_config=RiskConfig(
+            max_risk_per_trade=0.01,
+            max_total_exposure=0.05,
+            max_positions=5,
+            max_notional_per_trade=max_notional_per_trade,
+        ),
+        max_leverage=max_leverage,
+        initial_capital=100000.0,
+        default_timeframe="1m",
+        fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
+    )
+    return adapter.run(
+        signals=[_tight_stop_replay_signal()],
+        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
+        timeframe="1m",
+        backtest_start="2026-01-01",
+        backtest_end="2026-01-01",
+    )
+
+
+def test_replay_bounds_notional_cap_above_one_by_max_leverage() -> None:
+    """#240: a configured notional cap above 1x is bounded by the declared
+    broker maximum leverage; an unset maximum fails closed to 1x."""
+    # Fill at the bar-1 open (100.5); risk sizing wants ~10x equity notional.
+    bounded = _run_tight_stop_replay(max_leverage=3.0, max_notional_per_trade=5.0)
+    assert len(bounded.trades) == 1
+    # ceiling = min(5, 3) = 3 -> qty = 3 * 100_000 / 100.5.
+    assert bounded.trades[0].quantity == pytest.approx(300_000.0 / 100.5, rel=0.01)
+    assert bounded.meta.max_leverage == 3.0
+
+    configured_binds = _run_tight_stop_replay(max_leverage=50.0, max_notional_per_trade=5.0)
+    assert configured_binds.trades[0].quantity == pytest.approx(
+        500_000.0 / 100.5, rel=0.01
+    )
+
+    unknown = _run_tight_stop_replay(max_leverage=None, max_notional_per_trade=5.0)
+    assert unknown.trades[0].quantity == pytest.approx(100_000.0 / 100.5, rel=0.01)
+    assert unknown.meta.max_leverage is None
+
+
+def test_replay_sub_one_notional_cap_unchanged_by_max_leverage() -> None:
+    result = _run_tight_stop_replay(max_leverage=50.0, max_notional_per_trade=0.2)
+    assert result.trades[0].quantity == pytest.approx(20_000.0 / 100.5, rel=0.01)

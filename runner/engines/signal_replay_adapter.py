@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from risk.config import RiskConfig
+from risk.config import RiskConfig, effective_max_notional_per_trade
 from risk.engine import RiskEngine
 from risk.models import TradeSignal as RiskTradeSignal
 from risk.models import realized_risk_amount, realized_risk_percent
@@ -256,9 +256,14 @@ class SignalReplayAdapter:
         slippage_model: Any | None = None,
         slippage_params: dict[str, Any] | None = None,
         asset_class_by_symbol: dict[str, str] | None = None,
+        max_leverage: float | None = None,
     ) -> None:
         self.risk_config = risk_config or RiskConfig()
         self.risk_engine = RiskEngine(self.risk_config)
+        # #240: the declared broker maximum leverage for the account/asset —
+        # replay has no broker connection, so the operator declares it; unset
+        # means unknown and the notional ceiling fails closed to 1x.
+        self._max_leverage = max_leverage
         self.initial_capital = float(initial_capital)
         self.default_timeframe = normalize_timeframe(default_timeframe) or default_timeframe
         # #84: explicit fee model (no silent gross); resolved at run() so
@@ -1220,6 +1225,11 @@ class SignalReplayAdapter:
                 account_balance=account_balance,
                 pip_value=1.0,
                 current_exposure=exposure,
+                # #240: max_notional_per_trade may exceed 1 (leverage); the
+                # declared broker maximum bounds it, 1x when unknown.
+                max_notional_per_trade=effective_max_notional_per_trade(
+                    self.risk_config.max_notional_per_trade, self._max_leverage
+                ),
             )
             quantity = float(sized.position_size)
             if quantity <= 0:
@@ -1333,7 +1343,7 @@ class SignalReplayAdapter:
             initial_capital=float(self.initial_capital),
             risk_per_trade_pct=float(self.risk_config.max_risk_per_trade),
             max_position_exposure_pct=float(self.risk_config.max_notional_per_trade),
-            max_leverage=None,
+            max_leverage=self._max_leverage,
             modeling_resolution=normalized_timeframe,
             signal_exit_fill="close",
             allow_fallback_stop=self.risk_config.allow_fallback_stop,
@@ -1343,6 +1353,8 @@ class SignalReplayAdapter:
                 "max_risk_per_trade": float(self.risk_config.max_risk_per_trade),
                 "max_total_exposure": float(self.risk_config.max_total_exposure),
                 "max_positions": int(self.risk_config.max_positions),
+                "max_notional_per_trade": float(self.risk_config.max_notional_per_trade),
+                "max_leverage": self._max_leverage,
                 "signal_processor": self.signal_processor_name or None,
                 **(metadata or {}),
             },
@@ -1427,11 +1439,14 @@ class SignalReplayEngine:
         fee_params: dict[str, Any] | None = None,
         slippage_model: Any | None = None,
         slippage_params: dict[str, Any] | None = None,
+        max_leverage: float | None = None,
     ) -> None:
         self.data_dir = Path(data_dir or DATA_DIR).expanduser().resolve()
         self.risk_config = risk_config or RiskConfig()
         self.default_timeframe = normalize_timeframe(default_timeframe) or "1h"
         self.signal_processor_name = str(signal_processor_name or "").strip().lower()
+        # #240: declared broker maximum leverage, forwarded to the adapter.
+        self._max_leverage = max_leverage
         # #84: explicit fee declaration, forwarded to the inner adapter.
         self._fee_model = fee_model
         self._fee_params = dict(fee_params or {})
@@ -1630,6 +1645,7 @@ class SignalReplayEngine:
             ),
             slippage_params=merged_slippage_params,
             asset_class_by_symbol=dict(self._asset_class_by_symbol),
+            max_leverage=self._max_leverage,
         )
         result = adapter.run(
             signals=replay_signals,

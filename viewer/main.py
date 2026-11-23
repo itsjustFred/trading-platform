@@ -1422,7 +1422,9 @@ class BacktestRunRequest(SQLModel):
     end: str = ""
     capital: float = 100000.0
     risk_per_trade_pct: float | None = PydanticField(default=None, ge=0.0, lt=1.0)
-    max_position_pct: float | None = PydanticField(default=None, gt=0.0, le=1.0)
+    # #240: above 1 is leverage; the engine bounds the notional by
+    # max_leverage (1x when unset) — no upper bound here.
+    max_position_pct: float | None = PydanticField(default=None, gt=0.0)
     max_leverage: float | None = PydanticField(default=None, gt=0.0)
     modeling_resolution: str | None = "open_close"
     intrabar_resolution: str | None = None
@@ -1453,6 +1455,10 @@ class BacktestRunSignalsRequest(SQLModel):
     risk_per_trade_pct: float | None = None
     max_position_pct: float | None = None
     max_positions: int | None = None
+    # #240: per-position notional ceiling as a fraction of equity; values
+    # above 1 are leverage bounded by max_leverage (1x when unset).
+    max_notional_per_trade: float | None = None
+    max_leverage: float | None = None
     auto_download: bool = True
     # #130: optional fill-price slippage declaration (same spellings as the
     # CLI); absent means the per-asset-class auto model.
@@ -1479,6 +1485,8 @@ class BacktestRunFromSignalsRequest(SQLModel):
     risk_per_trade_pct: float | None = None
     max_position_pct: float | None = None
     max_positions: int | None = None
+    max_notional_per_trade: float | None = None
+    max_leverage: float | None = None
     auto_download: bool = True
     slippage: str | None = None
     slippage_bps: float | None = None
@@ -11369,6 +11377,16 @@ def _validate_positive_payload_float(value: Any, *, default: float, field: str) 
     return normalized
 
 
+def _validate_optional_positive_payload_float(value: Any, *, field: str) -> float | None:
+    """Like :func:`_validate_positive_payload_float` but preserves ``None``."""
+    if value is None:
+        return None
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise HTTPException(status_code=400, detail=f"{field} must be a finite number > 0")
+    return normalized
+
+
 async def _collect_source_signals(
     *,
     normalized_source: str,
@@ -11452,7 +11470,16 @@ def _public_value_error_detail(exc: Exception) -> str:
 def _validated_signal_replay_request(
     payload: BacktestRunSignalsRequest,
 ) -> tuple[
-    list[dict[str, Any]], str, str, str, str, float, float, int
+    list[dict[str, Any]],
+    str,
+    str,
+    str,
+    str,
+    float,
+    float,
+    int,
+    float | None,
+    float | None,
 ]:
     """Validate a run-signals request; returns the normalized request fields."""
     direct_signals_payload = list(payload.signals or [])
@@ -11481,6 +11508,14 @@ def _validated_signal_replay_request(
     max_positions = int(payload.max_positions or 5)
     if max_positions <= 0:
         raise HTTPException(status_code=400, detail="max_positions must be > 0")
+    # #240: optional leverage declarations — the notional ceiling and the
+    # broker maximum it is bounded by. Both fail closed downstream when unset.
+    max_notional_per_trade = _validate_optional_positive_payload_float(
+        payload.max_notional_per_trade, field="max_notional_per_trade"
+    )
+    max_leverage = _validate_optional_positive_payload_float(
+        payload.max_leverage, field="max_leverage"
+    )
     return (
         direct_signals_payload,
         source_name,
@@ -11490,6 +11525,8 @@ def _validated_signal_replay_request(
         risk_per_trade_pct,
         max_position_pct,
         max_positions,
+        max_notional_per_trade,
+        max_leverage,
     )
 
 
@@ -11552,6 +11589,8 @@ def _register_signal_replay_task(
     risk_per_trade_pct: float,
     max_position_pct: float,
     max_positions: int,
+    max_notional_per_trade: float | None,
+    max_leverage: float | None,
     timeframe: str,
     start_dt: datetime,
     end_dt: datetime,
@@ -11591,6 +11630,8 @@ def _register_signal_replay_task(
             "risk_per_trade_pct": risk_per_trade_pct,
             "max_position_pct": max_position_pct,
             "max_positions": max_positions,
+            "max_notional_per_trade": max_notional_per_trade,
+            "max_leverage": max_leverage,
             "signal_processor": signal_processor_name or None,
             "signal_count": len(normalized_signals),
             "fee_params": dict(fee_params),
@@ -11665,6 +11706,8 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         risk_per_trade_pct,
         max_position_pct,
         max_positions,
+        max_notional_per_trade,
+        max_leverage,
     ) = _validated_signal_replay_request(payload)
     # #361: resolve the fee declaration BEFORE registering the task — a
     # missing/conflicting declaration is a 400, not a task that dies in the
@@ -11700,6 +11743,8 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         risk_per_trade_pct=risk_per_trade_pct,
         max_position_pct=max_position_pct,
         max_positions=max_positions,
+        max_notional_per_trade=max_notional_per_trade,
+        max_leverage=max_leverage,
         timeframe=timeframe,
         start_dt=start_dt,
         end_dt=end_dt,
@@ -11823,13 +11868,18 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     slippage_params["slippage_default_bps"] = float(
                         payload.slippage_default_bps
                     )
+                risk_config_kwargs: dict[str, Any] = {
+                    "max_risk_per_trade": risk_per_trade_pct,
+                    "max_total_exposure": max_position_pct,
+                    "max_positions": max_positions,
+                    "default_sl_atr_multiplier": 2.0,
+                }
+                if max_notional_per_trade is not None:
+                    # #240: unset keeps the RiskConfig default (0.20).
+                    risk_config_kwargs["max_notional_per_trade"] = max_notional_per_trade
                 adapter = SignalReplayAdapter(
-                    risk_config=RiskConfig(
-                        max_risk_per_trade=risk_per_trade_pct,
-                        max_total_exposure=max_position_pct,
-                        max_positions=max_positions,
-                        default_sl_atr_multiplier=2.0,
-                    ),
+                    risk_config=RiskConfig(**risk_config_kwargs),
+                    max_leverage=max_leverage,
                     initial_capital=float(payload.capital or 100000.0),
                     default_timeframe=timeframe,
                     signal_processor_name=signal_processor_name or None,
@@ -12009,6 +12059,8 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
             risk_per_trade_pct=payload.risk_per_trade_pct,
             max_position_pct=payload.max_position_pct,
             max_positions=payload.max_positions,
+            max_notional_per_trade=payload.max_notional_per_trade,
+            max_leverage=payload.max_leverage,
             auto_download=payload.auto_download,
             slippage=payload.slippage,
             slippage_bps=payload.slippage_bps,
@@ -12062,6 +12114,8 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
         risk_per_trade_pct=payload.risk_per_trade_pct,
         max_position_pct=payload.max_position_pct,
         max_positions=payload.max_positions,
+        max_notional_per_trade=payload.max_notional_per_trade,
+        max_leverage=payload.max_leverage,
         auto_download=payload.auto_download,
         slippage=payload.slippage,
         slippage_bps=payload.slippage_bps,

@@ -1155,3 +1155,93 @@ def test_a_quote_fetch_that_hangs_is_cut_off_and_refuses_the_entry(monkeypatch):
         _prepare(adapter, deployment, signal)
     assert len(adapter.quote_calls) == 1
     assert adapter.submitted == []
+
+
+# ── #240: max_notional_per_trade above 1x, bounded by broker max leverage ──────
+
+
+@dataclass
+class _MaxLeverageAdapter(_GateAdapter):
+    """_GateAdapter plus a configurable broker maximum leverage (#240)."""
+
+    max_leverage: float | None = None
+    leverage_error: Exception | None = None
+
+    async def get_max_leverage(self, symbol: str):
+        if self.leverage_error is not None:
+            raise self.leverage_error
+        return self.max_leverage
+
+
+def _leverage_signal(deployment: LiveDeploymentConfig) -> LiveSignal:
+    # entry 100 / stop 99.9 -> 0.1 distance: risk sizing alone wants
+    # 1_000 / 0.1 = 10_000 units (~10x equity notional), so only the
+    # notional/leverage ceiling binds.
+    return _signal(
+        deployment, {"entry_price": 100.0, "stop_loss": 99.9, "take_profit": 110.0}
+    )
+
+
+def test_daemon_sizes_notional_cap_above_one_up_to_broker_maximum():
+    """#240: configured 5x cap, broker maximum 3x -> the 3x ceiling binds."""
+    deployment = _deployment(max_notional_per_trade=5.0)
+    adapter = _MaxLeverageAdapter(quote=_at_entry(), max_leverage=3.0)
+
+    _, qty = _prepare(adapter, deployment, _leverage_signal(deployment))
+
+    # ceiling = min(5, 3) = 3 -> 3 * 100_000 / (100 * 1.0) = 3_000 units.
+    assert qty == pytest.approx(3000.0)
+
+
+def test_daemon_sizes_notional_cap_above_one_below_broker_maximum():
+    """#240: configured 5x cap, broker maximum 50x -> the configured 5x binds."""
+    deployment = _deployment(max_notional_per_trade=5.0)
+    adapter = _MaxLeverageAdapter(quote=_at_entry(), max_leverage=50.0)
+
+    _, qty = _prepare(adapter, deployment, _leverage_signal(deployment))
+
+    assert qty == pytest.approx(5000.0)
+
+
+def test_daemon_unknown_broker_maximum_fails_closed_to_1x():
+    """#240: an undeterminable broker maximum caps leverage at 1x — never a
+    guessed ceiling, even with a 5x configured cap."""
+    deployment = _deployment(max_notional_per_trade=5.0)
+    for adapter in (
+        _MaxLeverageAdapter(quote=_at_entry(), max_leverage=None),
+        _MaxLeverageAdapter(
+            quote=_at_entry(), leverage_error=RuntimeError("no leverage feed")
+        ),
+        # An adapter that never implemented get_max_leverage inherits the
+        # base default (None -> 1x).
+        _GateAdapter(quote=_at_entry()),
+    ):
+        _, qty = _prepare(adapter, deployment, _leverage_signal(deployment))
+        assert qty == pytest.approx(1000.0)
+
+
+def test_daemon_sub_one_config_unchanged_by_high_broker_maximum():
+    """#240: a configured cap at or below 1x is untouched by the broker max."""
+    deployment = _deployment(max_notional_per_trade=0.5)
+    adapter = _MaxLeverageAdapter(quote=_at_entry(), max_leverage=50.0)
+
+    _, qty = _prepare(adapter, deployment, _leverage_signal(deployment))
+
+    assert qty == pytest.approx(500.0)
+
+
+def test_size_live_signal_broker_max_leverage_parameter_bounds_the_cap():
+    """The sync sizing entry takes the already-resolved broker maximum; the
+    effective ceiling is min(configured, broker max), 1x when unknown."""
+    deployment = _deployment(max_notional_per_trade=5.0)
+    signal = _leverage_signal(deployment)
+
+    sized = daemon.size_live_signal_for_submission(
+        signal, deployment, account_balance=100_000.0, broker_max_leverage=3.0
+    )
+    assert sized.metadata["qty"] == pytest.approx(3000.0)
+
+    sized = daemon.size_live_signal_for_submission(
+        signal, deployment, account_balance=100_000.0
+    )
+    assert sized.metadata["qty"] == pytest.approx(1000.0)

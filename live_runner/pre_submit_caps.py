@@ -32,8 +32,10 @@ quantity is **clamped down to the broker maximum** (floored to the
 instrument's quantity step) and the remaining caps run against the clamped
 size. An undeterminable broker maximum fails closed to 1x. The clamp is a
 backstop against a broken size, not the platform's notional policy —
-sizing still caps order notional at ``max_notional_per_trade`` (default
-0.20, ``RiskConfig`` refuses values > 1) until #240 decides otherwise.
+sizing caps order notional at ``max_notional_per_trade`` (default
+0.20, ``RiskConfig``), which since #240 may exceed 1: the effective
+ceiling is ``min(configured, broker_max_leverage)`` with an undeterminable
+broker maximum failing closed to 1x (``risk.config.effective_max_notional_per_trade``).
 
 The leverage ceiling is MT5-style **free margin** — the same rule the
 native engine applies since #355 (#359, the live half of #347): free
