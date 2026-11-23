@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pandas as pd
+
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     BaseLiveAdapter,
@@ -193,6 +195,184 @@ UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
 #: pending broker reconciliation instead of letting it sleep out the 30 s
 #: ``queue.get`` timeout. Never a real execution payload.
 _EXECUTION_RECONCILE_WAKE = object()
+
+# ── Trendbar market data (#168) ────────────────────────────────────────────────
+#
+# ProtoOATrendbar is delta-encoded against its own LOW, not the previous close:
+#   low    = absolute price in 1/100000 units (int64)
+#   open   = (low + deltaOpen) / 100000
+#   close  = (low + deltaClose) / 100000
+#   high   = (low + deltaHigh) / 100000
+#   utcTimestampInMinutes = unix minutes of the bar's nominal open
+# (cTrader Open API model-messages docs; verified against the installed
+# ctrader_open_api 0.9.2 descriptors.)
+
+#: Deployment/signal timeframe spelling -> ProtoOATrendbarPeriod member name.
+#: Only periods the enum actually defines are mapped (there is no H2/H3/H6).
+_TRENDBAR_PERIOD_BY_TIMEFRAME: dict[str, str] = {
+    "1m": "M1",
+    "1min": "M1",
+    "2m": "M2",
+    "3m": "M3",
+    "4m": "M4",
+    "5m": "M5",
+    "5min": "M5",
+    "10m": "M10",
+    "15m": "M15",
+    "15min": "M15",
+    "30m": "M30",
+    "30min": "M30",
+    "1h": "H1",
+    "60min": "H1",
+    "4h": "H4",
+    "12h": "H12",
+    "1d": "D1",
+    "1w": "W1",
+}
+
+#: Seconds per ProtoOATrendbarPeriod member (the enum has no H2/H3/H6/D2+).
+_TRENDBAR_PERIOD_SECONDS: dict[str, int] = {
+    "M1": 60,
+    "M2": 120,
+    "M3": 180,
+    "M4": 240,
+    "M5": 300,
+    "M10": 600,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14400,
+    "H12": 43200,
+    "D1": 86400,
+    "W1": 604800,
+    "MN1": 2_592_000,
+}
+
+#: Canonical deployment timeframes the cTrader adapter can serve (#168). The
+#: per-broker live-trailing table in ``shared.trailing`` mirrors this set.
+CTRADER_MARKET_DATA_TIMEFRAMES: frozenset[str] = frozenset(
+    {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+)
+
+
+def _trendbar_period_for_timeframe(timeframe: str) -> str | None:
+    """The ProtoOATrendbarPeriod member name for a deployment timeframe."""
+    normalized = str(timeframe or "").strip().lower()
+    return _TRENDBAR_PERIOD_BY_TIMEFRAME.get(normalized)
+
+
+def _decode_trendbar_price(raw_value: Any, *, price_digits: int) -> float:
+    """One 1/100000-unit price field -> a symbol-precision float, fail closed."""
+    try:
+        raw = float(raw_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"cTrader trendbar price is not numeric: {raw_value!r}") from exc
+    if not math.isfinite(raw):
+        raise ValueError(f"cTrader trendbar price is not finite: {raw_value!r}")
+    price = raw / CTRADER_RELATIVE_PRICE_UNIT_DIVISOR
+    # Round to the symbol's own digits, exactly like the broker-doc recipe:
+    # the integer protocol value can carry sub-tick noise the symbol cannot.
+    return round(price, max(0, int(price_digits)))
+
+
+def decode_trendbar(
+    bar: Any,
+    *,
+    price_digits: int,
+    timestamp_ms_fallback: int | None = None,
+) -> dict[str, Any]:
+    """Decode one ``ProtoOATrendbar`` into an OHLCV row.
+
+    ``timestamp_ms_fallback`` is the deprecated parallel ``timestamp`` array
+    entry (unix ms), used only when the bar carries no
+    ``utcTimestampInMinutes``. Raises ``ValueError`` on any missing or
+    unusable field: a bar this decoder cannot read must not be guessed into
+    the series a workflow trades on.
+    """
+    has_field = getattr(bar, "HasField", None)
+
+    def _present(name: str) -> bool:
+        if has_field is None:
+            return getattr(bar, name, None) is not None
+        try:
+            return bool(has_field(name))
+        except (TypeError, ValueError):
+            return getattr(bar, name, None) is not None
+
+    def _field(name: str) -> float:
+        try:
+            return float(getattr(bar, name))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError(f"cTrader trendbar field {name!r} is unreadable") from exc
+
+    for name in ("low", "deltaOpen", "deltaClose", "deltaHigh"):
+        if not _present(name):
+            raise ValueError(f"cTrader trendbar is missing required field {name!r}")
+    low_raw = _field("low")
+    open_raw = low_raw + _field("deltaOpen")
+    high_raw = low_raw + _field("deltaHigh")
+    close_raw = low_raw + _field("deltaClose")
+    open_price = _decode_trendbar_price(open_raw, price_digits=price_digits)
+    high_price = _decode_trendbar_price(high_raw, price_digits=price_digits)
+    low_price = _decode_trendbar_price(low_raw, price_digits=price_digits)
+    close_price = _decode_trendbar_price(close_raw, price_digits=price_digits)
+    if min(open_price, high_price, low_price, close_price) <= 0:
+        raise ValueError(
+            f"cTrader trendbar decoded a non-positive price: "
+            f"O={open_price!r} H={high_price!r} L={low_price!r} C={close_price!r}"
+        )
+    if high_price < max(open_price, close_price, low_price) or low_price > min(
+        open_price, close_price
+    ):
+        raise ValueError(
+            f"cTrader trendbar OHLC is inconsistent: "
+            f"O={open_price!r} H={high_price!r} L={low_price!r} C={close_price!r}"
+        )
+    open_minutes = _optional_int(getattr(bar, "utcTimestampInMinutes", None))
+    if open_minutes is not None and open_minutes > 0:
+        open_time = datetime.fromtimestamp(open_minutes * 60, tz=timezone.utc)
+    elif timestamp_ms_fallback is not None and timestamp_ms_fallback > 0:
+        open_time = datetime.fromtimestamp(timestamp_ms_fallback / 1000.0, tz=timezone.utc)
+    else:
+        raise ValueError("cTrader trendbar has no usable open timestamp")
+    return {
+        "timestamp": open_time,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "volume": float(getattr(bar, "volume", 0) or 0),
+    }
+
+
+def decode_trendbars_response(
+    response: Any, *, symbol: str, price_digits: int
+) -> list[dict[str, Any]]:
+    """Decode every bar of one ``ProtoOAGetTrendbarsRes``, oldest first.
+
+    The response's deprecated parallel ``timestamp`` array (unix ms) is used
+    only for bars that carry no ``utcTimestampInMinutes`` of their own.
+    """
+    bars = list(getattr(response, "trendbar", []) or [])
+    timestamps = [int(value) for value in (getattr(response, "timestamp", []) or [])]
+    rows: list[dict[str, Any]] = []
+    for index, bar in enumerate(bars):
+        fallback = timestamps[index] if index < len(timestamps) else None
+        try:
+            rows.append(
+                decode_trendbar(
+                    bar,
+                    price_digits=price_digits,
+                    timestamp_ms_fallback=fallback,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"cTrader trendbar {index} for {symbol} is unusable: {exc}"
+            ) from exc
+    rows.sort(key=lambda row: row["timestamp"])
+    return rows
+
 
 #: How far back the deal-list pass looks for broker-side position closes the
 #: stream never saw (#144). Bounded on purpose: an older unattributed close is
@@ -986,6 +1166,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOASubscribeSpotsReq: Any = None
         self._ProtoOAUnsubscribeSpotsReq: Any = None
 
+        self._ProtoOAGetTrendbarsReq: Any = None
+        self._ProtoOAGetTrendbarsRes: Any = None
+        self._ProtoOATrendbarPeriod: Any = None
+        self._ProtoOAAmendPositionSLTPReq: Any = None
+
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
         self._execution_payload_type: int | None = None
@@ -1003,6 +1188,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOAAccountAuthReq,
                 ProtoOAAccountAuthRes,
+                ProtoOAAmendPositionSLTPReq,
                 ProtoOAApplicationAuthReq,
                 ProtoOAApplicationAuthRes,
                 ProtoOACancelOrderReq,
@@ -1011,6 +1197,8 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOADealListRes,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
+                ProtoOAGetTrendbarsReq,
+                ProtoOAGetTrendbarsRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -1039,6 +1227,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOAPositionStatus,
                 ProtoOATimeInForce,
                 ProtoOATradeSide,
+                ProtoOATrendbarPeriod,
             )
         except ModuleNotFoundError as exc:
             raise RuntimeError(
@@ -1086,6 +1275,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._ProtoOASubscribeSpotsReq = ProtoOASubscribeSpotsReq
         self._ProtoOAUnsubscribeSpotsReq = ProtoOAUnsubscribeSpotsReq
+        self._ProtoOAGetTrendbarsReq = ProtoOAGetTrendbarsReq
+        self._ProtoOAGetTrendbarsRes = ProtoOAGetTrendbarsRes
+        self._ProtoOAAmendPositionSLTPReq = ProtoOAAmendPositionSLTPReq
+        self._ProtoOATrendbarPeriod = ProtoOATrendbarPeriod
 
         self._heartbeat_payload_type = ProtoHeartbeatEvent().payloadType
         self._spot_payload_type = ProtoOASpotEvent().payloadType
@@ -2931,6 +3124,106 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             finally:
                 self._spot_waiters.pop(symbol_id, None)
                 await self._unsubscribe_spot(symbol_id)
+
+    def supports_market_data_timeframe(self, timeframe: str) -> bool:
+        """Whether :meth:`get_market_data` can serve ``timeframe`` (#168).
+
+        Only canonical deployment spellings count: the per-broker trailing
+        table and the deployment gates compare the raw timeframe string, so
+        an alias like ``60min`` must not pass here and then fail there (or
+        vice versa). ``get_market_data`` itself accepts the aliases.
+        """
+        normalized = str(timeframe or "").strip().lower()
+        return normalized in CTRADER_MARKET_DATA_TIMEFRAMES
+
+    async def get_market_data(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        limit: int = 200,
+    ) -> pd.DataFrame:
+        """Recent closed trendbars for ``symbol`` on ``timeframe`` (#168).
+
+        Fetches ``ProtoOAGetTrendbarsReq`` history and decodes the
+        delta-encoded ``ProtoOATrendbar`` rows into the same OHLCV frame
+        shape the Alpaca adapter returns (``timestamp`` tz-aware UTC,
+        ascending, ``tail(limit)``). The still-forming bar is excluded: a
+        bar counts only once ``open + period <= now``, so no consumer can
+        read a close that has not happened yet.
+
+        Raises ``ValueError`` on an unsupported timeframe, an unknown
+        symbol, an unusable bar or an empty result — a workflow that cannot
+        see its bars must not guess at them.
+        """
+        self._raise_if_terminal_auth_failed()
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            raise ValueError("symbol is required for cTrader market data")
+        period_name = _trendbar_period_for_timeframe(timeframe)
+        if period_name is None:
+            raise ValueError(
+                f"cTrader cannot serve {timeframe!r} market data "
+                f"(supported: {', '.join(sorted(CTRADER_MARKET_DATA_TIMEFRAMES))})"
+            )
+        period_seconds = _TRENDBAR_PERIOD_SECONDS[period_name]
+        if (
+            self._ProtoOAGetTrendbarsReq is None
+            or self._ProtoOAGetTrendbarsRes is None
+            or self._ProtoOATrendbarPeriod is None
+        ):
+            raise RuntimeError("cTrader trendbar message types are not loaded")
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        symbol_id = await self._resolve_symbol_id(normalized)
+        scale = self._scale_for(normalized)
+        bounded_limit = max(1, min(int(limit), 1000))
+        now = _utc_now()
+        # The window is wider than count*period on purpose: weekends and
+        # session gaps mean `count` calendar periods hold fewer bars, and a
+        # too-narrow window would silently truncate the history the
+        # supertrend warm-up needs.
+        window_seconds = period_seconds * bounded_limit * 3
+        request = self._ProtoOAGetTrendbarsReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.symbolId = int(symbol_id)
+        request.period = getattr(self._ProtoOATrendbarPeriod, period_name)
+        request.count = bounded_limit
+        request.fromTimestamp = int((now - timedelta(seconds=window_seconds)).timestamp() * 1000)
+        request.toTimestamp = int(now.timestamp() * 1000)
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=20
+            )
+        except CTraderApiError as exc:
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        if not isinstance(response, self._ProtoOAGetTrendbarsRes):
+            raise RuntimeError(
+                f"Unexpected cTrader trendbars response: {type(response).__name__}"
+            )
+        rows = decode_trendbars_response(
+            response, symbol=normalized, price_digits=scale.price_digits
+        )
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            raise ValueError(
+                f"cTrader returned no {timeframe} trendbars for {normalized}"
+            )
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+        # Closed-bar detection: the bar whose period has not fully elapsed is
+        # still forming and must not reach a consumer as if it were closed.
+        closed = frame[
+            frame["timestamp"] + pd.to_timedelta(period_seconds, unit="s") <= now
+        ]
+        frame = closed.tail(bounded_limit).reset_index(drop=True)
+        if frame.empty:
+            raise ValueError(
+                f"cTrader returned only the still-forming {timeframe} bar for "
+                f"{normalized}; no closed bar is available yet"
+            )
+        return frame
 
     async def get_pip_value(self, symbol: str) -> LivePipValue:
         """Account-currency value of one qty unit per 1.0 price move (#146).
