@@ -1,0 +1,21 @@
+tests/test_broker_reconciliation.py
+  s_0a35059bbc325e::t_db7397e2c5cab5 39-41
+tests/test_ctrader_live_fix.py
+  s_0a35059bbc325e::t_506923398f1143 1820-1826,1863
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4f398bf3b602e7159446ab6fe1b900ff74cd9340",
+  "prompts": {},
+  "sessions": {
+    "s_0a35059bbc325e": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_0a35059bbc325e",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
