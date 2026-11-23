@@ -1,0 +1,43 @@
+shared/database.py
+  s_72b81e13fd197a::t_f5f2c77659f40e 4641-4741,4998-5000
+docs/live-deploy-runbook.md
+  s_9fab8860cbffcf::t_7ac7406d45d9d1 370-392
+live_runner/base_adapter.py
+  s_9fab8860cbffcf::t_80c618b051122f 472-487
+live_runner/ctrader_adapter.py
+  s_9fab8860cbffcf::t_22d5f9ad47ca95 1527-1568
+live_runner/daemon.py
+  s_9fab8860cbffcf::t_4447a2cbc92382 188,1598-1616,1618-1622,1678,1686-1693,1835-1839,1843-1851,1857-1920,1925,1941,1948,1959,1977,2000,2012,2065-2069,2076-2107
+live_runner/internal_strategy_runner.py
+  s_9fab8860cbffcf::t_f082397feb6ff8 77-87,149,176-177,270-273,293,295-297,768,1010-1066,1350,1417-1451,1467
+tests/live_runner/test_internal_strategy_runner.py
+  s_9fab8860cbffcf::t_349ca453b76f47 902,905-906,926-1001,1007-1008,1033,1035,1037-1039,1042-1043,1052-1053,1058-1301,1857
+tests/live_runner/test_open_entry_counts.py
+  s_9fab8860cbffcf::t_250457ba0ae397 14-15,402-503
+tests/test_live_execution_safety.py
+  s_9fab8860cbffcf::t_4e15f644c77cff 979-1261
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4b000b35328dd1a146b0641fca456755080aa858",
+  "prompts": {},
+  "sessions": {
+    "s_72b81e13fd197a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b26fdc3a-6176-466d-9ab1-1ac4055c946c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_9fab8860cbffcf": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_9fab8860cbffcf",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
