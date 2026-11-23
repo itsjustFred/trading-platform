@@ -20,19 +20,25 @@ positions to market for sizing (decision record D9).
 
 ## The three knobs — one documented meaning each
 
-All exposure fractions are validated as finite values in the inclusive range
-`0 < value <= 1`. `max_leverage` is a separate multiple of equity and is not a
+All exposure fractions are validated as finite values greater than 0. The
+aggregate caps (`max_risk_per_trade`, `max_total_exposure`,
+`RiskConfig.max_total_exposure`) stay bounded to `<= 1`; the per-position
+notional ceilings (`BacktestConfig.max_position_exposure_pct`,
+`RiskConfig.max_notional_per_trade`) may exceed 1 — that is leverage, bounded
+per path by the broker maximum for the account and asset (#240, maintainer
+decisions on #240/#329): the effective ceiling is
+`min(configured, broker_max_leverage)`, and an undeterminable broker maximum
+fails closed to 1x (`risk.config.effective_max_notional_per_trade`; the live
+daemon resolves it through the adapter's `get_max_leverage`, signal replay
+takes a declared `max_leverage`, the native engine uses `max_leverage`).
+`max_leverage` is a separate multiple of equity and is not a
 fraction-valued exposure field: it is the broker maximum leverage for the
 account/asset. An unset value means an unknown maximum, and the fallback is
 per engine: native clamps to 1x (#347), while the vectorbt and pynecore
 adapters resolve it through `runner.engines._shared.resolve_max_leverage`
-to 2.0x.
-
-**Pending #240:** that `<= 1` ceiling is the current validation limit, not a permanent
-design rule. The maintainer decided on 2026-11-16 that leverage may be allowed up to the
-broker maximum per account and asset — `RiskConfig.max_notional_per_trade` above 1×, with
-the entry size at the stop keeping the exposure sane. No PR implements it yet, so the
-range above still applies on main.
+to 2.0x for the aggregate — and, since #387, both refuse a
+`max_position_exposure_pct` above 1 rather than honouring per-position
+leverage the aggregate rule cannot see.
 
 | Name | Layer | Meaning (Decision Record, verbatim) |
 |---|---|---|
@@ -112,6 +118,16 @@ documented here.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.
+  Signal replay additionally applies the same aggregate free-margin rule
+  as the native engine (#240/#347): total open notional — each position
+  marked at its symbol's latest close — may not exceed
+  `equity × max_leverage`, where `L` is the operator-declared
+  `max_leverage`. **When `max_leverage` is unset the aggregate bound
+  fails closed to 1× equity**: a multi-position replay with default
+  settings (`max_notional_per_trade` ≤ 1, `max_positions` > 1) can
+  therefore refuse or clamp later entries that earlier versions would
+  have taken — there was no aggregate bound in replay before #387.
+  This matches the native engine's unset-`max_leverage` → 1× behaviour.
 
 ## Fill prices feeding sizing and PnL (owner decision 2026-11-13)
 

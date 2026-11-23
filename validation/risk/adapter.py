@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from risk.config import effective_max_notional_per_trade
 from risk.engine import RiskEngine
 from risk.models import TradeSignal
 from shared.models import Trade
@@ -143,6 +144,12 @@ class RiskAdapter:
             account_balance=account_balance,
             pip_value=self.pip_value,
             current_exposure=current_exposure,
+            # #240: validation has no broker connection, so a configured cap
+            # above 1x fails closed to the 1x ceiling here — analysis-only,
+            # never a guessed leverage bound.
+            max_notional_per_trade=effective_max_notional_per_trade(
+                self.engine.config.max_notional_per_trade, None
+            ),
         )
 
         # After sizing the signal may contain a fallback-resolved stop.

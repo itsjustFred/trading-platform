@@ -51,6 +51,12 @@ python scripts/check_requirements_drift.py
 Regenerate it with `python scripts/sync_requirements_from_lock.py` after an
 intentional lockfile change.
 
+Dependency updates and vulnerability auditing are automated: Dependabot
+opens weekly grouped PRs for GitHub Actions and uv, and a weekly workflow
+fails on high-severity `pip-audit`/`npm audit` findings. See
+[docs/dependency-security.md](docs/dependency-security.md) for the policy
+and the accepted-risk pins.
+
 ## Data Directory
 
 All runtime data (OHLCV, backtests, catalogs) lives in `DATA_DIR` (default: `./data` relativ zum Projekt-Root):
