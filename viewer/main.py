@@ -1462,8 +1462,8 @@ class BacktestRunSignalsRequest(SQLModel):
     # #361/#84: the replay adapter fails closed without an explicit fee
     # declaration; the viewer requires the caller to declare costs up front —
     # fees_zero for a conscious no-cost run, or fee_rate/fee_flat_per_trade.
-    fee_rate: float | None = None
-    fee_flat_per_trade: float | None = None
+    fee_rate: float | bool | None = None
+    fee_flat_per_trade: float | bool | None = None
     fees_zero: bool = False
 
 
@@ -1483,8 +1483,8 @@ class BacktestRunFromSignalsRequest(SQLModel):
     slippage: str | None = None
     slippage_bps: float | None = None
     slippage_default_bps: float | None = None
-    fee_rate: float | None = None
-    fee_flat_per_trade: float | None = None
+    fee_rate: float | bool | None = None
+    fee_flat_per_trade: float | bool | None = None
     fees_zero: bool = False
 
 
@@ -11506,14 +11506,18 @@ def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> d
     """
     fee_rate = payload.fee_rate
     fee_flat_per_trade = payload.fee_flat_per_trade
-    # #361: reject negative/NaN/inf declarations here — ``resolve_fee_model``
-    # clamps negatives to 0.0 downstream, which would turn a declared cost into
-    # a silent zero-cost run (and inf into non-finite fees).
+    # #361: reject bool/negative/NaN/inf declarations here — this boundary
+    # mirrors ``NotionalFeeModel``/``resolve_fee_model`` validation so a bad
+    # request is a 400 instead of a silent zero-cost run or non-finite fees.
     for field_name, value in (
         ("fee_rate", fee_rate),
         ("fee_flat_per_trade", fee_flat_per_trade),
     ):
-        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+        if value is not None and (
+            isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=f"{field_name} must be a finite, non-negative number",

@@ -47,9 +47,13 @@ class TestResolveFeeModel:
             ("fee_flat_per_trade", float("nan")),
             ("fee_flat_per_trade", float("inf")),
             ("fee_flat_per_trade", float("-inf")),
+            ("fee_rate", True),
+            ("fee_rate", False),
+            ("fee_flat_per_trade", True),
+            ("fee_flat_per_trade", False),
         ],
     )
-    def test_invalid_rate_keys_are_rejected(self, key: str, value: float) -> None:
+    def test_invalid_rate_keys_are_rejected(self, key: str, value: object) -> None:
         with pytest.raises(ValueError, match="finite and non-negative"):
             resolve_fee_model({key: value})
 
@@ -91,6 +95,19 @@ class TestNotionalFeeModel:
     def test_negative_flat_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
             NotionalFeeModel(flat_per_trade=-1.0)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"rate": True},
+            {"rate": False},
+            {"flat_per_trade": True},
+            {"flat_per_trade": False},
+        ],
+    )
+    def test_bool_fee_values_rejected(self, kwargs: dict) -> None:
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            NotionalFeeModel(**kwargs)
 
     def test_uses_absolute_values(self) -> None:
         model = NotionalFeeModel(rate=0.001)
