@@ -10,7 +10,8 @@
 
 Status: contract for the backtest engine adapters (`runner/engines/`), shared
 primitives in `runner/engines/contract.py`, conformance tests in
-`tests/test_engine_contract.py`.
+`tests/test_engine_contract.py`; the 2026-11-13 fill semantics are pinned per
+engine in `tests/test_realistic_fills.py`.
 
 Every engine adapter — `NativeAdapter` (+ `TradeEngine`),
 `VectorbtAdapter`, `PyneCoreAdapter`, `SignalReplayAdapter`, `LeanAdapter` —
@@ -20,6 +21,15 @@ as a silent parity drift between engines.
 
 Decision Records referenced below are from Cleanup 16-A (2026-08-31) and the
 parent Cleanup 16 record.
+
+> **Owner decision 2026-11-13 (realism / parity with MT5 and live brokers)
+> supersedes two earlier fill rules.** (A) A stop-loss/take-profit fills at the
+> *level* only when the bar touches it intrabar; a bar that **opens beyond** the
+> level (a gap) fills at the bar's **open**. (B) A signal exit fills at the
+> **next bar's open**, like an entry — not at the signal bar's close
+> (D4 / A-M1 "Fill-zum-Trigger-Close" is superseded). Wherever the old text
+> below is marked *superseded*, this decision wins. See §1 (Protective exits,
+> Signal exits) and §5.
 
 ## 1. Fills
 
@@ -50,19 +60,30 @@ parent Cleanup 16 record.
   triggers when `high >= take_profit`; mirrored for SHORT. Native records this
   as `stop_trigger_side = "bar_low_high"` and
   `take_profit_trigger_side = "bar_high_low"`.
-- Fill price: the protective **level itself ± the resolved slippage
-  model**, not the bar close (since #130 stop/TP fills slip like every
-  other fill; with `slippage="none"` the level is exact) — with one
-  owner-decided exception (2026-11-13, realism / MT5 + live-broker parity): a
-  bar that **opens beyond** the level gapped through it and fills at the
-  bar's **open**, the price actually available; an open exactly at the level
-  fills at that price either way, and intrabar touches keep the level fill.
-  The open is the bar's first event, so a gap also beats a later same-bar
-  touch of the other level. The shared helpers are
-  `contract.level_gapped_at_open` / `contract.level_fill_price` /
-  `contract.resolve_protective_exit`. On main today this is implemented for
-  the signal-replay `supertrend_flip` stop/TP1 exits (#287); the remaining
-  engine paths adopt it with #208. When a
+- Fill price (owner decision 2026-11-13, supersedes "always the level"): the
+  protective **level ± the resolved slippage model** (#130 — with
+  `slippage="none"` the level is exact) on an **intrabar touch** (the bar
+  opens on the safe side and trades through the level later); the bar's
+  **open** ± slippage when the bar **opens beyond** the level (gap through a
+  stop — the worse price — or through a take-profit in your favour — the
+  price actually available). An open exactly at the level fills at that
+  price either way. The gap is the first event of the bar, so it also beats a
+  later same-bar touch of the other level and needs no intrabar data. The
+  entry bar is never a gap (the position was opened at that very open).
+  Shared primitives: `contract.level_gapped_at_open` /
+  `contract.level_fill_price` / `contract.resolve_protective_exit`; the
+  gap-first ordering (gap through the stop, then gap through the target, then
+  the stop-first range test) is implemented in native `_check_stops` and in
+  signal replay's `_check_protective_exit_bar` (#287). The frozen vectorbt
+  intrabar walk keeps level fills for protective exits (documented divergence;
+  its `exit_order_type="level"` signal exits do honour gap → open, §2). PyneCore
+  is frozen: its `_normalize_trade_exits` containment restates a
+  level-violating leg to the recorded level only — no gap→open restatement
+  (frozen engines get fail-loud guards only, ADR 0001).
+  SHORT exits buy the ask, so native adds the spread on top of the open on a
+  gap fill exactly as on a level fill. A gap fill is a market fill, so a SHORT
+  target gapped by less than the spread fills at `open + spread`, which can be
+  worse than the target level — realistic. When a
   trailing stop is active, native reports reason `trailing_stop`; otherwise
   `stop_loss`. Native names take-profit exits after the level name (`tp`,
   `tp1`, …); vectorbt and signal replay use `take_profit`. Consumers must
@@ -97,9 +118,18 @@ parent Cleanup 16 record.
   last level therefore does not keep part of the position open; a strategy
   that wants a remainder held past its last level needs a later signal exit.
 - Vectorbt has no bar-loop position model: protective levels are resolved on
-  the entry bar and enforced through the intrabar walk (§3). Without intrabar
-  data, exits happen on the scheduled signal exit and the levels are recorded
-  in `trade.meta` (`sl_price`, `tp_price`).
+  the entry bar and enforced through the intrabar walk (§3), where the gap rule
+  applies per **sub-bar** (a sub-bar that opens beyond the level fills at its
+  open; the entry bar's first sub-bar is exempt). Without intrabar data, exits
+  happen on the scheduled signal exit and the levels are recorded in
+  `trade.meta` (`sl_price`, `tp_price`) — vectorbt therefore cannot express the
+  gap rule without intrabar data; it does not enforce the levels at all there
+  (pre-existing, documented limitation).
+- Signal replay applies the gap rule in `_check_protective_exit_bar`
+  (bar open beyond the level → fill at the open). PyneCore is frozen: its
+  broker emulator may fill gaps at the open internally, but the adapter's
+  containment (`_normalize_trade_exits`, §5) restates a level-violating leg
+  to the recorded level only — frozen engines get no behaviour changes.
 
 ### Slippage (fill-price cost model, #130)
 
@@ -162,25 +192,58 @@ inside the warm-up span is a hard error (`ValueError`), never a silent
 no-gate. Engines agree on the boundary semantics (pinned by cross-engine
 conformance tests).
 
-**Signal exit fill convention (A-M1/D4).** A signal exit (not a protective
-level exit) fills at the **trigger bar's close** by default (exception: the
-`supertrend_flip` leg, filled at the next bar's open, see below); the convention
-is one place — `_prepare_next_open_execution_data` keeps the exit leg
-unshifted in vectorbt, and `BacktestConfig.signal_exit_fill` (validated to
-`close`/`open`) selects `open` to fill at the exit bar's open instead for
-MT5-parity runs. Stop/TP exits fill at the level in every engine (§1),
-except that a bar opening beyond the level fills at its open (gap rule,
-§1).
+**Signal exit fill convention (owner decision 2026-11-13; supersedes
+A-M1/D4 "Fill-zum-Trigger-Close").** A signal exit (not a protective level
+exit) fills at the **next bar's open**, exactly like an entry: a signal on bar
+*N* exits at bar *N+1*'s open. `BacktestConfig.signal_exit_fill` is validated to
+`next_open` (default) / `close` / `open`; the last two are explicit legacy
+opt-ins that fill on the *signal bar itself* (its close / its open — `open`
+serves MT5 clock exits whose signal bar *is* the exit minute).
+
+Per engine (ADR `docs/adr/0001-native-single-strategy-engine.md` — only native
+is under active development):
+
+- native: the exit signal is parked and executed at the next bar's open inside
+  `_check_stops`, **after** open-gap exits (which keep their stop/target reason)
+  and **before** the bar's intrabar walk and before pending entries fill, so a
+  reversal (exit + entry on one bar) closes the old position and opens the new
+  one at the same open. SHORT exits pay the spread.
+- vectorbt / pynecore (frozen): do **not** implement `next_open` and **refuse**
+  a `next_open` config outright (`_frozen_signal_exit_fill` raises) — frozen
+  engines get fail-loud guards, not silent re-interpretation. Entry points
+  that select a frozen engine declare the legacy `close` fill explicitly
+  (`contract.default_signal_exit_fill_for_engine`), so the persisted meta
+  records the model actually simulated; explicit `close`/`open` keep working.
+- signal replay: external signals — entries and flip/exit-only exits alike — are
+  executed when they arrive at the fill bar's close (§5), so "exits like
+  entries" already holds; there is no separate next-open exit.
+
+**A signal exit on the last bar** has no next bar to fill at. On native the
+position is closed by the forced **end-of-data** close at that bar's close
+with reason `end_of_data`, and the trade is flagged
+`trade.meta["signal_exit_deferred_to_end_of_data"] = True` (PyneCore's ledger
+drops a trade that never closes, signal replay closes end-of-data at the last
+close). Stop/TP exits fill at the level or, on a gap, the open (§1).
+
+**Records without `signal_exit_fill`** predate this decision: the old default
+was `close` and the key was omitted when it held that default. Every reader —
+`BacktestMeta.from_dict`, the SQLite record loader and the optimizer's
+base-runtime reconstruction — reads a missing value as
+`shared.models.LEGACY_SIGNAL_EXIT_FILL` (`close`), so a legacy result is never
+re-run (or re-optimised) under a different exit model than its stored stats.
 
 **Explicit exit order type (#243).** A strategy may mark a signal exit with an
 exit-when `exit_order_type` series (signal column or indicator) taking `market`
 or `level` (case-insensitive):
 
-- `market` — the exit fills at the signal-exit convention price
-  (`signal_exit_fill`); any `exit_price` on that bar is ignored for pricing.
-- `level` — the exit fills at the strategy's `exit_price`. A `level` exit
-  without a usable (positive, finite) `exit_price` falls back to the market
-  fill, logs a warning once and flags the trade
+- `market` — the exit follows the `signal_exit_fill` convention (on native,
+  the next bar's open); any `exit_price` on that bar is ignored for pricing.
+- `level` — the exit is a resting-price order, **not** a market signal exit:
+  it fills at the strategy's `exit_price` on the signal bar under the §1
+  reachability/gap rules, in every engine that consumes the series, and is
+  *not* deferred to the next open even when `signal_exit_fill="next_open"`.
+  A `level` exit without a usable (positive, finite) `exit_price` falls back
+  to the market fill, logs a warning once and flags the trade
   `meta["exit_level_missing_price"]`.
 - a `level` outside the exit bar's traded range is never booked at the
   level (`contract.exit_level_disposition`, evaluated on the ask range for
@@ -191,9 +254,7 @@ or `level` (case-insensitive):
   *marketable* side — below the low for a LONG exit, above the high for a
   SHORT exit — the resting order was marketable at the open, so under the
   gap-through-level convention it fills at the bar's **open** and flags
-  `meta["exit_level_gapped"]`. (This is `level`-exit semantics only:
-  protective stop/TP legs fill at their level even on a gap-through —
-  gap → open for them lands with #208.)
+  `meta["exit_level_gapped"]`.
   Direction-specific, like every open fill: a LONG exit sells the bid at
   the raw open, while a SHORT exit buys the ask at `open + spread` when a
   spread is configured. With explicit `ask_high`/`ask_low` columns but no
@@ -204,10 +265,9 @@ or `level` (case-insensitive):
   A strategy whose `exit_price` is really a *stop* (e.g. a sell stop
   above the whole bar after a gap down) should express it through the
   `stop_loss` legs instead — a stop leg fills at its level whenever the
-  bar trades through it, including on a gap-through (gap → open for
-  protective exits lands with #208), which is the per-bar
-  trigger/fill-at-level behaviour `level` deliberately does not
-  reproduce. This applies to every level fill, explicit `level`
+  bar trades through it, including on a gap-through for native (§1),
+  which is the per-bar trigger/fill-at-level behaviour `level` deliberately
+  does not reproduce. This applies to every level fill, explicit `level`
   and vectorbt's legacy implicit `exit_price` alike.
 - absent or unrecognized — the **legacy fallback** applies per engine:
   vectorbt treats a usable `exit_price` as a level fill; native fills at the
@@ -219,7 +279,7 @@ Per-engine support for `exit_order_type` / `exit_price` on signal exits:
 
 | engine | `exit_order_type` | `exit_price` without it |
 |---|---|---|
-| native (`TradeEngine`) | `market`/`level` honored; absent/unrecognized → market fill | ignored |
+| native (`TradeEngine`) | `market`/`level` honored; absent/unrecognized → market fill (next-open under the default) | ignored |
 | vectorbt | `market`/`level` honored; absent/unrecognized → legacy rule | usable value → level fill (legacy) |
 | pynecore | not consumed — Pine-native orders, `_apply_fill_parity` (§5) | n/a |
 | signal_replay | not consumed — replays recorded fills | n/a |
@@ -296,7 +356,8 @@ Implementation:
   the same-bar ambiguity on its main frame exactly like native; its
   intrabar walk covers the trigger bar's own sub-bars (window through the
   trigger bar's close) and a trigger-bar stop/TP therefore fills at the
-  level in both engines.
+  level in both engines — except on a gap, where the bar's open is the fill
+  (see the gap rule in §1).
 - Signal replay: `_process_protective_exits` walks bars chronologically and
   classifies each through the shared helper.
 - Configuring `same_bar_order = "take_profit_first"` is **not** part of the
@@ -526,8 +587,9 @@ behavior**, not a bug to be fixed by silently changing one engine:
 
 | Engine | Model | Meaning |
 |---|---|---|
-| native / vectorbt | next-bar-open | Signal on bar *N* fills at bar *N+1* open; protective exits evaluated per bar (vectorbt: per intrabar sub-bar). |
-| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close; slippage/delay recorded in `trade.meta`. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
+| native | next-bar-open | Signal on bar *N* — entry **and** market signal exit — fills at bar *N+1* open (2026-11-13); protective exits evaluated per bar, filling at the level on a touch and at the open on a gap. `exit_order_type="level"` exits fill at their level on the signal bar (§2). |
+| vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar fill (`close`, or `open` opt-in); a `next_open` config is refused outright (§2). Protective exits fill at the level on a touch (no gap→open rule; frozen). |
+| signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
 **`supertrend_flip` exit (signal-replay, #168).** The flip leg is a signal exit
@@ -552,7 +614,8 @@ evaluated (the fill bar's close is the entry and
 `last_checked_at` starts there), so no `allow_gap=False` exemption is needed.
 
 **Pynecore restatement containment.** `_normalize_trade_exits` tightens a
-level-violating exit leg to the recorded protective level:
+level-violating exit leg to the recorded protective level (frozen engine —
+no gap→open restatement):
 
 - a LONG exit below `sl_price` is restated to `sl_price` with reason
   `stop_loss` (mirrored for SHORT);
@@ -563,11 +626,13 @@ level-violating exit leg to the recorded protective level:
 Since A-H4 (D3) the adapter additionally runs `_apply_fill_parity` before
 sizing: non-level exit legs (signal/time exits) are re-priced to the fill
 convention the other engines use — the configured `signal_exit_fill`
-(default `close`: the trigger bar's close; `open`: the next bar's open) —
-when the recorded Pine price disagrees with that convention. Level exits
-(`stop_loss`/`take_profit`) keep their recorded level. This re-pricing is a
-documented divergence from the raw Pine ledger, applied so cross-engine
-comparisons measure strategy edge instead of engine artifacts.
+(`close`: the recorded leg bar's close; `open`: that bar's open — the
+Pine ledger stamps legs on the fill bar itself; `next_open` is refused on
+this frozen engine) — when the recorded Pine price disagrees with that
+convention. Level exits (`stop_loss`/`take_profit`) keep their recorded
+price. This re-pricing is a documented divergence from the raw Pine ledger,
+applied so cross-engine comparisons measure strategy edge instead of engine
+artifacts.
 
 The restatement never invents prices beyond the recorded levels and never
 rewrites entry legs. Conformance tests pin the containment as a property:

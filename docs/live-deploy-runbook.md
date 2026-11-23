@@ -414,10 +414,11 @@ serves cannot be evaluated faithfully.
 
 **Timing contract.** The native engine evaluates a signal on bar T's close,
 records T's `close` as the entry reference, and fills the resulting market
-order at the *next* bar's open; signal exits fill at the trigger bar's close.
-Live maps this to: evaluate on the just-closed bar T and submit immediately —
+order at the *next* bar's open; signal exits fill at the next bar's open as
+well (`signal_exit_fill="next_open"` default). Live maps this to: evaluate on
+the just-closed bar T and submit immediately —
 the broker fill lands at (or very near) the open of bar T+1 for entries, and
-at approximately T's close for exits. Sizing geometry uses T's `close`, the
+at approximately the open of bar T+1 for exits. Sizing geometry uses T's `close`, the
 same reference the engine records. A signal is only actionable while bar T+1
 is still forming (30 s grace plus a feed-lag allowance of
 `min(120 s, 10% of the bar)`, measured from the bar's session-aware close —

@@ -46,6 +46,8 @@ def _config(tmp_path: Path, **overrides: Any) -> BacktestConfig:
         "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
+        # Frozen engine: next_open is refused; declare the legacy close fill.
+        "signal_exit_fill": "close",
         "parameters": {"fast_length": 3, "slow_length": 10},
     }
     payload.update(overrides)

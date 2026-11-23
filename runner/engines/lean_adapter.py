@@ -29,6 +29,7 @@ from runner.engines.base import (
     ProgressCallback,
     warn_if_engine_frozen,
 )
+from runner.engines.contract import SIGNAL_EXIT_FILL_NEXT_OPEN
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 
@@ -40,6 +41,25 @@ LEAN_PROJECT_DIR = Path(
         Path.home() / "Desktop" / "custom_lean_integration",
     )
 )
+
+
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Refuse the native-only ``next_open`` exit model on the LEAN run path.
+
+    LEAN decides its own fills; the platform's ``next_open`` convention is a
+    native-engine model the LEAN run cannot honour, so a ``next_open`` config
+    fails loud instead of persisting a fill model LEAN never simulated (the
+    imported result records ``signal_exit_fill`` as unset — "not modelled by
+    this platform"). Mirrors the vectorbt/pynecore frozen-engine guards.
+    """
+    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
+    if mode == SIGNAL_EXIT_FILL_NEXT_OPEN:
+        raise ValueError(
+            "engine 'lean' does not implement signal_exit_fill='next_open'; "
+            "LEAN fills come from LEAN itself — pass signal_exit_fill='close' "
+            "or 'open' explicitly, or run the native engine"
+        )
+    return config
 
 
 class LeanAdapter(EngineAdapter):
@@ -72,6 +92,7 @@ class LeanAdapter(EngineAdapter):
                 "import_result() with the result path instead."
             )
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
 
         lean_config = self._write_config(config, strategy_path)
         output_dir = self._run_lean(lean_config)
