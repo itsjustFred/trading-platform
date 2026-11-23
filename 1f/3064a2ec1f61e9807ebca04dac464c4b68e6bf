@@ -1,0 +1,19 @@
+docs/live-deploy-runbook.md
+  s_d1ffe93eefbbb4::t_f589b4274b6748 1264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1f3064a2ec1f61e9807ebca04dac464c4b68e6bf",
+  "prompts": {},
+  "sessions": {
+    "s_d1ffe93eefbbb4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de0fced8-a35e-419b-9595-dbcd49507893",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
