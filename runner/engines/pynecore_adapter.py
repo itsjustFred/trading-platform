@@ -242,6 +242,26 @@ def _pyne_cli_start_bound(start_date: str) -> str:
     return raw
 
 
+def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
+    """Refuse the native-only ``next_open`` exit model on this frozen adapter.
+
+    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    keep their existing semantics until removal and get fail-loud guards, not
+    silent re-interpretation. ``next_open`` is the native default, so a
+    ``BacktestConfig`` that never touched the field would otherwise simulate
+    the legacy signal-bar fill while the persisted meta claimed otherwise —
+    refuse instead of warn-and-run.
+    """
+    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
+    if mode == "next_open":
+        raise ValueError(
+            "engine 'pynecore' does not implement signal_exit_fill='next_open'; "
+            "frozen engines keep their legacy signal-bar fill — pass "
+            "signal_exit_fill='close' or 'open' explicitly, or run the native engine"
+        )
+    return config
+
+
 class PyneCoreAdapter(EngineAdapter):
     """Adapter for PyneCore-based Pine-style backtesting."""
 
@@ -256,6 +276,7 @@ class PyneCoreAdapter(EngineAdapter):
         progress_callback: ProgressCallback | None = None,
     ) -> BacktestResult:
         require_generated_strategy_approval(strategy_path)
+        config = _frozen_signal_exit_fill(config)
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
         # #84: missing fee/slippage config is a hard error, never silent gross.

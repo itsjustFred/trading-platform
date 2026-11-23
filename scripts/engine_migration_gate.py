@@ -71,6 +71,7 @@ import numpy as np
 import pandas as pd
 
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import FROZEN_SIGNAL_EXIT_ENGINES
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from runner.stats import merge_canonical_stats
@@ -391,6 +392,10 @@ def _backtest_config(gate: GateConfig, slug: str) -> BacktestConfig:
 
 def _run_engine(engine_name: str, config: BacktestConfig, strategy_path: Path) -> dict[str, Any]:
     adapter = {"native": NativeAdapter, "vectorbt": VectorbtAdapter}[engine_name]()
+    if engine_name in FROZEN_SIGNAL_EXIT_ENGINES:
+        # The frozen adapter refuses next_open; run its legacy close fill so
+        # the meta records the model actually simulated (unchanged behaviour).
+        config = config.model_copy(update={"signal_exit_fill": "close"})
     try:
         result = adapter.run(config, str(strategy_path))
     except Exception as exc:  # per-strategy engine failure is report data, not a gate failure
