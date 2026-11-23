@@ -88,6 +88,9 @@ def run_engine(
         parameters["fee_flat_per_trade"] = 0.0
     else:
         parameters["fees"] = "zero"
+    # #130: parity references are gross fills; declare the explicit opt-out
+    # rather than inherit the per-class slippage default.
+    parameters.setdefault("slippage", "none")
     config = BacktestConfig(
         strategy_name="parity",
         symbols=list(frames),
