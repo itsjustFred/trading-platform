@@ -23,7 +23,10 @@ Deterministic and verifiable: the window is fixed, the resample rules are the
 platform's own (``data_tools/resample.py``), and the written file is validated
 against the row-count/OHLC contract before it lands. A run that cannot produce
 a valid slice exits non-zero, because a truncated slice that looks complete is
-the failure mode that would quietly narrow the suite.
+the failure mode that would quietly narrow the suite. Exit status 3 specifically
+means the Dukascopy download failed, which is the signal CI uses to warn and
+skip the real-data scenarios instead of failing the job; any other non-zero
+status remains a hard failure.
 """
 
 from __future__ import annotations
@@ -66,6 +69,7 @@ from data_tools.differential_slice import (
     SLICE_TIMEFRAME,
     SLICE_WINDOW_END,
     SLICE_WINDOW_START,
+    SliceDownloadError,
     SliceValidationError,
     fetch_slice_frame,
     read_slice,
@@ -186,6 +190,20 @@ def main(argv: list[str] | None = None) -> int:
                 log_callback=print if not args.quiet else None,
             )
         )
+    except SliceDownloadError as exc:
+        # CI turns this status into a warning plus a skipped real-data slice;
+        # it is deliberately not the generic validation failure below.
+        print(
+            f"warning: Dukascopy slice download failed: {exc}; "
+            "the real-data tests will skip when no cache exists",
+            file=sys.stderr,
+        )
+        return 3
+    except SliceValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
         written = write_slice(destination, frame)
     except SliceValidationError as exc:
         # A run that cannot produce a valid slice is a failed run, and CI must see it as one.
