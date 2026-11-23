@@ -20,7 +20,10 @@ fills at the next bar's open. Stop-loss and fixed-RRR take-profit carry their
 level in ``exit_price``, which engines honor only with
 ``exit_order_type="level"`` (not emitted here): on native the protective
 ``stop_loss``/``sl_price`` covers the stop, while the take-profit level is
-not enforced as a resting order.
+not enforced as a resting order. With ``use_trailing_sl`` the trailed level is
+likewise NOT fed back into ``sl_price`` (written on the entry bar alone), so
+only the initial stop is protective on native — a trailed-stop exit is the
+strategy's market exit signal filling at the next bar's open, not a level fill.
 """
 
 STRATEGY_META = {

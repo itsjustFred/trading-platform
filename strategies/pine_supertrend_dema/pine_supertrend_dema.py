@@ -4,11 +4,14 @@ Strategy: Supertrend + DEMA (Pine Script Conversion)
 Combines Supertrend indicator with Double EMA (DEMA) filter.
 Long when Supertrend flips bullish AND price > DEMA.
 
-Exits: the trailing Supertrend stop's level travels in ``sl_price`` (the
-protective stop fills it; the exit-bar ``exit_price`` is only a level with
-``exit_order_type="level"``). The Supertrend flip-down is a close-triggered
-market exit (no explicit ``exit_price``), so under the default
-``signal_exit_fill="next_open"`` it fills at the next bar's open.
+Exits: only the INITIAL Supertrend band is protective on native — ``sl_price``
+is written on the entry bar alone, so the engine's stop never trails. The
+trailed level travels in the exit bar's ``exit_price``/``trailing_stop_at_exit``,
+which native honors only with ``exit_order_type="level"`` (not emitted here).
+A trailed-stop hit or Supertrend flip-down is therefore a close-triggered
+market exit (no explicit ``exit_price``) that fills at the next bar's open
+under the default ``signal_exit_fill="next_open"`` — the trailed level itself
+is not enforced as a fill price.
 """
 
 STRATEGY_META = {
@@ -109,11 +112,13 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if stop_hit or bool(exit_cond.iloc[i]):
                 exits.iloc[i] = True
                 trailing_stop_at_exit.iloc[i] = active_stop
-                # The trailing stop's level travels in sl_price (the
-                # protective stop fills it); the exit-bar exit_price is only
-                # honored as a level with exit_order_type="level", which is
-                # not emitted here. The Supertrend flip is a close-triggered
-                # MARKET exit: no explicit exit_price -> next bar's open.
+                # Only the INITIAL band is protective on native: sl_price is
+                # written on the entry bar alone, so the engine's stop never
+                # trails. The trailed level travels in exit_price /
+                # trailing_stop_at_exit, honored as a level only with
+                # exit_order_type="level" (not emitted here). A trailed-stop
+                # hit or flip is a close-triggered MARKET exit: no explicit
+                # exit_price -> next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "trailing_stop"

@@ -27,6 +27,13 @@ from risk.config import RiskConfig
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import default_signal_exit_fill_for_engine
+from runner.engines.lean_adapter import (
+    LeanAdapter,
+)
+from runner.engines.lean_adapter import (
+    _frozen_signal_exit_fill as _lean_frozen_fill,
+)
 from runner.engines.pynecore_adapter import (
     PyneCoreAdapter,
     _normalize_trade_exits,
@@ -458,6 +465,52 @@ class TestNativeGapEdgeCases:
         # The ladder's first level took its 1/2 fraction; the remainder is half.
         assert trade.exits[0].quantity == pytest.approx(trade.quantity / 2)
 
+    def test_tp_ladder_remainder_stops_out_at_the_level_on_the_same_bar(self):
+        # Bar2 opens at 110 — beyond tp1 (105, gapped) but nowhere near the
+        # 95 stop — then trades down through it. tp1 fills half at the open;
+        # the remainder stops out at the LEVEL (the open was not beyond the
+        # stop, so there is no gap fill on this branch).
+        rows = [
+            _flat(100.0), _flat(100.0),
+            (110.0, 112.0, 94.0, 108.0), _flat(108.0),
+        ]
+        result = _native(
+            rows,
+            stop=95.0,
+            extra_indicators={"tp1": 105.0, "tp2": 120.0},
+        )
+        (trade,) = result.trades
+        assert len(trade.exits) == 2
+        tp_leg, stop_leg = trade.exits
+        assert tp_leg.price == pytest.approx(110.0)
+        assert tp_leg.reason == "tp1"
+        assert stop_leg.price == pytest.approx(95.0)
+        assert stop_leg.reason == "stop_loss"
+        assert stop_leg.quantity == pytest.approx(trade.quantity / 2)
+
+    def test_tp_ladder_remainder_gap_fills_at_the_next_open(self):
+        # The remainder after a partial TP is a normal open position: a later
+        # bar that OPENS beyond the stop gap-fills the remainder at the open.
+        rows = [
+            _flat(100.0), _flat(100.0),
+            (100.0, 106.0, 99.0, 104.0),   # tp1 (105) fills half at the level
+            (90.0, 91.0, 88.0, 89.0),      # opens beyond the 95 stop: gap
+            _flat(89.0),
+        ]
+        result = _native(
+            rows,
+            stop=95.0,
+            extra_indicators={"tp1": 105.0, "tp2": 120.0},
+        )
+        (trade,) = result.trades
+        assert len(trade.exits) == 2
+        tp_leg, stop_leg = trade.exits
+        assert tp_leg.price == pytest.approx(105.0)
+        assert tp_leg.reason == "tp1"
+        assert stop_leg.price == pytest.approx(90.0)  # the open, not the 95 level
+        assert stop_leg.reason == "stop_loss"
+        assert stop_leg.quantity == pytest.approx(trade.quantity / 2)
+
     def test_short_ask_open_gap_fills_at_the_ask_open(self):
         # ask_ohlc: the SHORT stop triggers on the ask. Bid open 104.7 alone is
         # NOT beyond the 105 stop, but ask open (104.7 + 0.4 = 105.1) is — a
@@ -683,19 +736,19 @@ class TestFrozenEnginesRefuseNextOpen:
             signal_exit_fill=fill,
         )
 
-    @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill])
+    @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill, _lean_frozen_fill])
     def test_next_open_is_refused(self, guard):
         with pytest.raises(ValueError, match="next_open"):
             guard(self._config("next_open"))
 
-    @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill])
+    @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill, _lean_frozen_fill])
     def test_legacy_close_fill_passes_through(self, guard):
         # "open" was removed (issue #153): BacktestConfig rejects it before the
         # guard runs, so only the legacy "close" fill remains to pass through.
         config = self._config("close")
         assert guard(config) is config
 
-    @pytest.mark.parametrize("adapter", [VectorbtAdapter, PyneCoreAdapter])
+    @pytest.mark.parametrize("adapter", [VectorbtAdapter, PyneCoreAdapter, LeanAdapter])
     def test_run_refuses_next_open_before_touching_data(self, adapter, tmp_path):
         # The guard runs before data loading, so a next_open config fails loud
         # even with no OHLCV on disk.
@@ -703,6 +756,12 @@ class TestFrozenEnginesRefuseNextOpen:
         strategy.write_text("def generate_signals(df, params):\n    pass\n")
         with pytest.raises(ValueError, match="next_open"):
             adapter().run(self._config("next_open"), str(strategy))
+
+    def test_default_signal_exit_fill_for_engine(self):
+        assert default_signal_exit_fill_for_engine("native") == "next_open"
+        assert default_signal_exit_fill_for_engine("vectorbt") == "close"
+        assert default_signal_exit_fill_for_engine("pynecore") == "close"
+        assert default_signal_exit_fill_for_engine("lean") == "close"
 
 
 # --------------------------------------------------------------------------- #

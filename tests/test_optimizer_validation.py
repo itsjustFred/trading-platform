@@ -268,6 +268,7 @@ def _base_result(tmp_path: Path):
         data={"symbols": ["GOLD1", "GOLD2"], "timeframes": ["1h"], "data_dir": str(tmp_path)},
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
+        signal_exit_fill="next_open",
         parameters={"fast_length": 5, "slow_length": 20},
     )
     return BacktestResult(meta=meta, trades=[])
@@ -949,7 +950,7 @@ class TestLegacySignalExitFill:
 
     def test_missing_everywhere_reads_as_the_legacy_close(self, tmp_path: Path):
         result = _base_result(tmp_path)
-        result.meta.signal_exit_fill = None  # type: ignore[assignment]
+        result.meta.signal_exit_fill = None
 
         runtime = optimizer_module._runtime_config_from_base_result(result)
 
@@ -957,7 +958,7 @@ class TestLegacySignalExitFill:
 
     def test_stored_runtime_snapshot_wins_over_the_legacy_default(self, tmp_path: Path):
         result = _base_result(tmp_path)
-        result.meta.signal_exit_fill = None  # type: ignore[assignment]
+        result.meta.signal_exit_fill = None
         result.meta.data["_backtest_config"] = {"signal_exit_fill": "next_open"}
 
         runtime = optimizer_module._runtime_config_from_base_result(result)

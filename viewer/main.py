@@ -12917,6 +12917,34 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "actual_price_observed": row.get("actual_price_observed"),
                 "slippage": _optional_float(row.get("slippage")),
                 "slippage_bps": _optional_float(row.get("slippage_bps")),
+                # #134: the slippage split a later SlippageModel (#130) fits
+                # against. Each is None independently when its inputs are
+                # missing; quote_snapshot_missing flags a fill whose signal
+                # carries no usable quote snapshot - never silently zero.
+                "signal_delay_bps": _optional_float(row.get("signal_delay_bps")),
+                "execution_slippage_bps": _optional_float(
+                    row.get("execution_slippage_bps")
+                ),
+                "spread_bps": _optional_float(row.get("spread_bps")),
+                "quote_snapshot_missing": bool(row.get("quote_snapshot_missing")),
+                "quote_bid": _optional_float(row.get("quote_bid")),
+                "quote_ask": _optional_float(row.get("quote_ask")),
+                "quote_price": _optional_float(row.get("quote_price")),
+                "quote_time": _serialize_live_timestamp(row.get("quote_time"))[0]
+                or None,
+                "quote_source": row.get("quote_source"),
+                "order_type": row.get("order_type"),
+                "requested_qty": _optional_float(row.get("requested_qty")),
+                "producer_at": _serialize_live_timestamp(row.get("producer_at"))[0]
+                or None,
+                "message_received_at": (
+                    _serialize_live_timestamp(row.get("message_received_at"))[0] or None
+                ),
+                "order_submitted_at": (
+                    _serialize_live_timestamp(row.get("order_submitted_at"))[0] or None
+                ),
+                "broker_ack_at": _serialize_live_timestamp(row.get("broker_ack_at"))[0]
+                or None,
                 "filled_qty": float(row.get("filled_qty", 0.0)),
                 "position_size": _execution_risk_value(row, metadata, "position_size"),
                 "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),

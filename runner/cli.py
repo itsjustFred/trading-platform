@@ -621,6 +621,11 @@ def _fee_params_from_args(args) -> dict:
         if "fee_rate" in params or "fee_flat_per_trade" in params:
             raise ValueError("--fees-zero conflicts with --fee-rate/--fee-flat-per-trade")
         params["fees"] = "zero"
+    elif params:
+        # Fail at the CLI boundary instead of letting invalid values reach a run.
+        from runner.fees import resolve_fee_model
+
+        resolve_fee_model(params)
     return params
 
 
@@ -737,10 +742,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "--signal-exit-fill",
         default="",
-        choices=["", "next_open", "close", "open"],
+        choices=["", "next_open", "close"],
         help=(
             "Signal-exit fill convention. Default: 'next_open' on native; the "
-            "frozen engines (vectorbt, pynecore) only implement the legacy "
+            "frozen engines (vectorbt, pynecore, lean) only implement the legacy "
             "signal-bar fills and default to 'close' — they refuse 'next_open'"
         ),
     )
