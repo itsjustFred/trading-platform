@@ -1,0 +1,35 @@
+live_runner/ctrader_adapter.py
+  s_d1ffe93eefbbb4::t_04230f244984ea 1547-1558,1574
+tests/live_runner/test_open_entry_counts.py
+  s_d1ffe93eefbbb4::t_e40392de28215f 469-470
+shared/database.py
+  s_d1ffe93eefbbb4::t_dad1dff8d4abe6 11,4641-4681,4734
+tests/test_db_backup.py
+  s_d1ffe93eefbbb4::t_a8e826586fbf4c 640-643
+tests/test_live_execution_safety.py
+  s_61b148eda8daec::t_67f08135c8cb30 1072,1078,1128,1131,1134-1142,1144,1148,1151,1158,1174,1177,1180-1182,1185-1186,1190,1193-1200,1202-1222,1225-1243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eb178e31551f42f837a901630e6c09bbca622236",
+  "prompts": {},
+  "sessions": {
+    "s_61b148eda8daec": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_61b148eda8daec",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_d1ffe93eefbbb4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de0fced8-a35e-419b-9595-dbcd49507893",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
