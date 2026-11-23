@@ -124,6 +124,14 @@ class SliceValidationError(ValueError):
     """The slice does not satisfy the contract above (fail loudly, never skip)."""
 
 
+class SliceDownloadError(SliceValidationError):
+    """Dukascopy could not produce a complete valid slice on this run.
+
+    Kept distinct from a validation failure so the fetch script can exit with
+    the CI contract's "download failed" status instead of a generic error.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class SliceWindow:
     """The fixed fetch window, parsed."""
@@ -278,7 +286,11 @@ async def fetch_slice_frame(
     loop gives the whole window a fresh start instead of half a day of bars, and
     its pause doubles per attempt up to :data:`MAX_RETRY_PAUSE_SECONDS`. Every
     attempt is still bounded, and a run that cannot produce a valid slice raises
-    rather than writing a partial file.
+    rather than writing a partial file. Each attempt is checked for completeness
+    inside the loop, so a truncated download is retried instead of escaping as
+    a file that merely looks complete. A frame that reaches the full row count
+    but still violates the contract is corrupt data rather than a transient
+    download, so it fails immediately instead of being retried into a skip.
     """
     from data_tools.downloaders.dukascopy_native import download_minute_candles
 
@@ -297,23 +309,32 @@ async def fetch_slice_frame(
                 max_retries=max_retries,
                 log_callback=log_callback,
             )
-            return slice_from_minute_bars(minute)
+            frame = slice_from_minute_bars(minute)
         except (SliceValidationError, OSError) as exc:
             last_error = exc
-            if attempt >= max(1, attempts):
-                break
-            pause = min(
-                retry_pause_seconds * 2 ** (attempt - 1), MAX_RETRY_PAUSE_SECONDS
-            )
-            logger.warning(
-                "slice fetch attempt %d/%d failed (%s); retrying in %.0fs",
-                attempt,
-                attempts,
-                exc,
-                pause,
-            )
-            await asyncio.sleep(pause)
-    raise SliceValidationError(f"could not generate the slice: {last_error}")
+        else:
+            if len(frame) != EXPECTED_SLICE_ROWS:
+                last_error = SliceValidationError(
+                    f"downloaded slice: {len(frame)} rows, expected {EXPECTED_SLICE_ROWS} "
+                    f"(the window {SLICE_WINDOW_START} → {SLICE_WINDOW_END} on trading days)"
+                )
+            else:
+                validate_slice_frame(frame, source="downloaded slice")
+                return frame
+        if attempt >= max(1, attempts):
+            break
+        pause = min(
+            retry_pause_seconds * 2 ** (attempt - 1), MAX_RETRY_PAUSE_SECONDS
+        )
+        logger.warning(
+            "slice fetch attempt %d/%d failed (%s); retrying in %.0fs",
+            attempt,
+            attempts,
+            last_error,
+            pause,
+        )
+        await asyncio.sleep(pause)
+    raise SliceDownloadError(f"could not generate the slice: {last_error}")
 
 
 def slice_csv_text(frame: pd.DataFrame) -> str:
