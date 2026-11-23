@@ -41,7 +41,17 @@ parent Cleanup 16 record.
   `_fill_pending_orders` only on a later bar (`i > created_index`), at
   `bar_open`. The same creation-index guard applies to the native engine's
   LIMIT/STOP/STOP_LIMIT pending-order branches (#288): a pending order may
-  never fill on the bar whose close produced its signal.
+  never fill on the bar whose close produced its signal. Pending STOP orders
+  follow the 2026-11-13 gap rule: a bar that opens through the stop fills at
+  the open (`max(open, stop)` LONG / `min(open, stop)` SHORT), while an
+  intrabar touch keeps the stop price. STOP_LIMIT applies the open fill only
+  when the bar opens through the stop AND the resulting limit is marketable
+  at that open; a plain LIMIT keeps the conservative level fill (no
+  favourable-gap price improvement). A gap-through open fill is marketable,
+  so it pays the same spread a MARKET order at that open pays (maintainer
+  default 2026-11-23): a LONG buys the ask (`open + spread`), a SHORT sells
+  the bid open — symmetric with MARKET entries; intrabar level fills and
+  fills at a resting limit price carry no spread.
   `ExecutionModelSettings.market_order_timing = "next_bar_open"` and
   `entry_price_side = "open"` document this on every native trade
   (`trade.meta["execution_model"]`, `trade.meta["entry_fill"]`).
@@ -448,7 +458,10 @@ Implementation:
   broker maximum means 1x.
 - **`entry` is the price the order actually fills at**, for every order type
   (MARKET: the next bar's open, plus the configured spread for a LONG;
-  LIMIT/STOP: their trigger price). Pre-fill
+  LIMIT: its limit price; STOP/STOP_LIMIT: the trigger/limit level, or the
+  bar open — plus the configured spread for a LONG — when the bar gaps
+  through the stop and the fill is marketable at that open; for STOP_LIMIT
+  only when the limit is marketable at that open). Pre-fill
   creation sizing is only a pending-order estimate and must never survive into
   the position: because the caps are evaluated against the fill price, a
   quantity derived from the signal bar's close sizes a position *beyond* the
