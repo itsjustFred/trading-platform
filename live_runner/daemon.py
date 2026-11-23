@@ -114,7 +114,11 @@ from live_runner.loss_breaker import (
     refuse_entry_if_loss_breaker_tripped,
     set_accounts_env_file,
 )
-from live_runner.pre_submit_caps import enforce_pre_submit_caps
+from live_runner.pre_submit_caps import (
+    PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+    enforce_pre_submit_caps,
+    safe_max_leverage,
+)
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
@@ -164,7 +168,12 @@ from live_runner.trailing_stops import (
     run_trailing_stops_loop,
     validate_adapter_trailing_timeframe,
 )
-from risk import RiskConfig, RiskEngine, TradeSignal
+from risk import (
+    RiskConfig,
+    RiskEngine,
+    TradeSignal,
+    effective_max_notional_per_trade,
+)
 from risk.live import (
     entry_deviation_sl_fraction,
     entry_gate_settings,
@@ -1041,6 +1050,7 @@ def size_live_signal_for_submission(
     current_exposure: float = 0.0,
     pip_value: float | None = None,
     current_positions: int | None = None,
+    broker_max_leverage: float | None = None,
 ) -> LiveSignal:
     """Size a live entry with the deployment's risk config.
 
@@ -1058,6 +1068,11 @@ def size_live_signal_for_submission(
         current_positions: Open-position count from the broker. ``None`` when
             the broker cannot report positions; the payload's
             ``current_positions`` is never used in its place.
+        broker_max_leverage: The broker's maximum leverage for the account and
+            symbol (#240), already resolved by the caller (``None``/unusable
+            fails closed to 1x). It bounds ``max_notional_per_trade`` above 1:
+            the effective notional ceiling is
+            ``min(configured, broker_max_leverage)``.
 
     The returned metadata carries the engine's quantity/risk figures and
     ``resolved_stop_loss``: the stop the engine actually sized on (the signal
@@ -1098,11 +1113,17 @@ def size_live_signal_for_submission(
             "enforce_stop_direction": True,
         },
     )
-    sized_order = RiskEngine(_risk_config_for_deployment(deployment)).calculate_position_size(
+    risk_config = _risk_config_for_deployment(deployment)
+    sized_order = RiskEngine(risk_config).calculate_position_size(
         signal=trade_signal,
         account_balance=float(account_balance),
         pip_value=resolved_pip,
         current_exposure=float(current_exposure),
+        # #240: max_notional_per_trade may exceed 1 (leverage); the broker
+        # maximum for the account and asset bounds it, 1x when unknown.
+        max_notional_per_trade=effective_max_notional_per_trade(
+            risk_config.max_notional_per_trade, broker_max_leverage
+        ),
     )
 
     metadata["qty"] = float(sized_order.position_size)
@@ -2321,12 +2342,27 @@ async def prepare_order_with_risk(
                 }
             },
         )
+    # #240: the broker maximum leverage bounds max_notional_per_trade above
+    # 1x. Same fail-closed read the pre-submit caps use: an undeterminable or
+    # failing lookup degrades to None -> the 1x ceiling, never a guess. The
+    # read is bounded like the pre-submit one — a hung broker call must not
+    # stall the entry; timeout degrades to None -> 1x. This is a second
+    # round-trip for the same value the caps re-read moments later; that is
+    # deliberate — the caps need a fresh figure at submit time.
+    try:
+        broker_max_leverage = await asyncio.wait_for(
+            safe_max_leverage(adapter, signal.symbol),
+            timeout=PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        broker_max_leverage = None
     sized_signal = size_live_signal_for_submission(
         signal,
         deployment,
         account_balance=resolved_balance,
         current_exposure=max(float(current_exposure), broker_exposure),
         pip_value=resolved_pip,
+        broker_max_leverage=broker_max_leverage,
         current_positions=open_positions_count,
     )
     try:

@@ -16,6 +16,15 @@ Status: credential-gated as of 2026-07-13.
   a mode that only comes from the bot's own config default, which is read from the processor the
   deployment runs.
 
+## Go-Live Criteria (#306)
+
+Before the demo-only block (`_adapter_is_demo`) is ever lifted for real
+money, the written bar in [docs/live-go-live-checklist.md](live-go-live-checklist.md)
+must be fully checked: the merged safety features verified in paper, ≥ 60
+days of paper evidence with daily PnL and drift review, and the staged
+operator ramp (one strategy, one account, minimal size — deliberately no
+capital cap in code).
+
 ## Ops Alert Channel (#304)
 
 The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
@@ -559,7 +568,8 @@ deployment. The cTrader top-N deploy creates its deployments directly, without
 that re-verification, so it never arms a non-demo account either (#261): the
 rows are created `PAUSED` and a maintainer activates them by hand, which is the
 path that re-verifies - and, like every path, only arms an account the broker
-reports as demo. Lifting the demo-only block is a separate, deliberate step.
+reports as demo. Lifting the demo-only block is a separate, deliberate step;
+the acceptance criteria for it are the "Go-Live Criteria" checklist above.
 
 ### Required evidence and thresholds
 

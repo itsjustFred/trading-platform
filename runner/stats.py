@@ -738,6 +738,51 @@ def _daily_returns_series_from_equity_curve(
     return raw_returns
 
 
+def _mean_calendar_days_per_year(first: pd.Timestamp, last: pd.Timestamp) -> float:
+    """Mean Gregorian year length (365, or 366 across a leap day) over the
+    calendar years ``[first, last]`` touches."""
+    years = range(int(first.year), int(last.year) + 1)
+    return sum(
+        366.0 if pd.Timestamp(year, 1, 1).is_leap_year else 365.0 for year in years
+    ) / len(years)
+
+
+def return_periods_per_year(observations: pd.Series | pd.DatetimeIndex) -> float | None:
+    """Measured observation density: observations per calendar year (#353).
+
+    The annualisation factor for a return series is its interval count
+    over its own span, with the span measured in *calendar* years — the
+    mean Gregorian year length (365, or 366 across a leap day) of the
+    calendar years the observations touch. Intervals, not a padded
+    day-count, so the density is cadence-agnostic: a calendar-daily crypto
+    curve measures ~365 in a common year and ~366 in a leap year, an
+    hourly curve ~8760/8784, a weekly curve ~52, an observed-day equity
+    curve its trading-day density, and a mixed book whatever its combined
+    timestamps actually carry.
+
+    Accepts a return series (its index dates the observations) or a bare
+    ``DatetimeIndex`` of observation times. Returns ``None`` when the
+    density cannot be measured — fewer than two observations, a
+    non-datetime index, or an empty/zero-length span — so callers fall back
+    to their documented default rather than invent a cadence.
+    """
+    index = observations.index if isinstance(observations, pd.Series) else observations
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
+        return None
+    first, last = index.min(), index.max()
+    if pd.isna(first) or pd.isna(last):
+        return None
+    span_seconds = (last - first).total_seconds()
+    if span_seconds <= 0:
+        return None
+    return (
+        float(len(index) - 1)
+        * _mean_calendar_days_per_year(first, last)
+        * SECONDS_PER_DAY
+        / span_seconds
+    )
+
+
 def _resolve_return_convention(
     *,
     equity_curve: list[EquityPoint],
