@@ -1,0 +1,45 @@
+live_runner/alpaca_adapter.py
+  s_2bf89379757a94::t_19b22e104dd8aa 33,2875-2876,2899-2902
+live_runner/base_adapter.py
+  s_2bf89379757a94::t_ca12afff809438 650-655
+live_runner/daemon.py
+  s_2bf89379757a94::t_64db8a878e6e5b 170,7648
+live_runner/supertrend_flip.py
+  s_2bf89379757a94::t_7c5bfd463403b0 71,627-631,1140-1148,1153-1156,1159-1161,1163,1787-1794,1935-1952,2081,2093,2131,2428
+tests/live_runner/test_loss_breaker.py
+  s_2bf89379757a94::t_2f95d80ada1ee4 1790
+tests/live_runner/test_signal_archive.py
+  s_2bf89379757a94::t_8defe618a1f0f8 592
+live_runner/ctrader_adapter.py
+  s_6106bd57b162ad::t_3d636642018b01 5037-5041,5043,5046-5051
+tests/test_alpaca_adapter.py
+  s_6106bd57b162ad::t_4a6696e5bcee0f 2132,2151-2152
+tests/test_live_ctrader_broker_close_fills.py
+  s_6106bd57b162ad::t_b5b28740e3e9b6 749-841
+tests/test_live_supertrend_flip.py
+  s_6106bd57b162ad::t_385ac9057b0e7c 21,583-607,884-924,1009,1012-1047,1056-1059,1061,1063-1076,1092-1112,1126-1162
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7aa905f456c08eb71636a1d1229c1f1223337807",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_6106bd57b162ad": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_6106bd57b162ad",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
