@@ -29,6 +29,7 @@ declare global {
   var __ksRefreshCalls: number;
   var __ksRefreshResponder: (() => unknown) | undefined;
   var __ksHookChange: (() => void) | undefined;
+  var __ksWriteState: unknown;
   var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
 }
 
@@ -66,21 +67,24 @@ export { KILL_SWITCH_POLL_MS };
 export function Harness() {
   const ks = useLiveKillSwitch();
   globalThis.__ksHookChange = () =>
-    ks.onStateChange({
-      readable: true,
-      global_scope: "global",
-      modes: ["entries", "orders", "flatten"],
-      halts: [],
-      halted_accounts: [],
-      global_halted: false,
-      halt_details: [],
-    });
+    ks.onStateChange(
+      globalThis.__ksWriteState ?? {
+        readable: true,
+        global_scope: "global",
+        modes: ["entries", "orders", "flatten"],
+        halts: [],
+        halted_accounts: [],
+        global_halted: false,
+        halt_details: [],
+      },
+    );
   return createElement(
     "div",
     null,
     createElement("span", { "data-field": "state" }, ks.state ? "loaded" : "null"),
     createElement("span", { "data-field": "error" }, ks.error),
     createElement("span", { "data-field": "stale" }, String(ks.stale)),
+    createElement("span", { "data-field": "halted" }, String(ks.state?.global_halted ?? "")),
     createElement("span", { "data-field": "readAt" }, ks.readAt ?? ""),
   );
 }
@@ -169,6 +173,7 @@ async function cleanup() {
   globalThis.__ksRefreshCalls = 0;
   globalThis.__ksRefreshResponder = undefined;
   globalThis.__ksHookChange = undefined;
+  globalThis.__ksWriteState = undefined;
 }
 
 beforeEach(async () => {
@@ -287,4 +292,83 @@ test("LiveHub delegates the kill-switch read to the hook, not to refreshDeployme
   );
   assert.match(liveHub, /useLiveKillSwitch/);
   assert.doesNotMatch(liveHub, /getLiveKillSwitch/);
+});
+
+test("a poll resolving after a halt/resume write cannot overwrite it", async () => {
+  // #300 follow-up: the write's read-back is newer than anything an
+  // in-flight poll can carry. A poll that started before the write and
+  // resolves after it holds pre-write state and must be discarded, or the
+  // panel would render a stale "trading allowed" over a fresh halt.
+  globalThis.__ksRefreshResponder = () => killSwitchState();
+
+  await renderHarness();
+  assert.equal(field("halted"), "false");
+
+  // Hold the next poll's response open.
+  let releasePoll: (value: unknown) => void = () => undefined;
+  const pending = new Promise<unknown>((resolve) => {
+    releasePoll = resolve;
+  });
+  globalThis.__ksRefreshResponder = () => pending;
+
+  const poll = intervals.find((entry) => entry.ms === KILL_SWITCH_POLL_MS);
+  assert.ok(poll, `expected a ${KILL_SWITCH_POLL_MS}ms kill-switch poll interval`);
+  await act(async () => {
+    poll.fn();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  // While that poll is still in flight, a halt write returns the server's
+  // read-back state.
+  globalThis.__ksWriteState = killSwitchState({
+    global_halted: true,
+    halts: [{ scope: "global", mode: "entries" }],
+  });
+  await act(async () => {
+    globalThis.__ksHookChange?.();
+    await Promise.resolve();
+  });
+  assert.equal(field("halted"), "true");
+
+  // The older poll finally resolves with pre-write state.
+  await act(async () => {
+    releasePoll(killSwitchState());
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  assert.equal(
+    field("halted"),
+    "true",
+    "the pre-write poll response must not overwrite the write's read-back",
+  );
+  assert.equal(field("stale"), "false");
+});
+
+test("a successful halt/resume write clears the poll error text", async () => {
+  // #300 follow-up: after a failed poll the panel shows the error; a
+  // successful halt/resume write is itself a fresh server read-back, so the
+  // error text must clear with the state it returns.
+  let calls = 0;
+  globalThis.__ksRefreshResponder = () => {
+    calls += 1;
+    if (calls === 1) {
+      return killSwitchState();
+    }
+    throw new Error("viewer 500");
+  };
+
+  await renderHarness();
+  await tickPoll();
+  assert.equal(field("error"), "Could not load the kill-switch state.");
+
+  await act(async () => {
+    globalThis.__ksHookChange?.();
+    await Promise.resolve();
+  });
+
+  assert.equal(field("error"), "");
+  assert.equal(field("stale"), "false");
 });
