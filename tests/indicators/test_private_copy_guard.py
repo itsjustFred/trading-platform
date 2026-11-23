@@ -7,7 +7,9 @@ RSI, EMA, Supertrend and friends must come from ``core``/``presets`` (or a
 the copies that existed when the module landed; this test keeps them from
 coming back.
 
-The scan is AST-based over first-party ``*.py`` (tests, docs, frontend,
+The scan enumerates **tracked** files only (``git ls-files`` — untracked
+local clutter must not fail the suite; git being unavailable fails loudly)
+and is AST-based over first-party ``*.py`` (tests, docs, frontend,
 ``shared/indicators`` itself and generated/vendored trees excluded) and
 records two kinds of signal per file:
 
@@ -25,7 +27,12 @@ implementations awaiting their one-strategy-per-PR parity migration (the
 ``pine_*`` ones are being removed by the P3 draft), the ``ref_*``/agent
 strategies and parity/audit scripts are self-contained reference oracles,
 and the two non-strategy entries are reviewed non-computations kept for
-name/shape reasons. Any *new* signal — a new file, a new helper, an extra
+name/shape reasons. Files under ``strategies/`` carrying generated-code
+provenance (a ``.generated.json`` marker or a
+``STRATEGY_META.provenance.generated`` declaration) are exempt from this
+roster: the codegen contract requires
+self-contained pandas, so its indicator chains are emitted, not copied.
+Any *new* signal — a new file, a new helper, an extra
 ``.ewm()`` in an existing function — fails here; any *removed* signal fails
 too, so the roster cannot silently rot (same contract as
 ``scripts/gate-tests.sh``).
@@ -40,6 +47,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -170,22 +178,71 @@ def _scan_file(path: Path) -> tuple[Counter[str], list[str]]:
 
 
 def _iter_source_files() -> list[Path]:
-    files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(REPO_ROOT):
-        dirnames[:] = sorted(
-            name for name in dirnames if name not in _SKIP_DIRS
+    """Tracked ``*.py`` files only, via ``git ls-files``.
+
+    Scanning the working tree would flag unrelated local clutter (a scratch
+    ``.venv-alt``, an editor folder, an untracked strategy draft) and fail the
+    suite for reasons unrelated to the change. Only files git tracks are
+    first-party source; if git cannot answer, fail loudly rather than fall
+    back to an untracked-file scan.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", "*.py"],
+            capture_output=True,
+            env=env,
+            check=True,
         )
-        for filename in sorted(filenames):
-            if not filename.endswith(".py"):
-                continue
-            path = Path(dirpath) / filename
-            rel = path.relative_to(REPO_ROOT)
-            # Only the indicators package itself is exempt; the rest of
-            # ``shared/`` is scanned like everything else.
-            if rel.parts[:2] == ("shared", "indicators"):
-                continue
-            files.append(path)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(
+            "private-copy guard requires `git ls-files` to enumerate tracked "
+            f"sources; git is unavailable or failed: {exc}"
+        ) from exc
+
+    files: list[Path] = []
+    for raw in proc.stdout.decode("utf-8").split("\0"):
+        if not raw:
+            continue
+        rel = Path(raw)
+        # Same exclusions the directory walk applied: skipped directory
+        # names at any depth, plus the indicators package itself (the one
+        # place indicator math is allowed to live).
+        if any(part in _SKIP_DIRS for part in rel.parts[:-1]):
+            continue
+        if rel.parts[:2] == ("shared", "indicators"):
+            continue
+        files.append(REPO_ROOT / rel)
     return files
+
+
+def _is_generated_strategy(path: Path, repo_root: Path = REPO_ROOT) -> bool:
+    """True only for ``strategies/`` files carrying generated-code provenance.
+
+    Codegen emits self-contained pandas by contract (pinned by
+    ``test_generated_code_is_self_contained_no_risky_imports``), so a
+    committed generated strategy will necessarily contain ``.rolling()``/
+    ``.ewm()`` chains this guard would otherwise flag. The exemption is
+    deliberately narrow: the file must live under ``strategies/`` AND carry
+    generated provenance — the ``.generated.json`` marker written by
+    ``mark_generated_strategy`` or a ``STRATEGY_META.provenance.generated``
+    declaration (both defined by ``runner.approval_gate``). Hand-written code
+    can never qualify.
+    """
+    try:
+        rel = path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    if not rel.parts or rel.parts[0] != "strategies":
+        return False
+    from runner.approval_gate import is_generated_strategy
+
+    return is_generated_strategy(path)
 
 
 #: Expected signal counts per repository-relative path. See the module
@@ -204,8 +261,11 @@ _ALLOWED: dict[str, dict[str, int]] = {
         "rolling@init": 2,
     },
     # Pre-P3 private implementations awaiting their one-strategy-per-PR
-    # parity migration (#317); the pine_* trio is being removed by the P3
-    # draft PR #375 — when it lands, delete its entries here.
+    # parity migration (#317). PR #375 (P3 draft) touches four of these —
+    # custom_swings_supertrend, ema_crossoiver_conversion_test,
+    # pine_superosc_vumanchu, pine_supertrend_dema — plus adds
+    # scripts/bench_indicators_numba.py {"def:_supertrend_ta_nb": 1}; when
+    # it lands, apply those five roster changes here.
     "strategies/channel_breakout/channel_breakout.py": {
         "ewm@generate_signals": 1,
         "rolling@generate_signals": 3,
@@ -296,7 +356,7 @@ _ALLOWED: dict[str, dict[str, int]] = {
 
 def test_no_third_party_indicator_libraries() -> None:
     offenders = [
-        f"{path.relative_to(REPO_ROOT)}: {hit}"
+        f"{path.relative_to(REPO_ROOT).as_posix()}: {hit}"
         for path in _iter_source_files()
         for hit in _scan_file(path)[1]
     ]
@@ -310,9 +370,14 @@ def test_no_third_party_indicator_libraries() -> None:
 def test_private_indicator_copies_match_roster() -> None:
     actual: dict[str, dict[str, int]] = {}
     for path in _iter_source_files():
+        # Generated strategies are exempt (see _is_generated_strategy):
+        # codegen emits self-contained pandas by contract, so its
+        # .rolling()/.ewm() chains are required, not copied indicators.
+        if _is_generated_strategy(path):
+            continue
         tags, _forbidden = _scan_file(path)
         if tags:
-            actual[str(path.relative_to(REPO_ROOT))] = dict(sorted(tags.items()))
+            actual[path.relative_to(REPO_ROOT).as_posix()] = dict(sorted(tags.items()))
 
     expected = {name: dict(sorted(counts.items())) for name, counts in _ALLOWED.items()}
 
@@ -352,3 +417,50 @@ def test_private_indicator_copies_match_roster() -> None:
     )
 
     assert not problems, "\n".join(problems)
+
+
+def _write_generated_fixture(root: Path, rel: str, *, marker: bool, declared: bool) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    provenance = ', "provenance": {"generated": True}' if declared else ""
+    path.write_text(
+        "STRATEGY_META = {\n"
+        f'    "name": "fixture"{provenance}\n'
+        "}\n\n"
+        "def generate_signals(df, params):\n"
+        "    return df['close'].rolling(3).mean(), None, {}, []\n",
+        encoding="utf-8",
+    )
+    if marker:
+        path.with_name(path.name + ".generated.json").write_text("{}", encoding="utf-8")
+    return path
+
+
+def test_generated_strategy_exemption_is_narrow(tmp_path: Path) -> None:
+    """Only strategies/-tree files with generated provenance are exempt."""
+    marked = _write_generated_fixture(
+        tmp_path, "strategies/gen_x/gen_x.py", marker=True, declared=False
+    )
+    declared = _write_generated_fixture(
+        tmp_path, "strategies/gen_y/gen_y.py", marker=False, declared=True
+    )
+    hand_written = _write_generated_fixture(
+        tmp_path, "strategies/hand/hand.py", marker=False, declared=False
+    )
+    outside_tree = _write_generated_fixture(
+        tmp_path, "scripts/gen_z.py", marker=True, declared=False
+    )
+
+    assert _is_generated_strategy(marked, repo_root=tmp_path)
+    assert _is_generated_strategy(declared, repo_root=tmp_path)
+    assert not _is_generated_strategy(hand_written, repo_root=tmp_path)
+    assert not _is_generated_strategy(outside_tree, repo_root=tmp_path)
+
+
+def test_generated_exempt_file_still_flagged_without_provenance(tmp_path: Path) -> None:
+    """The same indicator-copying source fails the roster when not generated."""
+    path = _write_generated_fixture(
+        tmp_path, "strategies/plain/plain.py", marker=False, declared=False
+    )
+    tags, _ = _scan_file(path)
+    assert tags, "fixture must produce a private-copy signal to be meaningful"
