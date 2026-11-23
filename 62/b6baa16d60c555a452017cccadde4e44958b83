@@ -1,0 +1,19 @@
+viewer/main.py
+  s_2bf89379757a94::t_8422b2d07283e2 12916-12948,12984-12990
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "62b6baa16d60c555a452017cccadde4e44958b83",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
