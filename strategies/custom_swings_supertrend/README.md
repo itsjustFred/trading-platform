@@ -26,7 +26,7 @@ Die Quelle kombiniert mehrere Exit-Mechaniken:
 - optionale Partial Exits
 - Exit bei Gegen-Flip des Supertrends
 
-**Fill-Konvention (Version 1.1.0):** Marktausstiege auf Close-Basis (Supertrend-Gegen-Flip) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Stop-Loss und fester RRR-Take-Profit tragen ihr Level in `exit_price`, das Engines nur mit `exit_order_type="level"` als Level ausfuehren (wird hier nicht gesetzt): der protective `stop_loss`/`sl_price` deckt den Stop ab, das Take-Profit-Level ist auf native kein ruhender Order.
+**Fill-Konvention (Version 1.1.0):** Marktausstiege auf Close-Basis (Supertrend-Gegen-Flip) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Stop-Loss und fester RRR-Take-Profit tragen ihr Level in `exit_price`, das Engines nur mit `exit_order_type="level"` als Level ausfuehren (wird hier nicht gesetzt): der protective `stop_loss`/`sl_price` deckt den Stop ab, das Take-Profit-Level ist auf native kein ruhender Order. Mit `use_trailing_sl` wird das nachgezogene Stop-Level ebenfalls nicht in `sl_price` zurueckgeschrieben (nur in der Entry-Bar gesetzt): auf native ist nur der initiale Stop protective, ein Trailing-Ausstieg fuellt als Market-Exit zum naechsten Bar-Open.
 
 ### Stop-Loss
 Im Original nicht rein statisch, sondern struktur- bzw. bandbasiert:
