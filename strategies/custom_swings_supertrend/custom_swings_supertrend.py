@@ -20,10 +20,11 @@ fills at the next bar's open. Stop-loss and fixed-RRR take-profit carry their
 level in ``exit_price``, which engines honor only with
 ``exit_order_type="level"`` (not emitted here): on native the protective
 ``stop_loss``/``sl_price`` covers the stop, while the take-profit level is
-not enforced as a resting order. With ``use_trailing_sl`` the trailed level is
-likewise NOT fed back into ``sl_price`` (written on the entry bar alone), so
-only the initial stop is protective on native — a trailed-stop exit is the
-strategy's market exit signal filling at the next bar's open, not a level fill.
+not enforced as a resting order. ``use_trailing_sl`` is unsupported on the
+native engine (maintainer decision 2026-11-23): native refuses a resolved
+``use_trailing_sl=true`` config before running — as well as any value that is
+not an unambiguous boolean or a known true/false token — while
+``false``/absent keeps only the initial stop protective.
 """
 
 STRATEGY_META = {
@@ -190,6 +191,15 @@ def generate_signals(
         breakeven_r = float(params.get("breakeven_r", breakeven_r))
         use_trailing_sl = _coerce_bool(params.get("use_trailing_sl", use_trailing_sl))
         trade_direction = str(params.get("trade_direction", trade_direction))
+
+    # The native engine calls generate_signals kwargs-style, bypassing the
+    # legacy params-dict branch above. Coerce the boolean switches
+    # unconditionally so string values from JSON/CLI params cannot stay
+    # truthy (a non-empty "false" would otherwise trail the stop).
+    ema_filter_enabled = _coerce_bool(ema_filter_enabled)
+    use_rrr = _coerce_bool(use_rrr)
+    use_breakeven = _coerce_bool(use_breakeven)
+    use_trailing_sl = _coerce_bool(use_trailing_sl)
 
     trade_direction = str(trade_direction).strip().lower()
 

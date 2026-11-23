@@ -546,6 +546,14 @@ _STUB_OPENCODE = """#!/usr/bin/env bash
 # retried until it gave up, the anonymous per-IP cap it does not retry, and a
 # 400 that ends on the same "Provider returned error" line with no retry.
 set -u
+# Like the real CLI, every run first prints "> <agent> · <model>" on stderr:
+# a probe that greps stderr must not read its own agent name as a signature.
+agent=build
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--agent" ] && [ "$#" -gt 1 ]; then agent="$2"; fi
+  shift
+done
+printf '\\033[0m\\n> %s \\302\\267 stub/model\\n' "$agent" >&2
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   verdict) printf '**Summary:** probe verdict\\n**Verdict: PASS**\\n'; exit 0 ;;

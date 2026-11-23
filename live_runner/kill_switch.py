@@ -38,6 +38,10 @@ from enum import Enum
 from time import monotonic
 from typing import Any
 
+from live_runner.account_order_lock import (
+    AccountOrderLockTimeoutError,
+    account_order_placement,
+)
 from live_runner.base_adapter import BaseLiveAdapter
 from live_runner.shutdown import BrokerMutationGate
 from shared.database import (
@@ -627,6 +631,41 @@ async def _sweep_halted_account(
     return swept
 
 
+async def _sweep_halted_account_with_order_lock(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    mode: KillSwitchMode,
+    state: KillSwitchState,
+) -> bool:
+    """Sweep a halted account, serialising flattens with order placement.
+
+    A flatten reads the broker book and then submits closes; without the
+    account lock a signal submission could interleave between that read and
+    those writes (#362). Order-only halts do not read positions for sizing, so
+    they keep the sweep's existing behaviour. A lock timeout is unmet, not a
+    sweep: the halt stays due and the next tick retries.
+    """
+    if not mode.flattens:
+        return await _sweep_halted_account(account_id, adapter, mode, state)
+    try:
+        async with account_order_placement(account_id):
+            return await _sweep_halted_account(account_id, adapter, mode, state)
+    except AccountOrderLockTimeoutError as exc:
+        logger.error(
+            "Kill-switch flatten refused: the account's order-placement lock "
+            "could not be acquired in time; the halt stays due and the sweep "
+            "is retried next tick",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "mode": mode.value,
+                    "reason": str(exc),
+                }
+            },
+        )
+        return False
+
+
 async def enforce_live_kill_switch(
     adapters: Mapping[str, BaseLiveAdapter],
     account_ids: Iterable[str] | None = None,
@@ -698,7 +737,7 @@ async def enforce_live_kill_switch(
         if not resolved.sweep_is_due(account_id, mode):
             continue
         if mutation_gate is None:
-            swept_clean = await _sweep_halted_account(
+            swept_clean = await _sweep_halted_account_with_order_lock(
                 account_id, adapter, mode, resolved
             )
         else:
@@ -717,7 +756,7 @@ async def enforce_live_kill_switch(
                     )
                     unmet.append(account_id)
                     continue
-                swept_clean = await _sweep_halted_account(
+                swept_clean = await _sweep_halted_account_with_order_lock(
                     account_id, adapter, mode, resolved
                 )
         if swept_clean:

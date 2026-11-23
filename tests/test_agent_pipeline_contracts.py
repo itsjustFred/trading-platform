@@ -1870,6 +1870,14 @@ _STUB_OPENCODE = """#!/usr/bin/env bash
 # kilo-signup is the gateway's anonymous per-IP cap: a 429 sent with
 # `x-should-retry: false`, so opencode prints it without retrying (exit 1).
 set -u
+# Like the real CLI, every run first prints "> <agent> · <model>" on stderr:
+# a probe that greps stderr must not read its own agent name as a signature.
+agent=build
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--agent" ] && [ "$#" -gt 1 ]; then agent="$2"; fi
+  shift
+done
+printf '\\033[0m\\n> %s \\302\\267 stub/model\\n' "$agent" >&2
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
@@ -2017,9 +2025,19 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
     )
 
 
-KILO_CONFIG = (
-    '{"$schema":"https://opencode.ai/config.json","update":"disable","providers":{"kilo":{}}}'
-)
+KILO_GATEWAY = "https://ai-gateway.kilo.ai/api/v1"
+
+
+def _kilo_config(model_id: str) -> dict:
+    """The config a `kilo/<model_id>` stage must get: the gateway and the model declared, so
+    opencode cannot fall back to its default model when its catalog has not resolved it."""
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "update": "disable",
+        "providers": {"kilo": {"settings": {"baseURL": KILO_GATEWAY}, "models": {model_id: {}}}},
+    }
+
+
 ZEN_CONFIG = '{"$schema":"https://opencode.ai/config.json","update":"disable"}'
 
 
@@ -2031,12 +2049,14 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
     generated config - and every other model must keep the config it always had. Executed
     on the probe's config step, which needs no opencode, for each workflow."""
     step = _find_step(_load(name)["jobs"]["quota-probe"], r"^Configure quota probe agent$")
+    zen = json.loads(ZEN_CONFIG)
     for model, expected in (
-        ("kilo/reflection/beam-free", KILO_CONFIG),
-        ("opencode/inkling-2-small-free", ZEN_CONFIG),
-        ("kilonova/some-model", ZEN_CONFIG),
+        ("kilo/reflection/beam-free", _kilo_config("reflection/beam-free")),
+        ("kilo/inclusionai/ling-3.2-flash:free", _kilo_config("inclusionai/ling-3.2-flash:free")),
+        ("opencode/inkling-2-small-free", zen),
+        ("kilonova/some-model", zen),
     ):
-        home = tmp_path / model.replace("/", "_")
+        home = tmp_path / model.replace("/", "_").replace(":", "_")
         home.mkdir()
         env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high"}
         script = home / "configure.sh"
@@ -2046,9 +2066,8 @@ def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, t
         )
         assert result.returncode == 0, f"{name} {model}: {result.stderr}"
         written = (home / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
-        assert written.strip() == expected, f"{name} {model}: wrote {written!r}"
-        assert json.loads(written)["update"] == "disable", f"{name} {model}: updates enabled"
-        agent = (home / ".config" / "opencode" / "agents" / "quota-probe.md").read_text(
+        assert json.loads(written) == expected, f"{name} {model}: wrote {written!r}"
+        agent = (home / ".config" / "opencode" / "agents" / "model-probe.md").read_text(
             encoding="utf-8"
         )
         assert f'model: "{model}#high"' in agent, f"{name} {model}: probe pings another model"
@@ -2061,7 +2080,9 @@ def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
     conditional."""
     choice = (
         'if [ "${MODEL%%/*}" = "kilo" ]; then\n'
-        f"  printf '{KILO_CONFIG}\\n' > \"$conf/opencode.json\"\n"
+        '  jq -cn --arg model "${MODEL#kilo/}" \'{"$schema": "https://opencode.ai/config.json", '
+        'update: "disable", providers: {kilo: {settings: {baseURL: '
+        f'"{KILO_GATEWAY}"}}, models: {{($model): {{}}}}}}}}}}\' > "$conf/opencode.json"\n'
         "else\n"
         f"  printf '{ZEN_CONFIG}\\n' > \"$conf/opencode.json\"\n"
         "fi\n"

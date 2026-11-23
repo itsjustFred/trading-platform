@@ -91,6 +91,7 @@ from live_runner.stockkit_routing import validate_stockkit_deployment_route
 from risk.config import RiskConfig
 from risk.live import entry_gate_settings
 from runner.agent_process import build_backtest_child_env
+from runner.engines.base import native_strategy_parameter_errors
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
 from runner.grid_identity import data_staleness_reason, read_identity
 from runner.promotion_gate import StrategyNotPromotedError
@@ -11172,6 +11173,10 @@ async def run_backtest(payload: BacktestRunRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Strategy '{strategy}' not found")
 
     engine = str(payload.engine or "native").strip() or "native"
+    if engine.casefold() == "native":
+        parameter_errors = native_strategy_parameter_errors(strategy_path, params)
+        if parameter_errors:
+            raise HTTPException(status_code=400, detail="; ".join(parameter_errors))
     timeframe = normalize_timeframe(str(payload.timeframe or "1d"))
     data_source = str(payload.data_source or "").strip()
     start = str(payload.start or "")

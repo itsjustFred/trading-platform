@@ -460,6 +460,34 @@ sees a real stop. A *stale* exit is skipped like a stale entry — with the
 unbounded-TP policy the position is then held until the fallback stop or
 the next exit signal.
 
+**Order-placement serialization (#362).** Every broker position/quantity read
+that feeds sizing, the pre-submit caps, leverage or exit quantity, and the
+`adapter.submit_order` call it feeds, runs inside one per-account critical
+section (`account_order_placement` in `live_runner/account_order_lock.py`;
+the daemon reaches it through `_account_order_placement`). Two of this
+daemon's own signal submissions of the same account — entries and exits of
+any deployment, Discord or internal — can never interleave another of this
+daemon's signal submissions, or a STOPPED/kill-switch flatten, between the
+read and the write; submissions of *different* accounts are unaffected. The
+lock does **not** make the read→write atomic against the broker: a working
+order can still fill inside the section (a resting entry, a bracket leg, a
+broker-side close or a manual trade), and broker reconciliation remains the
+backstop for that residual race. The wait is bounded
+(`ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS`, 120 s): a submission that cannot start
+inside it is refused (`decision.refused` with reason
+`account_order_lock_timeout` on the leased path,
+`AccountOrderLockTimeoutError` from `submit_order_with_risk`) — it never
+sizes or submits on a read that may be stale. Signal age is re-checked after
+the lock is acquired, so a signal that expired while queued is refused
+(`signal_aged_out_during_lock_wait`). Exits still hold the per-account+symbol
+`_exit_lock` first; the account lock is always the inner one, and adapter
+code must not take `_exit_lock` inside it. STOPPED enforcement and
+kill-switch flatten sweeps take the same account lock; adapter-internal
+read→write paths outside the submit chokepoints use
+`adapter.order_placement_lock()` (not re-entrant — never inside
+`submit_order`). Trailing-stop amendments and broker reconciliation keep
+their own adapter-level serialization and are not queued behind this lock.
+
 **Idempotency.** Each emitted intent carries a producer-stable
 `metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
 close and intent kind. Within a process the runner tracks the newest
@@ -1206,6 +1234,17 @@ database.
 | `GET /api/live/kill-switch` | the state the daemon enforces, plus every scope's mode, since, by and reason |
 | `POST /api/live/kill-switch/halt` | halt one scope; `confirmed_scope` required for `orders` and `flatten` |
 | `POST /api/live/kill-switch/resume` | lift the halt on one scope; `confirmed_scope` required |
+
+The Live Hub page carries the same control: a kill-switch panel above the account grid shows
+the enforced state per scope (global, every live account, and any halted scope the account list
+does not name), offers all three modes, keeps `entries` one click, and puts `orders`, `flatten`
+and resume behind a confirmation dialog that echoes the scope. A scope that is already halted
+offers only the stricter modes as escalation (`entries` → orders/flatten, `orders` → flatten) -
+a weaker mode is refused by the server, so resuming first is never required to escalate. An
+unreadable state is displayed as fail-closed, not as "nothing halted": halt controls stay
+available while Resume is hidden. A failed refresh after a good read marks the panel stale -
+statuses read "last known:" and Resume is disabled - rather than passing the old state off as
+current.
 
 `entries` is deliberately unconfirmed: it refuses new entries and can cost nothing, so it stays
 one click in an incident. The modes that move money, and resuming trading, are confirmed on the

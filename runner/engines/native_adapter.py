@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,11 @@ from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines._drawings import _normalize_drawings
 from runner.engines.base import (
+    NATIVE_TRAILING_SL_PARAM,
     BacktestConfig,
     EngineAdapter,
     ProgressCallback,
+    native_parameter_errors,
     resolve_strategy_parameters,
 )
 from runner.engines.mtm_equity import (
@@ -44,6 +47,16 @@ def _load_strategy_module(path: str):
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _signature_parameter_default(func: Any, name: str) -> Any:
+    try:
+        parameter = inspect.signature(func).parameters.get(name)
+    except (TypeError, ValueError):
+        return None
+    if parameter is None or parameter.default is inspect.Parameter.empty:
+        return None
+    return parameter.default
 
 
 def _find_ohlcv_path(data_root: Path, symbol: str, timeframe: str) -> Path | None:
@@ -103,6 +116,11 @@ class NativeAdapter(EngineAdapter):
     def name(self) -> str:
         return "native"
 
+    def validate_config(self, config: BacktestConfig) -> list[str]:
+        errors = super().validate_config(config)
+        errors.extend(native_parameter_errors(config.parameters))
+        return errors
+
     def run(
         self,
         config: BacktestConfig,
@@ -124,6 +142,16 @@ class NativeAdapter(EngineAdapter):
 
         data_root = Path(config.data_dir) if config.data_dir else DATA_DIR
         resolved_parameters = resolve_strategy_parameters(strategy_path, config.parameters)
+        effective_parameters = dict(resolved_parameters)
+        if NATIVE_TRAILING_SL_PARAM not in effective_parameters:
+            signature_default = _signature_parameter_default(
+                strategy_module.generate_signals, NATIVE_TRAILING_SL_PARAM
+            )
+            if signature_default is not None:
+                effective_parameters[NATIVE_TRAILING_SL_PARAM] = signature_default
+        parameter_errors = native_parameter_errors(effective_parameters)
+        if parameter_errors:
+            raise ValueError("; ".join(parameter_errors))
 
         all_trades = []
         all_drawings: list[dict[str, Any]] = []

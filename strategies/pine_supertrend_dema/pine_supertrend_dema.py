@@ -12,7 +12,9 @@ A trailed-stop hit (a low-touch, not close-triggered) or Supertrend flip-down
 is therefore a market exit that fills at the next bar's open under the default
 ``signal_exit_fill="next_open"`` — any ``exit_price`` written on the stop-hit
 bar is informational and ignored without ``exit_order_type="level"``, so the
-trailed level itself is not enforced as a fill price.
+trailed level itself is not enforced as a fill price. Native also refuses any
+resolved ``use_trailing_sl=true`` parameter on this strategy even though the
+parameter is not part of its signature (maintainer decision 2026-11-23).
 """
 
 STRATEGY_META = {
