@@ -12913,6 +12913,39 @@ def _existing_portfolio_json_path(portfolio_id: str) -> Path | None:
     return None
 
 
+def _write_portfolio_json_atomically(output_path: Path, payload: dict[str, Any]) -> None:
+    """Serialise ``payload`` onto ``output_path`` without a torn write.
+
+    ``json.dump`` used to run before the file was opened on main, so a
+    non-serialisable value left the original intact; streaming into
+    ``open("w")`` truncates first and a mid-dump ``TypeError`` leaves a
+    permanently unreadable portfolio JSON (``_load_portfolio_payload`` has
+    no DB fallback once the file is corrupt). The document is serialised
+    into a temp file in the same directory and ``os.replace``d, so readers
+    see the old file or the new one, never a fragment. The temp file is
+    unlinked on any failure. ``output_path`` is the directory-enumerated
+    handle from ``_existing_portfolio_json_path``, never a join of client
+    input (SonarCloud pythonsecurity:S2083).
+    """
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_path, output_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
 @app.patch(
     "/api/portfolios/{portfolio_id}",
     responses={
@@ -12948,30 +12981,13 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
         if output_path is not None:
-            # Serialise-then-swap: json.dump used to run before the file was
-            # opened on main, so a non-serialisable value left the original
-            # intact; streaming into open("w") truncates first and a mid-dump
-            # TypeError would leave a permanently unreadable portfolio JSON.
-            # The temp file lives in PORTFOLIOS_DIR so os.replace stays on one
-            # filesystem, and the write sink is still the enumerated handle,
-            # never a join of client input (SonarCloud S2083).
-            tmp_path: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    dir=PORTFOLIOS_DIR,
-                    prefix=f".{output_path.name}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as handle:
-                    tmp_path = Path(handle.name)
-                    json.dump(normalized_portfolio, handle, indent=2)
-                os.replace(tmp_path, output_path)
-                tmp_path = None
-            finally:
-                if tmp_path is not None:
-                    tmp_path.unlink(missing_ok=True)
+            # Off the event loop: the serialise-and-swap is synchronous file
+            # I/O (SonarCloud pythonsecurity:S7493), and the temp-file +
+            # os.replace inside keeps the write atomic and the sink
+            # enumerated rather than client-derived (S2083).
+            await asyncio.to_thread(
+                _write_portfolio_json_atomically, output_path, normalized_portfolio
+            )
     except Exception as exc:
         logger.exception(
             "Failed to rename portfolio",
