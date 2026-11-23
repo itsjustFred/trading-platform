@@ -91,7 +91,7 @@ def test_pairs_on_the_server_trading_day_and_direction(tmp_path):
 
     mt5 = mod.load_mt5(tmp_path, "nas100")
     pf = mod.load_platform(artifact, "nas100", "dukascopy_mt5_index")
-    summary, merged = mod.score("nas100", mt5, pf)
+    summary, _merged = mod.score("nas100", mt5, pf)
 
     assert summary["matched"] == 2
     assert summary["mt5_only"] == 1  # 2025-07-02 LONG: the platform went SHORT that day

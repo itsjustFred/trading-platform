@@ -65,6 +65,54 @@ def test_build_ctrader_deployment_plan_targets_first_ctrader_account() -> None:
     assert deployments[0].signal_config["source_backtest_id"] == "bt-1"
 
 
+def test_build_ctrader_deployment_plan_never_activates_an_unknown_status() -> None:
+    """An unrecognised deployment status must never read as ACTIVE.
+
+    The planner writes only one of the three states the daemon dispatches.
+    Anything else - a typo, a future state, a differently-spelled ACTIVE -
+    falls back to PAUSED, so the plan exists but is not traded until a human
+    maps it. Reading it as ACTIVE would make a typo trade live money.
+    """
+    backtests = [
+        {
+            "id": "bt-1",
+            "strategy_name": "fx_breakout",
+            "symbols": ["EURUSD"],
+            "timeframe": "15m",
+            "sharpe_ratio": 1.5,
+            "cagr": 0.2,
+            "psr": 0.8,
+            "max_drawdown": -0.06,
+            "trade_count": 12,
+            "oos_status": "available",
+        }
+    ]
+    accounts = [LiveAccountConfig(id="ct-1", broker="ctrader", name="cTrader")]
+
+    for unknown in ("LIVE", "active", "", "ACTIVE ", "Stopped", "Pending"):
+        deployments = build_ctrader_deployment_plan(
+            backtests=backtests,
+            accounts=accounts,
+            limit=5,
+            status=unknown,
+        )
+
+        assert len(deployments) == 1
+        assert deployments[0].status == "PAUSED", unknown
+
+    # The three real states still pass through unchanged - the fallback only
+    # catches what the daemon cannot dispatch.
+    for known in ("ACTIVE", "PAUSED", "STOPPED"):
+        deployments = build_ctrader_deployment_plan(
+            backtests=backtests,
+            accounts=accounts,
+            limit=5,
+            status=known,
+        )
+
+        assert deployments[0].status == known
+
+
 def test_top_backtests_require_oos_evidence_by_default() -> None:
     """C5: in-sample-only rows never reach a live shortlist."""
     rows = [
@@ -90,6 +138,7 @@ def test_score_is_unit_normalized() -> None:
 
     modest = {
         "sharpe_ratio": 1.5,
+        "equity_return_periods_per_year": 365.25,
         "cagr": 0.2,
         "psr": 0.8,
         "max_drawdown": -0.06,
@@ -110,7 +159,13 @@ def test_drawdown_penalty_reads_max_drawdown_as_fraction() -> None:
     """
     from live_runner.ctrader_deployment import score_backtest_for_live
 
-    base = {"sharpe_ratio": 1.5, "cagr": 0.2, "psr": 0.8, "trade_count": 12}
+    base = {
+        "sharpe_ratio": 1.5,
+        "cagr": 0.2,
+        "psr": 0.8,
+        "trade_count": 12,
+        "equity_return_periods_per_year": 365.25,
+    }
     smooth = score_backtest_for_live({**base, "max_drawdown": -0.05})
     deep = score_backtest_for_live({**base, "max_drawdown": -0.25})
 
@@ -122,9 +177,40 @@ def test_drawdown_penalty_is_capped_at_one() -> None:
     """A drawdown of 100 % or more costs at most 1.0 (documented 0..1 penalty)."""
     from live_runner.ctrader_deployment import score_backtest_for_live
 
-    base = {"sharpe_ratio": 1.5, "cagr": 0.2, "psr": 0.8, "trade_count": 12}
+    base = {
+        "sharpe_ratio": 1.5,
+        "cagr": 0.2,
+        "psr": 0.8,
+        "trade_count": 12,
+        "equity_return_periods_per_year": 365.25,
+    }
     total = score_backtest_for_live({**base, "max_drawdown": -1.0})
     beyond = score_backtest_for_live({**base, "max_drawdown": -3.0})
 
     assert total == pytest.approx(1.5 / 3.0 + 0.2 + 0.8 - 1.0)
     assert beyond == pytest.approx(total)
+
+
+def test_legacy_rows_rescale_sharpe_onto_measured_density_basis() -> None:
+    """#349: rows stored before #229 were annualised at sqrt(252); the same
+    performance now measures ~sqrt(365.25). Ranking must compare them on one
+    basis, so a legacy row's Sharpe term is rescaled by sqrt(365.25/252)
+    while a row carrying `equity_return_periods_per_year` is not."""
+    import math
+
+    from live_runner.ctrader_deployment import _LEGACY_SHARPE_RESCALE, score_backtest_for_live
+
+    base = {
+        "sharpe_ratio": 1.5,
+        "cagr": 0.2,
+        "psr": 0.8,
+        "max_drawdown": -0.06,
+        "trade_count": 12,
+    }
+    legacy = score_backtest_for_live(base)
+    current = score_backtest_for_live({**base, "equity_return_periods_per_year": 365.25})
+
+    assert _LEGACY_SHARPE_RESCALE == pytest.approx(math.sqrt(365.25 / 252.0))
+    assert legacy - current == pytest.approx(
+        (1.5 * (_LEGACY_SHARPE_RESCALE - 1.0)) / 3.0
+    )

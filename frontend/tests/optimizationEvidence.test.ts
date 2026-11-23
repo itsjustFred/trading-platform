@@ -221,6 +221,18 @@ test("non-available OOS lifecycle status is unavailable", () => {
   );
 });
 
+test("insufficient_oos_bars explains the daily-observation minimum", () => {
+  const evidence = classifyOptimizationOosEvidence(
+    "sharpe",
+    2,
+    { sharpe_ratio: 2 },
+    "insufficient_oos_bars",
+  );
+
+  assert.equal(evidence.state, "unavailable");
+  assert.match(evidence.message, /daily observations/i);
+});
+
 test("missing and invalid OOS lifecycle statuses fail closed", () => {
   const missing = classifyOptimizationOosEvidence("sharpe", 2, { sharpe_ratio: 2 });
   const invalid = classifyOptimizationOosEvidence(

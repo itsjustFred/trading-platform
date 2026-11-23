@@ -47,6 +47,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import pairwise
 
 import numpy as np
 import pandas as pd
@@ -88,7 +89,7 @@ class BrokerClock:
             raise ValueError(
                 f"broker clock {self.name!r}: only the first segment may be open-ended"
             )
-        if any(later <= earlier for earlier, later in zip(starts, starts[1:])):
+        if any(later <= earlier for earlier, later in pairwise(starts)):
             raise ValueError(
                 f"broker clock {self.name!r}: segment starts must be strictly increasing"
             )

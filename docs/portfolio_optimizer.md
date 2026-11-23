@@ -26,7 +26,7 @@ Hinweis: `--backtest-ids` nimmt eine oder mehrere IDs als getrennte Argumente en
 
 ## Output
 
-- **JSON Output:** Ergebnisse werden nach `data/optimizations/portfolio_*.json` geschrieben.
+- **JSON Output:** Ergebnisse werden nach `DATA_DIR/optimizations/portfolio_*.json` geschrieben (default: `data/optimizations/`).
 - **Metrics:** In-Sample Sharpe, OOS Sharpe bei `--test-months`, PSR-ready Korrelationsmatrix, Max Drawdown.
 - **API:** Viewer-Endpunkte können die JSON-Dateien bzw. persistierte Backtest/Grid-Daten weiterverarbeiten.
 

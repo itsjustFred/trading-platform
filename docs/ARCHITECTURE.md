@@ -7,7 +7,10 @@ This is the current "state of the union" for the trading-platform repository.
 - **Backend API:** FastAPI (`viewer/main.py`)
 - **Frontend:** React + TypeScript + Vite (`frontend/`)
 - **Primary backtest engine:** native event-based engine (`runner/engines/native_adapter.py`)
-- **Additional engines:** vectorbt, PyneCore and LEAN adapters
+- **Additional engines:** vectorbt, PyneCore and LEAN adapters — all frozen
+  (bug fixes only) per `docs/adr/0001-native-single-strategy-engine.md` (#318);
+  native is the single strategy engine going forward, LEAN becomes
+  import-only, and pynecore is scheduled for deletion
 - **Performance/statistics:** `runner/stats.py`, QuantStats-derived metrics, custom p-value / PSR handling
 - **Persistence:** SQLite (`$DATA_DIR/backtests.db`) + JSON compatibility (`$DATA_DIR/backtests/*.trades.json`)
 
@@ -100,9 +103,10 @@ Execution and conversion layer.
   - any change to the file after approval invalidates the approval
   - REST surface: `GET /api/strategies/{file}/approval` and `POST /api/strategies/{file}/approve`
 - `runner/engines/`
-  - `vectorbt_adapter.py`: fast vectorized backtests (per-symbol processing in
+  - `vectorbt_adapter.py`: bar-loop adapter kept in parity with native via
+    `tests/test_vectorbt_native_parity.py` (per-symbol processing in
     `_process_symbol`, per-trade sizing in `_size_trade`; drawing and
-    indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`)
+    indicator-series presentation shared via `_drawings.py`/`_indicator_series.py`); FROZEN per #318 — no `vectorbt` import, no vectorization
   - `pynecore_adapter.py`: Pine-style strategies through PyneCore
   - `lean_adapter.py`: QuantConnect LEAN result ingestion / execution bridge
 - Sizing semantics: `max_position_exposure_pct` (position-size), `risk_per_trade_pct`
