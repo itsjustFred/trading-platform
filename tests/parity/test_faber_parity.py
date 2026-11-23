@@ -37,13 +37,13 @@ def _check(tmp_path, fixture, *, fee_rate=0.0, start=None, end=None):
     ],
 )
 def test_faber_engine_equals_reference(tmp_path, fixture, end):
-    run, ref, diffs = _check(tmp_path, fixture, end=end)
+    _run, ref, diffs = _check(tmp_path, fixture, end=end)
     assert not diffs, "\n".join(diffs[:10])
     assert len(ref.trades) >= 10
 
 
 def test_faber_engine_equals_reference_with_costs(tmp_path):
-    run, ref, diffs = _check(tmp_path, "spy", fee_rate=0.001)
+    _run, _ref, diffs = _check(tmp_path, "spy", fee_rate=0.001)
     assert not diffs, "\n".join(diffs[:10])
 
 

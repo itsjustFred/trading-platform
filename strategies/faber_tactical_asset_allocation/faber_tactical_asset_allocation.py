@@ -137,7 +137,7 @@ def generate_signals(df: pd.DataFrame, params: dict):
 
     close = df["close"].astype(float)
     timestamps = df["timestamp"] if "timestamp" in df.columns else None
-    is_month_end, month_end_close, month_end_sma, want_long = monthly_timing_signal(
+    is_month_end, _month_end_close, month_end_sma, want_long = monthly_timing_signal(
         close, timestamps, sma_months
     )
 
@@ -193,27 +193,27 @@ def generate_signals(df: pd.DataFrame, params: dict):
         exit_times = pd.to_datetime(
             df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
         ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": "Buy (SMA10M)",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "Sell to cash",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#22c55e",
+                "text": "Buy (SMA10M)",
+            }
+            for ts in entry_times.iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#ef4444",
+                "text": "Sell to cash",
+            }
+            for ts in exit_times.iloc[:30]
+        )
 
     return entries, exits, indicators_dict, drawings

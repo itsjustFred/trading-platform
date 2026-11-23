@@ -17,7 +17,7 @@ CURVE_ABS = 0.02
 def bars_of(frame: pd.DataFrame) -> list[Bar]:
     return [
         Bar(day=ts.strftime("%Y-%m-%d"), open=float(o), close=float(c))
-        for ts, o, c in zip(frame["timestamp"], frame["open"], frame["close"])
+        for ts, o, c in zip(frame["timestamp"], frame["open"], frame["close"], strict=True)
     ]
 
 
@@ -37,7 +37,7 @@ def compare(
     exp = sorted(ref.trades, key=lambda t: (t.entry_day, symbol_map[t.symbol]))
     if len(eng) != len(exp):
         diffs.append(f"trade count: engine={len(eng)} reference={len(exp)}")
-    for k, (a, b) in enumerate(zip(eng, exp)):
+    for k, (a, b) in enumerate(zip(eng, exp, strict=True)):
         tag = f"#{k} {b.symbol} {b.entry_day}"
         if (a.entry_time, a.symbol) != (b.entry_day, symbol_map[b.symbol]):
             diffs.append(f"{tag}: engine entry {a.symbol} {a.entry_time}")

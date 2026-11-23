@@ -346,27 +346,27 @@ def generate_signals(df: pd.DataFrame, params: dict):
         exit_times = pd.to_datetime(
             df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
         ).dropna()
-        for ts in entry_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "belowBar",
-                    "shape": "arrowUp",
-                    "color": "#22c55e",
-                    "text": f"GEM enter {own_slot}",
-                }
-            )
-        for ts in exit_times.iloc[:30]:
-            drawings.append(
-                {
-                    "type": "marker",
-                    "time": ts.isoformat(),
-                    "position": "aboveBar",
-                    "shape": "arrowDown",
-                    "color": "#ef4444",
-                    "text": "GEM rotate",
-                }
-            )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "belowBar",
+                "shape": "arrowUp",
+                "color": "#22c55e",
+                "text": f"GEM enter {own_slot}",
+            }
+            for ts in entry_times.iloc[:30]
+        )
+        drawings.extend(
+            {
+                "type": "marker",
+                "time": ts.isoformat(),
+                "position": "aboveBar",
+                "shape": "arrowDown",
+                "color": "#ef4444",
+                "text": "GEM rotate",
+            }
+            for ts in exit_times.iloc[:30]
+        )
 
     return entries, exits, indicators_dict, drawings

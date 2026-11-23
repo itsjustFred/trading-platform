@@ -26,7 +26,7 @@ def _check(tmp_path, frame, *, fee_rate=0.0):
 
 def test_connors_spy_engine_equals_reference(tmp_path):
     frame = load_fixture("spy")
-    run, ref, diffs = _check(tmp_path, frame)
+    _run, ref, diffs = _check(tmp_path, frame)
     assert not diffs, "\n".join(diffs[:10])
     assert len(ref.trades) > 100  # a real sample, not a handful
 
@@ -34,7 +34,7 @@ def test_connors_spy_engine_equals_reference(tmp_path):
 def test_connors_spy_engine_equals_reference_with_costs(tmp_path):
     frame = load_fixture("spy")
     frame = frame[frame["timestamp"] >= "2015-01-01"]
-    run, ref, diffs = _check(tmp_path, frame, fee_rate=0.0005)
+    _run, _ref, diffs = _check(tmp_path, frame, fee_rate=0.0005)
     assert not diffs, "\n".join(diffs[:10])
 
 

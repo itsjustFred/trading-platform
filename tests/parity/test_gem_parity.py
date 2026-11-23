@@ -55,12 +55,12 @@ def _run(tmp_path, non_us: str, *, fee_rate=0.0, start=START):
 
 @pytest.mark.parametrize("non_us", ["VEU", "EFA"])
 def test_gem_engine_equals_reference(tmp_path, non_us):
-    run, ref, diffs = _run(tmp_path, non_us)
+    run, _ref, diffs = _run(tmp_path, non_us)
     assert not diffs, "\n".join(diffs[:10])
     assert {t.symbol for t in run.trades} >= {"SPY", "AGG"}  # at least two slots rotated in
 
 
 def test_gem_engine_equals_reference_with_costs(tmp_path):
-    run, ref, diffs = _run(tmp_path, "VEU", fee_rate=0.0005)
+    run, _ref, diffs = _run(tmp_path, "VEU", fee_rate=0.0005)
     assert not diffs, "\n".join(diffs[:10])
     assert sum(t.fees for t in run.trades) > 0

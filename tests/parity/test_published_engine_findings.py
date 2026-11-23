@@ -1,7 +1,8 @@
 """Engine findings surfaced by the published-strategy parity work (minimal reproductions).
 
-Strict ``xfail``: when the engine is fixed the test XPASSes and fails the
-suite with "remove the marker".
+``test_max_drawdown_includes_open_position_drawdown`` documented a
+realized-only equity curve; the mark-to-market reporting stats (#196) fixed
+it, so the strict ``xfail`` marker was removed.
 """
 from __future__ import annotations
 
@@ -17,11 +18,6 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 FABER = REPO_ROOT / "strategies" / "faber_tactical_asset_allocation" / "faber_tactical_asset_allocation.py"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="engine equity curve is realized-only: max_drawdown_pct/Sharpe ignore the drawdown of an "
-    "open position (a 40 % intramonth crash inside one long hold reports max_drawdown_pct == 0)",
-)
 def test_max_drawdown_includes_open_position_drawdown(tmp_path):
     close = np.concatenate([np.full(22, 100.0 + 10 * m) for m in range(12)] + [np.full(22, 230.0)] * 4)
     close[22 * 13 + 5 : 22 * 13 + 15] = 138.0  # -40 % for ten bars, back to 230 before month end
