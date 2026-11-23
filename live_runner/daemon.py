@@ -1952,6 +1952,18 @@ async def prepare_exit_intent_order(
     broker_qty = broker_position_qty(sizing_positions, signal.symbol)
     if ledger_match_qty is None:
         ledger_match_qty = broker_qty
+    # On a hedging book a resolved per-lot position IS the lot: for a full
+    # exit the broker's own quantity is the truth to size against, with the
+    # ledger residual kept only as the sanity check alerted on below. A
+    # residual that disagrees with the position means a close the ledger
+    # attributed wrongly (or missed) - sizing off it would leave real
+    # exposure open or refuse a close the broker can prove.
+    sizing_ledger_qty = ledger_qty
+    broker_sized_full_exit = (
+        exit_position_id is not None and instruction.fraction >= 1.0
+    )
+    if broker_sized_full_exit:
+        sizing_ledger_qty = broker_qty
     # Other deployments' exits still working at the broker are not in the broker
     # position yet but will leave it: their unfilled quantity is spoken for and
     # this exit may only close what remains (floored at 0).
@@ -1978,7 +1990,7 @@ async def prepare_exit_intent_order(
     # to close" and ambiguous closes are reported as such.
     close_action, target_qty = resolve_exit_order(
         symbol=signal.symbol,
-        ledger_qty=ledger_qty,
+        ledger_qty=sizing_ledger_qty,
         broker_positions=sizing_positions,
         instruction=instruction,
     )
@@ -1993,7 +2005,7 @@ async def prepare_exit_intent_order(
     if sized_positions is not sizing_positions:
         close_action, target_qty = resolve_exit_order(
             symbol=signal.symbol,
-            ledger_qty=ledger_qty,
+            ledger_qty=sizing_ledger_qty,
             broker_positions=sized_positions,
             instruction=instruction,
         )
@@ -2004,6 +2016,29 @@ async def prepare_exit_intent_order(
     # hear about it: a close the ledgers never saw (a stop or target leg, a
     # flatten, a manual close) happened.
     tolerance = _position_qty_tolerance(adapter, signal.symbol)
+    if broker_sized_full_exit and abs(sizing_ledger_qty) > 0.0:
+        # The broker-sized full exit above traded the lot residual for the
+        # resolved position's own quantity; the residual stays the sanity
+        # check. A disagreement means the ledger attributed a close to the
+        # wrong lot (or missed one): the exit still closes the whole proven
+        # position, but an operator must reconcile the lots.
+        lot_residual = abs(ledger_qty)
+        position_qty = abs(sizing_ledger_qty)
+        if abs(lot_residual - position_qty) > tolerance:
+            await _alert_ledger_mismatch(
+                deployment,
+                signal.symbol,
+                LedgerMismatchError(
+                    "targeted lot residual does not match the resolved "
+                    "broker position; the full exit is sized at the broker "
+                    "position and the lots need reconciling",
+                    ledgers=ledgers,
+                    broker_qty=ledger_match_qty,
+                    tolerance=tolerance,
+                ),
+                own_qty=ledger_qty,
+                exit_qty=target_qty,
+            )
     try:
         ensure_ledgers_match_broker(
             symbol=signal.symbol,

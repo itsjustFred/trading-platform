@@ -86,9 +86,14 @@ Risk-policy notes (maintainer decision 2026-11-22):
   keep flowing (a single untargeted exit intent, sized by the shared
   chokepoint). Open
   positions are counted from the deployment's own persisted ledger —
-  filled residuals allocated FIFO plus unfilled entries the broker still
-  lists as working or holds a non-zero position for — and the total is
-  capped at ``TRADE_ENGINE_MAX_POSITIONS``.
+  filled residuals with named-attribution first and FIFO for the rest, plus
+  unfilled entries the broker still lists as working or holds a non-zero
+  position for — and the total is
+  capped at ``TRADE_ENGINE_MAX_POSITIONS``. A cap above 1 is refused
+  (entries disabled) on Alpaca accounts until #350 lands and on any
+  deployment carrying the live ``supertrend_flip`` opt-in, and a strategy
+  exit first cancels the deployment's still-working entry orders for the
+  symbol.
 * **Session-bound symbols** (everything the venue calendar does not resolve
   to 24/7) are only *evaluated* while the venue is open, using
   ``shared.venue_calendar``. Only actionability is session-gated, never the
@@ -129,8 +134,13 @@ from typing import Any
 
 import pandas as pd
 
+from live_runner.account_order_lock import account_order_placement
 from live_runner.base_adapter import UNBOUNDED_TP_POLICY, BaseLiveAdapter
-from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
+from live_runner.exit_signals import (
+    FULL_EXIT,
+    SIGNAL_INTENT_EXIT,
+    exit_intent_metadata,
+)
 from live_runner.promotion import (
     STRATEGY_PARAMETERS_KEY,
     deployment_signal_processor_name,
@@ -297,6 +307,63 @@ def _max_open_per_symbol(
             "must be a positive integer no larger than the engine maximum"
         )
     return value
+
+
+#: ``LiveDeploymentConfig.settings`` key opting a deployment into the live
+#: ``supertrend_flip`` workflow (#168). ``shared.trailing`` carries the same
+#: constant on the flip branch; it is mirrored here so this refusal does not
+#: depend on which PR merges first.
+FLIP_DEPLOYMENT_OPT_IN_KEY = "live_supertrend_flip"
+_FLIP_OPT_IN_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+
+def _flip_opted_in(settings: Any) -> bool:
+    """Whether deployment ``settings`` carry the live flip opt-in (#168).
+
+    Mirrors ``shared.trailing.supertrend_flip_opted_in``: only an explicit
+    truthy value enables it; every other value fails closed to off.
+    """
+    if not isinstance(settings, Mapping):
+        return False
+    value = settings.get(FLIP_DEPLOYMENT_OPT_IN_KEY)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _FLIP_OPT_IN_TOKENS
+
+
+def _multi_lot_cap_refusal(
+    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, cap: int
+) -> str | None:
+    """Why a per-symbol cap above 1 is refused on this account, or ``None``.
+
+    Maintainer defaults for #382: ``internal_max_open_per_symbol > 1`` is
+    refused (entries disabled, exits keep flowing - the same fail-closed
+    shape as an unusable cap) on Alpaca accounts until #350 lands, because a
+    netted Alpaca book reserves bracket-leg quantity a second lot's exit
+    cannot prove; and on any deployment carrying the live ``supertrend_flip``
+    opt-in, because the flip manager requires exactly one broker position
+    per symbol.
+    """
+    if cap <= 1:
+        return None
+    if _adapter_calendar_source(adapter) == "alpaca":
+        return (
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on Alpaca accounts "
+            "until #350 lands: a netted book cannot prove a per-lot exit "
+            "against bracket-leg quantity reservations. Set the cap to 1 "
+            "or wait for #350; entries are disabled, exits still evaluated."
+        )
+    if _flip_opted_in(deployment.settings):
+        return (
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} cannot be combined with the "
+            f"'{FLIP_DEPLOYMENT_OPT_IN_KEY}' opt-in: the live supertrend_flip "
+            "workflow manages exactly one position per symbol. Set the cap "
+            "to 1 or remove the opt-in; entries are disabled, exits still "
+            "evaluated."
+        )
+    return None
 
 
 def _adapter_calendar_source(adapter: BaseLiveAdapter) -> str:
@@ -639,6 +706,73 @@ class InternalStrategyRunner:
                 error=str(exc),
             )
             return None
+
+    async def _cancel_working_entry_orders(
+        self,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        symbol: str,
+    ) -> None:
+        """Retire this deployment's still-working entry orders for ``symbol``.
+
+        A strategy exit closes every filled lot; an entry still working at
+        the broker has no position yet but would open one *after* the close
+        if left resting (#382 maintainer default). Only this deployment's
+        own unfilled entry refs are cancelled, by name - never another
+        deployment's orders and never position protections. Best-effort:
+        the refs read, the account lock or the cancel itself failing is
+        reported and the exit still goes out - refusing to exit would leave
+        the open lots exposed, which is worse.
+        """
+        deployment_id = str(deployment.id)
+        try:
+            refs = await asyncio.to_thread(
+                list_live_deployment_unfilled_entry_order_refs,
+                deployment_id,
+                symbol,
+            )
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                f"entry_cancel:{symbol}",
+                "Internal strategy exit cannot prove which entry orders are "
+                "still working; the exit goes out without cancelling them",
+                deployment_id=deployment_id,
+                symbol=symbol,
+                error=str(exc),
+                level="warning",
+            )
+            return
+        if not refs:
+            return
+        try:
+            async with account_order_placement(str(deployment.account_id)):
+                outcome = await adapter.cancel_orders(refs, symbol=symbol)
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                f"entry_cancel:{symbol}",
+                "Internal strategy exit could not cancel the deployment's "
+                "still-working entry orders; the exit goes out without them",
+                deployment_id=deployment_id,
+                symbol=symbol,
+                refs=sorted(refs),
+                error=str(exc),
+                level="warning",
+            )
+            return
+        if outcome.unidentified or outcome.failed:
+            logger.warning(
+                "Internal strategy exit left working entry orders uncancelled",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "unidentified": list(outcome.unidentified),
+                        "failed": list(outcome.failed),
+                    }
+                },
+            )
 
     async def _broker_held_symbols(
         self, adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig
@@ -1211,6 +1345,16 @@ class InternalStrategyRunner:
         # is the second layer for the intents that did reach the broker).
         self._last_bar[state_key] = latest_open
 
+        if any(
+            str((signal.metadata or {}).get("signal_intent") or "")
+            == SIGNAL_INTENT_EXIT
+            for _position, signal in intents
+        ):
+            # #382 maintainer default: a strategy exit retires this
+            # deployment's still-working entry orders for the symbol first,
+            # so a late fill cannot open a lot the exit already closed past.
+            await self._cancel_working_entry_orders(adapter, deployment, symbol)
+
         for _position, signal in intents:
             try:
                 outcome = await self._submit_signal(adapter, deployment, signal)
@@ -1346,6 +1490,22 @@ class InternalStrategyRunner:
                     error=str(exc),
                 )
                 max_open_per_symbol = 0
+            if max_open_per_symbol > 1:
+                refusal = _multi_lot_cap_refusal(
+                    adapter, deployment, max_open_per_symbol
+                )
+                if refusal is not None:
+                    self._report_once(
+                        deployment_id,
+                        "open_position_cap",
+                        refusal,
+                        deployment_id=deployment_id,
+                        account_id=str(deployment.account_id),
+                        adapter=type(adapter).__name__,
+                        max_open_per_symbol=max_open_per_symbol,
+                        level="warning",
+                    )
+                    max_open_per_symbol = 0
             open_entries: dict[str, int] = {}
             open_lots: dict[str, list[dict[str, Any]]] | None = None
             if max_open_per_symbol > 0:

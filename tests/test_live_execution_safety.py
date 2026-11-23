@@ -6009,3 +6009,106 @@ def test_alpaca_exit_only_entry_passes_through_normalization_unchanged(monkeypat
     assert float(request.qty) == 3.9
     assert getattr(request, "stop_loss", None) is None
     assert saved[0].metadata == {"risk_sizing_mode": EXIT_ONLY_RISK_SIZING_MODE}
+
+
+def _record_ledger_alerts(monkeypatch) -> list:
+    """Replace ``_alert_ledger_mismatch`` with a recorder; returns the list."""
+    import live_runner.daemon as daemon
+
+    alerts: list = []
+
+    async def _record(*args, **kwargs):
+        alerts.append((args, kwargs))
+
+    monkeypatch.setattr(daemon, "_alert_ledger_mismatch", _record)
+    return alerts
+
+
+def test_targeted_full_exit_sizes_off_the_resolved_position(monkeypatch):
+    """#382 hedging: a resolved FULL_EXIT closes the broker position's own
+    quantity - the lot *is* the position - while the ledger residual stays
+    the sanity check that alerts on divergence."""
+    alerts = _record_ledger_alerts(monkeypatch)
+    prepared, qty = _prepare_targeted_exit(
+        monkeypatch,
+        [
+            {"symbol": "EURUSD", "qty": 5.0, "position_id": 10},
+            {"symbol": "EURUSD", "qty": 3.0, "position_id": 11},
+        ],
+        ledger_qty=8.0,
+        lots=[_lot("entry-1", qty=2.0), _lot("entry-2", qty=3.0)],
+        target="entry-1",
+        resolved_position_id=10,
+    )
+
+    assert qty == pytest.approx(5.0)
+    assert prepared.metadata["position_id"] == 10
+    assert prepared.metadata["exit_ledger_qty"] == pytest.approx(2.0)
+    # Exactly one alert: the lot residual (2.0) disagrees with the resolved
+    # position (5.0). The aggregate ledger check stays quiet (8.0 == 8.0).
+    assert len(alerts) == 1
+
+
+def test_targeted_full_exit_matching_residual_does_not_alert(monkeypatch):
+    """#382: when the lot residual agrees with the resolved position the
+    broker-sized exit raises no ledger alert at all - this pins the
+    ``_broker_symbol_qty_total`` fix a surviving mutant removed."""
+    alerts = _record_ledger_alerts(monkeypatch)
+    _prepared, qty = _prepare_targeted_exit(
+        monkeypatch,
+        [
+            {"symbol": "EURUSD", "qty": 2.0, "position_id": 10},
+            {"symbol": "EURUSD", "qty": 3.0, "position_id": 11},
+        ],
+        ledger_qty=5.0,
+        lots=[_lot("entry-1", qty=2.0), _lot("entry-2", qty=3.0)],
+        target="entry-1",
+        resolved_position_id=10,
+    )
+
+    assert qty == pytest.approx(2.0)
+    assert alerts == []
+
+
+def test_targeted_partial_exit_keeps_lot_residual_sizing(monkeypatch):
+    """#382: a partial (fraction < 1) targeted exit still sizes off the lot
+    residual - broker-position sizing applies to full exits only."""
+    alerts = _record_ledger_alerts(monkeypatch)
+    import live_runner.daemon as daemon
+    from live_runner.exit_signals import ExitInstruction
+
+    class _Adapter:
+        async def get_positions(self):
+            return [
+                {"symbol": "EURUSD", "qty": 5.0, "position_id": 10},
+                {"symbol": "EURUSD", "qty": 3.0, "position_id": 11},
+            ]
+
+        async def working_order_ids(self):
+            return set()
+
+        async def resolve_exit_position_target(self, symbol, entry_signal_id):
+            return 10
+
+    deployment = _deployment()
+    _patch_exit_ledger(monkeypatch, deployment, 8.0)
+    monkeypatch.setattr(
+        daemon,
+        "list_live_deployment_open_position_lots",
+        lambda _d, _s: [_lot("entry-1", qty=2.0), _lot("entry-2", qty=3.0)],
+        raising=False,
+    )
+    signal = _exit_only_sell(str(deployment.id), exit_target_signal_id="entry-1")
+    # A partial instruction: half of the named lot.
+    prepared, qty = asyncio.run(
+        daemon.prepare_exit_intent_order(
+            _Adapter(),
+            deployment,
+            signal,
+            instruction=ExitInstruction(fraction=0.5),
+        )
+    )
+
+    assert qty == pytest.approx(1.0)
+    assert prepared.metadata["exit_ledger_qty"] == pytest.approx(2.0)
+    assert alerts == []

@@ -1962,3 +1962,183 @@ def test_run_daemon_creates_and_cancels_internal_strategy_task(
         asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
 
     assert events == ["started", "cancelled"]
+
+
+# ── #382: multi-lot cap refusals and entry-order retirement ──────────────────
+
+
+class _AlpacaFakeAdapter(FakeAdapter):
+    """Name carries 'alpaca' so ``_adapter_calendar_source`` routes it."""
+
+
+def test_multi_lot_cap_is_refused_on_alpaca(tmp_path: Path) -> None:
+    """#382 maintainer default: ``internal_max_open_per_symbol > 1`` is
+    refused on Alpaca until #350 - a netted book cannot prove a per-lot
+    exit against bracket-leg reservations. Entries disable, exits flow."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _AlpacaFakeAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert sent == []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def test_multi_lot_cap_is_refused_with_supertrend_flip(tmp_path: Path) -> None:
+    """#382 maintainer default: cap > 1 cannot combine with the live
+    ``supertrend_flip`` opt-in - the flip workflow manages exactly one
+    position per symbol."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        settings={
+            "internal_max_open_per_symbol": 2,
+            "live_supertrend_flip": "true",
+        }
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def test_flip_opt_in_with_single_lot_cap_still_enters(tmp_path: Path) -> None:
+    """The refusal is cap-scoped: the flip opt-in alone (cap 1) is the
+    maintainer-approved #168 shape and must keep trading."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"live_supertrend_flip": "yes"})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+
+
+def test_strategy_exit_cancels_working_entry_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382 maintainer default: a strategy exit retires this deployment's
+    still-working entry orders for the symbol before the exits go out, so
+    a late fill cannot open a lot past the close."""
+    import live_runner.internal_strategy_runner as runner_mod
+    from live_runner.base_adapter import ControlOutcome
+
+    cancelled: list[tuple[set[str], str]] = []
+
+    class _CancellingAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            cancelled.append((set(order_refs), symbol))
+            return ControlOutcome(completed=len(order_refs))
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: {"sig-open", "bo-open"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _CancellingAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert cancelled == [({"sig-open", "bo-open"}, "AAPL")]
+    assert len(sent) == 1
+    assert sent[0].metadata["signal_intent"] == "exit"
+
+
+def test_strategy_exit_survives_a_failed_entry_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort: a cancel that raises is reported once and the exit
+    still goes out - refusing to exit would leave the lots exposed."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    class _BrokenCancelAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            raise RuntimeError("broker refused")
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: {"sig-open"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _BrokenCancelAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata["signal_intent"] == "exit"
+    assert (str(deployment.id), "entry_cancel:AAPL") in runner._reported
+
+
+def test_strategy_exit_with_no_working_entries_skips_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No unfilled entry refs means no broker call at all: the cancel path
+    must not manufacture work (or touch protections) out of an empty set."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    calls: list = []
+
+    class _RecordingAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            calls.append((set(order_refs), symbol))
+            from live_runner.base_adapter import ControlOutcome
+
+            return ControlOutcome(completed=0)
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: set(),
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _RecordingAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert calls == []
+    assert len(sent) == 1
