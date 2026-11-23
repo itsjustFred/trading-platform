@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import inspect
+import logging
 import math
 import os
 import re
@@ -11,7 +12,7 @@ import sys
 import threading
 import uuid
 import weakref
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -120,6 +121,21 @@ from live_runner.promotion import (
     is_real_money,
 )
 from live_runner.service_discovery import discover_discord_bots_from_env
+from live_runner.shutdown import (
+    DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+    DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    EXIT_CLEANUP_TIMEOUT,
+    EXIT_CRASH,
+    EXIT_OK,
+    EXIT_PATH_TIMEOUT_SECONDS,
+    FORCED_EXIT_CODE,
+    SENTRY_FLUSH_TIMEOUT_SECONDS,
+    WORKER_JOIN_TIMEOUT_SECONDS,
+    ShutdownCoordinator,
+    SubmissionRefusedError,
+    close_the_loop_bounded,
+    release_twisted_reactor_threads_bounded,
+)
 from live_runner.signal_archive import (
     SignalDecisionRecorder,
     get_signal_archive,
@@ -194,7 +210,7 @@ from shared.models import (
     ServiceStatus,
     ServiceType,
 )
-from shared.sentry import capture_exception, initialize_sentry
+from shared.sentry import capture_exception, flush_sentry, initialize_sentry
 from shared.single_instance import (
     SingleInstanceError,
     SingleInstanceLock,
@@ -2453,36 +2469,54 @@ async def submit_order_with_risk(
     account_balance: float | None = None,
     pip_value: float | None = None,
 ) -> str:
-    """Prepare an order and submit it, for callers with no lease to protect."""
-    prepared_signal, prepared_qty = await prepare_order_with_risk(
-        adapter,
-        deployment,
-        signal,
-        current_exposure=current_exposure,
-        account_balance=account_balance,
-        pip_value=pip_value,
-    )
-    # The same last-moment halt gate the leased submission path runs: this
-    # caller has no claim to protect, but a halt written while the order was
-    # being sized must still stop it. Entries only - an exit is never blocked.
-    if not is_exit_order(signal.action, signal.metadata or {}):
-        await refuse_entry_while_halted(
-            deployment.account_id,
-            deployment_id=str(deployment.id),
-            symbol=signal.symbol,
-        )
-    # #302: the last check before the broker sees the order, independent of
-    # the sizing code that produced it. Inside order_not_submitted so a
-    # refusal is provably pre-request.
-    with order_not_submitted():
-        prepared_qty = await enforce_pre_submit_caps(
+    """Prepare an order and submit it, for callers with no lease to protect.
+
+    The submission registers itself on the shutdown ledger (``_broker_mutation``)
+    instead of trusting its caller to: broker work that is not counted in flight
+    is work the shutdown drain does not wait for, and cancelling it mid-request
+    leaves the broker outcome unknown. A future in-daemon caller therefore cannot
+    bypass the ledger by calling this directly - the only way to send an order is
+    through a counted submission.
+
+    Refused with ``SubmissionRefusedError`` once a shutdown was requested: the
+    alternative is sending an order through connections that are being torn down,
+    outside the drain that would have waited for it.
+    """
+    async with _broker_mutation() as admitted:
+        if not admitted:
+            raise SubmissionRefusedError(
+                "order submission refused: the daemon is shutting down; nothing "
+                "was sent to the broker and its outcome is not unknown"
+            )
+        prepared_signal, prepared_qty = await prepare_order_with_risk(
             adapter,
             deployment,
-            prepared_signal,
-            qty=prepared_qty,
-            risk_config=_risk_config_for_deployment(deployment),
+            signal,
+            current_exposure=current_exposure,
+            account_balance=account_balance,
+            pip_value=pip_value,
         )
-    return await adapter.submit_order(prepared_signal, qty=prepared_qty)
+        # The same last-moment halt gate the leased submission path runs: this
+        # caller has no claim to protect, but a halt written while the order was
+        # being sized must still stop it. Entries only - an exit is never blocked.
+        if not is_exit_order(signal.action, signal.metadata or {}):
+            await refuse_entry_while_halted(
+                deployment.account_id,
+                deployment_id=str(deployment.id),
+                symbol=signal.symbol,
+            )
+        # #302: the last check before the broker sees the order, independent of
+        # the sizing code that produced it. Inside order_not_submitted so a
+        # refusal is provably pre-request.
+        with order_not_submitted():
+            prepared_qty = await enforce_pre_submit_caps(
+                adapter,
+                deployment,
+                prepared_signal,
+                qty=prepared_qty,
+                risk_config=_risk_config_for_deployment(deployment),
+            )
+        return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(
@@ -3129,6 +3163,58 @@ async def _prepare_discord_signal_for_submission(
     return normalized_signal
 
 
+# Process-wide shutdown state. Broker work deep in the listener tasks and the
+# daemon's own loops consults it (``_begin_submission``, ``_broker_mutation``)
+# without it being threaded through every call; ``run_daemon`` binds it to its
+# loop and drives the shutdown sequence.
+_SHUTDOWN = ShutdownCoordinator()
+# The coordinator THIS process actually runs on. It is ``_SHUTDOWN`` in
+# production, and whatever a test injects into ``run_daemon(shutdown=...)``
+# there. The gate and the drain must sit on the same object: a drain that
+# counts a different coordinator's in-flight work sees an always-zero count,
+# waits for nothing, and then cancels an order submission that was halfway to
+# the broker - the exact failure graceful shutdown exists to prevent.
+_ACTIVE_SHUTDOWN: ShutdownCoordinator = _SHUTDOWN
+
+
+def _begin_submission() -> bool:
+    """Register in-flight broker work (order submission or mutation)."""
+    return _ACTIVE_SHUTDOWN.begin_submission()
+
+
+def _end_submission() -> None:
+    """Unregister it once the broker has answered."""
+    _ACTIVE_SHUTDOWN.end_submission()
+
+
+@contextlib.asynccontextmanager
+async def _broker_mutation() -> AsyncIterator[bool]:
+    """Count one broker mutation on the shutdown ledger for the drain to see.
+
+    A broker mutation - a trailing-stop amendment, a stopped deployment's
+    enforcement sweep, a kill-switch sweep - has the same two requirements as
+    an order submission,
+    and the two share one in-flight ledger (an order submission *is* a broker
+    mutation):
+
+    * it must not START once shutdown was requested (yields ``False``). Sending
+      one would mutate a broker order through connections the daemon is tearing
+      down; the caller skips the mutation instead, which leaves the money-safety
+      action for the next pass or the next start to retry.
+    * one that is already running must be awaited by the shutdown drain. The
+      daemon's loops run in tasks the shutdown cancels, so an unregistered
+      mutation would be cancelled out from under the broker request and the
+      daemon could never say whether the broker applied it.
+    """
+    if not _begin_submission():
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        _end_submission()
+
+
 async def _submit_normalized_discord_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -3570,6 +3656,81 @@ async def _prepare_claim_and_submit_signal(
             )
             return SUBMIT_OUTCOME_REFUSED
 
+    # Shutdown gate + in-flight registration happen in one synchronous step, so
+    # a signal either is refused here or is counted as in flight before any
+    # await: the shutdown drain can never miss an order that is about to be sent.
+    if not _begin_submission():
+        if is_exit:
+            # A dropped exit leaves this deployment's position open, exactly like
+            # every other refused exit (#121): an operator has to look at it, so
+            # it is an error, not a skipped signal.
+            logger.error(
+                "Exit signal refused before submission: the daemon is shutting "
+                "down; nothing was sent to the broker and the position stays open",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "action": live_signal.action,
+                        "is_exit": True,
+                    }
+                },
+            )
+        else:
+            logger.warning(
+                f"Skipping {source_label.lower()} signal: daemon is shutting "
+                "down; nothing was sent to the broker",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                        "is_exit": False,
+                    }
+                },
+            )
+        if decision is not None:
+            decision.refused("shutdown_requested")
+        return SUBMIT_OUTCOME_REFUSED
+    try:
+        return await _claim_and_submit_prepared_signal(
+            account_id,
+            adapter,
+            deployment,
+            normalized_signal,
+            live_signal,
+            prepared_signal,
+            prepared_qty,
+            is_exit=is_exit,
+            decision=decision,
+            source_label=source_label,
+        )
+    finally:
+        _end_submission()
+
+
+async def _claim_and_submit_prepared_signal(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    normalized_signal: TradeSignal,
+    live_signal: LiveSignal,
+    prepared_signal: LiveSignal,
+    prepared_qty: float,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    source_label: str,
+) -> str:
+    """Claim the submission lease and submit the prepared order.
+
+    Split out of :func:`_prepare_claim_and_submit_signal` so the shutdown gate
+    (``_begin_submission``/``_end_submission``) wraps exactly the section that
+    can reach the broker: the claim, the post-claim halt re-check and the
+    ``adapter.submit_order`` call. Everything before it is sizing and
+    validation, which the drain does not need to wait for.
+    """
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
     # deployment, and the reconciler can halt entries. The claim turns "still
@@ -3789,6 +3950,7 @@ async def _prepare_claim_and_submit_signal(
             ),
         )
     return SUBMIT_OUTCOME_SUBMITTED
+
 
 
 def _deployment_accepts_signal_author(
@@ -4364,10 +4526,16 @@ async def _disconnect_adapter(
     *,
     account_id: str,
     reason: str,
-) -> None:
+) -> bool:
+    """Disconnect one adapter. Returns ``False`` if the disconnect failed.
+
+    A failure is logged here and reported to the caller: the deployment sync
+    path only wants the log, while the shutdown counts it as a failed phase (a
+    session that did not close is not a clean stop).
+    """
     disconnect_method = getattr(adapter, "disconnect", None)
     if not callable(disconnect_method):
-        return
+        return True
     try:
         result = disconnect_method()
         if inspect.isawaitable(result):
@@ -4384,6 +4552,8 @@ async def _disconnect_adapter(
                 }
             },
         )
+        return False
+    return True
 
 
 async def _disconnect_inactive_adapters(
@@ -5583,6 +5753,14 @@ async def _enforce_stopped_deployments(
     because leaving positions open is worse than leaving an order resting. It
     does gate the stamp.
 
+    The whole enforcement runs under one ``_broker_mutation`` registration, so
+    a signal that lands between its broker calls does not drop the ones that
+    follow: the drain waits for the rest (a cancel without the flatten leaves
+    the positions open with nothing resting, and a flatten without the orphaned-
+    protection sweep leaves detached stops resting, where a triggered stop with
+    nothing to sell opens a short). A signal that lands before the enforcement
+    starts refuses all of it, and the next tick or daemon start retries.
+
     The stamp is also withheld while the cancel sweep reports ids still in the
     broker's ``pending_cancel`` state (``ControlOutcome.pending_cancel``): such an
     order can still fill in a cancel/fill race, so the pass logs a WARNING naming
@@ -5691,259 +5869,308 @@ async def _enforce_stopped_deployments(
                 )
             continue
 
-        cancel_error: Exception | None = None
-        try:
-            cancelled = (
-                await adapter.cancel_open_orders()
-                if adapter.supports_cancel_orders
-                else None
-            )
-        except NotImplementedError:
-            cancelled = None
-        except Exception as exc:  # except-kind: money-decision
-            # Still flatten. The cancel failing says nothing about whether the
-            # positions can be closed - the Alpaca flatten cancels its own
-            # per-symbol orders - and leaving exposure open to protect a
-            # cosmetic ordering rule is the wrong trade.
-            cancelled = None
-            cancel_error = exc
-            logger.error(
-                "Failed to cancel open orders for stopped deployment; flattening "
-                "anyway",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
+        # A STOPPED enforcement is broker work: the shutdown drain waits for one
+        # that is running (``_broker_mutation``) and none may start once the stop
+        # flag is set. The registration covers the WHOLE enforcement - the order
+        # cancel, the flatten and the orphaned-protection sweep - because a signal
+        # that lands between them must not drop the rest: a cancel without the
+        # flatten leaves the positions open with nothing resting, and a flatten
+        # without the sweep leaves the protections it detached resting, where a
+        # triggered stop with nothing to sell opens a short. Refusing the whole
+        # enforcement leaves the deployment unenforced, so the next tick - or the
+        # next daemon start - retries it.
+        async with _broker_mutation() as may_enforce:
+            if not may_enforce:
+                logger.warning(
+                    "Skipping the STOPPED enforcement sweep: the daemon is "
+                    "shutting down; the deployment stays unenforced and the "
+                    "cancel/flatten is retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                        }
+                    },
+                )
+                continue
+            if not await _enforce_one_stopped_deployment(deployment, adapter):
+                continue
+            already_enforced.add(deployment_id)
 
-        # A partial cancel must not stop the flatten: closing the positions is
-        # the money-safety action, and the remaining order is retried on the
-        # next tick. It does, however, prevent the enforced stamp - the account
-        # may still have something resting.
-        cancel_ok = cancelled is not None and cancelled.complete
-        if cancel_error is not None:
-            pass  # already logged above
-        elif cancelled is None:
-            logger.error(
-                "Adapter cannot cancel orders; flattening anyway and keeping the "
-                "deployment unenforced",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "adapter": type(adapter).__name__,
-                    }
-                },
-            )
-        elif not cancel_ok:
-            logger.error(
-                "Order cancel was incomplete for stopped deployment; flattening "
-                "anyway and retrying the cancel: %s",
-                cancelled.describe(),
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                    }
-                },
-            )
 
-        try:
-            flattened = (
-                await adapter.close_all_positions() if adapter.supports_flatten else None
-            )
-        except NotImplementedError:
-            flattened = None
-        except Exception as exc:  # except-kind: money-decision
-            logger.error(
-                "Failed to flatten positions for stopped deployment",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
-            continue
+async def _enforce_one_stopped_deployment(
+    deployment: LiveDeploymentConfig,
+    adapter: BaseLiveAdapter,
+) -> bool:
+    """Cancel, flatten and sweep one STOPPED deployment, then record it.
 
-        if flattened is None:
-            logger.error(
-                "Adapter cannot flatten positions; stopped deployment is NOT flat",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "adapter": type(adapter).__name__,
-                    }
-                },
-            )
-            continue
-        if not flattened.complete:
-            logger.error(
-                "Flatten was incomplete for stopped deployment; keeping it "
-                "unenforced and retrying: %s",
-                flattened.describe(),
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                    }
-                },
-            )
-            continue
+    The caller holds one ``_broker_mutation`` registration across the whole
+    enforcement, so it runs as a unit: a signal that lands between the broker
+    calls may not drop the rest. A cancel without the flatten leaves the
+    positions open with nothing resting, and a flatten without the orphaned-
+    protection sweep leaves the protections it detached resting, where a
+    triggered stop with nothing to sell opens a short.
 
-        # The account is flat. Sweep the protections the flatten detached.
-        # This is not merely cosmetic: a stop that outlived its position can
-        # still trigger, and a triggered sell-stop with nothing to sell opens a
-        # short. So a sweep that *failed* keeps the deployment unenforced and
-        # retries; only an adapter that has no such concept may stamp without
-        # one.
-        orphan_sweep_unsupported = False
-        try:
-            orphaned = await adapter.cancel_orphaned_protections()
-        except NotImplementedError:
-            orphaned = None
-            orphan_sweep_unsupported = True
-        except Exception as exc:  # except-kind: money-decision
-            logger.error(
-                "Failed to sweep protections orphaned by the flatten; the account "
-                "is flat but a resting protection could still trigger",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "error": repr(exc),
-                    }
-                },
-            )
-            orphaned = None
-        if orphan_sweep_unsupported:
-            logger.warning(
-                "Adapter cannot identify orphaned protections; the account is flat "
-                "but protection orders may still be listed by the broker",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "adapter": type(adapter).__name__,
-                    }
-                },
-            )
-        elif orphaned is not None and not orphaned.complete:
-            logger.error(
-                "Orphaned-protection sweep was incomplete; the account is flat but "
-                "protections may still be resting: %s",
-                orphaned.describe(),
-                extra={"data": {"deployment_id": deployment_id}},
-            )
-
-        # Every sweep must be complete before the deployment counts as
-        # enforced. The account is flat either way - the money-safety part is
-        # done - but a surviving order means the next tick must try again.
-        if not cancel_ok:
-            logger.error(
-                "Not recording STOPPED enforcement: the order cancel did not "
-                "complete, so orders may still be resting. Retrying next tick: %s",
-                (
-                    cancelled.describe()
-                    if cancelled is not None
-                    else (
-                        f"cancel failed: {cancel_error!r}"
-                        if cancel_error is not None
-                        else "adapter cannot cancel open orders"
-                    )
-                ),
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                    }
-                },
-            )
-            continue
-        # ``not cancel_ok`` continued above, and ``cancel_ok`` is
-        # ``cancelled is not None and cancelled.complete``: the outcome is
-        # non-None here. mypy cannot follow that conjunction through the
-        # ``continue``.
-        if cancelled.pending_cancel:  # type: ignore[union-attr]
-            passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
-            _PENDING_CANCEL_PASSES[deployment_id] = passes
-            log = (
-                logger.error
-                if passes >= PENDING_CANCEL_ESCALATION_PASSES
-                else logger.warning
-            )
-            log(
-                "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
-                "and may yet fill (pass %d). Retrying next tick",
-                sorted(cancelled.pending_cancel),  # type: ignore[union-attr]  # non-None per cancel_ok
-                passes,
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                        "pending_cancel": sorted(cancelled.pending_cancel),  # type: ignore[union-attr]  # non-None per cancel_ok
-                        "passes": passes,
-                    }
-                },
-            )
-            continue
-        _PENDING_CANCEL_PASSES.pop(deployment_id, None)
-        if not orphan_sweep_unsupported and (
-            orphaned is None or not orphaned.complete
-        ):
-            logger.error(
-                "Not recording STOPPED enforcement: the orphaned-protection sweep "
-                "did not complete. Retrying next tick",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                    }
-                },
-            )
-            continue
-
-        try:
-            stamped = await asyncio.to_thread(
-                mark_live_deployment_stopped_enforced, deployment_id
-            )
-        except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
-            logger.warning(
-                "Could not record STOPPED enforcement for a deployment; retrying next tick",
-                extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
-            )
-            continue
-        if not stamped:
-            # Refused by the database: the deployment left STOPPED, or a submission
-            # lease (live or expired-but-unreleased) says an order may still fill.
-            # Either way the sweep does not count yet; the next tick runs it again.
-            logger.warning(
-                "Not recording STOPPED enforcement: the deployment is no longer STOPPED "
-                "or a submission lease is outstanding, so an in-flight order could still "
-                "fill. Retrying next tick",
-                extra={
-                    "data": {
-                        "deployment_id": deployment_id,
-                        "account_id": deployment.account_id,
-                    }
-                },
-            )
-            continue
-        already_enforced.add(deployment_id)
-        logger.warning(
-            "Enforced STOPPED deployment: orders cancelled and positions flattened",
+    Returns ``True`` only when the deployment was stamped as enforced; every
+    other outcome leaves it unenforced for the next pass to retry.
+    """
+    deployment_id = str(deployment.id)
+    cancel_error: Exception | None = None
+    try:
+        cancelled = (
+            await adapter.cancel_open_orders()
+            if adapter.supports_cancel_orders
+            else None
+        )
+    except NotImplementedError:
+        cancelled = None
+    except Exception as exc:  # except-kind: money-decision
+        # Still flatten. The cancel failing says nothing about whether the
+        # positions can be closed - the Alpaca flatten cancels its own
+        # per-symbol orders - and leaving exposure open to protect a
+        # cosmetic ordering rule is the wrong trade.
+        cancelled = None
+        cancel_error = exc
+        logger.error(
+            "Failed to cancel open orders for stopped deployment; flattening "
+            "anyway",
             extra={
                 "data": {
                     "deployment_id": deployment_id,
                     "account_id": deployment.account_id,
-                    "cancelled": cancelled.describe(),  # type: ignore[union-attr]  # non-None per cancel_ok
-                    "flattened": flattened.describe(),
+                    "error": repr(exc),
                 }
             },
         )
 
+    # A partial cancel must not stop the flatten: closing the positions is
+    # the money-safety action, and the remaining order is retried on the
+    # next tick. It does, however, prevent the enforced stamp - the account
+    # may still have something resting.
+    cancel_ok = cancelled is not None and cancelled.complete
+    if cancel_error is not None:
+        pass  # already logged above
+    elif cancelled is None:
+        logger.error(
+            "Adapter cannot cancel orders; flattening anyway and keeping the "
+            "deployment unenforced",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "adapter": type(adapter).__name__,
+                }
+            },
+        )
+    elif not cancel_ok:
+        logger.error(
+            "Order cancel was incomplete for stopped deployment; flattening "
+            "anyway and retrying the cancel: %s",
+            cancelled.describe(),
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                }
+            },
+        )
+
+    try:
+        flattened = (
+            await adapter.close_all_positions() if adapter.supports_flatten else None
+        )
+    except NotImplementedError:
+        flattened = None
+    except Exception as exc:  # except-kind: money-decision
+        logger.error(
+            "Failed to flatten positions for stopped deployment",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                    "error": repr(exc),
+                }
+            },
+        )
+        return False
+
+    if flattened is None:
+        logger.error(
+            "Adapter cannot flatten positions; stopped deployment is NOT flat",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "adapter": type(adapter).__name__,
+                }
+            },
+        )
+        return False
+    if not flattened.complete:
+        logger.error(
+            "Flatten was incomplete for stopped deployment; keeping it "
+            "unenforced and retrying: %s",
+            flattened.describe(),
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                }
+            },
+        )
+        return False
+
+    # The account is flat. Sweep the protections the flatten detached.
+    # This is not merely cosmetic: a stop that outlived its position can
+    # still trigger, and a triggered sell-stop with nothing to sell opens a
+    # short. So a sweep that *failed* keeps the deployment unenforced and
+    # retries; only an adapter that has no such concept may stamp without
+    # one.
+    orphan_sweep_unsupported = False
+    try:
+        orphaned = await adapter.cancel_orphaned_protections()
+    except NotImplementedError:
+        orphaned = None
+        orphan_sweep_unsupported = True
+    except Exception as exc:  # except-kind: money-decision
+        logger.error(
+            "Failed to sweep protections orphaned by the flatten; the account "
+            "is flat but a resting protection could still trigger",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                    "error": repr(exc),
+                }
+            },
+        )
+        orphaned = None
+    if orphan_sweep_unsupported:
+        logger.warning(
+            "Adapter cannot identify orphaned protections; the account is flat "
+            "but protection orders may still be listed by the broker",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "adapter": type(adapter).__name__,
+                }
+            },
+        )
+    elif orphaned is not None and not orphaned.complete:
+        logger.error(
+            "Orphaned-protection sweep was incomplete; the account is flat but "
+            "protections may still be resting: %s",
+            orphaned.describe(),
+            extra={"data": {"deployment_id": deployment_id}},
+        )
+
+    # Every sweep must be complete before the deployment counts as
+    # enforced. The account is flat either way - the money-safety part is
+    # done - but a surviving order means the next tick must try again.
+    if not cancel_ok:
+        logger.error(
+            "Not recording STOPPED enforcement: the order cancel did not "
+            "complete, so orders may still be resting. Retrying next tick: %s",
+            (
+                cancelled.describe()
+                if cancelled is not None
+                else (
+                    f"cancel failed: {cancel_error!r}"
+                    if cancel_error is not None
+                    else "adapter cannot cancel open orders"
+                )
+            ),
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                }
+            },
+        )
+        return False
+    # Narrow the outcome before it is read below. ``cancel_ok`` is a bool, so the
+    # checker cannot see that the branch above returned for every case where
+    # ``cancelled`` is ``None`` (no outcome, a raised cancel or an adapter that
+    # cannot cancel orders); stating it keeps the union resolved by types rather
+    # than by an ignore, and answers the money path the safe way - an outcome
+    # that is not there cannot be stamped as enforced.
+    if cancelled is None:  # pragma: no cover - defensive: cancel_ok returned above
+        return False
+    if cancelled.pending_cancel:
+        passes = _PENDING_CANCEL_PASSES.get(deployment_id, 0) + 1
+        _PENDING_CANCEL_PASSES[deployment_id] = passes
+        log = (
+            logger.error
+            if passes >= PENDING_CANCEL_ESCALATION_PASSES
+            else logger.warning
+        )
+        log(
+            "Not recording STOPPED enforcement: order(s) %s still pending_cancel "
+            "and may yet fill (pass %d). Retrying next tick",
+            sorted(cancelled.pending_cancel),
+            passes,
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                    "pending_cancel": sorted(cancelled.pending_cancel),
+                    "passes": passes,
+                }
+            },
+        )
+        return False
+    _PENDING_CANCEL_PASSES.pop(deployment_id, None)
+    if not orphan_sweep_unsupported and (
+        orphaned is None or not orphaned.complete
+    ):
+        logger.error(
+            "Not recording STOPPED enforcement: the orphaned-protection sweep "
+            "did not complete. Retrying next tick",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                }
+            },
+        )
+        return False
+
+    try:
+        stamped = await asyncio.to_thread(
+            mark_live_deployment_stopped_enforced, deployment_id
+        )
+    except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
+        logger.warning(
+            "Could not record STOPPED enforcement for a deployment; retrying next tick",
+            extra={"data": {"deployment_id": deployment_id, "error": repr(exc)}},
+        )
+        return False
+    if not stamped:
+        # Refused by the database: the deployment left STOPPED, or a submission
+        # lease (live or expired-but-unreleased) says an order may still fill.
+        # Either way the sweep does not count yet; the next tick runs it again.
+        logger.warning(
+            "Not recording STOPPED enforcement: the deployment is no longer STOPPED "
+            "or a submission lease is outstanding, so an in-flight order could still "
+            "fill. Retrying next tick",
+            extra={
+                "data": {
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.account_id,
+                }
+            },
+        )
+        return False
+    logger.warning(
+        "Enforced STOPPED deployment: orders cancelled and positions flattened",
+        extra={
+            "data": {
+                "deployment_id": deployment_id,
+                "account_id": deployment.account_id,
+                "cancelled": cancelled.describe(),
+                "flattened": flattened.describe(),
+            }
+        },
+    )
+    return True
 
 async def _load_db_accounts_and_deployments(
 ) -> tuple[list[LiveAccountConfig], list[LiveDeploymentConfig]]:
@@ -6350,6 +6577,19 @@ async def sync_deployments_loop(
     halt_state = read_kill_switch_state()
     while True:
         try:
+            # Once the stop flag is set for this loop the shutdown drain owns
+            # every broker mutation and the cleanup phases own every adapter
+            # and task: a tick from here could only start what both are trying
+            # to stop - a new adapter connect, a listener or Discord task, an
+            # enforcement sweep the mutation gate would refuse a moment later.
+            # ``requested_on`` ties the flag to THIS loop: the coordinator is
+            # process-wide and its ``requested`` stays set after a run until
+            # the next ``bind``, so a stale flag from a finished run must not
+            # idle this loop forever. Sleep through the drain instead; the
+            # flag cannot be cleared, so there is nothing left to reconcile.
+            if _ACTIVE_SHUTDOWN.requested_on(asyncio.get_running_loop()):
+                await asyncio.sleep(interval_seconds)
+                continue
             # Read credential file directly without repeatedly mutating process env.
             current_mtime = _accounts_env_mtime(accounts_env)
             if current_mtime != accounts_env_mtime:
@@ -6464,6 +6704,10 @@ async def sync_deployments_loop(
                 active_adapters,
                 halt_enforcement_account_ids | retained_account_ids | set(active_adapters),
                 state=halt_state,
+                # A sweep is broker work like the STOPPED enforcement above:
+                # the drain waits for one already running and none may start
+                # once the stop flag is set.
+                mutation_gate=_broker_mutation,
             )
             if kill_switch_report.modes:
                 logger.warning(
@@ -6493,13 +6737,295 @@ async def sync_deployments_loop(
         await asyncio.sleep(interval_seconds)
 
 
-#: How long the daemon waits for its own worker threads to finish joining before it stops waiting
-#: for them. The join covers ``asyncio.to_thread`` bodies - the startup discovery's database reads
-#: and writes, and a loop iteration's own - which normally finish in milliseconds. One still running
-#: after this budget is inside a call that is not coming back (a broker stream thread whose socket
-#: never closes), and a process that trades nothing must not wait for it while holding the
-#: single-instance lock.
-WORKER_JOIN_TIMEOUT_SECONDS = 30.0
+async def _bounded(awaitable: Awaitable[object], *, timeout: float, phase: str) -> bool:
+    """Run one cleanup phase with a deadline; never raises. False = failed/timed out.
+
+    The phase runs as its own task and the deadline is a bounded ``wait`` on it,
+    not an ``asyncio.timeout`` around the ``await``: a coroutine that swallows the
+    cancellation the timeout delivers would otherwise keep the cleanup - and with
+    it the exit code - waiting past the documented budget. A phase still running
+    at the deadline is cancelled and abandoned, and its eventual outcome is
+    retrieved so it cannot surface as a stray "never retrieved" warning.
+    """
+    task = asyncio.ensure_future(awaitable)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        task.add_done_callback(lambda finished: _retrieve_abandoned_phase(finished, phase))
+        logger.error(
+            "Shutdown phase timed out",
+            extra={"data": {"phase": phase, "timeout_seconds": timeout}},
+        )
+        return False
+    if task.cancelled():
+        logger.error("Shutdown phase was cancelled", extra={"data": {"phase": phase}})
+        return False
+    error = task.exception()
+    if error is None:
+        return True
+    if isinstance(error, TimeoutError):
+        # The phase bounded its own wait and reported the timeout (this is what
+        # ``_cancel_and_wait`` and the bounded reactor release do), so it is
+        # recorded as a timeout rather than as a crash.
+        logger.error(
+            "Shutdown phase timed out",
+            extra={"data": {"phase": phase, "timeout_seconds": timeout}},
+        )
+        return False
+    logger.error(
+        "Shutdown phase failed",
+        extra={"data": {"phase": phase, "error": str(error)}},
+        exc_info=error,
+    )
+    return False
+
+
+def _retrieve_abandoned_phase(task: asyncio.Task[object], phase: str) -> None:
+    """Retrieve an abandoned phase's outcome; never let it escape silently."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error(
+            "An abandoned shutdown phase ended with an error",
+            extra={"data": {"phase": phase, "error": str(error)}},
+            exc_info=error,
+        )
+
+
+async def _cancel_and_wait(tasks: Iterable[asyncio.Task[None]], *, timeout: float) -> None:
+    """Cancel every task and wait for the cancels, at most ``timeout``.
+
+    The wait must carry its own deadline: ``asyncio.gather`` cannot be timed out
+    from outside. A task that ignores its cancellation keeps the gather - and the
+    coroutine awaiting it - alive, so a deadline put on *this* wait never fires.
+    That is exactly the unbounded cleanup the shutdown budget rules out, so the
+    deadline lives in the wait itself: what is still unfinished at the end gets a
+    second cancel and is reported with ``TimeoutError``, which the caller records
+    as a timed-out phase.
+
+    Nothing here sends broker work: the tasks are cancelled, so whatever they
+    were doing stops (a broker request already in flight is drained before this
+    phase, and none can start after the stop flag).
+    """
+    pending = [task for task in tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if not pending:
+        return
+    done, unfinished = await asyncio.wait(pending, timeout=timeout)
+    failures: list[BaseException] = []
+    for task in done:
+        # Retrieve whatever ended the task so a crashed loop is not an unretrieved
+        # exception at interpreter shutdown. A task that was cancelled ends
+        # cancelled, which is not reported.
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            logger.error("A task ended with an error during shutdown", exc_info=error)
+            failures.append(error)
+    for task in unfinished:
+        # A second cancel: the first was ignored, and this phase is over.
+        task.cancel()
+    if unfinished:
+        raise TimeoutError(f"{len(unfinished)} task(s) did not finish after being cancelled")
+    if failures:
+        # A loop or listener that ended in an error while it was being cancelled
+        # did not stop cleanly, so the shutdown must not report a clean exit.
+        raise failures[0]
+
+
+async def _shutdown_cleanup(
+    *,
+    loop_tasks: tuple[asyncio.Task[None], ...],
+    active_listener_tasks: dict[str, asyncio.Task[None]],
+    active_discord_tasks: dict[str, asyncio.Task[None]],
+    active_discord_bot_tasks: dict[str, asyncio.Task[None]],
+    active_discord_bots: dict[str, DiscordSignalSource],
+    active_adapters: dict[str, BaseLiveAdapter],
+    scheduler: ServiceScheduler,
+    shutdown: ShutdownCoordinator,
+    drain_timeout: float,
+    cleanup_timeout: float,
+) -> bool:
+    """Bounded shutdown sequence. Returns True when every phase completed in time.
+
+    The drain comes first and covers every kind of in-flight broker work (an
+    order submission, a stop amendment, a stopped-deployment sweep, a
+    kill-switch sweep): cancelling any of them mid-request would leave the
+    broker outcome unknown. Only after it is anything cancelled, and by then
+    no broker request can be started.
+
+    The drain and every one of the ``live_runner.shutdown.CLEANUP_PHASE_COUNT``
+    phases below has its own deadline (``drain_timeout`` / ``cleanup_timeout``),
+    so a shutdown always finishes inside the worst case the runbook documents -
+    including here: a phase that neither completes nor is cancelled is reported
+    and abandoned, never waited for. One phase that overran makes the run report
+    ``False`` and the daemon exit ``EXIT_CLEANUP_TIMEOUT``.
+
+    SAFETY: this only stops the daemon and closes its own connections. It must
+    never cancel or close broker orders or positions (no ``close_all_positions``,
+    ``cancel_open_orders`` or equivalent): they belong to the strategy exits and
+    the operator, and a restart must find the account as it was left. The only
+    broker mutations a shutdown lets run are ones the daemon had already started
+    before the stop flag - and it lets them finish.
+    """
+    ok = True
+    # 1. Let the broker work that is already in flight finish: an order
+    #    submission a listener task owns, a trailing-stop amendment, a stopped
+    #    deployment's cancel/flatten sweep, a kill-switch sweep. All of them
+    #    register on the
+    #    coordinator's in-flight ledger, so the drain waits for them here -
+    #    before anything is cancelled. Cancelling one of them would leave the
+    #    broker outcome unknown. Nothing new can start meanwhile: the stop flag
+    #    is set before this runs and the gate refuses new broker work, so the
+    #    ledger can only shrink.
+    if not await shutdown.wait_idle(drain_timeout):
+        ok = False
+        logger.error(
+            "Shutdown timed out waiting for in-flight broker work (order "
+            "submissions, stop amendments, stopped-deployment and kill-switch "
+            "sweeps); their broker outcome is unknown and needs reconciliation",
+            extra={
+                "data": {
+                    "in_flight": shutdown.inflight,
+                    "timeout_seconds": drain_timeout,
+                }
+            },
+        )
+
+    # 2. (cancel_loops) Stop the loops that would start new adapters/listeners or
+    #    poll balances. Every broker mutation they could run is either finished
+    #    or refused by the gate, so cancelling them starts no broker request.
+    #    Bounded like any other phase: a loop task that ignores its first cancel
+    #    must not hold the shutdown - and with it the exit code - open.
+    #    ``_bounded`` keeps the other phases' contract; the wait inside
+    #    ``_cancel_and_wait`` is what actually bounds this one, because a gather
+    #    cannot be timed out from outside.
+    ok &= await _bounded(
+        _cancel_and_wait(loop_tasks, timeout=cleanup_timeout),
+        timeout=cleanup_timeout,
+        phase="cancel_loops",
+    )
+
+    # 3. (cancel_listeners) Stop listening for signals / executions.
+    ok &= await _bounded(
+        _cancel_and_wait(
+            [
+                *active_listener_tasks.values(),
+                *active_discord_tasks.values(),
+                *active_discord_bot_tasks.values(),
+            ],
+            timeout=cleanup_timeout,
+        ),
+        timeout=cleanup_timeout,
+        phase="cancel_listeners",
+    )
+
+    # 4. (disconnect_discord, stop_scheduler, disconnect_adapters) Close signal
+    #    sources, the scheduler, and every broker connection.
+    async def _close_discord_sources() -> None:
+        failures: list[Exception] = []
+        for source in list(active_discord_bots.values()):
+            try:
+                await source.disconnect(failed=False)
+            except Exception as exc:  # except-kind: loop-survival - one bot must not skip others
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+
+    ok &= await _bounded(
+        _close_discord_sources(), timeout=cleanup_timeout, phase="disconnect_discord"
+    )
+    ok &= await _bounded(scheduler.stop(), timeout=cleanup_timeout, phase="stop_scheduler")
+
+    async def _disconnect_all_adapters() -> None:
+        # Disconnect only: closes the daemon's own sessions. Orders and
+        # positions at the broker are left untouched. Concurrently and under the
+        # one phase deadline: disconnecting one account after another meant a
+        # single slow session spent the whole budget and left the rest connected.
+        # The dict is cleared first so a timeout cannot make the caller think the
+        # adapters are still live.
+        adapters = list(active_adapters.items())
+        active_adapters.clear()
+        results = await asyncio.gather(
+            *(
+                _disconnect_adapter(adapter, account_id=account_id, reason="shutdown")
+                for account_id, adapter in adapters
+            ),
+            return_exceptions=True,
+        )
+        # ``strict=True``: the gather returns one result per adapter, so a
+        # mismatch is a bug, not a length to tolerate silently.
+        for (account_id, adapter), result in zip(adapters, results, strict=True):
+            if isinstance(result, BaseException):
+                raise RuntimeError(
+                    f"adapter disconnect failed for account {account_id} "
+                    f"({type(adapter).__name__}): {result}"
+                ) from result
+            if result is False:
+                raise RuntimeError(
+                    f"adapter disconnect failed for account {account_id} "
+                    f"({type(adapter).__name__})"
+                )
+
+    ok &= await _bounded(
+        _disconnect_all_adapters(), timeout=cleanup_timeout, phase="disconnect_adapters"
+    )
+
+    # 6. (close_archive) Flush the raw-signal archive: records still queued by
+    #    the just-cancelled listeners must reach disk before exit. Off the
+    #    event loop: close() joins the writer thread, so it runs under the same
+    #    bounded phase as everything else. Best-effort like the daemon's own
+    #    shutdown: a failed flush is logged, never fatal to the exit code.
+    async def _close_signal_archive() -> None:
+        try:
+            await asyncio.to_thread(get_signal_archive().close, timeout=5.0)
+        except Exception:  # except-kind: loop-survival
+            logger.warning(
+                "Signal archive close failed during shutdown",
+                exc_info=True,
+            )
+
+    ok &= await _bounded(
+        _close_signal_archive(), timeout=cleanup_timeout, phase="close_archive"
+    )
+
+    # 7. (release_reactor) Release the Twisted reactor's thread pool (cTrader) so
+    #    the process can exit. It is a cleanup phase like the others, because it
+    #    is the one that can block for good: the reactor's shutdown never fires
+    #    here, so the release joins workers that may sit in a stuck broker
+    #    request. It runs off the loop under the same deadline, so a release that
+    #    does not come back is reported as a failed phase instead of hanging the
+    #    daemon in front of its exit code. The abandonment is recorded as well:
+    #    the pool's workers are non-daemon threads, which is one of the reasons
+    #    ``main`` leaves the process immediately instead of letting the
+    #    interpreter finish.
+    if not await _bounded(
+        release_twisted_reactor_threads_bounded(cleanup_timeout),
+        timeout=cleanup_timeout,
+        phase="release_reactor",
+    ):
+        shutdown.note_abandoned_reactor_release()
+        ok = False
+    return ok
+
+
+async def _start_daemon_services(
+    scheduler: ServiceScheduler, accounts_env: Path | str | None
+) -> None:
+    """The startup work that runs before the daemon's loops exist.
+
+    Kept as one coroutine so ``run_daemon`` can race it against the shutdown
+    waiter: a signal during startup must stop the daemon starting services, not
+    be noticed only after the last startup await returned.
+    """
+    await asyncio.to_thread(
+        _discover_and_register_discord_services, accounts_env, log_summary=True
+    )
+    await asyncio.to_thread(_recover_failed_services)
+    await scheduler.start()
 
 
 class WorkerJoinTimeout(RuntimeError):
@@ -6590,12 +7116,35 @@ def _start_balance_poller(
 async def _run_daemon_locked(
     *,
     accounts_env: Path | str | None = None,
-) -> None:
-    """The daemon's body; it runs only while this process holds the single-instance lock (#310)."""
+    shutdown: ShutdownCoordinator | None = None,
+    install_signal_handlers: bool = True,
+    drain_timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+) -> int:
+    """The daemon's body; it runs only while this process holds the single-instance lock (#310).
+
+    Returns the process exit code: ``EXIT_OK`` on a clean shutdown,
+    ``EXIT_CLEANUP_TIMEOUT`` when the drain or a cleanup phase timed out or
+    failed, so a broker outcome may be unknown and needs reconciliation. A
+    crash re-raises after the bounded cleanup ran.
+    """
     accounts_env = _accounts_env_file(accounts_env)
+    shutdown = shutdown if shutdown is not None else _SHUTDOWN
+    global _ACTIVE_SHUTDOWN
+    # The submission gate must follow the coordinator this run drains on.
+    _ACTIVE_SHUTDOWN = shutdown
+    shutdown.bind(asyncio.get_running_loop())
+    installed_signals: list[str] = []
+    if install_signal_handlers:
+        installed_signals = shutdown.install_signal_handlers()
     logger.info(
         "Starting live daemon",
-        extra={"data": {"accounts_env": str(accounts_env)}},
+        extra={
+            "data": {
+                "accounts_env": str(accounts_env),
+                "shutdown_signals": installed_signals,
+            }
+        },
     )
     # The loss breaker resolves LOSS_BREAKER_* env file-first through the same
     # accounts file the daemon was started with; without this a per-account
@@ -6607,89 +7156,126 @@ async def _run_daemon_locked(
     active_discord_bots: dict[str, DiscordSignalSource] = {}
     active_discord_bot_tasks: dict[str, asyncio.Task[None]] = {}
     scheduler = ServiceScheduler()
+    loop_tasks: tuple[asyncio.Task[None], ...] = ()
+    stop_waiter: asyncio.Task[None] | None = None
+    cleanup_ok = True
+    startup_phase = True
 
+    deployment_snapshot: list[LiveDeploymentConfig] = []
     try:
-        await asyncio.to_thread(
-            _discover_and_register_discord_services, accounts_env, log_summary=True
+        # The shutdown waiter is created first so a signal that lands during
+        # startup is acted on immediately: the startup work runs as its own task
+        # and is cancelled, instead of the daemon finishing an unbounded start
+        # before it notices the flag. (A startup thread already running cannot be
+        # interrupted; the second signal's forced exit covers that.)
+        stop_waiter = asyncio.create_task(shutdown.wait(), name="shutdown-waiter")
+        startup_task = asyncio.create_task(
+            _start_daemon_services(scheduler, accounts_env), name="daemon-startup"
         )
-        await asyncio.to_thread(_recover_failed_services)
-        await scheduler.start()
+        started, _ = await asyncio.wait(
+            {startup_task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if startup_task in started:
+            startup_task.result()  # re-raise a startup crash
+        else:
+            startup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await startup_task
 
-        deployment_snapshot: list[LiveDeploymentConfig] = []
-        first_sync_complete = asyncio.Event()
-        sync_task = asyncio.create_task(
-            sync_deployments_loop(
-                active_adapters,
-                active_listener_tasks,
-                active_discord_tasks,
-                accounts_env=accounts_env,
-                deployment_snapshot=deployment_snapshot,
-                first_sync_complete=first_sync_complete,
-            ),
-            name="deployment-sync-loop",
-        )
-        service_sync_task = asyncio.create_task(
-            sync_services_loop(
-                active_discord_bots,
-                active_discord_bot_tasks,
-                scheduler,
-                accounts_env=accounts_env,
-            ),
-            name="service-sync-loop",
-        )
-        balance_task = _start_balance_poller(active_adapters, deployment_snapshot)
-        trailing_task = asyncio.create_task(
-            run_trailing_stops_loop(
-                LiveTrailingStopManager(),
-                eligible_adapters=lambda: _trailing_eligible_adapters(
-                    active_adapters
+        if not shutdown.requested:
+            first_sync_complete = asyncio.Event()
+            sync_task = asyncio.create_task(
+                sync_deployments_loop(
+                    active_adapters,
+                    active_listener_tasks,
+                    active_discord_tasks,
+                    accounts_env=accounts_env,
+                    deployment_snapshot=deployment_snapshot,
+                    first_sync_complete=first_sync_complete,
                 ),
-                current_deployments=lambda: list(deployment_snapshot),
-            ),
-            name="trailing-stops-loop",
-        )
-        commission_task = asyncio.create_task(
-            _backfill_commissions_loop(active_adapters), name="commission-backfill"
-        )
-        reconciliation_task = asyncio.create_task(
-            run_broker_reconciliation_loop(
-                active_adapters,
-                current_deployments=lambda: list(deployment_snapshot),
-                deployments_ready=first_sync_complete,
-            ),
-            name="broker-reconciliation",
-        )
-        internal_strategy_task = asyncio.create_task(
-            run_internal_strategy_loop(
-                current_deployments=lambda: list(deployment_snapshot),
-                eligible_adapters=lambda: _trailing_eligible_adapters(
-                    active_adapters
+                name="deployment-sync-loop",
+            )
+            service_sync_task = asyncio.create_task(
+                sync_services_loop(
+                    active_discord_bots,
+                    active_discord_bot_tasks,
+                    scheduler,
+                    accounts_env=accounts_env,
                 ),
-                submit_signal=_submit_internal_strategy_signal,
-            ),
-            name="internal-strategy-loop",
-        )
-    except Exception:  # except-kind: money-decision
-        # A startup failure (broken DB, bad config) propagates out of
-        # asyncio.run as a traceback, not an ERROR record — log one here so
-        # the alert sink can page on the very failure an operator needs.
-        logger.exception("Live daemon failed to start")
-        raise
-    try:
-        await asyncio.gather(
-            sync_task,
-            service_sync_task,
-            balance_task,
-            trailing_task,
-            commission_task,
-            reconciliation_task,
-            internal_strategy_task,
-        )
+                name="service-sync-loop",
+            )
+            balance_task = _start_balance_poller(active_adapters, deployment_snapshot)
+            trailing_task = asyncio.create_task(
+                run_trailing_stops_loop(
+                    # A stop amendment is a broker mutation the shutdown drain must
+                    # wait for, and must not start once the stop flag is set.
+                    LiveTrailingStopManager(mutation_gate=_broker_mutation),
+                    eligible_adapters=lambda: _trailing_eligible_adapters(
+                        active_adapters
+                    ),
+                    current_deployments=lambda: list(deployment_snapshot),
+                ),
+                name="trailing-stops-loop",
+            )
+            commission_task = asyncio.create_task(
+                _backfill_commissions_loop(active_adapters), name="commission-backfill"
+            )
+            reconciliation_task = asyncio.create_task(
+                run_broker_reconciliation_loop(
+                    active_adapters,
+                    current_deployments=lambda: list(deployment_snapshot),
+                    deployments_ready=first_sync_complete,
+                ),
+                name="broker-reconciliation",
+            )
+            internal_strategy_task = asyncio.create_task(
+                run_internal_strategy_loop(
+                    current_deployments=lambda: list(deployment_snapshot),
+                    eligible_adapters=lambda: _trailing_eligible_adapters(
+                        active_adapters
+                    ),
+                    submit_signal=_submit_internal_strategy_signal,
+                ),
+                name="internal-strategy-loop",
+            )
+            loop_tasks = (
+                sync_task,
+                service_sync_task,
+                balance_task,
+                trailing_task,
+                commission_task,
+                reconciliation_task,
+                internal_strategy_task,
+            )
+            startup_phase = False
+
+            pending: set[asyncio.Task[None]] = set(loop_tasks)
+            while pending and not shutdown.requested:
+                done, _ = await asyncio.wait(
+                    {*pending, stop_waiter}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    if task is stop_waiter:
+                        continue
+                    pending.discard(task)
+                    task.result()  # re-raise a crashed loop, exactly like gather did
+        if shutdown.requested:
+            logger.info(
+                "Live daemon shutting down",
+                extra={"data": {"reason": shutdown.reason}},
+            )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
         raise
     except Exception as exc:  # except-kind: money-decision
-        logger.exception("Live daemon crashed")
+        # A startup failure (broken DB, bad config) propagates out of the
+        # process entry as a bounded exit, not an unbounded interpreter
+        # teardown - log one here so the alert sink can page on the very
+        # failure an operator needs. A loop crash after startup gets its own
+        # message: "failed to start" would misreport a daemon that ran.
+        logger.exception(
+            "Live daemon failed to start" if startup_phase else "Live daemon crashed"
+        )
         with contextlib.suppress(Exception):
             capture_exception(
                 exc,
@@ -6698,76 +7284,38 @@ async def _run_daemon_locked(
             )
         raise
     finally:
-        # B2: cancel EVERYTHING (sync + balance loops leaked before) and
-        # await the cancels — fire-and-forget cancel() leaves pending tasks
-        # and "Task was destroyed" warnings behind.
-        for task in (
-            sync_task,
-            service_sync_task,
-            balance_task,
-            trailing_task,
-            commission_task,
-            reconciliation_task,
-            internal_strategy_task,
-        ):
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                sync_task,
-                service_sync_task,
-                balance_task,
-                trailing_task,
-                commission_task,
-                reconciliation_task,
-                internal_strategy_task,
-                return_exceptions=True,
-            )
-        for task in list(active_listener_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(active_discord_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(active_discord_bot_tasks.values()):
-            if not task.done():
-                task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(
-                *list(active_listener_tasks.values()),
-                *list(active_discord_tasks.values()),
-                *list(active_discord_bot_tasks.values()),
-                return_exceptions=True,
-            )
-        for source in list(active_discord_bots.values()):
-            with contextlib.suppress(Exception):
-                await source.disconnect(failed=False)
-        # B1: close the broker sessions too, before the loop's executor is joined. A listener task
-        # that was cancelled above is still blocking a worker thread inside the stream it is
-        # listening on (Alpaca's ``TradingStream.run`` is a blocking call with no asyncio-native
-        # alternative), and cancelling the await never stops that thread: the stream has to be
-        # told to close, or the join in ``run_daemon`` waits for a thread that is never coming
-        # back - a daemon that no longer trades anything while holding the single-instance lock.
-        for account_id, adapter in list(active_adapters.items()):
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    _disconnect_adapter(
-                        adapter, account_id=account_id, reason="daemon_shutdown"
-                    ),
-                    timeout=WORKER_JOIN_TIMEOUT_SECONDS,
-                )
-        # #308: flush the raw-signal archive last — records still queued by
-        # the just-cancelled listeners must reach disk before exit. Off the
-        # event loop: close() joins the writer thread.
-        try:
-            await asyncio.to_thread(get_signal_archive().close, timeout=5.0)
-        except Exception:  # except-kind: loop-survival
-            logger.warning(
-                "Signal archive close failed during shutdown",
-                exc_info=True,
-            )
-        with contextlib.suppress(Exception):
-            await scheduler.stop()
+        # Refuse new submissions on every exit path (crash, cancel, signal).
+        shutdown.request("run_daemon_exit")
+        if shutdown is not _SHUTDOWN:
+            # An injected coordinator gates this run, but ``_ACTIVE_SHUTDOWN``
+            # is restored to the process-wide one below - and whatever reaches
+            # the submission gate after that consults it. Without the same
+            # verdict here a signal that was already refused by this run's
+            # coordinator could slip through the process gate and reach the
+            # broker while the daemon is on its way out. ``bind`` clears the
+            # flag for the next run, so this cannot leak into one.
+            _SHUTDOWN.request("run_daemon_exit")
+        if stop_waiter is not None and not stop_waiter.done():
+            stop_waiter.cancel()
+        cleanup_ok = await _shutdown_cleanup(
+            loop_tasks=loop_tasks,
+            active_listener_tasks=active_listener_tasks,
+            active_discord_tasks=active_discord_tasks,
+            active_discord_bot_tasks=active_discord_bot_tasks,
+            active_discord_bots=active_discord_bots,
+            active_adapters=active_adapters,
+            scheduler=scheduler,
+            shutdown=shutdown,
+            drain_timeout=drain_timeout_seconds,
+            cleanup_timeout=cleanup_timeout_seconds,
+        )
+        shutdown.restore_signal_handlers()
+        # Only after the cleanup has awaited every in-flight submission's
+        # ``_end_submission``: the last submission of this run must still be
+        # accounted on the coordinator this run used, not on the process one.
+        # (``global _ACTIVE_SHUTDOWN`` is declared once at the top of
+        # ``_run_daemon_locked``; Python forbids repeating it after an assignment.)
+        _ACTIVE_SHUTDOWN = _SHUTDOWN
         logger.info(
             "Stopping live daemon",
             extra={
@@ -6775,15 +7323,22 @@ async def _run_daemon_locked(
                     "active_listener_tasks": len(active_listener_tasks),
                     "active_discord_tasks": len(active_discord_tasks),
                     "active_discord_bot_tasks": len(active_discord_bot_tasks),
+                    "cleanup_ok": cleanup_ok,
                 }
             },
         )
+    return EXIT_OK if cleanup_ok else EXIT_CLEANUP_TIMEOUT
 
 
 async def run_daemon(
     *,
     accounts_env: Path | str | None = None,
-) -> None:
+    shutdown: ShutdownCoordinator | None = None,
+    install_signal_handlers: bool = True,
+    drain_timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS,
+    cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+    worker_join_timeout_seconds: float | None = None,
+) -> int:
     """Run the live daemon under the single-instance lock (#310).
 
     The lock is acquired here, before the first database touch and every broker connect (both
@@ -6797,6 +7352,11 @@ async def run_daemon(
     inside ``WORKER_JOIN_TIMEOUT_SECONDS``, the process keeps the lock and the OS releases it on
     death. Joining shuts the loop's default executor down - as :func:`asyncio.run` does at exit
     anyway - so an embedder must give each daemon run its own event loop.
+
+    Returns the exit code ``_run_daemon_locked`` reports: ``EXIT_OK`` or
+    ``EXIT_CLEANUP_TIMEOUT``. SIGINT/SIGTERM are handled by the shutdown
+    coordinator inside ``_run_daemon_locked`` (unless ``install_signal_handlers``
+    is false, e.g. in tests that drive the coordinator directly).
     """
     # Ops alert channel (#304): ERROR records and explicit `alert=` records are
     # pushed to OPS_ALERT_WEBHOOK_URL when configured; unset disables it and the
@@ -6818,7 +7378,13 @@ async def run_daemon(
             )
             raise
         try:
-            await _run_daemon_locked(accounts_env=accounts_env)
+            exit_code = await _run_daemon_locked(
+                accounts_env=accounts_env,
+                shutdown=shutdown,
+                install_signal_handlers=install_signal_handlers,
+                drain_timeout_seconds=drain_timeout_seconds,
+                cleanup_timeout_seconds=cleanup_timeout_seconds,
+            )
         finally:
             joined = True
             try:
@@ -6828,12 +7394,24 @@ async def run_daemon(
                 # thread was still writing would hand the next daemon exactly the overlap this lock
                 # exists to prevent.
                 #
-                # The join is bounded (``WORKER_JOIN_TIMEOUT_SECONDS``) and synchronous: an await could
-                # be interrupted by the next cancellation and abandoned, and a stop whose in-flight
-                # database work cannot finish must not hand the lock on. Blocking the loop thread here
-                # cannot deadlock - none of the daemon's worker functions calls back into the loop.
-                _join_default_executor(WORKER_JOIN_TIMEOUT_SECONDS)
-            except BaseException:  # except-kind: money-decision - keeps the lock, never a success-shaped exit
+                # The join is bounded (``worker_join_timeout_seconds``) and synchronous: an
+                # await could be interrupted by the next cancellation and abandoned, and a
+                # stop whose in-flight database work cannot finish must not hand the lock on.
+                # Blocking the loop thread here cannot deadlock - none of the daemon's worker
+                # functions calls back into the loop.
+                _join_default_executor(
+                    WORKER_JOIN_TIMEOUT_SECONDS
+                    if worker_join_timeout_seconds is None
+                    else worker_join_timeout_seconds
+                )
+                # ``executor.shutdown(wait=True)`` ran on the joiner thread, so the executor is
+                # closed but still attached as the loop's default: the next ``to_thread`` on this
+                # loop would fail with "cannot schedule new futures after shutdown". Detach it -
+                # the loop creates a fresh one on demand - so a caller whose loop outlives this run
+                # (a test, an embedder) keeps working.
+                with contextlib.suppress(AttributeError):
+                    asyncio.get_running_loop()._default_executor = None  # type: ignore[attr-defined]
+            except BaseException:  # except-kind: money-decision - keeps the lock on exit
                 # Interrupted mid-join (a signal, a KeyboardInterrupt), or the join budget expired
                 # with a worker still running. Releasing now would hand the next daemon the overlap
                 # this lock exists to prevent, so the process keeps the lock and the OS releases it
@@ -6847,17 +7425,19 @@ async def run_daemon(
                 # executor and the pieces of the interpreter that wait for them are still armed:
                 # `asyncio.run` would spend its own 300s budget closing this loop and the
                 # interpreter's exit would then join the same threads with no budget at all.
-                # Detaching the executor is what `EventLoop.close()` does too, and it is what makes
-                # leaving the process the caller's job (`daemon_cli` exits 4 on a WorkerJoinTimeout)
-                # rather than the interpreter's. The ignore is exact: `_default_executor` is a CPython
-                # private attribute `AbstractEventLoop` does not declare (a foreign loop simply has
-                # none to detach, which the suppress below already tolerates).
+                # Detaching the executor is what `EventLoop.close()` does too, and it is what
+                # makes leaving the process the caller's job (`daemon_cli` exits 4 on a
+                # WorkerJoinTimeout) rather than the interpreter's. The ignore is exact:
+                # `_default_executor` is a CPython private attribute `AbstractEventLoop` does
+                # not declare (a foreign loop simply has none to detach, which the suppress
+                # below already tolerates).
                 with contextlib.suppress(AttributeError):
                     asyncio.get_running_loop()._default_executor = None  # type: ignore[attr-defined]
                 raise
             finally:
                 if joined:
                     lock.release()
+        return exit_code
     finally:
         # Flush queued alerts (bounded): the shutdown/crash/startup-failure
         # ERROR records are the ones most likely to be sitting in the queue.
@@ -6867,12 +7447,142 @@ async def run_daemon(
             close_alert_sink(timeout=SHUTDOWN_FLUSH_SECONDS)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Start the daemon and return the process exit code.
+def _crash_exit_code(exc: BaseException) -> int:
+    """The code the interpreter itself would have used for this exception.
 
-    Kept for embedders; ``python -m live_runner.daemon`` goes through ``live_runner.daemon_cli``,
-    which parses the arguments before this module's heavy imports (#310).
+    ``main`` leaves through ``os._exit``, which runs no ``sys.excepthook``, so
+    the number has to be produced here rather than inherited: a Ctrl-C that
+    landed before the shutdown handler was installed (during start-up) is still
+    reported as 130, the same 128+SIGINT the interpreter gives an unhandled
+    ``KeyboardInterrupt``, and every other crash keeps the 1 it always had.
     """
-    from live_runner.daemon_cli import main as _cli_main
+    return FORCED_EXIT_CODE if isinstance(exc, KeyboardInterrupt) else EXIT_CRASH
 
-    return _cli_main(argv)
+
+def _leave_the_process(exit_code: int) -> None:
+    """Flush what has to reach the outside world, then leave with ``exit_code``.
+
+    The daemon leaves the process this way on every path - a clean shutdown, a
+    timed-out phase and a crash alike - rather than letting the interpreter finish
+    on its own, because the teardown that would run next joins every thread the
+    daemon left alive and that join has no deadline:
+
+    * ``concurrent.futures.thread._python_exit`` joins every live executor worker,
+      and a worker running a broker request - an Alpaca REST call, a balance
+      poll - is cancelled at the await but never at the call, so a task that
+      *honoured* its cancel still leaves one running. A clean shutdown reports
+      ``EXIT_OK`` in milliseconds and then waits out the broker's own timeout.
+    * ``threading`` joins every non-daemon thread, which is what Twisted's reactor
+      pool workers are when the release above was abandoned.
+
+    Either wait is past the unit's ``TimeoutStopSec``, so systemd would report the
+    SIGKILL it sent itself instead of the exit code - the code an operator needs
+    when a broker outcome was left unknown. Flushing first is what ``os._exit``
+    skips: the log handlers, and the Sentry queue (bounded, and counted in the
+    exit window the runbook publishes).
+
+    The cost is real and is the reason this is a maintainer decision: no
+    interpreter teardown ever runs for the live daemon, so no ``atexit`` hook, no
+    ``__del__``, no second pass of generator finalisation. Everything the daemon
+    needs on the way out is already closed by the bounded shutdown above.
+
+    The order of the tail is the contract: the bounded Sentry flush runs while
+    the log handlers are still open - its own failure is a log record - then
+    the handlers, then the standard streams, because ``os._exit`` skips every
+    flush the interpreter would have done and a traceback or print still
+    buffered at this point would be lost with the process.
+    """
+    flush_sentry(SENTRY_FLUSH_TIMEOUT_SECONDS)
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(exit_code)
+
+
+
+def main() -> None:
+    """Run the daemon and report its exit code, never past the shutdown budget.
+
+    The loop is run by hand rather than by ``asyncio.run`` because of how
+    ``asyncio.run`` closes a loop whose coroutine has returned: it cancels every
+    task still on the loop and gathers those cancels with no deadline, then joins
+    the loop's default executor. Both are unbounded, and the bounded shutdown
+    feeds both of them: a loop task that ignored the cancels the cleanup already
+    gave up on, and a broker request the drain did not cover (already handed to a
+    ``to_thread`` worker, which no cancel can stop). The exit code that says a
+    broker outcome was left unknown would then arrive only after the unit file's
+    ``TimeoutStopSec``, so systemd reports the SIGKILL it sent itself instead -
+    hence ``close_the_loop_bounded`` in place of that close.
+
+    The tail is then left immediately, through ``_leave_the_process``, on every
+    path: bounding the close is not enough, because the close only reports what
+    is unfinished *on the loop*. A task that awaited a ``to_thread`` call reports
+    nothing unfinished when it is cancelled and leaves the worker thread running,
+    and a reactor release that timed out leaves Twisted's non-daemon pool workers
+    behind; the interpreter would join both at its own pace.
+
+    A crashed daemon logs its traceback here and exits ``EXIT_CRASH`` instead of
+    re-raising: the interpreter's traceback dump is part of the teardown this
+    skips, and an operator acts on that traceback, so it is written explicitly -
+    before the handlers are closed - rather than lost with the rest.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    exit_code = EXIT_OK
+    exit_path_clean = True
+    crashed: BaseException | None = None
+    try:
+        exit_code = loop.run_until_complete(run_daemon()) or EXIT_OK
+        exit_path_clean = loop.run_until_complete(
+            close_the_loop_bounded(EXIT_PATH_TIMEOUT_SECONDS)
+        )
+    except BaseException as exc:  # except-kind: loop-survival - the bounded tail still runs
+        # A crashed run leaves exactly the leftovers above, so the tail it gets
+        # is the bounded one; the exception itself is reported below.
+        crashed = exc
+        with contextlib.suppress(BaseException):
+            exit_path_clean = loop.run_until_complete(
+                close_the_loop_bounded(EXIT_PATH_TIMEOUT_SECONDS)
+            )
+    finally:
+        # The daemon owns this loop for the process lifetime: no other code may
+        # run on a loop the daemon is about to close.
+        asyncio.set_event_loop(None)
+        loop.close()
+    if crashed is not None:
+        if isinstance(crashed, (SingleInstanceError, WorkerJoinTimeout)):
+            # Not a crash: the caller maps these to their own exit codes
+            # (``daemon_cli``: 3 for a held lock, 4 for an incomplete worker
+            # join). The bounded close above already ran, so re-raising here
+            # cannot strand the loop's leftovers on the interpreter.
+            raise crashed
+        # Before the flush, because ``logging.shutdown`` closes the handlers and
+        # ``os._exit`` runs no ``sys.excepthook``: without this line a crashed
+        # daemon would exit ``1`` in silence.
+        crash_code = _crash_exit_code(crashed)
+        logger.error(
+            "The live daemon crashed; exiting immediately without interpreter "
+            "teardown",
+            exc_info=crashed,
+            extra={"data": {"exit_code": crash_code}},
+        )
+        _leave_the_process(crash_code)
+    # Whatever the verdict, ``_leave_the_process`` runs next: a bounded close does
+    # not make the interpreter's teardown safe to wait for. What was left behind
+    # gets one line each, because this is the end of the log an operator reads -
+    # and the reactor release that timed out is one of those leftovers, recorded
+    # by the phase that gave up on it.
+    if _SHUTDOWN.reactor_release_abandoned:
+        logger.error(
+            "Leaving immediately: the reactor release was abandoned, so Twisted's "
+            "pool workers may still be alive",
+            extra={"data": {"exit_code": exit_code}},
+        )
+    if not exit_path_clean:
+        logger.error(
+            "Leaving immediately: the exit path could not account for everything "
+            "left on the loop",
+            extra={"data": {"exit_code": exit_code}},
+        )
+    _leave_the_process(exit_code)
