@@ -3493,3 +3493,107 @@ def test_crypto_pair_key_is_one_key_for_every_spelling(symbol):
     from shared.alpaca_symbols import crypto_pair_key
 
     assert crypto_pair_key(symbol) == "BTCUSD"
+
+
+# ── #149: net_pnl attributes commissions per closed round trip ─────────────────
+
+
+def test_closed_round_trip_commission_walk_unit():
+    """Direct walk checks: FIFO attribution, open lots excluded, unknowns."""
+    import viewer.main as viewer_main
+
+    fn = viewer_main._closed_round_trip_commission
+
+    # Flat book -> no closed round trips -> zero fees, known.
+    assert fn([]) == 0.0
+    # A still-open entry's fee is not netted.
+    assert fn([_stats_row("buy", 100.0, 2.0, 0, 1.0)]) == 0.0
+    # Closed round trip: entry rate 0.5/unit + exit rate 0.5/unit on 1 of 2.
+    rows = [
+        _stats_row("buy", 100.0, 2.0, 0, 1.0),
+        _stats_row("sell", 110.0, 1.0, 5, 0.5),
+    ]
+    assert fn(rows) == pytest.approx(1.0)
+    # Reversal: only the closed leg's share of the exit fee counts.
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.2),
+        _stats_row("sell", 90.0, 3.0, 5, 0.6),
+    ]
+    assert fn(rows) == pytest.approx(0.4)
+    # Unknown fee on a CLOSED leg -> None (fail closed).
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, None),
+        _stats_row("sell", 110.0, 1.0, 5, 0.5),
+    ]
+    assert fn(rows) is None
+    # Unknown fee on a still-OPEN lot does not block closed fees.
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.5),
+        _stats_row("sell", 110.0, 1.0, 5, 0.25),
+        _stats_row("buy", 50.0, 1.0, 10, None),
+    ]
+    assert fn(rows) == pytest.approx(0.75)
+
+
+def test_viewer_stats_net_pnl_excludes_fees_of_open_positions(monkeypatch):
+    """#149: net_pnl = realised PnL of closed trades minus THEIR fees only.
+
+    A still-open position's commission must not be netted against the
+    realised PnL of the closed round trip.
+    """
+    import viewer.main as viewer_main
+
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.5),
+        _stats_row("sell", 110.0, 1.0, 5, 0.25),
+        _stats_row("buy", 50.0, 1.0, 10, 9.99),  # still open at period end
+    ]
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["total_pnl"] == pytest.approx(10.0)
+    assert payload["total_commission"] == pytest.approx(10.74)
+    assert payload["net_pnl"] == pytest.approx(10.0 - 0.75), (
+        "net_pnl must subtract only the closed round trip's fees (0.75), "
+        "not the open position's 9.99"
+    )
+    assert payload["net_pnl_complete"] is True
+
+
+def test_viewer_stats_net_pnl_open_position_unknown_fee_does_not_block(monkeypatch):
+    """#149: an unknown fee on a still-open position is not netted, so it
+    cannot make the closed round trips' net PnL unknown either."""
+    import viewer.main as viewer_main
+
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.5),
+        _stats_row("sell", 110.0, 1.0, 5, 0.25),
+        _stats_row("buy", 50.0, 1.0, 10, None),  # open, fee not yet posted
+    ]
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    assert payload["commission_unknown_count"] == 1
+    assert payload["total_commission"] is None
+    assert payload["net_pnl"] == pytest.approx(9.25)
+    assert payload["net_pnl_complete"] is True
+
+
+def test_viewer_stats_net_pnl_partial_close_uses_fifo_fees(monkeypatch):
+    """#149: a partial close nets the consumed entry fee pro-rata plus the
+    exit fill's fee on the closed quantity only."""
+    import viewer.main as viewer_main
+
+    rows = [
+        _stats_row("buy", 100.0, 2.0, 0, 1.0),   # rate 0.5/unit
+        _stats_row("sell", 110.0, 1.0, 5, 0.5),  # closes 1 of 2, rate 0.5
+    ]
+    monkeypatch.setattr(viewer_main, "load_live_account_stats_inputs", lambda _a: ([], rows))
+
+    payload = viewer_main._live_account_stats_payload(ACCOUNT)
+
+    # realised = (110-100)*1 = 10; closed fees = 0.5 (entry) + 0.5 (exit) = 1.0
+    assert payload["net_pnl"] == pytest.approx(9.0)
+    assert payload["net_pnl_complete"] is True
