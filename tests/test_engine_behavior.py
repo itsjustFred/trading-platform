@@ -2619,8 +2619,8 @@ class TestPendingStopGapPricing:
         engine = self._engine(tmp_path)
         frame = _linear_frame(3)
         frame.loc[1, "open"] = 100.5
-        frame.loc[1, "high"] = 102.0
-        frame.loc[1, "low"] = 100.0
+        frame.loc[1, "high"] = 102.5
+        frame.loc[1, "low"] = 100.8
         frame.loc[1, "close"] = 101.5
         engine.pending_orders.append(
             self._order(
@@ -2628,7 +2628,7 @@ class TestPendingStopGapPricing:
                 "LONG",
                 created_index=0,
                 stop_price=101.0,
-                limit_price=103.0,
+                limit_price=102.0,
                 stop_loss=100.0,
             )
         )
@@ -2636,7 +2636,7 @@ class TestPendingStopGapPricing:
         self._fill(engine, frame)
 
         assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(103.0)
+        assert engine.positions[0].entry_price == pytest.approx(102.0)
 
     def test_stop_limit_short_no_gap_fills_at_limit(self, tmp_path):
         from runner.engine import OrderType
@@ -2645,7 +2645,7 @@ class TestPendingStopGapPricing:
         frame = _linear_frame(3)
         frame.loc[1, "open"] = 101.0
         frame.loc[1, "high"] = 101.5
-        frame.loc[1, "low"] = 99.5
+        frame.loc[1, "low"] = 98.5
         frame.loc[1, "close"] = 100.0
         engine.pending_orders.append(
             self._order(
@@ -2653,7 +2653,7 @@ class TestPendingStopGapPricing:
                 "SHORT",
                 created_index=0,
                 stop_price=100.0,
-                limit_price=98.0,
+                limit_price=99.0,
                 stop_loss=105.0,
             )
         )
@@ -2661,7 +2661,7 @@ class TestPendingStopGapPricing:
         self._fill(engine, frame)
 
         assert len(engine.positions) == 1
-        assert engine.positions[0].entry_price == pytest.approx(98.0)
+        assert engine.positions[0].entry_price == pytest.approx(99.0)
 
     def test_limit_long_favorable_gap_stays_at_limit(self, tmp_path):
         from runner.engine import OrderType
