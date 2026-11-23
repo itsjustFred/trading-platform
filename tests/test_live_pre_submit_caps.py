@@ -449,6 +449,27 @@ def test_leverage_lookup_failure_fails_closed_to_1x():
     assert qty == pytest.approx(1000.0)
 
 
+def test_garbage_leverage_read_clamps_to_1x():
+    # A present-but-unparseable broker leverage (Alpaca's ``multiplier`` now
+    # parses through ``parse_optional`` and raises ``MoneyParseError``) must
+    # degrade to the 1x ceiling, never be swallowed into a guessed leverage.
+    from shared.money import MoneyParseError
+
+    deployment = _deployment()
+    broker = _Broker(leverage_error=MoneyParseError("unreadable money value: 'junk'"))
+    signal = _signal(deployment, metadata={"stop_loss": 99.9, "take_profit": 105.0})
+    qty = _run(
+        enforce_pre_submit_caps(
+            broker,
+            deployment,
+            signal,
+            qty=2000.0,
+            risk_config=_loose_risk_config(),
+        )
+    )
+    assert qty == pytest.approx(1000.0)
+
+
 def test_leverage_clamp_below_one_step_refuses():
     # The broker maximum allows less than one quantity step: no compliant
     # order exists, so this is a refusal, not a clamp to zero.

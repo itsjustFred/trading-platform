@@ -42,6 +42,7 @@ from runner.engines.contract import (
     usable_exit_price,
 )
 from runner.fees import resolve_fee_model
+from runner.slippage import resolve_slippage_model
 from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     BacktestResult,
@@ -166,6 +167,29 @@ def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     return (1, int(name[2:]), name)
 
 
+def _armable_take_profit(value: Any) -> float | None:
+    """A take-profit price the engine may arm, else ``None``.
+
+    ``risk.live.resolve_live_levels`` refuses a present-but-unusable level
+    (non-numeric, non-finite or ``<= 0``) instead of trading it, so the backtest
+    must never arm one either: a LONG take-profit of ``0`` is reached by every
+    bar (``bar_high >= 0``) and would close the whole position at price ``0``,
+    while a non-finite level can never be reached at all. Returning ``None``
+    leaves the level unarmed — for the alias pair it lets the fallback
+    spelling (#237) supply the price — which is the conservative reading of a
+    row no committed strategy emits.
+    """
+    if pd.isna(value):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
 class TradeEngine:
     def __init__(
         self,
@@ -176,9 +200,19 @@ class TradeEngine:
         progress_callback: Callable[[float, str], None] | None = None,
         progress_start: float = 10.0,
         progress_end: float = 90.0,
+        asset_class: str = "",
     ):
         self.config = config
         self.symbol = symbol
+        # #130: fill-price slippage model, resolved once per engine. The
+        # adapter supplies the instrument's asset class (from the OHLCV
+        # path); direct engine use leaves it "" and the auto resolution
+        # refuses unless the run declares slippage explicitly — never a
+        # silent gross default.
+        self._slippage_asset_class = str(asset_class or "")
+        self.slippage_model = resolve_slippage_model(
+            config.parameters, asset_class=self._slippage_asset_class
+        )
         self.equity = config.initial_capital
         self.positions: list[Position] = []
         self.pending_orders: list[Order] = []
@@ -312,12 +346,38 @@ class TradeEngine:
 
         tp_levels: list[dict[str, Any]] = []
         tp_candidates: list[tuple[str, float]] = []
+        # "take_profit" and "tp_price" are two spellings of the SAME plain
+        # take-profit level (#237), so a row carrying both must produce a
+        # single "tp" candidate. The canonical spelling wins — the alias order
+        # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
+        # comparison/extraction helpers) — and the winner must not depend on
+        # the signal frame's column order. Appending one candidate per column
+        # made two levels named "tp" for the one intended level, so the row's
+        # single take-profit filled as two legs (each at the price its own
+        # spelling carried, both sharing the "tp_pct" fraction) and the
+        # phantom candidate also took a share of the default 1/n split.
+        # A lone level still closes the whole position: the last pending level
+        # takes the remaining quantity (see ``_check_stops``), which is the
+        # live bracket convention — a fraction below 1 does not leave a rest.
+        # (rank, price): 0 = canonical take_profit, 1 = tp_price alias.
+        plain_tp: tuple[int, float] | None = None
         for key in row.index:
             lower = str(key).lower()
-            if lower in {"take_profit", "tp_price"} and pd.notna(row.get(key)):
-                tp_candidates.append(("tp", float(row.get(key))))
-            elif lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
-                tp_candidates.append((lower, float(row.get(key))))
+            if lower in {"take_profit", "tp_price"}:
+                alias_value = _armable_take_profit(row.get(key))
+                if alias_value is None:
+                    continue
+                rank = 0 if lower == "take_profit" else 1
+                if plain_tp is None or rank < plain_tp[0]:
+                    plain_tp = (rank, alias_value)
+                continue
+            if lower.startswith("tp") and lower[2:].isdecimal():
+                numbered_value = _armable_take_profit(row.get(key))
+                if numbered_value is None:
+                    continue
+                tp_candidates.append((lower, numbered_value))
+        if plain_tp is not None:
+            tp_candidates.append(("tp", plain_tp[1]))
 
         # Plain "tp" (take_profit / tp_price) first, then numbered levels by
         # their numeric suffix so tp10 follows tp9, not tp1.
@@ -442,6 +502,88 @@ class TradeEngine:
 
         return max(0.0, risk_exposure)
 
+    def _free_margin(self, mark_price: float) -> float:
+        """MT5-style free margin: equity − used margin, marked at ``mark_price``.
+
+        ``equity`` is mark-to-market — deliberately NOT the realized-cash
+        sizing basis: D2 governs what may be *risked*, while the margin
+        check governs what the broker would *accept* (#347, decisions on
+        #267/#240/#329). The balance leg is ``_sizing_equity`` — realized
+        cash net of every fee already incurred, including the entry leg of
+        still-open positions, which is what MT5 has already charged — plus
+        the floating PnL at ``mark_price``. Used margin is each open
+        position's notional at the same mark divided by the
+        account/asset maximum leverage (``_max_leverage`` — 1x when the
+        broker maximum is unknown); pending orders hold no margin, as on
+        MT5.
+        """
+        if not math.isfinite(mark_price) or mark_price <= 0:
+            return 0.0
+        leverage = self._max_leverage
+        equity = float(self._sizing_equity)
+        used_margin = 0.0
+        for position in self.positions:
+            qty = float(position.remaining_qty or 0.0)
+            if qty <= 1e-9:
+                continue
+            entry = float(position.entry_price)
+            if position.direction == "LONG":
+                equity += (mark_price - entry) * qty
+            else:
+                equity += (entry - mark_price) * qty
+            used_margin += qty * mark_price / leverage
+        return equity - used_margin
+
+    def _free_margin_quantity_cap(self, entry_price: float) -> float:
+        """Largest quantity the free-margin leverage rule affords (unfloored).
+
+        A broker accepts an order whose margin (notional / max leverage)
+        fits in free margin, i.e. ``notional <= free_margin * max_leverage``.
+        """
+        free_margin = self._free_margin(entry_price)
+        # Fail closed: a NaN free margin (e.g. a NaN mark on an open position)
+        # must not silently lift the leverage ceiling — ``nan <= 0`` is False
+        # and ``min(qty, nan)`` returns ``qty``.
+        if not math.isfinite(free_margin) or free_margin <= 0:
+            return 0.0
+        return free_margin * self._max_leverage / entry_price
+
+    def _apply_notional_caps(
+        self,
+        shares: float,
+        *,
+        entry_price: float,
+        exposure_limit: float | None,
+        lot_step: float,
+        cap_by_leverage: bool = True,
+    ) -> float:
+        """Apply the two notional ceilings to a sized quantity (#347).
+
+        The per-position exposure cap stays a sizing rule on realized cash
+        (D2). The leverage/margin check is MT5-style free margin: when it is
+        the binding constraint the quantity is clamped down and floored to
+        ``lot_step`` — to zero when no free margin remains, in which case
+        the order is skipped (logged), never refused.
+        ``cap_by_leverage=False`` is the
+        fixed-risk ``cap_fixed_risk_by_leverage=false`` opt-out.
+        """
+        exposure_qty_cap = (
+            self._sizing_equity * exposure_limit / float(entry_price)
+            if exposure_limit is not None
+            else math.inf
+        )
+        shares = min(shares, exposure_qty_cap)
+        if cap_by_leverage:
+            leverage_cap = self._free_margin_quantity_cap(float(entry_price))
+            if lot_step > 0 and 0 < leverage_cap < shares:
+                # The shared grid floor (#365/#278), not a private
+                # ``floor(x / step + 1e-12)``: the risk-engine path never
+                # re-floors its result, so an off-grid float or a one-step-low
+                # size would reach the order.
+                leverage_cap = _floor_to_lot_grid(leverage_cap, lot_step)
+            shares = min(shares, leverage_cap)
+        return max(shares, 0.0)
+
     def _calculate_position_size(
         self,
         *,
@@ -452,12 +594,14 @@ class TradeEngine:
         stop_distance: float | None = None,
         exclude_order: Order | None = None,
     ) -> float:
-        max_leverage = self._max_leverage
-        position_notional_limit = (
-            max_leverage
-            if self._max_position_exposure_pct is None
-            else min(self._max_position_exposure_pct, max_leverage)
-        )
+        # #347: two different denominators now. The per-position exposure cap
+        # stays a sizing rule on realized cash (D2); the leverage/margin
+        # check is MT5-style and judges the order against FREE MARGIN
+        # (equity − used margin), clamping to the broker maximum instead of
+        # refusing. ``self._max_leverage`` is the broker maximum for the
+        # account/asset; unknown → 1x.
+        exposure_limit = self._max_position_exposure_pct
+
         # #170: resolve -- and thereby validate -- the declared risk amount
         # here, BEFORE any stop-dependent branch. `nan > 0`, `-inf > 0` and a
         # negative amount all compare False, so a value checked after a gate is
@@ -527,12 +671,18 @@ class TradeEngine:
                     )
                     shares = min(shares, max_lot_grid)
                 uncapped_shares = shares
-                if bool(self.config.parameters.get("cap_fixed_risk_by_leverage", True)):
-                    max_value = self._sizing_equity * position_notional_limit
-                    shares = min(shares, max_value / entry_price)
-                elif self._max_position_exposure_pct is not None:
-                    max_value = self._sizing_equity * self._max_position_exposure_pct
-                    shares = min(shares, max_value / entry_price)
+                # #347: the exposure cap (realized cash) and the free-margin
+                # leverage clamp live in `_apply_notional_caps`; the opt-out
+                # `cap_fixed_risk_by_leverage=false` skips only the margin clamp.
+                shares = self._apply_notional_caps(
+                    shares,
+                    entry_price=float(entry_price),
+                    exposure_limit=exposure_limit,
+                    lot_step=lot_step,
+                    cap_by_leverage=bool(
+                        self.config.parameters.get("cap_fixed_risk_by_leverage", True)
+                    ),
+                )
                 # Issue #151: the leverage/exposure cap is a raw
                 # equity/price ratio, so it can leave a size off the
                 # `lot_step` grid -- a size the broker would reject. Only a
@@ -619,7 +769,14 @@ class TradeEngine:
                 current_exposure=self._current_risk_exposure(
                     float(entry_price), exclude_order=exclude_order
                 ),
-                max_notional_per_trade=position_notional_limit,
+                # #347: only the realized-cash exposure cap goes into the
+                # risk engine; the leverage/margin ceiling is applied
+                # afterwards on free margin. With no exposure cap there is
+                # no engine-level ceiling — math.inf is the documented
+                # "uncapped" value (the post-cap is the real leverage bound).
+                max_notional_per_trade=(
+                    exposure_limit if exposure_limit is not None else math.inf
+                ),
             )
             shares = float(sized_order.position_size)
         else:
@@ -631,11 +788,16 @@ class TradeEngine:
                 "Set risk_per_trade_pct or fixed_risk_amount explicitly."
             )
 
-        # F21 (D2): the notional/leverage cap is denominated in the same
-        # realized sizing cash as the risk target.
-        max_value = self._sizing_equity * position_notional_limit
-        shares = min(shares, max_value / entry_price)
-        return max(shares, 0.0)
+        # F21 (D2): the per-position notional cap stays denominated in
+        # realized sizing cash; #347: the leverage/margin cap is free margin.
+        # The grid is resolved -- and thereby validated (#170) -- here for the
+        # risk-engine path; the fixed-risk branch resolved it above.
+        return self._apply_notional_caps(
+            shares,
+            entry_price=float(entry_price),
+            exposure_limit=exposure_limit,
+            lot_step=_sizing_value("lot_step", self.config.parameters.get("lot_step"), 0.0),
+        )
 
     @staticmethod
     def _to_iso(value: Any) -> str:
@@ -717,6 +879,16 @@ class TradeEngine:
             stop_distance=stop_distance,
         )
         if qty <= 0:
+            # #347: a zero size is usually the free-margin leverage clamp
+            # (no free margin remains) — log the skip like the fill-time
+            # skips instead of dropping the order silently.
+            logger.warning(
+                "Skipping %s %s order at %s: sized quantity %.6g <= 0",
+                self.symbol,
+                direction,
+                self._to_iso(row["timestamp"]),
+                qty,
+            )
             return
 
         created_time = self._to_iso(row["timestamp"])
@@ -794,6 +966,33 @@ class TradeEngine:
         # back from the next entry.
         self._refresh_sizing_equity()
 
+    def _slip(
+        self,
+        price: float,
+        side: str,
+        bar: pd.Series | None = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
+        """Adverse slippage adjustment on one fill price (#130).
+
+        ``side`` is the trader's side of the fill: entries buy on LONG /
+        sell on SHORT; exits are the mirror. Applied to every fill the
+        engine produces — market, stop, take-profit and signal exits — so
+        the recorded fill price, the PnL and the equity path all carry the
+        same cost. Limit-price clamping is NOT modeled (a slipped limit
+        buy could fill above its limit); the engine only submits market
+        orders today, so no live path reaches it. ``fill_side="ask"``
+        marks an ask-triggered SHORT exit whose level is already
+        ask-denominated (``ask_ohlc``), so the bar-spread model does not
+        charge the spread a second time.
+        """
+        return float(
+            self.slippage_model.slip_price(
+                float(price), side, bar, fill_side=fill_side
+            )
+        )
+
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
         if not self.pending_orders:
             return
@@ -856,6 +1055,14 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
+                # #130: slippage shifts the fill price adversely BEFORE any
+                # re-sizing, stop-side checks or position accounting, so the
+                # slipped price is the single price every consumer sees.
+                fill_price = self._slip(
+                    fill_price,
+                    "buy" if order.direction == "LONG" else "sell",
+                    row,
+                )
                 if order.stop_loss is None and getattr(order, "_sizing_stop_loss", None) is None:
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     fallback_distance = (
@@ -906,6 +1113,17 @@ class TradeEngine:
                     # fill-time ledger, so that is now the basis to record.
                     order._sizing_equity = float(self._sizing_equity)
                     if order.quantity <= 0:
+                        # Usually the free-margin leverage clamp (no free
+                        # margin remains) — log like the creation skip
+                        # instead of dropping the fill silently.
+                        logger.warning(
+                            "Skipping %s %s order at %s: fill-time sized "
+                            "quantity %.6g <= 0",
+                            order.symbol,
+                            order.direction,
+                            fill_time,
+                            order.quantity,
+                        )
                         continue
                     order._equity_proportional = self._equity_proportional_for_stop(order.stop_loss)
                 if order.order_type == OrderType.MARKET:
@@ -957,6 +1175,17 @@ class TradeEngine:
                         # fill-time basis is the one to record.
                         order._sizing_equity = float(self._sizing_equity)
                         if order.quantity <= 0:
+                            # Usually the free-margin leverage clamp (no free
+                            # margin remains) — log like the creation skip
+                            # instead of dropping the fill silently.
+                            logger.warning(
+                                "Skipping %s %s order at %s: fill-time sized "
+                                "quantity %.6g <= 0",
+                                order.symbol,
+                                order.direction,
+                                fill_time,
+                                order.quantity,
+                            )
                             continue
                         # A-M4 (D5)/#170: the fill-time re-size can select a
                         # different sizing branch than the creation-time
@@ -1011,11 +1240,22 @@ class TradeEngine:
         qty: float,
         time_iso: str,
         reason: str,
+        bar: pd.Series | None = None,
+        *,
+        fill_side: str | None = None,
     ) -> None:
         qty = max(0.0, min(qty, position.remaining_qty))
         if qty <= 0:
             return
 
+        # #130: exit fills slip adversely (a LONG exit sells, a SHORT exit
+        # buys) at the single choke point every exit leg passes through.
+        price = self._slip(
+            price,
+            "sell" if position.direction == "LONG" else "buy",
+            bar,
+            fill_side=fill_side,
+        )
         if position.direction == "LONG":
             pnl = (price - position.entry_price) * qty
         else:
@@ -1267,6 +1507,7 @@ class TradeEngine:
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,
+                bar=row,
             )
             self._finalize_position(position, i)
             if position.remaining_qty > 1e-9:
@@ -1558,6 +1799,16 @@ class TradeEngine:
                 adverse_cap=excursion_adverse_cap,
             )
 
+            # A-L5/A-H7: with ``ask_ohlc`` a SHORT's protective levels are
+            # ask-denominated — the trigger compared the ask side, so the
+            # exit fill must not pay the quoted spread a second time via
+            # the slippage model (#130).
+            exit_fill_side = (
+                "ask"
+                if position.direction != "LONG"
+                and (ask_high is not None or ask_low is not None)
+                else None
+            )
             if first_event == "stop" and position.stop_loss is not None:
                 # D4 (Phase 3, A-M1 exit convention): the unified convention
                 # is Fill-zum-Trigger-Close for SIGNAL exits; stop/TP legs
@@ -1575,6 +1826,8 @@ class TradeEngine:
                     qty=position.remaining_qty,
                     time_iso=time_iso,
                     reason="stop_loss",
+                    bar=row,
+                    fill_side=exit_fill_side,
                 )
             elif first_event == "tp":
                 # A-H7: SHORT TP fills buy the ask (level + spread), LONG TP
@@ -1593,6 +1846,14 @@ class TradeEngine:
                     fraction = float(level.get("fraction", 0.0))
                     qty = position.quantity * fraction
                     if level is pending_tp[-1]:
+                        # The last pending level takes whatever is left, so a
+                        # ladder closes the position instead of leaving a dust
+                        # remainder (and a lone level closes the whole
+                        # position, the way a live bracket order does). A
+                        # strategy that wants to keep part of the position
+                        # open past its last level needs a later signal exit;
+                        # honouring a lone level's fraction instead is left to
+                        # a maintainer decision (see #276).
                         qty = position.remaining_qty
 
                     self._close_partial(
@@ -1601,6 +1862,8 @@ class TradeEngine:
                         qty=qty,
                         time_iso=time_iso,
                         reason=str(level.get("name") or "take_profit"),
+                        bar=row,
+                        fill_side=exit_fill_side,
                     )
                     level["filled"] = True
 
@@ -1617,6 +1880,8 @@ class TradeEngine:
                         qty=position.remaining_qty,
                         time_iso=time_iso,
                         reason="stop_loss",
+                        bar=row,
+                        fill_side=exit_fill_side,
                     )
 
             self._finalize_position(position, i)

@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from live_runner.deployment_policy import (
     KNOWN_SIGNAL_SOURCES,
@@ -27,6 +27,7 @@ from live_runner.deployment_policy import (
     untradeable_signal_source_reason,
 )
 from shared.constants import normalize_symbols, normalize_timeframe
+from shared.database import sqlite_url_file
 from shared.models import LiveDeploymentConfig
 
 #: (strategy_name, account_id): how a YAML deployment and a DB row are matched.
@@ -65,19 +66,6 @@ class DbPreflightReport:
     warnings: list[str] = field(default_factory=list)
 
 
-def _sqlite_url_file(url: str) -> str:
-    """The file part of a SQLite URL, with any query string and fragment stripped.
-
-    ``shared.database`` hands ``DATABASE_URL`` straight to SQLAlchemy, which reads everything
-    after the first ``?`` as driver options rather than as part of the filename, so
-    ``sqlite:////abs/backtests.db?timeout=30`` opens ``/abs/backtests.db``. Splitting the raw URL
-    kept ``?timeout=30`` in the path, and a ``Path`` carrying it is not a file: a working database
-    was reported as "Database file not found".
-    """
-    without_params = url.partition("?")[0].partition("#")[0]
-    return unquote(without_params.split("///", 1)[1]) if "///" in without_params else ""
-
-
 def resolve_db_path(explicit: str | Path | None = None) -> Path:
     """The SQLite file the daemon would use: explicit, ``DATABASE_URL`` or ``DATA_DIR``.
 
@@ -93,7 +81,7 @@ def resolve_db_path(explicit: str | Path | None = None) -> Path:
         parsed = urlparse(url)
         if not parsed.scheme.lower().startswith("sqlite"):
             raise ValueError(f"DB preflight supports SQLite only, got {parsed.scheme!r}.")
-        raw = _sqlite_url_file(url)
+        raw = sqlite_url_file(url)
         if raw == ":memory:":
             # Not a missing file: the daemon would trade ACTIVE rows no on-disk path can show.
             raise ValueError(
@@ -214,8 +202,8 @@ def _db_row_drift(row: DbDeploymentRow, yaml_dep: LiveDeploymentConfig) -> list[
     reports it as an error.
 
     ``signal_source`` is on this list because the daemon gates Discord dispatch on the DB value
-    (``live_runner.daemon._active_discord_deployments_for_account`` and
-    ``_discord_active_account_ids``): a row that says ``discord`` on a deployment the YAML
+    (``live_runner.daemon._dispatchable_discord_deployments_for_account`` and
+    ``_discord_dispatchable_account_ids``): a row that says ``discord`` on a deployment the YAML
     configures as ``internal`` receives Discord signals, and the YAML-side check in
     ``live_runner.preflight._validate_deployments`` never sees the DB row.
     ``signal_source_id`` is on this list because it names the credential the daemon resolves that

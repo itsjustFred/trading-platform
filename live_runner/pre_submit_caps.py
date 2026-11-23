@@ -337,7 +337,7 @@ async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | N
     try:
         value = await adapter.get_max_leverage(symbol)
     except Exception as exc:  # except-kind: money-decision
-        logger.debug(
+        logger.warning(
             "Max leverage lookup raised; treating it as unknown (1x)",
             extra={"data": {"symbol": symbol, "error": repr(exc)}},
         )

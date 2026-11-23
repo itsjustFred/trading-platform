@@ -1144,6 +1144,92 @@ class TestRiskAdjustedObjective:
             )
             assert value == 1.5
 
+    def test_unmeasurable_drawdown_gets_worst_case_haircut(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #286: since #250 a run whose equity is unreadable stores
+        # max_drawdown_pct=None (and names it in undefined_metrics). Reading it
+        # with `or 0.0` gave such a run FULL drawdown credit; an unmeasurable
+        # drawdown must instead take the worst-case haircut.
+        for stats in (
+            {"total_trades": 30, "max_drawdown_pct": None},
+            {
+                "total_trades": 30,
+                "max_drawdown_pct": 0.0,
+                "undefined_metrics": ["max_drawdown_pct"],
+            },
+            {"total_trades": 30, "max_drawdown_pct": float("nan")},
+            {"total_trades": 30, "max_drawdown_pct": float("inf")},
+        ):
+            value, terms = _risk_adjusted_metric_value(
+                100.0,
+                stats,
+                metric_key="total_pnl",
+                direction="maximize",
+            )
+            assert terms["drawdown_factor"] == 0.0
+            assert value == 0.0
+
+    def test_unparseable_drawdown_is_unmeasurable(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #320: a value that does not parse is as unmeasurable as None.
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": "abc"},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.0
+        assert value == 0.0
+
+    def test_absent_drawdown_key_is_unmeasurable(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        # #320: "unmeasurable" is broader than corrupt artifacts - a stats
+        # dict with no max_drawdown_pct key at all takes the same worst-case
+        # haircut. (runner/stats.py itself never omits the key: a run whose
+        # equity curve has fewer than two points publishes the 0.0 placeholder
+        # and names the metric in `undefined_metrics` - covered above.)
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.0
+        assert value == 0.0
+
+    def test_drawdown_unmeasurable_classifier(self) -> None:
+        from runner.optimizer import _drawdown_unmeasurable
+
+        assert _drawdown_unmeasurable({"max_drawdown_pct": -0.25}) is False
+        assert _drawdown_unmeasurable({"max_drawdown_pct": "0.1"}) is False
+        assert _drawdown_unmeasurable({"max_drawdown_pct": "abc"}) is True
+        assert _drawdown_unmeasurable({"max_drawdown_pct": float("nan")}) is True
+        assert _drawdown_unmeasurable({"max_drawdown_pct": None}) is True
+        assert _drawdown_unmeasurable({}) is True
+        assert (
+            _drawdown_unmeasurable(
+                {"max_drawdown_pct": 0.0, "undefined_metrics": ["max_drawdown_pct"]}
+            )
+            is True
+        )
+        # Percent-scale stays "measurable" so the scale guard still raises.
+        assert _drawdown_unmeasurable({"max_drawdown_pct": -40.0}) is False
+
+    def test_measured_drawdown_still_haircuts(self) -> None:
+        from runner.optimizer import _risk_adjusted_metric_value
+
+        value, terms = _risk_adjusted_metric_value(
+            100.0,
+            {"total_trades": 30, "max_drawdown_pct": -0.25},
+            metric_key="total_pnl",
+            direction="maximize",
+        )
+        assert terms["drawdown_factor"] == 0.75
+        assert value == 75.0
+
     def test_percent_scaled_drawdown_fails_loud(self) -> None:
         import pytest
 

@@ -21,6 +21,14 @@ ATR smoothing legend (the four meanings of "ATR" in the repo):
   ``h-l``).
 - ``ema`` + ``seed="first"``: ``ewm(span=n)`` seeded at ``TR[0]`` — the
   live bots' stop-distance ATR.
+
+Performance (issue #378): the sequential loops in
+:func:`_custom_swings_atr` run as pure-NumPy kernels
+(``*_kernel_py``) with ``numba.njit`` compiled copies when numba is
+importable — see :mod:`shared.indicators._numba` for dispatch/fallback
+(``TP_DISABLE_NUMBA=1`` forces the Python path). The ``np.mean`` ATR seed
+stays on the NumPy path because numba's ``np.mean`` is not bit-identical
+to numpy's pairwise summation. Outputs are bit-identical either way.
 """
 
 from __future__ import annotations
@@ -30,9 +38,11 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
+from . import _numba
 from .core import (
     SupertrendResult,
     TrFirstBar,
+    _positive_int,
     atr,
     atr_from_tr,
     ema,
@@ -197,6 +207,59 @@ def rsi_wilder_fill50(close: pd.Series, period: int) -> pd.Series:
 # ── Supertrend presets ─────────────────────────────────────────────────
 
 
+def _custom_swings_tr_kernel_py(
+    high_v: np.ndarray, low_v: np.ndarray, close_v: np.ndarray
+) -> np.ndarray:
+    """True-range array of ``_custom_swings_atr`` (reference kernel).
+
+    ``tr[0]`` stays ``0.0`` and each later bar takes
+    ``max(h-l, |h-prev_close|, |l-prev_close|)``; written with explicit
+    comparisons so CPython and the numba-compiled copy share NaN semantics
+    (see :func:`shared.indicators.core._supertrend_pine_kernel_py`).
+    """
+    n = len(close_v)
+    tr = np.zeros(n)
+    for i in range(1, n):
+        m = high_v[i] - low_v[i]
+        d = abs(high_v[i] - close_v[i - 1])
+        if d > m:
+            m = d
+        d = abs(low_v[i] - close_v[i - 1])
+        if d > m:
+            m = d
+        tr[i] = m
+    return tr
+
+
+_custom_swings_tr_kernel_nb = _numba.compile_kernel(
+    _custom_swings_tr_kernel_py
+)
+
+
+def _custom_swings_atr_kernel_py(
+    tr: np.ndarray, period: int, seed: float
+) -> np.ndarray:
+    """Wilder recursion of ``_custom_swings_atr`` (reference kernel).
+
+    ``seed`` is ``np.mean(tr[1 : period + 1])`` computed by the caller:
+    numpy's pairwise summation is not bit-identical to numba's ``np.mean``,
+    so the seed stays on the NumPy path (issue #378).
+    """
+    n = len(tr)
+    atr_values = np.zeros(n)
+    if period < n:
+        atr_values[period] = seed
+        alpha = 1.0 / period
+        for i in range(period + 1, n):
+            atr_values[i] = alpha * tr[i] + (1 - alpha) * atr_values[i - 1]
+    return atr_values
+
+
+_custom_swings_atr_kernel_nb = _numba.compile_kernel(
+    _custom_swings_atr_kernel_py
+)
+
+
 def _custom_swings_atr(
     high: pd.Series, low: pd.Series, close: pd.Series, period: int
 ) -> pd.Series:
@@ -207,24 +270,34 @@ def _custom_swings_atr(
     operation order as the shared Wilder kernel. Keep this parity path
     local to the preset so ``supertrend_custom_swings`` stays bit-identical
     without forcing every RMA consumer onto the legacy order.
+
+    The two loops run as numba-compiled kernels when available (see
+    :mod:`shared.indicators._numba`); outputs are bit-identical either way.
     """
+    # Guard before dispatch: the kernels index ``tr``/``atr_values`` with
+    # ``period`` and a non-positive length must fail here, not as a
+    # ZeroDivisionError inside the recursion (or a numba typing error).
+    period = _positive_int(period, "period")
     high_v = high.to_numpy()
     low_v = low.to_numpy()
     close_v = close.to_numpy()
-    n = len(close_v)
-    tr = np.zeros(n)
-    for i in range(1, n):
-        tr[i] = max(
-            high_v[i] - low_v[i],
-            abs(high_v[i] - close_v[i - 1]),
-            abs(low_v[i] - close_v[i - 1]),
-        )
-    atr_values = np.zeros(n)
-    if period < n:
-        atr_values[period] = np.mean(tr[1 : period + 1])
-        alpha = 1.0 / period
-        for i in range(period + 1, n):
-            atr_values[i] = alpha * tr[i] + (1 - alpha) * atr_values[i - 1]
+    tr = _numba.call(
+        _custom_swings_tr_kernel_py,
+        _custom_swings_tr_kernel_nb,
+        high_v,
+        low_v,
+        close_v,
+    )
+    seed = (
+        float(np.mean(tr[1 : period + 1])) if period < len(close_v) else 0.0
+    )
+    atr_values = _numba.call(
+        _custom_swings_atr_kernel_py,
+        _custom_swings_atr_kernel_nb,
+        tr,
+        period,
+        seed,
+    )
     return pd.Series(atr_values, index=close.index, name="atr")
 
 

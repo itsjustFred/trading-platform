@@ -10,21 +10,34 @@ Used by the runner (after backtest) and the viewer (if stats not pre-computed).
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import math
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from scipy.stats import norm as _norm_dist
 from scipy.stats import ttest_1samp
 
+from shared import venue_calendar
 from shared.models import BacktestResult, BacktestStats, EquityPoint, Trade
 
 logger = logging.getLogger(__name__)
 
 MIN_CALMAR_DRAWDOWN = 0.001
 SECONDS_PER_DAY = 24 * 60 * 60
-DAILY_RETURN_PERIODS_PER_YEAR = 252
+DAYS_PER_YEAR = 365.25
+#: Fallback annualisation density when the return series carries no readable
+#: clock. The asset-class convention (``_resolve_return_convention``) is what
+#: ``compute_stats`` actually annualises with; this constant only survives as
+#: the default for direct helper calls (#229).
+DAILY_RETURN_PERIODS_PER_YEAR = 252.0
+#: 24/7 venues (crypto) have a trading day every calendar day, so their
+#: daily-return series annualises at 365 rather than the 252 business-day
+#: convention used for equities/FX/CFDs (maintainer decision 2026-11-22).
+CRYPTO_RETURN_PERIODS_PER_YEAR = 365.0
 DEFAULT_RISK_FREE_RATE = 0.0
 
 #: Reported in ``extras.equity_return_frequency`` when the equity curve's
@@ -51,6 +64,11 @@ def compute_stats(
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
     backtest_start: str | None = None,
     backtest_end: str | None = None,
+    *,
+    symbols: list[str] | tuple[str, ...] | None = None,
+    data_source: str | None = None,
+    asset_class: str | None = None,
+    data_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Compute comprehensive performance metrics from a list of trades.
 
@@ -59,6 +77,14 @@ def compute_stats(
         initial_capital: Starting capital.
         equity_curve: Optional equity curve for drawdown/Sharpe calculation.
         risk_free_rate: Annual risk-free rate for Sharpe/Sortino.
+        symbols: Traded symbols, used to resolve the venue calendar that
+            decides which calendar days count as trading days (#229).
+        data_source: Data source of the run (``meta.data.source`` /
+            ``execution_context.data_source``), forwarded to venue-calendar
+            resolution.
+        asset_class: Book-level asset class, forwarded to venue-calendar
+            resolution.
+        data_dir: Data root for cached broker venue calendars.
 
     Returns:
         Dictionary of metric name → value.
@@ -136,11 +162,23 @@ def compute_stats(
     undefined_metrics: set[str] = set()
     return_frequency = "none"
     return_frequency_reason: str | None = None
+    daily_return_series: pd.Series | None = None
     duplicate_timestamp_count = _duplicate_timestamp_count(equity_curve or [])
 
+    annualization_periods = DAILY_RETURN_PERIODS_PER_YEAR
+    trading_dates: set[dt.date] | None = None
     if equity_curve and len(equity_curve) > 1:
         equities = [e.equity for e in equity_curve]
-        daily_returns = _daily_returns_from_equity_curve(equity_curve)
+        annualization_periods, trading_dates = _resolve_return_convention(
+            equity_curve=equity_curve,
+            symbols=symbols,
+            data_source=data_source,
+            asset_class=asset_class,
+            data_dir=data_dir,
+        )
+        daily_returns = _daily_returns_from_equity_curve(
+            equity_curve, trading_dates=trading_dates
+        )
         p_value = _one_sided_p_value(daily_returns)
         cagr = _cagr_from_backtest_period(
             equity_curve=equity_curve,
@@ -149,7 +187,9 @@ def compute_stats(
             backtest_start=backtest_start,
             backtest_end=backtest_end,
         )
-        daily_return_series = _daily_returns_series_from_equity_curve(equity_curve)
+        daily_return_series = _daily_returns_series_from_equity_curve(
+            equity_curve, trading_dates=trading_dates
+        )
         if (
             daily_return_series is not None
             and not daily_return_series.empty
@@ -181,13 +221,14 @@ def compute_stats(
         #   compounded product of resampled daily returns;
         # - calmar_ratio: CAGR (elapsed-time based, identical on both paths)
         #   divided by max drawdown;
-        # - sharpe/sortino: daily-resampled returns, annualized with 252
-        #   periods (quantstats when available, manual fallback otherwise).
+        # - sharpe/sortino: daily-resampled trading-day returns — calendar-
+        #   filled weekend/holiday zero-return rows dropped — annualized at
+        #   252 for equities/FX/CFDs or 365 for 24/7 crypto (quantstats when
+        #   available, manual fallback otherwise; #229 maintainer decision
+        #   2026-11-22).
         max_drawdown_pct = -_max_drawdown_pct_manual(equities)
         total_return = (
-            (equities[-1] / float(initial_capital)) - 1
-            if float(initial_capital) > 0
-            else 0
+            (equities[-1] / float(initial_capital)) - 1 if float(initial_capital) > 0 else 0
         )
         calmar_ratio = _safe_calmar_ratio(cagr, max_drawdown_pct)
         max_drawdown_duration = _max_drawdown_duration(equities)
@@ -210,19 +251,23 @@ def compute_stats(
                     qs.stats.sharpe,
                     returns_series,
                     rf=risk_free_rate,
-                    periods=DAILY_RETURN_PERIODS_PER_YEAR,
+                    periods=annualization_periods,
                 )
                 sortino_ratio = _safe_qs(
                     qs.stats.sortino,
                     returns_series,
                     rf=risk_free_rate,
-                    periods=DAILY_RETURN_PERIODS_PER_YEAR,
+                    periods=annualization_periods,
                 )
                 psr = _probabilistic_sharpe(returns_series, sharpe_ratio)
         else:
             if return_frequency == "daily" and len(daily_returns) > 1:
-                sharpe_ratio = _sharpe_manual(daily_returns, risk_free_rate)
-                sortino_ratio = _sortino_manual(daily_returns, risk_free_rate)
+                sharpe_ratio = _sharpe_manual(
+                    daily_returns, risk_free_rate, periods_per_year=annualization_periods
+                )
+                sortino_ratio = _sortino_manual(
+                    daily_returns, risk_free_rate, periods_per_year=annualization_periods
+                )
                 psr = _probabilistic_sharpe_manual(daily_returns, sharpe_ratio)
             elif return_frequency == UNKNOWN_RETURN_FREQUENCY:
                 pass  # ratios already declared undefined above; p_value is period-free
@@ -283,6 +328,25 @@ def compute_stats(
     total_pnl = _finite_or_undefined(total_pnl, "total_pnl", undefined_metrics)
     total_return = _finite_or_undefined(total_return, "total_return", undefined_metrics)
 
+    # A metric named in `undefined_metrics` must publish null, not the 0.0
+    # its local variable initialised to: ranking and the cross-platform
+    # parity check read the value, and a fabricated 0.0 is a measurement
+    # they cannot distinguish from an honest zero (#349 review).
+    # p_value keeps its pinned 1.0 default: "no evidence against the null"
+    # is a conservative publication, unlike a fabricated 0.0 ratio.
+    if "sharpe_ratio" in undefined_metrics:
+        sharpe_ratio = None
+    if "sortino_ratio" in undefined_metrics:
+        sortino_ratio = None
+    if "psr" in undefined_metrics:
+        psr = None
+    if "cagr" in undefined_metrics:
+        cagr = None
+    if "calmar_ratio" in undefined_metrics:
+        calmar_ratio = None
+    if "max_drawdown_pct" in undefined_metrics:
+        max_drawdown_pct = None
+
     return BacktestStats(
         total_trades=total_trades,
         winners=win_count,
@@ -312,11 +376,116 @@ def compute_stats(
             "equity_return_frequency": _describe_return_frequency(
                 return_frequency, return_frequency_reason
             ),
+            # #229: the annualisation convention Sharpe/Sortino were
+            # computed with — 252 for equities/FX/CFDs, 365 for an all-crypto
+            # (24/7) book, from the asset-class classification. Rows written
+            # before this field existed used the old fixed sqrt(252) on the
+            # unfiltered calendar-filled series.
+            "equity_return_periods_per_year": (
+                round(annualization_periods, 4)
+                if daily_return_series is not None
+                else None
+            ),
             "duplicate_equity_timestamps": duplicate_timestamp_count,
             "ruined": ruined,
             "ruin_time": ruin_time,
         },
     ).to_dict()
+
+
+def _book_asset_class(
+    meta_data: dict[str, Any],
+    execution_context: dict[str, Any],
+    symbols: list[str],
+    data_source: str | None,
+    data_dir: str | Path | None,
+) -> str | None:
+    """Best-effort book-level asset class for the Sharpe convention (#229).
+
+    Explicit ``asset_class`` metadata wins. Otherwise the class is recovered
+    from the documented ``ohlcv/{source}/{asset_class}/...`` layout via
+    ``runner.engines.contract`` — the same classification the data path
+    itself carries. A book only gets a class when EVERY symbol resolves to
+    the same one; a mixed or partially unresolvable book returns ``None``
+    so the venue calendar falls back to per-symbol shape heuristics instead
+    of applying one class to instruments it does not describe.
+    """
+    explicit = meta_data.get("asset_class") or execution_context.get("asset_class")
+    if explicit:
+        return str(explicit)
+    if not data_dir or not symbols:
+        return None
+
+    timeframes = meta_data.get("timeframes") or []
+    classes: set[str] = set()
+    for symbol in symbols:
+        symbol_class = ""
+        for timeframe in timeframes or [""]:
+            resolved = _ohlcv_asset_class_for(
+                str(data_dir), symbol, timeframe, data_source or ""
+            )
+            if resolved is None:
+                continue
+            symbol_class = resolved
+            break
+        if not symbol_class:
+            return None
+        classes.add(symbol_class)
+    return classes.pop() if len(classes) == 1 else None
+
+
+@lru_cache(maxsize=8192)
+def _ohlcv_asset_class_for(
+    data_dir: str, symbol: str, timeframe: str, data_source: str
+) -> str | None:
+    """Asset class carried by the selected OHLCV parquet path.
+
+    ``None`` means no candidate path resolved (try the next timeframe);
+    ``""`` means a path resolved but carries no class; any other value is
+    the ``ohlcv/{source}/{asset_class}/...`` layout's class segment. The
+    lookup walks the data tree, so it is cached — optimizer loops call this
+    once per trial per symbol. The cache is process-local: OHLCV downloaded
+    while a long-lived viewer/daemon process runs is not seen until restart.
+    """
+    from runner.engines.contract import ohlcv_path_metadata, select_ohlcv_path
+
+    try:
+        path, _candidates = select_ohlcv_path(
+            data_dir, symbol, timeframe, data_source=data_source
+        )
+    except Exception:
+        return None
+    if path is None:
+        return None
+    return ohlcv_path_metadata(path).get("asset_class", "")
+
+
+def _result_venue_context(result: BacktestResult) -> dict[str, Any]:
+    """Venue/asset-class context a persisted result carries for stats (#229).
+
+    ``execution_context`` is written by the CLI at run time; top-level
+    ``meta.data`` fields are the fallback for artifacts that predate it.
+    """
+    meta_data = result.meta.data or {}
+    execution_context = meta_data.get("execution_context") or {}
+    symbols = (
+        execution_context.get("symbols")
+        or meta_data.get("symbols")
+        or [trade.symbol for trade in result.trades if getattr(trade, "symbol", "")]
+    )
+    symbol_list = [str(symbol) for symbol in (symbols or []) if str(symbol or "").strip()]
+    data_source = (
+        execution_context.get("data_source") or meta_data.get("source") or None
+    )
+    data_dir = execution_context.get("data_dir") or meta_data.get("data_dir")
+    return {
+        "symbols": symbol_list or None,
+        "data_source": data_source,
+        "asset_class": _book_asset_class(
+            meta_data, execution_context, symbol_list, data_source, data_dir
+        ),
+        "data_dir": data_dir,
+    }
 
 
 def compute_stats_for_result(
@@ -330,6 +499,7 @@ def compute_stats_for_result(
         risk_free_rate=risk_free_rate,
         backtest_start=result.meta.backtest_start or None,
         backtest_end=result.meta.backtest_end or None,
+        **_result_venue_context(result),
     )
 
 
@@ -405,9 +575,7 @@ def _as_readable_equity_point(point: EquityPoint) -> EquityPoint:
     return EquityPoint(time=point.time, equity=equity)
 
 
-def _finite_or_undefined(
-    value: float, metric: str, undefined_metrics: set[str]
-) -> float | None:
+def _finite_or_undefined(value: float, metric: str, undefined_metrics: set[str]) -> float | None:
     """``value`` when it is a finite measurement, else ``None`` named undefined.
 
     Non-finite is absence, not a number: NaN/inf cannot be stored in the stats
@@ -488,12 +656,29 @@ def _equity_to_returns_series(equity_curve: list[EquityPoint]) -> pd.Series | No
     return returns.replace([math.inf, -math.inf], pd.NA).dropna()
 
 
-def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> pd.Series | None:
+def _daily_returns_series_from_equity_curve(
+    equity_curve: list[EquityPoint],
+    *,
+    trading_dates: set[dt.date] | None = None,
+) -> pd.Series | None:
     """Convert any equity curve cadence into daily close-to-close returns.
 
     Sharpe, Sortino, PSR and p-values are reported on daily observations.  For
     intraday curves this avoids treating every bar as a full annualization
     period and prevents dense bar spacing from changing the metric definition.
+
+    ``trading_dates`` (#229) drops calendar-filled rows — weekend/holiday
+    days the venue was closed, whose forward-filled equity can only produce
+    a zero return — before the ratios are computed. ``None`` keeps every
+    calendar day.
+
+    The filter is applied to the equity LEVELS, not the returns: a real P&L
+    print on a venue-closed UTC day (an FX book's Sunday-evening session, or
+    weekend crypto inside a mixed book) must fold into the next trading
+    day's return rather than be deleted, so the filtered series still
+    compounds to the run's total return. The last observed day is always
+    kept — a curve ending mid-session carries that day's P&L even though
+    the venue's daily bar has not closed yet.
     """
     if len(equity_curve) < 2:
         return None
@@ -506,6 +691,13 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
         series = pd.Series(equities, index=timestamps, dtype=float).sort_index(kind="stable")
         series = series.groupby(level=0).last()
         daily_equity = series.resample("D").last().ffill()
+        if trading_dates is not None:
+            last_observed_day = daily_equity.index[-1]
+            keep = [
+                timestamp.date() in trading_dates or timestamp == last_observed_day
+                for timestamp in daily_equity.index
+            ]
+            daily_equity = daily_equity.loc[keep]
         previous = daily_equity.shift(1)
         # The curve's first observation is the OPENING equity of its first day,
         # and therefore the base of that day's return. Resampling to the last
@@ -519,7 +711,13 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
         # measure and must not be given a synthetic flat one.
         first_day = series.index[0].normalize()
         observations_on_first_day = int((series.index.normalize() == first_day).sum())
-        if observations_on_first_day >= 2 and daily_equity.index[0] == first_day:
+        if daily_equity.index[0] == first_day:
+            if observations_on_first_day >= 2:
+                previous.iloc[0] = float(series.iloc[0])
+        else:
+            # The first kept day is not the curve's first day (leading
+            # venue-closed days were filtered out): measure its return from
+            # the curve's opening equity so P&L accrued before it is not lost.
             previous.iloc[0] = float(series.iloc[0])
         returns = (daily_equity - previous) / previous
         returns.loc[previous <= 0] = pd.NA
@@ -532,6 +730,117 @@ def _daily_returns_series_from_equity_curve(equity_curve: list[EquityPoint]) -> 
     if raw_returns is None or raw_returns.empty:
         return None
     return raw_returns
+
+
+def _resolve_return_convention(
+    *,
+    equity_curve: list[EquityPoint],
+    symbols: list[str] | tuple[str, ...] | None,
+    data_source: str | None,
+    asset_class: str | None,
+    data_dir: str | Path | None,
+) -> tuple[float, set[dt.date] | None]:
+    """Sharpe/Sortino annualisation convention for this equity curve (#229).
+
+    Returns ``(periods_per_year, trading_dates)``: the calendar days that
+    count as trading days — weekend/holiday rows in the calendar-filled
+    daily series are dropped before the ratios are computed — and the
+    annualisation factor applied to the surviving returns.
+
+    Per the maintainer decision (2026-11-22): 365 for a 24/7 crypto book,
+    252 for equities/FX/CFDs. Asset class comes from the existing
+    classification — ``shared.venue_calendar.resolve_venue_calendar`` applied
+    to the run's symbols, source and asset-class metadata. A book annualises
+    at 365 only when EVERY symbol resolves to a continuous (24/7) calendar;
+    a mixed book uses 252, the conservative choice.
+
+    Trading dates are the union of each symbol's venue trading dates over
+    the curve's span: a portfolio day is real when any venue was open, so
+    only days every venue shares as closed (weekends for non-crypto books)
+    are dropped. A symbol whose venue cannot be resolved falls back to the
+    Monday–Friday grid — every non-crypto asset class is closed at least on
+    weekends, and venue_calendar's contract is that an unknown venue is
+    never treated as 24/7. A cached session calendar that does not cover
+    the whole curve is likewise not authoritative and falls back the same
+    way, so real trading days are never dropped on a partial calendar.
+
+    ``trading_dates`` is ``None`` only when the curve's timestamps cannot be
+    parsed — the return series is undefined then anyway.
+    """
+    normalized_symbols = [
+        str(symbol).strip().upper()
+        for symbol in (symbols or [])
+        if str(symbol or "").strip()
+    ]
+    normalized_symbols = list(dict.fromkeys(normalized_symbols))
+
+    calendars: list[venue_calendar.VenueCalendar | None] = []
+    for symbol in normalized_symbols:
+        try:
+            calendars.append(
+                venue_calendar.resolve_venue_calendar(
+                    symbol=symbol,
+                    asset_class=asset_class,
+                    source=data_source,
+                    data_dir=str(data_dir) if data_dir else "",
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Venue calendar resolution failed for %s", symbol, exc_info=True
+            )
+            calendars.append(None)
+
+    all_crypto = bool(normalized_symbols) and all(
+        isinstance(calendar, venue_calendar.ContinuousCalendar)
+        for calendar in calendars
+    )
+    periods = (
+        CRYPTO_RETURN_PERIODS_PER_YEAR if all_crypto else DAILY_RETURN_PERIODS_PER_YEAR
+    )
+
+    try:
+        stamps = pd.to_datetime(
+            [point.time for point in equity_curve],
+            utc=True,
+            errors="coerce",
+            format="mixed",
+        )
+        first_ts = pd.Timestamp(stamps.min())
+        last_ts = pd.Timestamp(stamps.max())
+        start = first_ts.normalize()
+        end = last_ts.normalize()
+    except Exception:
+        return periods, None
+    if pd.isna(first_ts) or pd.isna(last_ts):
+        return periods, None
+
+    # ``daily_bar_dates`` is close-aware for the session calendars (an FX or
+    # broker daily bar only exists once its window has CLOSED), so it must
+    # see the curve's real first/last instants — a normalized midnight end
+    # would silently drop the final trading day's return.
+    first_ts = first_ts.tz_localize("UTC") if first_ts.tzinfo is None else first_ts
+    last_ts = last_ts.tz_localize("UTC") if last_ts.tzinfo is None else last_ts
+
+    trading_dates: set[dt.date] = set()
+    entries = normalized_symbols or [""]
+    for _symbol, calendar in zip(
+        entries,
+        calendars + [None] * (len(entries) - len(calendars)),
+        strict=True,
+    ):
+        if calendar is not None and calendar.covers_window(first_ts, last_ts):
+            trading_dates.update(calendar.daily_bar_dates(first_ts, last_ts))
+        else:
+            # Unknown venue: never treated as 24/7 — keep the Monday–Friday
+            # grid so weekends are still recognised as closed.
+            day = start.date()
+            last = end.date()
+            while day <= last:
+                if day.weekday() < 5:
+                    trading_dates.add(day)
+                day += dt.timedelta(days=1)
+    return periods, trading_dates
 
 
 def _net_trade_pnl(trade: Trade) -> float:
@@ -589,14 +898,10 @@ def _resolve_backtest_period_bounds(
     carries no usable timestamps.
     """
     configured_start = (
-        pd.to_datetime(backtest_start, utc=True, errors="coerce")
-        if backtest_start
-        else pd.NaT
+        pd.to_datetime(backtest_start, utc=True, errors="coerce") if backtest_start else pd.NaT
     )
     configured_end = (
-        pd.to_datetime(backtest_end, utc=True, errors="coerce")
-        if backtest_end
-        else pd.NaT
+        pd.to_datetime(backtest_end, utc=True, errors="coerce") if backtest_end else pd.NaT
     )
     if (
         not pd.isna(configured_start)
@@ -735,6 +1040,7 @@ def _empty_stats(risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict[str, An
                 "p_value",
             ],
             "equity_return_frequency": "none",
+            "equity_return_periods_per_year": None,
             "duplicate_equity_timestamps": 0,
             "ruined": False,
             "ruin_time": None,
@@ -798,9 +1104,15 @@ def _daily_returns(equities: list[float]) -> list[float]:
     return returns
 
 
-def _daily_returns_from_equity_curve(equity_curve: list[EquityPoint]) -> list[float]:
+def _daily_returns_from_equity_curve(
+    equity_curve: list[EquityPoint],
+    *,
+    trading_dates: set[dt.date] | None = None,
+) -> list[float]:
     """Compute daily returns from an equity curve, falling back to raw period returns."""
-    daily_series = _daily_returns_series_from_equity_curve(equity_curve)
+    daily_series = _daily_returns_series_from_equity_curve(
+        equity_curve, trading_dates=trading_dates
+    )
     if daily_series is not None and not daily_series.empty:
         return [float(value) for value in daily_series.tolist() if pd.notna(value)]
 
@@ -828,7 +1140,7 @@ def _one_sided_p_value(returns: list[float]) -> float:
 
 def _period_risk_free_rate(
     risk_free_rate: float,
-    periods: int = DAILY_RETURN_PERIODS_PER_YEAR,
+    periods: float = DAILY_RETURN_PERIODS_PER_YEAR,
 ) -> float:
     """Convert an annual risk-free rate to a per-period rate.
 
@@ -843,40 +1155,41 @@ def _period_risk_free_rate(
 def _sharpe_manual(
     returns: list[float],
     risk_free_rate: float,
+    *,
+    periods_per_year: float,
 ) -> float:
     """Annualized Sharpe ratio, definitionally identical to quantstats.
 
     Excess returns are ``r - rf_period``; the dispersion is the sample
     standard deviation (ddof=1, i.e. ``pandas.Series.std()``); the ratio is
-    scaled by ``sqrt(252)``.
+    scaled by ``sqrt(periods_per_year)``.
 
-    There is deliberately no ``annualization_factor`` parameter. It used to
-    default to ``sqrt(252)`` and be passed ``1.0`` on the raw-period fallback
-    path (equity timestamps unresolvable), which silently published a
-    *per-observation* ratio under the name "Sharpe" — a daily 3.2 was reported
-    as 0.20 — while the docstring still claimed the function was definitionally
-    identical to the quantstats path. The knob only ever had one correct value,
-    so it is gone: ADR D5 requires ONE definition per metric on both code
-    paths, and a machine whose equity timestamps do not parse must publish the
-    same Sharpe as one whose timestamps do. The period assumption the fallback
-    cannot verify is reported through
-    ``extras.equity_return_frequency`` instead of being applied to the number.
+    ``periods_per_year`` is the asset-class annualisation convention
+    resolved by ``_resolve_return_convention`` (#229 maintainer decision
+    2026-11-22): 252 for equities/FX/CFDs, 365 for an all-crypto (24/7)
+    book. It is a required keyword — a silent fixed-252 default is exactly
+    the convention that understated 24/7 Sharpes by sqrt(252/365), and a
+    silent fixed-365 default would overstate business-day books by
+    sqrt(365/252). ``DAILY_RETURN_PERIODS_PER_YEAR`` remains only as the
+    named fallback for callers that cannot classify the book.
     """
     if len(returns) < 2:
         return 0.0
-    period_rf = _period_risk_free_rate(risk_free_rate)
+    period_rf = _period_risk_free_rate(risk_free_rate, periods=periods_per_year)
     excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
     variance = sum((value - mean_excess) ** 2 for value in excess) / (len(excess) - 1)
     std = math.sqrt(variance) if variance > 0 else 0
     if std == 0:
         return 0.0
-    return (mean_excess / std) * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+    return (mean_excess / std) * math.sqrt(periods_per_year)
 
 
 def _sortino_manual(
     returns: list[float],
     risk_free_rate: float,
+    *,
+    periods_per_year: float,
 ) -> float:
     """Annualized Sortino ratio, definitionally identical to quantstats.
 
@@ -888,19 +1201,20 @@ def _sortino_manual(
     the excess returns, is a different ratio that does not match the
     quantstats path.
 
-    Like :func:`_sharpe_manual` there is no ``annualization_factor``: the
-    ratio is always scaled by ``sqrt(252)``.
+    Like :func:`_sharpe_manual` the annualisation is the asset-class
+    ``periods_per_year`` convention (252 equities/FX/CFDs, 365 crypto),
+    never a silent fixed value.
     """
     if len(returns) < 2:
         return 0.0
-    period_rf = _period_risk_free_rate(risk_free_rate)
+    period_rf = _period_risk_free_rate(risk_free_rate, periods=periods_per_year)
     excess = [float(value) - period_rf for value in returns]
     mean_excess = sum(excess) / len(excess)
     downside_variance = sum(min(value, 0.0) ** 2 for value in excess) / len(excess)
     downside_std = math.sqrt(downside_variance) if downside_variance > 0 else 0
     if downside_std == 0:
         return 0.0
-    return (mean_excess / downside_std) * math.sqrt(DAILY_RETURN_PERIODS_PER_YEAR)
+    return (mean_excess / downside_std) * math.sqrt(periods_per_year)
 
 
 def _probabilistic_sharpe(
@@ -955,13 +1269,19 @@ def _psr_formula(sr: float, sr_bench: float, n: int, skew: float, kurt: float) -
     return float(_norm_dist.cdf(z))
 
 
-def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] | None:
+def daily_returns_moments(
+    equity_curve: list[EquityPoint],
+    *,
+    trading_dates: set[dt.date] | None = None,
+) -> dict[str, float] | None:
     """Moments of the daily returns, as the deflated Sharpe ratio needs them.
 
     Uses the same conventions as :func:`_probabilistic_sharpe` (sample
     standard deviation, pandas sample skewness, pandas excess kurtosis + 3),
     so a deflated Sharpe built from these moments with a single trial equals
-    the PSR reported in the stats.
+    the PSR reported in the stats. ``trading_dates`` applies the same
+    calendar-filled-row drop the canonical stats use (#229), keeping the
+    DSR moments on the identical observation set.
 
     Returns ``None`` when the moments are undefined: fewer than four daily
     returns (sample kurtosis needs four), or a standard deviation that is zero
@@ -972,7 +1292,9 @@ def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] |
     - ``skew``: skewness (normal = 0)
     - ``kurtosis``: non-excess kurtosis (normal = 3)
     """
-    returns = _daily_returns_series_from_equity_curve(equity_curve)
+    returns = _daily_returns_series_from_equity_curve(
+        equity_curve, trading_dates=trading_dates
+    )
     if returns is None or len(returns) < 2:
         return None
     std_r = float(returns.std())
@@ -989,3 +1311,22 @@ def daily_returns_moments(equity_curve: list[EquityPoint]) -> dict[str, float] |
         "skew": skew,
         "kurtosis": kurtosis,
     }
+
+
+def daily_returns_moments_for_result(
+    result: BacktestResult,
+) -> dict[str, float] | None:
+    """``daily_returns_moments`` on a result's own venue context (#229).
+
+    Resolves the same trading-day grid ``compute_stats_for_result`` uses, so
+    the deflated-Sharpe moments describe the identical observation set as the
+    reported PSR.
+    """
+    equity_curve = result.equity_curve or []
+    if not equity_curve:
+        return None
+    context = _result_venue_context(result)
+    _periods, trading_dates = _resolve_return_convention(
+        equity_curve=equity_curve, **context
+    )
+    return daily_returns_moments(equity_curve, trading_dates=trading_dates)
