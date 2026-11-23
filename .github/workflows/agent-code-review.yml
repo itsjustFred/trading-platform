@@ -85,7 +85,7 @@ concurrency:
 
 env:
   OPENCODE_VERSION: "2.2.7"
-  MODEL: nvidia/nvidia/nemotron-3-ultra-550b-a55b  # TEMP: PR-only NVIDIA trial, reverted before merge
+  MODEL: ${{ vars.REVIEW_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.REVIEW_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
 
