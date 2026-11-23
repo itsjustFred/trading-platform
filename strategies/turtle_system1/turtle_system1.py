@@ -122,7 +122,7 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
 
     entries = [False] * size
     exits = [False] * size
-    direction = [None] * size
+    direction: list[str | None] = [None] * size
     stop_loss = [math.nan] * size
 
     # actual position state: list of unit stops, side, last reference/N

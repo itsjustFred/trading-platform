@@ -83,6 +83,9 @@ def build_config(
         parameters["fee_flat_per_trade"] = fee_flat
     else:
         parameters["fees"] = "zero"
+    # #130: parity references are gross fills; declare the explicit opt-out
+    # rather than inherit the per-class slippage default.
+    parameters.setdefault("slippage", "none")
     return BacktestConfig(
         strategy_name="parity",
         symbols=[_symbol_for(timeframe)],
