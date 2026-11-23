@@ -1926,6 +1926,7 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     printf 'OK\\n'
     exit 0
     ;;
+  ok-quota-out) printf 'OK\\nFree usage limit reached for this model\\n'; exit 0 ;;
 esac
 """
 
@@ -2038,6 +2039,12 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
     result, written = _run_probe_step(tmp_path, "nvidia-429")
     assert result.returncode == 0, f"probe step failed on nvidia-429: {result.stderr}"
     assert "available=false" in written, "an NVIDIA 429 that outlasted the retries ran the agent"
+    result, written = _run_probe_step(tmp_path, "ok-quota-out")
+    assert result.returncode == 0, f"probe step failed on ok-quota-out: {result.stderr}"
+    assert "available=false" in written, (
+        "a cap signature on stdout next to an OK cleared the agent job - only stderr's retry "
+        "lines are excused"
+    )
     result, written = _run_probe_step(tmp_path, "nvidia-retry-ok")
     assert result.returncode == 0, f"probe step failed on nvidia-retry-ok: {result.stderr}"
     assert "available=true" in written and "available=false" not in written, (
@@ -2168,6 +2175,40 @@ def _provider_choice(body: str) -> str:
     """The `if [ "${MODEL%%/*}" = ... ]; then ... fi` block a config step writes."""
     start = body.index('if [ "${MODEL%%/*}" = "kilo" ]; then\n')
     return body[start : body.index("\nfi\n", start) + 4]
+
+
+@needs_bash
+@pytest.mark.parametrize("name", AGENT_WORKFLOWS)
+def test_a_model_without_a_provider_or_an_id_stops_with_its_name(name, tmp_path) -> None:
+    """MODEL is provider/model. `nvidia/` (empty id) or a bare `nvidia` would reach opencode
+    as a model it cannot resolve - a cryptic failure; both config steps stop first."""
+    data = _load(name)
+    steps = [
+        step
+        for job in data["jobs"].values()
+        for step in _steps(job)
+        if "opencode.json" in _run(step)
+    ]
+    for step in steps:
+        for model in ("nvidia/", "nvidia", "kilo/", ""):
+            label = f"{step['name']}-{model or 'empty'}"
+            home = tmp_path / label.replace("/", "_").replace(" ", "-")
+            home.mkdir()
+            script = home / "configure.sh"
+            script.write_text(_run(step), encoding="utf-8")
+            env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high",
+                   "RUNNER_TEMP": str(home)}
+            result = subprocess.run(
+                [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True,
+                text=True, cwd=home,
+            )
+            assert result.returncode == 1, f"{name}/{step['name']}: accepted MODEL={model!r}"
+            assert "is not provider/model" in result.stdout, (
+                f"{name}/{step['name']}: MODEL={model!r} failed without naming why"
+            )
+            assert not (home / ".config" / "opencode" / "opencode.json").exists(), (
+                f"{name}/{step['name']}: wrote a config for MODEL={model!r}"
+            )
 
 
 def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
