@@ -36,7 +36,9 @@ fraction-valued exposure field: it is the broker maximum leverage for the
 account/asset. An unset value means an unknown maximum, and the fallback is
 per engine: native clamps to 1x (#347), while the vectorbt and pynecore
 adapters resolve it through `runner.engines._shared.resolve_max_leverage`
-to 2.0x.
+to 2.0x for the aggregate — and, since #387, both refuse a
+`max_position_exposure_pct` above 1 rather than honouring per-position
+leverage the aggregate rule cannot see.
 
 | Name | Layer | Meaning (Decision Record, verbatim) |
 |---|---|---|
@@ -116,6 +118,16 @@ documented here.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.
+  Signal replay additionally applies the same aggregate free-margin rule
+  as the native engine (#240/#347): total open notional — each position
+  marked at its symbol's latest close — may not exceed
+  `equity × max_leverage`, where `L` is the operator-declared
+  `max_leverage`. **When `max_leverage` is unset the aggregate bound
+  fails closed to 1× equity**: a multi-position replay with default
+  settings (`max_notional_per_trade` ≤ 1, `max_positions` > 1) can
+  therefore refuse or clamp later entries that earlier versions would
+  have taken — there was no aggregate bound in replay before #387.
+  This matches the native engine's unset-`max_leverage` → 1× behaviour.
 
 ## Fill prices feeding sizing and PnL (owner decision 2026-11-13)
 

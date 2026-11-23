@@ -499,6 +499,71 @@ def test_replay_aggregate_open_notional_bounded_by_declared_leverage() -> None:
     assert result.meta.parameters["effective_max_leverage"] == 3.0
 
 
+def test_free_margin_cap_marks_open_positions_at_latest_close() -> None:
+    """#240 review: the aggregate cap marks open notional at each symbol's
+    latest close at/before ``as_of``, not at the entry price — a mutant
+    marking at entry understates used margin and over-allocates the next
+    entry once the open position has gained."""
+    from runner.engines.signal_replay_adapter import _OpenPosition
+
+    adapter = SignalReplayAdapter(
+        risk_config=RiskConfig(
+            max_risk_per_trade=0.01,
+            max_total_exposure=0.05,
+            max_positions=5,
+        ),
+        max_leverage=1.0,
+        initial_capital=100_000.0,
+        default_timeframe="1m",
+        fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
+    )
+    timestamps = pd.date_range("2026-01-01T00:00:00Z", periods=4, freq="1min")
+    frame = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100.0, 140.0, 150.0, 150.0],
+            "high": [110.0, 145.0, 155.0, 150.0],
+            "low": [95.0, 135.0, 148.0, 149.0],
+            "close": [100.0, 140.0, 150.0, 150.0],
+            "volume": [1000, 1000, 1000, 1000],
+        }
+    )
+    position = _OpenPosition(
+        symbol="AAA",
+        direction="LONG",
+        entry_time=timestamps[0],
+        entry_bar_index=0,
+        entry_price=100.0,
+        signal_entry_price=100.0,
+        quantity=1000.0,
+        stop_loss=None,
+        take_profit=None,
+        initial_stop_loss=None,
+        initial_take_profit=None,
+        risk_amount=None,
+        risk_percent=None,
+        timeframe="1m",
+        source="internal",
+        signal_time=timestamps[0],
+        signal_metadata={},
+        last_checked_at=timestamps[1],
+    )
+
+    cap = adapter._free_margin_quantity_cap(
+        open_positions={"AAA": position},
+        frames={"AAA": frame},
+        as_of=timestamps[-1],
+        equity=200_000.0,
+        entry_price=100.0,
+    )
+
+    # Open notional marked at the latest close (150): 1000 * 150 = 150k.
+    # Available = equity * L - open_notional = 200k - 150k = 50k -> 500 units.
+    # Marking at the entry price (100) would wrongly allow 1000 units.
+    assert cap == pytest.approx(500.0)
+
+
 def test_replay_aggregate_open_notional_bounded_at_one_x_when_leverage_unset() -> None:
     """#240: an undeclared broker maximum fails closed — the aggregate open
     notional stays within 1x equity, so the second entry is refused."""
