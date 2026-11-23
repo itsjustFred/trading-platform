@@ -109,6 +109,7 @@ GUARDED_SCRIPTS=(
     scripts/regenerate_qc_risk_parity_artifact.py
     scripts/run_risk_parity_backtest.py
     scripts/seed_demo_backtests.py
+    scripts/signal_archive_market_features.py
 )
 
 run_one "guarded scripts lint (ruff --select F)" \
