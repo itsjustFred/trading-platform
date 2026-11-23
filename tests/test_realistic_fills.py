@@ -387,7 +387,7 @@ class TestNativeSignalExitNextOpen:
 
     def test_open_mode_is_removed_and_fails_loudly(self):
         # Issue #153: filling a signal exit at the signal bar's own open is a lookahead.
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             _native(self.ROWS, exit_bar=3, signal_exit_fill="open")
 
     def test_execution_model_metadata_records_the_exit_rules(self):

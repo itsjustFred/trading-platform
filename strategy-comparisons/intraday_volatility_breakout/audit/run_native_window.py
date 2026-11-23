@@ -34,11 +34,14 @@ for entry in (str(REPO), str(HERE)):
         sys.path.insert(0, entry)
 
 import score_parity as sp  # noqa: E402
+
 from runner.engine import TradeEngine  # noqa: E402
 from runner.engines.base import BacktestConfig  # noqa: E402
 from shared.broker_clock import resolve_broker_clock  # noqa: E402
 
-DEFAULT_STRATEGY = REPO / "strategies" / "intraday_volatility_breakout" / "intraday_volatility_breakout.py"
+DEFAULT_STRATEGY = (
+    REPO / "strategies" / "intraday_volatility_breakout" / "intraday_volatility_breakout.py"
+)
 DEFAULT_REFERENCES = pathlib.Path("/home/ubuntu/trading-platform-references")
 CASES = {
     "eurusd": ("mt5-eurusd-h1", "EURUSD_M1_*.csv", "eurusd_h1.log", "dukascopy_mt5_forex"),
@@ -152,7 +155,9 @@ def run_case(key: str, args) -> tuple[dict, pd.DataFrame]:
         artifact.write_text(json.dumps({"trades": trades}), encoding="utf-8")
         pf = sp.load_platform(artifact, key, clock_name)
     mt5 = sp.load_mt5(args.ref_dir, key)
-    first, last = clock.to_server_time(pd.DatetimeIndex([frame["timestamp"].min(), frame["timestamp"].max()]))
+    first, last = clock.to_server_time(
+        pd.DatetimeIndex([frame["timestamp"].min(), frame["timestamp"].max()])
+    )
     window = (mt5["entry_server"] >= first) & (mt5["entry_server"] <= last)
     mt5 = mt5[window].reset_index(drop=True)
     summary, merged = sp.score(key, mt5, pf)

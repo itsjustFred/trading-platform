@@ -28,9 +28,9 @@ from runner.engine_pkg._time import to_iso_utc
 from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
+from runner.engines import contract
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
-from runner.engines import contract
 from runner.engines.contract import (
     EXIT_LEVEL_GAPPED,
     EXIT_LEVEL_UNREACHABLE,

@@ -130,7 +130,7 @@ class TestSignalExitFill:
     def test_signal_exit_fill_open_is_rejected(self, parity_env):
         # Issue #153: the lookahead-prone "open" mode is removed.
         path = _write_strategy(parity_env, "s_o", _strategy_text("LONG"))
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             _config(parity_env, path, signal_exit_fill="open")
 
     def test_vectorbt_engine_rejects_open_even_if_config_bypassed_validation(
@@ -140,7 +140,7 @@ class TestSignalExitFill:
         config = _config(parity_env, path)
         object.__setattr__(config, "signal_exit_fill", "open")
         # The adapter wraps per-symbol failures in a RuntimeError; the cause text stays.
-        with pytest.raises((ValueError, RuntimeError), match="removed.*next_open"):
+        with pytest.raises((ValueError, RuntimeError), match=r"removed.*next_open"):
             VectorbtAdapter().run(config, path)
 
 
@@ -299,18 +299,8 @@ class TestAskSideStops:
         """The window ends at the trigger bar's close: a stop touched only in
         the NEXT bar's sub-bars must NOT fire (the scheduled exit already
         ended at the trigger bar)."""
-        sub = pd.date_range("2024-01-01 08:00", periods=8, freq="15min", tz="UTC")
-        intrabar = pd.DataFrame(
-            {
-                "timestamp": sub,
-                "open": [100.0] * 8,
-                "high": [100.5] * 8,
-                "low": [100.0] * 7 + [98.8],  # only the 10:45 sub-bar? no: 8 bars end 09:45
-                "close": [100.0] * 8,
-            }
-        )
-        # 8 x 15min from 08:00 ends at 09:45 — inside the trigger bar. For a
-        # next-bar-only hit, extend past the trigger bar's close (10:00+).
+        # 12 x 15min from 08:00 ends at 11:00 — past the trigger bar's close
+        # (10:00), so the 10:45 sub-bar low is a next-bar-only hit.
         sub2 = pd.date_range("2024-01-01 08:00", periods=12, freq="15min", tz="UTC")
         intrabar2 = pd.DataFrame(
             {

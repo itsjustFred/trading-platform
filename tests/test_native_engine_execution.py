@@ -181,7 +181,7 @@ def test_signal_exit_fill_open_is_rejected_with_migration_message():
     # Issue #153: "open" filled a signal exit at the OPEN of the bar the exit was
     # computed from (lookahead). It is removed and must fail loudly.
     for spelling in ("open", "OPEN ", "Open"):
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             BacktestConfig(**_open_config_kwargs(signal_exit_fill=spelling))
 
 
@@ -190,7 +190,7 @@ def test_native_engine_rejects_open_even_if_config_bypassed_validation():
         **BacktestConfig(**_open_config_kwargs()).model_dump()
     )
     object.__setattr__(config, "signal_exit_fill", "open")
-    with pytest.raises(ValueError, match="removed.*next_open"):
+    with pytest.raises(ValueError, match=r"removed.*next_open"):
         TradeEngine(config, symbol="T")
 
 

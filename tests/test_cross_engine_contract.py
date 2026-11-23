@@ -1124,7 +1124,7 @@ class TestSignalExitFillOpenRemoved:
     def test_normalizer_rejects_open_with_migration_message(self, spelling):
         from runner.engines import contract
 
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             contract.normalize_signal_exit_fill(spelling)
 
     @pytest.mark.parametrize("value", ["next_open", "Close", "CLOSE "])
@@ -1137,5 +1137,5 @@ class TestSignalExitFillOpenRemoved:
         from runner.engines import vectorbt_adapter as vbt
 
         row = pd.Series({"open": 1.0, "close": 2.0})
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             vbt._resolve_exit_price(row, 0, None, signal_exit_fill="open")

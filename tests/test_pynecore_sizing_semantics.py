@@ -458,11 +458,11 @@ class TestFillParity:
     def test_signal_exit_open_is_rejected(self, tmp_path):
         # Issue #153: "open" is removed; the adapter fails loudly even when the
         # config bypassed pydantic validation.
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             _config(tmp_path, signal_exit_fill="open")
         config = _config(tmp_path)
         object.__setattr__(config, "signal_exit_fill", "open")
-        with pytest.raises(ValueError, match="removed.*next_open"):
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
             _apply_fill_parity(
                 [_trade(exit_reason="signal")],
                 _frame(),
