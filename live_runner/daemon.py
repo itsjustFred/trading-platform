@@ -165,6 +165,7 @@ from shared.database import (
     get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
+    get_live_signal_metadata,
     get_service,
     list_account_unfilled_exit_orders,
     list_live_accounts,
@@ -172,12 +173,13 @@ from shared.database import (
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
-    live_deployment_entries_halted,
     live_db_path,
+    live_deployment_entries_halted,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
     renew_live_deployment_submission,
     save_live_balance,
+    save_live_signal_rejection,
     update_service_status,
 )
 from shared.fill_keys import canonical_utc_timestamp
@@ -1007,6 +1009,7 @@ def _apply_signal_processor(
         take_profit=processed.take_profit,
         timeframe=processed.timeframe or signal.timeframe,
         metadata=metadata,
+        received_at_local=getattr(signal, "received_at_local", None),
     )
 
 
@@ -1154,6 +1157,17 @@ ENTRY_GATE_RULE_AT_STOP_LOSS = "quote_at_or_beyond_stop_loss"
 ENTRY_GATE_RULE_AT_TAKE_PROFIT = "quote_at_or_beyond_take_profit"
 ENTRY_GATE_RULE_TOWARD_STOP_LOSS = "deviation_toward_stop_loss"
 ENTRY_GATE_RULE_AWAY_FROM_STOP_LOSS = "deviation_away_from_stop_loss"
+
+#: Attribute carrying the gate's quote/deviation record on a rejection
+#: exception (#134), so the refusal can be persisted with the snapshot it was
+#: judged against. Same marker pattern as ``order_not_submitted``.
+_ENTRY_GATE_RECORD_ATTR = "_entry_gate_record"
+
+
+def _entry_gate_record(exc: BaseException) -> dict[str, object] | None:
+    """The quote record a gate rejection carries, if it carries one."""
+    record = getattr(exc, _ENTRY_GATE_RECORD_ATTR, None)
+    return record if isinstance(record, dict) else None
 
 
 def _entry_gate_rejection_rule(
@@ -1332,7 +1346,7 @@ async def _check_entry_deviation(
             "Live entry deviation gate rejected the signal",
             extra={"data": {**log_data, **record}},
         )
-        raise ValueError(
+        error = ValueError(
             f"Refusing live entry for {signal.symbol}: entry deviation gate rejected "
             f"({rule}): signed deviation {deviation:.4f} of the SL distance "
             f"(positive = toward the stop), limit +/-{max_fraction}; quote time "
@@ -1340,6 +1354,11 @@ async def _check_entry_deviation(
             f"(entry={entry_price}, stop={stop_loss}, take_profit={take_profit}, "
             f"{side}={quote_price})."
         )
+        # #134: the refusal is persisted with this record, so the quote the
+        # signal was judged against survives the rejection instead of living
+        # only in this log line.
+        setattr(error, _ENTRY_GATE_RECORD_ATTR, record)
+        raise error
     return record
 
 
@@ -2530,6 +2549,18 @@ def _trade_signal_to_live_signal(
         metadata["take_profit"] = float(signal.take_profit)
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
+    # #134: the submit/ack stamps are written by the broker path after the
+    # order returns - a payload value under these names must never survive to
+    # persistence. ``received_at_local`` is the local receipt stamp: the
+    # Discord source stamps it at parse time and the daemon carries it on the
+    # signal through the candle-close wait; any other producer could smuggle
+    # an arbitrary metadata value, so payload is never trusted here.
+    metadata.pop("order_submitted_at", None)
+    metadata.pop("broker_ack_at", None)
+    metadata["received_at_local"] = (
+        getattr(signal, "received_at_local", None)
+        or datetime.now(timezone.utc).isoformat()
+    )
     _mint_signal_idempotency_key(signal, deployment, metadata)
     if is_exit_intent(metadata):
         # A parsed exit is reduce-only whatever the deployment allows: on a
@@ -2989,6 +3020,13 @@ async def _prepare_discord_signal_for_submission(
         take_profit=trade_signal.take_profit,
         timeframe=signal_timeframe,
         metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
+        # Receipt is stamped at the daemon's first contact with the signal -
+        # before the candle-close wait - and carried on the signal, not in
+        # payload metadata, so a producer cannot smuggle an analytics stamp.
+        received_at_local=(
+            getattr(trade_signal, "received_at_local", None)
+            or datetime.now(timezone.utc).isoformat()
+        ),
     )
     try:
         # Fail closed on an already-stale signal BEFORE the candle-close wait:
@@ -3269,6 +3307,63 @@ async def _submit_internal_strategy_signal(
     )
 
 
+async def _persist_submission_rejection(
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    stage: str,
+    exc: BaseException,
+) -> None:
+    """Best-effort record of a signal refused before broker submission (#134).
+
+    Rejections are part of the cost picture: the quote snapshot and timing a
+    refused signal carried must not die with the log line. A gate rejection
+    contributes its quote record via ``_entry_gate_record``.
+
+    Never raises and never changes the refusal: a bookkeeping failure is
+    logged and the refusal stands. When the adapter already persisted a
+    ``live_signals`` row for this signal (a refusal after ``save_live_signal``),
+    that row IS the record - its NULL submit/ack stamps flag the non-submission
+    - so no second row is written.
+    """
+    try:
+        # Bounded: this runs on the refusal path, possibly inside the
+        # per-symbol exit lock, so a contended database must not delay the
+        # operator-visible log or the fan-out to sibling deployments. The two
+        # lookups share one deadline (wait_for bounds the await, not the
+        # worker thread - a stuck DB call still finishes in the background).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        existing = await asyncio.wait_for(
+            asyncio.to_thread(get_live_signal_metadata, str(live_signal.id)),
+            timeout=max(0.0, deadline - loop.time()),
+        )
+        if existing is not None:
+            return
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                save_live_signal_rejection,
+                live_signal,
+                stage=stage,
+                reason=str(exc),
+                extra_metadata=_entry_gate_record(exc),
+            ),
+            timeout=max(0.0, deadline - loop.time()),
+        )
+    except Exception:  # except-kind: loop-survival
+        logger.warning(
+            "Could not persist live signal rejection",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "stage": stage,
+                }
+            },
+            exc_info=True,
+        )
+
+
 async def _prepare_claim_and_submit_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -3325,6 +3420,9 @@ async def _prepare_claim_and_submit_signal(
         return SUBMIT_OUTCOME_IGNORED
     except ExitBelowStepError as exc:
         _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
         if decision is not None:
             decision.ignored("exit_below_step", detail=str(exc))
         return SUBMIT_OUTCOME_IGNORED
@@ -3345,6 +3443,9 @@ async def _prepare_claim_and_submit_signal(
                     "reason": str(exc),
                 }
             },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
         )
         if decision is not None:
             decision.refused("exit_in_flight", detail=str(exc))
@@ -3367,6 +3468,9 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
         return SUBMIT_OUTCOME_REFUSED
     except LossBreakerBreachError as exc:
         # The loss circuit breaker (#301) refused this entry. Nothing was sent,
@@ -3387,6 +3491,9 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
         return SUBMIT_OUTCOME_REFUSED
     except Exception as exc:  # except-kind: money-decision
         if is_exit:
@@ -3405,6 +3512,9 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
+            await _persist_submission_rejection(
+                deployment, live_signal, stage="prepare_exit", exc=exc
+            )
             if decision is not None:
                 decision.refused("exit_pre_submission_error", detail=str(exc))
             return SUBMIT_OUTCOME_REFUSED
@@ -3418,6 +3528,9 @@ async def _prepare_claim_and_submit_signal(
                     "error": str(exc),
                 }
             },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
         )
         if decision is not None:
             decision.refused("pre_submission_error", detail=str(exc))
@@ -3451,6 +3564,9 @@ async def _prepare_claim_and_submit_signal(
                         "reason": str(exc),
                     }
                 },
+            )
+            await _persist_submission_rejection(
+                deployment, live_signal, stage="prepare", exc=exc
             )
             return SUBMIT_OUTCOME_REFUSED
 
@@ -3523,6 +3639,9 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
+            await _persist_submission_rejection(
+                deployment, live_signal, stage="prepare", exc=exc
+            )
             return SUBMIT_OUTCOME_REFUSED
 
     renew_task = asyncio.create_task(
@@ -3566,6 +3685,9 @@ async def _prepare_claim_and_submit_signal(
                     _log_exit_below_step(
                         account_id, deployment, prepared_signal.symbol, exc
                     )
+                    await _persist_submission_rejection(
+                        deployment, prepared_signal, stage="submit_exit", exc=exc
+                    )
                     if decision is not None:
                         decision.ignored("exit_below_step", detail=str(exc))
                     return SUBMIT_OUTCOME_IGNORED
@@ -3590,6 +3712,12 @@ async def _prepare_claim_and_submit_signal(
                             "error": str(exc),
                         }
                     },
+                )
+                await _persist_submission_rejection(
+                    deployment,
+                    prepared_signal,
+                    stage="submit_exit" if is_exit else "submit",
+                    exc=exc,
                 )
                 if decision is not None:
                     decision.refused(

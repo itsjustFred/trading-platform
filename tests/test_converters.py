@@ -120,6 +120,29 @@ class TestLeanPairing:
         assert meta.backtest_end.startswith("2024-01-05")
         assert meta.initial_capital == 100000.0
 
+    def test_meta_signal_exit_fill_is_unset_not_next_open(self, tmp_path: Path) -> None:
+        """#208: LEAN fills come from LEAN itself — the imported meta must record
+        ``signal_exit_fill`` as unset ("not modelled by this platform"), never
+        inherit the native ``next_open`` default."""
+        from runner.converters.lean_converter import convert_lean_result
+        from shared.models import BacktestMeta
+
+        payload = _lean_payload(
+            [
+                _lean_order(1, "2024-01-01T10:00:00Z", 10.0, 100.0, tag="Entry"),
+                _lean_order(2, "2024-01-05T11:00:00Z", -10.0, 101.0, tag="Exit"),
+            ]
+        )
+        path = tmp_path / "lean.json"
+        path.write_text(json.dumps(payload))
+        meta = convert_lean_result(path).meta
+
+        assert meta.signal_exit_fill is None
+        # The unset value survives serialization as an explicit null — a
+        # missing key would be misread as the legacy "close" fill.
+        assert meta.to_dict()["signal_exit_fill"] is None
+        assert BacktestMeta.from_dict(meta.to_dict()).signal_exit_fill is None
+
 
 def test_converter_output_preserves_existing_file_on_write_failure(
     tmp_path: Path, monkeypatch
@@ -202,3 +225,18 @@ class TestStockkitConverter:
         rows = self._rows()
         rows[0]["Entry Date"] = "not-a-date"
         assert _build_trades(rows, "test") == []
+
+    def test_meta_signal_exit_fill_is_unset(self, tmp_path: Path) -> None:
+        """#208: StockKit history is an external artifact — its meta must not
+        claim the platform's ``next_open`` exit model."""
+        import csv
+
+        from runner.converters.stockkit_converter import convert_stockkit_trades
+
+        csv_path = tmp_path / "trades_history_test.csv"
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(self._rows()[0].keys()), delimiter=";")
+            writer.writeheader()
+            writer.writerows(self._rows())
+        result = convert_stockkit_trades(csv_path, strategy_name="test")
+        assert result.meta.signal_exit_fill is None

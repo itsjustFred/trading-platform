@@ -333,6 +333,15 @@ def _order_type(order: Any) -> str:
     return text.rsplit(".", 1)[-1]
 
 
+def _requested_order_qty(order: Any) -> float | None:
+    """The order's requested quantity as the broker stated it (#134).
+
+    ``qty`` on an Alpaca order is the total ordered quantity in the same
+    share/coin units the fill's ``filled_qty`` uses. ``None`` when the payload
+    does not state a usable one - never an invented quantity.
+    """
+    return _positive_finite(_order_attr(order, "qty", None))
+
 def _order_remaining_qty(order: Any) -> float | None:
     """Remaining working quantity for a broker order, when both fields are readable.
 
@@ -1339,6 +1348,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             )
             or "",
             close_side=_order_side(leg),
+            order_type=_order_type(leg) or None,
+            requested_qty=_requested_order_qty(leg),
         )
         if persisted_qty <= 0.0:
             return False
@@ -1458,6 +1469,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     dedupe_key=(
                         f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
                     ),
+                    order_type=_order_type(order) or None,
+                    requested_qty=_requested_order_qty(order),
                 )
                 persisted_qty = await asyncio.to_thread(
                     save_live_execution_up_to_cumulative,
@@ -2063,12 +2076,19 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         self,
         canonical_signal_id: str,
         broker_order_id: str,
+        *,
+        submitted_at: datetime | None = None,
+        acknowledged_at: datetime | None = None,
     ) -> None:
         normalized_order_id = _normalize_broker_order_id(broker_order_id)
         if normalized_order_id is None:
             raise RuntimeError("Alpaca order response has no valid broker order id.")
         persisted = await asyncio.to_thread(
-            set_live_signal_broker_order_id, canonical_signal_id, normalized_order_id
+            set_live_signal_broker_order_id,
+            canonical_signal_id,
+            normalized_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
         )
         if not persisted:
             raise RuntimeError("Failed to persist Alpaca broker order id.")
@@ -2225,7 +2245,13 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 market_request_cls=market_request_cls,
                 client_order_id=canonical_signal_id,
             )
+        # #134: bracket the broker call with the order-timing stamps. The
+        # values are captured here, in memory, and persisted with the order id
+        # once the broker answers - never written speculatively before the
+        # request, so a lost response cannot fabricate a submission record.
+        submitted_at = datetime.now(timezone.utc)
         order = await asyncio.to_thread(trading_client.submit_order, order_data=request)
+        acknowledged_at = datetime.now(timezone.utc)
         # #144: a bracket's legs are child orders with their own broker order ids, and Alpaca
         # reports them nested in the parent it just created. Learning them here means a leg's
         # fill is attributed to this signal even if it arrives before the first reconciliation
@@ -2237,7 +2263,12 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 "Alpaca order response carried no valid positive broker order id "
                 f"(signal_id={signal.id}, symbol={signal.symbol})."
             )
-        await self._persist_submitted_order_id(canonical_signal_id, broker_order_id)
+        await self._persist_submitted_order_id(
+            canonical_signal_id,
+            broker_order_id,
+            submitted_at=submitted_at,
+            acknowledged_at=acknowledged_at,
+        )
         logger.info(
             "Submitted Alpaca live order",
             extra={
@@ -4088,6 +4119,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
             # The leg's own side, cross-checked against the side the parent's action implies: a
             # leg that would extend the position is refused, not recorded.
             close_side=_order_side(order),
+            order_type=_order_type(order) or None,
+            requested_qty=_requested_order_qty(order),
         )
         logger.info(
             (
@@ -4284,6 +4317,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                 timestamp=fill_ts,
                 broker_order_id=broker_order_id,
                 dedupe_key=dedupe_key,
+                order_type=_order_type(order) or None,
+                requested_qty=_requested_order_qty(order),
             )
             persisted_qty = await self._persist_execution_fill(
                 execution, broker_cumulative_filled_qty

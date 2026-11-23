@@ -36,6 +36,23 @@ class TestResolveFeeModel:
         model = resolve_fee_model({"fee_rate": 0.001})
         assert model.fee_for_trade(100.0, 100.0, 5.0) == pytest.approx(1.0)
 
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("fee_rate", -0.001),
+            ("fee_rate", float("nan")),
+            ("fee_rate", float("inf")),
+            ("fee_rate", float("-inf")),
+            ("fee_flat_per_trade", -1.0),
+            ("fee_flat_per_trade", float("nan")),
+            ("fee_flat_per_trade", float("inf")),
+            ("fee_flat_per_trade", float("-inf")),
+        ],
+    )
+    def test_invalid_rate_keys_are_rejected(self, key: str, value: float) -> None:
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            resolve_fee_model({key: value})
+
     def test_explicit_model_passes_through(self) -> None:
         sentinel = ZeroFeeModel()
         assert resolve_fee_model({"fee_model": sentinel}) is sentinel

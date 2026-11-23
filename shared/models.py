@@ -488,6 +488,16 @@ class LiveExecution(BaseModel):
     # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
+    # Order context for the slippage decomposition (#134). `order_type` is the
+    # broker's own type label for the order this fill belongs to (e.g.
+    # "market", "MARKET", "LIMIT"); `requested_qty` is the quantity the order
+    # asked for, in the same qty units as `filled_qty`, so a row can show
+    # requested vs filled without joining back to the order. Both are read
+    # from the broker payload when it states them and stay ``None`` when it
+    # does not - a fill is never given an invented order type or quantity.
+    order_type: str | None = None
+    requested_qty: float | None = None
+
     @field_validator("commission", mode="before")
     @classmethod
     def _commission_is_a_non_negative_cost(cls, value: float | None) -> float | None:
@@ -845,10 +855,15 @@ class BacktestMeta:
     max_position_exposure_pct: float | None = None
     max_leverage: float | None = None
     modeling_resolution: str = "main_timeframe"
-    # Owner decision 2026-11-13: signal exits fill at the next bar's open. The
-    # persisted key is ALWAYS written (see to_dict) because records without it
-    # predate that decision and were produced under the legacy "close" fill.
-    signal_exit_fill: str = "next_open"
+    # Fill convention for signal-driven exits, as simulated by the engine that
+    # produced the record. ``None`` means "not modelled by this platform" —
+    # imported/external results (LEAN, StockKit, QC/validation imports, demo
+    # seeds) whose exit fills come from the source system, not from a platform
+    # engine, must NOT inherit the native ``next_open`` default. Engines that
+    # simulate the fills record the mode explicitly; ``BacktestMeta.to_dict``
+    # always writes the key (``null`` when unset) so a missing key keeps its
+    # legacy ``"close"`` meaning for pre-2026-11-13 records.
+    signal_exit_fill: str | None = None
     allow_fallback_stop: bool = True
     reject_missing_stop: bool = False
     require_explicit_column_roles: bool = False
