@@ -5824,14 +5824,16 @@ def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
     )
 
 
-def _calculate_realized_live_pnl(
+def _iter_live_position_fills(
     rows: list[dict[str, Any]],
-) -> tuple[float, int, int]:
-    positions: dict[str, dict[str, float]] = {}
-    total_pnl = 0.0
-    wins = 0
-    losses = 0
+) -> Iterator[tuple[str, float, float, float, dict[str, Any]]]:
+    """Position-moving fills in execution order: ``(symbol, direction, qty, price, row)``.
 
+    The shared preamble of the realised-PnL walk and the closed-round-trip
+    commission walk (#149): buy/sell rows with a usable quantity and price,
+    sorted by the serialized execution timestamp, symbol upper-cased, and
+    direction ``+1`` for buys / ``-1`` for sells.
+    """
     ordered_rows = sorted(
         rows,
         key=lambda row: _serialize_live_timestamp(row.get("execution_timestamp"))[1],
@@ -5850,7 +5852,18 @@ def _calculate_realized_live_pnl(
         price = _safe_float(row.get("actual_price"), 0.0)
         if quantity <= 0.0 or price <= 0.0:
             continue
+        yield symbol, direction, quantity, price, row
 
+
+def _calculate_realized_live_pnl(
+    rows: list[dict[str, Any]],
+) -> tuple[float, int, int]:
+    positions: dict[str, dict[str, float]] = {}
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    for symbol, direction, quantity, price, _row in _iter_live_position_fills(rows):
         delta = quantity * direction
         state = positions.setdefault(symbol, {"qty": 0.0, "avg": 0.0})
         current_qty = state["qty"]
@@ -5909,6 +5922,90 @@ def _live_commission_totals(rows: list[dict[str, Any]]) -> tuple[float | None, i
     return (None if unknown else total), unknown
 
 
+def _closed_round_trip_commission(rows: list[dict[str, Any]]) -> float | None:
+    """Commission attributable to CLOSED round trips only (#149).
+
+    ``net_pnl`` is realised PnL of closed trades minus the fees of exactly
+    those trades, so commissions are attributed per round trip on the SAME
+    average-cost basis as ``_calculate_realized_live_pnl``. Per symbol a
+    pool tracks the open position's signed quantity, the total commission
+    paid to build it (``fee_pool``) and whether any pooled fee is unknown.
+    A same-direction fill adds its whole commission to the pool — that
+    exposure is still open, so its fee stays unrealised. An opposing fill
+    releases the pool's pro-rata share for the closed quantity
+    (``fee_pool * closed / |qty|``, the average fee rate of the open
+    position — the same share average-cost PnL realises on a partial
+    close) plus its own commission on the closed quantity only. A
+    reversal's opening remainder starts a new pool carrying just the
+    remainder's share of the fill's fee, so its fee is netted only if that
+    position later closes. A NULL commission inside the pool taints any
+    close of that exposure, so one unknown fee makes the result ``None``;
+    a NULL fee on exposure still open at the end is simply not netted yet.
+
+    Returns the summed commission of the closed round trips, or ``None``
+    when any fee touching a closed round trip is unknown (NULL commission —
+    the broker has not reported it yet, e.g. an unposted Alpaca ``CFEE``).
+    """
+    state: dict[str, dict[str, Any]] = {}
+    closed_fees = 0.0
+    fees_known = True
+    for symbol, direction, quantity, _price, row in _iter_live_position_fills(rows):
+        commission = row.get("commission")
+        fee = None if commission is None else _safe_float(commission, 0.0)
+        rate = None if fee is None else fee / quantity
+        delta = quantity * direction
+        st = state.setdefault(
+            symbol, {"qty": 0.0, "fee_pool": 0.0, "fee_unknown": False}
+        )
+        current = float(st["qty"])
+        if abs(current) < LIVE_POSITION_FLAT_THRESHOLD:
+            # Flat (or dust): the whole fill opens fresh exposure; any
+            # residual pool belongs to a position the PnL walk already
+            # treats as closed, so it is replaced, not released.
+            st["qty"] = delta
+            st["fee_pool"] = 0.0 if fee is None else fee
+            st["fee_unknown"] = fee is None
+            continue
+        if current * delta > 0:
+            # Same direction: the fill only adds to the open position, so
+            # its fee stays unrealised until that exposure closes.
+            st["qty"] = current + delta
+            st["fee_pool"] = float(st["fee_pool"]) + (0.0 if fee is None else fee)
+            st["fee_unknown"] = bool(st["fee_unknown"]) or fee is None
+            continue
+
+        closed_qty = min(abs(current), quantity)
+        released = float(st["fee_pool"]) * (closed_qty / abs(current))
+        if st["fee_unknown"]:
+            fees_known = False
+        else:
+            closed_fees += released
+        if rate is None:
+            fees_known = False
+        else:
+            closed_fees += rate * closed_qty
+
+        new_qty = current + delta
+        if abs(new_qty) < LIVE_POSITION_FLAT_THRESHOLD:
+            st["qty"] = 0.0
+            st["fee_pool"] = 0.0
+            st["fee_unknown"] = False
+        elif current * new_qty > 0:
+            # Partial close: the remaining exposure keeps the un-released
+            # share of the pool (and its unknown flag).
+            st["qty"] = new_qty
+            st["fee_pool"] = float(st["fee_pool"]) - released
+        else:
+            # Reversal: the remainder is a fresh position opened by this
+            # fill, so its pool carries only the remainder's share of the
+            # fill's fee and its own unknown flag.
+            st["qty"] = new_qty
+            st["fee_pool"] = 0.0 if rate is None else rate * (quantity - closed_qty)
+            st["fee_unknown"] = rate is None
+
+    return None if not fees_known else closed_fees
+
+
 def _live_unpriced_fill_count(rows: list[dict[str, Any]]) -> int:
     """How many buy/sell fills carry real quantity at an unusable price (#124, review of #143).
 
@@ -5934,12 +6031,23 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     # unknown: never a 0.0 price.
     price_unknown_count = _live_unpriced_fill_count(execution_rows)
     pnl_complete = price_unknown_count == 0
-    # `total_pnl` is gross (price PnL of closed round trips). Net PnL subtracts every execution's
-    # commission and is reported only when every commission is known.
+    # `total_pnl` is gross (price PnL of closed round trips). Net PnL (#149)
+    # subtracts only the commissions attributable to those SAME closed
+    # round trips — entry fees released at the open position's average fee
+    # rate plus each exit fill's fee on the closed quantity — never the
+    # fees of positions still open. US equity regulatory fees on sales (SEC fee /
+    # FINRA TAF) are deliberately NOT modelled: they are fractions of a
+    # cent to a few cents per sale (TAF capped per trade), Alpaca does not
+    # break them out per execution, and net PnL therefore slightly
+    # overstates the true net on equity round trips by those small amounts.
+    closed_commission = _closed_round_trip_commission(execution_rows)
+    # `total_commission`/`commission_unknown_count` still describe ALL
+    # executions (open legs included) for transparency; they no longer
+    # gate `net_pnl`, whose completeness is `closed_commission is not None`.
     total_commission, commission_unknown_count = _live_commission_totals(execution_rows)
     net_pnl = (
-        round(total_pnl_realized - total_commission, 2)
-        if total_commission is not None and pnl_complete
+        round(total_pnl_realized - closed_commission, 2)
+        if closed_commission is not None and pnl_complete
         else None
     )
     # Win rate denominators are closed round trips (a win or a loss), never raw
@@ -5991,7 +6099,11 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
         ),
         "commission_unknown_count": commission_unknown_count,
         "net_pnl": net_pnl,
-        "net_pnl_complete": pnl_complete and commission_unknown_count == 0,
+        # Complete means the closed-round-trip basis is fully known: every
+        # fee touching a CLOSED trade is priced. An unknown fee on a
+        # still-open position does not block it (it is not netted anyway);
+        # `commission_unknown_count` still reports it.
+        "net_pnl_complete": net_pnl is not None,
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "current_balance": round(current_balance, 2),
