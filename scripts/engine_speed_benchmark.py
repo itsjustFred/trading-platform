@@ -58,6 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import FROZEN_SIGNAL_EXIT_ENGINES
 from runner.engines.native_adapter import NativeAdapter
 from runner.engines.vectorbt_adapter import VectorbtAdapter
 from scripts import engine_migration_gate as gate
@@ -97,7 +98,7 @@ def _default_param_grid(
     cells: list[dict[str, Any]] = []
     for combo in itertools.product(*(multipliers for _ in names)):
         cell: dict[str, Any] = {}
-        for name, multiplier in zip(names, combo):
+        for name, multiplier in zip(names, combo, strict=True):
             cell[name] = numeric[name] * multiplier
         cells.append(cell)
         if len(cells) >= max_cells:
@@ -193,16 +194,16 @@ def _timed_cells(
                 data_dir=data_dir,
                 parameters={**base_parameters, **cell_params},
             )
-            for engine_name in ENGINES:
-                rows.append(
-                    {
-                        "repeat": repeat,
-                        "cell": cell_index,
-                        "params": cell_params,
-                        "engine": engine_name,
-                        **_time_run(adapters[engine_name], config, strategy_path),
-                    }
-                )
+            rows.extend(
+                {
+                    "repeat": repeat,
+                    "cell": cell_index,
+                    "params": cell_params,
+                    "engine": engine_name,
+                    **_time_run(adapters[engine_name], config, strategy_path),
+                }
+                for engine_name in ENGINES
+            )
     return rows
 
 
@@ -234,6 +235,10 @@ def _summarize_cells(
 
 
 def _time_run(adapter: Any, config: BacktestConfig, strategy_path: Path) -> dict[str, Any]:
+    if getattr(adapter, "name", "") in FROZEN_SIGNAL_EXIT_ENGINES:
+        # The frozen adapter refuses next_open; run its legacy close fill so
+        # the meta records the model actually simulated (unchanged behaviour).
+        config = config.model_copy(update={"signal_exit_fill": "close"})
     started = time.perf_counter()
     try:
         result = adapter.run(config, str(strategy_path))

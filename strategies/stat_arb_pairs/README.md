@@ -26,6 +26,8 @@ Vollausstieg bei einem von zwei quellenbasierten Events:
 2. Statistischer Fail-Stop: `ZScore <= -4.0` (Quelle: `stop_zscore`).
 Opt-in (default OFF, keine Quelllogik): `use_atr_stop=true` fuer zusaetzlichen Stop-Loss-Hit auf dem ATR-Schutzstop.
 
+**Fill-Konvention (Version 1.3.0):** Marktausstiege auf Close-Basis (Z-Score-Mean-Reversion- und Fail-Stop-Exit) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Ein optionaler ATR-Stop-Level reist in `sl_price` (der protective Stop fuellt es); das `exit_price` der Exit-Bar ist nur mit `exit_order_type="level"` ein Level (wird hier nicht gesetzt).
+
 ### Stop-Loss
 Kein Stop-Loss im Standard (die Quelle nutzt einen z-Score-Fail-Stop, keinen ATR-Stop).
 Opt-in via `use_atr_stop=true`: `sl_price = entry_close - ATR_Wilder(14) * 2.0`.

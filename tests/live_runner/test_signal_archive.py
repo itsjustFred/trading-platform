@@ -14,6 +14,7 @@ import pytest
 
 import live_runner.daemon as daemon
 import live_runner.signal_archive as sa
+from live_runner.shutdown import ShutdownCoordinator
 from live_runner.signal_archive import (
     SignalArchive,
     SignalDecisionRecorder,
@@ -24,6 +25,15 @@ from live_runner.signal_archive import (
 from live_runner.signal_sources.discord_source import DiscordSignalSource
 from risk import TradeSignal
 from shared.models import LiveDeploymentConfig, LiveSignal
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_wide_coordinator(monkeypatch: pytest.MonkeyPatch) -> ShutdownCoordinator:
+    """``run_daemon`` leaves the process-wide gate closed; never leak that to other tests."""
+    fresh = ShutdownCoordinator(force_exit_fn=lambda code: pytest.fail("forced exit"))
+    monkeypatch.setattr(daemon, "_SHUTDOWN", fresh)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", fresh)
+    return fresh
 
 
 @pytest.fixture
@@ -491,12 +501,17 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     )
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", _Scheduler)
-    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda: object())
+    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda **_kwargs: object())
     monkeypatch.setattr(daemon, "sync_deployments_loop", _sync_loop)
     monkeypatch.setattr(daemon, "sync_services_loop", _noop_loop)
     monkeypatch.setattr(daemon, "_poll_balances", _noop_loop)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_loop)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_loop)
+    # The internal strategy loop runs forever by design; like the other
+    # gather members it must be stubbed for run_daemon to reach shutdown.
+    monkeypatch.setattr(daemon, "run_internal_strategy_loop", _noop_loop)
+
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_loop)
 
     asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
 
@@ -916,16 +931,61 @@ def test_claim_and_submit_success_records_traded(
         timestamp=datetime.now(timezone.utc),
         metadata=dict(normalized.metadata),
     )
-    prepared_signal = SimpleNamespace(symbol="AAPL", action="buy")
+    prepared_signal = SimpleNamespace(
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=190.5,
+        metadata={
+            "entry_price": 190.5,
+            "stop_loss": 185.0,
+            "take_profit": 200.0,
+        },
+    )
 
     async def _prepare_order(_adapter, _deployment, _signal):
         return prepared_signal, 1.0
+
+    async def _caps_passthrough(_adapter, _deployment, _signal, *, qty, risk_config):
+        # The caps have their own suite (test_live_pre_submit_caps.py); this
+        # test pins the archive record, so the check is stubbed to a pass —
+        # the SimpleNamespace signal/adapter doubles cannot satisfy its
+        # broker reads.
+        return qty
 
     class _Adapter:
         async def submit_order(self, _signal, qty=None):
             return "ord-42"
 
+        async def get_quote(self, symbol):
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=190.5,
+                ask=190.5,
+                timestamp=datetime.now(timezone.utc),
+                source="test",
+            )
+
+        async def get_pip_value(self, symbol):
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0,
+                units_per_qty=1.0,
+                conversion_rate=1.0,
+                quote_asset="USD",
+                account_asset="USD",
+                source="test",
+            )
+
+        async def get_equity(self):
+            return 100_000.0
+
+        async def get_used_margin(self):
+            return 0.0
+
     monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
+    monkeypatch.setattr(daemon, "enforce_pre_submit_caps", _caps_passthrough)
     monkeypatch.setattr(
         daemon, "claim_live_deployment_submission", lambda *_a, **_k: True
     )

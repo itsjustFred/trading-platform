@@ -8,8 +8,9 @@ PyneCore branch was test-blind) plus the P2 fixes:
   ``max()`` leverage floor, no over-cap fill).
 - A-H4 (D3) — ``_gate_warmup_trades`` drops pre-``start_date`` trades when
   ``warmup_start`` is set; ``_apply_fill_parity`` re-prices LONG entries to
-  the ask and non-level exits per ``signal_exit_fill`` (SHORT open-exits pay
-  the spread), leaving stop/TP level fills untouched.
+  the ask and non-level exits to the legacy ``close`` fill — the only mode
+  this frozen adapter accepts (``next_open`` is refused, ``open`` removed),
+  leaving stop/TP level fills untouched.
 """
 
 from __future__ import annotations
@@ -437,32 +438,52 @@ class TestFillParity:
         )
         assert trades[0].entry_price == pytest.approx(100.0)
 
-    def test_signal_exit_defaults_to_close(self, tmp_path):
-        config = _config(tmp_path)  # signal_exit_fill="close"
+    def test_signal_exit_prices_the_legacy_close_fill(self, tmp_path):
+        # Frozen engine: run() refuses signal_exit_fill="next_open"
+        # (_frozen_signal_exit_fill); the helper itself always re-prices
+        # non-level exits at the recorded leg bar's close.
+        config = _config(tmp_path)
         trades = [_trade(exit_reason="signal")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
         )
         assert trades[0].exits[-1].price == pytest.approx(101.2)
 
-    def test_signal_exit_open_fill(self, tmp_path):
-        config = _config(tmp_path, signal_exit_fill="open")
+    def test_signal_exit_close_is_explicit_legacy_opt_in(self, tmp_path):
+        config = _config(tmp_path, signal_exit_fill="close")
         trades = [_trade(exit_reason="signal")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
         )
-        assert trades[0].exits[-1].price == pytest.approx(101.0)
+        assert trades[0].exits[-1].price == pytest.approx(101.2)
 
-    def test_short_open_exit_pays_spread(self, tmp_path):
-        config = _config(tmp_path, signal_exit_fill="open")
+    def test_signal_exit_open_is_rejected(self, tmp_path):
+        # Issue #153: "open" is removed; the adapter fails loudly even when the
+        # config bypassed pydantic validation.
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
+            _config(tmp_path, signal_exit_fill="open")
+        config = _config(tmp_path)
+        object.__setattr__(config, "signal_exit_fill", "open")
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
+            _apply_fill_parity(
+                [_trade(exit_reason="signal")],
+                _frame(),
+                config,
+                {"spread_price_col": "spread_price"},
+            )
+
+    def test_short_signal_exit_reprices_at_close(self, tmp_path):
+        # The removed "open" mode used to add the ask spread to SHORT exits;
+        # the close fill re-prices at the leg bar's close with no spread.
+        config = _config(tmp_path)
         trades = [_trade(direction="SHORT", exit_reason="signal")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
         )
-        assert trades[0].exits[-1].price == pytest.approx(101.0 + 0.2)
+        assert trades[0].exits[-1].price == pytest.approx(101.2)
 
     def test_stop_level_exit_untouched(self, tmp_path):
-        config = _config(tmp_path, signal_exit_fill="open")
+        config = _config(tmp_path, signal_exit_fill="close")
         trades = [_trade(exit_price=99.0, exit_reason="stop_loss")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
@@ -474,8 +495,7 @@ class TestFillParity:
         trades = [_trade(exit_reason="signal")]
         before = (trades[0].entry_price, trades[0].exits[-1].price)
         _apply_fill_parity(trades, _frame(), config, {})
-        # close-fill re-price to the located bar close is still applied;
-        # entry without spread stays.
+        # the close re-price still applies; entry without spread stays.
         assert trades[0].entry_price == pytest.approx(before[0])
         assert trades[0].exits[-1].price == pytest.approx(101.2)
 
@@ -577,6 +597,9 @@ def test_pyne_cli_receives_full_day_bounds_for_date_only_config(monkeypatch, tmp
         risk_per_trade_pct=0.01,
         data_dir=str(tmp_path),
         parameters={"fees": "zero"},
+        # Frozen engine: next_open is refused; this test pins the CLI date
+        # bounds, so declare the legacy close fill explicitly.
+        signal_exit_fill="close",
     )
     PyneCoreAdapter().run(config, str(strategy))
 

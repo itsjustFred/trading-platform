@@ -14,6 +14,7 @@ from live_runner.ctrader_adapter import (
     _is_already_logged_in_error,
     _is_terminal_auth_error,
 )
+from shared.money import MoneyParseError
 
 
 def test_is_already_logged_in_error_detects_code() -> None:
@@ -1675,6 +1676,611 @@ def test_money_digits_fallback_is_logged(caplog) -> None:
     )
 
 
+# ── get_max_leverage (#240/#302) ──────────────────────────────────────────────
+
+
+def _leverage_adapter() -> CTraderLiveAdapter:
+    """A connected, authenticated adapter with the leverage proto types bound.
+
+    ``_fetch_trader`` is stubbed to a trader with zeroed leverage fields so
+    the account leg resolves to ``None`` without a broker call; tests that
+    need a readable account override it via ``_stub_trader``.
+    """
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetDynamicLeverageByIDReq,
+        ProtoOAGetDynamicLeverageByIDRes,
+    )
+
+    adapter._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
+    adapter._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=0, maxLeverage=0))
+    return adapter
+
+
+def _dynamic_leverage_response(*tier_leverages: int):
+    """A ``ProtoOAGetDynamicLeverageByIDRes`` whose tiers carry raw proto values.
+
+    ``ProtoOADynamicLeverageTier.leverage`` is in cents (1:200 -> 20000), the
+    same convention as ``ProtoOATrader.leverageInCents``.
+    """
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetDynamicLeverageByIDRes,
+    )
+
+    response = ProtoOAGetDynamicLeverageByIDRes()
+    for index, leverage in enumerate(tier_leverages):
+        tier = response.leverage.tiers.add()
+        tier.volume = (index + 1) * 1_000_000
+        tier.leverage = leverage
+    return response
+
+
+def test_get_max_leverage_returns_the_highest_tier_as_a_plain_ratio() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    sent: list[object] = []
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        # Tiers ascend by volume; leverage descends, so the LAST tier is the
+        # smallest — returning it instead of max() must fail this test.
+        return _dynamic_leverage_response(50000, 20000, 10000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    result = asyncio.run(adapter.get_max_leverage("eurusd"))
+
+    assert result == pytest.approx(500.0)
+    assert len(sent) == 1
+    request = sent[0]
+    assert request.leverageId == 42
+    assert request.ctidTraderAccountId == 46736452
+
+
+def test_get_max_leverage_without_a_leverage_id_never_calls_the_broker() -> None:
+    adapter = _leverage_adapter()
+
+    async def _fake_send(request, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no leverageId means no broker call")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_with_an_unusable_response_returns_none() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+
+    async def _fake_send(request, **_kwargs):
+        return object()  # not a ProtoOAGetDynamicLeverageByIDRes
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_with_empty_tiers_returns_none() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response()
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_send_failure_degrades_to_none() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+
+    async def _fake_send(request, **_kwargs):
+        raise RuntimeError("broker call failed")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_without_proto_types_returns_none() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    # _ProtoOAGetDynamicLeverageByIDReq/Res stay None (openapi types not loaded).
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+
+
+def _stub_trader(adapter: CTraderLiveAdapter, trader: object) -> None:
+    """Pin ``_fetch_trader`` so no broker call is needed for the account leg."""
+
+    async def _fake_fetch_trader():
+        if isinstance(trader, Exception):
+            raise trader
+        return trader
+
+    adapter._fetch_trader = _fake_fetch_trader
+
+
+def test_get_max_leverage_clamps_the_tier_to_the_account_leverage() -> None:
+    """The account's own ``leverageInCents`` bounds the symbol tiers.
+
+    Spotware's example computes the effective leverage as
+    ``min(trader.leverageInCents, tier.leverage) / 100``: an account set to
+    1:50 on a symbol whose leverage group offers 1:500 is capped at 50, not
+    500. Returning the tier alone would hand the caps a ceiling the broker
+    will not margin.
+    """
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=5000, maxLeverage=0))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(50000, 20000, 10000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(50.0)
+
+
+def test_get_max_leverage_ignores_max_leverage() -> None:
+    """``ProtoOATrader.maxLeverage`` is not read at all.
+
+    The field is a plain uint32 without an "InCents" suffix whose unit is
+    unverified; if it were a plain ratio (500 for 1:500) reading it as cents
+    would return 5x and silently clamp every cTrader order. It is also only
+    the broker's ceiling for *changing* leverage — ``leverageInCents`` is
+    already validated against it — so it can never be the tighter bound.
+    """
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=50000, maxLeverage=20000))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(50000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    # leverageInCents (500x) and the tier (500x) win; a cents-reading of
+    # maxLeverage=20000 would wrongly cap at 200x.
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(500.0)
+
+
+def test_get_max_leverage_uses_whichever_side_is_readable() -> None:
+    """Tier known + account unreadable -> tier; account known + no leverageId
+    -> the account leverage; neither -> None (the caller's 1x)."""
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, RuntimeError("trader request failed"))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(50000, 20000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(500.0)
+
+    # No leverageId: the tier leg is unreadable, the account leg still answers.
+    adapter2 = _leverage_adapter()
+    _stub_trader(adapter2, SimpleNamespace(leverageInCents=3000, maxLeverage=0))
+
+    async def _fake_send2(request, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no leverageId means no tier request")
+
+    adapter2._send_request_with_refresh_retry = _fake_send2
+    assert asyncio.run(adapter2.get_max_leverage("EURUSD")) == pytest.approx(30.0)
+
+    # Neither side readable -> None.
+    adapter3 = _leverage_adapter()
+    _stub_trader(adapter3, RuntimeError("trader request failed"))
+
+    async def _fake_send3(request, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("no leverageId means no tier request")
+
+    adapter3._send_request_with_refresh_retry = _fake_send3
+    assert asyncio.run(adapter3.get_max_leverage("EURUSD")) is None
+
+
+def test_get_max_leverage_ignores_unset_or_garbage_trader_fields() -> None:
+    """Unset (0) or non-numeric trader leverage fields are not a ceiling."""
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    _stub_trader(adapter, SimpleNamespace(leverageInCents=0, maxLeverage="not-a-number"))
+
+    async def _fake_send(request, **_kwargs):
+        return _dynamic_leverage_response(20000)
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(200.0)
+
+
+def _symbol_by_id_response(leverage_id: int | None, symbol_id: int = 123):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOASymbolByIdRes
+
+    response = ProtoOASymbolByIdRes()
+    symbol = response.symbol.add()
+    symbol.symbolId = symbol_id
+    symbol.digits = 5
+    symbol.pipPosition = 4
+    if leverage_id is not None:
+        symbol.leverageId = leverage_id
+    return response
+
+
+def test_symbol_props_refresh_captures_and_drops_leverage_ids() -> None:
+    """``_load_symbol_props_into_cache`` is the only writer of
+    ``_symbol_leverage_ids``: a refresh stores the id a live symbol carries
+    and drops the stale one a refreshed symbol no longer carries."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetDynamicLeverageByIDReq,
+        ProtoOASymbolByIdReq,
+    )
+
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 7  # stale id from a prior session
+    sent: list[object] = []
+
+    async def _fake_send(request, **_kwargs):
+        sent.append(request)
+        if isinstance(request, ProtoOASymbolByIdReq):
+            # The refreshed EURUSD no longer carries a leverageId.
+            return _symbol_by_id_response(leverage_id=None)
+        if isinstance(request, ProtoOAGetDynamicLeverageByIDReq):
+            return _dynamic_leverage_response(20000)
+        raise AssertionError(f"unexpected request {type(request).__name__}")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+    asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 123}))
+    assert "EURUSD" not in adapter._symbol_leverage_ids
+    # The stale id is gone: the leverage lookup must not fire a request.
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) is None
+    assert not any(
+        isinstance(request, ProtoOAGetDynamicLeverageByIDReq) for request in sent
+    )
+
+    # A refresh whose symbol carries leverageId stores it for the lookup.
+    async def _fake_send_with_id(request, **_kwargs):
+        if isinstance(request, ProtoOASymbolByIdReq):
+            return _symbol_by_id_response(leverage_id=99)
+        return _dynamic_leverage_response(20000)
+
+    adapter._send_request_with_refresh_retry = _fake_send_with_id
+    asyncio.run(adapter._load_symbol_props_into_cache({"EURUSD": 123}))
+    assert adapter._symbol_leverage_ids["EURUSD"] == 99
+    assert asyncio.run(adapter.get_max_leverage("EURUSD")) == pytest.approx(200.0)
+
+
+def test_disconnect_clears_symbol_leverage_ids() -> None:
+    adapter = _leverage_adapter()
+    adapter._symbol_leverage_ids["EURUSD"] = 42
+    asyncio.run(adapter.disconnect())
+    assert adapter._symbol_leverage_ids == {}
+
+
+# ── get_used_margin (#359) ────────────────────────────────────────────────────
+
+
+def _margin_adapter() -> CTraderLiveAdapter:
+    """A connected adapter with the position-status enum bound for the sum."""
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAPositionStatus = SimpleNamespace(POSITION_STATUS_OPEN=1)
+    return adapter
+
+
+def _stub_reconcile(adapter: CTraderLiveAdapter, positions: list[object]) -> None:
+    async def _fake_reconcile():
+        return SimpleNamespace(position=positions)
+
+    adapter._reconcile_state = _fake_reconcile
+
+
+def test_get_used_margin_sums_open_positions_in_account_currency() -> None:
+    adapter = _margin_adapter()
+    _stub_reconcile(
+        adapter,
+        [
+            # usedMargin is scaled by the position's own moneyDigits.
+            SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits=2),
+            SimpleNamespace(positionStatus=1, usedMargin=250_000, moneyDigits=2),
+            # Not OPEN: its margin is not held.
+            SimpleNamespace(positionStatus=2, usedMargin=9_999_999, moneyDigits=2),
+        ],
+    )
+    assert asyncio.run(adapter.get_used_margin()) == pytest.approx(12_500.0)
+
+
+def test_get_used_margin_returns_zero_with_no_open_positions() -> None:
+    adapter = _margin_adapter()
+    _stub_reconcile(adapter, [])
+    assert asyncio.run(adapter.get_used_margin()) == 0.0
+
+
+def test_get_used_margin_returns_none_when_a_position_margin_is_unreadable() -> None:
+    # A partial sum would understate used margin and overstate free margin.
+    adapter = _margin_adapter()
+    _stub_reconcile(
+        adapter,
+        [
+            SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits=2),
+            SimpleNamespace(positionStatus=1, usedMargin=None, moneyDigits=2),
+        ],
+    )
+    assert asyncio.run(adapter.get_used_margin()) is None
+
+
+def test_get_used_margin_returns_none_when_reconcile_fails() -> None:
+    adapter = _margin_adapter()
+
+    async def _fake_reconcile():
+        raise RuntimeError("reconcile failed")
+
+    adapter._reconcile_state = _fake_reconcile
+    assert asyncio.run(adapter.get_used_margin()) is None
+
+
+def test_get_used_margin_returns_none_on_negative_margin_or_digits() -> None:
+    # A negative usedMargin or moneyDigits cannot scale into a trustworthy
+    # figure; treating it as 0 would overstate free margin.
+    adapter = _margin_adapter()
+    _stub_reconcile(
+        adapter,
+        [SimpleNamespace(positionStatus=1, usedMargin=-1, moneyDigits=2)],
+    )
+    assert asyncio.run(adapter.get_used_margin()) is None
+
+    adapter2 = _margin_adapter()
+    _stub_reconcile(
+        adapter2,
+        [SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits=-1)],
+    )
+    assert asyncio.run(adapter2.get_used_margin()) is None
+
+    adapter3 = _margin_adapter()
+    _stub_reconcile(
+        adapter3,
+        [SimpleNamespace(positionStatus=1, usedMargin=1_000_000, moneyDigits="x")],
+    )
+    assert asyncio.run(adapter3.get_used_margin()) is None
+
+
+# ── get_equity mark-to-market equity (#359/#347, #302) ────────────────────────
+#
+# ``get_balance`` stays realized (#267 - sizing reads it); the mark-to-market
+# equity the pre-submit caps judge free margin against is ``get_equity``
+# (#301). Realized balance alone overstates free margin while positions
+# lose — the unsafe direction — so an unreadable PnL figure fails the read
+# closed.
+
+
+def _equity_adapter(trader: object) -> CTraderLiveAdapter:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    _stub_trader(adapter, trader)
+    return adapter
+
+
+def _pnl_response(*entries: tuple[int, float], money_digits: int = 2):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    response = ProtoOAGetPositionUnrealizedPnLRes()
+    response.moneyDigits = money_digits
+    for position_id, net_pnl in entries:
+        entry = response.positionUnrealizedPnL.add()
+        entry.positionId = position_id
+        entry.netUnrealizedPnL = net_pnl
+    return response
+
+
+def _stub_pnl_send(adapter: CTraderLiveAdapter, response: object) -> None:
+    async def _fake_send(request, **_kwargs):
+        return response
+
+    adapter._send_request_with_refresh_retry = _fake_send
+
+
+def test_get_equity_is_balance_plus_unrealized_pnl() -> None:
+    # balance 100_000.00 (10_000_000 at moneyDigits=2); a -5_000.00 and a
+    # +1_500.00 unrealized leg -> equity 96_500.00.
+    adapter = _equity_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(
+        adapter, _pnl_response((11, -500_000), (12, 150_000))
+    )
+    assert asyncio.run(adapter.get_equity()) == pytest.approx(96_500.0)
+
+
+def test_get_equity_without_positions_keeps_equity_at_balance() -> None:
+    adapter = _equity_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(adapter, _pnl_response())
+    assert asyncio.run(adapter.get_equity()) == pytest.approx(100_000.0)
+
+
+def test_get_equity_fails_closed_when_unrealized_pnl_is_unreadable() -> None:
+    adapter = _equity_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+
+    async def _fake_send(request, **_kwargs):
+        raise RuntimeError("pnl endpoint down")
+
+    adapter._send_request_with_refresh_retry = _fake_send
+    with pytest.raises(RuntimeError, match="pnl endpoint down"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_fails_closed_on_an_unexpected_pnl_response() -> None:
+    adapter = _equity_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(adapter, object())
+    with pytest.raises(RuntimeError, match="Unexpected unrealized PnL response"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_fails_closed_on_an_unreadable_pnl_entry(monkeypatch) -> None:
+    # A non-finite netUnrealizedPnL read as 0.0 would understate a losing
+    # position and overstate the free margin the caps judge against. The proto
+    # field is int64, so "unreadable" is simulated by patching the response
+    # class the reader isinstance-checks against.
+    import ctrader_open_api.messages.OpenApiMessages_pb2 as oa_messages
+
+    class _Res:
+        pass
+
+    response = _Res()
+    response.moneyDigits = 2
+    response.positionUnrealizedPnL = [SimpleNamespace(netUnrealizedPnL=None)]
+    monkeypatch.setattr(
+        oa_messages, "ProtoOAGetPositionUnrealizedPnLRes", _Res
+    )
+    adapter = _equity_adapter(SimpleNamespace(balance=10_000_000, moneyDigits=2))
+    _stub_pnl_send(adapter, response)
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+#
+# Broker volume, prices, balances and commissions used to parse through a
+# ``default=0.0`` coercion, so an unreadable value was stored or reported as
+# zero. They now go through ``shared.money`` and raise on garbage.
+
+
+def test_broker_volume_to_qty_raises_on_an_unreadable_volume() -> None:
+    from live_runner.ctrader_adapter import _broker_volume_to_qty
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        _broker_volume_to_qty("junk")
+
+
+def test_deal_commission_raises_on_an_unreadable_commission() -> None:
+    from live_runner.ctrader_adapter import _deal_commission
+
+    # A garbage commission must not be stored as the known-zero fee.
+    with pytest.raises(ValueError, match="unreadable money value"):
+        _deal_commission(SimpleNamespace(commission="junk"))
+
+
+def _trader_balance_adapter(trader):
+    """A cTrader adapter whose trader lookup returns ``trader``."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+
+    class _TraderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+
+    adapter._ProtoOATraderReq = _TraderReq
+    adapter._ProtoOATraderRes = type("_TraderRes", (), {})
+    response = adapter._ProtoOATraderRes()
+    response.trader = trader
+
+    async def _send_response(_request, **_kwargs):
+        return response
+
+    adapter._send_request = _send_response
+    return adapter
+
+
+def test_get_balance_raises_on_an_unreadable_balance() -> None:
+    adapter = _trader_balance_adapter(
+        SimpleNamespace(moneyDigits=2, balance="junk")
+    )
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_raises_on_an_unreadable_equity() -> None:
+    adapter = _trader_balance_adapter(
+        SimpleNamespace(moneyDigits=2, balance=123_456, equity="junk")
+    )
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_uses_balance_when_equity_is_absent() -> None:
+    adapter = _trader_balance_adapter(SimpleNamespace(moneyDigits=2, balance=123_456))
+
+    balance, equity = asyncio.run(adapter.get_balance())
+
+    assert balance == pytest.approx(1_234.56)
+    assert equity == pytest.approx(1_234.56)
+
+
+def _positions_adapter(positions):
+    """A cTrader adapter whose open-position fetch returns ``positions``."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOATradeSide = SimpleNamespace(SELL=1)
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    async def _fetch_open_positions():
+        return positions
+
+    adapter._fetch_open_positions = _fetch_open_positions
+    return adapter
+
+
+def _open_position(*, volume=5000, price=1.085, position_id=7):
+    return SimpleNamespace(
+        positionId=position_id,
+        price=price,
+        tradeData=SimpleNamespace(symbolId=1, volume=volume, tradeSide=0),
+    )
+
+
+def test_get_positions_raises_on_an_unreadable_volume() -> None:
+    adapter = _positions_adapter([_open_position(volume="junk")])
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_positions())
+
+
+def test_get_positions_raises_on_an_unreadable_entry_price() -> None:
+    adapter = _positions_adapter([_open_position(price="junk")])
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_positions())
+
+
+def test_close_all_positions_reports_an_unreadable_volume_as_unidentified() -> None:
+    """A flatten must not read a garbage volume as zero and skip the position."""
+    adapter = _positions_adapter([_open_position(volume="junk", position_id=7)])
+
+    outcome = asyncio.run(adapter.close_all_positions())
+
+    assert outcome.unidentified == ("position:7:volume",)
+    assert outcome.complete is False
+
+
 # ─── get_equity: equity must include open-position unrealized P&L (#301) ──────
 #
 # The loss breaker reads ``get_equity`` - a SEPARATE path from ``get_balance``
@@ -1873,3 +2479,66 @@ def test_get_equity_trusts_a_trader_equity_field_when_present():
     assert asyncio.run(adapter.get_equity()) == pytest.approx(55_000.0)
     balance, equity = asyncio.run(adapter.get_balance())
     assert (balance, equity) == (pytest.approx(50_000.0), pytest.approx(55_000.0))
+
+
+def test_get_equity_raises_on_an_unreadable_balance() -> None:
+    """A garbage ``balance`` must fail closed: ``_to_float`` used to read it
+    as 0.0, which the loss breaker would have seen as a total loss - or, on
+    the flip side, garbage that parsed to a large number as fake equity."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance="junk", moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_raises_on_an_unreadable_equity_field() -> None:
+    """A trader payload whose own ``equity`` field is garbage raises through
+    ``parse_optional`` rather than falling back or reading as 0."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, equity="junk", moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_raises_on_an_unreadable_net_unrealized_pnl(monkeypatch) -> None:
+    """A position-P&L row whose ``netUnrealizedPnL`` is not readable money is
+    unreadable, not "no unrealized loss": the sum must raise."""
+    import ctrader_open_api.messages.OpenApiMessages_pb2 as pb2
+
+    class _PnlReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+
+    class _PnlRes:
+        moneyDigits = 2
+        positionUnrealizedPnL = [SimpleNamespace(netUnrealizedPnL="junk")]
+
+    # The proto field is int64 and cannot itself hold garbage; patch the
+    # message classes the fetch imports so the row carries an unreadable
+    # value the way a malformed broker payload could.
+    monkeypatch.setattr(pb2, "ProtoOAGetPositionUnrealizedPnLReq", _PnlReq)
+    monkeypatch.setattr(pb2, "ProtoOAGetPositionUnrealizedPnLRes", _PnlRes)
+
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+
+    async def _send(request, **kwargs):
+        if isinstance(request, _PnlReq):
+            return _PnlRes()
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())

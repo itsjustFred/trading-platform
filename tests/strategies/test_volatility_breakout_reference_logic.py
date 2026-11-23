@@ -87,10 +87,15 @@ def test_source_session_entries_direction_and_session_open_stop():
     assert "ATR_Short" not in indicators
     assert "ATR_Long" not in indicators
 
-    # Every exit carries price + reason (NaN-PnL cascade guard).
+    # Every exit carries a reason; only LEVEL exits (the protective stop) carry
+    # an explicit exit_price - market exits fill at the next bar open and must
+    # not carry the signal bar's close (it would contradict next_open).
     exit_idx = exits[exits].index.tolist()
     assert len(exit_idx) > 0
-    assert int(indicators["exit_price"].iloc[exit_idx].isna().sum()) == 0
     assert int(pd.Series(indicators["exit_reason"].iloc[exit_idx]).isna().sum()) == 0
-    reasons = set(pd.Series(indicators["exit_reason"].iloc[exit_idx]).tolist())
-    assert reasons <= {"stop_loss", "force_close", "session_exit"}
+    reasons = pd.Series(indicators["exit_reason"].iloc[exit_idx])
+    assert set(reasons.tolist()) <= {"stop_loss", "force_close", "session_exit"}
+    prices = indicators["exit_price"].iloc[exit_idx].reset_index(drop=True)
+    is_stop = (reasons == "stop_loss").reset_index(drop=True)
+    assert prices[is_stop].notna().all()
+    assert prices[~is_stop].isna().all()

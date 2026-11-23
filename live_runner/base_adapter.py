@@ -234,6 +234,41 @@ def validate_live_quote_prices(
     return bid, ask
 
 
+#: How far a quote time may lie in the future before it is treated as a clock
+#: or feed fault rather than skew between our clock and the broker's (#125).
+LIVE_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+
+#: Freshness verdicts of :func:`live_quote_time_rule`.
+QUOTE_TIME_RULE_MISSING = "quote_time_missing"
+QUOTE_TIME_RULE_INVALID = "quote_time_invalid"
+QUOTE_TIME_RULE_IN_FUTURE = "quote_time_in_future"
+QUOTE_TIME_RULE_STALE = "quote_stale"
+
+
+def live_quote_time_rule(
+    timestamp: object, *, now: datetime, max_age_seconds: float
+) -> tuple[str | None, float | None]:
+    """Freshness verdict and age in seconds for a quote time (#125).
+
+    Fails closed: a missing time, anything but a timezone-aware datetime, a
+    time beyond :data:`LIVE_QUOTE_FUTURE_SKEW_SECONDS` in the future, or a
+    quote older than ``max_age_seconds`` all reject. One implementation for
+    every layer that gates or sizes on a broker quote — the entry-deviation
+    gate, the pip-value conversion check and the pre-submit caps (#302) must
+    agree on what "current" means.
+    """
+    if timestamp is None:
+        return QUOTE_TIME_RULE_MISSING, None
+    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
+        return QUOTE_TIME_RULE_INVALID, None
+    age = (now - timestamp).total_seconds()
+    if -age > LIVE_QUOTE_FUTURE_SKEW_SECONDS:
+        return QUOTE_TIME_RULE_IN_FUTURE, age
+    if age > max_age_seconds:
+        return QUOTE_TIME_RULE_STALE, age
+    return None, age
+
+
 @dataclass(frozen=True)
 class LivePipValue:
     """What one qty unit of a symbol gains or loses per 1.0 price move (#146).
@@ -326,6 +361,30 @@ def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
     return parsed
 
 
+#: Values :meth:`BaseLiveAdapter.get_order_state` may return. ``None`` means
+#: "unknown" and always fails closed in the reconciler.
+ORDER_STATE_WORKING = "working"
+ORDER_STATE_TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class BrokerOrderView:
+    """One working broker order, normalized for reconciliation (#303).
+
+    ``protection`` marks position-protection orders (bracket legs, attached
+    stop/target orders) so the reconciler does not mistake them for untracked
+    entry or exit orders.
+    """
+
+    order_id: str
+    client_order_id: str = ""
+    symbol: str = ""
+    side: str = ""
+    qty: float | None = None
+    order_type: str = ""
+    protection: bool = False
+
+
 @dataclass(frozen=True)
 class ProtectiveStop:
     """One working broker-side stop order that protects an open position.
@@ -410,6 +469,28 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol``.
+
+        ``None`` means the broker maximum cannot be determined; callers must
+        treat that as 1x (fail safe), never guess a higher ceiling (#240).
+        """
+        return None
+
+    async def get_used_margin(self) -> float | None:
+        """Margin the broker already holds against open positions, account ccy.
+
+        The pre-submit leverage ceiling is MT5-style free margin — account
+        equity minus this figure, times the maximum leverage (#359, the live
+        half of the #347 backtest rule). ``None`` means it cannot be
+        determined; callers must treat that as unverifiable and refuse the
+        order (fail closed), never guess a lower figure — an understated used
+        margin would overstate free margin.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report used margin"
+        )
+
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #
     # Status semantics built on top of these:
@@ -442,6 +523,25 @@ class BaseLiveAdapter(ABC):
         from, including after a daemon restart.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot list protective stops")
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Every working order on the account, normalized for reconciliation.
+
+        Unlike :meth:`working_order_ids`, this view keeps the client order id and
+        marks position-protection orders so the reconciler can tell an untracked
+        entry/exit from a bracket leg or attached stop/target (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot list reconciliation orders")
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Classify one order the ledger expects, by broker or client order id.
+
+        Returns ``"working"`` when the broker still has it open, ``"terminal"``
+        when it reached a final state (filled, cancelled, expired, rejected),
+        and ``None`` when the state cannot be determined - an unknown answer
+        must never suppress a reconciliation finding (#303).
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot look up order state")
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         """Round a computed stop to a price the broker accepts.

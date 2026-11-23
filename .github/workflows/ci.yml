@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # A push to a PR supersedes the run still in flight for that PR; every
+  # non-PR event gets a group keyed on its own run id, because GitHub keeps
+  # only one pending run per group and would otherwise drop a queued main
+  # push or dispatch. Every merged commit keeps its verdict (#297).
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python:
     name: Python ${{ matrix.os }}
@@ -18,13 +26,28 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    env:
+      # The differential real-data slice is downloaded, not committed (see
+      # scripts/fetch_differential_slice.py). Pointing the tests at a cached path
+      # keeps the scenario from depending on the working directory of the step
+      # that reads it. On pull requests REQUIRE_REAL_DATA_SLICE is set on the
+      # test step only when the fetch succeeded, so a Dukascopy outage warns and
+      # skips the real-data scenarios instead of failing the job; on push to
+      # main the fetch step itself fails on a download error, so the slice is
+      # always required there and a permanent outage is noticed. A present
+      # malformed slice still fails inside the tests either way.
+      DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install uv
-        run: "python -m pip install --only-binary=:all: uv==0.10.4"
+      # Same uv pin the pip install carried; setup-uv also restores the uv
+      # cache, which is where `uv sync --frozen` spends its time (#297).
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.10.4"
+          enable-cache: true
       - name: Validate lockfile
         run: uv lock --check
       - name: Install locked dependencies
@@ -33,17 +56,10 @@ jobs:
         run: uv run --no-sync --no-build python scripts/check_requirements_drift.py
       - name: Lint packaging and import seams
         if: runner.os == 'Linux'
-        run: >-
-          uv run --no-sync --no-build ruff check
-          live_runner/__init__.py
-          live_runner/account_discovery.py
-          live_runner/ctrader_adapter.py
-          scripts/sync_requirements_from_lock.py
-          scripts/check_requirements_drift.py
-          scripts/matrix_queue_runner.py
-          scripts/verify_ctrader_order.py
-          scripts/wheel_smoke.py
-          tests/test_packaging.py
+        # The seam list lives in ruff-seams.toml, which extends pyproject's
+        # lint config so this blocking run cannot drift from the advisory
+        # `ruff check .` below (#297).
+        run: uv run --no-sync --no-build ruff check --config ruff-seams.toml .
       - name: Lint (advisory)
         continue-on-error: true
         run: uv run --no-sync --no-build ruff check .
@@ -66,13 +82,47 @@ jobs:
         # overlay, no second copy of the type-checker, and a version bump is one
         # lock change.
         run: uv run --no-sync --no-build mypy
+      - name: Restore the differential real-data slice
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
+          # The key hashes the fetch script and the whole data_tools package: the window,
+          # schema and validation (differential_slice.py), the 1m parse (downloaders/),
+          # and the 15m resample rules (resample.py). A change to any of them must
+          # regenerate the slice, not reuse one built under the old rules. A hit means
+          # the download below is skipped entirely, so the network is touched rarely.
+          key: differential-slice-${{ hashFiles('scripts/fetch_differential_slice.py', 'data_tools/**/*.py') }}
+      - name: Fetch the differential real-data slice
+        if: runner.os == 'Linux'
+        id: fetch-slice
+        shell: bash
+        run: |
+          set +e
+          uv run --no-sync --no-build python -m scripts.fetch_differential_slice --skip-if-valid
+          status=$?
+          set -e
+          # Exit 3 is a download failure with no usable cache. On pull requests
+          # (and workflow_dispatch) that warns and skips the real-data tests;
+          # on push to main the slice is required, so the step - and the job -
+          # fails instead.
+          if [ "$status" -eq 3 ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "::warning::Dukascopy real-data slice download failed; the differential real-data tests will skip."
+            echo "download_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$status"
       - name: Tests
         if: runner.os == 'Linux'
+        env:
+          REQUIRE_REAL_DATA_SLICE: ${{ steps.fetch-slice.outputs.download_failed == 'true' && '0' || '1' }}
         run: >-
           uv run --no-sync --no-build pytest -q -p no:cacheprovider -m "not slow"
           --ignore=tests/strategies
       - name: Strategy tests
         if: runner.os == 'Linux'
+        # Mostly dataset-gated skips today (#289); kept so a change that makes
+        # them runnable cannot land without the step existing to run them.
         run: uv run --no-sync --no-build pytest -q -p no:cacheprovider tests/strategies
       - name: Harness gates
         if: runner.os == 'Linux'

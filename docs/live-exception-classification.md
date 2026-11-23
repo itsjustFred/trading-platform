@@ -31,11 +31,22 @@ Handlers in files owned by open PRs #192, #271, #272, #274, #277, #313, #316, an
 | `live_runner/alpaca_adapter.py` | 2285 | `_flatten_symbol_locked` | money decision (must fail closed) | yes — abandon + restore/report |
 | `live_runner/alpaca_adapter.py` | 2314 | `_flatten_symbol_locked` | money decision (must fail closed) | yes — abandon + restore/report |
 | `live_runner/alpaca_adapter.py` | 2403 | `_cancel_orphaned_protections_locked` | money decision (must fail closed) | yes — failure recorded |
+| `live_runner/alpaca_adapter.py` | 2509 | `_alpaca_order_state` | money decision (must fail closed) | yes — order stays unproven, returns None |
+| `live_runner/alpaca_adapter.py` | 2516 | `_alpaca_order_state` | money decision (must fail closed) | yes — order stays unproven, returns None |
 | `live_runner/alpaca_adapter.py` | 2771 | `_on_trade_update` | money decision (must fail closed) | no — after PR #277 |
 | `live_runner/alpaca_adapter.py` | 2804 | `listen_executions` | loop survival (log and continue) | yes — reconnect backoff |
 | `live_runner/alpaca_adapter.py` | 2831 | `listen_executions` | loop survival (log and continue) | yes — stream stop cleanup |
 | `live_runner/base_adapter.py` | 48 | `order_not_submitted` | money decision (must fail closed) | yes — marks and re-raises |
 | `live_runner/base_adapter.py` | 51 | `order_not_submitted` | money decision (must fail closed) | yes — marker failure degrades to unknown |
+| `live_runner/broker_reconciliation.py` | 425 | `_position_qty_tolerance` | money decision (must fail closed) | yes — falls back to the strict tolerance |
+| `live_runner/broker_reconciliation.py` | 484 | `_broker_state` | money decision (must fail closed) | yes — unreadable positions become a mismatch snapshot |
+| `live_runner/broker_reconciliation.py` | 503 | `_broker_state` | money decision (must fail closed) | yes — unreadable orders become a mismatch snapshot |
+| `live_runner/broker_reconciliation.py` | 528 | `_broker_state` | money decision (must fail closed) | yes — unreadable stops become a mismatch snapshot |
+| `live_runner/broker_reconciliation.py` | 837 | `_lookup_order_state` | money decision (must fail closed) | yes — returns None, order stays unproven |
+| `live_runner/broker_reconciliation.py` | 952 | `reconcile_account` | money decision (must fail closed) | yes — comparison failure counts as a mismatch pass |
+| `live_runner/broker_reconciliation.py` | 1016 | `reconcile_account` | money decision (must fail closed) | yes — halt failure logged, finding recorded |
+| `live_runner/broker_reconciliation.py` | 1051 | `reconcile_account` | money decision (must fail closed) | yes — resume failure leaves entries halted |
+| `live_runner/broker_reconciliation.py` | 1179 | `run_broker_reconciliation_loop` | loop survival (log and continue) | yes — iteration retried next interval |
 | `live_runner/ctrader_adapter.py` | 575 | `_twisted_deferred_timeout_class` | loop survival (log and continue) | yes — string-shape fallback |
 | `live_runner/ctrader_adapter.py` | 620 | `_reason_to_text` | loop survival (log and continue) | yes — str(reason) fallback |
 | `live_runner/ctrader_adapter.py` | 1089 | `_refresh_access_token` | money decision (must fail closed) | yes — refresh returns False |
@@ -125,5 +136,15 @@ These broad handlers landed on main while this classification was in review, and
 | `daemon.py` | account equity read in the loss-breaker entry gate | money-decision | raises `LossBreakerBreachError`, entry refused |
 | `loss_breaker.py` | breach-latch write, state read, deployment pip-value/quote/flows reads | money-decision | unmeasurable loss = entries refused |
 | `loss_breaker.py` | untrusted-fill listing for the alert, observation wrapper | loop-survival | alert/observation only |
+| `ctrader_adapter.py` | `get_max_leverage` tier/account legs | money-decision | degrades to `None` → the caps' fail-closed 1x ceiling |
+| `ctrader_adapter.py` | `_account_leverage_cents` trader read | money-decision | same 1x degradation |
+| `pre_submit_caps.py` | `_safe_max_leverage` adapter read | money-decision | same 1x degradation |
+| `pre_submit_caps.py` | broker-facts gather (quote/pip/balance/leverage) | money-decision | cancels siblings, refuses the order |
+| `pre_submit_caps.py` | `_record_cap_audit` audit write | loop-survival | observational; the cap decision stands |
+| `daemon.py` | `_join_default_executor` joiner-thread relay of `executor.shutdown` failures | loop-survival | infrastructure relay; re-raised on the loop thread |
+| `daemon.py` | `run_daemon` worker-join `BaseException` (interrupted or budget-expired join) | money-decision | keeps the single-instance lock and re-raises rather than handing it to a second daemon while DB writes may be in flight |
 | `broker_order_conflicts.py` | `pause_live_deployment_for_order_conflict` write failure | loop-survival | ERROR alert logged, remaining deployments still re-halted |
 | `daemon.py` | `enforce_broker_order_conflict_halts` call in `sync_services_loop` | loop-survival | ERROR alert logged, next tick retries |
+| `daemon.py` | startup failure in `_run_daemon_locked` (logs and re-raises) | money-decision | ERROR record for the alert sink, exception propagates |
+| `daemon.py` | crash handler in `_run_daemon_locked` (logs, captures, re-raises) | money-decision | ERROR record + Sentry capture, exception propagates |
+| `daemon.py` | signal-archive close in the `_run_daemon_locked` shutdown `finally` | loop-survival | WARNING logged during shutdown, nothing trades after |

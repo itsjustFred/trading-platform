@@ -92,6 +92,9 @@ def _config(tmp_path: Path, strategy_file: str, **overrides: Any) -> BacktestCon
         "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
+        # Frozen engine: next_open is refused; declare the legacy close fill
+        # (overridable via **overrides, e.g. signal_exit_fill="open").
+        "signal_exit_fill": "close",
         "parameters": {"spread_price_col": "spread_price"},
     }
     payload.update(overrides)
@@ -114,12 +117,10 @@ class TestSpreadAwareFills:
 
     def test_market_short_hits_bid(self, parity_env):
         path = _write_strategy(parity_env, "s_short", _strategy_text("SHORT"))
-        result = VectorbtAdapter().run(
-            _config(parity_env, path, signal_exit_fill="open"), path
-        )
+        result = VectorbtAdapter().run(_config(parity_env, path), path)
         trade = result.trades[0]
         assert trade.entry_price == pytest.approx(101.0)
-        # SHORT signal exit fills at open + spread (ask).
+        # SHORT signal exit fills at the (next) bar open + spread (ask).
         assert trade.exits[0].price == pytest.approx(102.0 + 0.2)
 
 
@@ -129,12 +130,21 @@ class TestSignalExitFill:
         result = VectorbtAdapter().run(_config(parity_env, path), path)
         assert result.trades[0].exits[0].price == pytest.approx(102.2)
 
-    def test_signal_exit_fill_open_uses_bar_open(self, parity_env):
+    def test_signal_exit_fill_open_is_rejected(self, parity_env):
+        # Issue #153: the lookahead-prone "open" mode is removed.
         path = _write_strategy(parity_env, "s_o", _strategy_text("LONG"))
-        result = VectorbtAdapter().run(
-            _config(parity_env, path, signal_exit_fill="open"), path
-        )
-        assert result.trades[0].exits[0].price == pytest.approx(102.0)
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
+            _config(parity_env, path, signal_exit_fill="open")
+
+    def test_vectorbt_engine_rejects_open_even_if_config_bypassed_validation(
+        self, parity_env
+    ):
+        path = _write_strategy(parity_env, "s_o2", _strategy_text("LONG"))
+        config = _config(parity_env, path)
+        object.__setattr__(config, "signal_exit_fill", "open")
+        # The adapter wraps per-symbol failures in a RuntimeError; the cause text stays.
+        with pytest.raises((ValueError, RuntimeError), match=r"removed.*next_open"):
+            VectorbtAdapter().run(config, path)
 
 
 class TestWarmupGate:
@@ -173,6 +183,7 @@ class TestWarmupGate:
         path = parity_env / "warmup_strat.py"
         path.write_text(text)
         config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+            signal_exit_fill="close",
             strategy_name="vbt_warmup",
             symbols=["VBW"],
             timeframe="1h",
@@ -292,18 +303,8 @@ class TestAskSideStops:
         """The window ends at the trigger bar's close: a stop touched only in
         the NEXT bar's sub-bars must NOT fire (the scheduled exit already
         ended at the trigger bar)."""
-        sub = pd.date_range("2024-01-01 08:00", periods=8, freq="15min", tz="UTC")
-        intrabar = pd.DataFrame(
-            {
-                "timestamp": sub,
-                "open": [100.0] * 8,
-                "high": [100.5] * 8,
-                "low": [100.0] * 7 + [98.8],  # only the 10:45 sub-bar? no: 8 bars end 09:45
-                "close": [100.0] * 8,
-            }
-        )
-        # 8 x 15min from 08:00 ends at 09:45 — inside the trigger bar. For a
-        # next-bar-only hit, extend past the trigger bar's close (10:00+).
+        # 12 x 15min from 08:00 ends at 11:00 — past the trigger bar's close
+        # (10:00), so the 10:45 sub-bar low is a next-bar-only hit.
         sub2 = pd.date_range("2024-01-01 08:00", periods=12, freq="15min", tz="UTC")
         intrabar2 = pd.DataFrame(
             {
@@ -368,8 +369,10 @@ class TestExplicitColumnRoles:
             },
             index=index,
         )
+        # The frozen adapter keeps the same-bar exit leg unshifted —
+        # signal_exit_fill="next_open" is refused on this adapter entirely;
+        # its accepted modes ("close"/"open") both fill on the signal bar.
         exec_default, _ = _prepare_next_open_execution_data(signals, {})
-        # Legacy guess: exit_* stays unshifted.
         assert exec_default["exit_signal"].tolist()[1:2] == [11.0]
         exec_declared, _ = _prepare_next_open_execution_data(
             signals, {}, {"exit_signal": "entry"}

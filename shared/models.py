@@ -488,6 +488,16 @@ class LiveExecution(BaseModel):
     # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
+    # Order context for the slippage decomposition (#134). `order_type` is the
+    # broker's own type label for the order this fill belongs to (e.g.
+    # "market", "MARKET", "LIMIT"); `requested_qty` is the quantity the order
+    # asked for, in the same qty units as `filled_qty`, so a row can show
+    # requested vs filled without joining back to the order. Both are read
+    # from the broker payload when it states them and stay ``None`` when it
+    # does not - a fill is never given an invented order type or quantity.
+    order_type: str | None = None
+    requested_qty: float | None = None
+
     @field_validator("commission", mode="before")
     @classmethod
     def _commission_is_a_non_negative_cost(cls, value: float | None) -> float | None:
@@ -801,6 +811,17 @@ class EquityPoint:
 # ─── Backtest metadata ──────────────────────────────────────────────────────
 
 
+#: ``signal_exit_fill`` of a persisted record that does not carry the key.
+#: Every reader (``BacktestMeta.from_dict``, the SQLite record loader, the
+#: optimizer's base-runtime reconstruction) must use this one value: before
+#: the 2026-11-13 next-open decision the default was ``"close"`` and
+#: ``to_dict`` omitted the key when it held that default, so a missing key
+#: means the record was produced with signal exits filled at the signal
+#: bar's close. Reading it as ``"next_open"`` would re-run (e.g. re-optimise)
+#: a legacy result under a different exit model than its stored stats.
+LEGACY_SIGNAL_EXIT_FILL = "close"
+
+
 @dataclass
 class BacktestMeta:
     """Metadata about a backtest run."""
@@ -834,7 +855,15 @@ class BacktestMeta:
     max_position_exposure_pct: float | None = None
     max_leverage: float | None = None
     modeling_resolution: str = "main_timeframe"
-    signal_exit_fill: str = "close"
+    # Fill convention for signal-driven exits, as simulated by the engine that
+    # produced the record. ``None`` means "not modelled by this platform" —
+    # imported/external results (LEAN, StockKit, QC/validation imports, demo
+    # seeds) whose exit fills come from the source system, not from a platform
+    # engine, must NOT inherit the native ``next_open`` default. Engines that
+    # simulate the fills record the mode explicitly; ``BacktestMeta.to_dict``
+    # always writes the key (``null`` when unset) so a missing key keeps its
+    # legacy ``"close"`` meaning for pre-2026-11-13 records.
+    signal_exit_fill: str | None = None
     allow_fallback_stop: bool = True
     reject_missing_stop: bool = False
     require_explicit_column_roles: bool = False
@@ -877,8 +906,7 @@ class BacktestMeta:
                 d[name] = value
         if self.modeling_resolution != "main_timeframe":
             d["modeling_resolution"] = self.modeling_resolution
-        if self.signal_exit_fill != "close":
-            d["signal_exit_fill"] = self.signal_exit_fill
+        d["signal_exit_fill"] = self.signal_exit_fill
         if not self.allow_fallback_stop:
             d["allow_fallback_stop"] = False
         if self.reject_missing_stop:
@@ -911,7 +939,8 @@ class BacktestMeta:
             max_position_exposure_pct=d.get("max_position_exposure_pct"),
             max_leverage=d.get("max_leverage"),
             modeling_resolution=d.get("modeling_resolution", "main_timeframe"),
-            signal_exit_fill=d.get("signal_exit_fill", "close"),
+            # Missing key = record from before the 2026-11-13 next-open decision.
+            signal_exit_fill=d.get("signal_exit_fill", LEGACY_SIGNAL_EXIT_FILL),
             allow_fallback_stop=d.get("allow_fallback_stop", True),
             reject_missing_stop=d.get("reject_missing_stop", False),
             require_explicit_column_roles=d.get("require_explicit_column_roles", False),

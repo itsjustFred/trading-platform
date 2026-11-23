@@ -1378,6 +1378,29 @@ def test_prepare_order_uses_get_equity_not_the_sizing_balance():
         )
 
 
+def test_prepare_order_refuses_when_equity_read_is_unparseable():
+    """A broker equity read that hits an unreadable money field (cTrader's
+    ``get_equity`` raises ``MoneyParseError`` on garbage balance/equity/
+    netUnrealizedPnL) must refuse the entry with
+    ``LossBreakerBreachError(state_unreadable=True)`` - never submit."""
+    from shared.money import MoneyParseError
+
+    account_id = "acc-eqgarbage"
+    dep = _deployment(account_id=account_id)
+    _observe(account_id, 100_000.0, DAY1)
+
+    class _GarbageEquityAdapter(_Adapter):
+        async def get_equity(self):
+            raise MoneyParseError("unreadable money value: 'junk'")
+
+    adapter = _GarbageEquityAdapter(equity=100_000.0)
+    with pytest.raises(LossBreakerBreachError) as excinfo:
+        asyncio.run(
+            daemon.prepare_order_with_risk(adapter, dep, _entry_signal(dep))
+        )
+    assert excinfo.value.state_unreadable is True
+
+
 def test_prepare_order_refuses_on_malformed_loss_breaker_config():
     """A bad ``loss_breaker_*`` deployment setting is a distinct
     configuration refusal (``config_invalid``), not a generic error."""
@@ -1761,6 +1784,11 @@ def test_run_daemon_points_loss_breaker_env_at_accounts_env(monkeypatch, tmp_pat
     monkeypatch.setattr(daemon, "sync_services_loop", _noop_async)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop_async)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop_async)
+    # Runs forever by design; stub it like the other gather members so
+    # run_daemon can return.
+    monkeypatch.setattr(daemon, "run_internal_strategy_loop", _noop_async)
+
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_async)
     monkeypatch.setattr(
         daemon,
         "_start_balance_poller",

@@ -1,0 +1,27 @@
+# Lint scope for the "Lint packaging and import seams" step in
+# .github/workflows/ci.yml.
+#
+# `ruff check .` is advisory because the repo carries an E501 backlog, so the
+# files whose import order and packaging surface are load-bearing get a
+# blocking run of their own. The list used to live inline in the workflow,
+# where nothing could check it; here it is a config `ruff check --config
+# ruff-seams.toml .` resolves, and `extend` pulls the real lint configuration
+# from pyproject.toml so `select`/per-file-ignores cannot drift between the
+# advisory and blocking runs.
+#
+# Adding a file: it must be clean under the full enabled rule set, not just
+# E/F/I/W - the same bar `ruff check .` reports against.
+extend = "pyproject.toml"
+
+include = [
+    "live_runner/__init__.py",
+    "live_runner/account_discovery.py",
+    "live_runner/ctrader_adapter.py",
+    "live_runner/pre_submit_caps.py",
+    "scripts/sync_requirements_from_lock.py",
+    "scripts/check_requirements_drift.py",
+    "scripts/matrix_queue_runner.py",
+    "scripts/verify_ctrader_order.py",
+    "scripts/wheel_smoke.py",
+    "tests/test_packaging.py",
+]

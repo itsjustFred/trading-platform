@@ -81,6 +81,60 @@ documented here.
     same bar are each judged against the full free margin, so with
     pyramiding they can jointly exceed it — the same convention MT5 applies
     to pending orders.
+  `fixed_risk_amount` (the MT5-alignment sizing protocol) routes through the
+  same `RiskEngine.calculate_position_size` via `risk_amount_override` on a
+  dedicated engine instance: `max_positions` (pending orders included) and
+  the aggregate `max_total_exposure` ceiling — which clamps the declared
+  amount to the remaining exposure budget — apply, with their own
+  configurable limits (`fixed_risk_max_positions`,
+  `fixed_risk_max_total_exposure`). `None` on either field means UNCAPPED —
+  the settled parity-safe default, because the MT5 EA the protocol mirrors
+  applies neither cap; setting a
+  field opts that one cap back in. `fixed_risk_amount = 0` is the #170
+  "off" idiom: the order falls through to pct sizing like an absent key,
+  while NaN/inf/negative amounts raise `ValueError`. Open
+  risk is measured in account currency: each position contributes
+  `|entry - stop| * qty * (tick_value / tick_size)`, and positions sized on
+  an explicit `stop_distance` carry their declared per-unit risk instead of
+  being re-measured against `|entry - stop|` — except once the stop has
+  trailed off its sizing value (breakeven/locked profit), where the smaller
+  of the declared per-unit risk and the current `|entry - stop|` counts.
+  The accepted quantity is
+  recomputed in the legacy MT5 order `(risk / distance) *
+  (tick_size / tick_value)` so unclamped sizes are bit-identical to the
+  pre-#279 formula; the per-position notional cap and the free-margin
+  leverage clamp are unchanged. `min_lot` is applied after the exposure
+  clamp, so a sub-minimum size can be raised back above the remaining
+  risk budget — pre-existing behaviour shared with the pct path. For the
+  shared-equity replay, an unclamped fixed-risk
+  quantity stays absolute-$ while a clamp-bound one is marked
+  equity-proportional and re-scaled.
 - **signal replay / live**: `risk_per_trade_pct` maps to
   `RiskConfig.max_risk_per_trade`; the exposure request maps to
   `RiskConfig.max_total_exposure`.
+
+## Fill prices feeding sizing and PnL (owner decision 2026-11-13)
+
+Sizing is anchored on the price a position actually fills at (§ "entry"). The
+exit side of that rule changed on 2026-11-13 and **supersedes** the earlier
+"stop/TP always fill at the level" and "signal exits fill at the signal bar's
+close" rules in any older text:
+
+- a stop-loss / take-profit fills at its **level on an intrabar touch**, but at
+  the bar's **open** when the bar opens beyond it (gap) — a gapped stop can
+  therefore lose more than the sized risk (`risk_per_trade_pct` bounds the
+  *planned* loss at the stop level, not a gap), exactly as at an MT5/live broker;
+- a signal exit fills at the **next bar's open**, like an entry; a signal on the
+  last bar is closed by the end-of-data close and flagged.
+
+Details and per-engine mapping: `docs/cross-engine-backtest-contract.md` §1,
+§3 and §5.
+
+## Sizing equity vs reporting equity
+
+Sizing draws on **realized cash** (`initial_capital` + closed-trade net PnL;
+`TradeEngine._sizing_equity`): unrealized profit is not spendable and a paper
+drawdown does not shrink new positions. The **reporting** equity curve that
+feeds drawdown / Sharpe / volatility is separate and **mark-to-market** on the
+native engine, so an open position's drawdown is reported even though it never
+changes a position size. See `docs/cross-engine-backtest-contract.md` §4b.

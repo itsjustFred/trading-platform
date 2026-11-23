@@ -49,6 +49,22 @@ def test_discord_parser_does_not_treat_lowercase_word_after_action_as_symbol() -
     assert signal is None or signal.symbol != "AT"
 
 
+def test_discord_parser_carries_the_parse_time_receipt_stamp() -> None:
+    """#337: the source stamps ``received_at_local`` at parse time and carries
+    it on the signal field - dropping either side would silently move
+    ``message_received_at`` to the post-wait conversion time."""
+    signal = _parse_trade_signal_from_message(
+        _message("**$AAPL** is now oversold — buy signal\nPrice: $190.50"),
+        default_timeframe="1h",
+    )
+
+    assert signal is not None
+    assert signal.received_at_local is not None
+    assert signal.received_at_local == signal.metadata["received_at_local"]
+    # The local receipt is "now", not the Discord message time (2026-01-01).
+    assert signal.received_at_local != signal.metadata["received_at"]
+
+
 def test_discord_parser_parses_rocketfuel_momentum_reversal_sell() -> None:
     signal = _parse_trade_signal_from_message(
         _message("Rocket Fuel momentum reversal for **$TSLA** @ 180.25"),

@@ -498,6 +498,72 @@ def resolve_same_bar_exit(
     return None
 
 
+#: Accepted ``BacktestConfig.signal_exit_fill`` spellings.
+#:
+#: ``next_open`` (default, owner decision 2026-11-13): a signal exit produced on
+#: bar *N* fills at bar *N+1*'s open — exactly like market entries.
+#: ``close`` is an explicit legacy opt-in that fills on the SIGNAL bar itself
+#: (its close).
+#:
+#: ``open`` (fill at the OPEN of the signal bar) was REMOVED (issue #153): a
+#: signal exit computed from bar *N* (its close, high/low, an indicator) cannot
+#: be filled at bar *N*'s open - that price predates the information, a silent
+#: lookahead. Its only legitimate use (MT5 clock exits) is served by raising the
+#: signal one bar early under the default ``next_open``.
+SIGNAL_EXIT_FILL_NEXT_OPEN = "next_open"
+SIGNAL_EXIT_FILL_VALUES = frozenset({SIGNAL_EXIT_FILL_NEXT_OPEN, "close"})
+REMOVED_SIGNAL_EXIT_FILL_OPEN = "open"
+
+
+def normalize_signal_exit_fill(value: Any) -> str:
+    """Return the canonical ``signal_exit_fill`` or raise ``ValueError`` loudly.
+
+    The single gate for every engine (native, vectorbt, pynecore) and for
+    ``BacktestConfig``: unknown spellings and the removed ``open`` mode fail the
+    run instead of silently falling through to another fill convention.
+    """
+    normalized = str(value or "").strip().lower()
+    if normalized == REMOVED_SIGNAL_EXIT_FILL_OPEN:
+        raise ValueError(
+            "signal_exit_fill='open' was removed (issue #153): it fills a signal exit "
+            "at the OPEN of the bar the exit was computed from, a lookahead for any "
+            "exit derived from that bar. Use the default 'next_open'; for a "
+            "clock-scheduled exit (MT5 time exit) raise the signal one bar early so "
+            "the next bar's open is the intended exit minute (see "
+            "docs/cross-engine-backtest-contract.md)."
+        )
+    if normalized not in SIGNAL_EXIT_FILL_VALUES:
+        raise ValueError(
+            f"Invalid signal_exit_fill {value!r}, must be 'next_open' or 'close'"
+        )
+    return normalized
+
+#: Engines that do not simulate the platform's ``next_open`` signal-exit
+#: convention and REFUSE a ``next_open`` config (fail loud, not warn-and-run),
+#: so entry points that select one of these engines must declare the legacy
+#: ``close`` fill explicitly — the fill the engine actually simulates is then
+#: what the persisted meta records. ``lean`` covers the LEAN *run* path only:
+#: its fills come from LEAN itself, and the imported result records
+#: ``signal_exit_fill`` as unset ("not modelled by this platform") — see
+#: ``runner.converters.lean_converter``.
+FROZEN_SIGNAL_EXIT_ENGINES = frozenset({"vectorbt", "pynecore", "lean"})
+
+
+def default_signal_exit_fill_for_engine(engine_name: str) -> str:
+    """The ``signal_exit_fill`` to declare when the caller did not choose one.
+
+    ``next_open`` on native (and any engine without a frozen guard); the
+    legacy ``close`` signal-bar fill on the frozen bar engines and on the
+    LEAN run path, matching the semantics they have always simulated. For
+    LEAN this is only the declared config value — the persisted result meta
+    records ``signal_exit_fill`` as unset because LEAN's own fill model is
+    not a platform convention.
+    """
+    if str(engine_name or "").strip().lower() in FROZEN_SIGNAL_EXIT_ENGINES:
+        return "close"
+    return SIGNAL_EXIT_FILL_NEXT_OPEN
+
+
 def level_gapped_at_open(
     *,
     direction: str,

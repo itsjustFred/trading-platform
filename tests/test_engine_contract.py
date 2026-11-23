@@ -141,6 +141,13 @@ def _config(data_dir: Path, **overrides) -> BacktestConfig:
     return BacktestConfig(**with_zero_fees(payload))
 
 
+def _frozen(cfg: BacktestConfig) -> BacktestConfig:
+    """Frozen engines (vectorbt/pynecore) refuse ``next_open``; pin the legacy
+    ``close`` signal-bar fill they actually simulate so the persisted meta
+    stays truthful."""
+    return cfg.model_copy(update={"signal_exit_fill": "close"})
+
+
 @pytest.fixture(scope="module")
 def contract_data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """One deterministic bundled fixture tree shared by the engine-level tests."""
@@ -223,7 +230,7 @@ class TestDateFilterConvention:
         cfg = _config(data_dir, end_date="2024-01-09", parameters={})
 
         native = NativeAdapter().run(cfg, STRATEGY_PATH)
-        vectorbt = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+        vectorbt = VectorbtAdapter().run(_frozen(cfg), STRATEGY_PATH)
 
         # Bars from 2024-01-01 00:00 through 2024-01-09 23:00 inclusive.
         for result in (native, vectorbt):
@@ -481,7 +488,7 @@ def test_vectorbt_engine_stops_first_without_intrabar_data(tmp_path: Path):
         end_date="2024-01-01",
         parameters={},
     )
-    result = VectorbtAdapter().run(cfg, str(strategy))
+    result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -544,7 +551,7 @@ def test_vectorbt_engine_uses_chronological_intrabar_event_when_available(tmp_pa
         modeling_resolution="5m",
         parameters={},
     )
-    result = VectorbtAdapter().run(cfg, str(strategy))
+    result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
     assert len(result.trades) == 1
     trade = result.trades[0]
@@ -668,7 +675,7 @@ def test_native_engine_resolves_one_lower_like_vectorbt(tmp_path: Path):
     flag = native_trade.meta.get("same_bar_priority")
     assert flag is None, "with the intrabar frame available no fallback flag may be recorded"
 
-    vectorbt = VectorbtAdapter().run(cfg, str(strategy))
+    vectorbt = VectorbtAdapter().run(_frozen(cfg), str(strategy))
     assert len(vectorbt.trades) == 1
     assert vectorbt.trades[0].exits[-1].reason == "take_profit", (
         "vectorbt already resolves '1-lower' chronologically; native must agree"
@@ -724,7 +731,7 @@ def test_native_and_vectorbt_resolve_the_same_intrabar_spellings(tmp_path: Path)
     ]
     for resolution in resolutions:
         for base in ("1h", "1d"):
-            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
                 strategy_name="parity",
                 symbols=["X"],
                 timeframe=base,
@@ -779,7 +786,7 @@ def test_spellings_pinned_against_one_shared_table():
     assert vbt_module._resolve_intrabar_timeframe("1h", "m1") == contract.resolve_intrabar_timeframe("1h", "m1")
     # The config validator canonicalizes alias spellings before any adapter
     # sees them, so per-adapter divergence is structurally impossible.
-    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
         strategy_name="pin",
         symbols=["X"],
         timeframe="1h",
@@ -810,7 +817,7 @@ class TestSizingContract:
             end_date="2024-01-02",
             initial_capital=100_000.0,
             risk_per_trade_pct=0.01,
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         from runner.engine import TradeEngine
 
@@ -837,7 +844,7 @@ class TestSizingContract:
             risk_per_trade_pct=0.01,
             parameters={},
         )
-        result = VectorbtAdapter().run(cfg, str(strategy))
+        result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
         assert len(result.trades) == 1
         trade = result.trades[0]
@@ -867,7 +874,7 @@ class TestSizingContract:
             max_position_pct=1.0,
             parameters={},
         )
-        result = VectorbtAdapter().run(cfg, str(strategy))
+        result = VectorbtAdapter().run(_frozen(cfg), str(strategy))
 
         assert len(result.trades) == 1
         trade = result.trades[0]
@@ -951,7 +958,7 @@ class TestStatsKeysContract:
                 "entry_price": 108.0,
             },
         ]
-        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, ).run(
             signals=[ReplaySignal.from_payload(signal) for signal in signals],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",
@@ -977,7 +984,7 @@ class TestStatsKeysContract:
         self, contract_data_dir: Path
     ):
         result = VectorbtAdapter().run(
-            _config(tmp_contract_dir(contract_data_dir)), STRATEGY_PATH
+            _frozen(_config(tmp_contract_dir(contract_data_dir))), STRATEGY_PATH
         )
         assert len(result.trades) > 0
 
@@ -1070,7 +1077,7 @@ class TestTotalBarsContract:
     def test_vectorbt_engine_reports_loaded_bar_count(self, contract_data_dir: Path):
         data_dir = tmp_contract_dir(contract_data_dir)
         frame = _read_parquet(data_dir, "PARITY", "1h")
-        result = VectorbtAdapter().run(_config(data_dir), STRATEGY_PATH)
+        result = VectorbtAdapter().run(_frozen(_config(data_dir)), STRATEGY_PATH)
         assert len(result.trades) > 0, "Fixture must trade for the assertion to bite"
         assert result.meta.total_bars == len(frame), (
             "total_bars must be the loaded bar count, not the trade count (F6)"
@@ -1094,7 +1101,10 @@ class TestTotalBarsContract:
     def test_total_bars_is_not_the_trade_count(self, contract_data_dir: Path):
         data_dir = tmp_contract_dir(contract_data_dir)
         for adapter in (NativeAdapter(), VectorbtAdapter()):
-            result = adapter.run(_config(data_dir), STRATEGY_PATH)
+            run_cfg = _config(data_dir)
+            if adapter.name == "vectorbt":
+                run_cfg = _frozen(run_cfg)
+            result = adapter.run(run_cfg, STRATEGY_PATH)
             assert result.meta.total_bars > len(result.trades), (
                 f"{result.meta.engine}: total_bars ({result.meta.total_bars}) must not "
                 f"degenerate into the trade count ({len(result.trades)})"
@@ -1136,7 +1146,7 @@ def _run_pyne_with_stubbed_cli(cfg, strategy_path, *, trade_csv_text, stats_csv_
         stack.enter_context(
             patch("runner.engines.pynecore_adapter.subprocess.run", side_effect=fake_run)
         )
-        return PyneCoreAdapter().run(cfg, strategy_path)
+        return PyneCoreAdapter().run(_frozen(cfg), strategy_path)
 
 
 PYNE_EMPTY_TRADE_CSV = (
@@ -1253,7 +1263,7 @@ def main(
             "runner.engines.pynecore_adapter.subprocess.run",
             side_effect=_stub_pyne_cli(captured, stats_csv_text="Metric,All USD\n"),
         ):
-            PyneCoreAdapter().run(cfg, str(strategy_path))
+            PyneCoreAdapter().run(_frozen(cfg), str(strategy_path))
         return strategy_path, captured
 
     @staticmethod
@@ -1473,7 +1483,7 @@ class TestFillContract:
             end_date="2024-01-02",
             initial_capital=100_000,
             modeling_resolution="main_timeframe",
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = TradeEngine(cfg, symbol="PARITY").run(data, strategy_fn)
 
@@ -1487,7 +1497,7 @@ class TestFillContract:
         _write_ohlcv(tmp_path, "PARITY", "1h", data)
 
         cfg = _config(tmp_path, parameters={"fast_length": 5, "slow_length": 20})
-        result = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+        result = VectorbtAdapter().run(_frozen(cfg), STRATEGY_PATH)
 
         assert len(result.trades) >= 1
         for trade in result.trades:
@@ -1504,7 +1514,7 @@ class TestFillContract:
         cfg = _config(data_dir)
 
         native = NativeAdapter().run(cfg, STRATEGY_PATH)
-        vectorbt = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+        vectorbt = VectorbtAdapter().run(_frozen(cfg), STRATEGY_PATH)
 
         assert len(native.trades) == len(vectorbt.trades)
         # `len(...) == len(...)` is asserted on the line above, so the strict zip
@@ -1524,7 +1534,7 @@ class TestFillContract:
                 "entry_price": float(frame.iloc[5]["close"]),
             }
         )
-        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, ).run(
             signals=[signal],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",

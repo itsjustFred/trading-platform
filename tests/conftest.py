@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -91,6 +92,17 @@ ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
 
 os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
+# A developer's shell or .env must never turn the test suite into an alert
+# source: the ops alert sink reads OPS_ALERT_WEBHOOK_URL from the environment.
+# Set it blank rather than popping it: shared.constants load_dotenv() fills in
+# missing variables from .env, but never overrides one that is already set, and
+# create_sink_from_env treats blank as disabled.
+os.environ["OPS_ALERT_WEBHOOK_URL"] = ""
+# Same reasoning for the alert filters: a developer's environment must not
+# change which records the suite's alert-sink tests see.
+os.environ["OPS_ALERT_MIN_LEVEL"] = ""
+os.environ["OPS_ALERT_EVENTS"] = ""
+os.environ["OPS_ALERT_IGNORE"] = ""
 os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
 # Removed rather than redirected: an exported TP_ACCOUNTS_ENV names a real credential file, and
 # nothing in the suite may read one. Removing it leaves exactly one redirect in play - the roster
@@ -113,6 +125,33 @@ class SuiteHermeticityViolation(RuntimeError):
 
 _REPO_SECRET_OPENS: list[str] = []
 _NETWORK_VIOLATIONS: list[str] = []
+
+# The node id of the test currently in its setup/call/teardown window, or ``None``
+# for collection, session hooks and work a leaked thread does between tests. The
+# audit hook runs on whichever thread made the socket call, so a violation is
+# attributed to the test *running* on this thread only implicitly: a background
+# thread spawned by a test fires while some other test (or no test) is current.
+# The thread name is recorded alongside so a leaked worker stands out.
+_CURRENT_TEST_NODEID: str | None = None
+
+# Hits on the Dukascopy network-edge stubs (``_no_dukascopy_sdk_network``).
+# Recorded and failed at session end like ``_NETWORK_VIOLATIONS``: the stub
+# already turned what would have been a hermeticity violation into an ordinary
+# downloader error, so without this handoff a swallowed stub hit would fail
+# nothing. A test that exercises a stub on purpose consumes its own hits (see
+# ``_consume_stub_hits`` in tests/test_suite_isolation.py).
+_DUKASCOPY_STUB_HITS: list[str] = []
+
+
+def dukascopy_stub_hits() -> tuple[str, ...]:
+    """Every blocked Dukascopy/JForex network-edge call this session saw."""
+    return tuple(_DUKASCOPY_STUB_HITS)
+
+
+def _test_phase_label() -> str:
+    if _CURRENT_TEST_NODEID is None:
+        return "no test running"
+    return f"test {_CURRENT_TEST_NODEID}"
 
 
 def repo_secret_opens() -> tuple[str, ...]:
@@ -197,7 +236,10 @@ def _is_local_host(host: object) -> bool:
 def _refuse_remote_host(host: object, action: str) -> None:
     if _is_local_host(host):
         return
-    _NETWORK_VIOLATIONS.append(f"{action} {host!r}")
+    _NETWORK_VIOLATIONS.append(
+        f"{action} {host!r} during {_test_phase_label()} "
+        f"(thread {threading.current_thread().name})"
+    )
     raise SuiteHermeticityViolation(
         f"the suite refused a {action} to {host!r}: tests must not reach the network. "
         "Point them at a fixture, a stub transport or localhost."
@@ -481,6 +523,18 @@ def _hermeticity_failure_messages(session: pytest.Session) -> list[str]:
             " also raised SuiteHermeticityViolation, which broad exception handlers can swallow."
         )
 
+    stub_hits = dukascopy_stub_hits()
+    if stub_hits:
+        shown = "\n  ".join(dict.fromkeys(stub_hits))
+        failures.append(
+            "\n\nERROR: the Dukascopy/JForex network-edge stubs blocked calls that would have"
+            f" reached the network:\n  {shown}"
+            "\nEach became an ordinary downloader error instead of a socket violation, so nothing"
+            " else would have failed. A test reached a real download path: give it a fixture, a"
+            " stub transport or localhost, or an explicit patch of the fetch edge. A test that"
+            " exercises a stub on purpose must consume its own hits."
+        )
+
     return failures
 
 
@@ -626,6 +680,91 @@ def _no_jforex_jvm_prewarm():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _no_dukascopy_sdk_network():
+    """Keep tests off the two Dukascopy network edges: the JNLP/JAR bootstrap
+    and the native ``.bi5`` datafeed fetch.
+
+    Viewer download tasks run on background threads that can outlive the
+    per-test monkeypatch window (and the JVM prewarm patch above only covers
+    ``prewarm_jvm``), so under a randomized order an accidental real fetch
+    fires while an unrelated test - or no test - is current. Stubbing the
+    edges themselves turns that leak into an ordinary task failure inside the
+    downloader, which its callers already handle - and every hit is recorded
+    and fails the session at :func:`pytest_sessionfinish` like a network
+    violation, so a stub hit can never pass silently. Tests that exercise the
+    fetchers patch the same attributes themselves; a test-local
+    ``monkeypatch.setattr`` wins for the duration of the test and this
+    fixture's undo restores the real callable afterwards. Both modules are
+    import-safe here: ``jforex_dl`` guards its ``jpype`` import and neither
+    module touches the network or starts a JVM at import time.
+    """
+    from data_tools.downloaders import dukascopy_native, jforex_dl
+
+    def _blocked_urlopen(*args, **kwargs):
+        _DUKASCOPY_STUB_HITS.append(
+            f"jforex_dl.urlopen during {_test_phase_label()} "
+            f"(thread {threading.current_thread().name})"
+        )
+        raise RuntimeError(
+            "the suite must not fetch JForex SDK jars over the network; "
+            "patch jforex_dl.urlopen or seed JFOREX_CLASSPATH/JFOREX_JARS"
+        )
+
+    async def _blocked_fetch_one(*args, **kwargs):
+        _DUKASCOPY_STUB_HITS.append(
+            f"dukascopy_native._fetch_one during {_test_phase_label()} "
+            f"(thread {threading.current_thread().name})"
+        )
+        raise RuntimeError(
+            "the suite must not fetch Dukascopy .bi5 files over the network; "
+            "patch dukascopy_native._fetch_one or download_bi5_files"
+        )
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(jforex_dl, "urlopen", _blocked_urlopen)
+        patch.setattr(dukascopy_native, "_fetch_one", _blocked_fetch_one)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_viewer_interrupted_task_resume():
+    """Keep ``TestClient(app)`` lifespans from resuming persisted download tasks.
+
+    The viewer lifespan marks queued/running ``BackgroundTaskRecord`` rows
+    interrupted and ``_resume_interrupted_tasks`` re-dispatches them - including
+    Dukascopy/JForex downloads that spawn ``run_download`` threads. Task records
+    live in the session-shared DATA_DIR database, so a lifespan entered by one
+    test resumes whatever an earlier test left behind, and the resumed worker
+    threads then run real fetches while unrelated tests are current (the leak
+    ``_no_dukascopy_sdk_network`` can only blunt, not prevent).
+
+    Only the lifespan entry point is stubbed: tests that exercise resume call
+    ``viewer.main._resume_interrupted_tasks`` directly and still see the real
+    function. ``app.router.lifespan_context`` is what ``TestClient`` runs on
+    ``__enter__``, so wrapping it covers every ``with TestClient(app)`` in the
+    suite without touching production code. ``viewer.main`` is imported here so
+    a test that imports it lazily still gets the wrapped app.
+    """
+    import viewer.main as viewer_main_module
+
+    app = viewer_main_module.app
+    original_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan_without_task_resume(lifespan_app):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(viewer_main_module, "_resume_interrupted_tasks", lambda: None)
+            async with original_lifespan(lifespan_app):
+                yield
+
+    app.router.lifespan_context = _lifespan_without_task_resume
+    try:
+        yield
+    finally:
+        app.router.lifespan_context = original_lifespan
+
+
 @pytest.fixture
 def isolated_db_sandbox(monkeypatch, tmp_path: Path):
     """Redirect ``shared.database`` at a throwaway SQLite database (pre-created
@@ -692,6 +831,30 @@ def _viewer_state_lock(lock, name: str):
         lock.release()
 
 
+def _join_viewer_task_threads(tasks: list, *, timeout: float = 2.0) -> None:
+    """Signal and briefly join viewer worker threads a test left behind.
+
+    Download/backtest/agent tasks run on daemon threads registered as
+    ``task["thread"]``; a worker still alive at reset time would keep fetching
+    or writing while later tests are current. ``stop_event`` asks the
+    cooperative loops to exit, then each thread gets a short join - the threads
+    are daemon, so one that ignores the signal cannot pin the interpreter, but
+    joining forever would hang the suite instead.
+    """
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        stop_event = task.get("stop_event")
+        if stop_event is not None:
+            stop_event.set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        thread = task.get("thread")
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            thread.join(timeout=timeout)
+
+
 def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
     """Clear viewer module state that must not cross test boundaries.
 
@@ -747,7 +910,9 @@ def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
         # DATA_TASKS lives in viewer.core (viewer.main re-exports it), so it
         # is cleared here to cover sessions that never import viewer.main.
         with _viewer_state_lock(legacy_module.DATA_TASKS_LOCK, "DATA_TASKS_LOCK"):
+            leftover_tasks = list(legacy_module.DATA_TASKS.values())
             legacy_module.DATA_TASKS.clear()
+        _join_viewer_task_threads(leftover_tasks)
         with _viewer_state_lock(legacy_module._OHLCV_DF_CACHE_LOCK, "_OHLCV_DF_CACHE_LOCK"):
             legacy_module._OHLCV_DF_CACHE.clear()
     from data_tools import cache_manager
@@ -817,7 +982,10 @@ def viewer_client(monkeypatch, tmp_path, viewer_app):
     return _TestClient(viewer_app)
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    global _CURRENT_TEST_NODEID
+    _CURRENT_TEST_NODEID = item.nodeid
     if item.get_closest_marker("e2e") is None:
         return
 
@@ -829,6 +997,19 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             "Playwright browser binaries not installed. "
             "Run: python -m playwright install firefox"
         )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+    """Clear the attributed node id once the test's fixtures have torn down.
+
+    ``trylast`` keeps the id set while fixture finalizers run, so a network
+    attempt inside a ``yield`` fixture's teardown still names its test. A
+    violation recorded after this point belongs to no test - the signature of
+    a background thread a test leaked.
+    """
+    global _CURRENT_TEST_NODEID
+    _CURRENT_TEST_NODEID = None
 
 
 @pytest.fixture(autouse=True)
@@ -938,4 +1119,28 @@ def _isolate_loss_breaker_accounts_env():
         # ``run_daemon`` may point the breaker at a configured accounts file;
         # tests must never inherit that override from an earlier test.
         patch.setattr(loss_breaker, "_ACCOUNTS_ENV_OVERRIDE", None)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_daemon_shutdown_gate():
+    """Give every test a fresh daemon shutdown coordinator.
+
+    ``run_daemon`` marks its coordinator requested on every exit path - that is
+    the submission gate doing its job - and ``_ACTIVE_SHUTDOWN`` is restored to
+    the process-wide ``_SHUTDOWN`` afterwards. Without isolation a test that ran
+    the daemon leaves the gate closed for every later test in the same process
+    (and, under xdist, the same worker), so submissions that should reach the
+    broker are refused with "daemon is shutting down".
+
+    Uses its own ``MonkeyPatch`` rather than the ``monkeypatch`` fixture, for
+    the same reason as ``_isolate_loss_breaker_accounts_env`` above.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.shutdown import ShutdownCoordinator
+
+    fresh = ShutdownCoordinator(force_exit_fn=lambda code: pytest.fail("forced exit"))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(daemon, "_SHUTDOWN", fresh)
+        patch.setattr(daemon, "_ACTIVE_SHUTDOWN", fresh)
         yield

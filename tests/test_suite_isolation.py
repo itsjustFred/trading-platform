@@ -20,6 +20,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -600,14 +601,17 @@ def test_a_loopback_connect_is_allowed_through_to_the_os(monkeypatch) -> None:
     assert suite_conftest.network_violations() == ()
 
 
-def test_a_remote_name_lookup_is_refused(monkeypatch) -> None:
+def test_a_remote_name_lookup_is_refused(monkeypatch, request) -> None:
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
     with pytest.raises(suite_conftest.SuiteHermeticityViolation, match=r"api\.alpaca\.markets"):
         socket.getaddrinfo("api.alpaca.markets", 443)
-    assert suite_conftest.network_violations() == ("name lookup 'api.alpaca.markets'",)
+    assert suite_conftest.network_violations() == (
+        f"name lookup 'api.alpaca.markets' during test {request.node.nodeid} "
+        f"(thread {threading.current_thread().name})",
+    )
 
 
-def test_a_remote_connect_is_refused(monkeypatch) -> None:
+def test_a_remote_connect_is_refused(monkeypatch, request) -> None:
     monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
     probe = socket.socket()
     try:
@@ -615,7 +619,10 @@ def test_a_remote_connect_is_refused(monkeypatch) -> None:
             probe.connect(("35.221.23.121", 443))
     finally:
         probe.close()
-    assert suite_conftest.network_violations() == ("connect '35.221.23.121'",)
+    assert suite_conftest.network_violations() == (
+        f"connect '35.221.23.121' during test {request.node.nodeid} "
+        f"(thread {threading.current_thread().name})",
+    )
 
 
 def test_a_unix_socket_connect_is_not_a_network_violation(monkeypatch) -> None:
@@ -669,6 +676,86 @@ def test_a_byte_form_local_name_stays_local(host: bytes) -> None:
 @pytest.mark.parametrize("host", [b"api.alpaca.markets", b"35.221.23.121"])
 def test_a_byte_form_remote_name_is_still_refused(host: bytes) -> None:
     assert suite_conftest._is_local_host(host) is False
+
+
+def test_a_network_violation_names_the_test_that_attempted_it(
+    monkeypatch, request
+) -> None:
+    """The guard must attribute a refused socket call to a test node id (#381).
+
+    The session-finish report is the only place a swallowed
+    ``SuiteHermeticityViolation`` surfaces, so the recorded entry has to carry
+    enough context to find the offender without a bisect.
+    """
+    monkeypatch.setattr(suite_conftest, "_NETWORK_VIOLATIONS", [])
+    monkeypatch.setattr(suite_conftest, "_CURRENT_TEST_NODEID", request.node.nodeid)
+    with pytest.raises(suite_conftest.SuiteHermeticityViolation):
+        socket.getaddrinfo("platform.dukascopy.com", 443)
+    (violation,) = suite_conftest.network_violations()
+    assert "platform.dukascopy.com" in violation
+    assert request.node.nodeid in violation
+
+
+def _consume_stub_hits(edge: str, nodeid: str) -> list[str]:
+    """Remove and return the stub hits a test deliberately triggered.
+
+    The session-end failure exists to expose *accidental* leaks; a test that
+    exercises the blocked edge on purpose must not leave its own hit behind.
+    Only hits recorded on the calling thread are consumed: a leaked worker
+    thread firing during this test is attributed to this node id too, and it
+    must stay behind to fail the session.
+    """
+    hits = suite_conftest._DUKASCOPY_STUB_HITS
+    thread_label = f"(thread {threading.current_thread().name})"
+    mine = [
+        hit
+        for hit in hits
+        if edge in hit and nodeid in hit and thread_label in hit
+    ]
+    hits[:] = [hit for hit in hits if hit not in mine]
+    return mine
+
+
+def test_jforex_classpath_resolution_cannot_reach_the_jnlp_endpoint(
+    monkeypatch, tmp_path: Path, request
+) -> None:
+    """The autouse stub turns an accidental JNLP bootstrap into a test failure (#381).
+
+    With no ``JFOREX_*`` override and no local jars, classpath resolution falls
+    through to ``_download_jforex_jars_from_jnlp``; the stubbed ``urlopen``
+    must stop it before any socket is opened.
+    """
+    from data_tools.downloaders import jforex_dl
+
+    monkeypatch.setattr(jforex_dl, "DATA_DIR", tmp_path)
+    for name in ("JFOREX_CLASSPATH", "JFOREX_JARS", "JFOREX_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(
+        "DUKASCOPY_JNLP_URL", "https://platform.dukascopy.com/demo/jforex.jnlp"
+    )
+
+    with pytest.raises(RuntimeError, match="must not fetch JForex SDK jars"):
+        jforex_dl._resolve_jforex_classpath_details()
+
+    (hit,) = _consume_stub_hits("jforex_dl.urlopen", request.node.nodeid)
+    assert request.node.nodeid in hit
+
+
+def test_dukascopy_native_fetch_is_stubbed_in_tests(request) -> None:
+    """``_fetch_one`` is the single aiohttp edge to ``datafeed.dukascopy.com``."""
+    import asyncio
+
+    from data_tools.downloaders import dukascopy_native as native
+
+    with pytest.raises(RuntimeError, match="must not fetch Dukascopy"):
+        asyncio.run(
+            native._fetch_one(
+                None, None, "https://datafeed.dukascopy.com/datafeed/x", None
+            )
+        )
+
+    (hit,) = _consume_stub_hits("dukascopy_native._fetch_one", request.node.nodeid)
+    assert request.node.nodeid in hit
 
 
 def test_every_daemon_discovery_call_names_the_resolved_accounts_env() -> None:

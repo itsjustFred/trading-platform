@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
 import re
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qsl, unquote
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import (
@@ -21,6 +23,7 @@ from sqlalchemy import (
     Column,
     Float,
     String,
+    Text,
     TextClause,
     UniqueConstraint,
     and_,
@@ -37,12 +40,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
-from shared.alpaca_symbols import classify_alpaca_symbol
+from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.constants import normalize_symbols
 from shared.fill_keys import canonical_utc_timestamp
 from shared.logging import get_logger
 from shared.models import (
+    LEGACY_SIGNAL_EXIT_FILL,
     PRICE_DERIVED,
     PRICE_DERIVED_UNAVAILABLE,
     STORED_ROW_CONTEXT,
@@ -94,7 +98,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # configuration at a different point in the import order and could disagree
 # with the DATA_DIR this module already resolved.
 DATA_DIR = RESOLVED_DATA_DIR
-DB_PATH = DATA_DIR / "backtests.db"
+DB_FILENAME = "backtests.db"
+DB_PATH = DATA_DIR / DB_FILENAME
 # Optional engine override. New code should call get_engine(); importing
 # ENGINE no longer forces engine creation at import time. Tests that need a
 # bespoke engine set this attribute directly (it is part of the module
@@ -107,11 +112,100 @@ def _sqlite_url(path: Path) -> str:
 
 
 def _default_database_url() -> str:
-    return _sqlite_url(DATA_DIR / "backtests.db")
+    return _sqlite_url(DATA_DIR / DB_FILENAME)
 
 
 def _is_sqlite_url(url: str) -> bool:
     return url.strip().lower().startswith("sqlite")
+
+
+#: Query values SQLAlchemy's ``asbool`` coercion reads as true for the ``uri`` parameter - the
+#: spelling that turns a ``file:`` database name into a SQLite URI filename.
+_SQLITE_URI_TRUE_VALUES = frozenset({"true", "yes", "on", "y", "t", "1"})
+
+
+def _sqlite_uri_file_path(body: str) -> str:
+    """The path inside a ``file:`` URI body, after ``uri=true`` was established.
+
+    ``file:/abs/db``, ``file:rel/db`` and ``file::memory:`` name their text after the prefix
+    directly. ``file://<authority>/<path>`` carries an authority SQLite accepts only when it is
+    empty or ``localhost`` (``file://localhost/abs/db`` is ``/abs/db``); any other authority is
+    refused by SQLite itself, so there is no file to name and the empty string is returned.
+    """
+    if not body.startswith("//"):
+        return body
+    authority, separator, path = body[2:].partition("/")
+    if authority not in ("", "localhost"):
+        return ""
+    result = separator + path if separator else ""
+    # On Windows ``file:///C:/x.db`` is the drive path ``C:/x.db``: SQLite drops the leading
+    # slash before a drive letter there, and keeping it would name ``/C:/x.db`` - a file the
+    # engine never opens, so the single-instance lock would sit beside the wrong path. On
+    # POSIX the same spelling is a literal ``/C:`` directory, so the strip is Windows-only.
+    if (
+        os.name == "nt"
+        and len(result) > 2
+        and result[0] == "/"
+        and result[1].isalpha()
+        and result[2] == ":"
+    ):
+        return result[1:]
+    return result
+
+
+def sqlite_url_file(url: str) -> str:
+    """The file part of a SQLite URL: query string and fragment stripped, percent-decoding undone.
+
+    ``DATABASE_URL`` is handed straight to SQLAlchemy, which reads everything after the first
+    ``?`` as driver options rather than as part of the filename, so
+    ``sqlite:////abs/backtests.db?timeout=30`` opens ``/abs/backtests.db``. Splitting the raw URL
+    kept ``?timeout=30`` in the path, and a ``Path`` carrying it is not a file: a working database
+    was reported as "Database file not found".
+
+    Empty when the URL names no file (``sqlite://``, or a ``file:`` URI in ``mode=memory``); the
+    caller decides what that means.
+
+    ``sqlite:///file:/abs/db.db?uri=true`` is SQLAlchemy's URI form for the same database as
+    ``sqlite:////abs/db.db``. The ``file:`` prefix is URI syntax the SQLite driver parses - and
+    only when ``uri=true`` enables URI filenames: without it the driver opens a literal file
+    named ``file:live.db``, so the prefix is kept. In URI mode the ``localhost`` authority of
+    ``file://localhost/...`` is normalised away and ``mode=memory`` names an in-memory database,
+    which has no file at all.
+    """
+    head, _, query = url.partition("?")
+    head = head.partition("#")[0]
+    raw_part = head.split("///", 1)[1] if "///" in head else ""
+    params = parse_qsl(query.partition("#")[0], keep_blank_values=True)
+    uri_mode = any(
+        key == "uri" and value.strip().lower() in _SQLITE_URI_TRUE_VALUES
+        for key, value in params
+    )
+    if raw_part.startswith("file:"):
+        if not uri_mode:
+            return unquote(raw_part)
+        if any(
+            key == "mode" and value.strip().lower() == "memory" for key, value in params
+        ):
+            # ``file:memdb1?mode=memory&cache=shared&uri=true`` is a named in-memory database.
+            return ""
+        return unquote(_sqlite_uri_file_path(raw_part[len("file:") :]))
+    return unquote(raw_part)
+
+
+def live_db_path() -> Path:
+    """The live database file this process trades.
+
+    The SQLite file ``DATABASE_URL`` names when it names one, so a caller acting on the file itself
+    (the daemon's single-instance lock, which sits next to it) sees the file the engine really
+    opens. A URL that names no file - in-memory, a bare ``sqlite://``, or another dialect - has no
+    file to point at, so the ``DATA_DIR/backtests.db`` default is used.
+    """
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url and _is_sqlite_url(url):
+        raw_file = sqlite_url_file(url)
+        if raw_file and raw_file != ":memory:":
+            return Path(raw_file)
+    return DATA_DIR / DB_FILENAME
 
 
 def _create_database_engine() -> Any:
@@ -575,6 +669,126 @@ def _normalize_optional_id(value: Any) -> str | None:
     return normalized or None
 
 
+def _lift_optional_float(value: Any) -> float | None:
+    """A metadata value as a float column, or ``None`` when it is not one.
+
+    The quote snapshot columns are a projection of untrusted signal metadata:
+    a malformed value must degrade to NULL (the raw value stays in
+    ``metadata_json``), never raise inside ``save_live_signal`` and never be
+    stored as a number the broker did not send.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _lift_optional_text(value: Any) -> str | None:
+    """A metadata value as a text column, or ``None`` when absent/blank."""
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
+
+def _lift_optional_datetime(value: Any) -> datetime | None:
+    """A metadata timestamp (datetime or ISO-8601 text) as a datetime column.
+
+    Naive values are read as UTC, the same convention ``timestamp`` uses on
+    the way in. Anything unparseable degrades to ``None``: a timestamp that
+    cannot be read is "unknown", not "now".
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError, TypeError):
+        # Producer-controlled stamps can name dates no datetime can hold
+        # (e.g. year 1 with a non-UTC offset); "unknown", never a raise.
+        return None
+
+
+#: Metadata keys projected into the ``live_signals`` quote-snapshot columns
+#: (#134). The #125 entry-deviation gate writes all of them on accepted
+#: entries; exits and pre-gate refusals leave them absent, which the columns
+#: record as NULL.
+_LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS = (
+    "entry_quote_bid",
+    "entry_quote_ask",
+    "entry_quote_price",
+)
+_LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS = (
+    "entry_quote_side",
+    "entry_quote_source",
+    "entry_quote_time_source",
+)
+
+#: Metadata keys projected into the ``live_signals`` timing columns (#134).
+#: ``received_at`` is the producer-stated time (Discord message ``created_at``);
+#: ``signal_timestamp`` is the fallback producer stamp internal/replay signals
+#: carry. ``received_at_local`` is stamped by the Discord source when this
+#: process handled the message. ``timestamp`` is deliberately NOT a fallback:
+#: it is ambiguous producer-vs-processing time.
+_LIVE_SIGNAL_PRODUCER_AT_METADATA_KEYS = ("received_at", "signal_timestamp")
+_LIVE_SIGNAL_TIMING_METADATA_KEYS = {
+    "producer_at": _LIVE_SIGNAL_PRODUCER_AT_METADATA_KEYS,
+    "message_received_at": ("received_at_local",),
+}
+
+
+def _live_signal_quote_snapshot_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Column values for the #134 quote snapshot, lifted from signal metadata.
+
+    Analytics only: this projection runs inside the order path, so it must
+    never raise - a malformed producer value degrades the whole snapshot to
+    NULLs with a warning rather than vetoing the trade.
+    """
+    field_names = (
+        list(_LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS)
+        + list(_LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS)
+        + ["entry_quote_time"]
+        + list(_LIVE_SIGNAL_TIMING_METADATA_KEYS)
+    )
+    fields: dict[str, Any] = {name: None for name in field_names}
+    try:
+        for key in _LIVE_SIGNAL_QUOTE_FLOAT_METADATA_KEYS:
+            fields[key] = _lift_optional_float(metadata.get(key))
+        for key in _LIVE_SIGNAL_QUOTE_TEXT_METADATA_KEYS:
+            fields[key] = _lift_optional_text(metadata.get(key))
+        fields["entry_quote_time"] = _lift_optional_datetime(
+            metadata.get("entry_quote_time")
+        )
+        for column, keys in _LIVE_SIGNAL_TIMING_METADATA_KEYS.items():
+            value = None
+            for key in keys:
+                value = _lift_optional_datetime(metadata.get(key))
+                if value is not None:
+                    break
+            fields[column] = value
+    except Exception:
+        logger.warning(
+            "Live signal quote snapshot projection failed; storing NULLs",
+            extra={"data": {"error": "projection_failed"}},
+            exc_info=True,
+        )
+        return {name: None for name in field_names}
+    return fields
+
+
 class LiveSignalModel(SQLModel, table=True):
     __tablename__ = "live_signals"
 
@@ -614,6 +828,32 @@ class LiveSignalModel(SQLModel, table=True):
         default=None,
         sa_column=Column("idempotency_key", String, nullable=True, index=True),
     )
+    # ── Quote snapshot and timing (#134) ──────────────────────────────────────
+    #
+    # The #125 entry-deviation gate already writes the broker quote it judged
+    # into signal metadata (`entry_quote_*`). These columns project the same
+    # values so the slippage decomposition can join on them without parsing
+    # JSON, and so a fill whose signal carries no snapshot is visibly flagged
+    # rather than silently zero. All nullable: exits never see the gate, and
+    # rows written before this change have no snapshot - "no snapshot" must
+    # stay distinguishable from "snapshot at zero".
+    entry_quote_bid: float | None = Field(default=None, nullable=True)
+    entry_quote_ask: float | None = Field(default=None, nullable=True)
+    entry_quote_side: str | None = Field(default=None, nullable=True)
+    entry_quote_price: float | None = Field(default=None, nullable=True)
+    entry_quote_time: datetime | None = Field(default=None, nullable=True)
+    entry_quote_source: str | None = Field(default=None, nullable=True)
+    entry_quote_time_source: str | None = Field(default=None, nullable=True)
+    # Timing chain for one order: when the producer stamped the signal
+    # (Discord message ``created_at``), when this process received it, when the
+    # order request was sent to the broker and when the broker answered. The
+    # last two are written by ``set_live_signal_broker_order_id`` after the
+    # submit call returns; a signal whose order outcome is unknown keeps them
+    # NULL, which is exactly the flag a later audit needs.
+    producer_at: datetime | None = Field(default=None, nullable=True)
+    message_received_at: datetime | None = Field(default=None, nullable=True)
+    order_submitted_at: datetime | None = Field(default=None, nullable=True)
+    broker_ack_at: datetime | None = Field(default=None, nullable=True)
     metadata_json: dict[str, Any] = Field(
         default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
     )
@@ -649,6 +889,7 @@ class LiveSignalModel(SQLModel, table=True):
             broker_order_id=broker_order_id or "",
             discord_message_id=discord_msg_id,
             idempotency_key=idempotency_key,
+            **_live_signal_quote_snapshot_fields(signal.metadata),
             metadata_json=metadata,
         )
 
@@ -698,6 +939,12 @@ class LiveExecutionModel(SQLModel, table=True):
     # Nullable and with no database default: a row written before this column existed has no
     # verdict, and "no verdict" must not be fabricated into "observed".
     actual_price_observed: str | None = Field(default=None, nullable=True)
+    # Order context for the slippage decomposition (#134): the broker's own
+    # order-type label and the quantity the order requested, in the same qty
+    # units as `filled_qty`. Both stay NULL when the broker payload does not
+    # state them - never an invented value.
+    order_type: str | None = Field(default=None, nullable=True)
+    requested_qty: float | None = Field(default=None, nullable=True)
 
     @classmethod
     def from_live_execution(cls, execution: LiveExecution) -> "LiveExecutionModel":
@@ -719,6 +966,12 @@ class LiveExecutionModel(SQLModel, table=True):
             else None,
             broker_fill_id=execution.broker_fill_id,
             actual_price_observed=execution.actual_price_observed,
+            order_type=_lift_optional_text(execution.order_type),
+            requested_qty=(
+                _lift_optional_float(execution.requested_qty)
+                if execution.requested_qty is not None
+                else None
+            ),
         )
 
     def to_live_execution(self) -> LiveExecution:
@@ -743,7 +996,68 @@ class LiveExecutionModel(SQLModel, table=True):
             dedupe_key=self.dedupe_key,
             broker_fill_id=self.broker_fill_id,
             actual_price_observed=self.actual_price_observed,
+            order_type=self.order_type,
+            requested_qty=self.requested_qty,
         )
+
+
+class LiveSignalRejectionModel(SQLModel, table=True):
+    """A live signal refused before its order reached the broker (#134).
+
+    Rejections are part of the cost picture a later slippage model needs: a
+    signal the entry-deviation gate refused still carries the quote it was
+    judged against, and a signal refused earlier still carries its provenance
+    and timing. These rows deliberately live OUTSIDE ``live_signals``: a
+    ``live_signals`` row asserts "an order may exist for this signal", which
+    dedupe, reconciliation and recovery all rely on. A rejection has no order,
+    so it gets its own table rather than a status column that every one of
+    those readers would have to learn to ignore.
+
+    The quote/timing columns mirror the ``live_signals`` #134 projection so a
+    rejection and an accepted signal answer the same questions. All nullable:
+    a refusal before the gate ran has no quote, and "no quote" must stay
+    distinguishable from "quote at zero".
+    """
+
+    __tablename__ = "live_signal_rejections"
+
+    id: str = Field(primary_key=True, default_factory=lambda: str(uuid4()))
+    deployment_id: str = Field(foreign_key="live_deployments.id", index=True)
+    # The in-memory ``LiveSignal.id`` that was refused. Not a foreign key:
+    # refused signals never get a ``live_signals`` row.
+    signal_id: str = Field(index=True)
+    symbol: str = Field(index=True)
+    action: str
+    theoretical_price: float = Field(default=0.0)
+    # When the daemon evaluated the signal (``LiveSignal.timestamp``).
+    timestamp: datetime = Field(index=True)
+    # Where the refusal happened (e.g. ``prepare``, ``prepare_exit``) and why
+    # (``str(exc)``). ``gate_rejection_rule`` carries the entry-deviation
+    # gate's rule name when the refusal came from it.
+    stage: str
+    reason: str = Field(sa_column=Column("reason", Text, nullable=False))
+    gate_rejection_rule: str | None = Field(default=None, nullable=True)
+    source: str = Field(default="internal")
+    discord_message_id: str | None = Field(default=None, nullable=True)
+    idempotency_key: str | None = Field(default=None, nullable=True)
+    producer_at: datetime | None = Field(default=None, nullable=True)
+    message_received_at: datetime | None = Field(default=None, nullable=True)
+    entry_quote_bid: float | None = Field(default=None, nullable=True)
+    entry_quote_ask: float | None = Field(default=None, nullable=True)
+    entry_quote_side: str | None = Field(default=None, nullable=True)
+    entry_quote_price: float | None = Field(default=None, nullable=True)
+    entry_quote_time: datetime | None = Field(default=None, nullable=True)
+    entry_quote_source: str | None = Field(default=None, nullable=True)
+    entry_quote_time_source: str | None = Field(default=None, nullable=True)
+    # Content hash making a redelivery of the same refused signal a no-op
+    # instead of a second row (same contract as ``live_signals`` dedupe).
+    dedupe_key: str | None = Field(
+        default=None,
+        sa_column=Column("dedupe_key", String, nullable=True, unique=True, index=True),
+    )
+    metadata_json: dict[str, Any] = Field(
+        default_factory=dict, sa_column=Column("metadata", JSON, nullable=False)
+    )
 
 
 class LiveBalanceModel(SQLModel, table=True):
@@ -1974,6 +2288,57 @@ def _add_live_executions_actual_price_observed(connection: Connection) -> None:
         )
 
 
+def _add_live_signal_quote_snapshot_columns(connection: Connection) -> None:
+    """Add the #134 quote-snapshot and timing columns to ``live_signals``.
+
+    The #125 entry-deviation gate already persists the broker quote it judged
+    into signal metadata; these columns project it (plus the order timing
+    chain) so the slippage decomposition does not have to parse JSON. Every
+    column is nullable with no default: exits never pass the gate, rows
+    predating this change have no snapshot, and "no snapshot" must stay
+    distinguishable from a snapshot at zero. Additive only - no existing row
+    changes. No-ops when the columns already exist.
+    """
+    column_names = _table_column_names(connection, "live_signals")
+    if not column_names:
+        return
+    additions = {
+        "entry_quote_bid": "FLOAT",
+        "entry_quote_ask": "FLOAT",
+        "entry_quote_side": "TEXT",
+        "entry_quote_price": "FLOAT",
+        "entry_quote_time": "DATETIME",
+        "entry_quote_source": "TEXT",
+        "entry_quote_time_source": "TEXT",
+        "producer_at": "DATETIME",
+        "message_received_at": "DATETIME",
+        "order_submitted_at": "DATETIME",
+        "broker_ack_at": "DATETIME",
+    }
+    for name, ddl in additions.items():
+        if name not in column_names:
+            connection.execute(
+                text(f"ALTER TABLE live_signals ADD COLUMN {name} {ddl}")
+            )
+
+
+def _add_live_executions_order_context_columns(connection: Connection) -> None:
+    """Add the #134 order-context columns to ``live_executions``.
+
+    ``order_type`` is the broker's own label for the order a fill belongs to
+    and ``requested_qty`` the quantity it asked for, both in the fill's qty
+    units. Nullable with no default: a broker payload that does not state
+    them leaves NULL, which is "unknown", never an invented value.
+    """
+    column_names = _table_column_names(connection, "live_executions")
+    if not column_names:
+        return
+    if "order_type" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN order_type TEXT"))
+    if "requested_qty" not in column_names:
+        connection.execute(text("ALTER TABLE live_executions ADD COLUMN requested_qty FLOAT"))
+
+
 _COMMISSION_NOT_NULL_RE = re.compile(
     r"((?:\"commission\"|`commission`|\[commission\]|\bcommission\b)\s+[A-Za-z]+(?:\s*\([^)]*\))?)"
     r"\s+NOT\s+NULL",
@@ -2575,11 +2940,13 @@ def _migrate_schema() -> None:
         _migrate_live_signal_discord_identity(connection)
         _migrate_live_signal_idempotency_key(connection)
         _migrate_live_submission_claim_uniqueness(connection)
+        _add_live_signal_quote_snapshot_columns(connection)
 
         _migrate_backtests_equity_curve(connection)
         _migrate_live_executions_dedupe_key(connection)
         _add_live_executions_broker_fill_id(connection)
         _add_live_executions_actual_price_observed(connection)
+        _add_live_executions_order_context_columns(connection)
         # Last: the rebuild copies every column, so the additive ones must already exist.
         _make_live_executions_commission_nullable(connection)
         # Independent of the rebuild (both run in one transaction); the rebuild copies whatever
@@ -2912,6 +3279,132 @@ def save_live_signal(signal: LiveSignal) -> tuple[str, bool]:
             _reconcile_existing_live_signal(session, existing, record)
             return str(existing.id), False
     return record_id, True
+
+
+def _live_signal_rejection_dedupe_key(
+    signal: LiveSignal,
+    *,
+    stage: str,
+    metadata: Mapping[str, Any],
+) -> str | None:
+    """Stable identity for one refused signal, or ``None`` when there is none.
+
+    Same contract as the signal dedupe: a Discord redelivery or an internal
+    replay of the same refused signal must not multiply rows. The category is
+    the refusal *kind* (the gate's rule name, else the stage) - two refusals
+    of the same signal for different reasons are different data points, while
+    the quote snapshot inside each row is what actually differs per attempt.
+    """
+    identity = _normalize_optional_id(metadata.get("discord_message_id")) or (
+        _normalize_optional_id(metadata.get("idempotency_key"))
+    )
+    if identity is None:
+        producer_stamp = None
+        for key in ("signal_timestamp", "received_at"):
+            producer_stamp = canonical_utc_timestamp(metadata.get(key))
+            if producer_stamp is not None:
+                break
+        if producer_stamp is None:
+            # No stable identity: every refusal is recorded (NULL dedupe keys
+            # never collide), which is the honest answer for a signal nothing
+            # can tell apart from its redelivery.
+            return None
+        identity = producer_stamp
+    category = _normalize_optional_id(metadata.get("entry_gate_rejection_rule")) or stage
+    material = "|".join(
+        [
+            str(signal.deployment_id),
+            identity,
+            str(signal.symbol or "").upper(),
+            str(signal.action or "").lower(),
+            str(stage or ""),
+            str(category or ""),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def save_live_signal_rejection(
+    signal: LiveSignal,
+    *,
+    stage: str,
+    reason: str,
+    extra_metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    """Persist a live signal refused before its order reached the broker (#134).
+
+    Rejections are part of the cost picture: the entry-deviation gate's refusal
+    still carries the quote the signal was judged against (passed via
+    ``extra_metadata`` - the gate attaches its record to the exception it
+    raises), and earlier refusals still carry provenance and timing. The row
+    lands in ``live_signal_rejections``, never ``live_signals``: a signal row
+    asserts an order may exist, which dedupe, reconciliation and recovery all
+    rely on, and a refusal has no order.
+
+    Returns True when the row was written, False when the same refusal was
+    already recorded. Never raises for a duplicate; any other failure
+    propagates to the caller, which must treat persistence as best-effort and
+    never let it reach the order path.
+    """
+    init_db()
+    metadata = dict(signal.metadata or {})
+    if extra_metadata:
+        # The refusal-stage record wins over payload values under the same
+        # keys, the same rule the accepted path applies to the gate's figures.
+        metadata.update(dict(extra_metadata))
+    timestamp = (
+        signal.timestamp.replace(tzinfo=timezone.utc)
+        if signal.timestamp.tzinfo is None
+        else signal.timestamp.astimezone(timezone.utc)
+    )
+    record = LiveSignalRejectionModel(
+        deployment_id=str(signal.deployment_id),
+        signal_id=str(signal.id),
+        symbol=str(signal.symbol or ""),
+        action=str(signal.action or ""),
+        theoretical_price=(
+            _lift_optional_float(signal.theoretical_price) or 0.0
+        ),
+        timestamp=timestamp,
+        stage=str(stage or ""),
+        reason=str(reason or ""),
+        gate_rejection_rule=_normalize_optional_id(
+            metadata.get("entry_gate_rejection_rule")
+        ),
+        source=str(metadata.get("source", "internal")),
+        discord_message_id=_normalize_optional_id(metadata.get("discord_message_id")),
+        idempotency_key=_normalize_optional_id(metadata.get("idempotency_key")),
+        dedupe_key=_live_signal_rejection_dedupe_key(
+            signal, stage=str(stage or ""), metadata=metadata
+        ),
+        metadata_json=metadata,
+        **_live_signal_quote_snapshot_fields(metadata),
+    )
+    with get_session() as session:
+        session.add(record)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            # The only unique constraint on this table is dedupe_key: a
+            # conflict is a redelivery of an already-recorded refusal. Any
+            # other integrity failure (e.g. a dangling deployment_id) is a
+            # real error and must not masquerade as a skip.
+            if record.dedupe_key is None:
+                raise
+            raced = session.exec(
+                select(LiveSignalRejectionModel)
+                .where(LiveSignalRejectionModel.dedupe_key == record.dedupe_key)
+                .limit(1)
+            ).first()
+            if raced is None:
+                raise
+            logger.info(
+                "Skipping duplicate live signal rejection (dedupe_key=%s)",
+                record.dedupe_key,
+            )
+            return False
+    return True
 
 
 def _auto_execution_dedupe_key(execution: LiveExecution) -> str:
@@ -3556,6 +4049,8 @@ def record_live_broker_side_close_fill(
     close_side: str | None = None,
     cumulative_filled_qty: float | None = None,
     cumulative_avg_price: float | None = None,
+    order_type: str | None = None,
+    requested_qty: float | None = None,
 ) -> float:
     """Record a broker-side close against the parent signal's deployment ledger (#144).
 
@@ -3597,6 +4092,9 @@ def record_live_broker_side_close_fill(
     missing slice's price is derived from the broker's cumulative average exactly the way
     :func:`save_live_execution_up_to_cumulative` does (``derived``, or
     ``derived_unavailable`` with the quantity still recorded).
+
+    ``order_type`` and ``requested_qty`` carry the closing order's own context onto the fill
+    row (#134) when the caller's broker payload states them; both stay ``None`` otherwise.
     """
     normalized_parent = str(parent_signal_id or "").strip()
     normalized_reason = str(close_reason or "").strip()
@@ -3828,6 +4326,8 @@ def record_live_broker_side_close_fill(
                 broker_order_id=str(broker_order_id or ""),
                 broker_fill_id=broker_fill_id,
                 dedupe_key=dedupe_key,
+                order_type=order_type,
+                requested_qty=requested_qty,
             )
             record = LiveExecutionModel.from_live_execution(execution)
             if not record.dedupe_key:
@@ -3931,6 +4431,213 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     return net
 
 
+def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[str]:
+    """Order references of this deployment's entries that have no fills yet (#360).
+
+    Returns every broker order id *and* signal id (the broker's client order
+    id is the canonical signal id) carried by entry signals whose persisted
+    fill quantity is at most ``_EXIT_FILL_TOLERANCE``. Only the broker can say
+    whether such an order is still working or dead, so the caller asks for the
+    working-order list only when this set is non-empty.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the unfilled entry refs")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    refs: set[str] = set()
+    for signal_id, symbol, broker_order_id, source, metadata in signal_rows:
+        if not str(symbol or "").strip():
+            continue
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            continue
+        if filled_by_signal.get(str(signal_id), 0.0) > _EXIT_FILL_TOLERANCE:
+            continue
+        refs.add(str(signal_id))
+        if broker_order_id:
+            refs.add(str(broker_order_id))
+    return refs
+
+
+def list_live_deployment_open_entry_counts_by_symbol(
+    deployment_id: str,
+    working_order_ids: Collection[str] | None = None,
+    broker_held_symbols: Collection[str] | None = None,
+) -> dict[str, int]:
+    """Open entry count per symbol for one deployment (#360 maintainer decision).
+
+    An *open entry* is a persisted entry signal — not exit-only and not a
+    broker-side close — that still holds quantity: its filled quantity minus
+    the reducing fills attributed to it, allocated oldest-first, is above
+    ``_EXIT_FILL_TOLERANCE``. Reducing fills are every fill on the
+    deployment's exit-only signals plus every broker-side close signal for
+    the symbol: the same rows the net ledger sums with the opposite sign.
+
+    FIFO attribution is an approximation — a deployment-level FULL_EXIT is
+    not tied to one entry — but it is conservative in the direction that
+    matters: a partially closed oldest entry keeps counting until its own
+    residual reaches zero.
+
+    An entry with no fills yet counts as one open position **only while the
+    broker still lists its order as working** — a DAY entry that expired
+    unfilled or an order cancelled after acceptance must not lock the symbol
+    forever (#360 review). ``working_order_ids`` is the adapter's
+    ``working_order_ids()`` result: broker order ids and client order ids
+    (the canonical signal id). An entry matches on either its persisted
+    ``broker_order_id`` or its signal id. When ``working_order_ids`` is
+    ``None`` the working status cannot be proven, so every unfilled entry
+    that carries a broker order id still counts — the fail-closed direction.
+
+    A *filled* order is not working either, so the working list alone cannot
+    tell "dead unfilled" from "filled but its fill is not yet booked" (the
+    trade-update stream is down, the post-restart reconcile has not run, or
+    persistence lags a bar). ``broker_held_symbols`` is the adapter's
+    non-zero-position symbol set for the account: a not-working unfilled
+    entry that carries a broker order id counts as open while its symbol is
+    held — over-counting when another deployment holds the symbol only
+    blocks entries, the fail-closed direction. ``broker_held_symbols=None``
+    means the position state could not be proven, so such an entry still
+    counts — again fail-closed. Entries with neither fills nor any order
+    reference never reached the broker and do not count.
+
+    Returns ``{SYMBOL: open entry count}`` for symbols with at least one
+    open entry; flat symbols are absent.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the open entry counts")
+    working = (
+        {str(order_id) for order_id in working_order_ids}
+        if working_order_ids is not None
+        else None
+    )
+    # Broker position symbols and stored signal symbols spell the same pair
+    # differently (Alpaca reports crypto as ``BTCUSD`` while a signal may say
+    # ``BTC/USD``): compare on ``crypto_pair_key``, which collapses every
+    # crypto spelling and leaves equities (``BRK.B``, ``BF-B``) untouched.
+    held_symbols = (
+        {crypto_pair_key(symbol) for symbol in broker_held_symbols}
+        if broker_held_symbols is not None
+        else None
+    )
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for signal_id, symbol, timestamp, broker_order_id, source, metadata in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        by_symbol.setdefault(normalized_symbol, []).append(
+            {
+                "signal_id": str(signal_id),
+                "timestamp": timestamp,
+                "broker_order_id": str(broker_order_id or ""),
+                "source": str(source or ""),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "filled_qty": filled_by_signal.get(str(signal_id), 0.0),
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for symbol, signals in by_symbol.items():
+        reducing_qty = 0.0
+        entries: list[dict[str, Any]] = []
+        for signal in signals:
+            metadata = signal["metadata"]
+            is_close = (
+                _is_exit_only_signal_metadata(metadata)
+                or str(signal["source"] or "") == BROKER_CLOSE_SIGNAL_SOURCE
+            )
+            if is_close:
+                reducing_qty += max(0.0, signal["filled_qty"])
+            else:
+                entries.append(signal)
+        entries.sort(
+            key=lambda item: (
+                item["timestamp"] is None,
+                item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+                item["signal_id"],
+            )
+        )
+        remaining_reduction = reducing_qty
+        open_count = 0
+        for entry in entries:
+            entry_qty = max(0.0, entry["filled_qty"])
+            if entry_qty <= _EXIT_FILL_TOLERANCE:
+                if working is None:
+                    still_open = bool(entry["broker_order_id"])
+                else:
+                    still_open = (
+                        entry["broker_order_id"] in working
+                        or entry["signal_id"] in working
+                    )
+                    if not still_open and entry["broker_order_id"]:
+                        # Not working: a filled-but-unbooked entry looks the
+                        # same as a dead unfilled one. The broker's non-zero
+                        # position is the proof it is still open; an
+                        # unreadable position set fails closed.
+                        still_open = (
+                            held_symbols is None
+                            or crypto_pair_key(symbol) in held_symbols
+                        )
+                if still_open:
+                    open_count += 1
+                continue
+            closed = min(entry_qty, remaining_reduction)
+            remaining_reduction -= closed
+            if entry_qty - closed > _EXIT_FILL_TOLERANCE:
+                open_count += 1
+        if open_count:
+            counts[symbol] = open_count
+    return counts
+
+
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
     """Every deployment's signed net filled quantity for ``symbol`` on one account.
 
@@ -3976,6 +4683,91 @@ def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> di
         key = str(deployment_id)
         ledgers[key] = ledgers.get(key, 0.0) + signed
     return ledgers
+
+
+def list_live_account_filled_symbols(account_id: str) -> list[str]:
+    """Symbols with at least one persisted fill on one account.
+
+    Reconciliation compares every symbol the ledger can hold a position in, not
+    only symbols that still have an unfilled order (#303).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for the filled-symbol ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(func.distinct(func.upper(LiveSignalModel.symbol)))
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        ).all()
+    return sorted({str(symbol).strip().upper() for symbol in rows if str(symbol or "").strip()})
+
+
+def list_live_account_order_expectations(account_id: str) -> list[dict[str, Any]]:
+    """Persisted signals on one account with their broker id and fill total.
+
+    Reconciliation uses these rows to know which broker orders the ledger still
+    expects to be working and which client order ids name a signal (#303). The
+    requested quantity is read from signal metadata by the caller; this function
+    only returns the persisted facts.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for order expectations")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .outerjoin(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .group_by(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+            )
+        ).all()
+    return [
+        {
+            "signal_id": str(signal_id),
+            "deployment_id": str(deployment_id),
+            "symbol": str(symbol or "").strip().upper(),
+            "action": str(action or "").strip().lower(),
+            "broker_order_id": str(broker_order_id or "").strip(),
+            # A stored non-object metadata value must not raise here: the
+            # reconciliation loop treats a comparison failure as an
+            # unreadable pass, and an unreadable *requested qty* already
+            # fails closed (the order stays expected). Normalise instead.
+            "metadata": dict(metadata_json) if isinstance(metadata_json, dict) else {},
+            "timestamp": timestamp,
+            "filled_qty": float(filled_qty or 0.0),
+        }
+        for (
+            signal_id,
+            deployment_id,
+            symbol,
+            action,
+            broker_order_id,
+            metadata_json,
+            timestamp,
+            filled_qty,
+        ) in rows
+    ]
 
 
 #: A filled quantity this close to the requested one counts as fully filled.
@@ -4107,12 +4899,27 @@ def _list_unfilled_exit_orders(
     return pending
 
 
-def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> bool:
-    """Persist the broker order id on a signal right after submission (crash recovery)."""
+def set_live_signal_broker_order_id(
+    signal_id: str,
+    broker_order_id: str,
+    *,
+    submitted_at: datetime | None = None,
+    acknowledged_at: datetime | None = None,
+) -> bool:
+    """Persist the broker order id on a signal right after submission (crash recovery).
+
+    ``submitted_at``/``acknowledged_at`` are the #134 order-timing stamps: the
+    adapters capture them around the broker submit call and pass them here so
+    the signal row records when the request left and when the broker answered,
+    in the same write that records the order id. ``None`` leaves the stored
+    value alone, so a recovery re-persist never erases a known time.
+    """
     normalized_signal_id = str(signal_id or "").strip()
     normalized_order_id = str(broker_order_id or "").strip()
     if not normalized_signal_id or not normalized_order_id:
         return False
+    submitted_utc = _lift_optional_datetime(submitted_at) if submitted_at is not None else None
+    ack_utc = _lift_optional_datetime(acknowledged_at) if acknowledged_at is not None else None
     init_db()
     with get_session() as session:
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -4122,11 +4929,17 @@ def set_live_signal_broker_order_id(signal_id: str, broker_order_id: str) -> boo
         existing_order_id = str(record.broker_order_id or "").strip()
         if existing_order_id and existing_order_id != normalized_order_id:
             return False
-        if existing_order_id == normalized_order_id:
+        if existing_order_id == normalized_order_id and submitted_utc is None and ack_utc is None:
             return True
         record.broker_order_id = normalized_order_id
         metadata = dict(record.metadata_json or {})
         metadata["broker_order_id"] = normalized_order_id
+        if submitted_utc is not None:
+            record.order_submitted_at = submitted_utc
+            metadata["order_submitted_at"] = submitted_utc.isoformat()
+        if ack_utc is not None:
+            record.broker_ack_at = ack_utc
+            metadata["broker_ack_at"] = ack_utc.isoformat()
         record.metadata_json = metadata
         session.add(record)
         session.commit()
@@ -4929,7 +5742,9 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.broker_reconciliation import validate_broker_reconciliation_settings
     from live_runner.loss_breaker import deployment_loss_breaker_limits
+    from live_runner.pre_submit_caps import validate_pre_submit_cap_settings
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -4937,6 +5752,12 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Same for the broker-reconciliation settings (#303): a typo'd boolean
+    # or out-of-range interval is refused here, not silently defaulted later.
+    validate_broker_reconciliation_settings(deployment.settings)
+    # Same for the pre-submit hard caps (#302): a malformed cap must not sit
+    # in the database until the first order is refused by it.
+    validate_pre_submit_cap_settings(deployment.settings)
     # Loss breaker settings (#301) get the same treatment: a malformed
     # threshold would otherwise refuse every entry at dispatch.
     deployment_loss_breaker_limits(deployment)
@@ -4999,6 +5820,124 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+#: ``settings`` key the broker reconciler uses for its entry-only halt (#303).
+#: The value is a small marker dict; only a marker written by the reconciler
+#: itself is cleared automatically (see :func:`resume_live_deployment_entries_halt`).
+ENTRIES_HALT_SETTINGS_KEY = "broker_reconciliation_entries_halted"
+ENTRIES_HALT_ACTOR = "broker_reconciliation"
+
+
+def entries_halt_marker_is_halted(value: object) -> bool:
+    """Whether a settings value counts as an entries halt.
+
+    This mirrors the atomic claim predicate in
+    :func:`claim_live_deployment_submission`: missing/null/false/0/"" are not
+    halted, while every other JSON value - including an empty object or array -
+    fails closed as halted.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value != ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Truthiness, not a float compare: 0/0.0 clear, NaN and every other
+        # number halt (fail closed), matching SQLite's ``IN (0, '')``.
+        return bool(value)
+    return True
+
+
+def set_live_deployment_entries_halt(
+    deployment_id: str, detail: Mapping[str, Any] | None
+) -> bool:
+    """Set (``detail``) or clear (``None``) the entry-only halt flag.
+
+    Persisted in ``settings`` so the halt survives a daemon restart without a
+    schema change. Returns ``False`` when the deployment does not exist.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        if detail is None:
+            settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        else:
+            settings[ENTRIES_HALT_SETTINGS_KEY] = dict(detail)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def live_deployment_entries_halted(deployment_id: str) -> bool:
+    """Fresh read of the entry-halt flag; a read failure counts as halted.
+
+    Entries are the dangerous direction, so an unreadable deployment row must
+    fail closed here - the caller blocks the entry rather than trading on a
+    stale answer. A missing row reads as *not* halted: the ACTIVE-status gate
+    upstream already refuses dispatch for a deployment that is gone, and this
+    flag can only exist on a row that does.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return True
+    if deployment is None:
+        return False
+    return entries_halt_marker_is_halted(
+        (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    )
+
+
+def live_deployment_entries_halt_marker(deployment_id: str) -> Mapping[str, Any] | None:
+    """The persisted entries-halt marker dict, or ``None`` when absent/unreadable.
+
+    Unlike :func:`live_deployment_entries_halted` this distinguishes *who* set
+    the halt, which the reconciler needs to write and audit only on the
+    transition into a halt it owns.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return None
+    if deployment is None:
+        return None
+    marker = (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    return dict(marker) if isinstance(marker, dict) else None
+
+
+def resume_live_deployment_entries_halt(deployment_id: str) -> bool:
+    """Clear the halt only when the broker reconciler set it.
+
+    Returns ``True`` when a reconciler-owned halt was actually removed, so the
+    caller can audit the resume. An operator-set or unmarked value is left
+    alone.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        halt = settings.get(ENTRIES_HALT_SETTINGS_KEY)
+        if not isinstance(halt, dict) or halt.get("by") != ENTRIES_HALT_ACTOR:
+            return False
+        settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
 def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> None:
     """Write a deployment's status (and the fields that go with it) on a loaded row.
 
@@ -5022,7 +5961,7 @@ def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> 
 
 
 def update_live_deployment_status(
-    deployment_id: str, status: str
+    deployment_id: str, status: str, *, release_entries_halt: bool = True
 ) -> LiveDeploymentConfig | None:
     next_status = str(status or "").upper()
     if next_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
@@ -5032,6 +5971,19 @@ def update_live_deployment_status(
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return None
+        if next_status == "ACTIVE" and release_entries_halt:
+            # Resuming is the operator's explicit "trade again": it also
+            # releases a broker-reconciliation entry halt. A still-mismatched
+            # account is re-halted on the next pass, so this cannot hide a
+            # live divergence - it only ends the halt early by decision.
+            # ``release_entries_halt=False`` is for internal status writes
+            # that merely restore a previous state (the delete endpoint's
+            # rollback): they are not an operator resume and must not clear
+            # a halt the operator never lifted.
+            settings = dict(record.settings_json or {})
+            if ENTRIES_HALT_SETTINGS_KEY in settings:
+                settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+                record.settings_json = settings
         _apply_live_deployment_status_row(record, next_status)
         session.add(record)
         session.commit()
@@ -5371,6 +6323,7 @@ def claim_live_deployment_submission(
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
     allow_paused: bool = False,
+    refuse_entries_halt: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
@@ -5386,6 +6339,12 @@ def claim_live_deployment_submission(
     what it holds but opens nothing. The caller is the daemon's claim site, which knows
     the signal kind; leaving it at the default keeps a plain status gate for entries.
 
+    ``refuse_entries_halt`` adds a third fact for *entry* submissions only:
+    the broker-reconciliation entries halt is checked inside the same
+    statement, so a halt committed while the dispatcher was sizing the order
+    still wins the race. Exits pass ``False`` - the halt is entry-only and
+    must never freeze them.
+
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
     cleanup is committed separately on purpose: it must survive a refused
@@ -5399,6 +6358,15 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    halt_predicate = ""
+    if refuse_entries_halt:
+        # json_extract mirrors live_deployment_entries_halted's truthiness for
+        # every JSON type: missing/null/false/0/"" read as not halted, anything
+        # else (the reconciler always stores a non-empty marker dict) blocks.
+        halt_predicate = (
+            "AND COALESCE(json_extract(settings, "
+            f"'$.{ENTRIES_HALT_SETTINGS_KEY}'), 0) IN (0, '')"
+        )
     # Built from the shared status tuple, never from caller text, so the set cannot be
     # widened by anything but this flag - and so the daemon's dispatch statuses and this
     # filter cannot drift apart.
@@ -5420,7 +6388,8 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    f"WHERE id = :deployment_id AND {status_filter}"
+                    f"WHERE id = :deployment_id AND {status_filter} "
+                    f"{halt_predicate}"
                 ),
                 {
                     "token": normalized_token,
@@ -6718,6 +7687,101 @@ def _optional_commission(execution: LiveExecutionModel | None) -> float | None:
     return float(execution.commission)
 
 
+def _usable_quote_price(value: Any) -> float | None:
+    """A quote-snapshot price as a usable number, or None (#134).
+
+    Same rule as ``execution_price_is_usable`` applied to a quote side: only a
+    finite, positive number counts. A missing or malformed snapshot value must
+    read as "no snapshot", never as a quote at zero.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _live_slippage_decomposition(
+    signal: LiveSignalModel,
+    *,
+    theoretical: float,
+    actual: float | None,
+) -> dict[str, Any]:
+    """Split one fill's cost into signal delay, execution slippage and spread (#134).
+
+    The legacy ``slippage``/``slippage_bps`` (``actual - theoretical``) mixes
+    two different things: the market moving between the signal price and the
+    quote at submit time (delay), and the fill landing away from that quote
+    (execution). The spread is inside both. This decomposition separates them
+    using the #125 quote snapshot persisted on the signal:
+
+    * ``signal_delay_bps``: the same-side quote at submit vs the signal's
+      theoretical price, in basis points of the theoretical price.
+    * ``execution_slippage_bps``: the fill price vs that same-side quote.
+    * ``spread_bps``: ``(ask - bid) / mid`` at submit - the quote width, a
+      separate measure that is *not* additive to the other two.
+
+    All three are **adverse-positive**: a positive value is a cost, for buys
+    and sells alike (for a sell the direction is applied). Only
+    ``signal_delay_bps + execution_slippage_bps`` reconstructs the
+    adverse-positive total cost - ``slippage_bps`` for a buy,
+    ``-slippage_bps`` for a sell under the legacy signed
+    ``actual - theoretical`` convention. The spread sits *inside* both terms,
+    so adding ``spread_bps`` would double-count it.
+    Each is ``None`` independently when its inputs are missing -
+    an unusable fill price hides only ``execution_slippage_bps``, and a signal
+    with no quote snapshot hides all three and sets ``quote_snapshot_missing``.
+    Exits never pass the entry quote gate, so a missing snapshot on an exit is
+    expected rather than a gap: ``quote_snapshot_missing`` is ``None`` there.
+    """
+    bid = _usable_quote_price(signal.entry_quote_bid)
+    ask = _usable_quote_price(signal.entry_quote_ask)
+    quote_price = _usable_quote_price(signal.entry_quote_price)
+    has_snapshot = bid is not None and ask is not None and quote_price is not None
+    metadata = signal.metadata_json or {}
+    is_exit = _is_exit_only_signal_metadata(metadata) or str(
+        metadata.get("signal_intent") or ""
+    ) == "exit"
+    result: dict[str, Any] = {
+        "signal_delay_bps": None,
+        "execution_slippage_bps": None,
+        "spread_bps": None,
+        "quote_snapshot_missing": (
+            False if has_snapshot else (None if is_exit else True)
+        ),
+        "quote_bid": bid,
+        "quote_ask": ask,
+        "quote_price": quote_price,
+        "quote_time": signal.entry_quote_time,
+        "quote_source": signal.entry_quote_source,
+    }
+    if not has_snapshot:
+        return result
+    if ask < bid:
+        # A crossed book is not a snapshot a model can decompose against; the
+        # gate refuses these, so a persisted one is corrupt data, not a quote.
+        result["quote_snapshot_missing"] = True
+        result.update(
+            {"quote_bid": None, "quote_ask": None, "quote_price": None}
+        )
+        return result
+    mid = (bid + ask) / 2.0
+    if mid > 0:
+        result["spread_bps"] = ((ask - bid) / mid) * 10000.0
+    if theoretical and math.isfinite(theoretical) and theoretical > 0:
+        direction = 1.0 if str(signal.action or "").lower() == "buy" else -1.0
+        result["signal_delay_bps"] = (
+            direction * (quote_price - theoretical) / theoretical * 10000.0
+        )
+        if actual is not None:
+            result["execution_slippage_bps"] = (
+                direction * (actual - quote_price) / theoretical * 10000.0
+            )
+    return result
+
+
 def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for signal, execution in rows:
@@ -6750,11 +7814,24 @@ def _serialize_live_signal_execution_rows(rows: list[Any]) -> list[dict[str, Any
                 "actual_price": actual,
                 "slippage": slippage,
                 "slippage_bps": slippage_bps,
+                **_live_slippage_decomposition(
+                    signal, theoretical=theoretical, actual=actual
+                ),
                 "actual_price_observed": execution.actual_price_observed,
                 "filled_qty": float(execution.filled_qty or 0.0),
+                "requested_qty": (
+                    float(execution.requested_qty)
+                    if execution.requested_qty is not None
+                    else None
+                ),
+                "order_type": execution.order_type,
                 "commission": _optional_commission(execution),
                 "signal_timestamp": signal.timestamp,
                 "execution_timestamp": execution.timestamp,
+                "producer_at": signal.producer_at,
+                "message_received_at": signal.message_received_at,
+                "order_submitted_at": signal.order_submitted_at,
+                "broker_ack_at": signal.broker_ack_at,
                 "broker_order_id": execution.broker_order_id,
                 "signal_metadata": signal.metadata_json or {},
             }
@@ -7108,6 +8185,10 @@ def _backtest_metadata_payload(backtest: BacktestRecord, trade_count: int) -> di
         "total_return": _stat_number_or_undefined(stats, "total_return", 0.0),
         "cagr": _stat_number_or_undefined(stats, "cagr", 0.0),
         "sharpe_ratio": _stat_number_or_undefined(stats, "sharpe_ratio", 0.0),
+        # #349: lets ranking tell pre-#229 rows (fixed sqrt(252) on the
+        # unfiltered calendar-filled series, field absent) from rows on the
+        # asset-class convention (252 equities/FX/CFDs, 365 crypto).
+        "equity_return_periods_per_year": stats.get("equity_return_periods_per_year"),
         "psr": _stat_number_or_undefined(stats, "psr", 0.0),
         "p_value": _stat_number_or_undefined(stats, "p_value", 1.0),
         "max_drawdown": _stat_number_or_undefined(stats, "max_drawdown_pct", 0.0),
@@ -8186,7 +9267,7 @@ def _backtest_meta_from_record(backtest: BacktestRecord) -> BacktestMeta:
         max_position_exposure_pct=runtime.get("max_position_exposure_pct"),
         max_leverage=runtime.get("max_leverage"),
         modeling_resolution=runtime.get("modeling_resolution", "main_timeframe"),
-        signal_exit_fill=runtime.get("signal_exit_fill", "close"),
+        signal_exit_fill=runtime.get("signal_exit_fill", LEGACY_SIGNAL_EXIT_FILL),
         allow_fallback_stop=runtime.get("allow_fallback_stop", True),
         reject_missing_stop=runtime.get("reject_missing_stop", False),
         require_explicit_column_roles=runtime.get("require_explicit_column_roles", False),

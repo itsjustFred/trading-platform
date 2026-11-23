@@ -23,10 +23,12 @@ from runner.engines.base import (
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
 )
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.portfolio_optimizer import (
     MIN_OOS_DAILY_OBSERVATIONS,
     optimize_portfolio_allocation,
 )
+from runner.slippage import assert_slippage_supported
 from runner.stats import merge_canonical_stats
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -151,6 +153,9 @@ def _run_fold_backtest(
         modeling_resolution=modeling_resolution,
         data_dir=data_dir,
         parameters=parameters,
+        # Frozen engines refuse next_open; declare the legacy close fill they
+        # simulate so the persisted meta stays truthful.
+        signal_exit_fill=default_signal_exit_fill_for_engine(getattr(engine, "name", "")),
     )
     errors = engine.validate_config(config)
     if errors:
@@ -481,6 +486,10 @@ def run_walkforward(
     normalized_timeframe = normalize_timeframe(timeframe)
     strategy_name = Path(strategy).stem
     parameters = resolve_strategy_parameters(strategy, params or {})
+    # #130: an engine outside the slippage scope must refuse a declared
+    # model rather than run every fold gross while the user believes it
+    # applied.
+    assert_slippage_supported(engine.name, parameters)
     effective_step_months = test_months if step_months is None else step_months
     windows = _build_windows(
         start=start,

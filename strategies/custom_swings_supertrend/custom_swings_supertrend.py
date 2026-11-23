@@ -13,11 +13,22 @@ This module intentionally ports the strategy's portable core:
 It does not attempt a full 1:1 reproduction of the original Pine source's
 stateful swing/BOS, MTF `request.security(...)`, session gating, or partial-exit
 management. Those differences are documented in the accompanying README.
+
+Exits (1.1.0): the Supertrend flip is a close-triggered MARKET exit with no
+explicit ``exit_price``; under the default ``signal_exit_fill="next_open"`` it
+fills at the next bar's open. Stop-loss and fixed-RRR take-profit carry their
+level in ``exit_price``, which engines honor only with
+``exit_order_type="level"`` (not emitted here): on native the protective
+``stop_loss``/``sl_price`` covers the stop, while the take-profit level is
+not enforced as a resting order. With ``use_trailing_sl`` the trailed level is
+likewise NOT fed back into ``sl_price`` (written on the entry bar alone), so
+only the initial stop is protective on native — a trailed-stop exit is the
+strategy's market exit signal filling at the next bar's open, not a level fill.
 """
 
 STRATEGY_META = {
     "name": "Custom Swings + Supertrend",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "tags": {
         "type": ["trend-following"],
         "source": "Pine Script v5 — DTFX Structure Swings + Supertrend Strategie",
@@ -309,11 +320,12 @@ def generate_signals(
                     exit_price_arr[i] = round(ep_exit, 6)
 
                 # Check Supertrend flip to DOWN
+                # Close-triggered MARKET exit: no explicit exit_price (it fills
+                # at the next bar's open under next_open; a price equal to this
+                # bar's close would contradict that fill).
                 elif sell_signal[i]:
                     exited = True
-                    ep_exit = close[i]
                     reason = "supertrend_flip"
-                    exit_price_arr[i] = round(ep_exit, 6)
 
                 # Update current stop
                 current_sl = sl
@@ -351,11 +363,10 @@ def generate_signals(
                     exit_price_arr[i] = round(ep_exit, 6)
 
                 # Check Supertrend flip to UP
+                # Close-triggered MARKET exit: no explicit exit_price (see LONG).
                 elif buy_signal[i]:
                     exited = True
-                    ep_exit = close[i]
                     reason = "supertrend_flip"
-                    exit_price_arr[i] = round(ep_exit, 6)
 
                 # Update current stop
                 current_sl = sl

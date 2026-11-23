@@ -26,27 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from shared.models import LiveSignal
-
-
-def _to_float(value: Any, *, default: float) -> float:
-    if value is None:
-        return float(default)
-    if isinstance(value, bool):
-        raise ValueError("numeric value must not be boolean")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"Invalid numeric value: {value!r}") from exc
-    if not math.isfinite(parsed):
-        raise ValueError(f"Numeric value must be finite: {value!r}")
-    return parsed
-
-
-def _to_optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    return _to_float(value, default=0.0)
-
+from shared.money import parse_money, parse_optional
 
 #: Single source precedence for live trade levels (C1: mixed sources sized
 #: wrong distances). Entry falls back to theoretical_price; SL/TP accept the
@@ -59,7 +39,7 @@ _LIVE_TP_KEYS = ("take_profit", "tp_price")
 def _first_metadata_float(metadata: dict[str, Any], keys: tuple[str, ...]) -> float | None:
     for key in keys:
         try:
-            value = _to_optional_float(metadata.get(key))
+            value = parse_optional(metadata.get(key))
         except ValueError as exc:
             raise ValueError(f"{key}: {exc}") from exc
         if value is not None:
@@ -81,10 +61,11 @@ def resolve_live_levels(signal: LiveSignal) -> tuple[float, float | None, float 
     """
     metadata = signal.metadata or {}
     try:
-        entry = _to_float(
-            metadata["entry_price"] if "entry_price" in metadata else signal.theoretical_price,
-            default=float(signal.theoretical_price),
+        entry = parse_optional(
+            metadata["entry_price"] if "entry_price" in metadata else signal.theoretical_price
         )
+        if entry is None:
+            entry = parse_money(signal.theoretical_price)
     except ValueError as exc:
         raise ValueError(f"entry_price: {exc}") from exc
     if entry <= 0:
@@ -178,9 +159,9 @@ def entry_deviation_sl_fraction(
     """
     if action not in {"buy", "sell"}:
         raise ValueError(f"Unsupported action for entry deviation: {action!r}")
-    entry = _to_float(entry_price, default=0.0)
-    stop = _to_float(stop_loss, default=0.0)
-    quote = _to_float(quote_price, default=0.0)
+    entry = parse_money(entry_price)
+    stop = parse_money(stop_loss)
+    quote = parse_money(quote_price)
     if entry <= 0 or stop <= 0 or quote <= 0:
         raise ValueError("entry, stop and quote prices must be > 0")
     distance = entry - stop

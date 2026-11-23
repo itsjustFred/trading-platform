@@ -33,13 +33,17 @@ from runner.engines.base import (
     resolve_strategy_parameters,
     warn_if_engine_frozen,
 )
-from runner.engines.contract import resolve_intrabar_timeframe
+from runner.engines.contract import (
+    default_signal_exit_fill_for_engine,
+    resolve_intrabar_timeframe,
+)
 from runner.grid_identity import (
     GRID_IDENTITY_KEY,
     cell_identity,
     identity_from_result_meta,
     identity_matches,
 )
+from runner.slippage import SLIPPAGE_CAPABLE_ENGINES, assert_slippage_supported
 from runner.stats import merge_canonical_stats
 from shared.constants import DATA_DIR, GRID_TIMEFRAME_ALIASES, normalize_timeframe
 from shared.database import save_result_to_sqlite
@@ -622,6 +626,9 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         modeling_resolution=intrabar_resolution or "open_close",
         data_dir=data_dir,
         parameters=resolved_parameters,
+        # Frozen engines refuse next_open; declare the legacy close fill they
+        # simulate so the persisted meta stays truthful.
+        signal_exit_fill=default_signal_exit_fill_for_engine(request.engine),
     )
     engine_adapter = get_engine(request.engine)
     errors = engine_adapter.validate_config(config)
@@ -642,6 +649,21 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         else {}
     )
     backtest_result.meta.data = {**meta_data, GRID_IDENTITY_KEY: identity}
+    # #130: engines outside the slippage scope record an explicit "not
+    # modeled" note on every cell artifact — the same record `runner.cli
+    # run` writes — never silence. Slippage-capable engines (native)
+    # already recorded their per-symbol models and setdefault keeps them.
+    if request.engine not in SLIPPAGE_CAPABLE_ENGINES:
+        backtest_result.meta.data.setdefault(
+            "slippage",
+            {
+                "models": {},
+                "note": (
+                    f"engine '{request.engine}' does not apply a slippage "
+                    "model (#130 scope: native + signal replay)"
+                ),
+            },
+        )
     # Use the resolved dates for daily equity attachment
     attach_daily_equity(backtest_result, start=start_date, end=end_date)
     merge_canonical_stats(backtest_result)
@@ -889,6 +911,11 @@ def run_backtest_grid(
     output_dir = output_dir or DEFAULT_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     params = dict(params or {})
+    # #130: an engine outside the slippage scope must refuse a declared
+    # model up front rather than run every cell gross while the user
+    # believes slippage was applied (grid/walk-forward/matrix default to
+    # vectorbt, which has no slippage code path).
+    assert_slippage_supported(engine, params)
 
     summary: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(),

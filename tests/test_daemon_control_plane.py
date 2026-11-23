@@ -16,6 +16,7 @@ import pytest
 import live_runner.daemon as daemon
 from live_runner.alpaca_adapter import AlpacaLiveAdapter
 from live_runner.base_adapter import ControlOutcome, LiveQuote, order_not_submitted
+from live_runner.shutdown import ShutdownCoordinator
 from shared.database import (
     clear_live_deployment_stopped_enforced,
     get_live_deployment,
@@ -71,6 +72,12 @@ class _ControlAdapter:
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
 
+    async def get_equity(self) -> float:
+        return 100_000.0
+
+    async def get_used_margin(self):
+        return 0.0
+
     async def get_pip_value(self, symbol):
         # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
         from live_runner.base_adapter import LivePipValue
@@ -97,6 +104,15 @@ class _ControlAdapter:
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_wide_coordinator(monkeypatch: pytest.MonkeyPatch) -> ShutdownCoordinator:
+    """``run_daemon`` leaves the process-wide gate closed; never leak that to other tests."""
+    fresh = ShutdownCoordinator(force_exit_fn=lambda code: pytest.fail("forced exit"))
+    monkeypatch.setattr(daemon, "_SHUTDOWN", fresh)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", fresh)
+    return fresh
 
 
 def _seed(database, *, status: str = "STOPPED", is_demo: bool = True) -> None:
@@ -154,6 +170,253 @@ def test_complete_sweep_marks_the_deployment_enforced(isolated_db_sandbox) -> No
     assert adapter.calls == ["cancel", "flatten", "orphan"]
     assert DEPLOYMENT_ID in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+class _HoldingAdapter(_ControlAdapter):
+    """A sweep adapter whose order cancel can be held open mid-request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        self.calls.append("cancel")
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return self.cancel
+
+
+class _RecordingScheduler:
+    def __init__(self) -> None:
+        self.stopped = 0
+
+    async def stop(self) -> None:
+        self.stopped += 1
+
+
+def _drain(
+    coordinator: ShutdownCoordinator,
+    *,
+    loop_tasks: tuple[asyncio.Task[None], ...] = (),
+    drain_timeout: float = 5.0,
+) -> asyncio.Task[bool]:
+    return asyncio.get_running_loop().create_task(
+        daemon._shutdown_cleanup(
+            loop_tasks=loop_tasks,
+            active_listener_tasks={},
+            active_discord_tasks={},
+            active_discord_bot_tasks={},
+            active_discord_bots={},
+            active_adapters={},
+            scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+            shutdown=coordinator,
+            drain_timeout=drain_timeout,
+            cleanup_timeout=5.0,
+        )
+    )
+
+
+def test_a_running_stopped_enforcement_is_drained_not_cancelled(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain must wait for a STOPPED enforcement that is running.
+
+    The whole enforcement is one unit of broker work: the cancel, the flatten
+    and the orphaned-protection sweep that follows it. It runs inside the
+    deployment sync loop, one of the daemon's loop tasks the shutdown cancels.
+    Cancelling it between two calls would leave the account half-enforced (an
+    open position after its orders were cancelled, or detached protections
+    still resting after the flatten), so it is registered on the shutdown
+    ledger as a whole and the drain waits for all of it before any task is
+    cancelled.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _HoldingAdapter()
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+
+    async def _probe() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        sweep = asyncio.create_task(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+        await asyncio.wait_for(adapter.entered.wait(), timeout=10)
+        assert coordinator.inflight == 1, "the enforcement must be on the drain's ledger"
+        coordinator.request("SIGTERM")
+        cleanup = _drain(coordinator)
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the drain must wait for the running enforcement"
+        adapter.release.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        await asyncio.gather(sweep, return_exceptions=True)
+        return ok
+
+    assert asyncio.run(_probe()) is True
+    # The running cancel was awaited to the end, and the sweeps that follow it
+    # ran too: the registration was taken before the signal, so nothing drops
+    # them. The deployment is fully enforced and stamped.
+    assert adapter.cancelled is False, "the cancel was not cut off mid-request"
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_a_stopped_sweep_is_refused_once_shutdown_was_requested(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A STOPPED sweep must not start once the stop flag is set.
+
+    The money-safety action still has to happen, but not during teardown: the
+    deployment stays unenforced, so the next daemon start retries the whole
+    sweep instead of leaving a half-done one behind.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _ControlAdapter()
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    coordinator.request("SIGTERM")
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+
+    assert adapter.calls == [], "no sweep may start after the stop flag"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is None
+    assert any("shutting down" in r.getMessage() for r in caplog.records)
+
+
+class _HoldingOrphanAdapter(_ControlAdapter):
+    """A sweep adapter whose orphaned-protection sweep can be held mid-request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        self.calls.append("orphan")
+        self.entered.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return self.orphan
+
+
+class _SignalOnFlattenAdapter(_ControlAdapter):
+    """A sweep adapter that receives the shutdown signal while it flattens.
+
+    The signal lands exactly where a real one does: between the order cancel /
+    flatten the enforcement already ran and the orphaned-protection sweep that
+    follows it, so the sweep is the next thing that would go to the broker.
+    """
+
+    def __init__(self, coordinator: ShutdownCoordinator) -> None:
+        super().__init__()
+        self._coordinator = coordinator
+
+    async def close_all_positions(self) -> ControlOutcome:
+        self.calls.append("flatten")
+        self._coordinator.request("SIGTERM")
+        return self.flatten
+
+
+def test_the_orphan_sweep_after_the_flatten_is_drained_not_cancelled(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain must wait for the orphaned-protection sweep too.
+
+    The enforcement is one registered unit, and the sweep of the protections
+    the flatten detached is its last step. A sweep cancelled mid-request could
+    leave a resting protection that still triggers, so the whole enforcement is
+    on the shutdown ledger and the drain waits for the sweep like the rest.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    adapter = _HoldingOrphanAdapter()
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+
+    async def _probe() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        sweep = asyncio.create_task(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+        await asyncio.wait_for(adapter.entered.wait(), timeout=10)
+        assert coordinator.inflight == 1, "the orphan sweep must be on the drain's ledger"
+        coordinator.request("SIGTERM")
+        cleanup = _drain(coordinator)
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the drain must wait for the running orphan sweep"
+        adapter.release.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        await asyncio.gather(sweep, return_exceptions=True)
+        return ok
+
+    assert asyncio.run(_probe()) is True
+    # The running sweep ran to the end, and only then was the loop cancelled.
+    assert adapter.cancelled is False
+    assert adapter.calls == ["cancel", "flatten", "orphan"]
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_the_orphan_sweep_runs_when_the_signal_lands_during_the_flatten(
+    isolated_db_sandbox, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A signal between the flatten and the orphan sweep must not drop the sweep.
+
+    The money-safety part is done (orders cancelled, account flat), but the
+    protections the flatten detached are still resting and can still trigger.
+    Refusing the sweep here would leave them resting while the daemon closes
+    its connections, and a triggered stop with nothing to sell opens a short.
+    The enforcement is one registered unit, so a signal that lands while it is
+    running is drained with it: the sweep runs, the deployment is stamped, and
+    the next tick has nothing left to retry.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database)
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _SignalOnFlattenAdapter(coordinator)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(
+            daemon._enforce_stopped_deployments(
+                [_deployment(database)],
+                {ACCOUNT_ID: adapter},
+                already_enforced=set(),
+                account_lookup={ACCOUNT_ID: LiveAccountConfig(id=ACCOUNT_ID, broker="ctrader")},
+            )
+        )
+
+    assert adapter.calls == ["cancel", "flatten", "orphan"], "the sweep may not be dropped"
+    assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+    assert not any("shutting down" in r.getMessage() for r in caplog.records)
 
 
 def test_partial_flatten_does_not_stamp_and_does_not_sweep_orphans(
@@ -651,6 +914,67 @@ def test_preparation_failure_never_takes_the_claim(
     _submit(database, adapter)
 
     assert adapter.submitted == []
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
+def test_entries_halt_written_during_prepare_blocks_the_claim(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """A halt committed while the dispatcher was sizing must still stop the entry.
+
+    The pre-submit ``live_deployment_entries_halted`` read runs before
+    ``prepare_order_with_risk``; the claim re-checks the flag inside its own
+    transaction, so a halt landing in that window wins the race (#303).
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    adapter = _ControlAdapter()
+
+    async def _halt_during_prepare(_adapter, _deployment, live_signal):
+        database.set_live_deployment_entries_halt(
+            DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+        )
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _halt_during_prepare)
+
+    _submit(database, adapter)
+
+    assert adapter.submitted == []
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
+def test_exit_claim_is_not_gated_by_the_entries_halt(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """The halt is entry-only: an exit on a halted deployment still submits."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    database.set_live_deployment_entries_halt(
+        DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+    )
+    adapter = _ControlAdapter()
+
+    async def _prepared(_adapter, _deployment, live_signal):
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepared)
+
+    exit_signal = _trade_signal()
+    exit_signal.action = "sell"
+    exit_signal.metadata = {**dict(exit_signal.metadata), "exit_only": True}
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            ACCOUNT_ID,
+            adapter,
+            _deployment(database),
+            exit_signal,
+            signal_timeframe="1h",
+            wait_enabled=False,
+        )
+    )
+
+    assert len(adapter.submitted) == 1
     assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
 
 

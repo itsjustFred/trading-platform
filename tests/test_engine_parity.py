@@ -86,7 +86,7 @@ def _parity_config(data_dir: Path) -> BacktestConfig:
         max_leverage=10.0,
         modeling_resolution="main_timeframe",
         data_dir=str(data_dir),
-        parameters={"fees": "zero", "fast_length": 5, "slow_length": 20},
+        parameters={"fees": "zero", "slippage": "none", "fast_length": 5, "slow_length": 20},
     )
 
 
@@ -118,7 +118,11 @@ def test_native_and_vectorbt_agree_exactly_on_bundled_fixture(parity_data_dir):
     cfg = _parity_config(parity_data_dir)
 
     native = NativeAdapter().run(cfg, STRATEGY_PATH)
-    vectorbt = VectorbtAdapter().run(cfg, STRATEGY_PATH)
+    # Frozen engine: next_open is refused; pin the legacy close fill it
+    # actually simulates (native keeps the next_open default).
+    vectorbt = VectorbtAdapter().run(
+        cfg.model_copy(update={"signal_exit_fill": "close"}), STRATEGY_PATH
+    )
 
     assert len(native.trades) > 0, "Fixture must produce trades for parity to be meaningful"
     assert len(native.trades) == len(vectorbt.trades), (

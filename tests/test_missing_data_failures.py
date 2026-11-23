@@ -33,6 +33,9 @@ def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
         end_date="2024-02-01",
         initial_capital=100_000.0,
         data_dir=str(tmp_path / "data"),
+        # Frozen engines refuse next_open; these tests only pin the
+        # missing-data failure, so declare the legacy close fill.
+        signal_exit_fill="close",
     )
 
 

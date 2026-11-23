@@ -34,7 +34,9 @@ from runner.engines.base import (
     resolve_strategy_parameters,
     warn_if_engine_frozen,
 )
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.promotion_cli import add_promote_parser
+from runner.slippage import SLIPPAGE_CAPABLE_ENGINES, assert_slippage_supported
 from runner.stats import merge_canonical_stats
 from runner.universe_provenance import (
     DEFAULT_UNIVERSE_PROVIDER,
@@ -219,8 +221,15 @@ def cmd_run(args):
         raise ValueError("--params must decode to a JSON object")
     resolved_parameters = resolve_strategy_parameters(args.strategy, parameter_overrides)
     # #84: explicit fee declaration rides into engine params (hard error
-    # downstream when absent).
-    resolved_parameters = {**resolved_parameters, **_fee_params_from_args(args)}
+    # downstream when absent). #130: slippage model params ride the same way.
+    resolved_parameters = {
+        **resolved_parameters,
+        **_fee_params_from_args(args),
+        **_slippage_params_from_args(args),
+    }
+    # #130: an engine outside the slippage scope must refuse a declared
+    # model rather than run gross while the user believes it applied.
+    assert_slippage_supported(engine.name, resolved_parameters)
 
     normalized_timeframe = normalize_timeframe(args.timeframe)
 
@@ -262,6 +271,14 @@ def cmd_run(args):
             max_position_exposure_pct=getattr(args, "max_position_exposure_pct", None),
             max_leverage=getattr(args, "max_leverage", None),
             modeling_resolution=getattr(args, "intrabar_resolution", "open_close") or "open_close",
+            # Frozen engines refuse next_open; when the operator did not pick
+            # a fill, declare the legacy close fill they actually simulate so
+            # the persisted meta stays truthful. An explicit --signal-exit-fill
+            # is passed through (next_open on a frozen engine then fails loud).
+            signal_exit_fill=(
+                str(getattr(args, "signal_exit_fill", "") or "").strip().lower()
+                or default_signal_exit_fill_for_engine(engine.name)
+            ),
             data_dir=args.data_dir or "",
             parameters=resolved_parameters,
         )
@@ -325,7 +342,25 @@ def cmd_run(args):
     result.meta.data["pnl_basis"] = {
         "pnl": "gross",
         "net_pnl": "net_after_fees",
+        # #130: on slippage-capable engines the fill-price model is
+        # embedded in entry/exit prices, so `pnl` is gross of fees but
+        # NET of slippage; out-of-scope engines stay fully gross.
+        "slippage_embedded": engine.name in SLIPPAGE_CAPABLE_ENGINES,
     }
+    # #130: every run records the slippage model used. The native and
+    # signal-replay adapters record their per-symbol models themselves;
+    # engines outside the #130 scope (vectorbt/pynecore, LEAN import-only
+    # per #318) get an explicit "not modeled" record, never silence.
+    result.meta.data.setdefault(
+        "slippage",
+        {
+            "models": {},
+            "note": (
+                f"engine '{engine.name}' does not apply a slippage model "
+                "(#130 scope: native + signal replay)"
+            ),
+        },
+    )
     result.meta.data["risk_config"] = {
         "risk_per_trade_pct": config.risk_per_trade_pct,
         "max_position_exposure_pct": config.max_position_exposure_pct,
@@ -411,7 +446,11 @@ def cmd_walkforward(args):
     """Run walk-forward validation for a strategy."""
     symbols = parse_csv_list(args.symbols)
     params = parse_params(args.params)
-    params = {**params, **_fee_params_from_args(args)}
+    params = {
+        **params,
+        **_fee_params_from_args(args),
+        **_slippage_params_from_args(args),
+    }
     result = run_walkforward(
         strategy=args.strategy,
         engine=get_engine(args.engine),
@@ -451,7 +490,11 @@ def cmd_grid(args):
         max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
-        params={**parse_params(args.params), **_fee_params_from_args(args)},
+        params={
+            **parse_params(args.params),
+            **_fee_params_from_args(args),
+            **_slippage_params_from_args(args),
+        },
         output_dir=args.output_dir,
         data_dir=args.data_dir or "",
         max_workers=args.max_workers,
@@ -480,7 +523,11 @@ def cmd_matrix(args):
         max_position_exposure_pct=args.max_position_exposure_pct,
         max_leverage=args.max_leverage,
         intrabar_resolution=args.intrabar_resolution,
-        params={**parse_params(args.params), **_fee_params_from_args(args)},
+        params={
+            **parse_params(args.params),
+            **_fee_params_from_args(args),
+            **_slippage_params_from_args(args),
+        },
         output_dir=args.output_dir,
         data_dir=args.data_dir or "",
         max_workers=args.max_workers,
@@ -574,6 +621,60 @@ def _fee_params_from_args(args) -> dict:
         if "fee_rate" in params or "fee_flat_per_trade" in params:
             raise ValueError("--fees-zero conflicts with --fee-rate/--fee-flat-per-trade")
         params["fees"] = "zero"
+    elif params:
+        # Fail at the CLI boundary instead of letting invalid values reach a run.
+        from runner.fees import resolve_fee_model
+
+        resolve_fee_model(params)
+    return params
+
+
+def _add_slippage_flags(parser: argparse.ArgumentParser) -> None:
+    """Slippage declaration flags (#130: fill-price model, always recorded)."""
+    parser.add_argument(
+        "--slippage",
+        choices=["none", "zero", "spread", "bps", "auto"],
+        default=None,
+        help=(
+            "Slippage model applied to fill prices: 'none'/'zero' is the "
+            "explicit parity opt-out, 'spread' uses bar bid/ask data with a "
+            "bps fallback, 'bps' is a fixed-bps model (needs "
+            "--slippage-bps), 'auto' picks per asset class and REFUSES "
+            "when the class cannot be mapped (fail closed like fees). "
+            "Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=None,
+        help="Fixed slippage in basis points per fill side (e.g. 5 = 0.05%%)",
+    )
+    parser.add_argument(
+        "--slippage-default-bps",
+        type=float,
+        default=None,
+        help="Fallback bps for the spread model when a bar has no bid/ask data",
+    )
+
+
+def _slippage_params_from_args(args) -> dict:
+    """Merge CLI slippage flags into engine params (#130)."""
+    params: dict = {}
+    slippage = getattr(args, "slippage", None)
+    if slippage is not None:
+        params["slippage"] = str(slippage)
+    if getattr(args, "slippage_bps", None) is not None:
+        params["slippage_bps"] = float(args.slippage_bps)
+    if getattr(args, "slippage_default_bps", None) is not None:
+        params["slippage_default_bps"] = float(args.slippage_default_bps)
+    if params.get("slippage") in {"none", "zero"} and "slippage_bps" in params:
+        raise ValueError("--slippage none/zero conflicts with --slippage-bps")
+    if params.get("slippage") == "auto" and "slippage_bps" in params:
+        raise ValueError(
+            "--slippage auto conflicts with --slippage-bps: auto picks the "
+            "per-class model; use --slippage bps to force fixed bps"
+        )
     return params
 
 
@@ -631,12 +732,23 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(run_p, risk_default=None)
     _add_fee_flags(run_p)
+    _add_slippage_flags(run_p)
     run_p.add_argument(
         "--intrabar-resolution",
         default="open_close",
         help="Intrabar exit modeling: main_timeframe, open_close, or explicit finer timeframe",
     )
     run_p.add_argument("--name", "-n", help="Strategy name (default: filename)")
+    run_p.add_argument(
+        "--signal-exit-fill",
+        default="",
+        choices=["", "next_open", "close"],
+        help=(
+            "Signal-exit fill convention. Default: 'next_open' on native; the "
+            "frozen engines (vectorbt, pynecore, lean) only implement the legacy "
+            "signal-bar fills and default to 'close' — they refuse 'next_open'"
+        ),
+    )
     run_p.add_argument("--output", "-o", help="Output file path")
     run_p.add_argument("--result-id", help="Persisted BacktestMeta.id override")
     run_p.add_argument(
@@ -727,6 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
     wf_p.add_argument("--output-dir", default="", help="Override output directory")
     _add_sizing_flags(wf_p, risk_default=None)
     _add_fee_flags(wf_p)
+    _add_slippage_flags(wf_p)
     wf_p.add_argument("--intrabar-resolution", default="open_close")
     wf_p.add_argument("--params", default="", help="Strategy params JSON")
     wf_p.add_argument("--data-dir", default="", help=HELP_OVERRIDE_DATA_DIR)
@@ -751,6 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
     grid_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(grid_p, risk_default=0.01)
     _add_fee_flags(grid_p)
+    _add_slippage_flags(grid_p)
     grid_p.add_argument("--intrabar-resolution", default="open_close")
     grid_p.add_argument("--params", default="", help='Strategy params JSON')
     grid_p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -807,6 +921,7 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_p.add_argument("--capital", type=float, default=100000, help="Initial capital")
     _add_sizing_flags(matrix_p, risk_default=0.01)
     _add_fee_flags(matrix_p)
+    _add_slippage_flags(matrix_p)
     matrix_p.add_argument("--intrabar-resolution", default="open_close")
     matrix_p.add_argument("--params", default="", help='Strategy params JSON')
     matrix_p.add_argument("--output-dir", type=Path, default=MATRIX_OUTPUT_DIR)

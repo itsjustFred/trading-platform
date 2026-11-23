@@ -73,6 +73,12 @@ class _EntryAdapter:
     async def get_balance(self):
         return 100_000.0, 100_000.0
 
+    async def get_equity(self):
+        return 100_000.0
+
+    async def get_used_margin(self):
+        return 0.0
+
     async def get_pip_value(self, symbol):
         return LivePipValue(
             value=1.0,
@@ -1306,3 +1312,72 @@ def test_a_mode_that_cannot_be_parsed_halts_entries_and_sweeps_nothing(
 
     with pytest.raises(LiveHaltError):
         asyncio.run(refuse_entry_while_halted(account))
+
+
+def test_a_refused_mutation_gate_skips_the_sweep_and_keeps_it_due() -> None:
+    """The daemon's shutdown gate: no sweep starts once the stop flag is set.
+
+    A refused sweep is not a failed one - the account stays due (the sweep
+    ledger is only written on a completed sweep), so the next daemon start
+    retries it. The adapter must see nothing at all.
+    """
+    import contextlib
+
+    from live_runner.kill_switch import KillSwitchState
+
+    adapter = _SweepAdapter()
+    state = KillSwitchState(
+        halts={ACCOUNT: KillSwitchMode.FLATTEN}, readable=True
+    )
+
+    @contextlib.asynccontextmanager
+    async def _refusing_gate():
+        yield False
+
+    report = asyncio.run(
+        enforce_live_kill_switch(
+            {ACCOUNT: adapter},
+            [ACCOUNT],
+            state=state,
+            mutation_gate=_refusing_gate,
+        )
+    )
+
+    assert adapter.calls == []
+    assert report.swept == ()
+    assert report.unmet == (ACCOUNT,)
+
+
+def test_an_admitted_mutation_gate_lets_the_whole_sweep_run() -> None:
+    """The gate wraps the account's sweep as one unit, cancel through orphan."""
+    import contextlib
+
+    from live_runner.kill_switch import KillSwitchState
+
+    adapter = _SweepAdapter()
+    state = KillSwitchState(
+        halts={ACCOUNT: KillSwitchMode.FLATTEN}, readable=True
+    )
+    admitted: list[bool] = []
+
+    @contextlib.asynccontextmanager
+    async def _admitting_gate():
+        admitted.append(True)
+        yield True
+
+    report = asyncio.run(
+        enforce_live_kill_switch(
+            {ACCOUNT: adapter},
+            [ACCOUNT],
+            state=state,
+            mutation_gate=_admitting_gate,
+        )
+    )
+
+    assert admitted == [True]
+    assert adapter.calls == [
+        "cancel_open_orders",
+        "close_all_positions",
+        "cancel_orphaned_protections",
+    ]
+    assert report.swept == (ACCOUNT,)

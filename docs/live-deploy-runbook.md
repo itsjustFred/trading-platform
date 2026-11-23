@@ -16,6 +16,70 @@ Status: credential-gated as of 2026-07-13.
   a mode that only comes from the bot's own config default, which is read from the processor the
   deployment runs.
 
+## Ops Alert Channel (#304)
+
+The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
+paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, installed
+by `run_daemon()` at daemon start; importing `live_runner.daemon` does not install the alert sink
+(logging and Sentry setup still happen at import).
+
+Set the variables in the environment the daemon runs with — e.g. exported before start or in the
+sourced `.accounts.env` / a systemd `EnvironmentFile`.
+
+- `OPS_ALERT_WEBHOOK_URL` — webhook URL. **Unset disables alerting entirely**; the daemon then
+  behaves exactly as before. There is no other configuration needed to turn it on.
+- `OPS_ALERT_MAX_PER_MINUTE` (default `12`) — alerts per sliding minute; overflow is dropped and
+  the drop count is folded into the next alert that does go out.
+- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — alerts with the same dedup key inside this window
+  send once. The key is the `data.alert` marker plus the record's `account_id`,
+  `deployment_id`, `service_id` and `symbol` when present — so the same marker on a different
+  deployment is a different alert, but a changed payload (e.g. new mismatch quantities) under the
+  same marker and scope is still suppressed until the window expires. For records without a
+  marker the key is logger + level + message template (not the formatted message) plus the same
+  scope identifiers.
+- `OPS_ALERT_MIN_LEVEL` (default `ERROR`) — minimum level for level-triggered alerts, as a level
+  name (`CRITICAL`) or number. Raise it to `CRITICAL` to page only on emergencies; an explicit
+  `data.alert` marker still bypasses the floor because it is a deliberate operator alert. An
+  invalid value falls back to `ERROR` rather than muting the channel.
+- `OPS_ALERT_EVENTS` (unset = everything) — comma-separated allowlist of event classes. An entry
+  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name; when set,
+  only matching records page, so routine errors can be filtered without touching call sites. Logger
+  names match the logging hierarchy: `trading.live-runner` also covers
+  `trading.live-runner.<child>` but not `trading.live-runnerx`. **Markers and `CRITICAL` records
+  always page regardless of the allowlist** — the allowlist exists to filter routine errors, and
+  muting those two would hide real emergencies. Note that today all live modules log under the
+  single logger `trading.live-runner` (`get_logger("live-runner")`), so a logger-name allowlist can
+  only select "the whole live daemon", not one module inside it.
+- `OPS_ALERT_IGNORE` (unset = nothing ignored) — comma-separated denylist of fnmatch patterns
+  (e.g. `poll failed for *`, `*heartbeat*`) matched against the message template and the rendered
+  message. Matching is `fnmatchcase`: case-sensitive, and a pattern cannot itself contain a comma
+  (the comma separates entries). A match drops the record even when it is a `data.alert` marker or
+  `CRITICAL`, so this is the explicit "this one routine error is noise" switch — a broad pattern
+  such as `*failed*` can silently mute the known emergency markers, which is why setting it logs a
+  startup warning. Use it to mute a single noisy ERROR without touching call sites; prefer it over
+  a broad `OPS_ALERT_EVENTS` allowlist.
+
+The effective filter (min level, allowlist, denylist) is logged once at startup on the
+`trading.alerts` logger, and setting `OPS_ALERT_EVENTS` or `OPS_ALERT_IGNORE` additionally logs a
+warning — a filter that matches nothing, or a denylist wide enough to mute the emergency markers,
+would otherwise leave the channel silently dead or silently mute.
+
+What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
+any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
+at any level — `data.alert` markers route even when `LOG_LEVEL` would keep the record out of the
+file/console output — then filtered by `OPS_ALERT_IGNORE` and, for routine errors only,
+`OPS_ALERT_EVENTS`.
+
+Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
+webhook drops and counts alerts; it can never block or raise into a trading path. A failed send
+(e.g. a Discord 429 or 5xx) is counted and logged on the `trading.alerts` logger, not retried — a single
+lost alert is accepted for v1 rather than risking a retry storm against a struggling webhook.
+The sink's own logger (`trading.alerts`) never pages, so a failing webhook cannot feed alerts
+back into the channel.
+Payloads are
+redacted with the same rules as the JSON log formatter before they leave the process. Only the
+live daemon installs the sink today; other entry points are unaffected.
+
 ## Live Trailing Stops
 
 Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:
@@ -134,6 +198,10 @@ results stop predicting live behaviour:
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
   flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
   flatten never misses a stop that was replaced under it.
+- Shutdown: an amendment that is already in flight when SIGINT/SIGTERM arrives is drained (30 s)
+  before the daemon's loops are cancelled, so the daemon always learns whether the stop moved; a
+  new amendment is refused once the stop flag is set and retried on the next start (the previous
+  broker-side stop stays in force). See "Stopping the daemon" below.
 - Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
   logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
@@ -265,6 +333,211 @@ clean-up.
 - `PATCH /v2/orders/{id}` on the `held` stop leg is accepted: the response is a new order id,
   `held`, with the new `stop_price`; the parent's `legs` then show the new stop and the unchanged
   take-profit leg. Through the adapter the stop moved 11.35 -> 11.52 with the take profit intact.
+
+## Internal strategy live runner (#348)
+
+ACTIVE deployments with `signal_source`/`signal_source_type` = `internal` are
+evaluated by `live_runner/internal_strategy_runner.py` (daemon task
+`internal-strategy-loop`, 15 s tick). Discord deployments are unaffected —
+their signals still arrive through the channel listeners.
+
+**Opt-in.** An internal deployment is only evaluated when
+`settings["internal_runner_enabled"]` is explicitly truthy (`true`, `1`,
+`yes`, `on`). Deployments that predate the runner stay inert until an
+operator sets the flag per deployment — there is no way to distinguish a
+pre-existing ACTIVE row from a new one, so the flag gates all of them.
+
+**Risk policy (maintainer decision 2026-11-22).**
+
+- An entry with **no take-profit level** is allowed: it is stamped
+  `take_profit_policy=unbounded_exit_on_opposite_signal`, so the strategy's
+  own `exits` signals are its exit mechanism — matching the backtest. A stop
+  is still required.
+- An entry with **no stop loss** gets a broker stop at the engine's fallback
+  distance (`fallback_stop_pct` of the entry price — the same fallback the
+  engine uses for sizing). Live never runs unprotected.
+- Entries per symbol are capped by `settings["internal_max_open_per_symbol"]`
+  (falling back to a same-named `STRATEGY_META` parameter): **default 1 open
+  position per deployment+symbol**. Only `1` is accepted today — N>1 is not
+  supported end-to-end (per-position sizing, protection and exits on the
+  qty-netted live ledger are unresolved; maintainer decision 2026-11-22:
+  N=1, N>1 is #382), so any other value fails closed: **entries are disabled
+  for the deployment but exits keep flowing** — a bad cap must never
+  suppress an exit on an open position. Open positions are counted from the
+  deployment's own persisted ledger with oldest-first FIFO attribution of
+  reducing fills; an entry with no fills counts only while the broker still
+  lists its order as working or holds a non-zero position in the symbol
+  (a filled-but-unbooked entry is not working, so the position is what
+  proves it open), so a canceled or expired unfilled order does not lock
+  the symbol. The count is updated within a pass so same-pass signals
+  cannot exceed the cap, and the deployment total is capped at the engine
+  maximum of 5. If the ledger, the broker's working-order list or its
+  positions cannot be read, entries fail closed the same way — exits still
+  evaluate.
+  A same-bar reversal (exit + new entry on one bar) emits the exit but the
+  entry waits one bar: the closing position still counts against the cap
+  until the next evaluation.
+  **Known window:** an entry that reached `adapter.submit_order` but whose
+  `broker_order_id` was never persisted (a crash between the broker accept
+  and the write, or a lost submit response) carries only its signal id — no
+  broker order id and no fills yet. While the broker's position in the
+  symbol is flat *and* the order is no longer working, that row counts as 0
+  open entries, so a same-symbol entry could be submitted in that window.
+  The window closes as soon as either the fill is booked or the broker
+  position goes non-zero; there is no persisted "submitted" marker on the
+  signal row to close it earlier (#360 review).
+- **Session-bound symbols** (anything the venue calendar does not resolve to
+  24/7) are only *actioned* while the venue is open, using
+  `shared.venue_calendar`. Daily-and-longer bars may be held over the market
+  close; a bar whose data runs into the session close becomes actionable at
+  the next session open, matching the engine's next-bar-open fill. A bar
+  counts when it *overlaps* a trading interval, not when it opens inside
+  one — a 09:00 ET hourly bar is regular-hours data for its 09:30-10:00
+  portion. Session logic gates actionability, never the indicator input:
+  intraday strategies see every nominally closed feed bar, including
+  extended-hours bars, matching the unfiltered backtest dataset. Bars with
+  no session overlap produce no signals, and an unresolvable venue calendar
+  fails closed.
+
+**What runs.** For each deployment symbol the runner fetches bars through the
+adapter's existing `get_market_data` (no new network client; an adapter that
+cannot serve bars for the timeframe fails closed and the deployment is
+skipped), keeps only *closed* bars, and calls the deployment strategy's own
+`generate_signals(df, params)` through the native engine's
+`_call_strategy`/`_normalize_strategy_output`/`_resolve_direction`/
+`_extract_levels` — the same code path a backtest uses, with
+`STRATEGY_META["parameters"]` defaults (per-deployment
+`settings.strategy_parameters` stays refused, exactly as the promotion gate
+binds it). Up to 1000 bars of history are requested per evaluation, which
+bounds indicator warmup; a strategy needing deeper history than the feed
+serves cannot be evaluated faithfully.
+
+**Timing contract.** The native engine evaluates a signal on bar T's close,
+records T's `close` as the entry reference, and fills the resulting market
+order at the *next* bar's open; signal exits fill at the next bar's open as
+well (`signal_exit_fill="next_open"` default). Live maps this to: evaluate on
+the just-closed bar T and submit immediately —
+the broker fill lands at (or very near) the open of bar T+1 for entries, and
+at approximately the open of bar T+1 for exits. Sizing geometry uses T's `close`, the
+same reference the engine records. A signal is only actionable while bar T+1
+is still forming (30 s grace plus a feed-lag allowance of
+`min(120 s, 10% of the bar)`, measured from the bar's session-aware close —
+never a full extra bar); an older bar is stale and is
+never traded. Bars that closed while the daemon was down are stale by
+definition: only the newest closed bar is actionable after a restart, and
+missed bars are never backfilled with orders. Missing, malformed, unclosed or
+out-of-window bars fail closed — no order is emitted.
+
+**Orders.** Emitted intents go through the daemon's
+`_submit_internal_strategy_signal` → `_trade_signal_to_live_signal` →
+`_prepare_claim_and_submit_signal`, the same prepare/claim/submit path as
+Discord signals: live level resolution, risk sizing, the SL/TP guard, the
+promotion gate, the demo/paper hard block, the submission lease and adapter
+persistence all apply unchanged. A strategy `exits` row becomes a
+reduce-only `FULL_EXIT` against the deployment's own ledger quantity — it can
+never open or extend a position. A `SHORT` entry on a deployment without
+`allow_short` is skipped (it must not be reinterpreted as an exit). Entries
+carrying more than one take-profit level — or a single partial (`tp_pct` /
+`fraction < 1`) level — are skipped: the live bracket carries a single
+full-size TP and emitting only the first would silently drop the native
+partial-exit ladder. Entries carrying engine sizing-only stop fields
+(`sizing_sl_price`/`sizing_stop`/`sizing_sl`/`stop_distance`) are likewise
+skipped — the live path cannot reproduce the engine's sizing math. A
+`signal_processor` configuration is refused outright: processors are a
+Discord-pipeline concept the internal path never runs. An entry with no TP
+level is emitted with the unbounded-TP policy above; an entry with no stop
+gets the fallback-distance broker stop, so the daemon's SL/TP guard always
+sees a real stop. A *stale* exit is skipped like a stale entry — with the
+unbounded-TP policy the position is then held until the fallback stop or
+the next exit signal.
+
+**Idempotency.** Each emitted intent carries a producer-stable
+`metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
+close and intent kind. Within a process the runner tracks the newest
+processed bar per deployment+symbol; across a restart the same closed bar
+re-evaluates to the same key, and the adapter's `save_live_signal` dedupe
+returns the persisted row instead of placing a second broker order.
+
+## Periodic Broker Reconciliation (#303)
+
+The daemon runs `live_runner/broker_reconciliation.py` on the deployment sync
+snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
+
+- the signed ledger quantity per symbol (`live_executions` fills by deployment)
+  with the broker's net position for that symbol;
+- broker order ids/client order ids the ledger still expects to be working with
+  the adapter's normalized working-order view (bracket legs and attached
+  stop/target orders are marked as protection, not untracked entries/exits);
+- protective stops with open broker positions when the adapter can list them.
+
+Unreadable broker state is a mismatch (fail closed), but it must not flap: a
+deployment's entries are halted only after
+`broker_reconciliation_consecutive_mismatches` consecutive bad passes
+(default `2`), and a clean pass resets the streak *and* releases the halt.
+
+The halt is **entry-only**. It is a persisted flag on the deployment (the
+`broker_reconciliation_entries_halted` settings key), re-checked atomically
+inside the submission claim immediately before an entry order is submitted -
+the deployment stays
+`ACTIVE`, so exits, in-flight orders, trailing stops and STOPPED enforcement
+keep their normal semantics. A `PAUSED` status was rejected for this on
+purpose: it would also freeze exits and trailing, exactly when a broker/ledger
+divergence makes them most needed. The halt and its release are written to the
+live control audit trail as `broker_reconciliation_entries_halt` /
+`broker_reconciliation_entries_resume` (actor `broker_reconciliation`).
+
+To release a halt early, set the deployment `PAUSED` and back to `ACTIVE` (the
+resume transition clears the flag); a still-mismatched account is re-halted on
+the next pass, so this cannot hide a live divergence. To make the halt
+permanent, leave the flag - or `PAUSED`/`STOPPED` the deployment.
+
+Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
+count as orders the ledger still expects to be working: both live order paths
+expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
+unfilled row is a cancelled/expired/rejected historical order, not a working
+one. A younger order missing from the broker's working list is not trusted on
+the age bound alone: the reconciler asks the adapter for that order's state
+(`get_order_state`, bounded lookups per pass), and only a proven `terminal`
+state clears the finding - IOC remainders, cancelled orders and rejected
+submissions all classify terminal, while `working`, unknown, timed-out or
+unreadable states keep it. Accounts holding positions or orders placed
+*outside* the platform
+(manual trades, another tool) will always mismatch - the ledger cannot vouch
+for them; flatten or adopt them at the broker before relying on a clean
+report.
+
+Settings live in deployment `settings` (see `live_deployments.example.yaml`).
+Broker state is account-level, so the strictest values across an account's
+deployments win:
+
+- `broker_reconciliation_interval_seconds` (default `300`, bounds 30-86400)
+- `broker_reconciliation_qty_tolerance` (`null` = adapter precision, strict
+  default when unknown)
+- `broker_reconciliation_consecutive_mismatches` (default `2`, bounds 1-10)
+- `broker_reconciliation_enabled` (default `true`; the account reconciles unless
+  every deployment on it opts out)
+
+All four are validated at deployment creation: an unusable value is refused
+instead of being silently defaulted. At runtime an unrecognised boolean still
+fails closed to *enabled* (a typo like `"flase"` cannot disable
+reconciliation).
+
+The latest pass is written to
+`$DATA_DIR/live/broker_reconciliation_report.json` and served read-only at
+`GET /api/live/reconciliation`. Every mismatch logs the structured diff; the
+halt threshold logs at ERROR with `alert=broker_reconciliation_mismatch`.
+
+### Open decision
+
+Interval, tolerance and the consecutive-mismatch count are maintainer decisions.
+The shipped defaults are deliberately conservative (5-minute interval, adapter
+precision or the strict 1e-9 quantity tolerance, two consecutive mismatches)
+because a false halt is recoverable while a missed broker/ledger divergence is
+not. Whether account-level mismatches should halt entries on *all* ACTIVE
+deployments on the account (current conservative choice) or only the
+deployments whose ledger rows implicate the symbol is also open; the
+account-wide halt is kept because broker positions and working orders are
+netted per account and cannot be attributed to one deployment safely.
 
 ## Strategy Promotion Gate (#165)
 
@@ -455,6 +728,8 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+
+
 ### The cTrader top-N deploy never arms a non-demo account (#261)
 
 That endpoint creates its rows in one shot, with no per-deployment
@@ -629,9 +904,68 @@ set -o pipefail
 uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date -u +%Y%m%dT%H%M%SZ).log"
 ```
 
-> NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
+The daemon takes no options: deployments come from the database (`live_deployments` via
+`shared/database.list_live_deployments`), not from `live_deployments.yaml`, and there is no
+`--config`. An unknown option is a usage error (exit 2), never a silently ignored argument.
+
+`python -m live_runner.daemon --help` is safe to run anywhere, at any time: it prints the usage
+and exits 0 without opening the database, running migrations, or connecting to a broker. It used
+to start the daemon instead (#310).
+
+**One daemon per database.** Before the first migration or broker connect, the daemon takes an
+exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lock`, or the
+`DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
+exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
+was killed (even `kill -9`) releases it on death and never blocks the next start. The data
+directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` - or
+the directory of a SQLite `DATABASE_URL` file - on a network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
+disconnects its broker adapters and then waits - bounded, `WORKER_JOIN_TIMEOUT_SECONDS` = 30s - for
+its in-flight database work, so the lock is never handed on while its own writes are still
+running; if a worker thread is still stuck after the budget the daemon logs CRITICAL and exits 4
+with the lock held until the process dies. `systemctl stop` sends SIGTERM, which this build does
+not handle: the daemon dies immediately with no drain (graceful SIGTERM shutdown is a separate
+change). Deploy this build as stop, deploy, start - the first rollout is **not** protected against
+a daemon already running an older, lockless build: stop the old daemon before starting this one.
+A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
+therefore retries a refused start every `RestartSec` and logs the refusal each time: that is the
+signal to find and stop the other daemon, not to delete the lock file - the file is a handle, the
+lock is the kernel's.
+
+**A newer build runs data migrations.** Starting a build whose schema or one-time data migrations
+the running build does not have yet applies them on startup (see "Commission sign migration
+(cTrader, #205)"). Roll out as stop, deploy, start: never run an old and a new build side by side.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+## Stopping the daemon
+
+`SIGTERM` (systemd stop, `kill`) and `SIGINT` (Ctrl-C) start a graceful shutdown:
+
+1. No new broker work is accepted. An order submission, a trailing-stop amendment, a STOPPED enforcement sweep or a kill-switch sweep that starts now is refused (a signal is logged and dropped before the broker request; a stop amendment leaves the previous broker-side stop in force and the bars unprocessed; a STOPPED sweep leaves the deployment unenforced and is retried; a kill-switch sweep leaves the halt due and is retried on the next start). A STOPPED enforcement that is already running is one unit: its order cancel, its flatten and the sweep of the protections the flatten detached are drained together, because dropping the later steps would leave the account flat with detached stops still resting. A kill-switch sweep is one unit the same way.
+2. Broker work already in flight is allowed to finish - all four kinds above - before anything is cancelled (default 30 s for the whole drain). None of them is cancelled out from under the broker request *within that 30 s*, so the daemon always knows the outcome of what it sent while the drain held. When the drain times out instead, whatever is still in flight is abandoned and its broker outcome is unknown - that is exactly what the `1` says, and a broker request already handed to a worker thread is not something a cancel can reach.
+3. The daemon then stops itself: its loops, its listeners, the Discord bots, the scheduler, its broker connections and the Twisted reactor's thread pool (default 20 s per phase, seven phases - loop cancel, listener cancel, Discord close, scheduler stop, adapter disconnect, signal-archive close, reactor release).
+4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of the broker work that did not finish is unknown: an order submission keeps its lease (reconcile the account before sending new signals), a stop amendment leaves the broker's own state in force, and a STOPPED sweep is retried. A daemon that crashed also exits 1, with its traceback in the log: every exit path, crash included, leaves the process immediately instead of running the interpreter's teardown.
+5. A second signal forces an immediate exit (code `130`) and skips all cleanup. A Ctrl-C that lands before the handlers are installed - during startup - exits `130` too, the same code the interpreter would have reported.
+
+Shutdown itself never cancels or closes open orders or positions at the broker; they are left exactly as they were.
+
+Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the 7 cleanup phases, then the daemon's own tail inside `run_daemon`: a bounded join of its worker threads - at most 30 s (`WORKER_JOIN_TIMEOUT_SECONDS`), because a worker still writing keeps the single-instance lock - and a bounded flush of the alert sink - at most 2 s (`SHUTDOWN_FLUSH_SECONDS`). That is 202 s in total before the daemon has even reported (`live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS`; `tests/test_shutdown_budget_contract.py` pins that constant, this figure and the generated unit file together). The tail after the daemon has reported is bounded too: `main` closes the loop itself rather than letting `asyncio.run` do it, and waits at most 2 s (`EXIT_PATH_TIMEOUT_SECONDS`) for the tasks it cancelled to unwind. Closing the loop is not the end of it - a task that awaited a broker request in a worker thread honours its cancel and still leaves that thread running, and no deadline can reach it - so `main` then flushes the Sentry queue - at most 2 s (`SENTRY_FLUSH_TIMEOUT_SECONDS`) - and leaves the process with `os._exit`, which skips the interpreter's own teardown: that teardown would join every thread the bounded shutdown could not account for, with no deadline, and the join is what turns a shutdown that already reported its verdict into one the service manager SIGKILLs. So the whole window is 206 s, exit path included. On systemd the stop timeout has to stay above that so the unit is not SIGKILLed mid-shutdown: `scripts/setup_services.sh` generates `trading-daemon.service` with `TimeoutStopSec=240`. A hand-written unit needs the same, because a daemon that is killed before it finishes never reports its exit code - and a `1` is the operator's only signal that a broker outcome needs reconciliation.
+
+On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
+
+## Indicator Kernel Warm-up (#378)
+
+The shared indicator hot loops (`shared/indicators/`) run as `numba.njit`
+compiled kernels. Importing `shared.indicators` stays cheap — numba is
+imported lazily — but the **first call of each kernel in a process pays a
+one-time compile of roughly 0.1–0.8 s** (four kernels: the two Supertrend
+recursions and the two `custom_swings` ATR loops). For a live signal bot
+that is the first bar it evaluates; for a backtest it is inside the first
+strategy evaluation and is amortised over the run. Compiled kernels are
+cached in the `__pycache__` directory next to `shared/indicators/` (or
+under `NUMBA_CACHE_DIR` when set), so a warm checkout does not recompile
+after the first process. Set `TP_DISABLE_NUMBA=1` to force the pure
+Python/NumPy path everywhere (parity is pinned bit-for-bit either way).
 
 ## Loss Circuit Breaker (#301)
 
@@ -918,8 +1252,8 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 ## Execution prices and commissions (Alpaca, #124)
 
 - `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet. Every reader treats `NULL` as "net PnL incomplete", never as zero: the live stats payload reports `net_pnl: null`, `net_pnl_complete: false` and `commission_unknown_count`, and trade/signal payloads carry `commission: null`.
-- Alpaca crypto fees are posted end of day as `CFEE` account activities, so crypto fills are stored with `NULL`. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST, once a trade date is two UTC days old and for fills up to 30 days back, allocates each (pair, trade date)'s fee pro rata by received quantity, converts it to USD and writes it. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules.
-- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, trade date not posted yet).
+- Alpaca crypto fees are posted as `CFEE` account activities in batches, so crypto fills are stored with `NULL`. `CFEE.date` is the *posting* date (the New York date of `created_at`), not the trade date, and observed posting delays reach ~51 h, so there is no fixed delay to wait out. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST for fills up to 30 days back. `CFEE` entries are clustered into posting batches by `created_at` (entries within 15 minutes of each other are one batch); a batch's fee covers the fills since the previous batch's latest `created_at` up to its own. A fill newer than the latest posted batch stays `NULL` and is retried on the next pass - "not posted yet" is never treated as "no fee". Two fee kinds exist: asset fees (on buys) name their pair and a base-asset `qty`; USD fees (on sells) carry only a negative `net_amount` and *no* `symbol`, so they form a per-account, per-batch USD pool that is allocated to a pair only when exactly one crypto pair has sells in the batch window - with several selling pairs the USD part fails closed while pair-attributed asset fees are still priced. Each fee is allocated pro rata by received quantity and converted to USD. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules. The first fetched batch fails closed when an earlier batch or earlier fills may exist outside the fetch window, so a posting stall longer than the lookback leaves a batch unpriced rather than risk the wrong attribution. Checking for earlier crypto fills is a full-history `FILL` scan per adapter, bounded by `MAX_ACTIVITY_PAGES` (200) requests against the shared ~200/min Alpaca budget. A found instant and an unfinished scan are cached, but a completed scan that finds *no* crypto fill is deliberately rescanned every pass - a fill posted later can still carry an earlier `transaction_time`, so `None` is not fixed history. That state only persists while crypto executions await a commission that the broker reports no fills for (for example local rows Alpaca does not report - a wrong account or symbol mismatch), which the pass logs as a warning; on a healthy account the scan resolves to a cached instant or UNKNOWN and runs once.
+- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, no posted CFEE batch covers it yet).
 - `actual_price_observed` labels every Alpaca price: `observed` (stated for this fill), `derived` (computed from broker prices: the order's `filled_avg_price` on a single-fill order, or a reconciled remainder), `sent_bad`/`absent` (no usable price), `derived_unavailable` (the remainder's price could not be derived honestly). A stream event never borrows the order's cumulative average for a partial fill.
 - A reconciled fill whose order has no usable `filled_avg_price` is not stored; the next reconciliation pass (adapter connect) retries it. Otherwise the missing QUANTITY is always stored. Its price is `(avg*broker_qty - sum(local price*qty)) / missing_qty`, labelled `derived`, when every local leg has a usable price and the result lies within 10% of the order's average (`REMAINDER_PRICE_MAX_REL_DEVIATION`); otherwise it is stored at `0.0` with `derived_unavailable`, so exit sizing and duplicate-order protection still see the quantity.
 - `live_executions.timestamp` drives PnL ordering and is never invented (#135). A fill takes the stream event's own timestamp, then the order's `filled_at`, then its `updated_at`; a stamp that carries no time of day (a bare date such as `2026-11-03`) is refused rather than read as midnight. When none parses, no row is stored: the stream path logs the quantity it dropped (`filled_qty`, `broker_cumulative_filled_qty`) and the reconciled path logs `missing_filled_qty`, and both say the retry is the next adapter connect, because Alpaca reconciliation runs on `connect()` only - there is no periodic pass. Until then the local filled quantity understates the broker's, so exit sizing and duplicate-order protection size against a flat position.
@@ -1054,3 +1388,104 @@ so a trimming that hides an older conflict cannot happen there.
    repeat steps 3-5.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## Release / rollback
+
+The live state that must survive a deploy is the SQLite database (`live_executions`, the
+ledgers, `live_deployments`, `schema_data_migrations`). `scripts/db_backup.py` backs it up and
+restores it; run it from the repo root with the same `.env`/`DATA_DIR` the daemon uses.
+
+### Backup
+
+```bash
+uv run python -m scripts.db_backup backup          # snapshot now, keep 14
+uv run python -m scripts.db_backup backup --keep 30
+uv run python -m scripts.db_backup list            # what is retained
+uv run python -m scripts.db_backup verify <file>   # integrity + applied migrations
+```
+
+Backups use the SQLite online backup API (`pages=-1`, one step under a single read
+transaction), so they are **safe while the daemon runs** - the copy is always a consistent
+committed-state snapshot, no stop needed. Files land in `<db parent>/backups/<db file
+name>-<UTC stamp>.db` - `<DATA_DIR>/backups/backtests.db-<UTC stamp>.db` for the default
+database, or pass `--backup-dir` to choose another directory - one self-contained file each
+(rollback-journal mode), rotating to `--keep` per database *within that directory*. Schedule
+it (cron/systemd timer) independently of deploys; the release procedure below takes one
+explicitly anyway, and pre-deploy snapshots should go to their own `--backup-dir` (or be
+copied off-box) so daily rotation cannot prune the backup a rollback past a migration needs.
+
+### Restore
+
+```bash
+uv run python -m scripts.db_backup restore <backup-file>
+```
+
+Restore **refuses while the database may be in use** and exits 2. Before overwriting, it
+holds the daemon's single-instance lock for the whole operation (so no daemon can start
+mid-restore), proves no other process has the database open by switching it to
+rollback-journal mode - which fails while the viewer, a smoke run, or any other connection
+holds it - takes a safety snapshot of the current database into the same backup directory
+(skip with `--no-safety-snapshot`), verifies the backup (`PRAGMA quick_check`), stages the
+restore beside the target, and swaps it in with `os.replace` - a failed copy never leaves a
+half-written database, and stale `-wal`/`-shm`/`-journal` sidecars are removed first so old
+frames cannot replay over the restored file. It prints the `schema_data_migrations` delta
+between the backup and the pre-restore database; read it before starting any build.
+
+The guard works in three layers:
+
+* **Single-instance lock.** Once the daemon lock from PR #313
+  (`shared/single_instance.py`, `<db>.lock` next to the database file) is on main, the script
+  uses it; until then it holds the same `flock` inline on the same file. Either way the lock
+  is *held* through the swap, not just probed.
+* **Process scan.** The script scans the process table for a `live_runner.daemon` command
+  line (`ps` on Linux/macOS, PowerShell CIM on Windows) and refuses when one is found,
+  whatever the lock reports: during the first release after #313 the running daemon is an old
+  build that never takes the lock, and a daemon on another `DATABASE_URL` cannot be told
+  apart from one on this database. If you are certain the found process trades a different
+  database, re-run with `--force` (the override is logged to stderr). Check what the guard
+  sees with `python -m scripts.db_backup status`.
+* **Open-database probe.** `PRAGMA journal_mode=DELETE` on the live file fails while any
+  other process - the viewer above all - has it open, because `os.replace` would strand that
+  connection on the unlinked inode and its later commits would be silently lost. **Stop the
+  viewer and every process using the database before restoring**; `--force` overrides this
+  too, with the same data-loss risk as a live daemon.
+
+### Release procedure
+
+1. **Stop** the daemon (SIGINT/SIGTERM; confirm no `live_runner.daemon` process remains and
+   `db_backup status` shows a free lock) **and stop the viewer and every other process using
+   the database** - restore refuses while any of them holds it open.
+2. **Backup**: `python -m scripts.db_backup backup` - for a risky deploy take it into a
+   dedicated directory (`--backup-dir <dir>`) or copy the file off-box; the default backup
+   dir is local disk only and its `--keep` rotation will eventually prune it.
+3. **Deploy** the new build.
+4. **Migrate**: the first `init_db` runs schema and one-way data migrations exactly once
+   (recorded in `schema_data_migrations`). There is no separate migrate step - do not start two
+   builds side by side across a migration boundary (see #205 below).
+5. **Start** the daemon, then verify fills/ledgers reconcile (`reconcile_executions`).
+
+### Rollback
+
+* **Code-only rollback** (no data migration ran): stop, check out the previous build, start.
+  Safe at any time.
+* **Data rollback**: stop everything on the database (daemon *and* viewer),
+  `python -m scripts.db_backup restore <pre-deploy backup>`, then **before starting anything**
+  reconcile the restored state against the broker: the restore rolls the database back to the
+  backup, so orders, fills and positions created since are invisible to it - compare broker
+  positions and open orders with the restored DB, flatten or manually reconcile anything newer
+  than the backup, and confirm no signal source will re-ingest post-backup messages (a replay
+  would create duplicate live orders; signal-ingestion cursors written after the backup are
+  gone too). Only then start the build that matches the backup's schema. The restore prints
+  which `schema_data_migrations` the backup lacks; the next `init_db` re-applies them, which
+  is only correct if the backup predates them. Note the ledger does not see every data
+  change: the #205-style commission backfill rewrites rows without a
+  `schema_data_migrations` marker, so "no migration ran" cannot be read off the ledger alone.
+* **One-way migrations cannot be rolled back by an old build.** The #205 commission-sign
+  migration and the other `schema_data_migrations` entries transform data in place; an old build
+  starting on a migrated database misreads it (e.g. a raw negative cTrader charge is
+  indistinguishable from a new-convention rebate). To go back past one, restore a backup taken
+  *before* that migration and accept losing every fill written since. `live_executions` can
+  only be rebuilt through reconciliation for fills whose signal the backup already contains -
+  `reconcile_executions` walks local `live_signals`, so orders created after the backup have
+  no local signal and stay invisible; the broker remains the source of truth for those, per
+  the reconciliation steps above.
