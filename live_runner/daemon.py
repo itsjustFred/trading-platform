@@ -3447,6 +3447,26 @@ def _record_halt_refusal(decision: SignalDecisionRecorder | None, exc: LiveHaltE
     )
 
 
+def _record_loss_breaker_refusal(
+    decision: SignalDecisionRecorder | None, exc: LossBreakerBreachError
+) -> None:
+    """Write the ``loss_breaker_refused`` decision record for a breaker refusal.
+
+    Same audit gap as ``halt_refused`` (#386): the catch persisted the
+    rejection but left no decision record, so a tripped loss breaker was
+    invisible in the decision archive.
+    """
+    if decision is None:
+        return
+    decision.refused(
+        "loss_breaker_refused",
+        detail=str(exc),
+        breaker_scope=exc.scope,
+        breaker_kind=exc.kind,
+        breaker_state_unreadable=exc.state_unreadable,
+    )
+
+
 async def _persist_submission_rejection(
     deployment: LiveDeploymentConfig,
     live_signal: LiveSignal,
@@ -3635,6 +3655,7 @@ async def _prepare_claim_and_submit_signal(
         await _persist_submission_rejection(
             deployment, live_signal, stage="prepare", exc=exc
         )
+        _record_loss_breaker_refusal(decision, exc)
         return SUBMIT_OUTCOME_REFUSED
     except Exception as exc:  # except-kind: money-decision
         if is_exit:

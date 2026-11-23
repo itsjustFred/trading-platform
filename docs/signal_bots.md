@@ -506,6 +506,7 @@ Daemon-Neustart kann zuletzt emittierte Nachrichten erneut archivieren.
   `deployment_not_active`, `symbol_not_covered`, `author_not_allowed`,
   `unmapped_channel`, `stale_signal`, `signal_gate_rejected`,
   `invalid_deployment_config`, `submission_claim_failed`, `halt_refused`,
+  `loss_breaker_refused`,
   `broker_refused_pre_request`, `broker_submit_outcome_unknown`,
   `nothing_to_exit`, `exit_below_step`, `exit_in_flight`,
   `unhandled_error`), `detail`,

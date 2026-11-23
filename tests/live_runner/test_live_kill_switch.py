@@ -1315,6 +1315,74 @@ def test_a_halt_refusal_after_the_claim_records_a_decision(
     )
 
 
+def test_a_loss_breaker_refusal_records_a_decision(
+    isolated_db_sandbox, account, monkeypatch, decision_archive
+) -> None:
+    """The breaker catch owes the archive the same record a halt does (#386).
+
+    ``LossBreakerBreachError`` was the only refusal on the submission path that
+    persisted the rejection but wrote no ``decision.refused`` record, so a
+    tripped loss breaker was just as invisible in the decision archive as the
+    halt refusals this issue fixed.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.loss_breaker import (
+        LossBreakerBreachError,
+        LossBreakerLimits,
+    )
+
+    deployment = _deployment()
+    adapter = _EntryAdapter()
+    live_signal = _entry_signal(deployment)
+    decision = _decision_recorder(account, deployment, live_signal, decision_archive)
+
+    monkeypatch.setattr(
+        daemon,
+        "account_loss_breaker_limits",
+        lambda *_a, **_k: LossBreakerLimits(
+            enabled=True,
+            daily_loss_fraction=0.05,
+            max_drawdown_fraction=0.10,
+        ),
+    )
+
+    def _tripped(*_args: Any, **_kwargs: Any) -> None:
+        raise LossBreakerBreachError(
+            "daily loss breaker tripped",
+            scope="account:acc-halt",
+            kind="daily_loss",
+            account_id=account,
+            deployment_id=str(deployment.id),
+            state_unreadable=False,
+        )
+
+    monkeypatch.setattr(
+        daemon, "refuse_entry_if_loss_breaker_tripped", _tripped, raising=False
+    )
+
+    events = _run_submit_path(
+        account,
+        adapter,
+        deployment,
+        live_signal,
+        is_exit=False,
+        monkeypatch=monkeypatch,
+        decision=decision,
+    )
+
+    assert adapter.submitted == []
+    assert events == []
+    assert decision_archive.flush(timeout=5.0)
+    records = _decision_records()
+    assert len(records) == 1
+    record = records[0]
+    assert record["outcome"] == "refused"
+    assert record["reason"] == "loss_breaker_refused"
+    assert record["breaker_scope"] == "account:acc-halt"
+    assert record["breaker_kind"] == "daily_loss"
+    assert record["breaker_state_unreadable"] is False
+
+
 def test_submit_order_with_risk_rechecks_the_halt_before_submitting(
     isolated_db_sandbox, account, monkeypatch
 ) -> None:
