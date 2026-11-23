@@ -1,0 +1,20 @@
+docs/cleanup-16d1-money-path-semantics.md
+  h_f251b30ae7fbf6 193-195,220
+docs/cross-engine-backtest-contract.md
+  h_f251b30ae7fbf6 44-50,438-440
+runner/engine_pkg/trading_engine.py
+  h_f251b30ae7fbf6 1316-1352,1389-1392,1395-1398,1402,1411-1417,1425-1431,1485-1488
+tests/test_engine_behavior.py
+  h_f251b30ae7fbf6 1960-1961,2028-2029,2031,2034,2223-2224,2234-2236,2317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0e7a36e2c2fe9fd5f40e34ffa60036ce57391477",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
