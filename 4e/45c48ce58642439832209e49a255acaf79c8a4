@@ -1,0 +1,18 @@
+runner/backtest_grid.py
+  h_f251b30ae7fbf6 868-875,928
+runner/engines/base.py
+  h_f251b30ae7fbf6 21,118-120,127,138,140-141,143-161,163
+shared/strategy_registry.py
+  h_f251b30ae7fbf6 195-205
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4e45c48ce58642439832209e49a255acaf79c8a4",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
