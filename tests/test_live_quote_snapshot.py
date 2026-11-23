@@ -1112,11 +1112,11 @@ def _prepare_with_advanced_wait(monkeypatch, trade_signal, deployment):
             return clock["now"]
 
     async def _wait_then_advance(_signal, _timeframe):
-        clock["now"] = clock["now"] + timedelta(hours=1)
+        clock["now"] = clock["now"] + timedelta(minutes=30)
 
     monkeypatch.setattr(daemon, "datetime", _FakeDateTime)
     monkeypatch.setattr(daemon, "wait_for_candle_close", _wait_then_advance)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
     prepared = asyncio.run(
         daemon._prepare_discord_signal_for_submission(
             "acc-1",
@@ -1169,11 +1169,11 @@ def test_prepare_stamps_receipt_at_first_contact_when_source_missing(
 
     async def _wait_then_advance(_signal, _timeframe):
         seen["stamp_during_wait"] = _signal.received_at_local
-        clock["now"] = clock["now"] + timedelta(hours=1)
+        clock["now"] = clock["now"] + timedelta(minutes=30)
 
     monkeypatch.setattr(daemon, "datetime", _FakeDateTime)
     monkeypatch.setattr(daemon, "wait_for_candle_close", _wait_then_advance)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
 
     prepared = asyncio.run(
         daemon._prepare_discord_signal_for_submission(

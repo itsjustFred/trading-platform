@@ -1469,6 +1469,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
                     dedupe_key=(
                         f"alpaca:order:{broker_order_id}:reconciled:{broker_filled_qty}"
                     ),
+                    order_type=_order_type(order) or None,
+                    requested_qty=_requested_order_qty(order),
                 )
                 persisted_qty = await asyncio.to_thread(
                     save_live_execution_up_to_cumulative,
