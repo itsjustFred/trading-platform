@@ -175,6 +175,12 @@ jobs:
           # homes and in others silently ran its default model instead (run 45239957263
           # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
           # reached the configured model.
+          # MODEL is provider/model; a bare or empty model id would only reach
+          # opencode as a model it cannot resolve, so it stops here with its name.
+          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
+            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
+            exit 1
+          fi
           if [ "${MODEL%%/*}" = "kilo" ]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
           elif [ "${MODEL%%/*}" = "nvidia" ]; then
@@ -257,8 +263,10 @@ jobs:
           # A reply that carries the OK token proves the model answered, so it
           # is read first: stderr also holds opencode's retry lines, and a rate
           # limit that cleared on a retry ("retrying (attempt 1): ... Too Many
-          # Requests", then OK) must not read as a cap.
-          if [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
+          # Requests", then OK) must not read as a cap. Only stderr is excused:
+          # a signature on stdout next to an OK still reads as a cap.
+          if [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout" \
+            && ! grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Quota probe reached the model; the agent job will run."
           elif grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr"; then
@@ -361,6 +369,12 @@ jobs:
           # homes and in others silently ran its default model instead (run 45239957263
           # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
           # reached the configured model.
+          # MODEL is provider/model; a bare or empty model id would only reach
+          # opencode as a model it cannot resolve, so it stops here with its name.
+          if [ "${MODEL%%/*}" = "$MODEL" ] || [ -z "${MODEL#*/}" ]; then
+            echo "::error::MODEL '${MODEL}' is not provider/model (e.g. nvidia/stepfun-ai/step-5-preview)."
+            exit 1
+          fi
           if [ "${MODEL%%/*}" = "kilo" ]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
           elif [ "${MODEL%%/*}" = "nvidia" ]; then
