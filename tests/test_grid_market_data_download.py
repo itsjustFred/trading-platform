@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import data_tools.download_grid_market_data as dl
 from data_tools.download_grid_market_data import (
@@ -46,6 +47,46 @@ def test_normalize_ohlcv_columns_fills_from_bid(tmp_path: Path):
     assert actual.loc[0, "close"] == 1.05
     assert actual.loc[0, "volume"] == 1.0
     assert actual.loc[1, "open"] == 2.0
+
+
+def test_normalize_ohlcv_columns_keeps_ask_columns(tmp_path: Path):
+    """Maintainer decision 2026-11-22: ``ask_*`` columns must survive
+    normalization so FX/CFD spreads come from bid/ask data — the slippage
+    bar-spread model reads ``ask_*`` minus the canonical (bid-side) series.
+    ``bid_*`` columns are still dropped: canonical OHLCV already carries
+    the bid-priority values."""
+    path = tmp_path / "test.parquet"
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2020-01-01", periods=2, freq="min", tz="UTC"),
+        "open": [1.0, 2.0],
+        "high": [1.1, 2.1],
+        "low": [0.9, 1.9],
+        "close": [1.05, 2.05],
+        "volume": [1.0, 10.0],
+        "bid_open": [1.0, 2.0],
+        "bid_high": [1.1, 2.1],
+        "bid_low": [0.9, 1.9],
+        "bid_close": [1.05, 2.05],
+        "bid_volume": [1.0, 10.0],
+        "ask_open": [1.02, 2.02],
+        "ask_high": [1.12, 2.12],
+        "ask_low": [0.92, 1.92],
+        "ask_close": [1.07, 2.07],
+        "ask_volume": [1.0, 10.0],
+    })
+    df.to_parquet(path, index=False)
+
+    normalize_ohlcv_columns(path)
+
+    actual = pd.read_parquet(path)
+    for field in ("open", "high", "low", "close", "volume"):
+        assert f"ask_{field}" in actual.columns
+        assert f"bid_{field}" not in actual.columns
+    assert actual["ask_close"].tolist() == [1.07, 2.07]
+    # The spread the slippage model reads: ask minus canonical (bid side).
+    assert (actual["ask_close"] - actual["close"]).tolist() == pytest.approx(
+        [0.02, 0.02]
+    )
 
 
 def test_normalize_timeframe_value_handles_m30():

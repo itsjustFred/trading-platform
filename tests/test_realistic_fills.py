@@ -152,7 +152,7 @@ def _native(
         "risk_per_trade_pct": 0.01,
         "max_leverage": 100.0,
         "modeling_resolution": "main_timeframe",
-        "parameters": {"fees": "zero", **(parameters or {})},
+        "parameters": {"fees": "zero", "slippage": "none", **(parameters or {})},
     }
     payload.update(config_kwargs)
     return TradeEngine(BacktestConfig(**payload), symbol="T").run(frame, strategy_fn)
@@ -356,7 +356,7 @@ class TestNativeSignalExitNextOpen:
             initial_capital=100_000.0,
             risk_per_trade_pct=0.01,
             max_leverage=100.0,
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = TradeEngine(cfg, symbol="T").run(frame, strategy_fn)
         first, second = result.trades
@@ -419,6 +419,7 @@ def _replay(frame: pd.DataFrame, *, action: str, stop: float | None, tp: float |
     )
     adapter = SignalReplayAdapter(
         fee_params={"fees": "zero"},
+        slippage_params={"slippage": "none"},
         risk_config=RiskConfig(
             max_risk_per_trade=0.01,
             max_total_exposure=0.5,

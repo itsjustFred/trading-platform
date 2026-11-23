@@ -106,14 +106,17 @@ def write_ohlcv(
 
 
 def with_zero_fees(payload: dict) -> dict:
-    """Merge an explicit no-cost fee declaration into engine-test params (#84).
+    """Merge an explicit no-cost declaration into engine-test params (#84, #130).
 
     Shared by engine contract/parity tests whose fixtures assert
-    gross-equivalent numbers: declaring ``fees="zero"`` keeps the numbers
-    identical while satisfying the mandatory fee-config gate.
+    gross-equivalent numbers: declaring ``fees="zero"`` and
+    ``slippage="none"`` keeps the numbers identical while satisfying the
+    mandatory cost-model gates. (The name predates #130; it now declares a
+    fully cost-free run, not just fees.)
     """
     merged = dict(payload)
     params = dict(merged.get("parameters") or {})
     params.setdefault("fees", "zero")
+    params.setdefault("slippage", "none")
     merged["parameters"] = params
     return merged

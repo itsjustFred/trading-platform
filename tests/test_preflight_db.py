@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from textwrap import dedent
@@ -446,6 +447,39 @@ def test_resolve_db_path_drops_a_query_string_from_the_url(tmp_path: Path, monke
     monkeypatch.setenv("DATABASE_URL", f"{_url(path)}?timeout=30&mode=ro")
 
     assert resolve_db_path() == path
+
+
+def test_resolve_db_path_normalizes_the_sqlite_uri_form(tmp_path: Path, monkeypatch) -> None:
+    """``sqlite:///file:/abs/db.db?uri=true`` addresses the same file as ``sqlite:////abs/db.db``.
+
+    The ``file:`` prefix is URI syntax the SQLite driver parses, not a directory: a working
+    database was reported as "Database file not found" while the parser kept the prefix in the
+    path.
+    """
+    path = tmp_path / "backtests.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///file:{path.as_posix()}?uri=true")
+
+    assert resolve_db_path() == path
+
+
+def test_sqlite_url_file_strips_the_slash_before_a_windows_drive_letter(monkeypatch) -> None:
+    """``file:///C:/x.db?uri=true`` is ``C:/x.db`` on Windows.
+
+    SQLite drops the leading slash before a drive letter on Windows only; keeping it would
+    resolve the database - and the daemon's single-instance lock beside it - to ``/C:/x.db``,
+    a file the engine never opens.
+    """
+    from shared.database import sqlite_url_file
+
+    monkeypatch.setattr(os, "name", "nt")
+    assert sqlite_url_file("sqlite:///file:///C:/data/live.db?uri=true") == "C:/data/live.db"
+
+
+def test_sqlite_url_file_keeps_the_slash_before_a_drive_letter_on_posix() -> None:
+    """On POSIX ``/C:/x.db`` is a literal absolute path, not a drive letter."""
+    from shared.database import sqlite_url_file
+
+    assert sqlite_url_file("sqlite:///file:///C:/data/live.db?uri=true") == "/C:/data/live.db"
 
 
 def test_resolve_db_path_decodes_a_percent_encoded_url(tmp_path: Path, monkeypatch) -> None:

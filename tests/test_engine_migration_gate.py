@@ -579,7 +579,7 @@ class TestSyntheticWindowGuard:
 
     def test_small_default_window_still_runs(self, tmp_path):
         resolution = gate.DataResolution(data_root=tmp_path, mode="synthetic")
-        symbols, start, end = gate._resolve_symbols_and_window(
+        _symbols, start, end = gate._resolve_symbols_and_window(
             self._args(), resolution, tmp_path / "ohlcv", "1h"
         )
         assert (start, end) == ("2024-01-01", "2024-06-30")

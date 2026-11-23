@@ -1178,3 +1178,73 @@ def test_broker_close_rows_carry_their_own_source_and_fill_price(
     assert close["theoretical_price"] == pytest.approx(0.0)
     assert close["actual_price"] == pytest.approx(95.0)
     assert by_id[parent]["source"] == "internal"
+
+
+# ─── unreadable money fields fail closed (#280) ────────────────────────────────────────────────
+
+ORDER_B_ID = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+LEG_B_ID = "cccccccc-dddd-4eee-8fff-000000000000"
+LEG_BAD_ID = "dddddddd-eeee-4fff-8aaa-111111111111"
+
+
+def test_an_unreadable_leg_quantity_skips_only_that_signal(database, caplog) -> None:
+    """A leg ``filled_qty`` nobody can read is skipped per signal, nothing more.
+
+    The parent fill booked earlier in the same reconcile call is kept, no leg
+    row is written for it, a WARNING is logged, and the next signal in the page
+    still reconciles (#280).
+    """
+    parent_bad = _persist_entry(database)
+    parent_good = _persist_entry(
+        database, deployment_id=DEP_OTHER, broker_order_id=ORDER_B_ID
+    )
+    bad_order = _parent_order(legs=[_leg(order_id=LEG_BAD_ID, filled_qty="junk")])
+    bad_order.filled_qty = 12.0  # two shares of the parent's own fill still unbooked
+    good_order = _parent_order(legs=[_leg(order_id=LEG_B_ID)])
+    good_order.id = ORDER_B_ID
+    adapter = _alpaca_adapter(
+        client=_FakeTradingClient({parent_bad: bad_order, parent_good: good_order})
+    )
+
+    with caplog.at_level(logging.WARNING):
+        recovered = asyncio.run(adapter.reconcile_executions())
+
+    assert recovered == 1
+    # The unreadable leg raised MoneyParseError inside the pass: the signal was
+    # skipped with a warning, its already-booked parent fill kept, and its leg
+    # wrote no row.
+    assert database.get_live_signal_filled_qty(parent_bad) == pytest.approx(12.0)
+    assert _close_execution_rows(database, parent_bad) == []
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(12.0)
+    assert any(
+        "unreadable order data" in record.getMessage() for record in caplog.records
+    )
+    # The next signal in the page reconciled normally.
+    assert _ledger(database, DEP_OTHER) == pytest.approx(0.0)
+    assert [row[0] for row in _close_execution_rows(database, parent_good)] == [10.0]
+
+
+def test_a_leg_fill_with_an_unreadable_cumulative_persists_nothing(
+    database, caplog
+) -> None:
+    """The stream path fails closed too: an unreadable ``order.filled_qty`` on a
+    leg trade update writes no row, and ``_on_trade_update`` survives to
+    process the next update (#280)."""
+    parent = _persist_entry(database)
+    adapter = _alpaca_adapter()
+    adapter._register_bracket_legs(parent, _parent_order(legs=[_leg()]))
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(adapter._on_trade_update(_leg_fill_update(cumulative="junk")))
+
+    assert _close_execution_rows(database, parent) == []
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(10.0)
+    assert any(
+        "Failed to process trade update" in record.getMessage()
+        for record in caplog.records
+    )
+
+    # The handler did not die: the next, readable update books normally.
+    asyncio.run(adapter._on_trade_update(_leg_fill_update(execution_id="exec-after")))
+
+    assert _ledger(database, DEP_ENTRY) == pytest.approx(0.0)
