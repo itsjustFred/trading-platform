@@ -1,0 +1,21 @@
+.github/workflows/agent-code-review.yml
+  s_2bf89379757a94::t_ee857308d40fa1 87
+.github/workflows/agent-pre-mortem.yml
+  s_2bf89379757a94::t_829f9113092202 200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b93d93ccd438dc098735331552f01a29d5f5bf9c",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
