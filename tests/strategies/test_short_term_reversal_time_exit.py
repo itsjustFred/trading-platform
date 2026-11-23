@@ -1,6 +1,7 @@
 """short_term_reversal under next_open: a 5-bar hold is open(i+1) -> open(i+6).
 
-End-to-end through the vectorbt engine on synthetic daily bars (no market data).
+End-to-end through the native engine on synthetic daily bars (no market data);
+the frozen vectorbt adapter maps ``next_open`` to its legacy close fill.
 The time exit counts bars from the SIGNAL bar, fills at the next open and carries
 no explicit exit_price - so entry/exit timestamps and prices agree.
 """
@@ -12,7 +13,7 @@ import pandas as pd
 import pytest
 
 from runner.engines.base import BacktestConfig
-from runner.engines.vectorbt_adapter import VectorbtAdapter
+from runner.engines.native_adapter import NativeAdapter
 from tests.helpers import with_zero_fees
 from tests.helpers import write_ohlcv as _write_ohlcv
 
@@ -58,7 +59,7 @@ def _run(tmp_path: Path, **cfg):
         "parameters": {},
     }
     payload.update(cfg)
-    return frame, VectorbtAdapter().run(BacktestConfig(**with_zero_fees(payload)), STRATEGY_PATH)
+    return frame, NativeAdapter().run(BacktestConfig(**with_zero_fees(payload)), STRATEGY_PATH)
 
 
 def test_five_bar_hold_is_open_of_bar_i_plus_1_to_open_of_bar_i_plus_6(tmp_path: Path):
@@ -67,7 +68,9 @@ def test_five_bar_hold_is_open_of_bar_i_plus_1_to_open_of_bar_i_plus_6(tmp_path:
     assert pd.Timestamp(trade.entry_time) == frame["timestamp"].iloc[CRASH + 1]
     assert trade.entry_price == pytest.approx(float(frame["open"].iloc[CRASH + 1]))
     exit_leg = trade.exits[0]
-    assert exit_leg.reason == "time_exit"
+    # native labels every market signal exit "signal"; the strategy's semantic
+    # label lives in the exit_reason indicator asserted below
+    assert exit_leg.reason == "signal"
     assert pd.Timestamp(exit_leg.time) == frame["timestamp"].iloc[CRASH + 6]
     # price and timestamp agree: the OPEN of the exit bar, not the signal bar's close
     assert exit_leg.price == pytest.approx(float(frame["open"].iloc[CRASH + 6]))
@@ -84,4 +87,5 @@ def test_strategy_emits_no_explicit_price_for_market_exits():
     _, exits, indicators, _ = module.generate_signals(_frame(), {})
     assert exits.sum() == 1
     assert indicators["exit_price"].isna().all()
+    assert indicators["exit_reason"][exits].iloc[0] == "time_exit"
     assert indicators["bars_held_at_exit"][exits].iloc[0] == 5

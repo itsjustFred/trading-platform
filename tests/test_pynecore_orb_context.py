@@ -161,7 +161,8 @@ class TestOrbContextMirror:
         assert ctx["sl_price_short"].tolist() == pytest.approx((close * 1.01).tolist())
 
     def test_forced_time_exit_books_the_open_position(self):
-        # The 15:45 ET bar flattens an open position and stamps the exit.
+        # The exit signal fires on the bar before 15:45 ET; the fill lands at the
+        # 15:45 open. The context stamps the exit on the signal bar.
         frame = _frame(
             [
                 ("2024-01-02 14:30:00+00:00", 100.0, 100.0, 98.0, 99.0),  # OR
@@ -175,7 +176,8 @@ class TestOrbContextMirror:
         assert ctx["exit_reason"].iloc[3] == "time_exit"
 
     def test_no_entries_after_the_forced_exit(self):
-        # A real long is open when the 15:45 ET bar flattens it, and the
+        # A real long is open when the pre-15:45 signal bar flattens it (fill at the
+        # 15:45 open), and the
         # breakout-shaped close that follows (below the short level, so a fresh
         # entry would show up as its own direction marker rather than the
         # carried one) must not trade either.
@@ -279,6 +281,32 @@ class TestOrbContextMirror:
         ctx = _load_context_module().build_trade_context(frame, {})
         assert ctx["direction"].iloc[1] == "LONG"
         assert ctx["exit_reason"].iloc[2] == "day_reset_flatten"
+
+    def test_forced_exit_is_marked_on_the_bar_before_the_exit_time(self):
+        # 2.1.0: the script raises the 15:45 ET exit on the first bar whose END
+        # reaches 15:45 (Pine fills at the next open, i.e. AT 15:45). On 15m bars
+        # that is the 15:30 ET bar, so the context marks it there, not at 15:45.
+        idx = pd.date_range("2024-01-02 14:30", "2024-01-02 21:00", freq="15min", tz="UTC")
+        close = [100.0, 100.0] + [105.0 + 0.01 * i for i in range(len(idx) - 2)]
+        df = pd.DataFrame(
+            {
+                "timestamp": idx,
+                "open": close,
+                "high": [c + 1 for c in close],
+                "low": [c - 1 for c in close],
+                "close": close,
+                "volume": 1.0,
+            }
+        )
+        df.loc[:1, ["high", "low"]] = [101.0, 99.0]
+        ctx = _load_context_module().build_trade_context(df, {})
+        marked = ctx["exit_reason"].dropna()
+        times = [
+            idx[int(i)].tz_convert("America/New_York").strftime("%H:%M")
+            for i in marked.index
+            if marked.loc[i] == "time_exit"
+        ]
+        assert times[0] == "15:30"
 
 
 class TestOrbContextInputContract:

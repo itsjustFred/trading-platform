@@ -94,7 +94,7 @@ def test_power_hour_exit_is_raised_on_the_bar_before_1400(freq, expected, monkey
 
 
 def test_market_exits_never_carry_the_signal_bar_close(monkeypatch):
-    df, _, exits, indicators = _signals("5min", monkeypatch)
+    _, _, exits, indicators = _signals("5min", monkeypatch)
     market = indicators["exit_reason"].isin(["scale_50pct_power_hour", "eod_flatten"]) & exits
     assert market.any()
     assert indicators["exit_price"][market].isna().all()
