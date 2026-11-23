@@ -42,6 +42,7 @@ from runner.engines.contract import (
     usable_exit_price,
 )
 from runner.fees import resolve_fee_model
+from runner.slippage import resolve_slippage_model
 from shared.lot_grid import floor_qty_to_step
 from shared.models import (
     BacktestResult,
@@ -166,6 +167,29 @@ def _tp_sort_key(item: tuple[str, float]) -> tuple[int, int, str]:
     return (1, int(name[2:]), name)
 
 
+def _armable_take_profit(value: Any) -> float | None:
+    """A take-profit price the engine may arm, else ``None``.
+
+    ``risk.live.resolve_live_levels`` refuses a present-but-unusable level
+    (non-numeric, non-finite or ``<= 0``) instead of trading it, so the backtest
+    must never arm one either: a LONG take-profit of ``0`` is reached by every
+    bar (``bar_high >= 0``) and would close the whole position at price ``0``,
+    while a non-finite level can never be reached at all. Returning ``None``
+    leaves the level unarmed — for the alias pair it lets the fallback
+    spelling (#237) supply the price — which is the conservative reading of a
+    row no committed strategy emits.
+    """
+    if pd.isna(value):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
 class TradeEngine:
     def __init__(
         self,
@@ -176,9 +200,19 @@ class TradeEngine:
         progress_callback: Callable[[float, str], None] | None = None,
         progress_start: float = 10.0,
         progress_end: float = 90.0,
+        asset_class: str = "",
     ):
         self.config = config
         self.symbol = symbol
+        # #130: fill-price slippage model, resolved once per engine. The
+        # adapter supplies the instrument's asset class (from the OHLCV
+        # path); direct engine use leaves it "" and the auto resolution
+        # refuses unless the run declares slippage explicitly — never a
+        # silent gross default.
+        self._slippage_asset_class = str(asset_class or "")
+        self.slippage_model = resolve_slippage_model(
+            config.parameters, asset_class=self._slippage_asset_class
+        )
         self.equity = config.initial_capital
         self.positions: list[Position] = []
         self.pending_orders: list[Order] = []
@@ -312,12 +346,38 @@ class TradeEngine:
 
         tp_levels: list[dict[str, Any]] = []
         tp_candidates: list[tuple[str, float]] = []
+        # "take_profit" and "tp_price" are two spellings of the SAME plain
+        # take-profit level (#237), so a row carrying both must produce a
+        # single "tp" candidate. The canonical spelling wins — the alias order
+        # every other level resolver uses (``risk.live._LIVE_TP_KEYS``, the
+        # comparison/extraction helpers) — and the winner must not depend on
+        # the signal frame's column order. Appending one candidate per column
+        # made two levels named "tp" for the one intended level, so the row's
+        # single take-profit filled as two legs (each at the price its own
+        # spelling carried, both sharing the "tp_pct" fraction) and the
+        # phantom candidate also took a share of the default 1/n split.
+        # A lone level still closes the whole position: the last pending level
+        # takes the remaining quantity (see ``_check_stops``), which is the
+        # live bracket convention — a fraction below 1 does not leave a rest.
+        # (rank, price): 0 = canonical take_profit, 1 = tp_price alias.
+        plain_tp: tuple[int, float] | None = None
         for key in row.index:
             lower = str(key).lower()
-            if lower in {"take_profit", "tp_price"} and pd.notna(row.get(key)):
-                tp_candidates.append(("tp", float(row.get(key))))
-            elif lower.startswith("tp") and lower[2:].isdecimal() and pd.notna(row.get(key)):
-                tp_candidates.append((lower, float(row.get(key))))
+            if lower in {"take_profit", "tp_price"}:
+                alias_value = _armable_take_profit(row.get(key))
+                if alias_value is None:
+                    continue
+                rank = 0 if lower == "take_profit" else 1
+                if plain_tp is None or rank < plain_tp[0]:
+                    plain_tp = (rank, alias_value)
+                continue
+            if lower.startswith("tp") and lower[2:].isdecimal():
+                numbered_value = _armable_take_profit(row.get(key))
+                if numbered_value is None:
+                    continue
+                tp_candidates.append((lower, numbered_value))
+        if plain_tp is not None:
+            tp_candidates.append(("tp", plain_tp[1]))
 
         # Plain "tp" (take_profit / tp_price) first, then numbered levels by
         # their numeric suffix so tp10 follows tp9, not tp1.
@@ -906,6 +966,33 @@ class TradeEngine:
         # back from the next entry.
         self._refresh_sizing_equity()
 
+    def _slip(
+        self,
+        price: float,
+        side: str,
+        bar: pd.Series | None = None,
+        *,
+        fill_side: str | None = None,
+    ) -> float:
+        """Adverse slippage adjustment on one fill price (#130).
+
+        ``side`` is the trader's side of the fill: entries buy on LONG /
+        sell on SHORT; exits are the mirror. Applied to every fill the
+        engine produces — market, stop, take-profit and signal exits — so
+        the recorded fill price, the PnL and the equity path all carry the
+        same cost. Limit-price clamping is NOT modeled (a slipped limit
+        buy could fill above its limit); the engine only submits market
+        orders today, so no live path reaches it. ``fill_side="ask"``
+        marks an ask-triggered SHORT exit whose level is already
+        ask-denominated (``ask_ohlc``), so the bar-spread model does not
+        charge the spread a second time.
+        """
+        return float(
+            self.slippage_model.slip_price(
+                float(price), side, bar, fill_side=fill_side
+            )
+        )
+
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
         if not self.pending_orders:
             return
@@ -968,6 +1055,14 @@ class TradeEngine:
                 fill_price = order.limit_price if order.limit_price is not None else bar_open
 
             if filled:
+                # #130: slippage shifts the fill price adversely BEFORE any
+                # re-sizing, stop-side checks or position accounting, so the
+                # slipped price is the single price every consumer sees.
+                fill_price = self._slip(
+                    fill_price,
+                    "buy" if order.direction == "LONG" else "sell",
+                    row,
+                )
                 if order.stop_loss is None and getattr(order, "_sizing_stop_loss", None) is None:
                     direction_sign = 1.0 if order.direction == "LONG" else -1.0
                     fallback_distance = (
@@ -1145,11 +1240,22 @@ class TradeEngine:
         qty: float,
         time_iso: str,
         reason: str,
+        bar: pd.Series | None = None,
+        *,
+        fill_side: str | None = None,
     ) -> None:
         qty = max(0.0, min(qty, position.remaining_qty))
         if qty <= 0:
             return
 
+        # #130: exit fills slip adversely (a LONG exit sells, a SHORT exit
+        # buys) at the single choke point every exit leg passes through.
+        price = self._slip(
+            price,
+            "sell" if position.direction == "LONG" else "buy",
+            bar,
+            fill_side=fill_side,
+        )
         if position.direction == "LONG":
             pnl = (price - position.entry_price) * qty
         else:
@@ -1401,6 +1507,7 @@ class TradeEngine:
                 qty=position.remaining_qty,
                 time_iso=time_iso,
                 reason=reason,
+                bar=row,
             )
             self._finalize_position(position, i)
             if position.remaining_qty > 1e-9:
@@ -1692,6 +1799,16 @@ class TradeEngine:
                 adverse_cap=excursion_adverse_cap,
             )
 
+            # A-L5/A-H7: with ``ask_ohlc`` a SHORT's protective levels are
+            # ask-denominated — the trigger compared the ask side, so the
+            # exit fill must not pay the quoted spread a second time via
+            # the slippage model (#130).
+            exit_fill_side = (
+                "ask"
+                if position.direction != "LONG"
+                and (ask_high is not None or ask_low is not None)
+                else None
+            )
             if first_event == "stop" and position.stop_loss is not None:
                 # D4 (Phase 3, A-M1 exit convention): the unified convention
                 # is Fill-zum-Trigger-Close for SIGNAL exits; stop/TP legs
@@ -1709,6 +1826,8 @@ class TradeEngine:
                     qty=position.remaining_qty,
                     time_iso=time_iso,
                     reason="stop_loss",
+                    bar=row,
+                    fill_side=exit_fill_side,
                 )
             elif first_event == "tp":
                 # A-H7: SHORT TP fills buy the ask (level + spread), LONG TP
@@ -1727,6 +1846,14 @@ class TradeEngine:
                     fraction = float(level.get("fraction", 0.0))
                     qty = position.quantity * fraction
                     if level is pending_tp[-1]:
+                        # The last pending level takes whatever is left, so a
+                        # ladder closes the position instead of leaving a dust
+                        # remainder (and a lone level closes the whole
+                        # position, the way a live bracket order does). A
+                        # strategy that wants to keep part of the position
+                        # open past its last level needs a later signal exit;
+                        # honouring a lone level's fraction instead is left to
+                        # a maintainer decision (see #276).
                         qty = position.remaining_qty
 
                     self._close_partial(
@@ -1735,6 +1862,8 @@ class TradeEngine:
                         qty=qty,
                         time_iso=time_iso,
                         reason=str(level.get("name") or "take_profit"),
+                        bar=row,
+                        fill_side=exit_fill_side,
                     )
                     level["filled"] = True
 
@@ -1751,6 +1880,8 @@ class TradeEngine:
                         qty=position.remaining_qty,
                         time_iso=time_iso,
                         reason="stop_loss",
+                        bar=row,
+                        fill_side=exit_fill_side,
                     )
 
             self._finalize_position(position, i)

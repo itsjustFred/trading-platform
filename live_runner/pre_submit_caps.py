@@ -145,11 +145,11 @@ class PreSubmitCapSettings:
     max_risk_multiple: float
 
 
-def _cap_number(raw: object, *, key: str) -> float:
+def _cap_number(raw: Any, *, key: str) -> float:
     if raw is None or isinstance(raw, bool):
         raise ValueError(f"{key} must be a number, got {raw!r}")
     try:
-        value = float(raw)  # type: ignore[arg-type]  # raw is a parsed JSON scalar
+        value = float(raw)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{key} must be a number, got {raw!r}") from exc
     if not math.isfinite(value):
@@ -182,8 +182,10 @@ def _parse_cap_overrides(
         unknown = sorted(
             key
             for key in raw
-            if str(key).startswith("pre_submit")
-            and key not in (*_CAP_KEYS, _SYMBOL_CAPS_KEY)
+            if (
+                str(key).startswith("pre_submit")
+                and key not in (*_CAP_KEYS, _SYMBOL_CAPS_KEY)
+            )
         )
         if unknown:
             raise ValueError(f"{context} has unknown cap keys: {unknown}")
@@ -331,7 +333,7 @@ async def _record_cap_audit(
             succeeded=succeeded,
             detail=dict(data),
         )
-    except Exception as exc:  # pragma: no cover - defensive  # except-kind: money-decision
+    except Exception as exc:  # except-kind: loop-survival  # pragma: no cover - defensive
         logger.error(
             "Could not write the pre-submit cap audit record; the decision stands",
             extra={"data": {"error": repr(exc)}},
@@ -351,7 +353,7 @@ async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | N
     try:
         value = await adapter.get_max_leverage(symbol)
     except Exception as exc:  # except-kind: money-decision
-        logger.debug(
+        logger.warning(
             "Max leverage lookup raised; treating it as unknown (1x)",
             extra={"data": {"symbol": symbol, "error": repr(exc)}},
         )

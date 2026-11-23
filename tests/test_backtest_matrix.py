@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from runner.backtest_matrix import run_backtest_matrix
 
 
@@ -131,6 +133,54 @@ def test_run_backtest_matrix_honors_strategy_engine_metadata(monkeypatch, tmp_pa
     assert summary["strategies"] == ["intraday_volatility_breakout"]
     assert len(calls) == 1
     assert calls[0]["engine"] == "native"
+
+
+def test_matrix_rejects_declared_slippage_before_any_cell_runs(
+    monkeypatch, tmp_path
+):
+    """#130 pre-flight: a matrix whose first strategy is native but a LATER
+    one resolves to vectorbt must refuse up front — ``run_backtest_grid``
+    re-checks per strategy, but only after earlier strategies' cells were
+    already computed and written."""
+    strategies_dir = tmp_path / "strategies"
+    _write_strategy_with_meta(
+        strategies_dir / "native_alpha",
+        "native_alpha",
+        "{'name': 'native_alpha', 'engine': 'native'}",
+    )
+    _write_strategy_with_meta(
+        strategies_dir / "vec_beta",
+        "vec_beta",
+        "{'name': 'vec_beta', 'engine': 'vectorbt'}",
+    )
+    calls = []
+
+    def fake_run_backtest_grid(**kwargs):
+        calls.append(kwargs)
+        return {
+            "strategy": str(kwargs["strategy"]),
+            "runs": [],
+            "ok": 0,
+            "failed": 0,
+            "skipped_existing": 0,
+            "requested": 0,
+            "matrix_csv": str(kwargs["output_dir"] / "grid_matrix.csv"),
+        }
+
+    monkeypatch.setattr("runner.backtest_matrix.run_backtest_grid", fake_run_backtest_grid)
+
+    with pytest.raises(ValueError, match="does not model slippage"):
+        run_backtest_matrix(
+            strategy_identifiers=["native_alpha", "vec_beta"],
+            strategies_dir=strategies_dir,
+            symbols=["XAUUSD"],
+            timeframes=["1h"],
+            output_dir=tmp_path / "out",
+            params={"slippage_bps": 5.0},
+            max_workers=1,
+        )
+
+    assert calls == [], "the pre-flight must fire before the first cell runs"
 
 
 def test_run_backtest_matrix_reports_strategy_failure(monkeypatch, tmp_path):

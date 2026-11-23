@@ -264,14 +264,14 @@ weiter erzwungen.
 Menge und Preislevel stammen
 dagegen aus dem gesizeten Signal — nichts wird aus dem Payload neu erfunden.
 
-Abgelehnt wird (fail-closed, ERROR-Alert `pre_submit_cap_refusal` plus
-Audit-Eintrag über `record_live_control_audit`), wenn
+Refused (fail-closed, ERROR alert `pre_submit_cap_refusal` plus an audit entry via
+`record_live_control_audit`) when
 
-| Regel | Bedingung |
+| Rule | Condition |
 |-------|-----------|
-| `qty_cap` | `qty > pre_submit_max_qty` (nur wenn konfiguriert) |
-| `price_deviation` | `|entry - quote_side| / quote_side > pre_submit_max_price_deviation_fraction` (Ask für Buy, Bid für Sell, absolut in beide Richtungen) |
-| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` (nur wenn der Bruchteil explizit konfiguriert ist) |
+| `qty_cap` | `qty > pre_submit_max_qty` (only when configured) |
+| `price_deviation` | `|entry - quote_side| / quote_side > pre_submit_max_price_deviation_fraction` (ask for buy, bid for sell, absolute in both directions) |
+| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` (only when the fraction is explicitly configured) |
 | `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
 
 Die Caps fügen **keine eigene Notional-Obergrenze unter dem Broker-Maximum
@@ -338,26 +338,24 @@ normal gecappt, und der Entry-Pfad entfernt `exit_only`/`risk_sizing_mode`
 vor dem Adapter. Exit-Orders laufen nie durch die Caps — sie reduzieren
 Exposure, und eine Cap darf einen Flatten nicht blockieren.
 
-Settings pro Deployment (deployment = account + symbols, also der
-Per-Account/-Per-Symbol-Scope), validiert beim Anlegen
-(`validate_pre_submit_cap_settings` in `create_live_deployment`: Typ,
-Endlichkeit, Positivität und eindeutige Symbol-Keys) und erneut
-fail-closed beim Submit:
+Settings per deployment (deployment = account + symbols, i.e. the per-account /
+per-symbol scope), validated at creation (`validate_pre_submit_cap_settings` in
+`create_live_deployment`: type, finiteness, positivity and unique symbol keys) and
+again fail-closed at submit:
 
-| Setting | Default | Gültig |
+| Setting | Default | Valid |
 |---------|---------|--------|
-| `pre_submit_max_qty` | **unbegrenzt** | `> 0`, endlich (kein universeller Default: Share, Lot und 0.01-Lot sind verschiedene Instrumente) |
-| `pre_submit_max_notional_equity_fraction` | **Broker-Hebel** (unbekannt → 1x) | `> 0` (Order-Notional als Bruchteil des Account-Equity; nur explizit gesetzt = harter Reject-Cap) |
+| `pre_submit_max_qty` | **unlimited** | `> 0`, finite (no universal default: share, lot and 0.01-lot are different instruments) |
+| `pre_submit_max_notional_equity_fraction` | **broker leverage** (unknown → 1x) | `> 0` (order notional as a fraction of account equity; only explicitly set = hard reject cap) |
 | `pre_submit_max_price_deviation_fraction` | **0.02** | `> 0` |
-| `pre_submit_max_risk_multiple` | **2.0** | `> 0` (Vielfaches des konfigurierten `max_risk_per_trade`-Risikos) |
-| `pre_submit_symbol_caps` | — | Mapping `SYMBOL -> {gleiche Keys}`, überschreibt nur für dieses Symbol |
+| `pre_submit_max_risk_multiple` | **2.0** | `> 0` (multiple of the configured `max_risk_per_trade` risk) |
+| `pre_submit_symbol_caps` | — | mapping `SYMBOL -> {same keys}`, overrides only for this symbol |
 
-Die Defaults sind konservative Backstops gegen Sizing-Bugs (Basis: #146
-~1000x, #184 100x), keine Trading-Policy — Risk-Multiple 2.0 und
-Price-Deviation 2% sind per Maintainer-Entscheidung (2026-11-21) akzeptiert,
-pro Symbol überschreibbar. Ein Timeout von 30 s
-(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) begrenzt die Broker-Lesungen;
-bei Timeout wird abgelehnt.
+The defaults are conservative backstops against sizing bugs (basis: #146 ~1000x, #184
+100x), not trading policy — risk multiple 2.0 and price deviation 2% are accepted per
+maintainer decision (2026-11-21), overridable per symbol. A 30 s timeout
+(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) bounds the broker reads; on timeout the
+order is refused.
 
 ## Kill Switch (#300)
 

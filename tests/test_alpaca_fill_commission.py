@@ -2211,7 +2211,7 @@ def test_base_adapter_backfill_is_a_no_op():
 # ── additional fail-closed edges ───────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("bad_qty", ["nan", "inf"])
+@pytest.mark.parametrize("bad_qty", ["nan", "inf", "junk"])
 def test_reconcile_refuses_a_non_finite_broker_quantity(db, bad_qty):
     signal = _signal(db)
     order = _order(signal, filled_qty=bad_qty, filled_avg_price="100", order_id=_order_id(bad_qty))

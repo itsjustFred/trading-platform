@@ -16,6 +16,7 @@ from live_runner.symbol_class import (
 )
 from shared.logging import get_logger
 from shared.models import LiveAccountConfig, LiveDeploymentConfig
+from shared.money import parse_money
 
 logger = get_logger("live-runner")
 
@@ -50,13 +51,6 @@ def _bar_key(symbol: str) -> str:
     return normalized
 
 
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _normalize_symbol(symbol: str) -> str:
     return str(symbol or "").strip().upper()
 
@@ -66,6 +60,12 @@ def _is_connection_limit_error(error: BaseException) -> bool:
 
 
 def _serialize_bar_payload(bar: Any) -> dict[str, Any]:
+    """Serialize one bar; every money field is strict-parsed.
+
+    ``volume=None`` drops the bar via the caller's ``ValueError`` handler —
+    fine for Alpaca, whose ``Bar.volume`` is required, but a feed that can
+    legitimately report no volume must not reuse this serializer unchanged.
+    """
     symbol = _normalize_symbol(getattr(bar, "symbol", ""))
     ts = getattr(bar, "timestamp", None)
     if isinstance(ts, str):
@@ -78,11 +78,11 @@ def _serialize_bar_payload(bar: Any) -> dict[str, Any]:
         "symbol": symbol,
         "timestamp": parsed.isoformat(),
         "time": float(parsed.timestamp()),
-        "open": _to_float(getattr(bar, "open", None)),
-        "high": _to_float(getattr(bar, "high", None)),
-        "low": _to_float(getattr(bar, "low", None)),
-        "close": _to_float(getattr(bar, "close", None)),
-        "volume": _to_float(getattr(bar, "volume", None)),
+        "open": parse_money(getattr(bar, "open", None)),
+        "high": parse_money(getattr(bar, "high", None)),
+        "low": parse_money(getattr(bar, "low", None)),
+        "close": parse_money(getattr(bar, "close", None)),
+        "volume": parse_money(getattr(bar, "volume", None)),
     }
 
 
@@ -389,7 +389,22 @@ class LiveMarketDataStreamService:
                 queue.append(dict(bar))
 
     async def _on_bar(self, bar: Any) -> None:
-        payload = _serialize_bar_payload(bar)
+        try:
+            payload = _serialize_bar_payload(bar)
+        except ValueError as exc:
+            # A bar with an unreadable money field is refused, never stored as
+            # zeros: a 0.0 close is a price a strategy could trade on.
+            logger.error(
+                "Dropping market-data bar with unreadable price/volume",
+                exc_info=exc,
+                extra={
+                    "data": {
+                        "symbol": _normalize_symbol(getattr(bar, "symbol", "")),
+                        "error": str(exc),
+                    }
+                },
+            )
+            return
         symbol = _bar_key(payload["symbol"])
         if not symbol:
             return
