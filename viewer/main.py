@@ -4859,6 +4859,12 @@ def _download_request_key_for_source(identity: dict[str, Any]) -> str:
         "options": {},
     }
     if source == "dolthub":
+        # Invariant (#157): a DoltHub download is always the full dataset -
+        # `_generic_download_command` runs `dolthub_manager update`, which
+        # takes no symbol/timeframe/date arguments - so every request shares
+        # one single-flight key and scoping fields are deliberately dropped.
+        # If dolthub_manager ever gains scoped updates, this collapse becomes
+        # a bug: a differently scoped request would merge into the running one.
         request_identity.update(symbols=[], timeframes=[], start=None, end=None)
     if source in {"dukascopy", "jforex"}:
         request_identity["price_type"] = identity.get("offer_side", "")
@@ -15519,6 +15525,9 @@ def _generic_download_command(request: _PreparedDownloadRequest) -> list[str]:
         "alpaca": "data_tools.downloaders.alpaca_dl",
     }
     if request.source == "dolthub":
+        # Full-dataset update only: no symbol/timeframe/date flags exist, so
+        # the request key collapses all DoltHub downloads into one
+        # single-flight slot (see `_download_request_key_for_source`, #157).
         return [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
     if request.source not in module_names:
         raise HTTPException(status_code=400, detail="Unknown source")
