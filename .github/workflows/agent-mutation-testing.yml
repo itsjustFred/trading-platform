@@ -153,15 +153,23 @@ jobs:
 
       # The probe agent lives in the global config, like the real one, so the
       # ping exercises the same model resolution the agent run will.
+      # The agent is named `model-probe`, not `quota-probe`: opencode prints
+      # "> <agent> · <model>" on stderr, the probe greps stderr for `quota`, and
+      # with the old name every reply - "OK" included - read as a cap, so the
+      # agent job was skipped on every run the probe reached the model.
       - name: Configure quota probe agent
         run: |
           conf="$HOME/.config/opencode"
           mkdir -p "$conf/agents"
-          # opencode ships Kilo's anonymous gateway (ai-gateway.kilo.ai, no key, like the
-          # Zen free models) as a provider but enables it only when the config names it:
-          # a `kilo/...` model gets it, every other model the config it always had.
+          # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
+          # like the Zen free models); every other model gets the config it always had.
+          # The gateway URL and the model itself are declared, not left to opencode's
+          # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
+          # homes and in others silently ran its default model instead (run 45239957263
+          # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
+          # reached the configured model.
           if [ "${MODEL%%/*}" = "kilo" ]; then
-            printf '{"$schema":"https://opencode.ai/config.json","update":"disable","providers":{"kilo":{}}}\n' > "$conf/opencode.json"
+            jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
           else
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
@@ -178,7 +186,7 @@ jobs:
             printf '  - { action: "*", resource: "*", effect: deny }\n'
             printf -- '---\n'
             printf 'Reply with the single word OK and nothing else.\n'
-          } > "$conf/agents/quota-probe.md"
+          } > "$conf/agents/model-probe.md"
 
       - name: Probe model quota
         id: probe
@@ -209,7 +217,7 @@ jobs:
           # exit with no OK, even a dead probe - fails open: the agent job runs
           # and the genuine failure surfaces there.
           status=0
-          raw=$(opencode run --standalone --archived --agent quota-probe \
+          raw=$(opencode run --standalone --archived --agent model-probe \
             "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
           printf '%s\n' "$raw" > "$probe_dir/stdout"
           note_exhausted_retries "$probe_dir/stderr"
@@ -363,11 +371,15 @@ jobs:
         run: |
           conf="$HOME/.config/opencode"
           mkdir -p "$conf/agents"
-          # opencode ships Kilo's anonymous gateway (ai-gateway.kilo.ai, no key, like the
-          # Zen free models) as a provider but enables it only when the config names it:
-          # a `kilo/...` model gets it, every other model the config it always had.
+          # A `kilo/...` model runs on Kilo's anonymous gateway (ai-gateway.kilo.ai, no key,
+          # like the Zen free models); every other model gets the config it always had.
+          # The gateway URL and the model itself are declared, not left to opencode's
+          # catalog: with only `"kilo": {}` opencode 2.2.7 resolved the model in some fresh
+          # homes and in others silently ran its default model instead (run 45239957263
+          # pinged `nex-agi/nex-n2.6`, "You need to sign in"). Declared, 5 of 5 fresh homes
+          # reached the configured model.
           if [ "${MODEL%%/*}" = "kilo" ]; then
-            printf '{"$schema":"https://opencode.ai/config.json","update":"disable","providers":{"kilo":{}}}\n' > "$conf/opencode.json"
+            jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
           else
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
