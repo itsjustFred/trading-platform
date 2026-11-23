@@ -60,7 +60,7 @@ class RiskConfig:
             raise ValueError("max_positions must be > 0")
         if self.default_sl_atr_multiplier <= 0:
             raise ValueError("default_sl_atr_multiplier must be > 0")
-        if not (0 < self.fallback_stop_pct < 1):
+        if self.fallback_stop_pct <= 0 or self.fallback_stop_pct >= 1:
             raise ValueError("fallback_stop_pct must be between 0 and 1")
         if not 0 < self.max_notional_per_trade:
             raise ValueError("max_notional_per_trade must be > 0")

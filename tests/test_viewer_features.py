@@ -42,6 +42,63 @@ def _wait_for_viewer_task(viewer_app_module, task_id: str, *, timeout: float = 5
     return viewer_app_module.DATA_TASKS[task_id]
 
 
+def _tiny_replay_ohlcv_df() -> pd.DataFrame:
+    """Three-bar 1h frame shared by the stubbed signal-replay tests."""
+    return pd.DataFrame(
+        {
+            "timestamp": [
+                "2024-01-01T12:00:00+00:00",
+                "2024-01-01T13:00:00+00:00",
+                "2024-01-01T14:00:00+00:00",
+            ],
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [1000, 1100, 1200],
+        }
+    )
+
+
+def _completed_signal_replay_result(result_id: str, source: str) -> BacktestResult:
+    """Minimal completed replay result shared by the stubbed-adapter tests."""
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=result_id,
+            created_at="2026-03-12T12:00:00Z",
+            engine="signal-replay",
+            strategies=["Signal Replay"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+            data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": source},
+            initial_capital=100000.0,
+            tags=["signal-replay"],
+            notes="Signal Replay",
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+
+
+class _ImmediateExitProc:
+    """Popen double whose child 'exits' immediately so the fill-bar watchdog
+    thread terminates instead of blocking pytest shutdown."""
+
+    def __init__(self, lines: list[str]):
+        self.stdout = iter(lines)
+        self.pid = 4242
+        self._killed = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        self._killed = True
+
+
 def test_get_dukascopy_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
@@ -3198,27 +3255,10 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
     monkeypatch.setattr(viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: [])
 
-    class _FakeProc:
-        def __init__(self, lines: list[str]):
-            self.stdout = iter(lines)
-            self.pid = 4242
-            self._killed = False
-
-        def wait(self, timeout=None):
-            return 0
-
-        def poll(self):
-            # The fake child "exits" immediately so the fill-bar watchdog
-            # thread terminates instead of blocking pytest shutdown.
-            return 0
-
-        def kill(self):
-            self._killed = True
-
     def fake_popen(cmd, *args, **kwargs):
         assert cmd[:4] == [sys.executable, "-u", "-m", "runner.cli"]
         assert "--progress-stdout" in cmd
-        return _FakeProc(
+        return _ImmediateExitProc(
             [
                 '{"message":"Auto-detected date range: 2024-01-01 to 2024-12-31"}\n',
                 "PROGRESS:5.00:Loading market data...\n",
@@ -3328,20 +3368,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     monkeypatch.setattr(
         viewer_app_module.legacy_viewer,
         "_load_ohlcv_df",
-        lambda symbol, timeframe: pd.DataFrame(
-            {
-                "timestamp": [
-                    "2024-01-01T12:00:00+00:00",
-                    "2024-01-01T13:00:00+00:00",
-                    "2024-01-01T14:00:00+00:00",
-                ],
-                "open": [100.0, 101.0, 102.0],
-                "high": [101.0, 102.0, 103.0],
-                "low": [99.0, 100.0, 101.0],
-                "close": [100.5, 101.5, 102.5],
-                "volume": [1000, 1100, 1200],
-            }
-        ),
+        lambda symbol, timeframe: _tiny_replay_ohlcv_df(),
     )
 
     class _FakeSignalReplayAdapter:
@@ -3356,22 +3383,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             if callable(progress_callback):
                 progress_callback(50.0, "halfway")
                 progress_callback(100.0, "done")
-            return BacktestResult(
-                meta=BacktestMeta(
-                    id="signal-replay-unit",
-                    created_at="2026-03-12T12:00:00Z",
-                    engine="signal-replay",
-                    strategies=["Signal Replay"],
-                    backtest_start="2024-01-01",
-                    backtest_end="2024-01-02",
-                    data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": "discord"},
-                    initial_capital=100000.0,
-                    tags=["signal-replay"],
-                    notes="Signal Replay",
-                ),
-                trades=[],
-                equity_curve=[],
-            )
+            return _completed_signal_replay_result("signal-replay-unit", "discord")
 
     monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
 
@@ -8319,20 +8331,7 @@ def _stub_signal_replay_pipeline(viewer_app_module, monkeypatch, adapter_init_kw
     monkeypatch.setattr(
         viewer_app_module.legacy_viewer,
         "_load_ohlcv_df",
-        lambda symbol, timeframe: pd.DataFrame(
-            {
-                "timestamp": [
-                    "2024-01-01T12:00:00+00:00",
-                    "2024-01-01T13:00:00+00:00",
-                    "2024-01-01T14:00:00+00:00",
-                ],
-                "open": [100.0, 101.0, 102.0],
-                "high": [101.0, 102.0, 103.0],
-                "low": [99.0, 100.0, 101.0],
-                "close": [100.5, 101.5, 102.5],
-                "volume": [1000, 1100, 1200],
-            }
-        ),
+        lambda symbol, timeframe: _tiny_replay_ohlcv_df(),
     )
 
     class _FakeSignalReplayAdapter:
@@ -8340,22 +8339,7 @@ def _stub_signal_replay_pipeline(viewer_app_module, monkeypatch, adapter_init_kw
             adapter_init_kwargs.update(kwargs)
 
         def run(self, **kwargs):
-            return BacktestResult(
-                meta=BacktestMeta(
-                    id="signal-replay-leverage",
-                    created_at="2026-03-12T12:00:00Z",
-                    engine="signal-replay",
-                    strategies=["Signal Replay"],
-                    backtest_start="2024-01-01",
-                    backtest_end="2024-01-02",
-                    data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": "manual"},
-                    initial_capital=100000.0,
-                    tags=["signal-replay"],
-                    notes="Signal Replay",
-                ),
-                trades=[],
-                equity_curve=[],
-            )
+            return _completed_signal_replay_result("signal-replay-leverage", "manual")
 
     monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
 
@@ -8463,29 +8447,11 @@ def test_backtest_run_accepts_position_pct_above_one(viewer_client, monkeypatch,
     )
 
     captured_cmd: list[str] = []
-
-    class _FakeProc:
-        def __init__(self):
-            self.stdout = iter(
-                [
-                    json.dumps({"message": f"Saved to: {tmp_path}/out.trades.json"}) + "\n",
-                    "PROGRESS:100.00:Completed\n",
-                ]
-            )
-            self.pid = 4242
-
-        def wait(self, timeout=None):
-            return 0
-
-        def poll(self):
-            return 0
-
-        def kill(self):
-            pass
+    saved_line = json.dumps({"message": f"Saved to: {tmp_path}/out.trades.json"}) + "\n"
 
     def fake_popen(cmd, *args, **kwargs):
         captured_cmd.extend(cmd)
-        return _FakeProc()
+        return _ImmediateExitProc([saved_line, "PROGRESS:100.00:Completed\n"])
 
     monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
 

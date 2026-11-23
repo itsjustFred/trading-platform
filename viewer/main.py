@@ -11578,23 +11578,30 @@ def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> d
     return fee_params
 
 
+@dataclass(frozen=True)
+class _SignalReplayTaskSpec:
+    """Validated replay request fields bundled for task registration (S107)."""
+
+    symbols: list[str]
+    normalized_signals: list[dict[str, Any]]
+    replay_source_label: str
+    account_id: str
+    signal_processor_name: str
+    risk_per_trade_pct: float
+    max_position_pct: float
+    max_positions: int
+    max_notional_per_trade: float | None
+    max_leverage: float | None
+    timeframe: str
+    start_dt: datetime
+    end_dt: datetime
+    fee_params: dict[str, Any]
+
+
 def _register_signal_replay_task(
     *,
     payload: BacktestRunSignalsRequest,
-    symbols: list[str],
-    normalized_signals: list[dict[str, Any]],
-    replay_source_label: str,
-    account_id: str,
-    signal_processor_name: str,
-    risk_per_trade_pct: float,
-    max_position_pct: float,
-    max_positions: int,
-    max_notional_per_trade: float | None,
-    max_leverage: float | None,
-    timeframe: str,
-    start_dt: datetime,
-    end_dt: datetime,
-    fee_params: dict[str, Any],
+    spec: _SignalReplayTaskSpec,
 ) -> tuple[str, Any, int]:
     """Create the replay task record, restart config and job placeholder."""
     task_id = str(uuid.uuid4())[:8]
@@ -11603,10 +11610,10 @@ def _register_signal_replay_task(
     stage_total = 5
     record = _create_task_record(
         task_id,
-        name=_signal_replay_task_name(replay_source_label),
+        name=_signal_replay_task_name(spec.replay_source_label),
         description=(
-            f"Replay {len(normalized_signals)} signals "
-            f"for {', '.join(symbols)} ({timeframe})."
+            f"Replay {len(spec.normalized_signals)} signals "
+            f"for {', '.join(spec.symbols)} ({spec.timeframe})."
         ),
         kind="backtest",
         source="signal-replay",
@@ -11621,20 +11628,20 @@ def _register_signal_replay_task(
     _update_task_fields(
         task_id,
         restart_config={
-            "signal_source": replay_source_label,
-            "account_id": account_id,
-            "start_date": start_dt.date().isoformat(),
-            "end_date": end_dt.date().isoformat(),
-            "timeframe": timeframe,
+            "signal_source": spec.replay_source_label,
+            "account_id": spec.account_id,
+            "start_date": spec.start_dt.date().isoformat(),
+            "end_date": spec.end_dt.date().isoformat(),
+            "timeframe": spec.timeframe,
             "capital": float(payload.capital or 100000.0),
-            "risk_per_trade_pct": risk_per_trade_pct,
-            "max_position_pct": max_position_pct,
-            "max_positions": max_positions,
-            "max_notional_per_trade": max_notional_per_trade,
-            "max_leverage": max_leverage,
-            "signal_processor": signal_processor_name or None,
-            "signal_count": len(normalized_signals),
-            "fee_params": dict(fee_params),
+            "risk_per_trade_pct": spec.risk_per_trade_pct,
+            "max_position_pct": spec.max_position_pct,
+            "max_positions": spec.max_positions,
+            "max_notional_per_trade": spec.max_notional_per_trade,
+            "max_leverage": spec.max_leverage,
+            "signal_processor": spec.signal_processor_name or None,
+            "signal_count": len(spec.normalized_signals),
+            "fee_params": dict(spec.fee_params),
         },
     )
     _running_jobs[task_id] = {
@@ -11735,20 +11742,22 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     end_str = end_dt.date().isoformat()
     task_id, log_file, stage_total = _register_signal_replay_task(
         payload=payload,
-        symbols=symbols,
-        normalized_signals=normalized_signals,
-        replay_source_label=replay_source_label,
-        account_id=account_id,
-        signal_processor_name=signal_processor_name,
-        risk_per_trade_pct=risk_per_trade_pct,
-        max_position_pct=max_position_pct,
-        max_positions=max_positions,
-        max_notional_per_trade=max_notional_per_trade,
-        max_leverage=max_leverage,
-        timeframe=timeframe,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        fee_params=fee_params,
+        spec=_SignalReplayTaskSpec(
+            symbols=symbols,
+            normalized_signals=normalized_signals,
+            replay_source_label=replay_source_label,
+            account_id=account_id,
+            signal_processor_name=signal_processor_name,
+            risk_per_trade_pct=risk_per_trade_pct,
+            max_position_pct=max_position_pct,
+            max_positions=max_positions,
+            max_notional_per_trade=max_notional_per_trade,
+            max_leverage=max_leverage,
+            timeframe=timeframe,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            fee_params=fee_params,
+        ),
     )
     _set_task_status(task_id, "queued")
     _register_job(

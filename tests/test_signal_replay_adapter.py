@@ -510,7 +510,18 @@ def test_replay_aggregate_open_notional_bounded_at_one_x_when_leverage_unset() -
     assert total_open_notional <= 100000.0 * 1.05
 
 
-def test_replay_fallback_stop_entry_still_bounded_by_leverage() -> None:
+@pytest.mark.parametrize(
+    ("max_leverage", "expected_notional"),
+    [
+        # ceiling = min(5, 3) = 3 -> qty = 3 * 100_000 / fill (~100.5).
+        (3.0, 300_000.0),
+        # No declared broker maximum fails closed to the 1x ceiling.
+        (None, 100_000.0),
+    ],
+)
+def test_replay_fallback_stop_entry_bounded_by_leverage(
+    max_leverage, expected_notional
+) -> None:
     """#190 with #240: a stopless signal sized on the ATR fallback stop must
     still respect min(configured cap, declared leverage) — the fallback stop
     only supplies a distance, it never lifts the ceiling."""
@@ -521,7 +532,7 @@ def test_replay_fallback_stop_entry_still_bounded_by_leverage() -> None:
             max_positions=5,
             max_notional_per_trade=5.0,
         ),
-        max_leverage=3.0,
+        max_leverage=max_leverage,
         initial_capital=100_000.0,
         default_timeframe="1m",
         fee_params={"fees": "zero"},
@@ -549,43 +560,4 @@ def test_replay_fallback_stop_entry_still_bounded_by_leverage() -> None:
         backtest_end="2026-01-01",
     )
     assert len(result.trades) == 1
-    # ceiling = min(5, 3) = 3 -> qty = 3 * 100_000 / fill (~100.5).
-    assert result.trades[0].quantity == pytest.approx(300_000.0 / 100.5, rel=0.01)
-
-
-def test_replay_fallback_stop_entry_fails_closed_without_leverage() -> None:
-    """Same fallback-stop entry with no declared broker maximum caps at 1x."""
-    adapter = SignalReplayAdapter(
-        risk_config=RiskConfig(
-            max_risk_per_trade=0.01,
-            max_total_exposure=0.05,
-            max_positions=5,
-            max_notional_per_trade=5.0,
-        ),
-        max_leverage=None,
-        initial_capital=100_000.0,
-        default_timeframe="1m",
-        fee_params={"fees": "zero"},
-        slippage_params={"slippage": "none"},
-    )
-    signal = ReplaySignal.from_payload(
-        {
-            "timestamp": "2026-01-01T00:00:00Z",
-            "symbol": "AAPL",
-            "action": "buy",
-            "entry_price": 100.0,
-            "timeframe": "1m",
-            "source": "csv:signals.csv",
-            "metadata": {"atr": 0.05},
-        },
-        default_timeframe="1m",
-    )
-    result = adapter.run(
-        signals=[signal],
-        ohlcv_by_symbol={"AAPL": _one_bar_frame()},
-        timeframe="1m",
-        backtest_start="2026-01-01",
-        backtest_end="2026-01-01",
-    )
-    assert len(result.trades) == 1
-    assert result.trades[0].quantity == pytest.approx(100_000.0 / 100.5, rel=0.01)
+    assert result.trades[0].quantity == pytest.approx(expected_notional / 100.5, rel=0.01)
