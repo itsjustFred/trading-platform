@@ -813,8 +813,13 @@ def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     default ``next_open`` run would silently simulate the legacy ``close`` fill
     while the persisted meta claimed otherwise.
     """
-    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
-    if mode != "next_open":
+    # normalize first: a config that bypassed BacktestConfig validation still
+    # fails loudly on the removed "open" mode (issue #153) instead of silently
+    # keeping an unsupported fill.
+    mode = contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
+    if mode != contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
         return config
     logger.warning(
         "frozen engine does not implement signal_exit_fill='next_open'; "
@@ -1529,6 +1534,9 @@ def _resolve_exit_price(
     # strategy exit_price level always wins — except a level that gapped
     # the bar's open (gap_open=True), which fills at the open under the
     # gap-through-level convention regardless of signal_exit_fill.
+    # Normalize anyway so a bypassed config still fails loudly on the
+    # removed "open" mode (#153).
+    contract.normalize_signal_exit_fill(signal_exit_fill or "close")
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
     if exit_price_series is not None and not gap_open:

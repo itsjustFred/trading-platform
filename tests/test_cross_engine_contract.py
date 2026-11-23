@@ -801,19 +801,20 @@ class TestExitLevelGapped:
         assert len(vectorbt.trades) == 2
         assert len(vbt_msgs) == 1
 
-    def test_level_with_signal_exit_fill_open_and_spread(self, tmp_path: Path):
-        # signal_exit_fill="open" + spread must not leak into a level fill:
-        # an in-range level still fills AT the level on both engines.
+    def test_level_with_signal_exit_fill_close_and_spread(self, tmp_path: Path):
+        # signal_exit_fill="close" + spread must not leak into a level fill:
+        # an in-range level still fills AT the level on both engines. (The
+        # "open" mode this test originally used was removed in #153.)
         frame = _frame(spread=0.5)
         params = {"spread_price_col": "spread_price"}
         text = _exit_order_type_strategy_text(order_type="level", exit_price=107.1)
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_openfill")
 
         native = _native_result(
-            frame, strategy_fn, signal_exit_fill="open", parameters=params
+            frame, strategy_fn, signal_exit_fill="close", parameters=params
         )
         vectorbt = _vectorbt_result(
-            tmp_path, frame, text, signal_exit_fill="open", parameters=params
+            tmp_path, frame, text, signal_exit_fill="close", parameters=params
         )
 
         for result in (native, vectorbt):
