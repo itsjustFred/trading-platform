@@ -665,8 +665,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
     # MT5 closes at the FIRST TICK at/after Exit_Time, i.e. at the OPEN of the first bar
     # that starts at/after exit_time. The engines fill a signal exit at the NEXT bar's
     # open (``signal_exit_fill="next_open"``, the default), so the signal is raised on
-    # the first bar whose END reaches exit_time (bar start + bar length >= exit_time). On M1 that is the bar before
-    # exit_time (22:54 -> fills 22:55); on M15/H1 it is the bar containing exit_time
+    # the first bar whose END reaches exit_time (bar start + bar length >= exit_time).
+    # On M1 that is the bar before exit_time (22:54 -> fills 22:55); on M15/H1 it is
+    # the bar containing exit_time
     # (22:45 / 22:00 -> fills 23:00, the first open at/after 22:55). The bar length is
     # the modal bar spacing of the frame (a property of the data feed, not of a
     # particular bar); the rest is the known clock schedule, so a signal on bar t
