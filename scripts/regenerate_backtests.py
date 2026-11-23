@@ -67,6 +67,7 @@ _guard.ensure_own_checkout("regenerate_backtests")
 import shared  # noqa: F401
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig, resolve_strategy_parameters
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.stats import compute_stats_for_result
 from shared.database import (
     BacktestRecord,
@@ -533,6 +534,9 @@ def _run_strategy(
             modeling_resolution="open_close",
             data_dir=str(data_dir),
             parameters=parameters,
+            # Frozen engines (pynecore/vectorbt here) refuse next_open; declare
+            # the legacy close fill they simulate so meta stays truthful.
+            signal_exit_fill=default_signal_exit_fill_for_engine(engine_name),
         )
     except ValidationError as exc:
         raise BacktestRunError(f"{strategy_name}: invalid config ({exc})") from exc

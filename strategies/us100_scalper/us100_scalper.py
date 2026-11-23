@@ -30,7 +30,7 @@ from shared.strategy_markers import entry_exit_markers
 
 STRATEGY_META = {
     "name": "US100 Intraday Scalper",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "source_url": "https://discord.com/channels/1230977283888648315/1453162378509418657/1453162378509418657",
     "notes": (
         "Long-only NQ scalper ported from 'us100 intrayday scalper "
@@ -49,8 +49,9 @@ STRATEGY_META = {
         "exit without an explicit price; its signal is raised on the bar "
         "before 16:00 ET so it fills at the 16:00 open (next_open), instead "
         "of the old 'book the signal-bar close' price hack; a missing "
-        "post-16:00-ET bar books 'day_reset_flatten' on the last bar of the "
-        "ET day instead of dropping the position."
+        "post-16:00-ET bar books 'day_reset_flatten' on the first bar of the "
+        "next ET day (no look-ahead: the last bar of the prior day cannot "
+        "know it is the last) instead of dropping the position."
     ),
     "parameters": {
         "reference_price": 25000.0,
@@ -143,11 +144,14 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if in_trade:
                 # B-H1: day-reset flatten. The 16:00-ET exit never fired
                 # (no post-16:00 bar in the frame, e.g. a session-data gap).
-                # Book the exit on the last bar of the prior ET day at its
-                # close instead of silently dropping the open position
-                # (phantom trade: entry without exit).
-                exits.iloc[i - 1] = True
-                exit_reason.iloc[i - 1] = "day_reset_flatten"
+                # Signal the flatten on THIS bar - the first bar of the new
+                # ET day - so the next-open fill lands one bar into the new
+                # day, the same convention as channel_breakout's
+                # session_day_start flatten. Marking the previous bar would
+                # be look-ahead: that bar's "signal" would depend on today's
+                # date, which live cannot know when the bar closed.
+                exits.iloc[i] = True
+                exit_reason.iloc[i] = "day_reset_flatten"
             cur_day = et_day[i]
             # H1 close into NY midnight: previous bar's close at the first bar
             # of the ET day (exactly iClose(H1,1) at 07:00 server on H1 data).
@@ -197,8 +201,8 @@ def generate_signals(df: pd.DataFrame, params: dict):
     if in_trade and len(df) > 0:
         # B-H1 edge: the frame ends mid-day with an open position (no further
         # bar to trigger the 16:00 EOD exit or a day-change flatten). Signal the
-        # exit on the last bar (the engine's end-of-data close takes it) instead of dropping the position
-        # (phantom trade: entry without exit).
+        # exit on the last bar (the engine's end-of-data close takes it)
+        # instead of dropping the position (phantom trade: entry without exit).
         last = len(df) - 1
         # PM11: skip when the entry fired on this very bar — a same-bar flatten
         # would book a phantom round trip (entry at the stop level, exit at the

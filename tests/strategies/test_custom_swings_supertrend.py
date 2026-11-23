@@ -40,7 +40,7 @@ EXPECTED_NET_PROFIT = -2197.47
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"},
+    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="custom_swings_supertrend",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

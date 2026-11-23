@@ -235,11 +235,11 @@ class SignalReplayAdapter:
     like every other open position at the end of the data. See
     :meth:`_check_flip_bar` for the full per-bar ordering.
 
-    Gap fills (#287): inside the ``supertrend_flip`` workflow the stop and the
-    TP1 tranche fill at the bar's OPEN when the bar opens beyond the level
+    Gap fills (#287, extended by the 2026-11-13 owner decision): BOTH the
+    ``supertrend_flip`` workflow and the plain protective path fill at the
+    bar's OPEN when the bar opens beyond the level
     (``contract.resolve_protective_exit``); intrabar touches keep the level
-    fill. The non-flip protective path still fills at the level — that path's
-    gap handling lands with #208.
+    fill.
     """
 
     def __init__(

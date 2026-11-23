@@ -1357,6 +1357,9 @@ class TradeEngine:
             return
         if not position.exits:
             return
+        if position.finalized:
+            return
+        position.finalized = True
 
         self._trade_counter += 1
         pnl = sum(float(item.pnl or 0.0) for item in position.exits)

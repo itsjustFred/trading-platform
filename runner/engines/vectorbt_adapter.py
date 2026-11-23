@@ -808,11 +808,14 @@ def _process_symbol(
 
 
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
-    """Map the native-only ``next_open`` exit model onto this frozen adapter's
-    documented signal-bar fill (ADR ``docs/adr/0001-native-single-strategy-engine.md``:
-    frozen engines keep their existing semantics until removal). Without this a
-    default ``next_open`` run would silently simulate the legacy ``close`` fill
-    while the persisted meta claimed otherwise.
+    """Refuse the native-only ``next_open`` exit model on this frozen adapter.
+
+    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    keep their existing semantics until removal and get fail-loud guards, not
+    silent re-interpretation. ``next_open`` is the native default, so a
+    ``BacktestConfig`` that never touched the field would otherwise simulate
+    the legacy signal-bar fill while the persisted meta claimed otherwise —
+    refuse instead of warn-and-run.
     """
     # normalize first: a config that bypassed BacktestConfig validation still
     # fails loudly on the removed "open" mode (issue #153) instead of silently
@@ -820,13 +823,13 @@ def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     mode = contract.normalize_signal_exit_fill(
         getattr(config, "signal_exit_fill", "close") or "close"
     )
-    if mode != contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
-        return config
-    logger.warning(
-        "frozen engine does not implement signal_exit_fill='next_open'; "
-        "running with the legacy 'close' signal-exit fill instead"
-    )
-    return config.model_copy(update={"signal_exit_fill": "close"})
+    if mode == contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
+        raise ValueError(
+            "engine 'vectorbt' does not implement signal_exit_fill='next_open'; "
+            "frozen engines keep their legacy signal-bar fill — pass "
+            "signal_exit_fill='close' explicitly, or run the native engine"
+        )
+    return config
 
 
 @dataclass
@@ -1572,8 +1575,8 @@ def _resolve_exit_price(
 ) -> float:
     # Frozen engine (ADR 0001): signal exits stay on the trigger bar (see
     # _prepare_next_open_execution_data) and fill at its close — the frozen
-    # adapter maps ``next_open`` to ``close`` upstream, and the lookahead-
-    # prone ``open`` mode was removed (issue #153). Stop/TP
+    # adapter refuses ``next_open`` upstream and the lookahead-prone ``open``
+    # mode was removed (issue #153). Stop/TP
     # legs resolve via the intrabar walk at their levels. An explicit
     # strategy exit_price level always wins — except a level that gapped
     # the bar's open (gap_open=True), which fills at the open under the

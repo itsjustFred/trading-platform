@@ -41,7 +41,7 @@ EXPECTED_NET_PROFIT = -688.18
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = VectorbtAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"},
+    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="channel_breakout",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,
