@@ -1038,3 +1038,53 @@ def test_account_tolerance_includes_an_unset_deployments_adapter_default() -> No
         config.qty_tolerance,
         include_adapter_default=config.qty_tolerance_includes_adapter_default,
     ) == pytest.approx(DEFAULT_QTY_TOLERANCE)
+
+
+_HALT_MARKER_CASES = [
+    (None, False),
+    (False, False),
+    (0, False),
+    (0.0, False),
+    ("", False),
+    (True, True),
+    (1, True),
+    (-1, True),
+    (0.5, True),
+    (float("nan"), True),
+    ("x", True),
+    ("0", True),
+    ({}, True),
+    ([], True),
+    ({"halted_at": "2026-11-22T00:00:00Z", "reason": "mismatch"}, True),
+]
+
+
+@pytest.mark.parametrize(("value", "halted"), _HALT_MARKER_CASES)
+def test_entries_halt_marker_truth_table(value, halted):
+    from shared.database import entries_halt_marker_is_halted
+
+    assert entries_halt_marker_is_halted(value) is halted
+
+
+@pytest.mark.parametrize(
+    ("value", "halted"),
+    [
+        case
+        for case in _HALT_MARKER_CASES
+        if not (isinstance(case[0], float) and case[0] != case[0])  # JSON has no NaN
+    ],
+)
+def test_entries_halt_marker_mirrors_the_claim_sql_predicate(value, halted):
+    """The Python helper and the atomic claim's SQL must agree on every JSON value."""
+    import sqlite3
+
+    from shared.database import ENTRIES_HALT_SETTINGS_KEY
+
+    settings = json.dumps({ENTRIES_HALT_SETTINGS_KEY: value})
+    with sqlite3.connect(":memory:") as conn:
+        (not_halted,) = conn.execute(
+            "SELECT COALESCE(json_extract(?, "
+            f"'$.{ENTRIES_HALT_SETTINGS_KEY}'), 0) IN (0, '')",
+            (settings,),
+        ).fetchone()
+    assert (not not_halted) is halted

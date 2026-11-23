@@ -5410,7 +5410,9 @@ def entries_halt_marker_is_halted(value: object) -> bool:
     if isinstance(value, str):
         return value != ""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value) != 0.0
+        # Truthiness, not a float compare: 0/0.0 clear, NaN and every other
+        # number halt (fail closed), matching SQLite's ``IN (0, '')``.
+        return bool(value)
     return True
 
 
