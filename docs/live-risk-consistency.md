@@ -406,7 +406,9 @@ Set, lift and read: `scripts/live_kill_switch.py` (CLI) and `/api/live/kill-swit
 
 `live_executions.commission` is a **non-negative cost value** on **all** brokers (fee =
 positive, known-null = `0.0`; #285). Net P&L is
-`gross - commission` everywhere (viewer, `net_pnl`, Alpaca CFEE backfill from #143).
+`gross - commission` on closed round trips everywhere (viewer, `net_pnl`, Alpaca CFEE
+backfill from #143); an unknown fee on still-open exposure is not netted and does not
+block `net_pnl`, while an unknown fee inside a pool that is later closed makes it null.
 Adapters normalize before storing: cTrader reports `ProtoOADeal.commission` as a signed
 cash flow (fee negative) and is negated via `base_adapter.commission_from_signed_cash_flow`; Alpaca reports
 no commission (known null `0.0` or NULL, see #124) and backfills CFEE as a positive cost.

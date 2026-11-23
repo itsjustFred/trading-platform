@@ -541,8 +541,19 @@ _STUB_OPENCODE = """#!/usr/bin/env bash
 # probe cannot currently see), quota-verdict (a started report that never
 # reaches a verdict, cap signature on stdout, exit 0), garbage (a zero exit
 # with no signature and no report), no-ok (a zero exit whose reply carries no
-# OK token), other (a non-quota failure, exit 1).
+# OK token), other (a non-quota failure, exit 1). kilo-429 / kilo-signup /
+# kilo-400 are what opencode 2.2.7 printed against Kilo's gateway: a 429 it
+# retried until it gave up, the anonymous per-IP cap it does not retry, and a
+# 400 that ends on the same "Provider returned error" line with no retry.
 set -u
+# Like the real CLI, every run first prints "> <agent> · <model>" on stderr:
+# a probe that greps stderr must not read its own agent name as a signature.
+agent=build
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--agent" ] && [ "$#" -gt 1 ]; then agent="$2"; fi
+  shift
+done
+printf '\\033[0m\\n> %s \\302\\267 stub/model\\n' "$agent" >&2
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   verdict) printf '**Summary:** probe verdict\\n**Verdict: PASS**\\n'; exit 0 ;;
@@ -557,6 +568,18 @@ case "${STUB_OPENCODE_MODE:-ok}" in
   garbage) printf 'The agent said something unrelated.\\n'; exit 0 ;;
   no-ok) printf 'Here is the answer you asked for.\\n'; exit 0 ;;
   other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
+  kilo-429)
+    for n in 1 2 3; do
+      printf '\\033[93m! \\033[0mretrying (attempt %s): Provider returned error\\n' "$n" >&2
+    done
+    printf '\\033[91mError: \\033[0mProvider returned error\\n' >&2
+    exit 1
+    ;;
+  kilo-signup)
+    printf 'Error: Sign up for free to continue and explore 500 other models.\\n' >&2
+    exit 1
+    ;;
+  kilo-400) printf '\\033[91mError: \\033[0mProvider returned error\\n' >&2; exit 1 ;;
 esac
 """
 
@@ -707,7 +730,8 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         # they fail - the cap has been seen arriving on a zero exit.
         transient = (
             "usage limit|rate.?limit|quota|insufficient credits|limit reached|"
-            "not available in your country|service unavailable|overloaded"
+            "not available in your country|service unavailable|overloaded|"
+            "sign up for free to continue"
         )
         dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
         assert body.count(dead_end_grep) == 2, (
@@ -718,7 +742,17 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         # (quota-zero), or with a report that never reaches a verdict
         # (quota-verdict), the step must still take the quota path. A zero exit
         # with no signature (garbage) is still a failure.
-        for mode in ("quota", "quota-zero", "quota-verdict", "verdict", "garbage", "other"):
+        for mode in (
+            "quota",
+            "quota-zero",
+            "quota-verdict",
+            "kilo-429",
+            "kilo-signup",
+            "verdict",
+            "garbage",
+            "other",
+            "kilo-400",
+        ):
             case = tmp_path / f"{stage}-{mode}"
             case.mkdir(parents=True, exist_ok=True)
             runner_temp = case / "runner-temp"
@@ -751,7 +785,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
                 text=True,
             )
             comment = runner_temp / stage / "comment.md"
-            if mode in ("quota", "quota-zero", "quota-verdict"):
+            if mode in ("quota", "quota-zero", "quota-verdict", "kilo-429", "kilo-signup"):
                 assert result.returncode == 0, (
                     f"{name}: the quota path failed the step:\n{result.stderr}"
                 )
