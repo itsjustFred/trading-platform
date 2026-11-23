@@ -27,6 +27,7 @@ from runner.portfolio_optimizer import (
     MIN_OOS_DAILY_OBSERVATIONS,
     optimize_portfolio_allocation,
 )
+from runner.slippage import assert_slippage_supported
 from runner.stats import merge_canonical_stats
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -481,6 +482,10 @@ def run_walkforward(
     normalized_timeframe = normalize_timeframe(timeframe)
     strategy_name = Path(strategy).stem
     parameters = resolve_strategy_parameters(strategy, params or {})
+    # #130: an engine outside the slippage scope must refuse a declared
+    # model rather than run every fold gross while the user believes it
+    # applied.
+    assert_slippage_supported(engine.name, parameters)
     effective_step_months = test_months if step_months is None else step_months
     windows = _build_windows(
         start=start,

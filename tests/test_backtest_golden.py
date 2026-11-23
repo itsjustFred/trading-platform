@@ -493,6 +493,11 @@ def _run_native_cli(tmp_path: Path, *, timeout: float = CLI_TIMEOUT_SECONDS) -> 
             "0.0005",
             "--fee-flat-per-trade",
             "1.0",
+            # #130: the golden pins gross-fill economics — declare the
+            # explicit parity opt-out so per-asset-class slippage defaults
+            # cannot move the fixture.
+            "--slippage",
+            "none",
             "--intrabar-resolution",
             "main_timeframe",
             "--data-dir",
@@ -531,7 +536,11 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert result.meta.parameters == {
         "fee_rate": 0.0005,
         "fee_flat_per_trade": 1.0,
+        "slippage": "none",
     }
+    # #130: the run records which slippage model priced its fills — here
+    # the explicit parity opt-out.
+    assert result.meta.data["slippage"]["models"]["PARITY"]["model"] == "none"
     assert [trade.id for trade in result.trades] == [1, 2, 3]
     assert [trade.entry_time for trade in result.trades] == [
         "2024-01-01T03:00:00+00:00",
@@ -990,7 +999,15 @@ def test_oracle_calendar_path_agrees_with_the_engine_curve_path(scenario: str) -
         for name, result in (("engine", engine), ("calendar", calendar))
     }
     for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value", "total_return"):
-        assert ratios["engine"][key] == pytest.approx(ratios["calendar"][key], abs=1e-9), key
+        engine_value = ratios["engine"].get(key)
+        calendar_value = ratios["calendar"].get(key)
+        if engine_value is None or calendar_value is None:
+            # Weekend filler rows no longer count toward the PSR
+            # observation minimum, so a short window can leave it
+            # undefined on BOTH paths — agreement is what matters.
+            assert engine_value == calendar_value, key
+        else:
+            assert engine_value == pytest.approx(calendar_value, abs=1e-9), key
     assert ratios["engine"]["duplicate_equity_timestamps"] == 0
 
 
