@@ -724,7 +724,7 @@ def test_native_and_vectorbt_resolve_the_same_intrabar_spellings(tmp_path: Path)
     ]
     for resolution in resolutions:
         for base in ("1h", "1d"):
-            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+            cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
                 strategy_name="parity",
                 symbols=["X"],
                 timeframe=base,
@@ -779,7 +779,7 @@ def test_spellings_pinned_against_one_shared_table():
     assert vbt_module._resolve_intrabar_timeframe("1h", "m1") == contract.resolve_intrabar_timeframe("1h", "m1")
     # The config validator canonicalizes alias spellings before any adapter
     # sees them, so per-adapter divergence is structurally impossible.
-    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+    cfg = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero", "slippage": "none"},
         strategy_name="pin",
         symbols=["X"],
         timeframe="1h",
@@ -810,7 +810,7 @@ class TestSizingContract:
             end_date="2024-01-02",
             initial_capital=100_000.0,
             risk_per_trade_pct=0.01,
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         from runner.engine import TradeEngine
 
@@ -951,7 +951,7 @@ class TestStatsKeysContract:
                 "entry_price": 108.0,
             },
         ]
-        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, ).run(
             signals=[ReplaySignal.from_payload(signal) for signal in signals],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",
@@ -1473,7 +1473,7 @@ class TestFillContract:
             end_date="2024-01-02",
             initial_capital=100_000,
             modeling_resolution="main_timeframe",
-            parameters={"fees": "zero"},
+            parameters={"fees": "zero", "slippage": "none"},
         )
         result = TradeEngine(cfg, symbol="PARITY").run(data, strategy_fn)
 
@@ -1524,7 +1524,7 @@ class TestFillContract:
                 "entry_price": float(frame.iloc[5]["close"]),
             }
         )
-        result = SignalReplayAdapter(fee_params={"fees": "zero"}, ).run(
+        result = SignalReplayAdapter(fee_params={"fees": "zero"}, slippage_params={"slippage": "none"}, ).run(
             signals=[signal],
             ohlcv_by_symbol={"PARITY": frame},
             timeframe="1h",

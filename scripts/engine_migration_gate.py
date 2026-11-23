@@ -519,7 +519,7 @@ def _trade_field_diffs(native: Any, vectorbt: Any) -> list[dict[str, Any]]:
     if len(native_exits) != len(vectorbt_exits):
         add("exits.count", len(native_exits), len(vectorbt_exits))
     else:
-        for index, (a_exit, b_exit) in enumerate(zip(native_exits, vectorbt_exits)):
+        for index, (a_exit, b_exit) in enumerate(zip(native_exits, vectorbt_exits, strict=True)):
             prefix = f"exits[{index}]"
             a_time = _norm_time(getattr(a_exit, "time", None))
             b_time = _norm_time(getattr(b_exit, "time", None))
@@ -602,17 +602,17 @@ def _diff_trades(native_result: Any, vectorbt_result: Any) -> dict[str, Any]:
         )
         candidate = candidates.pop(best_index)
         matched += 1
-        for diff in _trade_field_diffs(trade, candidate):
-            field_diffs.append(
-                {
-                    "trade": {
-                        "symbol": trade.symbol,
-                        "direction": trade.direction,
-                        "entry_time": str(trade.entry_time),
-                    },
-                    **diff,
-                }
-            )
+        field_diffs.extend(
+            {
+                "trade": {
+                    "symbol": trade.symbol,
+                    "direction": trade.direction,
+                    "entry_time": str(trade.entry_time),
+                },
+                **diff,
+            }
+            for diff in _trade_field_diffs(trade, candidate)
+        )
     unmatched_vectorbt = [
         trade for trades in vbt_by_key.values() for trade in trades
     ]

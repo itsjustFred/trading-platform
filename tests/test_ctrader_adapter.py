@@ -14,6 +14,7 @@ from live_runner.ctrader_adapter import (
     _is_already_logged_in_error,
     _is_terminal_auth_error,
 )
+from shared.money import MoneyParseError
 
 
 def test_is_already_logged_in_error_detects_code() -> None:
@@ -1675,6 +1676,128 @@ def test_money_digits_fallback_is_logged(caplog) -> None:
     )
 
 
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+#
+# Broker volume, prices, balances and commissions used to parse through a
+# ``default=0.0`` coercion, so an unreadable value was stored or reported as
+# zero. They now go through ``shared.money`` and raise on garbage.
+
+
+def test_broker_volume_to_qty_raises_on_an_unreadable_volume() -> None:
+    from live_runner.ctrader_adapter import _broker_volume_to_qty
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        _broker_volume_to_qty("junk")
+
+
+def test_deal_commission_raises_on_an_unreadable_commission() -> None:
+    from live_runner.ctrader_adapter import _deal_commission
+
+    # A garbage commission must not be stored as the known-zero fee.
+    with pytest.raises(ValueError, match="unreadable money value"):
+        _deal_commission(SimpleNamespace(commission="junk"))
+
+
+def _trader_balance_adapter(trader):
+    """A cTrader adapter whose trader lookup returns ``trader``."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+
+    class _TraderReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+
+    adapter._ProtoOATraderReq = _TraderReq
+    adapter._ProtoOATraderRes = type("_TraderRes", (), {})
+    response = adapter._ProtoOATraderRes()
+    response.trader = trader
+
+    async def _send_response(_request, **_kwargs):
+        return response
+
+    adapter._send_request = _send_response
+    return adapter
+
+
+def test_get_balance_raises_on_an_unreadable_balance() -> None:
+    adapter = _trader_balance_adapter(
+        SimpleNamespace(moneyDigits=2, balance="junk")
+    )
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_raises_on_an_unreadable_equity() -> None:
+    adapter = _trader_balance_adapter(
+        SimpleNamespace(moneyDigits=2, balance=123_456, equity="junk")
+    )
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_uses_balance_when_equity_is_absent() -> None:
+    adapter = _trader_balance_adapter(SimpleNamespace(moneyDigits=2, balance=123_456))
+
+    balance, equity = asyncio.run(adapter.get_balance())
+
+    assert balance == pytest.approx(1_234.56)
+    assert equity == pytest.approx(1_234.56)
+
+
+def _positions_adapter(positions):
+    """A cTrader adapter whose open-position fetch returns ``positions``."""
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="46736452"
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOATradeSide = SimpleNamespace(SELL=1)
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+
+    async def _fetch_open_positions():
+        return positions
+
+    adapter._fetch_open_positions = _fetch_open_positions
+    return adapter
+
+
+def _open_position(*, volume=5000, price=1.085, position_id=7):
+    return SimpleNamespace(
+        positionId=position_id,
+        price=price,
+        tradeData=SimpleNamespace(symbolId=1, volume=volume, tradeSide=0),
+    )
+
+
+def test_get_positions_raises_on_an_unreadable_volume() -> None:
+    adapter = _positions_adapter([_open_position(volume="junk")])
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_positions())
+
+
+def test_get_positions_raises_on_an_unreadable_entry_price() -> None:
+    adapter = _positions_adapter([_open_position(price="junk")])
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_positions())
+
+
+def test_close_all_positions_reports_an_unreadable_volume_as_unidentified() -> None:
+    """A flatten must not read a garbage volume as zero and skip the position."""
+    adapter = _positions_adapter([_open_position(volume="junk", position_id=7)])
+
+    outcome = asyncio.run(adapter.close_all_positions())
+
+    assert outcome.unidentified == ("position:7:volume",)
+    assert outcome.complete is False
+
+
 # ─── get_equity: equity must include open-position unrealized P&L (#301) ──────
 #
 # The loss breaker reads ``get_equity`` - a SEPARATE path from ``get_balance``
@@ -1873,3 +1996,66 @@ def test_get_equity_trusts_a_trader_equity_field_when_present():
     assert asyncio.run(adapter.get_equity()) == pytest.approx(55_000.0)
     balance, equity = asyncio.run(adapter.get_balance())
     assert (balance, equity) == (pytest.approx(50_000.0), pytest.approx(55_000.0))
+
+
+def test_get_equity_raises_on_an_unreadable_balance() -> None:
+    """A garbage ``balance`` must fail closed: ``_to_float`` used to read it
+    as 0.0, which the loss breaker would have seen as a total loss - or, on
+    the flip side, garbage that parsed to a large number as fake equity."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance="junk", moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_raises_on_an_unreadable_equity_field() -> None:
+    """A trader payload whose own ``equity`` field is garbage raises through
+    ``parse_optional`` rather than falling back or reading as 0."""
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, equity="junk", moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())
+
+
+def test_get_equity_raises_on_an_unreadable_net_unrealized_pnl(monkeypatch) -> None:
+    """A position-P&L row whose ``netUnrealizedPnL`` is not readable money is
+    unreadable, not "no unrealized loss": the sum must raise."""
+    import ctrader_open_api.messages.OpenApiMessages_pb2 as pb2
+
+    class _PnlReq:
+        def __init__(self) -> None:
+            self.ctidTraderAccountId = 0
+
+    class _PnlRes:
+        moneyDigits = 2
+        positionUnrealizedPnL = [SimpleNamespace(netUnrealizedPnL="junk")]
+
+    # The proto field is int64 and cannot itself hold garbage; patch the
+    # message classes the fetch imports so the row carries an unreadable
+    # value the way a malformed broker payload could.
+    monkeypatch.setattr(pb2, "ProtoOAGetPositionUnrealizedPnLReq", _PnlReq)
+    monkeypatch.setattr(pb2, "ProtoOAGetPositionUnrealizedPnLRes", _PnlRes)
+
+    adapter = _connected_adapter()
+
+    async def _fetch_trader():
+        return SimpleNamespace(balance=5_000_000, moneyDigits=2)
+
+    adapter._fetch_trader = _fetch_trader
+
+    async def _send(request, **kwargs):
+        if isinstance(request, _PnlReq):
+            return _PnlRes()
+        raise AssertionError(f"unexpected request {type(request)}")
+
+    adapter._send_request_with_refresh_retry = _send
+    with pytest.raises(MoneyParseError, match="unreadable money value"):
+        asyncio.run(adapter.get_equity())

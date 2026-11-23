@@ -166,6 +166,7 @@ def test_no_unix_only_lock_import_at_module_scope() -> None:
     for relative in (
         "live_runner/ctrader_adapter.py",
         "scripts/matrix_queue_runner.py",
+        "shared/single_instance.py",
     ):
         tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
         module_imports = [

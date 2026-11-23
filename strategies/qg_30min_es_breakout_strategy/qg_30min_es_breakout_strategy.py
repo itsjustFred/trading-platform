@@ -132,8 +132,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     in_time = (ny_minutes >= open_minutes) & (ny_minutes < close_minutes)
     # Signal exits fill at the NEXT bar's open: raise the forced exit on the first
     # bar whose end reaches the forced-exit time so the fill lands AT that open.
-    exit_now = clock_exit_signal_mask(
-        ny_minutes, modal_bar_minutes(timestamps_utc), forced_exit_minutes
+    exit_now = pd.Series(
+        clock_exit_signal_mask(
+            ny_minutes, modal_bar_minutes(timestamps_utc), forced_exit_minutes
+        ),
+        index=df.index,
     )
     time_exit_reason = f"time_exit_{forced_exit_hour:02d}{forced_exit_minute:02d}_ny"
 
