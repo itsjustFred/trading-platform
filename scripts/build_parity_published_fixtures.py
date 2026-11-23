@@ -1,8 +1,13 @@
-"""Rebuild the committed fixtures of the published-strategy parity tests.
+"""Rebuild the cached fixtures of the published-strategy parity tests.
 
 Downloads daily data with yfinance, stores the raw download under
 ``<data_dir>/ohlcv/yfinance/...`` (gitignored, catalog layout) and writes the
-small gzip CSV fixtures to ``tests/parity/fixtures/published``.
+small gzip CSV fixtures to the vendor-data cache the parity tests read
+(``$PARITY_VENDOR_DATA_DIR/published``, or ``$DATA_DIR/parity_vendor/published``
+when unset — see ``tests/parity/vendor_data.py``). Vendor data is licensed to
+be queried, not redistributed, so the fixtures are cached, not committed; a
+missing file skips on pull requests and fails when
+``REQUIRE_PARITY_VENDOR_DATA`` is set (pushes to main).
 
 Total-return handling: ``SPY``/``EFA``/``AGG``/``BIL``/``VEU`` fixtures hold
 DIVIDEND-ADJUSTED prices (``Adj Close`` scale factor applied to open/high/low/
@@ -16,11 +21,38 @@ import argparse
 import os
 from pathlib import Path
 
-import pandas as pd
-import yfinance as yf
+# isort: split
+
+# --- import-origin guard ---
+# `shared` must resolve to this checkout, not the installed package. The mechanism lives in
+# scripts/_import_origin.py; only the invocation is per script. scripts/ goes on sys.path - never
+# the repo root, which would repair `import shared` and defeat the guard - so a direct run is
+# refused (exit 2) instead of reading a different tree's constants and writing the cache to a
+# path that tree resolves elsewhere. See tests/test_script_import_origin.py; run as:
+#     python -m scripts.build_parity_published_fixtures
+import sys as _sys
+from pathlib import Path as _path
+
+_scripts_dir = str(_path(__file__).resolve().parent)
+if _scripts_dir not in _sys.path:
+    _sys.path.insert(0, _scripts_dir)
+import _import_origin as _guard
+
+_guard.ensure_own_checkout("build_parity_published_fixtures")
+# --- end import-origin guard ---
+import pandas as pd  # noqa: E402
+import yfinance as yf  # noqa: E402
+
+from shared.constants import DATA_DIR  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
-OUT = REPO / "tests" / "parity" / "fixtures" / "published"
+
+
+def _vendor_out() -> Path:
+    """The ``published/`` directory inside the parity vendor-data cache."""
+    override = (os.environ.get("PARITY_VENDOR_DATA_DIR") or "").strip()
+    root = Path(override).expanduser() if override else DATA_DIR / "parity_vendor"
+    return root / "published"
 
 #: symbol -> (yfinance ticker, first date kept, ohlc?)
 SPECS = {
@@ -56,15 +88,41 @@ def build(name: str, ticker: str, start: str, ohlc: bool, data_dir: Path) -> pd.
     return out
 
 
+def _fixture_valid(path: Path) -> bool:
+    """Cheap presence+shape check for --skip-if-valid."""
+    if not path.is_file():
+        return False
+    try:
+        frame = pd.read_csv(path, nrows=5)
+        return {"timestamp", "close"} <= set(frame.columns)
+    except Exception:
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default=os.environ.get("TRADING_DATA_DIR", "data"))
+    parser.add_argument(
+        "--skip-if-valid",
+        action="store_true",
+        help="exit 0 without network access when every fixture is already cached",
+    )
     args = parser.parse_args()
-    OUT.mkdir(parents=True, exist_ok=True)
+    out_dir = _vendor_out()
+    if args.skip_if_valid and all(
+        _fixture_valid(out_dir / f"{name.lower()}_1d.csv.gz") for name in SPECS
+    ):
+        print("all parity published fixtures are cached and valid; nothing to do")
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
     for name, (ticker, start, ohlc) in SPECS.items():
         frame = build(name, ticker, start, ohlc, Path(args.data_dir))
-        frame.to_csv(OUT / f"{name.lower()}_1d.csv.gz", index=False, compression="gzip")
-        print(name, len(frame), frame["timestamp"].iloc[0], frame["timestamp"].iloc[-1])
+        target = out_dir / f"{name.lower()}_1d.csv.gz"
+        frame.to_csv(target, index=False, compression="gzip")
+        print(
+            name, len(frame), frame["timestamp"].iloc[0],
+            frame["timestamp"].iloc[-1], "->", target,
+        )
 
 
 if __name__ == "__main__":

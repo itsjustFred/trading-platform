@@ -1,7 +1,7 @@
 """Print the platform / reference / buy-and-hold tables of the published-strategy parity report.
 
 Runs the platform engine and the independent reference
-(``tests/parity/ref_published.py``) on the committed fixtures and prints
+(``tests/parity/ref_published.py``) on the cached vendor fixtures and prints
 markdown.  Usage: ``python scripts/report_parity_published.py``.
 """
 from __future__ import annotations

@@ -14,9 +14,13 @@ import pandas as pd
 
 from runner.engines.base import BacktestConfig
 from runner.engines.native_adapter import NativeAdapter
+from tests.parity.vendor_data import load_vendor_frame
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = Path(__file__).resolve().parent / "fixtures" / "published"
+
+#: Vendor fixtures are cached, not committed — see tests/parity/vendor_data.py.
+FETCH_HINT = "python -m scripts.build_parity_published_fixtures"
+SUITE = "published"
 
 
 @dataclass
@@ -42,7 +46,7 @@ class EngineRun:
 
 def load_fixture(name: str) -> pd.DataFrame:
     """Fixture as a UTC-timestamp frame with open/high/low/close columns."""
-    frame = pd.read_csv(FIXTURES / f"{name.lower()}_1d.csv.gz")
+    frame = load_vendor_frame(SUITE, f"{name.lower()}_1d", fetch_hint=FETCH_HINT)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     if "open" not in frame.columns:  # close-only series: flat bars
         for col in ("open", "high", "low"):

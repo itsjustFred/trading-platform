@@ -23,9 +23,13 @@ engine run; the columns are now lower-case (test in `test_published_signal_edges
 
 ## Data
 
-Yahoo Finance daily data (yfinance 1.6.0), committed as gzip CSV in `tests/parity/fixtures/published/`
-(496 KB total; rebuilt by `scripts/build_parity_published_fixtures.py`, raw downloads go to
-`data/ohlcv/yfinance/equity/US/<SYM>/1d.parquet`):
+Yahoo Finance daily data (yfinance), cached as gzip CSV by
+`scripts/build_parity_published_fixtures.py` under `$PARITY_VENDOR_DATA_DIR/published/`
+(or `$DATA_DIR/parity_vendor/published`; raw downloads go to
+`data/ohlcv/yfinance/equity/US/<SYM>/1d.parquet`). Vendor data is licensed to be queried, not
+redistributed, so the fixtures are fetched on demand and cached, not committed — the tests read
+them via `tests/parity/vendor_data.py`, a missing file skips on pull requests and fails when
+`REQUIRE_PARITY_VENDOR_DATA` is set (pushes to main):
 
 | Fixture | Range | Basis |
 |---|---|---|
