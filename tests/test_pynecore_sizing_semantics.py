@@ -437,8 +437,19 @@ class TestFillParity:
         )
         assert trades[0].entry_price == pytest.approx(100.0)
 
-    def test_signal_exit_defaults_to_close(self, tmp_path):
-        config = _config(tmp_path)  # signal_exit_fill="close"
+    def test_signal_exit_next_open_config_falls_back_to_close_fill(self, tmp_path):
+        # Frozen engine: the adapter refuses signal_exit_fill="next_open" at
+        # run() (_frozen_signal_exit_fill); the helper itself treats any
+        # non-"open" mode as the legacy close fill.
+        config = _config(tmp_path)
+        trades = [_trade(exit_reason="signal")]
+        _apply_fill_parity(
+            trades, _frame(), config, {"spread_price_col": "spread_price"}
+        )
+        assert trades[0].exits[-1].price == pytest.approx(101.2)
+
+    def test_signal_exit_close_is_explicit_legacy_opt_in(self, tmp_path):
+        config = _config(tmp_path, signal_exit_fill="close")
         trades = [_trade(exit_reason="signal")]
         _apply_fill_parity(
             trades, _frame(), config, {"spread_price_col": "spread_price"}
@@ -474,8 +485,7 @@ class TestFillParity:
         trades = [_trade(exit_reason="signal")]
         before = (trades[0].entry_price, trades[0].exits[-1].price)
         _apply_fill_parity(trades, _frame(), config, {})
-        # close-fill re-price to the located bar close is still applied;
-        # entry without spread stays.
+        # the close re-price still applies; entry without spread stays.
         assert trades[0].entry_price == pytest.approx(before[0])
         assert trades[0].exits[-1].price == pytest.approx(101.2)
 
@@ -577,6 +587,9 @@ def test_pyne_cli_receives_full_day_bounds_for_date_only_config(monkeypatch, tmp
         risk_per_trade_pct=0.01,
         data_dir=str(tmp_path),
         parameters={"fees": "zero"},
+        # Frozen engine: next_open is refused; this test pins the CLI date
+        # bounds, so declare the legacy close fill explicitly.
+        signal_exit_fill="close",
     )
     PyneCoreAdapter().run(config, str(strategy))
 

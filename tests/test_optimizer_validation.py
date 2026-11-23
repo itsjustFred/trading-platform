@@ -268,6 +268,7 @@ def _base_result(tmp_path: Path):
         data={"symbols": ["GOLD1", "GOLD2"], "timeframes": ["1h"], "data_dir": str(tmp_path)},
         initial_capital=100_000,
         risk_per_trade_pct=0.01,
+        signal_exit_fill="next_open",
         parameters={"fast_length": 5, "slow_length": 20},
     )
     return BacktestResult(meta=meta, trades=[])
@@ -934,6 +935,54 @@ def test_run_optimization_forwards_the_configured_embargo():
         "run_optimization must pass embargo_pct into _split_backtest_period; "
         "without it the embargo is never applied to the windows that run"
     )
+
+# ─── Legacy signal_exit_fill default (review of #208) ───────────────────────
+
+
+class TestLegacySignalExitFill:
+    """A base result without a recorded exit model is a legacy artifact.
+
+    Before the 2026-11-13 next-open decision the default was ``"close"`` and
+    the key was omitted when it held that default, so every reader must read
+    a missing value as ``"close"`` - the optimizer too, or it would re-run a
+    legacy base under a different exit model than its stored stats.
+    """
+
+    def test_missing_everywhere_reads_as_the_legacy_close(self, tmp_path: Path):
+        result = _base_result(tmp_path)
+        result.meta.signal_exit_fill = None
+
+        runtime = optimizer_module._runtime_config_from_base_result(result)
+
+        assert runtime["signal_exit_fill"] == "close"
+
+    def test_stored_runtime_snapshot_wins_over_the_legacy_default(self, tmp_path: Path):
+        result = _base_result(tmp_path)
+        result.meta.signal_exit_fill = None
+        result.meta.data["_backtest_config"] = {"signal_exit_fill": "next_open"}
+
+        runtime = optimizer_module._runtime_config_from_base_result(result)
+
+        assert runtime["signal_exit_fill"] == "next_open"
+
+    def test_legacy_json_round_trip_reaches_the_optimizer_as_close(self, tmp_path: Path):
+        from shared.models import BacktestMeta, BacktestResult
+
+        payload = _base_result(tmp_path).meta.to_dict()
+        payload.pop("signal_exit_fill")
+        meta = BacktestMeta.from_dict(payload)
+
+        runtime = optimizer_module._runtime_config_from_base_result(
+            BacktestResult(meta=meta, trades=[])
+        )
+
+        assert runtime["signal_exit_fill"] == "close"
+
+    def test_a_fresh_result_keeps_next_open(self, tmp_path: Path):
+        runtime = optimizer_module._runtime_config_from_base_result(_base_result(tmp_path))
+
+        assert runtime["signal_exit_fill"] == "next_open"
+
 
 # ─── Three-way split config validation (Issue #164) ─────────────────────────
 
