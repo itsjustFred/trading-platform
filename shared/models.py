@@ -855,10 +855,15 @@ class BacktestMeta:
     max_position_exposure_pct: float | None = None
     max_leverage: float | None = None
     modeling_resolution: str = "main_timeframe"
-    # Owner decision 2026-11-13: signal exits fill at the next bar's open. The
-    # persisted key is ALWAYS written (see to_dict) because records without it
-    # predate that decision and were produced under the legacy "close" fill.
-    signal_exit_fill: str = "next_open"
+    # Fill convention for signal-driven exits, as simulated by the engine that
+    # produced the record. ``None`` means "not modelled by this platform" —
+    # imported/external results (LEAN, StockKit, QC/validation imports, demo
+    # seeds) whose exit fills come from the source system, not from a platform
+    # engine, must NOT inherit the native ``next_open`` default. Engines that
+    # simulate the fills record the mode explicitly; ``BacktestMeta.to_dict``
+    # always writes the key (``null`` when unset) so a missing key keeps its
+    # legacy ``"close"`` meaning for pre-2026-11-13 records.
+    signal_exit_fill: str | None = None
     allow_fallback_stop: bool = True
     reject_missing_stop: bool = False
     require_explicit_column_roles: bool = False
