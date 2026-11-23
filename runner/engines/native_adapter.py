@@ -22,6 +22,7 @@ from runner.engines.mtm_equity import (
     closes_from_frame,
     describe_basis,
 )
+from runner.slippage import BarSpreadSlippage
 from shared.constants import DATA_DIR
 from shared.models import BacktestMeta, BacktestResult
 
@@ -45,15 +46,20 @@ def _load_strategy_module(path: str):
     return module
 
 
-def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
+def _find_ohlcv_path(data_root: Path, symbol: str, timeframe: str) -> Path | None:
     matches = sorted(
         (data_root / "ohlcv").rglob(f"**/{symbol}/{timeframe}.parquet"),
         key=lambda path: path.as_posix(),
     )
-    if not matches:
+    return matches[0] if matches else None
+
+
+def _load_ohlcv(data_root: Path, symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
+    match = _find_ohlcv_path(data_root, symbol, timeframe)
+    if match is None:
         return None
 
-    df = pd.read_parquet(matches[0])
+    df = pd.read_parquet(match)
     df.columns = [str(col).lower() for col in df.columns]
     df = contract.normalize_ohlcv_frame(df)
     if "timestamp" not in df.columns:
@@ -125,6 +131,9 @@ class NativeAdapter(EngineAdapter):
         symbols_total = max(len(config.symbols), 1)
         total_loaded_bars = 0
         symbol_closes: dict[str, pd.Series] = {}
+        # #130: the slippage model each symbol's engine resolved — recorded
+        # in run metadata regardless of which model won.
+        slippage_models: dict[str, dict[str, Any]] = {}
 
         for symbol_index, symbol in enumerate(config.symbols):
             # warmup_start extends the
@@ -165,6 +174,13 @@ class NativeAdapter(EngineAdapter):
                 used_timeframes.append(config.modeling_resolution)
 
             symbol_config = config.model_copy(update={"symbols": [symbol], "parameters": resolved_parameters})
+            # #130: classify the instrument from the OHLCV layout
+            # (ohlcv/{source}/{asset_class}/...) so the slippage defaults
+            # apply per asset class; unclassifiable paths record "none".
+            match = _find_ohlcv_path(data_root, symbol, config.timeframe)
+            asset_class = (
+                contract.ohlcv_path_metadata(match)["asset_class"] if match else ""
+            )
             engine = TradeEngine(
                 symbol_config,
                 symbol=symbol,
@@ -172,8 +188,26 @@ class NativeAdapter(EngineAdapter):
                 progress_callback=progress_callback,
                 progress_start=symbol_start,
                 progress_end=symbol_end,
+                asset_class=asset_class,
             )
             symbol_result = engine.run(data, strategy_module.generate_signals)
+            # #130: report the basis the resolved model actually prices
+            # on — "bid_ask" only when the bar-spread model can use the
+            # ask columns; fixed/none models fill on the canonical (bid)
+            # series even when ask columns happen to be present.
+            has_two_sided = any(
+                str(col).startswith("ask_") for col in data.columns
+            )
+            price_basis = (
+                "bid_ask"
+                if has_two_sided
+                and isinstance(engine.slippage_model, BarSpreadSlippage)
+                else ("bid" if has_two_sided else "single_price")
+            )
+            slippage_models[symbol] = {
+                **engine.slippage_model.describe(),
+                "price_basis": price_basis,
+            }
 
             all_trades.extend(symbol_result.trades)
             # Normalize exactly as the vectorbt adapter does. The native engine
@@ -257,6 +291,10 @@ class NativeAdapter(EngineAdapter):
                 # runs (empty for single-symbol legacy path).
                 "shared_equity": shared_summary,
                 **describe_basis(unmarked_symbols),
+                # #130: mandatory slippage-model record — which model each
+                # symbol's fills were priced with (or the explicit "none"
+                # parity opt-out / unclassified outcome).
+                "slippage": {"models": slippage_models},
             },
             initial_capital=config.initial_capital,
             risk_per_trade_pct=config.risk_per_trade_pct,
