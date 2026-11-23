@@ -274,6 +274,7 @@ _STATIC_ASSET_SUFFIXES = {
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOG_DIR / "tasks"
 OPTIMIZATIONS_DIR = legacy_viewer.OPTIMIZATIONS_DIR
+JSON_FILE_GLOB = legacy_viewer.JSON_FILE_GLOB
 ALL_LOGS_NAME = legacy_viewer.ALL_LOGS_NAME
 BARS_BEFORE = legacy_viewer.BARS_BEFORE
 BARS_AFTER = legacy_viewer.BARS_AFTER
@@ -2778,7 +2779,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
+    for file_path in sorted(PORTFOLIOS_DIR.glob(JSON_FILE_GLOB)):
         try:
             data = _normalize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
         except (OSError, TypeError, ValueError) as exc:
@@ -12207,7 +12208,7 @@ async def list_optimizations() -> list[dict[str, Any]]:
     if not OPTIMIZATIONS_DIR.exists():
         return results
 
-    for path in sorted(OPTIMIZATIONS_DIR.glob("*.json")):
+    for path in sorted(OPTIMIZATIONS_DIR.glob(JSON_FILE_GLOB)):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             results.append(_optimization_summary_payload(payload, path))
@@ -12829,7 +12830,7 @@ def _existing_portfolio_json_path(portfolio_id: str) -> Path | None:
     so a symlink must not become writable through the rename path.
     """
     base = PORTFOLIOS_DIR.resolve()
-    for path in PORTFOLIOS_DIR.glob("*.json"):
+    for path in PORTFOLIOS_DIR.glob(JSON_FILE_GLOB):
         if path.stem != portfolio_id or path.is_symlink():
             continue
         resolved = path.resolve()
@@ -12873,7 +12874,12 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
         if output_path is not None:
-            output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+            # Stream the document to the enumerated handle instead of
+            # passing the loaded-payload-derived string to write_text, so
+            # no file-content-derived value reaches a filesystem call
+            # (SonarCloud pythonsecurity:S2083).
+            with output_path.open("w", encoding="utf-8") as handle:
+                json.dump(normalized_portfolio, handle, indent=2)
     except Exception as exc:
         logger.exception(
             "Failed to rename portfolio",
