@@ -29,11 +29,18 @@ jobs:
       # always required there and a permanent outage is noticed. A present
       # malformed slice still fails inside the tests either way.
       DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
+<<<<<<< HEAD
       # The published-strategy parity vendor data is downloaded, not committed
       # (see scripts/build_parity_published_fixtures.py and
       # tests/parity/vendor_data.py). Same contract as the differential slice:
       # cached path, warn-and-skip on pull requests when the download fails,
       # required on push to main.
+=======
+      # The web-strategy parity vendor data is downloaded, not committed (see
+      # scripts/fetch_parity_web_data.py and tests/parity/vendor_data.py). Same
+      # contract as the differential slice: cached path, warn-and-skip on pull
+      # requests when the download fails, required on push to main.
+>>>>>>> test/parity-web-strategies
       PARITY_VENDOR_DATA_DIR: ${{ github.workspace }}/.cache/parity-vendor
     steps:
       - uses: actions/checkout@v4
@@ -119,28 +126,48 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.cache/parity-vendor
-          # The key hashes the fixture builder and the code that defines the
-          # data contract (vendor_data.py read/validate rules).
-          key: parity-vendor-${{ hashFiles('scripts/build_parity_published_fixtures.py', 'tests/parity/vendor_data.py') }}
+          # The key hashes BOTH parity fetch scripts (this is the combined
+          # vendor-data step #194 owns; both fetches share one cache) plus the
+          # code that defines the data contract (vendor_data.py read/validate
+          # rules, the Dukascopy downloader, the resampler and the session
+          # calendar the RTH filter uses). A change to any of them must
+          # regenerate the cache, not reuse files built under the old rules.
+          key: parity-vendor-${{ hashFiles('scripts/fetch_parity_web_data.py', 'scripts/build_parity_published_fixtures.py', 'tests/parity/vendor_data.py', 'data_tools/**/*.py', 'shared/market_calendar.py') }}
       - name: Fetch the parity vendor data
         if: runner.os == 'Linux'
         id: fetch-parity
         shell: bash
         run: |
           set +e
+          uv run --no-sync --no-build python -m scripts.fetch_parity_web_data --skip-if-valid
+          web_status=$?
+          # A hard failure (validation or code error, exit 1) fails the step
+          # immediately; a download failure (exit 3) still lets the other
+          # fetch run so one throttled source does not hide the other.
+          if [ "$web_status" -ne 0 ] && [ "$web_status" -ne 3 ]; then
+            exit "$web_status"
+          fi
           uv run --no-sync --no-build python -m scripts.build_parity_published_fixtures --skip-if-valid
-          status=$?
+          pub_status=$?
           set -e
-          # Any non-zero status is a download failure with no usable cache. On
-          # pull requests (and workflow_dispatch) that warns and skips the
-          # real-data parity tests; on push to main the data is required, so
-          # the step - and the job - fails instead.
-          if [ "$status" -ne 0 ] && [ "${{ github.event_name }}" != "push" ]; then
+          if [ "$pub_status" -ne 0 ] && [ "$pub_status" -ne 3 ]; then
+            exit "$pub_status"
+          fi
+          # Exit 3 is a download failure with no usable cache. On pull requests
+          # (and workflow_dispatch) that warns and skips the real-data parity
+          # tests; on push to main the data is required, so the step - and the
+          # job - fails instead.
+          download_failed=false
+          for status in "$web_status" "$pub_status"; do
+            if [ "$status" -eq 3 ]; then download_failed=true; fi
+          done
+          if [ "$download_failed" = "true" ] && [ "${{ github.event_name }}" != "push" ]; then
             echo "::warning::parity vendor data download failed; the real-data parity tests will skip."
             echo "download_failed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          exit "$status"
+          if [ "$download_failed" = "true" ]; then exit 3; fi
+          exit 0
       - name: Tests
         if: runner.os == 'Linux'
         env:
