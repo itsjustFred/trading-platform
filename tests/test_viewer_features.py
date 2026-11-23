@@ -5025,7 +5025,14 @@ def test_create_portfolio_persists_p_value_and_psr(viewer_client, tmp_path):
             )
         ],
         equity_curve=_equity_curve_from_returns(
-            [0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012, 0.010, 0.011, 0.009, 0.013]
+            # Weekend rows no longer count toward the PSR observation
+            # minimum (#229 trading-day filter), so the fixture needs
+            # comfortably more than ten trading-day returns.
+            [
+                0.010, 0.012, 0.009, 0.014, 0.011, 0.013, 0.008, 0.012,
+                0.010, 0.011, 0.009, 0.013, 0.010, 0.012, 0.009, 0.011,
+                0.013, 0.008, 0.012, 0.010,
+            ]
         ),
     )
     result.save(backtests_dir / "portfolio-source.trades.json")

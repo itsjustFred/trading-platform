@@ -436,6 +436,9 @@ def _config(
         parameters["fee_flat_per_trade"] = fee_flat
     else:
         parameters["fees"] = "zero"
+    # #130: the reference fills are gross, so the engine run must declare the
+    # explicit no-slippage opt-out rather than inherit the per-class default.
+    parameters.setdefault("slippage", "none")
     return BacktestConfig(
         strategy_name="differential",
         symbols=["SYN"],

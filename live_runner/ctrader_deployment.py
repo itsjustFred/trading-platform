@@ -15,6 +15,26 @@ def _metric(row: dict[str, Any], key: str, default: float = 0.0) -> float:
     return default if math.isnan(value) else value
 
 
+# Rows written before #229 carry no `equity_return_periods_per_year` and were
+# annualised at sqrt(252) on the unfiltered calendar-filled series. Since the
+# 2026-11-22 decision stats.py drops weekend/holiday filler rows and
+# annualises at 252 (equities/FX/CFDs) or 365 (crypto); the residual
+# old-vs-new scale difference is ~sqrt(365/252) either way, so rescaling
+# legacy Sharpes onto the new basis keeps identical performance ranked
+# identically regardless of when the row was computed (#349 review,
+# maintainer Q2 option a). Approximate: dropping weekend zeros shifts
+# per-day Sharpe by ~sqrt(7/5) and holidays move it further — fine for
+# ranking, not for reporting.
+_LEGACY_SHARPE_RESCALE = math.sqrt(365.25 / 252.0)
+
+
+def _ranking_sharpe(row: dict[str, Any]) -> float:
+    sharpe = _metric(row, "sharpe_ratio")
+    if row.get("equity_return_periods_per_year") is None:
+        return sharpe * _LEGACY_SHARPE_RESCALE
+    return sharpe
+
+
 def _has_oos_evidence(row: dict[str, Any]) -> bool:
     """Whether a backtest row carries out-of-sample evidence (C5).
 
@@ -48,7 +68,7 @@ def score_backtest_for_live(row: dict[str, Any]) -> float:
     for key in ("sharpe_ratio", "cagr", "psr", "max_drawdown"):
         if key in row and row[key] is None:
             return float("-inf")
-    sharpe = _metric(row, "sharpe_ratio")
+    sharpe = _ranking_sharpe(row)
     cagr = min(max(_metric(row, "cagr"), -1.0), 1.0)
     psr = min(max(_metric(row, "psr"), 0.0), 1.0)
     # Payload `max_drawdown` is a fraction (0.25 = 25 %), signed negative by
@@ -86,7 +106,7 @@ def top_backtests_for_ctrader(
     candidates.sort(
         key=lambda item: (
             _metric(item, "live_deployment_score"),
-            _metric(item, "sharpe_ratio"),
+            _ranking_sharpe(item),
             _metric(item, "trade_count"),
             str(item.get("created_at") or ""),
         ),

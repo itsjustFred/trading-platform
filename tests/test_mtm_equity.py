@@ -489,7 +489,7 @@ def _config(tmp_path: Path, symbols: list[str]) -> BacktestConfig:
         modeling_resolution="main_timeframe",
         signal_exit_fill="close",
         data_dir=str(tmp_path),
-        parameters={"fees": "zero"},
+        parameters={"fees": "zero", "slippage": "none"},
     )
 
 
