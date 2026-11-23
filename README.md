@@ -175,6 +175,11 @@ tests/               — Test suite
 | `UVICORN_HOST` | `0.0.0.0` | Recommended host for `python -m uvicorn viewer.main:app` |
 | `UVICORN_PORT` | `5556` | Recommended port for `python -m uvicorn viewer.main:app` |
 | `NVIDIA_API_KEY` | — | API key for the Strategy Lab auto-conversion agent via NVIDIA NIM |
+| `OPS_ALERT_WEBHOOK_URL` | — | Discord-compatible webhook for ops alerts from the live daemon (`ERROR`/`CRITICAL` records plus records carrying a `data.alert` marker). Empty disables alerting |
+| `OPS_ALERT_MAX_PER_MINUTE` | `12` | Ops alerts per sliding minute before overflow is dropped |
+| `OPS_ALERT_DEDUP_SECONDS` | `300` | Ops alerts with the same dedup key (alert marker or message template, scoped by account/deployment/symbol) inside this window are sent once |
+| `OPS_ALERT_MIN_LEVEL` | `ERROR` | Minimum level for level-triggered ops alerts (level name or number); `data.alert` markers bypass this floor. Invalid values fall back to `ERROR` |
+| `OPS_ALERT_EVENTS` | — | Comma-separated allowlist of event classes (a record's `data.alert` marker or logger name); when set, only matching records alert. Empty/unset alerts everything |
 
 ## FastAPI + WebSocket
 
