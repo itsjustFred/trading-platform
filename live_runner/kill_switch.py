@@ -39,6 +39,7 @@ from time import monotonic
 from typing import Any
 
 from live_runner.base_adapter import BaseLiveAdapter
+from live_runner.shutdown import BrokerMutationGate
 from shared.database import (
     KILL_SWITCH_GLOBAL_SCOPE,
     read_live_kill_switch_scopes,
@@ -631,6 +632,7 @@ async def enforce_live_kill_switch(
     account_ids: Iterable[str] | None = None,
     *,
     state: KillSwitchState | None = None,
+    mutation_gate: BrokerMutationGate | None = None,
 ) -> KillSwitchEnforcementReport:
     """Enforce every halt that needs the broker, once per tick.
 
@@ -644,6 +646,15 @@ async def enforce_live_kill_switch(
     leaves the broker untouched, because liquidating on a read failure is a money
     event the operator never asked for. The halt it could not read is still
     persisted, so the next readable tick enforces it.
+
+    ``mutation_gate`` is the daemon's shutdown drain guard, taken exactly like
+    the STOPPED enforcement's and the trailing stops': each account's sweep
+    registers on the shutdown ledger as one unit, so a sweep already at the
+    broker when the stop flag lands is drained rather than cancelled
+    mid-request, and no sweep starts once the flag is set. A refused sweep is
+    reported ``unmet`` - the sweep ledger is only written on a completed sweep,
+    so the halt stays due and the next tick or the next daemon start retries
+    it.
     """
     resolved = state if state is not None else await asyncio.to_thread(read_kill_switch_state)
     if not resolved.readable:
@@ -686,7 +697,30 @@ async def enforce_live_kill_switch(
             continue
         if not resolved.sweep_is_due(account_id, mode):
             continue
-        if await _sweep_halted_account(account_id, adapter, mode, resolved):
+        if mutation_gate is None:
+            swept_clean = await _sweep_halted_account(
+                account_id, adapter, mode, resolved
+            )
+        else:
+            async with mutation_gate() as may_sweep:
+                if not may_sweep:
+                    logger.warning(
+                        "Skipping the kill-switch sweep: the daemon is shutting "
+                        "down; the halt stays enforced at the entry gate and the "
+                        "sweep is retried on the next start",
+                        extra={
+                            "data": {
+                                "account_id": account_id,
+                                "mode": mode.value,
+                            }
+                        },
+                    )
+                    unmet.append(account_id)
+                    continue
+                swept_clean = await _sweep_halted_account(
+                    account_id, adapter, mode, resolved
+                )
+        if swept_clean:
             resolved.record_sweep(account_id, mode)
             swept.append(account_id)
         else:
