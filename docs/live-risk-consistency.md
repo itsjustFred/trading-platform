@@ -50,7 +50,9 @@ Where:
 - `risk_amount = balance * risk_percent`
 - `risk_percent = min(max_risk_per_trade, max_total_exposure - current_exposure)`
 - `position_size = min(position_size, max_notional_per_trade * balance / (entry_price * pip_value))`
-  (notional ceiling, `max_notional_per_trade` as a fraction of the balance, default 0.20).
+  (notional ceiling, `max_notional_per_trade` as a fraction of the balance, default 0.20;
+  values above 1 are leverage and are bounded by the broker maximum for the account and
+  asset — `min(configured, broker_max_leverage)`, 1x when unknown, #240).
   The notional of one position in account currency is `position_size * entry_price * pip_value`
   (#146: without `* pip_value` the ceiling was 1000x too loose for cTrader FX).
 - `pip_value` is the P&L of **one** `position_size` unit per price move of 1.0, in
@@ -65,7 +67,7 @@ All risk limits are fractions of the account balance (fraction of balance):
 |----------|------|
 | `max_risk_per_trade` | Fraction of the balance (maximum loss per trade) |
 | `max_total_exposure` / `current_exposure` | Fraction of the balance (aggregate open risk) |
-| `max_notional_per_trade` | Fraction of the balance (notional ceiling per position) |
+| `max_notional_per_trade` | Fraction of the balance (notional ceiling per position; >1 = leverage, bounded by broker max) |
 | `SizedOrder.position_size` / `qty` | Account-currency units of the symbol (shares/lots) |
 
 Trust boundary: signal metadata is **untrusted** publisher payload. It may only supply
@@ -139,13 +141,13 @@ Persisted on the signal: `pip_value`, `pip_value_source`, `pip_value_units_per_q
 overwritten.
 
 Consequence of the corrected notional cap: `RiskConfig` accepts
-`max_notional_per_trade <= 1` (no leverage; `risk/config.py:62-63`). On a 100-USD account
-0.01 lot EURUSD (~1,100 USD notional) is already above that cap, so such entries are
-refused (below `minVolume`).
-**Pending #240:** the maintainer decided on 2026-11-16 that leverage may be allowed up to
-the broker maximum per account and asset, with the entry size (risk at the stop) keeping
-the exposure sane. No PR implements it yet, so the 1× ceiling is a current validation
-limit and not a permanent design rule.
+`max_notional_per_trade` above 1 — that is leverage, bounded by the broker
+maximum for the account and asset (#240; `risk/config.py` validates only
+`> 0`, the effective ceiling is `min(configured, broker_max_leverage)` with an
+undeterminable maximum failing closed to 1x). On a 100-USD account
+0.01 lot EURUSD (~1,100 USD notional) is already above the default 0.20 cap,
+so such entries are refused (below `minVolume`) unless the deployment raises
+`max_notional_per_trade` and the broker maximum allows it.
 
 ## Single Level Resolver (#125)
 
@@ -330,9 +332,10 @@ bewusst zwei Audit-Zeilen — Klemme und Verweigerung); lässt die
 freie Marge nicht einmal einen Lot-Step zu, wird abgelehnt
 (`broker_leverage_cap`). Die Klemme ist damit ein Backstop gegen eine
 kaputte Größe, keine Platform-Notional-Policy: das Sizing deckelt den
-Notional pro Order weiterhin bei `max_notional_per_trade` (Default 0.20;
-`RiskConfig` lehnt Werte > 1 ab) — diese Obergrenze bleibt bis zur
-#240-Entscheidung bestehen.
+Notional pro Order bei `max_notional_per_trade` (Default 0.20; `RiskConfig`
+erlaubt seit #240 Werte > 1) — die effektive Obergrenze ist
+`min(konfiguriert, broker_max_leverage)`, bei unbestimmtem Broker-Maximum
+fail-closed 1× (`risk.config.effective_max_notional_per_trade`).
 
 Notional und Stop-Risk rechnen gegen das Account-**Equity** — und zwar gegen
 den **Mark-to-Market**-Wert über `adapter.get_equity()`: auf Alpaca ist das

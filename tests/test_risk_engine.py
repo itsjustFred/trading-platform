@@ -15,12 +15,27 @@ from shared.models import LiveDeploymentConfig, LiveSignal
 
 @pytest.mark.parametrize(
     "field_name",
-    ["max_risk_per_trade", "max_total_exposure", "max_notional_per_trade"],
+    ["max_risk_per_trade", "max_total_exposure"],
 )
 @pytest.mark.parametrize("value", [0.0, -0.01, 1.01, math.nan, math.inf])
 def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
     with pytest.raises(ValueError):
         RiskConfig(**{field_name: value})
+
+
+@pytest.mark.parametrize("value", [0.0, -0.01, math.nan, math.inf])
+def test_risk_config_rejects_non_positive_notional_cap(value):
+    with pytest.raises(ValueError):
+        RiskConfig(max_notional_per_trade=value)
+
+
+@pytest.mark.parametrize("value", [0.2, 1.0, 1.01, 50.0])
+def test_risk_config_accepts_notional_cap_above_one(value):
+    """#240: max_notional_per_trade may exceed 1x — leverage up to the broker
+    maximum. The broker bound is applied by each sizing path
+    (``effective_max_notional_per_trade``), not by this validation."""
+    config = RiskConfig(max_notional_per_trade=value)
+    assert config.max_notional_per_trade == value
 
 
 @pytest.mark.parametrize(
@@ -30,6 +45,28 @@ def test_risk_config_rejects_exposure_outside_fraction_range(field_name, value):
 def test_risk_config_accepts_upper_fraction_boundary(field_name):
     config = RiskConfig(**{field_name: 1.0})
     assert getattr(config, field_name) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("configured", "broker_max", "expected"),
+    [
+        (5.0, 3.0, 3.0),    # broker maximum binds below the configured cap
+        (5.0, 50.0, 5.0),   # configured cap binds below the broker maximum
+        (0.2, 50.0, 0.2),   # sub-1x configs are unchanged by a high broker max
+        (5.0, None, 1.0),   # unknown broker maximum fails closed to 1x
+        (0.2, None, 0.2),
+        (5.0, math.nan, 1.0),
+        (5.0, 0.0, 1.0),
+        (5.0, -3.0, 1.0),
+        (5.0, math.inf, 1.0),
+        (5.0, "x", 1.0),
+        (5.0, True, 1.0),
+    ],
+)
+def test_effective_max_notional_per_trade(configured, broker_max, expected):
+    from risk.config import effective_max_notional_per_trade
+
+    assert effective_max_notional_per_trade(configured, broker_max) == pytest.approx(expected)
 
 
 def _risk_decision(risk_percent: float) -> RiskDecision:
