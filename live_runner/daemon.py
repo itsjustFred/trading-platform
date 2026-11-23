@@ -159,6 +159,7 @@ from live_runner.stockkit_routing import (
     validate_stockkit_deployment_route,
 )
 from live_runner.supertrend_flip import (
+    FLIP_SUPPORTED_BROKERS,
     LiveSupertrendFlipManager,
     run_supertrend_flip_loop,
 )
@@ -231,7 +232,9 @@ from shared.single_instance import (
 )
 from shared.trailing import (
     ANY_BROKER,
+    TRAILING_MODE_SUPERTREND_FLIP,
     TRAILING_SL_CONFIG_METADATA_KEY,
+    deployment_supertrend_flip_enabled,
     validate_live_deployment_trailing_mode,
     validate_trailing_sl_config,
 )
@@ -995,7 +998,7 @@ def _apply_signal_processor(
     # the signal.
     validate_trailing_sl_config(
         (processed.metadata or {}).get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=adapter_live_trailing_modes(adapter),
+        supported=_live_signal_trailing_modes(adapter, deployment),
         context=(
             f"live deployment '{deployment.strategy_name}' ({deployment.id}) "
             f"signal processor '{processor_name}'"
@@ -1619,6 +1622,53 @@ def _describe_exit_rows(
     )
 
 
+def _live_signal_trailing_modes(
+    adapter: BaseLiveAdapter | None, deployment: LiveDeploymentConfig
+) -> frozenset[str]:
+    """Trailing modes a signal may request through THIS adapter+deployment.
+
+    ``adapter_live_trailing_modes`` covers the broker table plus the
+    adapter's stop-amendment capability. ``supertrend_flip`` is the single
+    exception (#168): the cTrader broker table lists it, but it runs ONLY for
+    a deployment carrying the explicit ``live_supertrend_flip`` settings
+    opt-in on a provably demo/paper cTrader account
+    (``supports_supertrend_flip`` + ``_adapter_is_demo``). Every other
+    combination resolves to the adapter's own modes - fail closed, exactly
+    the ``main`` behaviour for live and non-opted accounts.
+    """
+    modes = adapter_live_trailing_modes(adapter)
+    try:
+        flip_ok = (
+            str(getattr(adapter, "broker_name", "") or "").strip().lower()
+            in FLIP_SUPPORTED_BROKERS
+            and getattr(adapter, "supports_supertrend_flip", False) is True
+            and deployment_supertrend_flip_enabled(deployment)
+            and adapter is not None
+            and _adapter_is_demo(adapter)
+        )
+    except Exception:  # except-kind: money-decision
+        flip_ok = False
+    if flip_ok:
+        return modes | {TRAILING_MODE_SUPERTREND_FLIP}
+    return modes - {TRAILING_MODE_SUPERTREND_FLIP}
+
+
+async def _flip_exit_in_flight_check(
+    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
+) -> bool:
+    """True when any exit for this deployment+symbol may still be working.
+
+    Wraps :func:`_ensure_no_exit_in_flight` for the flip manager: its own
+    working exit (``ExitInFlightError``) and other deployments' working exits
+    both mean "defer this close", never "submit anyway".
+    """
+    try:
+        others = await _ensure_no_exit_in_flight(adapter, deployment, symbol)
+    except ExitInFlightError:
+        return True
+    return bool(others)
+
+
 async def _ensure_no_exit_in_flight(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
 ) -> list[dict[str, Any]]:
@@ -2203,7 +2253,7 @@ async def prepare_order_with_risk(
     # _apply_signal_processor).
     validate_trailing_sl_config(
         metadata.get(TRAILING_SL_CONFIG_METADATA_KEY),
-        supported=adapter_live_trailing_modes(adapter),
+        supported=_live_signal_trailing_modes(adapter, deployment),
         context=f"live deployment '{deployment.strategy_name}' ({deployment.id}) order submission",
     )
     validate_adapter_trailing_timeframe(
@@ -7264,7 +7314,11 @@ async def _run_daemon_locked(
             # this wiring cannot turn the mode on by itself.
             flip_task = asyncio.create_task(
                 run_supertrend_flip_loop(
-                    LiveSupertrendFlipManager(mutation_gate=_broker_mutation),
+                    LiveSupertrendFlipManager(
+                        mutation_gate=_broker_mutation,
+                        exit_lock=_exit_lock,
+                        exit_in_flight_check=_flip_exit_in_flight_check,
+                    ),
                     eligible_adapters=lambda: _trailing_eligible_adapters(
                         active_adapters
                     ),

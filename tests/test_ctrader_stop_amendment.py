@@ -95,8 +95,23 @@ def _wire_amend_types(adapter: CTraderLiveAdapter) -> None:
     adapter._ProtoOATradeSide = ProtoOATradeSide
 
 
-def test_supports_stop_amendment_is_declared() -> None:
-    assert _adapter().supports_stop_amendment is True
+def test_flip_capability_is_demo_scoped_and_stop_amendment_stays_off() -> None:
+    """#168 review: the flip-workflow stop primitives exist for opted-in demo
+    deployments only. The adapter must NOT declare ``supports_stop_amendment``
+    (that would leak stop listing/amendment into the percent-trailing path and
+    the broker reconciler for every cTrader account); ``supports_supertrend_flip``
+    is the single gated capability."""
+    adapter = _adapter()
+    assert adapter.supports_stop_amendment is False
+    assert adapter.supports_supertrend_flip is True
+    live = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+        demo=False,
+    )
+    assert live.supports_supertrend_flip is False
 
 
 def test_list_protective_stops_synthesizes_from_position_stop() -> None:

@@ -96,37 +96,37 @@ Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROK
 
 | Broker  | `none` | `percent` | `supertrend_flip` |
 |---------|--------|-----------|-------------------|
-| Alpaca  | yes    | yes       | no (see below)    |
-| cTrader | yes    | no        | no                |
+| Alpaca  | yes    | yes       | no                |
+| cTrader | yes    | no        | opt-in only       |
 
-cTrader stays on `none`: the daemon has no cTrader market data to trail on, and the adapter does
-not declare the `supports_stop_amendment` capability. Unknown brokers get `none` only.
+cTrader `percent` stays off: the adapter deliberately does not declare
+`supports_stop_amendment`, so the percent trail and the broker reconciler treat every cTrader
+account exactly as before. `supertrend_flip` runs live on cTrader ONLY for a deployment that
+carries the explicit opt-in and whose account is provably demo/paper:
 
-**Why `supertrend_flip` is not live yet (#168)**
+- **Opt-in key:** `settings.live_supertrend_flip` on the `LiveDeploymentConfig` (truthy:
+  `true`, `"true"`, `"1"`, `"yes"`, `"on"`). Absent or unrecognized values fail closed - the
+  mode is refused at deployment validation and at signal time.
+- **Account gate:** the adapter must be a cTrader demo/paper account
+  (`supports_supertrend_flip` + the daemon's `_adapter_is_demo` check). Live cTrader accounts
+  and every non-opted deployment behave exactly as on `main`.
+- **Workflow** (`live_runner/supertrend_flip.py`): TP1 partial close sized to the broker's
+  volume step, intent persisted before every submit, confirmation from broker-reported closed
+  volume (position drop AND the execution ledger - a partial fill completes the tranche and is
+  never resubmitted), the plan bound to the broker `position_id` recorded at entry fill
+  (mismatch = alert + no action), breakeven stop after the TP1 bar (never loosens a tighter
+  stop), then Supertrend-flip exit of the remainder at market. Flip closes route through the
+  daemon's per-symbol exit lock and in-flight-exit check.
+- **Live/replay differences (accepted):** live TP1 triggers on bid polling, so an intrapoll
+  wick that replay's bar-high would catch can be missed; live closes the remainder at market
+  while replay fills at the next bar's open. cTrader serves only sub-day bars
+  (`1m`/`5m`/`15m`/`30m`/`1h`) for this workflow because the broker anchors `4h`/`1d`/`1w` to
+  its server day/week, not the UTC alignment replay uses.
 
-The replay backtest executes it (`runner/engines/signal_replay_adapter.py`); live rejects it on
-every broker, at deployment validation and at signal time like any other unsupported mode. The
-blocker is the entry order, not the trailing loop:
-
-- The Alpaca entry is a BRACKET for the full quantity. Its take-profit leg sits at the signal's
-  `take_profit`, which for RamJet *is* the TP1 price, so a `supertrend_flip` entry would close
-  100 % at TP1 instead of `tp1_exit_percent`.
-- Alpaca reserves the quantity of every working reducing-side order. While the bracket's stop
-  leg holds the full quantity, no separate TP1 limit (or partial market) order for part of it
-  is accepted, and shrinking the stop first would leave the TP1 part without a stop.
-
-Proposed design for the follow-up: for `supertrend_flip` entries, submit the position as two
-orders with deterministic client order ids derived from the signal id: a BRACKET for the TP1
-tranche (take profit at TP1, stop at the initial stop) and an OTO for the remainder (stop only).
-Tranche quantities must be whole shares (Alpaca brackets refuse fractional quantities) and the
-rounding must be mirrored by the replay. The trailing loop then (a) detects TP1 as the tranche
-bracket's take-profit fill and amends the remainder's stop to breakeven with the existing
-replace, (b) evaluates the RamJet Supertrend on each closed bar, with enough history to match the
-replay's warm-up, and (c) on the first red bar after activation closes the remainder through the
-adapter's locked flatten path (cancel, close, restore the stop on failure), so no stop is left
-orphaned. The only state that is not derivable from the broker is "activated"; it would be
-persisted on the entry signal row (`live_signals.metadata`). This changes order submission,
-recovery and fill reconciliation, which today assume one broker order per signal.
+**Alpaca remains replay-only** (#168 route (a), built on #350): the Alpaca entry is a
+full-quantity bracket whose take-profit leg sits at the TP1 price, so a partial TP1 exit needs
+a different entry order structure first - see #350. cTrader needed none of that: it closes
+part of a position natively.
 
 **Replay semantics to mirror live (decided 2026-11-16, `#176`)**
 

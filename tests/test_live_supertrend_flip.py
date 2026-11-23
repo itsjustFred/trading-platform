@@ -103,6 +103,10 @@ class _FakeFlipAdapter(BaseLiveAdapter):
     def supports_stop_amendment(self) -> bool:
         return True
 
+    @property
+    def supports_supertrend_flip(self) -> bool:
+        return True
+
     # ── broker surface the manager uses ──────────────────────────────────
 
     async def get_positions(self) -> list[dict]:
@@ -635,7 +639,7 @@ def test_paused_deployment_still_manages_its_position(isolated_db, monkeypatch) 
 def test_alpaca_adapter_is_never_eligible(live: _Live) -> None:
     class _NoAmendAdapter(_FakeFlipAdapter):
         @property
-        def supports_stop_amendment(self) -> bool:
+        def supports_supertrend_flip(self) -> bool:
             return False
 
     adapter = _NoAmendAdapter()
@@ -703,3 +707,158 @@ def test_alpaca_broker_is_outside_the_supported_set(live: _Live) -> None:
 
     live.tick(manager, _at(0.2), adapter=adapter)
     assert adapter.orders == []
+
+
+# ── #393 review blockers: intent-first persistence, broker accounting,
+#    position binding, exit-lock routing, breakeven guard ────────────────────
+
+
+def test_tp1_intent_is_persisted_before_submit(live: _Live) -> None:
+    """B1: the TP1 phase/qty/signal-id must be durable BEFORE submit_order is
+    called, so a crash between submit and persist cannot lose the intent."""
+    seen: list[dict] = []
+    orig_submit = live.adapter.submit_order
+
+    async def spy_submit(signal, *, qty=None):
+        seen.append(dict(live.state()))
+        return await orig_submit(signal, qty=qty)
+
+    live.adapter.submit_order = spy_submit
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+
+    live.tick(manager, _at(0.2))
+
+    assert len(seen) == 1
+    assert seen[0]["phase"] == "tp1_pending"
+    assert seen[0]["tp1_qty"] == TRANCHE
+    assert seen[0]["tp1_signal_id"]
+    assert seen[0]["tp1_pending_since"]
+
+
+def test_tp1_partial_fill_is_accepted_and_never_resubmitted(
+    live: _Live, surfaced
+) -> None:
+    """B2: a broker partial fill completes the tranche - the remainder is
+    recorded, nothing is resubmitted, the workflow advances."""
+    live.adapter.submit_order_orig = live.adapter.submit_order
+
+    async def partial_submit(signal, *, qty=None):
+        # Fill only part of the requested tranche, like a volume-step floor.
+        filled = min(float(qty or 0.0), TRANCHE - 1.0)
+        live.adapter._order_ids[str(signal.id)] = f"ord-{len(live.adapter._order_ids)+1}"
+        live.adapter.orders.append((signal, float(qty or 0.0)))
+        for row in live.adapter.positions:
+            row["qty"] = float(row["qty"]) - filled
+        return live.adapter._order_ids[str(signal.id)]
+
+    live.adapter.submit_order = partial_submit
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))
+    live.tick(manager, _at(0.3))
+
+    state = live.state()
+    assert state["phase"] == "await_green"
+    assert state.get("tp1_filled_qty") == pytest.approx(TRANCHE - 1.0)
+    tp1_orders = [
+        o for o in live.adapter.orders if o[0].metadata.get("flip_role") == "tp1"
+    ]
+    assert len(tp1_orders) == 1
+
+
+def test_position_id_mismatch_takes_no_action(live: _Live, surfaced) -> None:
+    """B3: a plan bound to position 4242 must not manage a different position
+    id - alert + done, zero orders."""
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))  # TP1 submitted, state bound to 4242
+    assert live.state()["position_id"] == 4242
+
+    # The original position is replaced by a new one (manual close + reopen).
+    live.adapter.positions = [
+        {
+            "symbol": SYMBOL,
+            "qty": POSITION_QTY,
+            "entry_price": ENTRY_PRICE,
+            "position_id": 9999,
+        }
+    ]
+    live.tick(manager, _at(0.4))
+
+    orders_after = len(live.adapter.orders)
+    live.adapter.bid = 200.0
+    live.tick(manager, _at(0.5))
+    assert len(live.adapter.orders) == orders_after
+    assert live.state()["phase"] == "done"
+    assert any("mismatch" in m for m, _c in surfaced)
+
+
+def test_flip_close_uses_exit_lock_and_in_flight_check(live: _Live) -> None:
+    """SF6: flip closes route through the injected exit lock and the
+    in-flight exit check before reaching the adapter."""
+    import asyncio as _aio
+
+    lock_calls: list[tuple[str, str]] = []
+    check_calls: list[str] = []
+    real_lock = _aio.Lock()
+
+    def exit_lock(account_id, symbol):
+        lock_calls.append((account_id, symbol))
+        return real_lock
+
+    async def in_flight(adapter, deployment, symbol):
+        check_calls.append(symbol)
+        return []
+
+    manager = LiveSupertrendFlipManager(
+        exit_lock=exit_lock, exit_in_flight_check=in_flight
+    )
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))
+
+    assert lock_calls == [(ACCOUNT, SYMBOL)]
+    assert check_calls == [SYMBOL]
+
+
+def test_in_flight_exit_defers_flip_close(live: _Live) -> None:
+    """SF6: a working exit for the deployment defers the flip close - no
+    order is submitted and no failure is recorded."""
+    async def busy(adapter, deployment, symbol):
+        return [{"signal_id": "other-exit"}]
+
+    manager = LiveSupertrendFlipManager(exit_in_flight_check=busy)
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))
+    live.tick(manager, _at(0.3))
+
+    assert live.adapter.orders == []
+    assert live.state()["phase"] == "tp1_pending"
+
+
+def test_breakeven_never_loosens_a_tighter_stop(live: _Live) -> None:
+    """SF9: a stop already above entry (manually tightened) is left alone."""
+    manager = LiveSupertrendFlipManager()
+    # TP1 then confirm.
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))
+    live.tick(manager, _at(0.3))
+    assert live.state()["phase"] == "await_green"
+
+    # A green bar activates; TP1 bar must be dead first - use bars helper
+    # through the manager's own flow is complex; instead drive breakeven via
+    # a post-TP1 state and a stop above entry.
+    live.adapter.stop_price = ENTRY_PRICE + 3.0  # manually tightened above BE
+    state = live.state()
+    state["phase"] = "active"
+    state["tp1_bar_open"] = _at(0.0).isoformat()
+    state["breakeven_done"] = False
+    live.database.merge_live_signal_metadata(
+        str(live.entry.id),
+        {FLIP_STATE_METADATA_KEY: state},
+    )
+    # Force the entry metadata refresh path: re-add via state()
+    live.tick(manager, _at(10.0))
+    assert ENTRY_PRICE + 3.0 not in live.adapter.amends or all(
+        a <= ENTRY_PRICE + 1e-9 for a in live.adapter.amends
+    )

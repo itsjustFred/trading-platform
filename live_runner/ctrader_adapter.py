@@ -21,6 +21,7 @@ import pandas as pd
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_FILLED,
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
@@ -260,10 +261,13 @@ _TRENDBAR_PERIOD_SECONDS: dict[str, int] = {
     "MN1": 2_592_000,
 }
 
-#: Canonical deployment timeframes the cTrader adapter can serve (#168). The
+#: Canonical deployment timeframes the cTrader adapter can serve for the
+#: live ``supertrend_flip`` workflow (#168). Only sub-day bars: the broker
+#: anchors ``4h``/``1d``/``1w`` to its server day/week, which is not provably
+#: the UTC alignment replay uses, so the flip workflow refuses them. The
 #: per-broker live-trailing table in ``shared.trailing`` mirrors this set.
 CTRADER_MARKET_DATA_TIMEFRAMES: frozenset[str] = frozenset(
-    {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+    {"1m", "5m", "15m", "30m", "1h"}
 )
 
 
@@ -4172,10 +4176,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         status_enum = self._ProtoOAOrderStatus
         if status == int(status_enum.ORDER_STATUS_ACCEPTED):
             return ORDER_STATE_WORKING
+        if status == int(status_enum.ORDER_STATUS_FILLED):
+            return ORDER_STATE_FILLED
         terminal = {
             int(getattr(status_enum, name))
             for name in (
-                "ORDER_STATUS_FILLED",
                 "ORDER_STATUS_REJECTED",
                 "ORDER_STATUS_EXPIRED",
                 "ORDER_STATUS_CANCELLED",
@@ -4430,15 +4435,18 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     # cTrader has no standalone protective-stop order: a position's stopLoss /
     # takeProfit live on the position itself and are amended atomically through
     # ProtoOAAmendPositionSLTPReq. The previous levels keep working until the
-    # broker accepts the new ones, and a refused request changes nothing - which
-    # is what makes `supports_stop_amendment` safe to declare. Because the
-    # request has no dedicated response message, success is never taken from
-    # the send: the position is re-read from the broker and the amendment only
-    # counts once the broker reports the new stop.
+    # broker accepts the new ones, and a refused request changes nothing.
+    # These primitives exist ONLY for the opt-in live ``supertrend_flip``
+    # workflow on demo/paper accounts: the adapter deliberately does NOT
+    # declare ``supports_stop_amendment``, so the percent-trailing path and
+    # the broker reconciler treat every cTrader account exactly as on main.
+    # ``supports_supertrend_flip`` is the single capability the flip manager
+    # and the daemon's signal gates check, and it is demo-only.
 
     @property
-    def supports_stop_amendment(self) -> bool:
-        return True
+    def supports_supertrend_flip(self) -> bool:
+        """Live flip workflow requires a provably demo/paper account."""
+        return self.demo is True
 
     async def list_protective_stops(self) -> list[ProtectiveStop]:
         """One amendable protective stop per open position that has one.
