@@ -173,8 +173,8 @@ from shared.database import (
     list_live_deployments,
     list_services,
     list_stopped_enforced_deployment_ids,
-    live_deployment_entries_halted,
     live_db_path,
+    live_deployment_entries_halted,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
     renew_live_deployment_submission,
@@ -3350,7 +3350,7 @@ async def _persist_submission_rejection(
             ),
             timeout=max(0.0, deadline - loop.time()),
         )
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         logger.warning(
             "Could not persist live signal rejection",
             extra={

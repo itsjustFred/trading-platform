@@ -525,7 +525,7 @@ def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCAL
 def _enum_name_or_none(name_fn: Any, value: int) -> str | None:
     try:
         return str(name_fn(value))
-    except Exception:
+    except Exception:  # except-kind: loop-survival
         return None
 
 
