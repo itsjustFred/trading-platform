@@ -76,6 +76,9 @@ def _run_engine(slug: str, tmp_path: Path) -> EngineRun:
     parameters = (
         {"fee_rate": fee_rate, "fee_flat_per_trade": 0.0} if fee_rate else {"fees": "zero"}
     )
+    # #130: the reference trades are gross fills; declare the explicit
+    # no-slippage opt-out rather than inherit the per-class default.
+    parameters["slippage"] = "none"
     config = BacktestConfig(
         strategy_name="ref_parity",
         symbols=[SYMBOL],
