@@ -29,6 +29,7 @@ from runner.approval_gate import require_generated_strategy_approval
 from runner.daily_equity import attach_daily_equity
 from runner.engines.base import (
     BacktestConfig,
+    native_strategy_parameter_errors,
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
     warn_if_engine_frozen,
@@ -864,6 +865,18 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _assert_native_strategy_parameters(engine: str, strategy: str, params: dict[str, Any]) -> None:
+    if str(engine).strip().lower() != "native":
+        return
+    # Every grid cell runs with this same ``params`` dict (cells differ only by
+    # symbol/timeframe — there is no per-cell parameter sweep), so checking it
+    # once here refuses a trailing-stop request up front for the whole grid.
+    # ``NativeAdapter.run`` repeats the check per cell as a backstop.
+    parameter_errors = native_strategy_parameter_errors(strategy, params)
+    if parameter_errors:
+        raise ValueError("; ".join(parameter_errors))
+
+
 def run_backtest_grid(
     *,
     strategy: str,
@@ -916,6 +929,7 @@ def run_backtest_grid(
     # believes slippage was applied (grid/walk-forward/matrix default to
     # vectorbt, which has no slippage code path).
     assert_slippage_supported(engine, params)
+    _assert_native_strategy_parameters(engine, strategy, params)
 
     summary: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(),
