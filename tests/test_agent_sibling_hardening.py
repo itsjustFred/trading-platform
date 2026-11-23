@@ -580,6 +580,18 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     exit 1
     ;;
   kilo-400) printf '\\033[91mError: \\033[0mProvider returned error\\n' >&2; exit 1 ;;
+  nvidia-429)
+    for n in 1 2 3; do
+      printf '! retrying (attempt %s): HTTP 429: Too Many Requests\\n' "$n" >&2
+    done
+    printf 'Error: Provider request failed with HTTP 429: Too Many Requests\\n' >&2
+    exit 1
+    ;;
+  nvidia-retry-ok)
+    printf '! retrying (attempt 1): Provider request failed with HTTP 429: Too Many Requests\\n' >&2
+    printf 'OK\\n'
+    exit 0
+    ;;
 esac
 """
 
@@ -731,7 +743,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         transient = (
             "usage limit|rate.?limit|quota|insufficient credits|limit reached|"
             "not available in your country|service unavailable|overloaded|"
-            "sign up for free to continue"
+            "sign up for free to continue|too many requests"
         )
         dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
         assert body.count(dead_end_grep) == 2, (
@@ -748,6 +760,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             "quota-verdict",
             "kilo-429",
             "kilo-signup",
+            "nvidia-429",
             "verdict",
             "garbage",
             "other",
@@ -785,7 +798,9 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
                 text=True,
             )
             comment = runner_temp / stage / "comment.md"
-            if mode in ("quota", "quota-zero", "quota-verdict", "kilo-429", "kilo-signup"):
+            if mode in (
+                "quota", "quota-zero", "quota-verdict", "kilo-429", "kilo-signup", "nvidia-429"
+            ):
                 assert result.returncode == 0, (
                     f"{name}: the quota path failed the step:\n{result.stderr}"
                 )

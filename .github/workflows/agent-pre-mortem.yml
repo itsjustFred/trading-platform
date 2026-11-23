@@ -65,6 +65,7 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 #
 # opencode's free Zen models (and Kilo's, see Configuration) need no login and
 # no API key, so this workflow holds no secret besides the default GITHUB_TOKEN
+# (and, only for an `nvidia/...` model, ACTIONS_NVIDIA_API_KEY - see Configuration)
 # of the jobs that run no repo code. Those models do cap usage, and an exhausted cap must not read as a
 # pre-mortem result: the `quota-probe` job pings the same model before the
 # agent job installs anything, and a cap, rate limit or region refusal there
@@ -135,6 +136,14 @@ run-name: "Agent Pre-Mortem PR #${{ github.event.pull_request.number || github.e
 # quota path like a Zen cap. Kilo's free models may train on prompts - this
 # repository is public. Variants are per model and not always the ones Kilo lists:
 # opencode 2.2.7 refused Ling 3.2 Flash's `thinking` and took `high`.
+#
+# A `nvidia/<model>` value (e.g. nvidia/stepfun-ai/step-5-preview) runs the stage on
+# NVIDIA's API with the ACTIONS_NVIDIA_API_KEY repository secret. Only the probe step
+# and the agent step receive it, and only for an `nvidia/...` model; every other model
+# runs with no secret, as before. The agent has a shell, so the key is reachable from
+# the agent's environment: accepted for a free-tier key on same-repo PRs (forks are
+# skipped and get no secrets). NVIDIA's free tier limits per key, not per IP, and the
+# key is shared with local use. A 429 ("Too Many Requests") takes the quota path.
 
 on:
   pull_request:
@@ -390,6 +399,12 @@ jobs:
           # reached the configured model.
           if [ "${MODEL%%/*}" = "kilo" ]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
+          elif [ "${MODEL%%/*}" = "nvidia" ]; then
+            # An `nvidia/...` model runs on NVIDIA's API with the key from the
+            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
+            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
+            # reads). The model is declared for the same reason as Kilo's.
+            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
           else
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
@@ -412,8 +427,14 @@ jobs:
         id: probe
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
         run: |
           set -euo pipefail
+          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
+          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
           probe_dir="$RUNNER_TEMP/quota-probe"
           mkdir -p "$probe_dir"
           # Over Kilo's OpenAI-compatible gateway a 429 reaches opencode only as the bare
@@ -455,12 +476,16 @@ jobs:
           # an exhausted quota or a region refusal - and deliberately not the
           # misconfiguration class (a model or variant that cannot be resolved
           # at all): that is a genuine failure, and the agent job reports it.
-          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$probe_dir/stdout" "$probe_dir/stderr"; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
-          elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
+          # A reply that carries the OK token proves the model answered, so it
+          # is read first: stderr also holds opencode's retry lines, and a rate
+          # limit that cleared on a retry ("retrying (attempt 1): ... Too Many
+          # Requests", then OK) must not read as a cap.
+          if [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Quota probe reached the model; the agent job will run."
+          elif grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
           else
             # Inconclusive - a non-quota failure, or a zero exit whose reply
             # carried no OK. Fail open, exactly as before the probe existed.
@@ -587,6 +612,12 @@ jobs:
           # reached the configured model.
           if [ "${MODEL%%/*}" = "kilo" ]; then
             jq -cn --arg model "${MODEL#kilo/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {kilo: {settings: {baseURL: "https://ai-gateway.kilo.ai/api/v1"}, models: {($model): {}}}}}' > "$conf/opencode.json"
+          elif [ "${MODEL%%/*}" = "nvidia" ]; then
+            # An `nvidia/...` model runs on NVIDIA's API with the key from the
+            # ACTIONS_NVIDIA_API_KEY secret, which only the probe and agent steps
+            # receive (as NVIDIA_API_KEY, the variable opencode's built-in provider
+            # reads). The model is declared for the same reason as Kilo's.
+            jq -cn --arg model "${MODEL#nvidia/}" '{"$schema": "https://opencode.ai/config.json", update: "disable", providers: {nvidia: {models: {($model): {}}}}}' > "$conf/opencode.json"
           else
             printf '{"$schema":"https://opencode.ai/config.json","update":"disable"}\n' > "$conf/opencode.json"
           fi
@@ -622,8 +653,14 @@ jobs:
         id: run
         env:
           OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          NVIDIA_API_KEY: ${{ startsWith(env.MODEL, 'nvidia/') && secrets.ACTIONS_NVIDIA_API_KEY || '' }}
         run: |
           set -euo pipefail
+          # Without the secret an `nvidia/...` model can only fail with a 401; say why.
+          if [ -n "${MODEL:-}" ] && [ "${MODEL%%/*}" = "nvidia" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
+            echo "::error::MODEL is ${MODEL}, but the ACTIONS_NVIDIA_API_KEY secret is not set (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
           out="$RUNNER_TEMP/premortem/comment.md"
           # Captured through a variable, never a file the agent can reach: it
           # has a shell, and an appended "**Summary:** ... Verdict: PASS" block
@@ -699,7 +736,7 @@ jobs:
             # class (an `unauthorized` that could be either) is left to the bare failure and
             # the captured stderr above it, which is the reason itself - better than guessing
             # for it.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.stderr"; then
               report_quota_skip
             elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
               echo "::error::The pre-mortem agent could not resolve its model - PREMORTEM_MODEL / PREMORTEM_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes. The stage status is reported as \`error\`."
@@ -726,7 +763,7 @@ jobs:
             # classified before it fails. The grep covers the raw stream and
             # stderr both, and runs only here - a real report's own text may
             # mention "quota", so a produced report is never re-classified.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$out.raw" "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr"; then
               echo "::group::Agent output (last 4000 bytes)"
               tail -c 4000 "$out.raw"
               echo "::endgroup::"
@@ -770,7 +807,7 @@ jobs:
           if [ -z "$verdict" ]; then
             # Same zero-exit cap as above: a report that starts but never reaches
             # a valid verdict can still be the quota signature, on either stream.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue' "$out.raw" "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr"; then
               echo "::group::Agent output (last 4000 bytes)"
               tail -c 4000 "$out.raw"
               echo "::endgroup::"
