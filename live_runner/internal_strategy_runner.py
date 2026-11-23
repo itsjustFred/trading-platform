@@ -74,17 +74,26 @@ Risk-policy notes (maintainer decision 2026-11-22):
   multi-level ladder: the live bracket carries one full-size TP.
 * Entries per symbol are capped by ``internal_max_open_per_symbol``
   (deployment ``settings``, falling back to a same-named ``STRATEGY_META``
-  parameter): default **1 open position per deployment and symbol**. Only 1
-  is accepted today — N>1 is not supported end-to-end (per-position sizing,
-  protection and exits on the qty-netted live ledger are unresolved;
-  maintainer decision 2026-11-22: N=1, N>1 is #382) and any other value
-  fails closed. Open
+  parameter): default **1 open position per deployment and symbol**. Values
+  1..``TRADE_ENGINE_MAX_POSITIONS`` are accepted (#382): each entry signal is
+  one position lot with its own persisted fills, its own bracket (stop/TP) at
+  the broker, and its own slice of the deployment ledger. A strategy ``exits``
+  signal closes **every** open lot of that deployment and symbol — the same
+  all-positions close the native engine performs — by emitting one targeted
+  exit intent per filled lot when more than one is open, each carrying the
+  entry signal it closes (``exit_target_signal_id``). When the cap or the
+  ledger cannot be read, entries are disabled for the deployment while exits
+  keep flowing (a single untargeted exit intent, sized by the shared
+  chokepoint). Open
   positions are counted from the deployment's own persisted ledger —
-  filled residuals allocated FIFO plus unfilled entries the broker still
-  lists as working or holds a non-zero position for — and the total is
-  capped at ``TRADE_ENGINE_MAX_POSITIONS``.
-  When the cap or the ledger cannot be read, entries are disabled for the
-  deployment while exits keep flowing.
+  filled residuals with named-attribution first and FIFO for the rest, plus
+  unfilled entries the broker still lists as working or holds a non-zero
+  position for — and the total is
+  capped at ``TRADE_ENGINE_MAX_POSITIONS``. A cap above 1 is refused
+  (entries disabled) on Alpaca accounts until #350 lands and on any
+  deployment carrying the live ``supertrend_flip`` opt-in, and a strategy
+  exit first cancels the deployment's still-working entry orders for the
+  symbol.
 * **Session-bound symbols** (everything the venue calendar does not resolve
   to 24/7) are only *evaluated* while the venue is open, using
   ``shared.venue_calendar``. Only actionability is session-gated, never the
@@ -125,8 +134,13 @@ from typing import Any
 
 import pandas as pd
 
+from live_runner.account_order_lock import account_order_placement
 from live_runner.base_adapter import UNBOUNDED_TP_POLICY, BaseLiveAdapter
-from live_runner.exit_signals import FULL_EXIT, exit_intent_metadata
+from live_runner.exit_signals import (
+    FULL_EXIT,
+    SIGNAL_INTENT_EXIT,
+    exit_intent_metadata,
+)
 from live_runner.promotion import (
     STRATEGY_PARAMETERS_KEY,
     deployment_signal_processor_name,
@@ -141,7 +155,9 @@ from shared import venue_calendar
 from shared.constants import normalize_symbols, normalize_timeframe
 from shared.database import (
     DATA_DIR,
+    flag_live_ledger_reconciliation,
     list_live_deployment_open_entry_counts_by_symbol,
+    list_live_deployment_open_position_lots,
     list_live_deployment_unfilled_entry_order_refs,
 )
 from shared.logging import get_logger
@@ -168,9 +184,8 @@ SUBMIT_FEED_LAG_CAP_SECONDS = 120.0
 #: until an operator sets it — maintainer decision 2026-11-22 rollout rule.
 INTERNAL_RUNNER_ENABLED_KEY = "internal_runner_enabled"
 #: Per-symbol open-entry cap (deployment ``settings``, falling back to a
-#: same-named ``STRATEGY_META`` parameter). Only 1 is accepted: N>1 per-symbol
-#: entries is not supported end-to-end yet (maintainer decision 2026-11-22:
-#: N=1; N>1 is #382) and any other value fails closed.
+#: same-named ``STRATEGY_META`` parameter). 1..TRADE_ENGINE_MAX_POSITIONS are
+#: accepted (#382); anything else fails closed.
 MAX_OPEN_PER_SYMBOL_KEY = "internal_max_open_per_symbol"
 #: How far ahead the venue calendar is asked to find the next session open.
 SESSION_LOOKAHEAD_DAYS = 14
@@ -263,11 +278,10 @@ def _max_open_per_symbol(
     """Configured per-symbol open-entry cap.
 
     Deployment ``settings`` win; a same-named ``STRATEGY_META`` parameter is
-    the per-strategy fallback. Default 1. Only 1 is accepted: N>1 per-symbol
-    entries is not supported end-to-end on the qty-netted live ledger
-    (maintainer decision 2026-11-22: N=1; N>1 is #382) — anything else, or
-    an unreadable value, fails closed (the caller disables entries while
-    exits keep flowing).
+    the per-strategy fallback. Default 1. Values 1..``TRADE_ENGINE_MAX_POSITIONS``
+    are accepted (#382); anything else — including 0, negatives, non-integers
+    and values above the engine maximum — fails closed (the caller disables
+    entries while exits keep flowing).
     """
     settings = deployment.settings or {}
     if MAX_OPEN_PER_SYMBOL_KEY in settings:
@@ -287,14 +301,102 @@ def _max_open_per_symbol(
             f"{MAX_OPEN_PER_SYMBOL_KEY}={raw!r} is not an integer"
         )
     value = int(number)
-    if value != 1:
+    if value < 1 or value > TRADE_ENGINE_MAX_POSITIONS:
         raise ValueError(
-            f"{MAX_OPEN_PER_SYMBOL_KEY}={value} is not supported: only 1 open "
-            "entry per deployment and symbol is implemented end-to-end "
-            "(per-position sizing, protection and exits on the netted live "
-            "ledger; maintainer decision 2026-11-22: N=1, N>1 is #382)"
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={value} is outside "
+            f"1..{TRADE_ENGINE_MAX_POSITIONS}; the per-symbol open-entry cap "
+            "must be a positive integer no larger than the engine maximum"
         )
     return value
+
+
+#: ``LiveDeploymentConfig.settings`` key opting a deployment into the live
+#: ``supertrend_flip`` workflow (#168). ``shared.trailing`` carries the same
+#: constant on the flip branch; it is mirrored here so this refusal does not
+#: depend on which PR merges first.
+FLIP_DEPLOYMENT_OPT_IN_KEY = "live_supertrend_flip"
+_FLIP_OPT_IN_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+
+def _flip_opted_in(settings: Any) -> bool:
+    """Whether deployment ``settings`` carry the live flip opt-in (#168).
+
+    Mirrors ``shared.trailing.supertrend_flip_opted_in``: only an explicit
+    truthy value enables it; every other value fails closed to off.
+    """
+    if not isinstance(settings, Mapping):
+        return False
+    value = settings.get(FLIP_DEPLOYMENT_OPT_IN_KEY)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _FLIP_OPT_IN_TOKENS
+
+
+async def _multi_lot_cap_refusal(
+    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, cap: int
+) -> str | None:
+    """Why a per-symbol cap above 1 is refused on this account, or ``None``.
+
+    Maintainer defaults for #382: ``internal_max_open_per_symbol > 1`` is
+    refused (entries disabled, exits keep flowing - the same fail-closed
+    shape as an unusable cap) on Alpaca accounts until #350 lands, because a
+    netted Alpaca book reserves bracket-leg quantity a second lot's exit
+    cannot prove; on cTrader accounts that cannot prove they hedge positions
+    (``ProtoOAAccountType`` NETTED or unreadable), because a netted cTrader
+    book merges several entries into one position whose per-lot exit cannot
+    be sized safely; and on any deployment carrying the live
+    ``supertrend_flip`` opt-in, because the flip manager requires exactly
+    one broker position per symbol.
+    """
+    if cap <= 1:
+        return None
+    source = _adapter_calendar_source(adapter)
+    if source == "alpaca":
+        return (
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on Alpaca accounts "
+            "until #350 lands: a netted book cannot prove a per-lot exit "
+            "against bracket-leg quantity reservations. Set the cap to 1 "
+            "or wait for #350; entries are disabled, exits still evaluated."
+        )
+    if source == "ctrader":
+        account_type = await _adapter_account_type(adapter)
+        if account_type != "hedged":
+            return (
+                f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on cTrader "
+                f"accounts that are not proven hedging (account type: "
+                f"{account_type or 'unreadable'}): a netted book merges "
+                "several entries into one position, so a per-lot exit "
+                "cannot be sized safely. Set the cap to 1 or move the "
+                "deployment to a hedging account; entries are disabled, "
+                "exits still evaluated."
+            )
+    if _flip_opted_in(deployment.settings):
+        return (
+            f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} cannot be combined with the "
+            f"'{FLIP_DEPLOYMENT_OPT_IN_KEY}' opt-in: the live supertrend_flip "
+            "workflow manages exactly one position per symbol. Set the cap "
+            "to 1 or remove the opt-in; entries are disabled, exits still "
+            "evaluated."
+        )
+    return None
+
+
+async def _adapter_account_type(adapter: BaseLiveAdapter) -> str | None:
+    """The adapter's proven account type, or ``None`` when it cannot say.
+
+    Only ``CTraderLiveAdapter`` exposes ``account_type``; any other adapter
+    routed here by name returns ``None``, which the caller treats as "not
+    proven hedging" - the fail-closed direction.
+    """
+    getter = getattr(adapter, "account_type", None)
+    if not callable(getter):
+        return None
+    try:
+        return await getter()
+    except Exception:  # except-kind: money-decision
+        return None
 
 
 def _adapter_calendar_source(adapter: BaseLiveAdapter) -> str:
@@ -638,6 +740,73 @@ class InternalStrategyRunner:
             )
             return None
 
+    async def _cancel_working_entry_orders(
+        self,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        symbol: str,
+    ) -> None:
+        """Retire this deployment's still-working entry orders for ``symbol``.
+
+        A strategy exit closes every filled lot; an entry still working at
+        the broker has no position yet but would open one *after* the close
+        if left resting (#382 maintainer default). Only this deployment's
+        own unfilled entry refs are cancelled, by name - never another
+        deployment's orders and never position protections. Best-effort:
+        the refs read, the account lock or the cancel itself failing is
+        reported and the exit still goes out - refusing to exit would leave
+        the open lots exposed, which is worse.
+        """
+        deployment_id = str(deployment.id)
+        try:
+            refs = await asyncio.to_thread(
+                list_live_deployment_unfilled_entry_order_refs,
+                deployment_id,
+                symbol,
+            )
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                f"entry_cancel:{symbol}",
+                "Internal strategy exit cannot prove which entry orders are "
+                "still working; the exit goes out without cancelling them",
+                deployment_id=deployment_id,
+                symbol=symbol,
+                error=str(exc),
+                level="warning",
+            )
+            return
+        if not refs:
+            return
+        try:
+            async with account_order_placement(str(deployment.account_id)):
+                outcome = await adapter.cancel_orders(refs, symbol=symbol)
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                f"entry_cancel:{symbol}",
+                "Internal strategy exit could not cancel the deployment's "
+                "still-working entry orders; the exit goes out without them",
+                deployment_id=deployment_id,
+                symbol=symbol,
+                refs=sorted(refs),
+                error=str(exc),
+                level="warning",
+            )
+            return
+        if outcome.unidentified or outcome.failed:
+            logger.warning(
+                "Internal strategy exit left working entry orders uncancelled",
+                extra={
+                    "data": {
+                        "deployment_id": deployment_id,
+                        "symbol": symbol,
+                        "unidentified": list(outcome.unidentified),
+                        "failed": list(outcome.failed),
+                    }
+                },
+            )
+
     async def _broker_held_symbols(
         self, adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig
     ) -> set[str] | None:
@@ -723,6 +892,167 @@ class InternalStrategyRunner:
                 held.add(symbol)
         return held
 
+    async def _lot_position_map_blocks_entries(
+        self,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        open_lots: Mapping[str, list[dict[str, Any]]],
+    ) -> bool:
+        """Whether the multi-lot symbols' lots fail to map 1:1 onto positions.
+
+        #382 hedging orphan guard: an unattributed broker close is consumed
+        from the lots' residuals oldest-first, which on a hedging N>1 book can
+        credit the wrong lot - its ledger then says closed while its broker
+        position stays open (or the reverse). Before entries are allowed to
+        add another lot, every open lot of a multi-lot symbol must resolve to
+        its own broker position through ``resolve_exit_position_target``: a
+        lot that resolves to nothing, or two lots that resolve to the same
+        position, means the ledger and the book disagree.
+
+        Returns ``True`` when entries must be disabled for this deployment
+        (exits still flow). Only adapters that override the base
+        ``resolve_exit_position_target`` can prove the mapping; on every
+        other adapter - and on symbols with at most one lot, where FIFO
+        cannot misattribute - this is a no-op. An unreadable position book or
+        order list cannot prove the mapping either, so it fails closed the
+        same way without raising the reconciliation alert: unproven is not
+        the same as mismatched.
+        """
+        resolver = getattr(adapter, "resolve_exit_position_target", None)
+        if resolver is None or getattr(resolver, "__func__", resolver) is (
+            BaseLiveAdapter.resolve_exit_position_target
+        ):
+            return False
+        pending = {
+            str(symbol).upper(): lots
+            for symbol, lots in open_lots.items()
+            if lots and len(lots) > 1
+        }
+        if not pending:
+            return False
+        deployment_id = str(deployment.id)
+        get_positions = getattr(adapter, "get_positions", None)
+        if not callable(get_positions):
+            self._report_once(
+                deployment_id,
+                "lot_position_map",
+                "Adapter cannot list broker positions; the open lots cannot "
+                "be proven to map onto them, so entries are disabled "
+                "(exits still evaluated)",
+                deployment_id=deployment_id,
+                adapter=type(adapter).__name__,
+            )
+            return True
+        try:
+            # The resolver reads the position-id map ``get_positions``
+            # refreshes; a stale map would report every lot unpositioned.
+            await get_positions()
+        except Exception as exc:  # except-kind: money-decision
+            self._report_once(
+                deployment_id,
+                "lot_position_map",
+                "Broker positions could not be read; the open lots cannot "
+                "be proven to map onto them, so entries are disabled "
+                "(exits still evaluated)",
+                deployment_id=deployment_id,
+                error=str(exc),
+            )
+            return True
+        blocked = False
+        for symbol, lots in pending.items():
+            resolved: dict[str, int] = {}
+            unresolved: list[str] = []
+            try:
+                for lot in lots:
+                    signal_id = str(lot.get("signal_id") or "").strip()
+                    if not signal_id:
+                        raise ValueError("open lot carries no signal id")
+                    position_id = await resolver(symbol, signal_id)
+                    if position_id is None:
+                        # Proven: the ledger calls this lot open but no
+                        # broker position resolves to its entry - the shape
+                        # an unattributed close consumed from the wrong lot
+                        # leaves behind.
+                        unresolved.append(signal_id)
+                    else:
+                        resolved[signal_id] = int(position_id)
+            except Exception as exc:  # except-kind: money-decision
+                # Unreadable is unproven, not mismatched: fail closed on
+                # entries without flagging a reconciliation that may be a
+                # transient broker read failure.
+                self._report_once(
+                    deployment_id,
+                    f"lot_position_map:{symbol}",
+                    "Open position lots could not be proven to map onto "
+                    "broker positions; entries are disabled (exits still "
+                    "evaluated)",
+                    deployment_id=deployment_id,
+                    symbol=symbol,
+                    error=str(exc),
+                )
+                blocked = True
+                continue
+            position_owners: dict[int, str] = {}
+            duplicate: str | None = None
+            for signal_id, position_id in resolved.items():
+                owner = position_owners.get(position_id)
+                if owner is not None:
+                    duplicate = (
+                        f"lots {owner} and {signal_id} both resolve to "
+                        f"broker position {position_id}"
+                    )
+                    break
+                position_owners[position_id] = signal_id
+            reasons: list[str] = []
+            if unresolved:
+                reasons.append(
+                    f"lots with no open broker position: {sorted(unresolved)}"
+                )
+            if duplicate is not None:
+                reasons.append(duplicate)
+            if not reasons and len(resolved) != len(lots):
+                reasons.append(
+                    f"{len(lots)} open lots resolved to {len(resolved)} "
+                    "broker positions"
+                )
+            mismatch = "; ".join(reasons) if reasons else None
+            if mismatch is None:
+                continue
+            marker = (deployment_id, f"lot_position_map_mismatch:{symbol}")
+            if marker not in self._reported:
+                self._reported.add(marker)
+                await asyncio.to_thread(
+                    flag_live_ledger_reconciliation,
+                    account_id=str(deployment.account_id),
+                    symbol=symbol,
+                    cause="lot_position_map_mismatch",
+                    detail={
+                        "deployment_id": deployment_id,
+                        "resolved_lots": sorted(resolved),
+                        "unresolved_lots": sorted(unresolved),
+                        "reason": mismatch,
+                    },
+                )
+                logger.error(
+                    "ALERT: internal deployment open lots do not map 1:1 "
+                    "onto the symbol's broker positions; a broker-side "
+                    "close was likely consumed from the wrong lot. Entries "
+                    "are disabled until the ledgers are reconciled",
+                    extra={
+                        "data": {
+                            "alert": "lot_position_map_mismatch",
+                            "account_id": str(deployment.account_id),
+                            "deployment_id": deployment_id,
+                            "symbol": symbol,
+                            "reason": mismatch,
+                            "resolved_lots": sorted(resolved),
+                            "unresolved_lots": sorted(unresolved),
+                        }
+                    },
+                )
+            blocked = True
+        return blocked
+
     def _symbol_calendar(
         self, adapter: BaseLiveAdapter, symbol: str
     ) -> venue_calendar.VenueCalendar | None:
@@ -763,6 +1093,7 @@ class InternalStrategyRunner:
         moment: datetime,
         open_entries: dict[str, int],
         max_open_per_symbol: int,
+        open_lots: dict[str, list[dict[str, Any]]] | None = None,
     ) -> None:
         state_key = (str(deployment.id), symbol)
         calendar = self._symbol_calendar(adapter, symbol)
@@ -1004,25 +1335,64 @@ class InternalStrategyRunner:
                 "internal_strategy": deployment.strategy_name,
             }
             if bool(exits.iloc[position]):
-                exit_metadata = dict(common_metadata)
-                exit_metadata.update(exit_intent_metadata(FULL_EXIT))
-                exit_metadata["idempotency_key"] = _intent_idempotency_key(
-                    deployment, symbol, timeframe, close_time, kind="exit"
-                )
-                intents.append(
-                    (
-                        position,
-                        TradeSignal(
-                            action="sell",
-                            symbol=symbol,
-                            entry_price=close_price,
-                            stop_loss=None,
-                            take_profit=None,
-                            timeframe=timeframe,
-                            metadata=exit_metadata,
-                        ),
+                lots = list((open_lots or {}).get(symbol.upper(), ()))
+                if len(lots) > 1:
+                    # #382: the strategy's exits signal closes every open
+                    # position of this deployment and symbol — the same
+                    # all-positions close the native engine performs. Emit one
+                    # targeted exit per filled lot so each order names the
+                    # entry it closes (stable idempotency per lot) and a
+                    # hedging broker can address the right position. Lots that
+                    # are still unfilled working orders have no position to
+                    # close and are not listed here.
+                    for lot in lots:
+                        target_signal_id = str(lot.get("signal_id") or "")
+                        if not target_signal_id:
+                            continue
+                        exit_metadata = dict(common_metadata)
+                        exit_metadata.update(exit_intent_metadata(FULL_EXIT))
+                        exit_metadata["exit_target_signal_id"] = target_signal_id
+                        exit_metadata["idempotency_key"] = _intent_idempotency_key(
+                            deployment,
+                            symbol,
+                            timeframe,
+                            close_time,
+                            kind=f"exit:{target_signal_id}",
+                        )
+                        intents.append(
+                            (
+                                position,
+                                TradeSignal(
+                                    action="sell",
+                                    symbol=symbol,
+                                    entry_price=close_price,
+                                    stop_loss=None,
+                                    take_profit=None,
+                                    timeframe=timeframe,
+                                    metadata=exit_metadata,
+                                ),
+                            )
+                        )
+                else:
+                    exit_metadata = dict(common_metadata)
+                    exit_metadata.update(exit_intent_metadata(FULL_EXIT))
+                    exit_metadata["idempotency_key"] = _intent_idempotency_key(
+                        deployment, symbol, timeframe, close_time, kind="exit"
                     )
-                )
+                    intents.append(
+                        (
+                            position,
+                            TradeSignal(
+                                action="sell",
+                                symbol=symbol,
+                                entry_price=close_price,
+                                stop_loss=None,
+                                take_profit=None,
+                                timeframe=timeframe,
+                                metadata=exit_metadata,
+                            ),
+                        )
+                    )
             # ``max_open_per_symbol == 0`` means entries are disabled for this
             # deployment (cap or ledger unreadable): exits still flow, entries
             # do not — the fail-closed direction for new exposure.
@@ -1169,6 +1539,16 @@ class InternalStrategyRunner:
         # is the second layer for the intents that did reach the broker).
         self._last_bar[state_key] = latest_open
 
+        if any(
+            str((signal.metadata or {}).get("signal_intent") or "")
+            == SIGNAL_INTENT_EXIT
+            for _position, signal in intents
+        ):
+            # #382 maintainer default: a strategy exit retires this
+            # deployment's still-working entry orders for the symbol first,
+            # so a late fill cannot open a lot the exit already closed past.
+            await self._cancel_working_entry_orders(adapter, deployment, symbol)
+
         for _position, signal in intents:
             try:
                 outcome = await self._submit_signal(adapter, deployment, signal)
@@ -1304,7 +1684,24 @@ class InternalStrategyRunner:
                     error=str(exc),
                 )
                 max_open_per_symbol = 0
+            if max_open_per_symbol > 1:
+                refusal = await _multi_lot_cap_refusal(
+                    adapter, deployment, max_open_per_symbol
+                )
+                if refusal is not None:
+                    self._report_once(
+                        deployment_id,
+                        "open_position_cap",
+                        refusal,
+                        deployment_id=deployment_id,
+                        account_id=str(deployment.account_id),
+                        adapter=type(adapter).__name__,
+                        max_open_per_symbol=max_open_per_symbol,
+                        level="warning",
+                    )
+                    max_open_per_symbol = 0
             open_entries: dict[str, int] = {}
+            open_lots: dict[str, list[dict[str, Any]]] | None = None
             if max_open_per_symbol > 0:
                 try:
                     unfilled_refs = await asyncio.to_thread(
@@ -1371,6 +1768,48 @@ class InternalStrategyRunner:
                             error=str(exc),
                         )
                         max_open_per_symbol = 0
+            # #382: when more than one position lot may be open for a symbol -
+            # or when entries are disabled so the counts were never read - a
+            # strategy exit must close every lot: one targeted exit per filled
+            # entry so each order names its target. When the cap is usable the
+            # lots are only needed for symbols the count already reports as
+            # multi-position; if the lots read fails the exit falls back to
+            # the single untargeted intent (the hedging adapter then fails
+            # closed rather than guess, and the netting adapter still closes
+            # the aggregate).
+            need_lots = max_open_per_symbol == 0 or any(
+                count > 1 for count in open_entries.values()
+            )
+            if need_lots:
+                open_lots = {}
+                for symbol in symbols:
+                    try:
+                        open_lots[str(symbol).upper()] = await asyncio.to_thread(
+                            list_live_deployment_open_position_lots,
+                            deployment_id,
+                            symbol,
+                        )
+                    except Exception as exc:  # except-kind: money-decision
+                        self._report_once(
+                            deployment_id,
+                            "position_lots",
+                            "Internal deployment position-lot ledger is "
+                            "unreadable; exits fall back to untargeted close "
+                            "intents (hedging brokers fail closed on "
+                            "ambiguity)",
+                            deployment_id=deployment_id,
+                            symbol=str(symbol),
+                            error=str(exc),
+                        )
+                        open_lots = None
+                        break
+            if open_lots and await self._lot_position_map_blocks_entries(
+                adapter, deployment, open_lots
+            ):
+                # #382 orphan guard: the lots and the broker positions
+                # disagree, so a new lot could entrench the misattribution.
+                # Entries fail closed; exits still flow.
+                max_open_per_symbol = 0
             for symbol in symbols:
                 # Fresh wall-clock per symbol: a pass over many symbols must
                 # not judge the last ones by the pass's start time.
@@ -1386,6 +1825,7 @@ class InternalStrategyRunner:
                         moment=symbol_moment,
                         open_entries=open_entries,
                         max_open_per_symbol=max_open_per_symbol,
+                        open_lots=open_lots,
                     )
                 except asyncio.CancelledError:
                     raise

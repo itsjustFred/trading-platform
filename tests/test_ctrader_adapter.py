@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from live_runner.ctrader_adapter import (
+    _ACCOUNT_TYPE_RETRY_SECONDS,
     _EXECUTION_RECONCILE_WAKE,
     CTraderApiError,
     CTraderAuthTerminalError,
@@ -2542,3 +2543,570 @@ def test_get_equity_raises_on_an_unreadable_net_unrealized_pnl(monkeypatch) -> N
     adapter._send_request_with_refresh_retry = _send
     with pytest.raises(MoneyParseError, match="unreadable money value"):
         asyncio.run(adapter.get_equity())
+
+
+# ── #382: resolve_exit_position_target ────────────────────────────────────────
+
+
+def _resolver_adapter() -> CTraderLiveAdapter:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._position_ids_by_symbol = {"EURUSD": (10, 11)}
+    return adapter
+
+
+def _position_orders(*orders: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(order=list(orders))
+
+
+def _position_order(
+    order_id: int, client_order_id: str = "", *, closing: bool = False
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        orderId=order_id,
+        clientOrderId=client_order_id,
+        closingOrder=closing,
+    )
+
+
+def _stub_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: CTraderLiveAdapter,
+    orders_by_position: dict[int, object],
+) -> list[int]:
+    """Fake ``_fetch_position_orders`` + ``_signal_id_for_position_order``.
+
+    ``_signal_id_for_position_order`` returns the order's clientOrderId when
+    it is a UUID-shaped signal id, else None - enough to drive the matcher.
+    Returns the list of fetched position ids so tests can assert caching.
+    """
+    import uuid
+
+    fetched: list[int] = []
+
+    async def _fetch(position_id: int):
+        fetched.append(int(position_id))
+        return orders_by_position.get(int(position_id))
+
+    async def _signal_id(order):
+        candidate = str(getattr(order, "clientOrderId", "") or "")
+        try:
+            uuid.UUID(candidate)
+        except (ValueError, AttributeError, TypeError):
+            return None
+        return candidate
+
+    monkeypatch.setattr(adapter, "_fetch_position_orders", _fetch)
+    monkeypatch.setattr(adapter, "_signal_id_for_position_order", _signal_id)
+    return fetched
+
+
+def test_resolve_exit_position_target_single_match(monkeypatch) -> None:
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, wanted)),
+            11: _position_orders(_position_order(101, str(_uuid.uuid4()))),
+        },
+    )
+
+    assert asyncio.run(
+        adapter.resolve_exit_position_target("EURUSD", wanted)
+    ) == 10
+
+
+def test_resolve_exit_position_target_no_match_returns_none(monkeypatch) -> None:
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, "not-a-uuid")),
+            11: _position_orders(_position_order(101, "also-not")),
+        },
+    )
+
+    assert asyncio.run(
+        adapter.resolve_exit_position_target("EURUSD", "missing")
+    ) is None
+
+
+def test_resolve_exit_position_target_two_matches_raise(monkeypatch) -> None:
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, wanted)),
+            11: _position_orders(_position_order(101, wanted)),
+        },
+    )
+
+    with pytest.raises(ValueError, match="several open positions"):
+        asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+
+
+def test_resolve_exit_position_target_unreadable_raises(monkeypatch) -> None:
+    adapter = _resolver_adapter()
+    _stub_resolver(monkeypatch, adapter, {10: None, 11: _position_orders()})
+
+    with pytest.raises(ValueError, match="unreadable"):
+        asyncio.run(adapter.resolve_exit_position_target("EURUSD", "wanted"))
+
+
+def test_resolve_exit_position_target_skips_closing_orders(monkeypatch) -> None:
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, wanted, closing=True)),
+            11: _position_orders(_position_order(101, str(_uuid.uuid4()))),
+        },
+    )
+
+    assert asyncio.run(
+        adapter.resolve_exit_position_target("EURUSD", wanted)
+    ) is None
+
+
+def test_resolve_exit_position_target_caches_position_reads(monkeypatch) -> None:
+    """#382: the per-lot fan-out resolves every exit inside the account lock;
+    the position order lists are immutable opening-order reads, so repeats
+    within the TTL must not cost one broker call per position per exit."""
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    fetched = _stub_resolver(
+        monkeypatch,
+        adapter,
+        {10: _position_orders(_position_order(100, wanted)), 11: _position_orders()},
+    )
+
+    first = asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+    second = asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+
+    assert first == second == 10
+    assert fetched == [10, 11]
+
+
+# ── #382 maintainer decision: netted-account safety ──────────────────────────
+#
+# On a netted cTrader book several entries merge into ONE position. The exit
+# resolver may pin a lot to a position only when that position's opening
+# orders belong exclusively to the lot's entry signal, and a cached order
+# read may never be that proof while the position's volume has moved.
+
+
+def test_resolve_exit_position_target_shared_position_returns_none(monkeypatch) -> None:
+    """P1: a netted position with openers A and B resolves for NEITHER -
+    matching it for one lot would let a broker-sized full exit close the
+    sibling's quantity too."""
+    import uuid as _uuid
+
+    a, b = str(_uuid.uuid4()), str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {10: _position_orders(_position_order(100, a), _position_order(101, b))},
+    )
+
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", a)) is None
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", b)) is None
+
+
+def test_resolve_exit_position_target_unattributed_opener_blocks(monkeypatch) -> None:
+    """An opening order that resolves to no signal (manual, foreign, or an
+    exit) still counts as an opener: the position is not exclusively the
+    wanted entry's."""
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(
+                _position_order(100, wanted), _position_order(101, "manual-order")
+            )
+        },
+    )
+
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted)) is None
+
+
+def test_resolve_exit_position_target_scale_in_same_signal_still_matches(
+    monkeypatch,
+) -> None:
+    """Two opening orders of the SAME entry signal are one lot's scale-in,
+    not a shared position: the exclusivity set stays ``{wanted}``."""
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(
+                _position_order(100, wanted), _position_order(101, wanted)
+            )
+        },
+    )
+
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted)) == 10
+
+
+def test_resolve_exit_position_target_cache_refetches_on_volume_change(
+    monkeypatch,
+) -> None:
+    """P3: a cached order list may never prove exclusivity from a stale
+    read. Position 10 cached with opener A only; B's order then nets in and
+    the volume moves - the next resolve must refetch and see the shared
+    position, not pin lot A to it."""
+    import uuid as _uuid
+
+    a, b = str(_uuid.uuid4()), str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    adapter._position_volumes = {10: 500}
+    orders_by_position = {10: _position_orders(_position_order(100, a))}
+    fetched = _stub_resolver(monkeypatch, adapter, orders_by_position)
+
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", a)) == 10
+    assert fetched == [10]
+
+    # B's entry nets into position 10: the broker volume moves, so the
+    # cached [A]-only order list can no longer prove exclusivity.
+    orders_by_position[10] = _position_orders(
+        _position_order(100, a), _position_order(101, b)
+    )
+    adapter._position_volumes = {10: 800}
+
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", a)) is None
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", b)) is None
+    assert fetched == [10, 10]
+
+
+def test_resolve_exit_position_target_cache_hit_requires_matching_volume(
+    monkeypatch,
+) -> None:
+    """The volume check is the invalidation, not a fetch-everything
+    regression: an unchanged volume still reuses the cached read."""
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    adapter._position_volumes = {10: 500}
+    fetched = _stub_resolver(
+        monkeypatch,
+        adapter,
+        {10: _position_orders(_position_order(100, wanted))},
+    )
+
+    first = asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+    second = asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+
+    assert first == second == 10
+    assert fetched == [10]
+
+
+def test_position_orders_cache_expired_ttl_refetches(monkeypatch) -> None:
+    """A cache entry older than the TTL is refetched even at unchanged
+    volume."""
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    adapter._position_volumes = {10: 500}
+    orders = _position_orders(_position_order(100, wanted))
+    fetched = _stub_resolver(monkeypatch, adapter, {10: orders})
+    adapter._position_orders_cache[10] = (
+        time.monotonic() - adapter._POSITION_ORDERS_CACHE_TTL_SECONDS - 1.0,
+        orders,
+        500,
+    )
+
+    assert asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted)) == 10
+    assert fetched == [10]
+
+
+def test_position_orders_cache_does_not_pin_unreadable_reads(monkeypatch) -> None:
+    """A ``None`` (unreadable) read is never cached: the next call fetches
+    again rather than replaying the failure or a stale success."""
+    adapter = _resolver_adapter()
+    adapter._position_ids_by_symbol = {"EURUSD": (10,)}
+    calls = {"n": 0}
+
+    async def _fetch(position_id: int):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(adapter, "_fetch_position_orders", _fetch)
+
+    with pytest.raises(ValueError, match="unreadable"):
+        asyncio.run(adapter.resolve_exit_position_target("EURUSD", "wanted"))
+    with pytest.raises(ValueError, match="unreadable"):
+        asyncio.run(adapter.resolve_exit_position_target("EURUSD", "wanted"))
+    assert calls["n"] == 2
+    assert 10 not in adapter._position_orders_cache
+
+
+def test_account_type_maps_proto_values_and_caches(monkeypatch) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    reads = {"n": 0}
+
+    async def _fetch_trader():
+        reads["n"] += 1
+        return SimpleNamespace(accountType=1)  # ProtoOAAccountType.NETTED
+
+    adapter._fetch_trader = _fetch_trader
+
+    assert asyncio.run(adapter.account_type()) == "netted"
+    assert asyncio.run(adapter.account_type()) == "netted"
+    assert reads["n"] == 1
+
+
+def test_account_type_unreadable_is_none_and_negatively_cached(monkeypatch) -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    outcomes = [RuntimeError("trader down"), SimpleNamespace(accountType=0)]
+    reads = {"n": 0}
+
+    async def _fetch_trader():
+        reads["n"] += 1
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    adapter._fetch_trader = _fetch_trader
+
+    assert asyncio.run(adapter.account_type()) is None
+    # The failure is negatively cached for the retry window: an unreachable
+    # broker must not cost a request timeout on every runner pass.
+    assert asyncio.run(adapter.account_type()) is None
+    assert reads["n"] == 1
+    # Once the window lapses the next read retries and can still prove the
+    # type - "unknown" is never pinned permanently.
+    adapter._account_type_unreadable_at = (
+        time.monotonic() - _ACCOUNT_TYPE_RETRY_SECONDS - 1.0
+    )
+    assert asyncio.run(adapter.account_type()) == "hedged"
+
+
+def test_account_type_unset_proto_field_is_none_not_hedged() -> None:
+    """A ``ProtoOATrader`` without ``accountType`` must not read as hedged.
+
+    The field is proto2 ``optional`` with ``[default = HEDGED]``: ``getattr``
+    returns 0 and ``HasField`` is False, so only the presence check proves
+    the broker stated a type (#382 fail-open hole).
+    """
+    from ctrader_open_api.messages import OpenApiModelMessages_pb2 as m
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._account_type = None
+    adapter._account_type_unreadable_at = None
+
+    async def _fetch_trader():
+        return m.ProtoOATrader()
+
+    adapter._fetch_trader = _fetch_trader
+    assert asyncio.run(adapter.account_type()) is None
+
+
+def test_account_type_set_proto_field_maps() -> None:
+    from ctrader_open_api.messages import OpenApiModelMessages_pb2 as m
+
+    adapter = CTraderLiveAdapter.__new__(CTraderLiveAdapter)
+    adapter._account_type = None
+    adapter._account_type_unreadable_at = None
+    trader = m.ProtoOATrader()
+    trader.accountType = 1  # ProtoOAAccountType.NETTED
+
+    async def _fetch_trader():
+        return trader
+
+    adapter._fetch_trader = _fetch_trader
+    assert asyncio.run(adapter.account_type()) == "netted"
+
+
+def test_account_type_unknown_value_is_none() -> None:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+
+    async def _fetch_trader():
+        return SimpleNamespace(accountType=99)
+
+    adapter._fetch_trader = _fetch_trader
+    assert asyncio.run(adapter.account_type()) is None
+
+
+# ── #382: cancel_orders adapter-level pins ───────────────────────────────────
+#
+# The runner-level tests only stub ``cancel_orders``; these pin the broker
+# side. The order-type gate is what keeps a position's attached
+# ``STOP_LOSS_TAKE_PROFIT`` protection out of the cancellable set - losing it
+# would let a strategy exit cancel a live position's stop.
+
+
+def _cancel_test_adapter(orders: list[SimpleNamespace]):
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._ProtoOAOrderType = SimpleNamespace(
+        LIMIT=1,
+        STOP=2,
+        STOP_LIMIT=3,
+        MARKET=4,
+        STOP_LOSS_TAKE_PROFIT=5,
+    )
+    adapter._ProtoOAOrderStatus = SimpleNamespace(
+        ORDER_STATUS_ACCEPTED=1, ORDER_STATUS_FILLED=2
+    )
+    adapter._symbol_name_to_id = {"EURUSD": 100, "GBPUSD": 200}
+
+    async def _reconcile():
+        return SimpleNamespace(order=list(orders), position=[])
+
+    adapter._reconcile_state = _reconcile
+    cancelled: list[int] = []
+
+    async def _cancel(order_id: int) -> None:
+        cancelled.append(int(order_id))
+
+    adapter._cancel_order_id = _cancel
+    return adapter, cancelled
+
+
+def _book_order(
+    order_id: int,
+    *,
+    order_type: int = 1,
+    symbol_id: int = 100,
+    status: int = 1,
+    client_order_id: str = "",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        orderId=order_id,
+        clientOrderId=client_order_id,
+        orderType=order_type,
+        orderStatus=status,
+        tradeData=SimpleNamespace(symbolId=symbol_id),
+        positionId=0,
+        closingOrder=False,
+    )
+
+
+def test_cancel_orders_cancels_matching_limit_and_stop_on_symbol() -> None:
+    adapter, cancelled = _cancel_test_adapter(
+        [
+            _book_order(1, order_type=1),
+            _book_order(2, order_type=2, client_order_id="sig-2"),
+        ]
+    )
+
+    outcome = asyncio.run(adapter.cancel_orders({"1", "sig-2"}, symbol="EURUSD"))
+
+    assert sorted(cancelled) == [1, 2]
+    assert outcome.completed == 2
+    assert outcome.unidentified == ()
+    assert outcome.failed == ()
+
+
+def test_cancel_orders_never_touches_position_protections() -> None:
+    """A ref colliding with an attached SL/TP protection must not cancel it:
+    protections are not in the cancellable order-type set at all."""
+    adapter, cancelled = _cancel_test_adapter(
+        [
+            _book_order(7, order_type=5, client_order_id="entry-sig"),
+            _book_order(8, order_type=1),
+        ]
+    )
+
+    outcome = asyncio.run(adapter.cancel_orders({"entry-sig"}, symbol="EURUSD"))
+
+    assert cancelled == []
+    assert outcome.completed == 0
+
+
+def test_cancel_orders_leaves_other_symbols_working_and_dead_orders() -> None:
+    adapter, cancelled = _cancel_test_adapter(
+        [
+            _book_order(1, symbol_id=200),  # GBPUSD: ref names it, wrong symbol
+            _book_order(2, status=2),  # filled: not working
+            _book_order(3),  # EURUSD working but no ref names it
+        ]
+    )
+
+    outcome = asyncio.run(adapter.cancel_orders({"1", "2", "9"}, symbol="EURUSD"))
+
+    assert cancelled == []
+    assert outcome.completed == 0
+
+
+def test_cancel_orders_unresolvable_symbol_is_unidentified() -> None:
+    adapter, cancelled = _cancel_test_adapter([_book_order(9, symbol_id=999)])
+
+    outcome = asyncio.run(adapter.cancel_orders({"9"}, symbol="EURUSD"))
+
+    assert cancelled == []
+    assert outcome.unidentified == ("order:9",)
+
+
+def test_cancel_orders_refused_cancel_is_failed_not_dropped() -> None:
+    adapter, cancelled = _cancel_test_adapter(
+        [_book_order(1), _book_order(2)]
+    )
+
+    async def _cancel(order_id: int) -> None:
+        if order_id == 1:
+            raise CTraderApiError("TRADING_BAD_VOLUME", "refused")
+        cancelled.append(order_id)
+
+    adapter._cancel_order_id = _cancel
+
+    outcome = asyncio.run(adapter.cancel_orders({"1", "2"}, symbol="EURUSD"))
+
+    assert cancelled == [2]
+    assert outcome.completed == 1
+    assert outcome.failed == ("1",)
