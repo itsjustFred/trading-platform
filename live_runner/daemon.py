@@ -32,6 +32,11 @@ if __name__ == "__main__":
 
 import pandas as pd
 
+from live_runner.account_order_lock import (
+    AccountOrderLockTimeoutError,
+    account_order_lock,
+    account_order_placement,
+)
 from live_runner.account_routing import (
     ctrader_account_identifier,
     validate_live_account_routes,
@@ -194,6 +199,7 @@ from shared.database import (
     get_service,
     list_account_unfilled_exit_orders,
     list_live_accounts,
+    list_live_deployment_open_position_lots,
     list_live_deployment_unfilled_exit_orders,
     list_live_deployments,
     list_services,
@@ -1615,8 +1621,31 @@ def _describe_exit_rows(
     )
 
 
+def _exit_targets_same_lot(row: Mapping[str, Any], target_signal_id: str | None) -> bool:
+    """Whether a pending exit row can still be closing the incoming exit's lot.
+
+    #382: per-lot exits of one deployment and symbol may work concurrently -
+    each names the entry signal it closes (``exit_target_signal_id``). Two
+    exits block each other only when they target the same lot, or when either
+    side is untargeted (an untargeted close may take any lot, so it must be
+    treated as potentially overlapping).
+    """
+    if not target_signal_id:
+        return True
+    row_target = str(
+        (row.get("metadata") or {}).get("exit_target_signal_id") or ""
+    ).strip()
+    if not row_target:
+        return True
+    return row_target == target_signal_id
+
+
 async def _ensure_no_exit_in_flight(
-    adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, symbol: str
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    symbol: str,
+    *,
+    target_signal_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Refuse while an earlier exit of THIS deployment may still be working.
 
@@ -1672,6 +1701,7 @@ async def _ensure_no_exit_in_flight(
         row
         for row in blocking
         if str(row.get("deployment_id") or deployment.id) == str(deployment.id)
+        and _exit_targets_same_lot(row, target_signal_id)
     ]
     if own_blocking:
         raise ExitInFlightError(
@@ -1679,7 +1709,14 @@ async def _ensure_no_exit_in_flight(
             f"still working at the broker ({_describe_exit_rows(own_blocking, deployment)}); "
             "the ledger and the broker position do not include its fills yet."
         )
-    return [row for row in blocking if row not in own_blocking]
+    # Only OTHER deployments' exits are returned for reservation: this
+    # deployment's own working exits of different lots (#382) neither block
+    # nor reserve against this close - each is sized off its own lot.
+    return [
+        row
+        for row in blocking
+        if str(row.get("deployment_id") or deployment.id) != str(deployment.id)
+    ]
 
 
 def _reserved_by_other_exits(
@@ -1732,6 +1769,14 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     """
     locks = _EXIT_LOCKS.setdefault(asyncio.get_running_loop(), {})
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
+
+
+#: The per-account order-placement lock lives in ``live_runner.account_order_lock``
+#: so broker adapters can take the same critical section as the daemon's submit
+#: chokepoints (#362). These aliases keep the daemon's call sites and tests on
+#: the names they already use.
+_account_order_lock = account_order_lock
+_account_order_placement = account_order_placement
 
 
 async def _alert_ledger_mismatch(
@@ -1821,23 +1866,109 @@ async def prepare_exit_intent_order(
     metadata = dict(signal.metadata or {})
     if instruction is None:
         instruction = exit_instruction_from_metadata(metadata)
+    # #382: a per-lot exit names the entry signal whose residual quantity it
+    # closes. The lot's own residual - not the deployment's whole net ledger -
+    # is what this order may take, and on a hedging broker the order is pinned
+    # to the position that entry opened.
+    target_signal_id = str(metadata.get("exit_target_signal_id") or "").strip()
     get_positions = getattr(adapter, "get_positions", None)
     if not callable(get_positions):
         raise ValueError("Exit signal requires a broker adapter with get_positions support")
-    # One exit at a time per deployment and symbol: a second exit sized while
-    # the first is still working would size off a ledger without its fills.
-    other_working = await _ensure_no_exit_in_flight(adapter, deployment, signal.symbol)
+    # One exit at a time per deployment, symbol and lot: a second exit sized
+    # while the first is still working would size off a ledger without its
+    # fills. Exits of *different* lots do not block each other.
+    other_working = await _ensure_no_exit_in_flight(
+        adapter,
+        deployment,
+        signal.symbol,
+        target_signal_id=target_signal_id or None,
+    )
     positions = list(await get_positions())
     ledgers = await asyncio.to_thread(
         get_account_net_filled_qty_by_deployment, deployment.account_id, signal.symbol
     )
     ledger_qty = float(ledgers.get(str(deployment.id), 0.0))
-    broker_qty = broker_position_qty(positions, signal.symbol)
+    sizing_positions = positions
+    exit_position_id: int | None = None
+    ledger_match_qty: float | None = None
+    if target_signal_id:
+        lots = await asyncio.to_thread(
+            list_live_deployment_open_position_lots,
+            str(deployment.id),
+            signal.symbol,
+        )
+        lot = next(
+            (
+                row
+                for row in lots
+                if str(row.get("signal_id") or "") == target_signal_id
+            ),
+            None,
+        )
+        if lot is None:
+            raise NothingToExitError(
+                f"Exit signal for {signal.symbol} ignored: its target entry "
+                f"{target_signal_id} has no open residual - the lot is already "
+                "closed.",
+                broker_qty=0.0,
+            )
+        lot_qty = float(lot.get("qty") or 0.0)
+        lot_action = str(lot.get("action") or "").strip().lower()
+        if lot_action == "buy":
+            ledger_qty = lot_qty
+        elif lot_action == "sell":
+            ledger_qty = -lot_qty
+        else:
+            raise ValueError(
+                f"Exit signal for {signal.symbol}: target entry "
+                f"{target_signal_id} has unreadable side {lot_action!r}; "
+                "refusing to guess the close direction."
+            )
+        # On a hedging broker each lot is its own position: resolve which one
+        # this entry opened so the close cannot take a sibling's quantity.
+        # Netting adapters return None and the single broker row sizes it.
+        resolver = getattr(adapter, "resolve_exit_position_target", None)
+        if callable(resolver):
+            resolved = await resolver(signal.symbol, target_signal_id)
+            if resolved is not None:
+                exit_position_id = int(resolved)
+        if exit_position_id is not None:
+            sizing_positions = [
+                position
+                for position in positions
+                if _position_row_id(position) == exit_position_id
+            ]
+            if len(sizing_positions) != 1:
+                raise ValueError(
+                    f"Refusing exit for {signal.symbol}: the position "
+                    f"{exit_position_id} resolved for entry {target_signal_id} "
+                    "is not an open broker position; the close would be "
+                    "ambiguous."
+                )
+        # The ledger-match check still compares every deployment's ledger
+        # against the symbol's whole broker exposure, so on a hedging book it
+        # sums all of the symbol's position rows rather than the one target.
+        ledger_match_qty = _broker_symbol_qty_total(positions, signal.symbol)
+    broker_qty = broker_position_qty(sizing_positions, signal.symbol)
+    if ledger_match_qty is None:
+        ledger_match_qty = broker_qty
+    # On a hedging book a resolved per-lot position IS the lot: for a full
+    # exit the broker's own quantity is the truth to size against, with the
+    # ledger residual kept only as the sanity check alerted on below. A
+    # residual that disagrees with the position means a close the ledger
+    # attributed wrongly (or missed) - sizing off it would leave real
+    # exposure open or refuse a close the broker can prove.
+    sizing_ledger_qty = ledger_qty
+    broker_sized_full_exit = (
+        exit_position_id is not None and instruction.fraction >= 1.0
+    )
+    if broker_sized_full_exit:
+        sizing_ledger_qty = broker_qty
     # Other deployments' exits still working at the broker are not in the broker
     # position yet but will leave it: their unfilled quantity is spoken for and
     # this exit may only close what remains (floored at 0).
     reserved = 0.0
-    sized_positions = positions
+    sized_positions = sizing_positions
     effective_cap = abs(broker_qty)
     if other_working and broker_qty != 0.0:
         reserved = _reserved_by_other_exits(
@@ -1853,14 +1984,14 @@ async def prepare_exit_intent_order(
                 if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
                 and float(position.get("qty") or 0.0) != 0.0
                 else position
-                for position in positions
+                for position in sizing_positions
             ]
     # Resolved against the real position first, so "nothing of this deployment's
     # to close" and ambiguous closes are reported as such.
     close_action, target_qty = resolve_exit_order(
         symbol=signal.symbol,
-        ledger_qty=ledger_qty,
-        broker_positions=positions,
+        ledger_qty=sizing_ledger_qty,
+        broker_positions=sizing_positions,
         instruction=instruction,
     )
     if reserved > 0.0 and effective_cap <= 0.0:
@@ -1871,10 +2002,10 @@ async def prepare_exit_intent_order(
             f"({_describe_exit_rows(other_working, deployment)}); nothing is left "
             "for this deployment to close, so its position stays open."
         )
-    if sized_positions is not positions:
+    if sized_positions is not sizing_positions:
         close_action, target_qty = resolve_exit_order(
             symbol=signal.symbol,
-            ledger_qty=ledger_qty,
+            ledger_qty=sizing_ledger_qty,
             broker_positions=sized_positions,
             instruction=instruction,
         )
@@ -1885,11 +2016,34 @@ async def prepare_exit_intent_order(
     # hear about it: a close the ledgers never saw (a stop or target leg, a
     # flatten, a manual close) happened.
     tolerance = _position_qty_tolerance(adapter, signal.symbol)
+    if broker_sized_full_exit and abs(sizing_ledger_qty) > 0.0:
+        # The broker-sized full exit above traded the lot residual for the
+        # resolved position's own quantity; the residual stays the sanity
+        # check. A disagreement means the ledger attributed a close to the
+        # wrong lot (or missed one): the exit still closes the whole proven
+        # position, but an operator must reconcile the lots.
+        lot_residual = abs(ledger_qty)
+        position_qty = abs(sizing_ledger_qty)
+        if abs(lot_residual - position_qty) > tolerance:
+            await _alert_ledger_mismatch(
+                deployment,
+                signal.symbol,
+                LedgerMismatchError(
+                    "targeted lot residual does not match the resolved "
+                    "broker position; the full exit is sized at the broker "
+                    "position and the lots need reconciling",
+                    ledgers=ledgers,
+                    broker_qty=ledger_match_qty,
+                    tolerance=tolerance,
+                ),
+                own_qty=ledger_qty,
+                exit_qty=target_qty,
+            )
     try:
         ensure_ledgers_match_broker(
             symbol=signal.symbol,
             ledgers=ledgers,
-            broker_qty=broker_qty,
+            broker_qty=ledger_match_qty,
             tolerance=tolerance,
         )
     except LedgerMismatchError as exc:
@@ -1912,7 +2066,7 @@ async def prepare_exit_intent_order(
                         else ""
                     ),
                     ledgers=ledgers,
-                    broker_qty=broker_qty,
+                    broker_qty=ledger_match_qty,
                     tolerance=tolerance,
                 ),
                 own_qty=ledger_qty,
@@ -1924,7 +2078,7 @@ async def prepare_exit_intent_order(
     target_qty = _round_exit_qty_to_adapter_step(adapter, signal.symbol, target_qty)
     matching_positions = [
         position
-        for position in positions
+        for position in sizing_positions
         if str(position.get("symbol") or "").strip().upper() == signal.symbol.upper()
     ]
     for key in (
@@ -1977,10 +2131,47 @@ async def prepare_exit_intent_order(
             position_ids.append(position_id)
     if len(matching_positions) == 1 and len(position_ids) == 1:
         metadata["position_id"] = position_ids[0]
+    if exit_position_id is not None:
+        # #382: the per-lot exit is pinned to the position its entry opened;
+        # this survives the untrusted-metadata scrub above because it was
+        # resolved here from broker state, not taken from the payload.
+        metadata["position_id"] = exit_position_id
     metadata["action"] = close_action
     metadata["signal_action"] = signal.action
     prepared = signal.model_copy(update={"metadata": metadata, "action": close_action})
     return prepared, float(target_qty)
+
+
+def _position_row_id(position: Mapping[str, object]) -> int | None:
+    """The broker position id a position row states, or ``None``."""
+    raw = position.get("position_id", position.get("positionId"))
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _broker_symbol_qty_total(
+    positions: Iterable[Mapping[str, object]], symbol: str
+) -> float:
+    """Signed total of every broker position row for ``symbol`` (#382).
+
+    A hedging book holds several rows per symbol; the ledger-match check
+    compares ledgers against the symbol's whole exposure, so it sums the rows
+    instead of reading one. Every row goes through the same readable-quantity
+    gate as the entry count: an unreadable row raises rather than counting as
+    flat.
+    """
+    wanted = symbol.strip().upper()
+    total = 0.0
+    for index, position in enumerate(positions):
+        if str(position.get("symbol") or "").strip().upper() != wanted:
+            continue
+        total += _broker_position_qty(position, index)
+    return total
 
 
 class UnreadableBrokerPositionQtyError(ValueError):
@@ -2524,35 +2715,43 @@ async def submit_order_with_risk(
                 "order submission refused: the daemon is shutting down; nothing "
                 "was sent to the broker and its outcome is not unknown"
             )
-        prepared_signal, prepared_qty = await prepare_order_with_risk(
-            adapter,
-            deployment,
-            signal,
-            current_exposure=current_exposure,
-            account_balance=account_balance,
-            pip_value=pip_value,
-        )
-        # The same last-moment halt gate the leased submission path runs: this
-        # caller has no claim to protect, but a halt written while the order was
-        # being sized must still stop it. Entries only - an exit is never blocked.
-        if not is_exit_order(signal.action, signal.metadata or {}):
-            await refuse_entry_while_halted(
-                deployment.account_id,
-                deployment_id=str(deployment.id),
-                symbol=signal.symbol,
-            )
-        # #302: the last check before the broker sees the order, independent of
-        # the sizing code that produced it. Inside order_not_submitted so a
-        # refusal is provably pre-request.
-        with order_not_submitted():
-            prepared_qty = await enforce_pre_submit_caps(
+        # #362: the position reads sizing and the caps make, and the submit
+        # they feed, are one serialized section per account - another of this
+        # daemon's submissions, or a STOPPED/kill-switch flatten, can never
+        # interleave between them. A bounded wait that expires refuses with
+        # AccountOrderLockTimeoutError: never submit on a read that may be
+        # stale. Broker-side fills can still move the book inside the section;
+        # reconciliation is the backstop for that residual race.
+        async with _account_order_placement(deployment.account_id):
+            prepared_signal, prepared_qty = await prepare_order_with_risk(
                 adapter,
                 deployment,
-                prepared_signal,
-                qty=prepared_qty,
-                risk_config=_risk_config_for_deployment(deployment),
+                signal,
+                current_exposure=current_exposure,
+                account_balance=account_balance,
+                pip_value=pip_value,
             )
-        return await adapter.submit_order(prepared_signal, qty=prepared_qty)
+            # The same last-moment halt gate the leased submission path runs: this
+            # caller has no claim to protect, but a halt written while the order was
+            # being sized must still stop it. Entries only - an exit is never blocked.
+            if not is_exit_order(signal.action, signal.metadata or {}):
+                await refuse_entry_while_halted(
+                    deployment.account_id,
+                    deployment_id=str(deployment.id),
+                    symbol=signal.symbol,
+                )
+            # #302: the last check before the broker sees the order, independent of
+            # the sizing code that produced it. Inside order_not_submitted so a
+            # refusal is provably pre-request.
+            with order_not_submitted():
+                prepared_qty = await enforce_pre_submit_caps(
+                    adapter,
+                    deployment,
+                    prepared_signal,
+                    qty=prepared_qty,
+                    risk_config=_risk_config_for_deployment(deployment),
+                )
+            return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(
@@ -3541,6 +3740,15 @@ async def _prepare_claim_and_submit_signal(
     before the broker saw anything, ``unknown`` means the broker may have the
     order. Callers that only fan out (Discord) ignore the value; the internal
     strategy runner counts non-clean outcomes toward its escalation.
+
+    The whole prepare -> claim -> caps -> submit section runs under the
+    account's order-placement lock (#362): the broker position reads sizing
+    and the caps make, and the submit they feed, are atomic with respect to
+    every other signal submission of the same account and to STOPPED/
+    kill-switch flattens. Broker-side fills can still move the book inside
+    the section; reconciliation is the backstop. A bounded wait that expires
+    refuses with ``account_order_lock_timeout`` - the order is never sized or
+    submitted on a read that may be stale.
     """
     # This chokepoint serves Discord and internal-strategy signals alike;
     # refusal logs name the actual metadata source, not a hardcoded "Discord".
@@ -3550,6 +3758,193 @@ async def _prepare_claim_and_submit_signal(
         if str(_metadata.get("source") or "").strip().lower() == "internal"
         else "Discord"
     )
+    try:
+        async with _account_order_placement(account_id):
+            # The lock wait is bounded but can still be long: re-run the age
+            # gate now that the section has started, so a signal that was fresh
+            # at dispatch cannot be sized and submitted after it expired (#362).
+            # ``received_at`` absent means the gate is a no-op anyway
+            # (require_producer_timestamp=False), so skip the call rather than
+            # touch attributes a minimal signal stand-in may not have.
+            normalized_metadata = getattr(normalized_signal, "metadata", None)
+            if isinstance(normalized_metadata, Mapping) and normalized_metadata.get(
+                "received_at"
+            ):
+                try:
+                    _validate_signal_age_before_wait(
+                        normalized_signal,
+                        deployment,
+                        timeframe=(
+                            getattr(normalized_signal, "timeframe", None)
+                            or str(
+                                (live_signal.metadata or {}).get("timeframe")
+                                or deployment.timeframe
+                            )
+                        ),
+                        require_producer_timestamp=False,
+                    )
+                except ValueError as exc:
+                    return await _refuse_signal_aged_out_after_lock(
+                        account_id,
+                        deployment,
+                        live_signal,
+                        is_exit=is_exit,
+                        decision=decision,
+                        exc=exc,
+                        source_label=source_label,
+                    )
+            return await _prepare_claim_and_submit_signal_locked(
+                account_id,
+                adapter,
+                deployment,
+                normalized_signal,
+                live_signal,
+                is_exit=is_exit,
+                decision=decision,
+                source_label=source_label,
+            )
+    except AccountOrderLockTimeoutError as exc:
+        return await _refuse_account_order_lock_timeout(
+            account_id,
+            deployment,
+            live_signal,
+            is_exit=is_exit,
+            decision=decision,
+            exc=exc,
+            source_label=source_label,
+        )
+
+
+async def _refuse_account_order_lock_timeout(
+    account_id: str,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    exc: AccountOrderLockTimeoutError,
+    source_label: str,
+) -> str:
+    """Record the fail-closed refusal of an order that could not take the lock.
+
+    Nothing was sent to the broker and no broker state was read for sizing, so
+    this is a plain pre-submission refusal - but for an exit it leaves the
+    position open, which is an operator-visible error like every other refused
+    exit (#121).
+    """
+    if is_exit:
+        logger.error(
+            "Exit signal refused: the account's order-placement lock could not "
+            "be acquired in time; nothing was sent to the broker and the "
+            "position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "action": live_signal.action,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
+    else:
+        logger.warning(
+            f"{source_label} signal refused: the account's order-placement "
+            "lock could not be acquired in time; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+    if decision is not None:
+        decision.refused("account_order_lock_timeout", detail=str(exc))
+    return SUBMIT_OUTCOME_REFUSED
+
+
+async def _refuse_signal_aged_out_after_lock(
+    account_id: str,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    exc: ValueError,
+    source_label: str,
+) -> str:
+    """Record a signal that expired while it waited for the account lock.
+
+    The age gate ran before dispatch and again inside the order-placement
+    section; this is the second refusal, so it gets its own reason rather than
+    looking like a sizing failure. Nothing reached the broker.
+    """
+    reason = "signal_aged_out_during_lock_wait"
+    if is_exit:
+        logger.error(
+            "Exit signal refused after the order-placement lock wait: the "
+            "signal aged out before the section started; nothing was sent to "
+            "the broker and the position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "action": live_signal.action,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
+    else:
+        logger.warning(
+            f"{source_label} signal refused after the order-placement lock "
+            "wait: the signal aged out before the section started; nothing "
+            "was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+    if decision is not None:
+        decision.refused(reason, detail=str(exc))
+    return SUBMIT_OUTCOME_REFUSED
+
+
+async def _prepare_claim_and_submit_signal_locked(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    normalized_signal: TradeSignal,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    source_label: str,
+) -> str:
+    """The claim-and-submit body, run under the account order-placement lock.
+
+    Split from :func:`_prepare_claim_and_submit_signal` so the bounded lock
+    wait wraps exactly the section that reads broker position state and
+    submits; ``source_label`` is computed once by the wrapper.
+    """
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -5971,7 +6366,26 @@ async def _enforce_stopped_deployments(
                     },
                 )
                 continue
-            if not await _enforce_one_stopped_deployment(deployment, adapter):
+            try:
+                async with _account_order_placement(deployment.account_id):
+                    enforced = await _enforce_one_stopped_deployment(
+                        deployment, adapter
+                    )
+            except AccountOrderLockTimeoutError as exc:
+                logger.error(
+                    "STOPPED enforcement refused: the account's order-placement "
+                    "lock could not be acquired in time; the deployment stays "
+                    "unenforced and the cancel/flatten is retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                            "reason": str(exc),
+                        }
+                    },
+                )
+                continue
+            if not enforced:
                 continue
             already_enforced.add(deployment_id)
 

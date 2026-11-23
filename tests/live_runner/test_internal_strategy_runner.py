@@ -899,12 +899,11 @@ def test_max_positions_cap_uses_deployment_ledger(
     assert sent == []
 
 
-def test_max_open_per_symbol_above_one_is_refused(
+def test_max_open_per_symbol_two_allows_pyramid_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Maintainer decision (c), revised 2026-11-22: the per-symbol cap is
-    configurable, but N>1 is not supported end-to-end yet — the deployment
-    is refused with a clear error rather than silently faking it."""
+    """#382: ``internal_max_open_per_symbol`` above 1 is supported — with one
+    open entry and a cap of 2 the next entry submits as an independent lot."""
     import live_runner.internal_strategy_runner as runner_mod
 
     path = _strategy_file(tmp_path, META)
@@ -924,18 +923,89 @@ def test_max_open_per_symbol_above_one_is_refused(
         )
     )
 
-    assert sent == []
-    # Entries are disabled, but the deployment is still evaluated so exits
-    # keep flowing — the market-data fetch proves evaluation ran.
-    assert adapter.calls != []
-    assert (str(deployment.id), "open_position_cap") in runner._reported
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is not True
+    assert (str(deployment.id), "open_position_cap") not in runner._reported
+
+
+def test_max_open_per_symbol_cap_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: the configured cap still binds — at the cap the entry is
+    refused while exits keep flowing."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 2},
+    )
+    adapter = FakeAdapter()
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    # Only the exit goes out; the third lot is refused by the cap.
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "already_open:AAPL") in runner._reported
+
+
+def test_max_open_per_symbol_three_allows_up_to_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: N=3 — two open entries under a cap of 3 still admit a third,
+    and the third submit counts against the cap within the same pass."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 2},
+    )
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 3})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+
+    # At the cap the next bar's entry is refused.
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 3},
+    )
+    later = BASE + timedelta(seconds=130)
+    feed = _bars(count=31, last_open=BASE + timedelta(seconds=60))
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter(feed)}, now=later
+        )
+    )
+
+    assert len(sent) == 1
+    assert (str(deployment.id), "already_open:AAPL") in runner._reported
 
 
 def test_max_open_per_symbol_above_engine_maximum_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Any value other than 1 fails closed — including values that would
-    clamp under the engine maximum."""
+    """#382: values above ``TRADE_ENGINE_MAX_POSITIONS`` fail closed — the
+    engine itself cannot hold more positions than its maximum."""
     import live_runner.internal_strategy_runner as runner_mod
 
     path = _strategy_file(tmp_path, META)
@@ -960,13 +1030,17 @@ def test_max_open_per_symbol_above_engine_maximum_is_refused(
     assert (str(deployment.id), "open_position_cap") in runner._reported
 
 
+@pytest.mark.parametrize("bad_cap", [0, -1, 1.5, True, "lots", None])
 def test_max_open_per_symbol_invalid_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_cap: Any
 ) -> None:
+    """#382: anything that is not an integer in 1..TRADE_ENGINE_MAX_POSITIONS
+    disables entries while exits keep flowing."""
+
     path = _strategy_file(tmp_path, META)
     sent, submit = _collect()
-    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
-    deployment = _deployment(settings={"internal_max_open_per_symbol": "lots"})
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": bad_cap})
     adapter = FakeAdapter()
 
     asyncio.run(
@@ -975,9 +1049,254 @@ def test_max_open_per_symbol_invalid_fails_closed(
         )
     )
 
-    assert sent == []
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
     assert adapter.calls != []
     assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def _exit_only_strategy(df: pd.DataFrame, params: dict[str, Any]):
+    entries = pd.Series(False, index=df.index)
+    exits = pd.Series(False, index=df.index)
+    exits.iloc[-1] = True
+    return entries, exits, {}, []
+
+
+def _lots(*signal_ids: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "signal_id": signal_id,
+            "symbol": "AAPL",
+            "action": "buy",
+            "qty": 1.0,
+            "timestamp": None,
+            "broker_order_id": "",
+        }
+        for signal_id in signal_ids
+    ]
+
+
+def test_exit_fans_out_to_one_targeted_exit_per_lot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: with two filled lots open, a strategy exit emits one exit per
+    lot, each naming the entry signal it closes — distinct idempotency keys
+    so the broker orders cannot dedupe into one."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 2},
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_position_lots",
+        lambda deployment_id, symbol: _lots("entry-a", "entry-b"),
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 2
+    targets = {signal.metadata.get("exit_target_signal_id") for signal in sent}
+    assert targets == {"entry-a", "entry-b"}
+    keys = {signal.metadata["idempotency_key"] for signal in sent}
+    assert len(keys) == 2
+    for signal in sent:
+        assert signal.metadata["signal_intent"] == "exit"
+        assert signal.metadata["exit_only"] is True
+        assert "internal_direction" not in signal.metadata
+
+
+def test_exit_fans_out_to_three_lots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: N=3 — three open lots produce three targeted exits."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 3},
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_position_lots",
+        lambda deployment_id, symbol: _lots("e1", "e2", "e3"),
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 3})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 3
+    assert {
+        signal.metadata.get("exit_target_signal_id") for signal in sent
+    } == {"e1", "e2", "e3"}
+    assert len({signal.metadata["idempotency_key"] for signal in sent}) == 3
+
+
+def test_single_open_lot_exit_stays_untargeted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: one filled lot keeps the N=1 shape — a single untargeted exit
+    with no ``exit_target_signal_id``."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 1},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert "exit_target_signal_id" not in sent[0].metadata
+
+
+def test_unreadable_position_lots_fall_back_to_untargeted_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: when the lot ledger cannot be read the exit still goes out —
+    untargeted, so a hedging broker fails closed on ambiguity rather than
+    the runner guessing a target."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 2},
+    )
+
+    def _boom(deployment_id, symbol):
+        raise RuntimeError("lots locked")
+
+    monkeypatch.setattr(
+        runner_mod, "list_live_deployment_open_position_lots", _boom
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert "exit_target_signal_id" not in sent[0].metadata
+    assert (str(deployment.id), "position_lots") in runner._reported
+
+
+def test_restart_reemits_identical_targeted_exit_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382: a fresh runner re-deriving the same lots emits the same per-lot
+    exit keys, so the adapter's idempotency dedupe prevents double closes
+    after a restart."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: {"AAPL": 2},
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_position_lots",
+        lambda deployment_id, symbol: _lots("entry-a", "entry-b"),
+    )
+    path = _strategy_file(tmp_path, META)
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+    now = BASE + timedelta(seconds=70)
+
+    sent_a, submit_a = _collect()
+    sent_b, submit_b = _collect()
+    for submit in (submit_a, submit_b):
+        runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+        asyncio.run(
+            runner.run_once([deployment], {"acct-1": FakeAdapter()}, now=now)
+        )
+
+    keys_a = {
+        (s.metadata["exit_target_signal_id"], s.metadata["idempotency_key"])
+        for s in sent_a
+    }
+    keys_b = {
+        (s.metadata["exit_target_signal_id"], s.metadata["idempotency_key"])
+        for s in sent_b
+    }
+    assert len(keys_a) == 2
+    assert keys_a == keys_b
+    assert {target for target, _key in keys_a} == {"entry-a", "entry-b"}
+
+
+def test_consecutive_bars_accumulate_independent_lots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382 end-to-end at the runner level: three closed bars under a cap of
+    3 each submit one entry — every entry is an independent lot with its own
+    stop/TP and its own idempotency key."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 3})
+    counts = iter([{}, {"AAPL": 1}, {"AAPL": 2}])
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_open_entry_counts_by_symbol",
+        lambda deployment_id, working_order_ids=None, broker_held_symbols=None: next(counts),
+    )
+
+    steps = (
+        (70, BASE),
+        (130, BASE + timedelta(seconds=60)),
+        (190, BASE + timedelta(seconds=120)),
+    )
+    for offset, last_open in steps:
+        feed = _bars(count=30 + offset // 60, last_open=last_open)
+        asyncio.run(
+            runner.run_once(
+                [deployment],
+                {"acct-1": FakeAdapter(feed)},
+                now=BASE + timedelta(seconds=offset),
+            )
+        )
+
+    assert len(sent) == 3
+    keys = [signal.metadata["idempotency_key"] for signal in sent]
+    assert len(set(keys)) == 3
+    timestamps = [signal.metadata["signal_timestamp"] for signal in sent]
+    assert len(set(timestamps)) == 3
 
 
 def test_engine_position_cap_counts_same_pass_submits(
@@ -1535,7 +1854,7 @@ def test_cap_refusal_still_allows_exits(
     path = _strategy_file(tmp_path, META)
     sent, submit = _collect()
     runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
-    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 0})
 
     asyncio.run(
         runner.run_once(
@@ -1643,3 +1962,183 @@ def test_run_daemon_creates_and_cancels_internal_strategy_task(
         asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
 
     assert events == ["started", "cancelled"]
+
+
+# ── #382: multi-lot cap refusals and entry-order retirement ──────────────────
+
+
+class _AlpacaFakeAdapter(FakeAdapter):
+    """Name carries 'alpaca' so ``_adapter_calendar_source`` routes it."""
+
+
+def test_multi_lot_cap_is_refused_on_alpaca(tmp_path: Path) -> None:
+    """#382 maintainer default: ``internal_max_open_per_symbol > 1`` is
+    refused on Alpaca until #350 - a netted book cannot prove a per-lot
+    exit against bracket-leg reservations. Entries disable, exits flow."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _AlpacaFakeAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert sent == []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def test_multi_lot_cap_is_refused_with_supertrend_flip(tmp_path: Path) -> None:
+    """#382 maintainer default: cap > 1 cannot combine with the live
+    ``supertrend_flip`` opt-in - the flip workflow manages exactly one
+    position per symbol."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(
+        settings={
+            "internal_max_open_per_symbol": 2,
+            "live_supertrend_flip": "true",
+        }
+    )
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert sent == []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def test_flip_opt_in_with_single_lot_cap_still_enters(tmp_path: Path) -> None:
+    """The refusal is cap-scoped: the flip opt-in alone (cap 1) is the
+    maintainer-approved #168 shape and must keep trading."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"live_supertrend_flip": "yes"})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": FakeAdapter()}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+
+
+def test_strategy_exit_cancels_working_entry_orders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#382 maintainer default: a strategy exit retires this deployment's
+    still-working entry orders for the symbol before the exits go out, so
+    a late fill cannot open a lot past the close."""
+    import live_runner.internal_strategy_runner as runner_mod
+    from live_runner.base_adapter import ControlOutcome
+
+    cancelled: list[tuple[set[str], str]] = []
+
+    class _CancellingAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            cancelled.append((set(order_refs), symbol))
+            return ControlOutcome(completed=len(order_refs))
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: {"sig-open", "bo-open"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _CancellingAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert cancelled == [({"sig-open", "bo-open"}, "AAPL")]
+    assert len(sent) == 1
+    assert sent[0].metadata["signal_intent"] == "exit"
+
+
+def test_strategy_exit_survives_a_failed_entry_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort: a cancel that raises is reported once and the exit
+    still goes out - refusing to exit would leave the lots exposed."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    class _BrokenCancelAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            raise RuntimeError("broker refused")
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: {"sig-open"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _BrokenCancelAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata["signal_intent"] == "exit"
+    assert (str(deployment.id), "entry_cancel:AAPL") in runner._reported
+
+
+def test_strategy_exit_with_no_working_entries_skips_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No unfilled entry refs means no broker call at all: the cancel path
+    must not manufacture work (or touch protections) out of an empty set."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    calls: list = []
+
+    class _RecordingAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            calls.append((set(order_refs), symbol))
+            from live_runner.base_adapter import ControlOutcome
+
+            return ControlOutcome(completed=0)
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: set(),
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_only_strategy))
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _RecordingAdapter()},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert calls == []
+    assert len(sent) == 1

@@ -2542,3 +2542,164 @@ def test_get_equity_raises_on_an_unreadable_net_unrealized_pnl(monkeypatch) -> N
     adapter._send_request_with_refresh_retry = _send
     with pytest.raises(MoneyParseError, match="unreadable money value"):
         asyncio.run(adapter.get_equity())
+
+
+# ── #382: resolve_exit_position_target ────────────────────────────────────────
+
+
+def _resolver_adapter() -> CTraderLiveAdapter:
+    adapter = CTraderLiveAdapter(
+        app_id="app",
+        app_secret="secret",
+        access_token="token",
+        account_id="46736452",
+    )
+    adapter._position_ids_by_symbol = {"EURUSD": (10, 11)}
+    return adapter
+
+
+def _position_orders(*orders: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(order=list(orders))
+
+
+def _position_order(
+    order_id: int, client_order_id: str = "", *, closing: bool = False
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        orderId=order_id,
+        clientOrderId=client_order_id,
+        closingOrder=closing,
+    )
+
+
+def _stub_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: CTraderLiveAdapter,
+    orders_by_position: dict[int, object],
+) -> list[int]:
+    """Fake ``_fetch_position_orders`` + ``_signal_id_for_position_order``.
+
+    ``_signal_id_for_position_order`` returns the order's clientOrderId when
+    it is a UUID-shaped signal id, else None - enough to drive the matcher.
+    Returns the list of fetched position ids so tests can assert caching.
+    """
+    import uuid
+
+    fetched: list[int] = []
+
+    async def _fetch(position_id: int):
+        fetched.append(int(position_id))
+        return orders_by_position.get(int(position_id))
+
+    async def _signal_id(order):
+        candidate = str(getattr(order, "clientOrderId", "") or "")
+        try:
+            uuid.UUID(candidate)
+        except (ValueError, AttributeError, TypeError):
+            return None
+        return candidate
+
+    monkeypatch.setattr(adapter, "_fetch_position_orders", _fetch)
+    monkeypatch.setattr(adapter, "_signal_id_for_position_order", _signal_id)
+    return fetched
+
+
+def test_resolve_exit_position_target_single_match(monkeypatch) -> None:
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, wanted)),
+            11: _position_orders(_position_order(101, str(_uuid.uuid4()))),
+        },
+    )
+
+    assert asyncio.run(
+        adapter.resolve_exit_position_target("EURUSD", wanted)
+    ) == 10
+
+
+def test_resolve_exit_position_target_no_match_returns_none(monkeypatch) -> None:
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, "not-a-uuid")),
+            11: _position_orders(_position_order(101, "also-not")),
+        },
+    )
+
+    assert asyncio.run(
+        adapter.resolve_exit_position_target("EURUSD", "missing")
+    ) is None
+
+
+def test_resolve_exit_position_target_two_matches_raise(monkeypatch) -> None:
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, wanted)),
+            11: _position_orders(_position_order(101, wanted)),
+        },
+    )
+
+    with pytest.raises(ValueError, match="several open positions"):
+        asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+
+
+def test_resolve_exit_position_target_unreadable_raises(monkeypatch) -> None:
+    adapter = _resolver_adapter()
+    _stub_resolver(monkeypatch, adapter, {10: None, 11: _position_orders()})
+
+    with pytest.raises(ValueError, match="unreadable"):
+        asyncio.run(adapter.resolve_exit_position_target("EURUSD", "wanted"))
+
+
+def test_resolve_exit_position_target_skips_closing_orders(monkeypatch) -> None:
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    _stub_resolver(
+        monkeypatch,
+        adapter,
+        {
+            10: _position_orders(_position_order(100, wanted, closing=True)),
+            11: _position_orders(_position_order(101, str(_uuid.uuid4()))),
+        },
+    )
+
+    assert asyncio.run(
+        adapter.resolve_exit_position_target("EURUSD", wanted)
+    ) is None
+
+
+def test_resolve_exit_position_target_caches_position_reads(monkeypatch) -> None:
+    """#382: the per-lot fan-out resolves every exit inside the account lock;
+    the position order lists are immutable opening-order reads, so repeats
+    within the TTL must not cost one broker call per position per exit."""
+    import uuid as _uuid
+
+    wanted = str(_uuid.uuid4())
+    adapter = _resolver_adapter()
+    fetched = _stub_resolver(
+        monkeypatch,
+        adapter,
+        {10: _position_orders(_position_order(100, wanted)), 11: _position_orders()},
+    )
+
+    first = asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+    second = asyncio.run(adapter.resolve_exit_position_target("EURUSD", wanted))
+
+    assert first == second == 10
+    assert fetched == [10, 11]
