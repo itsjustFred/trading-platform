@@ -509,7 +509,9 @@ class TestNativeEngineFillPriceSlippage:
         from runner.engine import TradeEngine
 
         engine = TradeEngine(
-            _engine_config({"slippage_bps": 100.0}),  # 1%
+            # #208 made next_open the default signal-exit fill; these cases
+            # pin slippage on the explicit legacy close fill.
+            _engine_config({"slippage_bps": 100.0}, signal_exit_fill="close"),  # 1%
             symbol="TEST",
         )
         result = engine.run(_engine_frame(), _engine_strategy())
@@ -529,7 +531,7 @@ class TestNativeEngineFillPriceSlippage:
         from runner.engine import TradeEngine
 
         engine = TradeEngine(
-            _engine_config({"slippage": "none"}),
+            _engine_config({"slippage": "none"}, signal_exit_fill="close"),
             symbol="TEST",
         )
         result = engine.run(_engine_frame(), _engine_strategy())
@@ -549,7 +551,7 @@ class TestNativeEngineFillPriceSlippage:
             return entries, exits, {"direction": direction}, []
 
         engine = TradeEngine(
-            _engine_config({"slippage_bps": 100.0}),
+            _engine_config({"slippage_bps": 100.0}, signal_exit_fill="close"),
             symbol="TEST",
         )
         result = engine.run(_engine_frame(), short_strategy)
