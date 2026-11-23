@@ -211,6 +211,43 @@ class TestDirectionError:
         assert result.errors > 0
 
 
+class TestMissingRequiredArtifact:
+    def test_missing_required_artifact_is_an_error_level_check(self) -> None:
+        """A missing mandatory artifact fails the gate at severity=error.
+
+        The gate emits a `required_artifact_<name>` check for each configured
+        mandatory artifact. Downgrading that check to a warning let an
+        incomplete validation run (one artifact never produced) read as
+        READY_WITH_WARNINGS instead of NOT_READY.
+
+        The older duplicate block in `validate()` (the `required_<artifact>`
+        names) still emits the same failure under its own name, so both are
+        pinned here: an earlier version of this test only looked up that
+        duplicate, which left `_check_required_artifacts` - the canonical
+        emitter, and the one that also appends the recommendation - free to
+        regress while the suite stayed green.
+        """
+        result = ReadinessValidator.validate(
+            report=_make_delta_report(),
+            regression=None,
+            risk_report=_make_risk_report(),
+            stats=(_make_stats(), _make_stats()),
+            config=ReadinessConfig(require_regression=True),
+        )
+
+        checks = {check.name: check for check in result.checks}
+        canonical = checks["required_artifact_regression_result"]
+        assert canonical.passed is False
+        assert canonical.severity == "error"
+        # The duplicate block emits the same failure under the older name.
+        duplicate = checks["required_regression_result"]
+        assert duplicate.passed is False
+        assert duplicate.severity == "error"
+        assert result.level == PaperReadinessLevel.NOT_READY
+        assert result.passed is False
+        assert any("regression_result" in item for item in result.recommendations)
+
+
 class TestPnlError:
     def test_not_ready_on_pnl_error(self) -> None:
         """A PnL mismatch is severity=error → NOT_READY."""

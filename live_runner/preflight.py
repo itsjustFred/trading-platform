@@ -17,8 +17,17 @@ from pydantic import ValidationError
 from live_runner.account_routing import ctrader_account_identifier
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.config_parser import parse_live_deployments_config
-from live_runner.credential_env import overlay_process_env, read_accounts_env_file
+from live_runner.credential_env import (
+    overlay_process_env,
+    read_accounts_env_file,
+    resolve_accounts_env_path,
+)
 from live_runner.ctrader_adapter import DEFAULT_ACCOUNTS_ENV, CTraderLiveAdapter
+from live_runner.deployment_policy import (
+    normalize_deployment_status,
+    signal_source_can_trade,
+    untradeable_signal_source_reason,
+)
 from live_runner.promotion import enforce_promotion_gate, is_real_money
 from live_runner.shutdown import release_twisted_reactor_threads
 from runner.promotion_gate import StrategyNotPromotedError
@@ -89,7 +98,7 @@ class _LookupRecorder(Mapping[str, str]):
         self.looked_up.add(key)
         return self._values[key]
 
-    def get(self, key: str, default: object = None) -> object:
+    def get(self, key: str, default: Any = None) -> Any:
         self.looked_up.add(key)
         return self._values.get(key, default)
 
@@ -165,7 +174,7 @@ def _connectivity_event_loop(enabled: bool) -> Iterator[asyncio.AbstractEventLoo
     finally:
         try:
             _release_twisted_reactor_threads()
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             logger.warning(
                 "Releasing Twisted reactor threads failed; the process may hang at exit",
                 exc_info=True,
@@ -205,7 +214,7 @@ def _run_broker_connectivity_check(
             balance, equity, positions_count = asyncio.run(_check())
         else:
             balance, equity, positions_count = loop.run_until_complete(_check())
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # Broker error text can quote credential values; redact like every other path.
         errors.append(
             _redact_values(
@@ -440,10 +449,21 @@ def _validate_deployments(
             errors.append(f"{label}: has no symbols configured.")
         if not str(deployment.timeframe).strip():
             errors.append(f"{label}: has no timeframe configured.")
-        if deployment.signal_source == "discord":
+        if signal_source_can_trade(deployment.signal_source):
             channel_id = str(deployment.signal_config.get("channel_id") or "").strip()
             if not channel_id:
                 warnings.append(f"{label}: Discord deployment has no channel_id in signal_config.")
+        elif normalize_deployment_status(deployment.status) == "ACTIVE":
+            # #242: the daemon only trades Discord signals; an ACTIVE row on any
+            # other signal source is a deployment that will never place an order.
+            # The reason and the source test are the daemon's own definitions, so
+            # this preflight cannot call a row clean that the daemon then ignores.
+            reason = untradeable_signal_source_reason(deployment.signal_source)
+            if reason is not None:
+                warnings.append(
+                    f"{label}: ACTIVE deployment has {reason}; the live daemon will "
+                    "never trade it. Stop it or move it to a Discord signal source."
+                )
 
     return errors, warnings
 
@@ -588,14 +608,14 @@ def _config_error_message(exc: Exception, *, redact: Mapping[str, str]) -> str:
 def run_live_preflight(
     config_path: str | Path,
     *,
-    accounts_env_path: str | Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env_path: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     check_connectivity: bool = False,
     check_db: bool = False,
     db_path: str | Path | None = None,
 ) -> LivePreflightResult:
     config = Path(config_path)
-    accounts_env = Path(accounts_env_path)
+    accounts_env = resolve_accounts_env_path(accounts_env_path, default=DEFAULT_ACCOUNTS_ENV)
     # ${VAR} references in the YAML resolve exactly like credentials: the accounts
     # env file first, the process environment only for keys the file does not
     # define. An explicit ``env`` mapping is used as-is (hermetic callers). The
@@ -615,7 +635,7 @@ def run_live_preflight(
         # not a config-text one; it reaches main()'s crash document with a
         # traceback on stderr, as before.
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # B3: invalid account definitions (e.g. non-routable ctrader ids)
         # report as a failed preflight, never as an unhandled crash. The text is
         # value-free: expanded values can be credentials (#199), and so can a
@@ -679,7 +699,9 @@ def run_live_preflight(
     deployment_errors, deployment_warnings = _validate_deployments(accounts, deployments)
     deployment_errors.extend(_promotion_gate_errors(deployments, account_results))
 
-    db_report: dict[str, Any] | None = None
+    # Annotated once, on the config-error path above: this is the other branch
+    # of the same ``db_report``, so annotating it again would shadow the type.
+    db_report = None
     if check_db:
         from live_runner.preflight_db import run_db_preflight
 
@@ -714,7 +736,7 @@ def _crash_redaction(accounts_env: Path) -> dict[str, str] | None:
     """
     try:
         env_values, expansion_env = _accounts_env_views(accounts_env)
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return None
     return _redaction_values(env_values=env_values, expansion_env=expansion_env, referenced=None)
 
@@ -750,8 +772,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--accounts-env",
-        default=str(DEFAULT_ACCOUNTS_ENV),
-        help="Path to .accounts.env-style credential file.",
+        default=None,
+        help=(
+            "Path to .accounts.env-style credential file "
+            "(default: the project file)."
+        ),
     )
     parser.add_argument(
         "--check-connectivity",
@@ -779,23 +804,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A named database is a request to validate it; ignoring the flag would print the same
         # green document as a run that never looked at the DB.
         args.check_db = True
+    # Resolve once here so the preflight, the crash redaction and the result document all name the
+    # same file: --accounts-env applies only when given, else the module default.
+    accounts_env = resolve_accounts_env_path(args.accounts_env, default=DEFAULT_ACCOUNTS_ENV)
 
     # stdout carries exactly one JSON result document; log lines go to stderr.
     route_console_logs_to_stderr()
     try:
         result = run_live_preflight(
             args.config,
-            accounts_env_path=args.accounts_env,
+            accounts_env_path=accounts_env,
             check_connectivity=args.check_connectivity,
             check_db=args.check_db,
             db_path=args.db_path,
         )
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         # An unhandled failure (e.g. missing or malformed config) must still honour
         # the stdout contract: a failed result document, traceback on stderr. Both
         # the traceback and the document are redacted, so an expanded value that
         # reached the exception text is printed nowhere.
-        redact = _crash_redaction(Path(args.accounts_env))
+        redact = _crash_redaction(accounts_env)
         crash_traceback = _crash_traceback(exc, redact=redact)
         crash_log = "Live preflight crashed"
         if crash_traceback is not None:
@@ -819,7 +847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = LivePreflightResult(
             ok=False,
             config_path=str(args.config),
-            accounts_env_path=str(args.accounts_env),
+            accounts_env_path=str(accounts_env),
             accounts=[],
             deployment_errors=[_crash_message(exc, redact=redact)],
             db_deployments=db_report,

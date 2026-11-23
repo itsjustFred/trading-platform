@@ -41,6 +41,7 @@ import pytest
 
 import live_runner.daemon as daemon
 import live_runner.shutdown as shutdown_module
+from live_runner.daemon_cli import EXIT_WORKER_JOIN_TIMEOUT
 from live_runner.shutdown import (
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
@@ -105,6 +106,15 @@ class _GateAdapter:
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_equity(self) -> float:
+        return 100_000.0
+
+    async def get_used_margin(self) -> float:
+        return 0.0
+
+    async def get_max_leverage(self, symbol: str) -> float:
+        return 500.0
 
     async def get_pip_value(self, symbol: str) -> Any:
         # Entries are sized from the broker's pip value and refused without one:
@@ -938,6 +948,7 @@ def test_a_dropped_exit_is_logged_as_an_error_that_the_position_stays_open(
                 ACCOUNT_ID,
                 adapter,  # type: ignore[arg-type]
                 deployment,
+                _trade_signal(),
                 live_signal,
                 is_exit=True,
             )
@@ -1255,6 +1266,7 @@ import time
 sys.path.insert(0, os.environ["TP_REPO_ROOT"])
 
 import live_runner.daemon as daemon
+import live_runner.daemon_cli as daemon_cli
 
 # Longer than any budget this test could grant it, so a single second spent
 # waiting for it is a wait the budget did not allow.
@@ -1284,12 +1296,15 @@ async def _fast_daemon(**kwargs):
     # after the last phase, and that is the part that has to hold the budget.
     kwargs.setdefault("drain_timeout_seconds", 0.2)
     kwargs.setdefault("cleanup_timeout_seconds", 0.2)
+    kwargs.setdefault("worker_join_timeout_seconds", 0.2)
     return await _real_run_daemon(**kwargs)
 
 
 daemon.run_daemon = _fast_daemon
 print("READY", flush=True)
-daemon.main()
+# The real entry point: ``daemon_cli`` owns the exit codes, including the 4 a
+# WorkerJoinTimeout maps to when a broker worker outlives the join budget.
+daemon_cli.main([])
 """
 
 
@@ -1309,10 +1324,14 @@ def test_the_exit_path_survives_a_task_that_ignores_every_cancel(
     systemd would report the SIGKILL it sent itself instead of the exit code that
     says a broker outcome was left unknown.
 
-    The exit code here is ``1`` (the loop cancel phase timed out, because the
-    wedge ignored it), and it has to arrive while the abandoned worker is still
-    running: that is the whole difference between a reported shutdown and a
-    process the service manager kills.
+    The shutdown itself reports ``1`` (the loop cancel phase timed out, because
+    the wedge ignored it), and the worker join then reports its own verdict:
+    the abandoned ``to_thread`` worker is still inside its 300 s broker call
+    when the join budget runs out, so ``run_daemon`` raises
+    ``WorkerJoinTimeout`` and the CLI exits ``4`` - the code that says a broker
+    outcome is unknown. Either way the code has to arrive while the abandoned
+    worker is still running: that is the whole difference between a reported
+    shutdown and a process the service manager kills.
     """
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -1370,7 +1389,7 @@ def test_the_exit_path_survives_a_task_that_ignores_every_cancel(
     assert elapsed < 20.0, (
         f"the exit code did not arrive within the budget after {elapsed:.2f}s"
     )
-    assert process.returncode == EXIT_CLEANUP_TIMEOUT, text[-2000:]
+    assert process.returncode == EXIT_WORKER_JOIN_TIMEOUT, text[-2000:]
 
 
 # A stand-in for the deployment-sync loop that produces the one leftover the
@@ -1389,6 +1408,7 @@ from pathlib import Path
 sys.path.insert(0, os.environ["TP_REPO_ROOT"])
 
 import live_runner.daemon as daemon
+import live_runner.daemon_cli as daemon_cli
 
 # Longer than any budget this test could grant it, so a single second spent
 # waiting for it is a wait the budget did not allow.
@@ -1434,11 +1454,14 @@ async def _fast_daemon(**kwargs):
     # after the last phase, and that is the part that has to hold the budget.
     kwargs.setdefault("drain_timeout_seconds", 0.2)
     kwargs.setdefault("cleanup_timeout_seconds", 0.2)
+    kwargs.setdefault("worker_join_timeout_seconds", 0.2)
     return await _real_run_daemon(**kwargs)
 
 
 daemon.run_daemon = _fast_daemon
-daemon.main()
+# The real entry point: ``daemon_cli`` owns the exit codes, including the 4 a
+# WorkerJoinTimeout maps to when a broker worker outlives the join budget.
+daemon_cli.main([])
 """
 
 
@@ -1556,12 +1579,16 @@ def test_a_clean_shutdown_does_not_wait_for_the_worker_a_broker_call_left_behind
     long as the broker call takes, which is past the unit's ``TimeoutStopSec``,
     so systemd reported the SIGKILL it sent itself instead of the verdict.
 
-    The exit code here is ``0`` - the drain and every phase really did finish -,
-    and it has to arrive while the worker is still running: the marker it writes
+    The shutdown's own verdict is ``EXIT_OK`` - the drain and every phase really
+    did finish - but the worker join that runs before the lock goes gives up on
+    the abandoned ``to_thread`` worker when its budget expires, so the process
+    exits ``4``: the broker outcome is unknown and needs reconciliation. Either
+    code has to arrive while the worker is still running: the marker it writes
     only exists if the process lived long enough for the 300 s call to return.
     """
     _assert_the_budget_held(
-        _run_the_cooperative_worker_program(tmp_path, crash=False), expected=EXIT_OK
+        _run_the_cooperative_worker_program(tmp_path, crash=False),
+        expected=EXIT_WORKER_JOIN_TIMEOUT,
     )
 
 
@@ -1571,16 +1598,20 @@ def test_a_crashed_shutdown_does_not_wait_for_the_worker_left_behind(
     """End to end through ``main``: the crash path leaves the worker behind too.
 
     A crashed daemon re-raised, and the interpreter's teardown then joined the
-    same worker with no deadline - so the ``1`` that says "this crashed" arrived
-    only when the broker call it had already abandoned returned, or not at all
-    inside the unit's ``TimeoutStopSec``. The crash now logs its traceback and
-    leaves through ``os._exit`` like every other path, which is what has to hold
-    the budget here; the traceback is asserted, because the exit that produced
-    the code is the same one that skips the interpreter's traceback dump.
+    same worker with no deadline - so the verdict arrived only when the broker
+    call it had already abandoned returned, or not at all inside the unit's
+    ``TimeoutStopSec``. The crash still logs its traceback, and the worker join
+    that runs before the lock goes gives up on the abandoned ``to_thread``
+    worker when its budget expires: ``WorkerJoinTimeout`` is the verdict that
+    reaches the CLI, which exits ``4`` - a broker outcome is unknown and needs
+    reconciliation. What has to hold the budget here is that neither the crash
+    nor the join waits for the 300 s call; the traceback is asserted, because
+    the exit that produced the code is the same one that skips the
+    interpreter's traceback dump.
     """
     result = _run_the_cooperative_worker_program(tmp_path, crash=True)
 
-    _assert_the_budget_held(result, expected=EXIT_CRASH)
+    _assert_the_budget_held(result, expected=EXIT_WORKER_JOIN_TIMEOUT)
     assert "Traceback" in result.text, result.text[-2000:]
     assert "the stand-in daemon crashed" in result.text
 
@@ -1787,7 +1818,7 @@ def test_a_signal_during_startup_stops_starting_services(
         entered = asyncio.Event()
         cancelled: list[bool] = []
 
-        async def _hang(_scheduler: Any) -> None:
+        async def _hang(_scheduler: Any, *_args: Any, **_kwargs: Any) -> None:
             entered.set()
             try:
                 await asyncio.Event().wait()

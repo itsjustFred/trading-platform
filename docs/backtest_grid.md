@@ -18,13 +18,14 @@ Der Grid-Runner führt automatisierte Backtest-Matrizen für Strategien aus.
 
 ```bash
 # Grid-Run für eine Strategie (kanonische Engine)
-python -m runner.backtest_grid --strategy strategies/example_sma.py --symbols EURUSD GBPUSD USDJPY --timeframes 1h 4h 1d --start 2023-01-01 --end 2024-12-31
+# --strategy takes a file path; --symbols/--timeframes are comma-separated lists
+python -m runner.backtest_grid --strategy strategies/example_sma/example_sma.py --symbols EURUSD,GBPUSD,USDJPY --timeframes 1h,4h,1d --start 2023-01-01 --end 2024-12-31
 
 # Mit anderem Engine-Backend
-python -m runner.backtest_grid --strategy strategies/my_strategy.py --symbols BTCUSDT ETHUSDT --timeframes 1h 1d --start 2023-01-01 --end 2024-12-31 --engine vectorbt
+python -m runner.backtest_grid --strategy strategies/my_strategy/my_strategy.py --symbols BTCUSDT,ETHUSDT --timeframes 1h,1d --start 2023-01-01 --end 2024-12-31 --engine vectorbt
 
 # Alle Strategien über das Grid (Matrix-Runner)
-python -m runner.backtest_matrix --symbols EURUSD GBPUSD --timeframes 1h 4h
+python -m runner.backtest_matrix --symbols EURUSD,GBPUSD --timeframes 1h,4h
 ```
 
 ## Output

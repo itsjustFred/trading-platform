@@ -124,6 +124,7 @@ def test_the_cleanup_runs_as_many_bounded_phases_as_the_budget_counts(
         "disconnect_discord",
         "stop_scheduler",
         "disconnect_adapters",
+        "close_archive",
         "release_reactor",
     ]
     assert len(phases) == CLEANUP_PHASE_COUNT

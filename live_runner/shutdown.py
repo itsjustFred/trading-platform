@@ -75,11 +75,11 @@ EXIT_CRASH = 1
 
 # How many bounded cleanup phases run after the drain, in order: the daemon loop
 # cancel, the listener/Discord cancel, the Discord close, the scheduler stop, the
-# adapter disconnect and the Twisted reactor release. Each gets its own
-# ``DEFAULT_CLEANUP_TIMEOUT_SECONDS``, and the shutdown budget the runbook and
-# the systemd unit pin is derived from how many there are - see
+# adapter disconnect, the signal-archive close and the Twisted reactor release.
+# Each gets its own ``DEFAULT_CLEANUP_TIMEOUT_SECONDS``, and the shutdown budget
+# the runbook and the systemd unit pin is derived from how many there are - see
 # ``WORST_CASE_SHUTDOWN_SECONDS``.
-CLEANUP_PHASE_COUNT = 6
+CLEANUP_PHASE_COUNT = 7
 
 # The longest a bounded shutdown can take: the drain, then one deadline per
 # cleanup phase. A service manager that stops the daemon (``systemctl stop`` →
@@ -183,7 +183,7 @@ async def release_twisted_reactor_threads_bounded(timeout: float) -> None:
     def _release() -> None:
         try:
             release_twisted_reactor_threads()
-        except BaseException as exc:  # the verdict must survive anything the release does
+        except BaseException as exc:  # except-kind: loop-survival - verdict survives release
             failure.append(exc)
         finally:
             try:

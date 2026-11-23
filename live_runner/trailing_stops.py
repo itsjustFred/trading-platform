@@ -115,7 +115,7 @@ def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:
     try:
         broker = getattr(adapter, "broker_name", "")
         can_amend = getattr(adapter, "supports_stop_amendment", False) is True
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return live_supported_trailing_modes(None, supports_stop_amendment=False)
     return live_supported_trailing_modes(broker, supports_stop_amendment=can_amend)
 
@@ -133,7 +133,7 @@ def adapter_live_trailing_timeframes(adapter: Any) -> frozenset[str]:
         serves = getattr(adapter, "supports_market_data_timeframe", None)
         if callable(serves):
             timeframes = frozenset(item for item in timeframes if serves(item))
-    except Exception:
+    except Exception:  # except-kind: money-decision
         return frozenset()
     return timeframes
 
@@ -210,8 +210,8 @@ def _normalize_symbol(value: object) -> str:
 
 
 def _signal_timeframe(deployment: LiveDeploymentConfig) -> str:
-    configured = (deployment.signal_config or {}).get("timeframe")
-    return str(configured or deployment.timeframe or "").strip()
+    """The deployment's own signal timeframe, resolved by the model."""
+    return deployment.signal_timeframe
 
 
 def _position_qty(position: Mapping[str, Any]) -> float:
@@ -302,7 +302,7 @@ class LiveTrailingStopManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 self._surface(
                     "Live trailing-stop pass failed for account; broker-side stops are unchanged",
                     exc,
@@ -413,7 +413,7 @@ class LiveTrailingStopManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # except-kind: money-decision
                 needs_retry |= self._record_failure(key, entry, exc, context, moment)
         return needs_retry
 
@@ -481,7 +481,7 @@ class LiveTrailingStopManager:
             stops = list(await adapter.list_protective_stops())
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: money-decision
             return None, self._record_outage(outage, exc, account_context, moment)
         self._resume(outage, account_context)
         return stops, False
@@ -605,7 +605,10 @@ class LiveTrailingStopManager:
             )
         if (action == "buy") != (qty > 0):
             return None
-        return dict(trailing_cfg)
+        # ``validate_trailing_sl_config`` returns ``None`` for a ``None`` config
+        # and raises for anything that is not a mapping, so reaching here means
+        # ``trailing_cfg`` is a validated dict; mypy cannot follow that guard.
+        return dict(trailing_cfg)  # type: ignore[arg-type]
 
     # ── one position ─────────────────────────────────────────────────────
 
@@ -775,7 +778,7 @@ class LiveTrailingStopManager:
         if not math.isfinite(entry_price) or entry_price <= 0:
             entry_price = bars[0][1]
         signal = TradeSignal(
-            action=action,
+            action=action,  # type: ignore[arg-type]  # restricted to buy/sell by the guard above
             symbol=symbol,
             entry_price=entry_price,
             stop_loss=current.stop_price,
@@ -849,7 +852,10 @@ class LiveTrailingStopManager:
             raise _TrailingFailure("market data has no timestamp/close columns")
         bars: list[tuple[datetime, float]] = []
         ordered = frame.sort_values("timestamp")
-        for raw_time, raw_close in zip(ordered["timestamp"], ordered["close"]):
+        # Both are columns of the same sorted frame, so the two are the same
+        # length by construction: ``strict=True`` turns them getting out of step
+        # into an error instead of pairing a close with the wrong time.
+        for raw_time, raw_close in zip(ordered["timestamp"], ordered["close"], strict=True):
             opened = pd.Timestamp(raw_time)
             if opened.tzinfo is None:
                 opened = opened.tz_localize("UTC")
@@ -909,7 +915,7 @@ async def run_trailing_stops_loop(
             await manager.run_once(eligible_adapters(), current_deployments())
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             LiveTrailingStopManager._surface(
                 "Live trailing-stop tick failed", exc, {"phase": "tick"}
             )

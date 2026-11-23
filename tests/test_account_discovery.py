@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,31 +60,43 @@ def test_message_to_debug_fields_extracts_scalar_and_repeated_values():
     assert payload["permissions"] == ["1", "2"]
 
 
-def test_discover_alpaca_accounts_sets_broker_login(monkeypatch):
-    class _FakeAccount:
-        id = "acc-id"
-        account_number = "broker-42"
-        status = "ACTIVE"
-        equity = 1234.56
-        cash = 1234.56
+def _install_fake_alpaca(monkeypatch, account) -> None:
+    """Point ``alpaca.trading.client`` at a stub whose ``get_account`` returns ``account``."""
 
     class _FakeTradingClient:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
         def get_account(self):
-            return _FakeAccount()
+            return account
 
     fake_module = SimpleNamespace(TradingClient=_FakeTradingClient)
+    modules = __import__("sys").modules
     monkeypatch.setitem(
-        __import__("sys").modules,
+        modules,
         "alpaca",
         SimpleNamespace(trading=SimpleNamespace(client=fake_module)),
     )
     monkeypatch.setitem(
-        __import__("sys").modules, "alpaca.trading", SimpleNamespace(client=fake_module)
+        modules, "alpaca.trading", SimpleNamespace(client=fake_module)
     )
-    monkeypatch.setitem(__import__("sys").modules, "alpaca.trading.client", fake_module)
+    monkeypatch.setitem(modules, "alpaca.trading.client", fake_module)
+
+
+def _fake_alpaca_account(**overrides):
+    fields = {
+        "id": "acc-id",
+        "account_number": "broker-42",
+        "status": "ACTIVE",
+        "equity": 1234.56,
+        "cash": 1234.56,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_discover_alpaca_accounts_sets_broker_login(monkeypatch):
+    _install_fake_alpaca(monkeypatch, _fake_alpaca_account())
 
     accounts = account_discovery.discover_alpaca_accounts("k", "s", True)
     assert len(accounts) == 1
@@ -157,7 +168,12 @@ def test_iter_alpaca_credentials_share_adapter_block_semantics():
     blocks = _alpaca_credential_blocks(env, indexes)
 
     by_key = {block["key"]: block for block in discovered}
-    by_adapter_key = {f"ACC{index}": block for index, block in zip(indexes, blocks)}
+    # `strict=True` is the point of this test: the two lists must stay
+    # index-aligned, and a block that fails to build would otherwise shift
+    # every later adapter key onto the wrong credentials.
+    by_adapter_key = {
+        f"ACC{index}": block for index, block in zip(indexes, blocks, strict=True)
+    }
 
     assert by_key["ACC1"]["paper"] is False
     assert by_adapter_key["ACC1"]["paper"] is False
@@ -208,31 +224,29 @@ def test_iter_alpaca_credentials_default_block_falls_back_to_adapter_default_pai
         )
 
 
-def _tmp_accounts_env(content: str) -> Path:
-    import tempfile
-
-    fd, path = tempfile.mkstemp(suffix=".env")
-    with os.fdopen(fd, "w") as handle:
-        handle.write(content)
-    return Path(path)
+def _write_accounts_env(tmp_path: Path, content: str) -> Path:
+    path = tmp_path / ".accounts.env"
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
-def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch):
+def test_discover_configured_accounts_skips_block_with_invalid_bool(tmp_path, monkeypatch, caplog):
     """A typo'd ALPACA_PAPER_ACC{N} must skip that block with a warning, not
     abort the whole discovery run (which would also drop cTrader accounts)."""
     monkeypatch.setenv("CTRADER_APP_ID", "app")
     monkeypatch.setenv("CTRADER_APP_SECRET", "secret")
     monkeypatch.setenv("CTRADER_ACCESS_TOKEN", "token")
-    env_path = _tmp_accounts_env(
+    env_path = _write_accounts_env(
+        tmp_path,
         "ALPACA_API_KEY_ACC1=good-key\n"
         "ALPACA_SECRET_KEY_ACC1=good-secret\n"
         "ALPACA_PAPER_ACC1=false\n"
         "ALPACA_API_KEY_ACC2=bad-key\n"
         "ALPACA_SECRET_KEY_ACC2=bad-secret\n"
-        "ALPACA_PAPER_ACC2=ture\n"
+        "ALPACA_PAPER_ACC2=ture\n",
     )
 
-    async def _discover(app_id, app_secret, access_token):
+    async def _discover_ctrader(app_id, app_secret, access_token):
         return [
             LiveAccount(
                 id="47644617",
@@ -243,13 +257,40 @@ def test_discover_configured_accounts_skips_block_with_invalid_bool(monkeypatch)
             )
         ]
 
-    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover)
+    discovered_keys: list[str] = []
+
+    def _discover_alpaca(api_key, secret_key, paper):
+        discovered_keys.append(api_key)
+        return [
+            LiveAccount(
+                id=f"alpaca-{len(discovered_keys)}",
+                name="Alpaca paper",
+                broker="alpaca",
+                is_demo=paper,
+            )
+        ]
+
+    monkeypatch.setattr(account_discovery, "discover_ctrader_accounts", _discover_ctrader)
+    # Stubbed: the unstubbed discovery builds a real alpaca-py client from the fixture keys, which
+    # resolves Alpaca's live host and connects. The value of this test is the skip, not the network.
+    monkeypatch.setattr(account_discovery, "discover_alpaca_accounts", _discover_alpaca)
 
     accounts = asyncio.run(account_discovery.discover_configured_accounts(accounts_env=env_path))
 
     # The cTrader account survives; the typo'd block is skipped with a warning
     # instead of aborting the whole discovery run.
     assert [account.id for account in accounts if account.broker == "ctrader"] == ["47644617"]
+    # The malformed block is skipped *with a warning*, and the healthy block is still discovered -
+    # neither half may be silent.
+    assert discovered_keys == ["good-key"]
+    assert [account.id for account in accounts if account.broker == "alpaca"] == ["alpaca-1"]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelname == "WARNING" and "ACC2" in str(record.data)
+    ]
+    assert len(warnings) == 1, [record.getMessage() for record in caplog.records]
+    assert "ALPACA_PAPER_ACC2" in warnings[0].data["error"]
 
 
 def test_iter_alpaca_credentials_safe_keeps_valid_sibling_blocks(monkeypatch):
@@ -411,7 +452,17 @@ def test_the_adapter_balance_uses_the_same_resolution():
     response = adapter._ProtoOATraderRes()
     response.trader = trader
 
-    async def _send_response(_request, **_kwargs):
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAGetPositionUnrealizedPnLReq,
+        ProtoOAGetPositionUnrealizedPnLRes,
+    )
+
+    async def _send_response(request, **_kwargs):
+        # get_balance keeps realized-balance semantics (#267): it no longer
+        # asks for open-position unrealized P&L - that is get_equity's job.
+        # The branch stays so the mock also serves a get_equity call.
+        if isinstance(request, ProtoOAGetPositionUnrealizedPnLReq):
+            return ProtoOAGetPositionUnrealizedPnLRes()
         return response
 
     adapter._send_request = _send_response
@@ -689,3 +740,20 @@ def test_adapter_client_after_discovery_uses_the_adapter_installed_reactor():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+
+
+def test_trader_balance_raises_on_an_unreadable_balance():
+    """A garbage broker balance must not be discovered as a 0.00 account."""
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery._trader_balance(SimpleNamespace(moneyDigits=2, balance="junk"))
+
+
+@pytest.mark.parametrize("field", ["cash", "equity"])
+def test_discover_alpaca_accounts_raises_on_unreadable_money(monkeypatch, field):
+    _install_fake_alpaca(monkeypatch, _fake_alpaca_account(**{field: "junk"}))
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery.discover_alpaca_accounts("k", "s", True)
