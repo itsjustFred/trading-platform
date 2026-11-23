@@ -76,8 +76,10 @@ parent Cleanup 16 record.
   the stop-first range test) is implemented in native `_check_stops` and in
   signal replay's `_check_protective_exit_bar` (#287). The frozen vectorbt
   intrabar walk keeps level fills for protective exits (documented divergence;
-  its `exit_order_type="level"` signal exits do honour gap → open, §2); pynecore
-  restates through its broker emulator + `_normalize_trade_exits` containment.
+  its `exit_order_type="level"` signal exits do honour gap → open, §2). PyneCore
+  is frozen: its `_normalize_trade_exits` containment restates a
+  level-violating leg to the recorded level only — no gap→open restatement
+  (frozen engines get fail-loud guards only, ADR 0001).
   SHORT exits buy the ask, so native adds the spread on top of the open on a
   gap fill exactly as on a level fill. A gap fill is a market fill, so a SHORT
   target gapped by less than the spread fills at `open + spread`, which can be
@@ -124,10 +126,10 @@ parent Cleanup 16 record.
   gap rule without intrabar data; it does not enforce the levels at all there
   (pre-existing, documented limitation).
 - Signal replay applies the gap rule in `_check_protective_exit_bar`
-  (bar open beyond the level → fill at the open). PyneCore's own broker
-  emulator fills gaps at the open; the adapter's containment
-  (`_normalize_trade_exits`, §5) restates a level-violating leg to the level, or
-  to the exit bar's open when that bar gapped through the level.
+  (bar open beyond the level → fill at the open). PyneCore is frozen: its
+  broker emulator may fill gaps at the open internally, but the adapter's
+  containment (`_normalize_trade_exits`, §5) restates a level-violating leg
+  to the recorded level only — frozen engines get no behaviour changes.
 
 ### Slippage (fill-price cost model, #130)
 
@@ -206,10 +208,12 @@ is under active development):
   and **before** the bar's intrabar walk and before pending entries fill, so a
   reversal (exit + entry on one bar) closes the old position and opens the new
   one at the same open. SHORT exits pay the spread.
-- vectorbt / pynecore (frozen): do **not** implement `next_open`. Their
-  adapters map it to the legacy `close` fill with a warning
-  (`_frozen_signal_exit_fill`) so a default run cannot silently claim a
-  next-open model it did not simulate; explicit `close`/`open` keep working.
+- vectorbt / pynecore (frozen): do **not** implement `next_open` and **refuse**
+  a `next_open` config outright (`_frozen_signal_exit_fill` raises) — frozen
+  engines get fail-loud guards, not silent re-interpretation. Entry points
+  that select a frozen engine declare the legacy `close` fill explicitly
+  (`contract.default_signal_exit_fill_for_engine`), so the persisted meta
+  records the model actually simulated; explicit `close`/`open` keep working.
 - signal replay: external signals — entries and flip/exit-only exits alike — are
   executed when they arrive at the fill bar's close (§5), so "exits like
   entries" already holds; there is no separate next-open exit.
@@ -352,7 +356,8 @@ Implementation:
   the same-bar ambiguity on its main frame exactly like native; its
   intrabar walk covers the trigger bar's own sub-bars (window through the
   trigger bar's close) and a trigger-bar stop/TP therefore fills at the
-  level in both engines.
+  level in both engines — except on a gap, where the bar's open is the fill
+  (see the gap rule in §1).
 - Signal replay: `_process_protective_exits` walks bars chronologically and
   classifies each through the shared helper.
 - Configuring `same_bar_order = "take_profit_first"` is **not** part of the
@@ -564,7 +569,7 @@ behavior**, not a bug to be fixed by silently changing one engine:
 | Engine | Model | Meaning |
 |---|---|---|
 | native | next-bar-open | Signal on bar *N* — entry **and** market signal exit — fills at bar *N+1* open (2026-11-13); protective exits evaluated per bar, filling at the level on a touch and at the open on a gap. `exit_order_type="level"` exits fill at their level on the signal bar (§2). |
-| vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar fill (`close`, or `open` opt-in) — `next_open` is mapped to `close` with a warning (§2). Protective exits fill at the level on a touch (no gap→open rule; frozen). |
+| vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar fill (`close`, or `open` opt-in); a `next_open` config is refused outright (§2). Protective exits fill at the level on a touch (no gap→open rule; frozen). |
 | signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
@@ -590,25 +595,25 @@ evaluated (the fill bar's close is the entry and
 `last_checked_at` starts there), so no `allow_gap=False` exemption is needed.
 
 **Pynecore restatement containment.** `_normalize_trade_exits` tightens a
-level-violating exit leg to the recorded protective level:
+level-violating exit leg to the recorded protective level (frozen engine —
+no gap→open restatement):
 
 - a LONG exit below `sl_price` is restated to `sl_price` with reason
-  `stop_loss` (mirrored for SHORT) — or to the exit bar's **open** when that
-  bar opened beyond `sl_price` (gap, 2026-11-13);
+  `stop_loss` (mirrored for SHORT);
 - a LONG exit above `tp_price` is restated to `tp_price` with reason
-  `take_profit` (mirrored for SHORT), likewise to the exit bar's open when that
-  bar gapped through the target;
+  `take_profit` (mirrored for SHORT);
 - an exit inside the levels is left untouched.
 
 Since A-H4 (D3) the adapter additionally runs `_apply_fill_parity` before
 sizing: non-level exit legs (signal/time exits) are re-priced to the fill
 convention the other engines use — the configured `signal_exit_fill`
-(default `next_open`, equal to `open` for the Pine ledger whose legs are
-stamped on the fill bar: that bar's open; legacy `close`: that bar's close) —
-when the recorded Pine price disagrees with that convention. Level exits
-(`stop_loss`/`take_profit`) keep their recorded price. This re-pricing is a
-documented divergence from the raw Pine ledger, applied so cross-engine
-comparisons measure strategy edge instead of engine artifacts.
+(`close`: the recorded leg bar's close; `open`: that bar's open — the
+Pine ledger stamps legs on the fill bar itself; `next_open` is refused on
+this frozen engine) — when the recorded Pine price disagrees with that
+convention. Level exits (`stop_loss`/`take_profit`) keep their recorded
+price. This re-pricing is a documented divergence from the raw Pine ledger,
+applied so cross-engine comparisons measure strategy edge instead of engine
+artifacts.
 
 The restatement never invents prices beyond the recorded levels and never
 rewrites entry legs. Conformance tests pin the containment as a property:

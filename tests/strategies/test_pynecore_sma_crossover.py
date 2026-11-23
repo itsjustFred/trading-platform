@@ -31,7 +31,7 @@ EXPECTED_NET_PROFIT = 2178.03
 @pytest.fixture(scope="module")
 def backtest_result():
     engine = PyneCoreAdapter()
-    config = BacktestConfig(parameters={"fees": "zero"},
+    config = BacktestConfig(signal_exit_fill="close", parameters={"fees": "zero"},
         strategy_name="pynecore_sma_crossover",
         symbols=[TEST_SYMBOL],
         timeframe=TEST_TIMEFRAME,

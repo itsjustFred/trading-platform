@@ -205,6 +205,9 @@ class _Adapter(BaseLiveAdapter):
     async def get_positions(self) -> list[dict[str, Any]]:
         return list(self.positions)
 
+    async def get_used_margin(self) -> float | None:
+        return 0.0
+
     async def get_pip_value(self, symbol: str):
         # #146: sizing needs a trusted broker pip value for entries.
         from live_runner.base_adapter import LivePipValue

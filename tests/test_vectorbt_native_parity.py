@@ -92,6 +92,9 @@ def _config(tmp_path: Path, strategy_file: str, **overrides: Any) -> BacktestCon
         "risk_per_trade_pct": 0.01,
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
+        # Frozen engine: next_open is refused; declare the legacy close fill
+        # (overridable via **overrides, e.g. signal_exit_fill="open").
+        "signal_exit_fill": "close",
         "parameters": {"spread_price_col": "spread_price"},
     }
     payload.update(overrides)
@@ -173,6 +176,7 @@ class TestWarmupGate:
         path = parity_env / "warmup_strat.py"
         path.write_text(text)
         config = BacktestConfig(risk_per_trade_pct=0.01, parameters={"fees": "zero"},
+            signal_exit_fill="close",
             strategy_name="vbt_warmup",
             symbols=["VBW"],
             timeframe="1h",
@@ -368,9 +372,9 @@ class TestExplicitColumnRoles:
             },
             index=index,
         )
-        # The frozen adapter keeps the same-bar exit leg unshifted (the
-        # signal_exit_fill="next_open" mode is native-only; the adapter maps
-        # it to "close" upstream).
+        # The frozen adapter keeps the same-bar exit leg unshifted —
+        # signal_exit_fill="next_open" is refused on this adapter entirely;
+        # its accepted modes ("close"/"open") both fill on the signal bar.
         exec_default, _ = _prepare_next_open_execution_data(signals, {})
         assert exec_default["exit_signal"].tolist()[1:2] == [11.0]
         exec_declared, _ = _prepare_next_open_execution_data(
