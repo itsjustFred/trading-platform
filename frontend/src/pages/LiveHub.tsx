@@ -10,6 +10,7 @@ import {
   getLiveBalances,
   getLiveDashboard,
   getLiveDeployments,
+  getLiveKillSwitch,
   getLivePositions,
   getSignalProcessors,
   getLiveStats,
@@ -20,6 +21,7 @@ import {
   updateLiveDeploymentStatus,
 } from "../api/client";
 import { liveWinRateToPoints } from "../api/metricScale";
+import { LiveKillSwitchPanel } from "../components/LiveKillSwitchPanel";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
@@ -32,6 +34,7 @@ import type {
   LiveDashboardResponse,
   LiveDeploymentConfig,
   LiveDeploymentStatus,
+  LiveKillSwitchState,
   LiveTradeSlippage,
   SignalProcessorOption,
   Service,
@@ -303,6 +306,8 @@ export function LiveHubPage() {
   const [cards, setCards] = useState<DeploymentCard[]>([]);
   const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
   const [dashboard, setDashboard] = useState<LiveDashboardResponse | null>(null);
+  const [killSwitch, setKillSwitch] = useState<LiveKillSwitchState | null>(null);
+  const [killSwitchError, setKillSwitchError] = useState("");
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -350,6 +355,17 @@ export function LiveHubPage() {
         void getLiveDashboard()
           .then(setDashboard)
           .catch(() => setDashboard(null));
+        // The kill-switch state is a single read the daemon enforces; a failure
+        // here must not take the deployments view down with it, so it resolves
+        // on its own and reports through the panel instead of `error`.
+        void getLiveKillSwitch()
+          .then((payload) => {
+            setKillSwitch(payload);
+            setKillSwitchError("");
+          })
+          .catch(() =>
+            setKillSwitchError("Could not load the kill-switch state."),
+          );
         const statsEntries = await Promise.all(
           accountPayload.map(async (account) => {
             const [statsResult, balancesResult, positionsResult] = await Promise.allSettled([
@@ -1297,6 +1313,13 @@ export function LiveHubPage() {
           </strong>
         </div>
       </div>
+
+      <LiveKillSwitchPanel
+        state={killSwitch}
+        loadError={killSwitchError}
+        accounts={accounts}
+        onStateChange={setKillSwitch}
+      />
 
       {loading && (
         <div style={{ color: "var(--color-text-muted)", textAlign: "center", padding: "48px 0" }}>

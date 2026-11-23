@@ -1207,6 +1207,11 @@ database.
 | `POST /api/live/kill-switch/halt` | halt one scope; `confirmed_scope` required for `orders` and `flatten` |
 | `POST /api/live/kill-switch/resume` | lift the halt on one scope; `confirmed_scope` required |
 
+The Live Hub page carries the same control: a kill-switch panel above the account grid shows
+the enforced state per scope (global plus every live account), offers all three modes, keeps
+`entries` one click, and puts `orders`, `flatten` and resume behind a confirmation dialog that
+echoes the scope. An unreadable state is displayed as fail-closed, not as "nothing halted".
+
 `entries` is deliberately unconfirmed: it refuses new entries and can cost nothing, so it stays
 one click in an incident. The modes that move money, and resuming trading, are confirmed on the
 server - the API is directly callable, so a dialog in the UI constrains nothing but the UI.
