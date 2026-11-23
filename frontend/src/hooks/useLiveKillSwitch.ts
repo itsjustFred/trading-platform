@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getLiveKillSwitch } from "../api/client";
 import type { LiveKillSwitchState } from "../api/types";
@@ -19,14 +19,20 @@ export function useLiveKillSwitch() {
   const [error, setError] = useState("");
   const [stale, setStale] = useState(false);
   const [readAt, setReadAt] = useState<string | null>(null);
+  // Bumped by every halt/resume write. A poll that was already in flight
+  // when the write landed carries pre-write state (or a pre-write failure),
+  // so its result is discarded rather than allowed to overwrite — or stale-
+  // mark — the fresher read-back the write returned (#300 follow-up).
+  const writeSeq = useRef(0);
 
   useEffect(() => {
     let active = true;
 
     const refresh = async () => {
+      const writeSeqAtStart = writeSeq.current;
       try {
         const payload = await getLiveKillSwitch();
-        if (!active) {
+        if (!active || writeSeq.current !== writeSeqAtStart) {
           return;
         }
         setState(payload);
@@ -34,7 +40,7 @@ export function useLiveKillSwitch() {
         setStale(false);
         setReadAt(new Date().toISOString());
       } catch {
-        if (!active) {
+        if (!active || writeSeq.current !== writeSeqAtStart) {
           return;
         }
         // A failed refresh must not leave the last good state rendering as
@@ -58,9 +64,13 @@ export function useLiveKillSwitch() {
   }, []);
 
   // A halt/resume write returns the server's read-back state, which is a
-  // fresh read: it clears the stale mark a failed poll left behind.
+  // fresh read: it clears the stale mark AND the error text a failed poll
+  // left behind, and invalidates any poll still in flight so its older
+  // answer cannot overwrite this state.
   const onStateChange = useCallback((next: LiveKillSwitchState) => {
+    writeSeq.current += 1;
     setState(next);
+    setError("");
     setStale(false);
     setReadAt(new Date().toISOString());
   }, []);
