@@ -3393,6 +3393,24 @@ async def _submit_internal_strategy_signal(
     )
 
 
+def _record_halt_refusal(decision: SignalDecisionRecorder | None, exc: LiveHaltError) -> None:
+    """Write the ``halt_refused`` decision record for a kill-switch refusal (#386).
+
+    Every ``LiveHaltError`` catch on the submission path owes the decision
+    audit trail the same record: the outcome, the halt's mode and whether the
+    halt state itself was unreadable (fail-closed). One helper keeps the three
+    sites identical instead of three copies drifting apart.
+    """
+    if decision is None:
+        return
+    decision.refused(
+        "halt_refused",
+        detail=str(exc),
+        halt_mode=exc.mode.value if exc.mode is not None else None,
+        halt_state_unreadable=exc.state_unreadable,
+    )
+
+
 async def _persist_submission_rejection(
     deployment: LiveDeploymentConfig,
     live_signal: LiveSignal,
@@ -3557,13 +3575,7 @@ async def _prepare_claim_and_submit_signal(
         await _persist_submission_rejection(
             deployment, live_signal, stage="prepare", exc=exc
         )
-        if decision is not None:
-            decision.refused(
-                "halt_refused",
-                detail=str(exc),
-                halt_mode=exc.mode.value if exc.mode is not None else None,
-                halt_state_unreadable=exc.state_unreadable,
-            )
+        _record_halt_refusal(decision, exc)
         return SUBMIT_OUTCOME_REFUSED
     except LossBreakerBreachError as exc:
         # The loss circuit breaker (#301) refused this entry. Nothing was sent,
@@ -3661,13 +3673,7 @@ async def _prepare_claim_and_submit_signal(
             await _persist_submission_rejection(
                 deployment, live_signal, stage="prepare", exc=exc
             )
-            if decision is not None:
-                decision.refused(
-                    "halt_refused",
-                    detail=str(exc),
-                    halt_mode=exc.mode.value if exc.mode is not None else None,
-                    halt_state_unreadable=exc.state_unreadable,
-                )
+            _record_halt_refusal(decision, exc)
             return SUBMIT_OUTCOME_REFUSED
 
     # Shutdown gate + in-flight registration happen in one synchronous step, so
@@ -3817,13 +3823,7 @@ async def _claim_and_submit_prepared_signal(
             await _persist_submission_rejection(
                 deployment, live_signal, stage="prepare", exc=exc
             )
-            if decision is not None:
-                decision.refused(
-                    "halt_refused",
-                    detail=str(exc),
-                    halt_mode=exc.mode.value if exc.mode is not None else None,
-                    halt_state_unreadable=exc.state_unreadable,
-                )
+            _record_halt_refusal(decision, exc)
             return SUBMIT_OUTCOME_REFUSED
 
     renew_task = asyncio.create_task(
