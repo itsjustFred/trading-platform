@@ -1,0 +1,47 @@
+docs/live-deploy-runbook.md
+  s_ddbd14be9364ad::t_2eb65719714f78 370-418
+live_runner/alpaca_adapter.py
+  s_ddbd14be9364ad::t_a08db1c3337dde 8,3112-3166
+live_runner/base_adapter.py
+  s_ddbd14be9364ad::t_57f76b4b18a42c 5,504-519,642-660
+live_runner/ctrader_adapter.py
+  s_ddbd14be9364ad::t_ba7fc25bd73eea 12,886-896,1177-1198,1787-1854,2820-2821,3770-3814,4414-4502,4632,4634,4665,5164-5206
+live_runner/daemon.py
+  s_ddbd14be9364ad::t_26c85baca2ee62 208,1713-1731,1733-1737,1793,1801-1808,1958-1962,1966-1974,1980-2055,2060,2076,2082-2083,2094,2097,2108-2130,2135,2158,2170,2223-2227,2234-2265
+live_runner/internal_strategy_runner.py
+  s_ddbd14be9364ad::t_1344a494e0694f 77-87,89-96,137,139-143,158,160,166-169,191-192,285-288,308,310-312,317-381,723-789,875-1035,1076,1318-1374,1522-1531,1667-1682,1684,1751-1792,1808
+live_runner/supertrend_flip.py
+  s_ddbd14be9364ad::t_63fbdfda8c864b 1928-1930
+shared/database.py
+  s_ddbd14be9364ad::t_5154a7724f9605 11,4434-4436,4443-4445,4450,4453-4464,4504-4513,4564,4581-4583,4586,4589,4591,4613,4620-4773,5030-5032
+tests/live_runner/test_internal_strategy_runner.py
+  s_ddbd14be9364ad::t_3afa6a37ddcfc1 902,905-906,926-1001,1007-1008,1033,1035,1037-1039,1042-1043,1052-1053,1058-1301,1857,1965-2518
+tests/live_runner/test_open_entry_counts.py
+  s_ddbd14be9364ad::t_9d273576731685 14-15,402-504,527-690
+tests/test_alpaca_adapter.py
+  s_ddbd14be9364ad::t_1e3e8dd866ccff 2621-2722
+tests/test_ctrader_adapter.py
+  s_ddbd14be9364ad::t_7e995d3e84ae5f 10,2546-3112
+tests/test_db_backup.py
+  s_ddbd14be9364ad::t_83b43ba2cad946 640-643
+tests/test_live_execution_safety.py
+  s_ddbd14be9364ad::t_aa6e4da7d9069e 979-1245,6012-6161
+tests/test_live_supertrend_flip.py
+  s_ddbd14be9364ad::t_6e950e62af35c8 386-418
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f876b2edace78f1d6772614768a69dfef5060202",
+  "prompts": {},
+  "sessions": {
+    "s_ddbd14be9364ad": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_ddbd14be9364ad",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
