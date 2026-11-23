@@ -75,7 +75,6 @@ def test_five_bar_hold_is_open_of_bar_i_plus_1_to_open_of_bar_i_plus_6(tmp_path:
     # price and timestamp agree: the OPEN of the exit bar, not the signal bar's close
     assert exit_leg.price == pytest.approx(float(frame["open"].iloc[CRASH + 6]))
     assert exit_leg.price != pytest.approx(float(frame["close"].iloc[CRASH + 5]))
-    assert "exit_price_ignored_market_close" not in trade.meta
 
 
 def test_strategy_emits_no_explicit_price_for_market_exits():

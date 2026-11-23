@@ -88,8 +88,14 @@ class _FakeTradingClient:
         self.submitted: list[object] = []
         self.close_error = close_error
         self.submit_error = submit_error
+        self.account = SimpleNamespace(
+            cash=100_000.0, equity=100_000.0, currency="USD", multiplier="2"
+        )
         self.order_filters: list[object] = []
         self.history: dict[str, _FakeOrder] = {}
+
+    def get_account(self):
+        return self.account
 
     def get_orders(self, filter=None):  # noqa: A002 - mirrors alpaca-py
         # alpaca-py's server-side default page size is 50.
@@ -2041,6 +2047,294 @@ def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
 def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     adapter = _adapter(_FakeTradingClient())
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
+
+
+def test_reconciliation_orders_do_not_mark_market_exits_as_protection() -> None:
+    """#303: a working exit is a market order; "reduces a position" alone must
+    not mark it protection, or the reconciler reports it missing and halts
+    entries on a healthy account."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder("exit-1", "AAPL", "sell", order_type="market"),
+            _FakeOrder("tp-1", "AAPL", "sell", order_type="limit"),
+            _FakeOrder("sl-1", "AAPL", "sell", order_type="stop", stop_price=90.0),
+            _FakeOrder("entry-1", "MSFT", "buy", order_type="limit"),
+        ],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    views = {
+        view.order_id: view
+        for view in asyncio.run(_adapter(client).list_reconciliation_orders())
+    }
+
+    assert views["exit-1"].protection is False
+    assert views["tp-1"].protection is True
+    assert views["sl-1"].protection is True
+    assert views["entry-1"].protection is False
+
+
+def test_reconciliation_orders_mark_bracket_legs_as_protection() -> None:
+    legs = [
+        _FakeOrder("leg-tp", "AAPL", "sell", order_type="limit"),
+        _FakeOrder("leg-sl", "AAPL", "sell", order_type="stop", stop_price=90.0),
+    ]
+    client = _FakeTradingClient(
+        orders=[_FakeOrder("parent-1", "AAPL", "buy", order_type="market", legs=legs)],
+        positions=[_FakePosition("AAPL", 10.0)],
+    )
+
+    views = {
+        view.order_id: view
+        for view in asyncio.run(_adapter(client).list_reconciliation_orders())
+    }
+
+    assert views["leg-tp"].protection is True
+    assert views["leg-sl"].protection is True
+
+
+def test_order_remaining_qty_reports_qty_minus_filled() -> None:
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=4.0)) == pytest.approx(6.0)
+
+
+def test_order_remaining_qty_is_none_when_qty_is_unreadable() -> None:
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty="junk", filled_qty=0.0)) is None
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=None, filled_qty=0.0)) is None
+
+
+def test_order_remaining_qty_is_none_when_filled_qty_is_unreadable() -> None:
+    # An unreadable filled_qty is "unknown", never 0: guessing 0 would
+    # overstate the working quantity.
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty="junk")) is None
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=None)) is None
+
+
+def test_order_remaining_qty_reports_zero_when_filled_covers_qty() -> None:
+    # filled >= qty on an order still listed as working means "filled but not
+    # yet off the book": the remaining working qty is 0, not the full qty.
+    from live_runner.alpaca_adapter import _order_remaining_qty
+
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=10.0)) == 0.0
+    assert _order_remaining_qty(_FakeOrder("o1", "AAPL", "buy", qty=10.0, filled_qty=12.0)) == 0.0
+
+
+def test_get_order_state_maps_broker_statuses() -> None:
+    """Reconciliation lookups: accounted-for statuses drop the finding, the
+    rest fail closed (#303)."""
+    orders = {
+        "ord-expired": SimpleNamespace(status="expired"),
+        "ord-working": SimpleNamespace(status="new"),
+        "ord-weird": SimpleNamespace(status="some_future_status"),
+        "ord-done-for-day": SimpleNamespace(status="done_for_day"),
+        "ord-stopped": SimpleNamespace(status="stopped"),
+        "ord-suspended": SimpleNamespace(status="suspended"),
+        "ord-replaced": SimpleNamespace(status="replaced"),
+    }
+
+    def get_order_by_id(order_id):
+        order = orders.get(order_id)
+        if order is None:
+            raise RuntimeError("404 not found")
+        return order
+
+    client = SimpleNamespace(get_order_by_id=get_order_by_id)
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter.get_order_state("ord-expired")) == "terminal"
+    assert asyncio.run(adapter.get_order_state("ord-working")) == "working"
+    assert asyncio.run(adapter.get_order_state("ord-weird")) is None
+    assert asyncio.run(adapter.get_order_state("ord-missing")) is None
+    for order_id in (
+        "ord-done-for-day",
+        "ord-stopped",
+        "ord-suspended",
+        "ord-replaced",
+    ):
+        assert asyncio.run(adapter.get_order_state(order_id)) == "terminal"
+
+
+def test_get_order_state_falls_back_to_client_order_id() -> None:
+    def get_order_by_id(order_id):
+        raise RuntimeError("404 not found")
+
+    def get_order_by_client_id(client_order_id):
+        if client_order_id != "sig-1":
+            raise RuntimeError("404 not found")
+        return SimpleNamespace(status="canceled")
+
+    client = SimpleNamespace(
+        get_order_by_id=get_order_by_id,
+        get_order_by_client_id=get_order_by_client_id,
+    )
+    adapter = _adapter(client)
+
+    assert (
+        asyncio.run(adapter.get_order_state("broker-id", client_order_id="sig-1"))
+        == "terminal"
+    )
+
+
+def test_install_http_timeout_wraps_the_session_once() -> None:
+    from live_runner.alpaca_adapter import _install_http_timeout
+
+    calls: list[dict] = []
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            calls.append({"method": method, "kwargs": kwargs})
+            return "ok"
+
+    client = SimpleNamespace(_session=_Session())
+    _install_http_timeout(client, 12.5)
+    _install_http_timeout(client, 99.0)  # second call must not double-wrap
+
+    assert client._session.request("GET", "https://example.invalid") == "ok"
+    assert calls == [
+        {"method": "GET", "kwargs": {"timeout": 12.5}}
+    ]
+
+# ── get_max_leverage (#240/#302) ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("multiplier", "expected"),
+    [
+        # multiplier=4 is intraday buying power only; Reg T caps overnight
+        # marginable-stock positions at 2x, and no platform order is marked
+        # intraday-only, so the ceiling is the conservative min(multiplier, 2).
+        ("4", 2.0),
+        ("2", 2.0),
+        ("1", 1.0),
+    ],
+)
+def test_get_max_leverage_returns_the_overnight_reg_t_ceiling(
+    multiplier: str, expected: float
+) -> None:
+    client = _FakeTradingClient()
+    client.account.multiplier = multiplier
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) == pytest.approx(expected)
+
+
+def test_get_max_leverage_crypto_stays_at_the_1x_default() -> None:
+    # Alpaca offers no crypto margin: the multiplier does not apply, so the
+    # lookup reports unknown and the caps fail closed to 1x.
+    client = _FakeTradingClient()
+    client.account.multiplier = "4"
+    assert asyncio.run(_adapter(client).get_max_leverage("BTC/USD")) is None
+    assert asyncio.run(_adapter(client).get_max_leverage("BTCUSD")) is None
+
+
+def test_get_max_leverage_unreadable_multiplier_fails_closed() -> None:
+    client = _FakeTradingClient()
+    client.account = SimpleNamespace(cash=1.0, equity=1.0, currency="USD")
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) is None
+    client.account.multiplier = "0"
+    assert asyncio.run(_adapter(client).get_max_leverage("AAPL")) is None
+
+
+# ── get_used_margin (#359) ────────────────────────────────────────────────────
+
+
+def test_get_used_margin_prefers_the_brokers_initial_margin() -> None:
+    # The broker's own figure already prices marginable vs non-marginable and
+    # crypto positions; it wins over any local approximation.
+    client = _FakeTradingClient()
+    client.account.initial_margin = "1234.56"
+    assert asyncio.run(_adapter(client).get_used_margin()) == pytest.approx(1234.56)
+
+
+def test_get_used_margin_falls_back_to_position_notionals_over_leverage() -> None:
+    # No initial_margin on the account: sum |market value| / effective
+    # leverage — min(multiplier, 2) for marginable stocks, 1x for crypto and
+    # non-marginable assets.
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(
+            symbol="AAPL", market_value="100000", asset_class="us_equity",
+            asset_marginable=True,
+        ),
+        SimpleNamespace(
+            symbol="BTC/USD", market_value="-40000", asset_class="crypto",
+            asset_marginable=False,
+        ),
+        SimpleNamespace(
+            symbol="XYZ", market_value="30000", asset_class="us_equity",
+            asset_marginable=False,
+        ),
+    ]
+    # multiplier "2" -> overnight leverage 2 for the marginable stock only:
+    # 100000/2 + 40000/1 + 30000/1 = 120000.
+    assert asyncio.run(_adapter(client).get_used_margin()) == pytest.approx(120_000.0)
+
+
+def test_get_used_margin_fallback_without_positions_is_zero() -> None:
+    client = _FakeTradingClient()
+    assert asyncio.run(_adapter(client).get_used_margin()) == 0.0
+
+
+def test_get_used_margin_returns_none_when_positions_are_unreadable() -> None:
+    client = _FakeTradingClient()
+
+    def _boom():
+        raise RuntimeError("positions endpoint down")
+
+    client.get_all_positions = _boom
+    assert asyncio.run(_adapter(client).get_used_margin()) is None
+
+
+def test_get_used_margin_raises_on_an_unreadable_position_value() -> None:
+    # A partial sum would understate used margin and overstate free margin:
+    # ``parse_money`` raises ``MoneyParseError`` so the caps refuse.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(symbol="AAPL", market_value=None),
+    ]
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_used_margin())
+
+
+def test_get_used_margin_raises_on_a_non_finite_position_value() -> None:
+    # market_value is Optional[str] on the broker model; "nan" parses but is
+    # not a usable notional, so the fallback must fail closed like any other
+    # unreadable figure.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.positions = [
+        SimpleNamespace(symbol="AAPL", market_value="nan"),
+    ]
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_used_margin())
+
+
+def test_get_used_margin_raises_on_a_garbage_initial_margin() -> None:
+    # A present-but-unreadable ``initial_margin`` is not "absent": it raises
+    # so the caps refuse, instead of silently degrading to the approximation.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.account.initial_margin = "junk"
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_used_margin())
+
+
+def test_get_max_leverage_garbage_multiplier_raises_money_parse_error() -> None:
+    # A present-but-unreadable multiplier is not "absent": it raises so the
+    # caps' ``_safe_max_leverage`` maps it to the 1x ceiling, never to a guess.
+    from shared.money import MoneyParseError
+
+    client = _FakeTradingClient()
+    client.account.multiplier = "junk"
+    with pytest.raises(MoneyParseError):
+        asyncio.run(_adapter(client).get_max_leverage("AAPL"))
 
 
 # ── Money fields fail closed (#280) ──────────────────────────────────────────

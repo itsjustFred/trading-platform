@@ -122,8 +122,10 @@ def test_day_reset_flattens_without_eod_bar():
     """B-H1: offene Position wird am Day-Reset geflattet (kein Phantom-Trade).
 
     Fehlt jede Post-16:00-ET-Bar des Entry-Tages (Session-Data-Gap), feuert
-    der time_exit_eod nie. Der Day-Rollover muss den Exit auf der letzten
-    Bar des Vortages zum Close buchen statt die Position still zu droppen.
+    der time_exit_eod nie. Der Day-Rollover signalisiert den Exit auf der
+    ERSTEN Bar des neuen ET-Tages (kein Look-ahead: die letzte Bar des
+    Vortages kann nicht wissen, dass sie die letzte ist); der Market-Exit
+    fuellt dann am naechsten Open.
     """
     module = _load_module()
     df = _frame()
@@ -137,10 +139,10 @@ def test_day_reset_flattens_without_eod_bar():
     exit_idx = exits[exits].index.tolist()
     assert len(exit_idx) == 1, "Day-Reset muss genau einen Exit buchen"
     assert indicators["exit_reason"].loc[exit_idx[0]] == "day_reset_flatten"
-    # Letzte Bar des ET-Tages 2024-01-02 = 19:00 UTC (14:00 ET); Market-Exit ohne
-    # expliziten Preis (fuellt am naechsten Open).
+    # Erste Bar des ET-Tages 2024-01-03 = 05:00 UTC (00:00 ET); Market-Exit
+    # ohne expliziten Preis (fuellt am naechsten Open).
     assert df_gap.loc[exit_idx[0], "timestamp"] == pd.Timestamp(
-        "2024-01-02 19:00", tz="UTC"
+        "2024-01-03 05:00", tz="UTC"
     )
     assert pd.isna(indicators["exit_price"].loc[exit_idx[0]])
 

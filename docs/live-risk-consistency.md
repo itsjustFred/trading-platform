@@ -229,6 +229,134 @@ signals; refused ones are not persisted yet, only logged).
 On entries, payload values under these keys are overwritten; on exits (which run no gate)
 they are removed. A schema for quote snapshots (of refused signals too) is #134.
 
+## Pre-Submit-Hart-Caps (#302)
+
+`live_runner/pre_submit_caps.py::enforce_pre_submit_caps()` ist die letzte
+Prüfung vor dem Broker-Submit der Daemon-Pfade — nach dem Sizing, nach dem
+Submission-Claim, unmittelbar vor `adapter.submit_order()`. Sie wird an beiden
+Submit-Chokepoints aufgerufen (`submit_order_with_risk()` und der Discord-
+Dispatch in `_prepare_claim_and_submit_signal()`). Innerhalb von
+`scripts/live_smoke.py` laufen nur die direkten `adapter.submit_order`-Aufrufe
+(:596 Einstieg, :1481 Close) an den Caps vorbei; die Aufrufe über
+`submit_order_with_risk` (:702, :1130, :1570) unterliegen ihnen wie jeder
+Daemon-Pfad. `live_runner/test_signal_trigger.py:86` ist ein weiterer direkter
+Submit. Alles Operator-Werkzeuge für manuelle Tests, kein Daemon-Pfad; ein
+Fehler dort hat damit kein Cap-Backstop.
+**Unabhängig vom Sizing-Code** sind die Broker-Fakten: Quote, Pip-Value,
+Equity, die benutzte Marge (`get_used_margin`, #359) und die maximale
+Hebel des Brokers für Account und Asset
+(`get_max_leverage`; cTrader über `ProtoOASymbol.leverageId` +
+`GetDynamicLeverageByID` — der Tier-Wert steht in Cents wie
+`leverageInCents`, 1:200 = 20000, und wird vor der Nutzung durch 100
+gerechnet — geklemmt an die eigene Account-Hebel `leverageInCents` aus
+`ProtoOATrader`, wie Spotwares Beispiel mit `min(trader, tier)`;
+`ProtoOATrader.maxLeverage` wird bewusst nicht gelesen — es ist ein
+uint32 ohne „InCents“-Suffix, nur die Obergrenze für *Änderungen* der
+Hebel, gegen die `leverageInCents` bereits validiert wird; fehlt dem
+Symbol eine `leverageId`, ist die Account-Hebel allein die Obergrenze;
+Alpaca über `min(account.multiplier, 2)` — der 4x-Multiplikator ist nur
+Intraday-Buying-Power, über Nacht gilt Reg T mit 2x, und kein Plattform-Order
+ist als intraday-only markiert; Crypto bleibt bei
+1x; unbekannt → 1x). Die Tier-Hebel ist eine Obergrenze: bei cTrader sinkt
+die Hebel mit dem Volumen, daher gilt der erste (kleinste) Tier — der
+tatsächlich angewandte Hebel kann niedriger sein und wird vom Broker
+weiter erzwungen.
+Menge und Preislevel stammen
+dagegen aus dem gesizeten Signal — nichts wird aus dem Payload neu erfunden.
+
+Refused (fail-closed, ERROR alert `pre_submit_cap_refusal` plus an audit entry via
+`record_live_control_audit`) when
+
+| Rule | Condition |
+|-------|-----------|
+| `qty_cap` | `qty > pre_submit_max_qty` (only when configured) |
+| `price_deviation` | `|entry - quote_side| / quote_side > pre_submit_max_price_deviation_fraction` (ask for buy, bid for sell, absolute in both directions) |
+| `notional_cap` | `qty * quote * pip_value > pre_submit_max_notional_equity_fraction * equity` (only when the fraction is explicitly configured) |
+| `stop_risk` | `qty * |entry - stop| * pip_value > pre_submit_max_risk_multiple * (max_risk_per_trade * equity)` |
+
+Die Caps fügen **keine eigene Notional-Obergrenze unter dem Broker-Maximum
+hinzu** — die einzige Notional-Obergrenze dieses Moduls ist die maximale
+Hebel des Brokers für Account und Asset (#240, Entscheidung auf #329):
+braucht ein korrekt gesizter Order mehr Hebel als der Broker
+erlaubt, wird die Menge **auf die freie Marge geklemmt** (abgerundet auf
+den Lot-Step) statt abgelehnt — verbleibende Caps laufen gegen die geklemmte
+Größe. Die freie Marge ist MT5-Stil und entspricht der Backtest-Regel aus
+#355 (#359, die Live-Hälfte von #347): `equity − used_margin`, also das
+Account-Equity minus der Marge, die der Broker bereits für offene Positionen
+hält (`adapter.get_used_margin` — cTrader summiert das broker-gemeldete
+`ProtoOAPosition.usedMargin` über alle offenen Positionen, Alpaca liest
+`account.initial_margin` und fällt ohne ihn auf Σ |Market Value| /
+Effektiv-Hebel zurück); die Notional-Obergrenze ist
+`freie_Marge × Broker-Maximum`. Eine unbekannte Broker-Hebel failt closed
+auf 1x; eine **unbekannte Used Margin lehnt ab** (`broker_facts_unavailable`)
+— anders als bei der Hebel ist „niedriger ansetzen“ hier die unsichere
+Richtung, weil eine zu kleine Used Margin die freie Marge überschätzt. Ist
+die freie Marge aufgebraucht, bleibt nach der Klemme weniger als ein
+Lot-Step und der Order wird abgelehnt (`broker_leverage_cap`) — live gibt
+es kein stilles Überspringen wie im Backtest, die Verweigerung gibt das
+Submission-Lease frei. **Bekannte Grenze:** noch nicht ausgefüllte
+Entry-Orders reservieren in keiner der beiden Margin-Größen Marge —
+weder cTrader-`usedMargin` noch Alpaca-`initial_margin` sind für offene
+Orders belastet. Zwei gleichzeitige Entries sehen daher jeweils die volle
+freie Marge; der Broker lehnt den zweiten ab, statt ihn zu klemmen.
+Die Klemme wird
+mit WARNING geloggt und als `pre_submit_leverage_clamp` auditiert (das Feld
+`broker_max_leverage_is_upper_bound` markiert die Obergrenzen-Eigenschaft;
+die Audit-Daten tragen `used_margin`, `free_margin` und `leverage_ceiling`;
+folgt auf die Klemme eine Verweigerung durch einen anderen Cap, entstehen
+bewusst zwei Audit-Zeilen — Klemme und Verweigerung); lässt die
+freie Marge nicht einmal einen Lot-Step zu, wird abgelehnt
+(`broker_leverage_cap`). Die Klemme ist damit ein Backstop gegen eine
+kaputte Größe, keine Platform-Notional-Policy: das Sizing deckelt den
+Notional pro Order weiterhin bei `max_notional_per_trade` (Default 0.20;
+`RiskConfig` lehnt Werte > 1 ab) — diese Obergrenze bleibt bis zur
+#240-Entscheidung bestehen.
+
+Notional und Stop-Risk rechnen gegen das Account-**Equity** — und zwar gegen
+den **Mark-to-Market**-Wert über `adapter.get_equity()`: auf Alpaca ist das
+das Broker-Equity (`account.equity`), auf cTrader der realisierte `balance`
+plus die Summe der broker-gemeldeten `netUnrealizedPnL` aus
+`ProtoOAGetPositionUnrealizedPnLReq` (netto = brutto + Swap + Kommission,
+also die konservativere Seite). Eine unlesbare PnL-Antwort lässt
+`get_equity` fehlschlagen — ein gemeldeter realisierter Balance-Wert allein
+würde die freie Marge in fallenden Märkten überschätzen, die unsichere
+Richtung. `get_balance()[1]` bleibt dabei der **realisierte** Wert
+(#267-Entscheidung: das Sizing liest ihn); nur `get_equity` trägt den
+unrealized-Anteil. Die Caps sind damit kein zweites Sizing, sondern ein
+hartes Backstop gegen kaputte Größen auf derselben MTM-Basis.
+
+Zusätzlich lehnt jede **Nicht-Verifizierbarkeit** ab: fehlender Stop, ungültige
+Cap-Settings, Quote/Pip-Value/Equity/Used-Margin nicht abrufbar oder unbrauchbar,
+insbesondere eine Quote ohne verwertbare oder veraltete Broker-Zeit
+(`stale_quote`, gleiche Regel wie das Entry-Gate, `max_entry_quote_age_seconds`)
+(`broker_facts_unavailable` / `broker_facts_unusable` / `stale_quote` /
+`invalid_cap_config` / `invalid_entry_gate_config` / `missing_stop_loss` /
+`unresolved_levels` / `invalid_qty`). Ob ein Order ein Exit ist, entscheidet
+`is_exit_order` — dieselbe Klassifikation, nach der das Sizing dispatched —
+nie ein Payload-Marker: ein Entry mit `risk_sizing_mode="exit_only"` wird
+normal gecappt, und der Entry-Pfad entfernt `exit_only`/`risk_sizing_mode`
+vor dem Adapter. Exit-Orders laufen nie durch die Caps — sie reduzieren
+Exposure, und eine Cap darf einen Flatten nicht blockieren.
+
+Settings per deployment (deployment = account + symbols, i.e. the per-account /
+per-symbol scope), validated at creation (`validate_pre_submit_cap_settings` in
+`create_live_deployment`: type, finiteness, positivity and unique symbol keys) and
+again fail-closed at submit:
+
+| Setting | Default | Valid |
+|---------|---------|--------|
+| `pre_submit_max_qty` | **unlimited** | `> 0`, finite (no universal default: share, lot and 0.01-lot are different instruments) |
+| `pre_submit_max_notional_equity_fraction` | **broker leverage** (unknown → 1x) | `> 0` (order notional as a fraction of account equity; only explicitly set = hard reject cap) |
+| `pre_submit_max_price_deviation_fraction` | **0.02** | `> 0` |
+| `pre_submit_max_risk_multiple` | **2.0** | `> 0` (multiple of the configured `max_risk_per_trade` risk) |
+| `pre_submit_symbol_caps` | — | mapping `SYMBOL -> {same keys}`, overrides only for this symbol |
+
+The defaults are conservative backstops against sizing bugs (basis: #146 ~1000x, #184
+100x), not trading policy — risk multiple 2.0 and price deviation 2% are accepted per
+maintainer decision (2026-11-21), overridable per symbol. A 30 s timeout
+(`PRE_SUBMIT_CAPS_FETCH_TIMEOUT_SECONDS`) bounds the broker reads; on timeout the
+order is refused.
+
 ## Kill Switch (#300)
 
 Before every entry `prepare_order_with_risk()` refuses the order when the account is
@@ -314,6 +442,19 @@ cTrader receives SL/TP as relative distances in 1/100000 of the price. The grid 
 the entry** (`floor`), so the actual risk never exceeds the sized budget: a stop of
 1.6 ticks goes out as 1 tick. A stop below one tick is refused (ValueError before
 sending); a take profit below one tick is sent as one tick (never 0).
+
+## Periodic Broker Reconciliation (#303)
+
+`live_runner/broker_reconciliation.py` periodically compares the local ledger truth
+(`live_executions` fills per deployment) with the broker state per account: net
+position per symbol, expected working orders and - where the adapter can list them -
+protective stops. An unreadable broker state counts as a mismatch (fail closed), but
+only stops the deployment's **entries** after
+`broker_reconciliation_consecutive_mismatches` consecutive failed passes (default 2)
+(the status stays ACTIVE; exits and trailing keep running); a clean pass resets the
+counter and lifts the halt. The report is read-only under
+`GET /api/live/reconciliation`. Details and open maintainer decisions:
+`docs/live-deploy-runbook.md`.
 
 ## Implicit Divergence
 

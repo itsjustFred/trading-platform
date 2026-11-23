@@ -15,7 +15,7 @@ Vollausstieg bei einem von zwei Events:
 1. Trailing-Stop-Hit: Das Tief der Bar erreicht oder unterschreitet das aktuelle untere Supertrend-Band.
 2. Supertrend-Flip nach bearish: `trend == -1` und `trend[-1] == 1`.
 
-**Fill-Konvention (Version 1.1.0):** Marktausstiege auf Close-Basis (Supertrend-Flip nach bearish) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Der Trailing-Stop bleibt ein explizites Level (`exit_price`).
+**Fill-Konvention (Version 1.1.0):** Marktausstiege auf Close-Basis (Supertrend-Flip nach bearish) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Der Trailing-Stop-Level reist in `sl_price` (der protective Stop fuellt ihn); das `exit_price` der Exit-Bar ist nur mit `exit_order_type="level"` ein Level (wird hier nicht gesetzt).
 
 ### Stop-Loss
 Initialer Stop-Loss entspricht beim Entry dem unteren Supertrend-Band.
