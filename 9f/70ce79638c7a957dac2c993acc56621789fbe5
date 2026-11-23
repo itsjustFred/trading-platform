@@ -1,0 +1,25 @@
+docs/cleanup-16d1-money-path-semantics.md
+  s_2bf89379757a94::t_07f1992fb4102f 194-195
+docs/cross-engine-backtest-contract.md
+  s_2bf89379757a94::t_1e4affed5e2126 50-54,443-445
+runner/engine_pkg/trading_engine.py
+  s_2bf89379757a94::t_d814e60dc98aaa 1318-1322,1329-1336,1339-1342,1351-1352,1359-1363,1372-1373,1414-1417,1423-1426,1446,1461
+tests/test_engine_behavior.py
+  s_2bf89379757a94::t_ee08bae974c676 2690-2914
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f70ce79638c7a957dac2c993acc56621789fbe5",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
