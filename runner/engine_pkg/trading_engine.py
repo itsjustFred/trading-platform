@@ -251,6 +251,13 @@ class TradeEngine:
         # bar) and before pending entry orders fill (so a reversal's exit leg
         # closes the OLD position, never the position the same open creates).
         self._pending_signal_exit = False
+        # Test/diagnostic hook (#210): when True the run loop reproduces the
+        # pre-optimization eager path on EVERY bar — the merged signal row is
+        # built unconditionally, ``next_time`` comes from ``frame.iloc[i + 1]``,
+        # and entries/exits are read with ``.iloc`` — so equivalence tests can
+        # diff lazy vs eager dumps and isolate each optimisation. Never set
+        # outside tests — it only costs performance, never changes results.
+        self._eager_signal_rows = False
         # Fail loudly even if the config bypassed pydantic validation (#153).
         self._signal_exit_next_open = (
             contract.normalize_signal_exit_fill(
@@ -2550,24 +2557,24 @@ class TradeEngine:
         step_bars = max(1000, by_percent)
         next_emit = 0
 
+        # Perf: one boxed Timestamp list instead of a second frame.iloc[i + 1]
+        # row construction per bar (same Timestamp objects row["timestamp"] yields).
+        timestamps = list(frame["timestamp"])
+        entries_arr = entries.to_numpy(dtype=bool)
+        exits_arr = exits.to_numpy(dtype=bool)
+
         for i in range(total_bars):
             row = frame.iloc[i]
             if trade_from is not None and pd.to_datetime(
                 row["timestamp"], utc=True
             ) < trade_from:
                 continue  # warmup bar: indicators only, no trading
-            next_time = frame.iloc[i + 1]["timestamp"] if i + 1 < total_bars else None
-            signal_row = (
-                self._signals_frame.iloc[i] if self._signals_frame is not None else pd.Series()
-            )
-            # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
-            # (aligned by label). The previous ``pd.concat([row, signal_row])``
-            # stacked the two Series vertically, producing a row of length
-            # len(row) + len(signal_row) with duplicated labels — OHLCV lookups
-            # became ambiguous and colliding signal names ("close", "high", …)
-            # silently corrupted or crashed entry extraction.
-            merged_row = row.combine_first(signal_row)
-
+            if self._eager_signal_rows:
+                next_time = (
+                    frame.iloc[i + 1]["timestamp"] if i + 1 < total_bars else None
+                )
+            else:
+                next_time = timestamps[i + 1] if i + 1 < total_bars else None
             self._check_stops(row, i, next_time)
             # The parked signal exit (if any) was consumed at this bar's open.
             self._pending_signal_exit = False
@@ -2583,11 +2590,37 @@ class TradeEngine:
             # special case here.
             self._check_stops(row, i, next_time, only_entry_index=i)
 
-            if bool(entries.iloc[i]):
+            if self._eager_signal_rows:
+                entry_fired = bool(entries.iloc[i])
+                exit_fired = bool(exits.iloc[i])
+            else:
+                entry_fired = entries_arr[i]
+                exit_fired = exits_arr[i]
+
+            if self._eager_signal_rows or entry_fired or exit_fired:
+                # F20: overlay the signal values onto the OHLCV row ELEMENT-WISE
+                # (aligned by label). The previous ``pd.concat([row, signal_row])``
+                # stacked the two Series vertically, producing a row of length
+                # len(row) + len(signal_row) with duplicated labels — OHLCV lookups
+                # became ambiguous and colliding signal names ("close", "high", …)
+                # silently corrupted or crashed entry extraction.
+                # Perf: the merged row is only consumed by order creation and
+                # by the exit branch's exit_order_type/exit_price lookup, so it
+                # is built lazily on signal bars only (combine_first is pure —
+                # no observable difference from building it on every bar, ~85%
+                # of the old per-bar cost).
+                signal_row = (
+                    self._signals_frame.iloc[i]
+                    if self._signals_frame is not None
+                    else pd.Series()
+                )
+                merged_row = row.combine_first(signal_row)
+
+            if entry_fired:
                 direction = self._resolve_direction(merged_row)
                 self._create_order(merged_row, i, direction)
 
-            if bool(exits.iloc[i]):
+            if exit_fired:
                 exit_order_type = merged_row.get("exit_order_type")
                 if self._signal_exit_next_open and normalize_exit_order_type(
                     exit_order_type
