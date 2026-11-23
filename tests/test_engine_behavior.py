@@ -1544,10 +1544,149 @@ class TestFixedRiskViaRiskEngine:
         )
         assert qty == pytest.approx(3_000.0)
 
+    def test_stop_distance_only_estimate_is_not_vetoed_by_pct_caps(
+        self, tmp_path: Path
+    ):
+        """#279: a ``stop_distance``-only order has no stop at creation, so
+        its creation-time estimate lands on the pct path — but the
+        fill-time re-size applies the fixed-risk branch, whose aggregate
+        and position caps are OFF by default. The pct engine's own 5% /
+        5-position defaults must not veto the estimate.
+
+        Two open fixed-risk FX positions each carry $5,000 of declared
+        risk (``sizing_risk_per_unit`` = distance x pip = 0.01 x 1e5 =
+        1,000 per unit, qty 5) — 10% combined on the 100k realized cash,
+        over the pct engine's 5% default. On main the same estimate
+        sized normally (its exposure figure never saw the declared
+        per-unit risk); the estimate must still size here."""
+        engine = self._engine(
+            tmp_path,
+            parameters=self._fx_params(),
+            max_leverage=100.0,
+        )
+        for _ in range(2):
+            engine.positions.append(
+                Position(
+                    symbol="PROBE",
+                    direction="LONG",
+                    entry_index=0,
+                    entry_time="2024-01-01T00:00:00+00:00",
+                    entry_price=1.10,
+                    order_type="market",
+                    quantity=5.0,
+                    remaining_qty=5.0,
+                    stop_loss=1.09,
+                    meta={"sizing_risk_per_unit": 1_000.0},
+                )
+            )
+        engine._refresh_sizing_equity()
+        qty = engine._calculate_position_size(
+            entry_price=1.10,
+            stop_loss_price=None,
+            direction="LONG",
+            stop_distance=0.01,
+        )
+        assert qty > 0.0, (
+            "the creation-time estimate must not be vetoed by the pct "
+            "engine's caps: the fill-time re-size applies the fixed-risk "
+            "branch, whose caps default to off"
+        )
+        assert engine._last_sizing is not None
+        assert engine._last_sizing.decision is not None
+        assert engine._last_sizing.decision.rejection_reason is None
+
+    def test_stop_distance_only_fixed_risk_entries_match_main(
+        self, tmp_path: Path
+    ):
+        """#279 end-to-end: three concurrent ``stop_distance``-only
+        fixed-risk entries each declare $5,000 risk — 15% combined on a
+        100k account, far over the pct engine's 5% default that vetoed
+        the creation-time estimate. Main sizes all three at the
+        fixed-risk quantity (500 units = 5000 / 10 x tick_size/tick_value);
+        the trade count and quantities must equal it."""
+        n = 10
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC"),
+                "open": [100.0] * n,
+                "high": [100.5] * n,
+                "low": [99.5] * n,
+                "close": [100.0] * n,
+                "volume": [1000.0] * n,
+            }
+        )
+        entries = pd.Series([False] * n, index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[1] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * n, index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits, {
+            "stop_distance": pd.Series([10.0] * n, index=df.index),
+        })
+
+        engine = TradeEngine(
+            _config(
+                tmp_path,
+                parameters={
+                    "fixed_risk_amount": 5000.0,
+                    "tick_value": 1.0,
+                    "tick_size": 1.0,
+                    "cap_fixed_risk_by_leverage": False,
+                },
+                max_leverage=100.0,
+            ),
+            symbol="PROBE",
+        )
+        engine.run(frame, strategy)
+
+        # Open positions are closed at end of data, so the run's trade
+        # count is the closed-trade count.
+        assert len(engine.closed_trades) == 3, (
+            "all three entries must fill: the pct engine's default caps "
+            "are off for the fixed-risk protocol"
+        )
+        for trade in engine.closed_trades:
+            assert trade.quantity == pytest.approx(500.0), (
+                "each position risks the declared $5,000 over the 10-point "
+                "stop_distance: 5000 / 10 x (1 / 1) = 500 units, the same "
+                "quantity main's fixed-amount branch produced"
+            )
+
+    def test_fixed_risk_amount_above_equity_sizes_like_main(
+        self, tmp_path: Path
+    ):
+        """#279: ``fixed_risk_amount`` larger than the sizing equity is a
+        legitimate state (only equity <= 0 raises) — main and the MT5 EA
+        size it and let the margin/leverage clamp apply afterwards. The
+        reported ``risk_percent`` saturates at 1.0; the declared dollars
+        and the quantity are unchanged."""
+        engine = self._engine(
+            tmp_path,
+            parameters=self._fixed_params(
+                fixed_risk_amount=5000.0, cap_fixed_risk_by_leverage=False
+            ),
+            max_leverage=100.0,
+        )
+        engine._sizing_equity = 3_000.0
+        qty = engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.0,
+            direction="LONG",
+        )
+        assert qty == pytest.approx(5_000.0), (
+            "5000 / |100 - 99| x (1 / 1) = 5,000 units — the same "
+            "quantity main's inline fixed-amount formula produced"
+        )
+        sized = engine._last_sizing
+        assert sized is not None
+        assert sized.risk_amount == pytest.approx(5_000.0)
+        assert sized.risk_percent == pytest.approx(1.0)
+
     def test_fixed_risk_limits_are_configurable(self, tmp_path: Path):
         """``fixed_risk_max_total_exposure`` / ``fixed_risk_max_positions``
         tune the caps for the fixed-risk protocol only; ``None`` means
-        UNCAPPED (the parity-safe default while #279 Q1 is open)."""
+        UNCAPPED (the settled parity-safe default)."""
         engine = self._engine(
             tmp_path,
             parameters=self._fx_params(),
@@ -1586,7 +1725,7 @@ class TestFixedRiskViaRiskEngine:
         assert qty == pytest.approx(500.0), "7th position fits a limit of 7"
 
     def test_fixed_risk_defaults_are_uncapped(self, tmp_path: Path):
-        """Parity-safe default while #279 Q1 is unanswered: ``None`` on both
+        """Settled parity-safe default: ``None`` on both
         ``fixed_risk_max_*`` fields means NO aggregate exposure ceiling and
         NO position cap — the MT5 EA the protocol mirrors applies neither.
         Six positions already past the old 5-position/5% limits must still
@@ -1690,6 +1829,34 @@ class TestFixedRiskViaRiskEngine:
         # result is 228.0 either way — the snap band, not the operation
         # order, decides this edge now.
         assert qty == pytest.approx(228.0)
+
+    def test_fixed_risk_size_without_grid_is_the_exact_mt5_product(
+        self, tmp_path: Path
+    ):
+        """The same config with ``lot_step = 0`` (no broker grid): nothing
+        floors or snaps the size, so the quantity IS the MT5-order
+        recompute bit-for-bit — ``(228.0 / 1e-5) * (1e-5 / 1.0)`` =
+        227.99999999999997, one ulp below the engine's
+        ``risk / (distance * pip)`` order (228.00000000000003). This pins
+        the MT5-order recompute itself, which the grid case above can no
+        longer discriminate."""
+        engine = self._engine(
+            tmp_path,
+            parameters=self._fixed_params(
+                fixed_risk_amount=228.0,
+                tick_value=1.0,
+                tick_size=0.00001,
+                cap_fixed_risk_by_leverage=False,
+            ),
+            max_leverage=100.0,
+        )
+        qty = engine._calculate_position_size(
+            entry_price=1.10,
+            stop_loss_price=1.10 - 1e-5,
+            direction="LONG",
+            stop_distance=1e-5,
+        )
+        assert qty == 227.99999999999997
 
     def test_fixed_risk_clamped_size_is_equity_proportional(
         self, tmp_path: Path

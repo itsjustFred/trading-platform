@@ -173,6 +173,35 @@ def test_calculate_position_size_risk_amount_override_clamps_to_exposure_budget(
     assert sized.position_size == pytest.approx(500.0)
 
 
+def test_calculate_position_size_risk_amount_override_above_balance_saturates_percent():
+    """#279: a declared amount larger than the balance is legitimate — only
+    equity <= 0 raises (the margin/leverage clamp applies after sizing, and
+    main sizes it too). ``risk_percent`` is a fraction of balance and the
+    order model caps it at 1.0, so the reported figure saturates while
+    ``risk_amount`` keeps the declared dollars exact and the size is
+    unchanged."""
+    engine = RiskEngine(
+        RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)
+    )
+    sized = engine.calculate_position_size(
+        signal=_override_signal(),
+        account_balance=2_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+        risk_amount_override=3_000.0,
+        max_total_exposure=math.inf,
+    )
+
+    # |100 - 98| = 2 → 3,000 / 2 = 1,500 units; the 1% pct target would be 20.
+    assert sized.position_size == pytest.approx(1_500.0)
+    assert sized.risk_amount == pytest.approx(3_000.0)
+    assert sized.risk_percent == pytest.approx(1.0)
+    assert sized.decision is not None
+    assert sized.decision.risk_percent == pytest.approx(1.0)
+    assert sized.decision.accepted is True
+
+
 def test_calculate_position_size_risk_amount_override_rejects_at_exposure_limit():
     engine = RiskEngine(
         RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05, max_positions=5)

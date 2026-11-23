@@ -88,8 +88,8 @@ documented here.
   amount to the remaining exposure budget — apply, with their own
   configurable limits (`fixed_risk_max_positions`,
   `fixed_risk_max_total_exposure`). `None` on either field means UNCAPPED —
-  the parity-safe default while the #279 aggregate-cap question is open,
-  because the MT5 EA the protocol mirrors applies neither cap; setting a
+  the settled parity-safe default, because the MT5 EA the protocol mirrors
+  applies neither cap; setting a
   field opts that one cap back in. `fixed_risk_amount = 0` is the #170
   "off" idiom: the order falls through to pct sizing like an absent key,
   while NaN/inf/negative amounts raise `ValueError`. Open

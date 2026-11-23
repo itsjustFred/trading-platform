@@ -287,9 +287,8 @@ class TradeEngine:
         # #279: the fixed-risk protocol gets its own engine instance. Its
         # config limits only apply when the corresponding
         # ``fixed_risk_max_*`` field is set; ``None`` is expressed per call
-        # as ``math.inf`` (uncapped, the MT5-parity default while #279 Q1
-        # is unanswered), so the config values below are just the
-        # documented fallback.
+        # as ``math.inf`` (uncapped — the settled MT5-parity default), so
+        # the config values below are just the documented fallback.
         self._fixed_risk_engine = RiskEngine(
             risk_config(
                 total_exposure=(
@@ -523,10 +522,19 @@ class TradeEngine:
                     and sizing_stop is not None
                     and float(current_stop) != float(sizing_stop)
                 ):
-                    params = self.config.parameters
-                    pip_factor = float(
-                        params.get("tick_value", 1.0) or 1.0
-                    ) / float(params.get("tick_size", 1.0) or 1.0)
+                    # Same validated resolution the sizing branches use —
+                    # two parsers of one field can drift.
+                    pip_factor = _sizing_value(
+                        "tick_value",
+                        self.config.parameters.get("tick_value"),
+                        1.0,
+                        positive=True,
+                    ) / _sizing_value(
+                        "tick_size",
+                        self.config.parameters.get("tick_size"),
+                        1.0,
+                        positive=True,
+                    )
                     current_per_unit = min(
                         declared_per_unit,
                         abs(
@@ -998,6 +1006,35 @@ class TradeEngine:
                 return max(shares, 0.0)
 
         if self._risk_enabled:
+            # #279: a ``stop_distance``-only fixed-risk order has no stop at
+            # creation, so its creation-time estimate lands on this pct path
+            # even though the fill-time re-size applies the fixed-risk
+            # branch. The fixed-risk aggregate/position caps are OFF by
+            # default; the pct engine's own defaults (5% exposure,
+            # TRADE_ENGINE_MAX_POSITIONS) must not veto the estimate — pass
+            # the same per-call overrides the fixed-risk branch uses, so an
+            # opted-in ``fixed_risk_max_*`` still binds here exactly as it
+            # will at the fill. The estimate only needs to not spuriously
+            # reject: the fill sets the final size.
+            fixed_risk_estimate = (
+                risk_amount > 0
+                and stop_distance is not None
+                and stop_distance > 0
+            )
+            if fixed_risk_estimate:
+                estimate_max_positions: int | float | None = (
+                    int(self.config.fixed_risk_max_positions)
+                    if self.config.fixed_risk_max_positions is not None
+                    else math.inf
+                )
+                estimate_max_exposure: float | None = (
+                    float(self.config.fixed_risk_max_total_exposure)
+                    if self.config.fixed_risk_max_total_exposure is not None
+                    else math.inf
+                )
+            else:
+                estimate_max_positions = None
+                estimate_max_exposure = None
             sized_order = self._risk_engine.calculate_position_size(
                 signal=signal,
                 # F21 (D2): realized cash, NOT the mark-to-market
@@ -1016,6 +1053,8 @@ class TradeEngine:
                 max_notional_per_trade=(
                     exposure_limit if exposure_limit is not None else math.inf
                 ),
+                max_positions=estimate_max_positions,
+                max_total_exposure=estimate_max_exposure,
             )
             self._last_sizing = sized_order
             shares = float(sized_order.position_size)

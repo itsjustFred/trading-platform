@@ -440,9 +440,9 @@ Implementation:
   stop — breakeven/locked profit — counts the smaller of the declared
   per-unit risk and the current `|entry - stop|`). Both caps are configurable
   for this protocol via `fixed_risk_max_positions` /
-  `fixed_risk_max_total_exposure`; `None` means UNCAPPED (the parity-safe
-  default while the #279 aggregate-cap question is open — the MT5 EA applies
-  neither), and setting a field opts that cap back in. The accepted size is
+  `fixed_risk_max_total_exposure`; `None` means UNCAPPED (the settled
+  parity-safe default — the MT5 EA applies neither), and setting a field
+  opts that cap back in. The accepted size is
   recomputed in the MT5 order `(risk / distance) * (tick_size / tick_value)`
   so unclamped sizes stay bit-identical to the legacy formula; the result is
   still capped by `max_leverage` (free margin, #347) unless

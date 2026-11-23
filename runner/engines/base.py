@@ -128,11 +128,10 @@ class BacktestConfig(BaseModel):
     # Fixed-risk (``fixed_risk_amount``) sizing policy (#279). The fixed-risk
     # protocol routes through RiskEngine like the pct path; these fields opt
     # the aggregate open-risk ceiling and the concurrent-position limit back
-    # in for that protocol only. ``None`` means UNCAPPED — the parity-safe
-    # default while the maintainer question on #279 is open: the MT5 EA the
-    # protocol mirrors applies neither cap (parity-first per #262). Set a
-    # field to reproduce a reference that does enforce it, or to tighten a
-    # fixed-risk run.
+    # in for that protocol only. ``None`` means UNCAPPED — the settled
+    # parity-safe default: the MT5 EA the protocol mirrors applies neither
+    # cap (parity-first per #262). Set a field to reproduce a reference
+    # that does enforce it, or to tighten a fixed-risk run.
     fixed_risk_max_total_exposure: float | None = Field(None, gt=0.0, le=1.0)
     fixed_risk_max_positions: int | None = Field(None, ge=1)
     modeling_resolution: str = "main_timeframe"

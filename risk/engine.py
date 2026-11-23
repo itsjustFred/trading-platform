@@ -365,7 +365,15 @@ class RiskEngine:
             # exposure ceiling still binds: the amount is clamped to the
             # remaining exposure budget, exactly like the pct path clamps
             # ``risk_percent`` to ``remaining_exposure``.
-            risk_percent = min(override_amount / balance, remaining_exposure)
+            # ``risk_percent`` is a fraction of balance and the order model
+            # caps it at 1.0; a declared amount above the balance is a
+            # legitimate state (only equity <= 0 raises — the
+            # margin/leverage clamp applies after sizing), so the reported
+            # fraction saturates at 1.0 while ``risk_amount`` below keeps
+            # the declared dollars exact.
+            risk_percent = min(
+                override_amount / balance, remaining_exposure, 1.0
+            )
         if risk_percent <= 0:
             return self._sized_order(
                 signal=signal,
