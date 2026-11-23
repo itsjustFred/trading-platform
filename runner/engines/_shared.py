@@ -259,7 +259,14 @@ def replay_shared_equity(
 
         stop_distance = _trade_stop_distance(trade)
         trade_notional = new_qty * float(trade.entry_price or 0.0)
-        trade_risk = new_qty * stop_distance if stop_distance else 0.0
+        # Fixed-risk trades carry the declared per-unit risk (account
+        # currency) they were sized with — prefer it over re-measuring a
+        # stop distance the strategy may never have used (ATR stop_distance).
+        per_unit_risk = (trade.meta or {}).get("sizing_risk_per_unit")
+        if per_unit_risk is not None:
+            trade_risk = new_qty * float(per_unit_risk)
+        else:
+            trade_risk = new_qty * stop_distance if stop_distance else 0.0
         if not isinstance(trade.meta, dict):
             trade.meta = {}
         trade.meta["portfolio"] = {

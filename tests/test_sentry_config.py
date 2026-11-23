@@ -141,3 +141,58 @@ def test_capture_exception_uses_scoped_context(monkeypatch: pytest.MonkeyPatch) 
     assert calls["exited"] is True
     assert calls["tag:service"] == "scheduler"
     assert calls["context:error_context"] == {"task_id": "abc"}
+
+
+def test_flush_sentry_flushes_the_initialized_sdk_within_its_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shutdown path's flush reaches the SDK, and it is bounded.
+
+    ``live_runner/daemon.py`` leaves through ``os._exit``, which runs no atexit
+    hook: without this call every event a shutdown emitted (a drain timeout, an
+    exit path that gave up) stays in the queue. The bound is what lets the
+    daemon count the flush inside its exit window - a flush is a network wait,
+    and the shutdown has a budget.
+    """
+    flushed: list[float] = []
+
+    def _flush(*, timeout: float) -> None:
+        flushed.append(timeout)
+
+    monkeypatch.setattr(sentry_module.sentry_sdk, "flush", _flush)
+
+    assert sentry_module.flush_sentry(2.0) is True
+    assert flushed == [2.0]
+
+
+def test_flush_sentry_is_a_noop_when_the_sdk_was_never_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to flush, and nothing to wait for, without an initialized SDK."""
+
+    def _unexpected(timeout: float) -> None:  # pragma: no cover - must not run
+        raise AssertionError(f"flush must not be called without a client ({timeout})")
+
+    monkeypatch.setattr(sentry_module.sentry_sdk, "flush", _unexpected)
+    sentry_module._reset_for_tests()  # noqa: SLF001
+
+    assert sentry_module.flush_sentry(2.0) is False
+
+
+def test_flush_sentry_reports_a_failing_flush_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flush that fails must not take the exit code down with it.
+
+    The caller is on its way out of the process; losing the events in the queue
+    is strictly better than losing the exit code that says a broker outcome was
+    left unknown.
+    """
+
+    def _boom(timeout: float) -> None:
+        raise OSError("the SDK is wedged")
+
+    monkeypatch.setattr(sentry_module.sentry_sdk, "flush", _boom)
+    monkeypatch.setattr(sentry_module, "_INITIALIZED", True)
+
+    assert sentry_module.flush_sentry(2.0) is False

@@ -125,6 +125,15 @@ class BacktestConfig(BaseModel):
     # ``max_total_exposure`` (RiskConfig) and ``risk_per_trade_pct``.
     max_position_exposure_pct: float | None = Field(None, gt=0.0, le=1.0)
     max_leverage: float | None = Field(None, gt=0.0)
+    # Fixed-risk (``fixed_risk_amount``) sizing policy (#279). The fixed-risk
+    # protocol routes through RiskEngine like the pct path; these fields opt
+    # the aggregate open-risk ceiling and the concurrent-position limit back
+    # in for that protocol only. ``None`` means UNCAPPED — the settled
+    # parity-safe default: the MT5 EA the protocol mirrors applies neither
+    # cap (parity-first per #262). Set a field to reproduce a reference
+    # that does enforce it, or to tighten a fixed-risk run.
+    fixed_risk_max_total_exposure: float | None = Field(None, gt=0.0, le=1.0)
+    fixed_risk_max_positions: int | None = Field(None, ge=1)
     modeling_resolution: str = "main_timeframe"
     # Fill convention for signal-driven exits in bar engines. Owner decision
     # 2026-11-13 (supersedes D4 / A-M1 "Fill-zum-Trigger-Close"): a signal exit
@@ -180,6 +189,7 @@ class BacktestConfig(BaseModel):
         "risk_per_trade_pct",
         "max_position_exposure_pct",
         "max_leverage",
+        "fixed_risk_max_total_exposure",
         mode="before",
     )
     @classmethod

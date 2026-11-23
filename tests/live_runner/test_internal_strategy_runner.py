@@ -1630,7 +1630,7 @@ def test_run_daemon_creates_and_cancels_internal_strategy_task(
     )
     monkeypatch.setattr(daemon, "_recover_failed_services", lambda: [])
     monkeypatch.setattr(daemon, "ServiceScheduler", lambda: _Scheduler())
-    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda: object())
+    monkeypatch.setattr(daemon, "LiveTrailingStopManager", lambda **_kwargs: object())
     monkeypatch.setattr(daemon, "sync_deployments_loop", _boom)
     monkeypatch.setattr(daemon, "sync_services_loop", _noop)
     monkeypatch.setattr(daemon, "_poll_balances", _noop)
