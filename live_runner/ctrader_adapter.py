@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -27,6 +28,7 @@ from live_runner.base_adapter import (
     ControlOutcome,
     LivePipValue,
     LiveQuote,
+    ProtectiveStop,
     coerce_positive_live_qty,
     commission_from_signed_cash_flow,
     is_unbounded_tp,
@@ -195,6 +197,12 @@ MAX_CONVERSION_HOPS = 3
 CTRADER_RELATIVE_PRICE_UNIT_DIVISOR = 100_000
 EXECUTION_RETRY_LIMIT = 3
 UNRESOLVED_EXECUTION_EVENT_LIMIT = 1000
+#: Bounded broker-state confirmation for ProtoOAAmendPositionSLTPReq (#168):
+#: the request has no dedicated response, so the amended stop is confirmed by
+#: re-reading the position. The broker applies the amend asynchronously, so a
+#: few short-interval reads cover the apply window without stalling the trail.
+_AMEND_CONFIRM_ATTEMPTS = 8
+_AMEND_CONFIRM_INTERVAL_SECONDS = 0.4
 #: Sentinel queued on ``_execution_queue`` to wake ``listen_executions`` for a
 #: pending broker reconciliation instead of letting it sleep out the 30 s
 #: ``queue.get`` timeout. Never a real execution payload.
@@ -1027,9 +1035,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
     """cTrader live adapter backed by OpenApiPy."""
 
     broker_name = "ctrader"
-    # No `supports_stop_amendment`: the daemon has no cTrader market data to
-    # trail on, so this adapter stays on trailing mode "none" (issue #167; see
-    # `shared.trailing.LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`).
+    # `supports_stop_amendment` (#168): a cTrader position's SL/TP is amended
+    # in place through ProtoOAAmendPositionSLTPReq - the broker replaces the
+    # protective levels atomically, so the previous stop keeps working until
+    # the new one is accepted and stays if the request is refused. The adapter
+    # confirms every amendment by re-reading the position from the broker
+    # before reporting success; an unconfirmed outcome raises instead of
+    # claiming the stop moved.
 
     def __init__(
         self,
@@ -4394,6 +4406,254 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             for symbol, position_ids in observed_position_ids.items()
         }
         return payload
+
+    # ── Protective stops / in-place SL-TP amendment (#168) ──────────────────────
+    #
+    # cTrader has no standalone protective-stop order: a position's stopLoss /
+    # takeProfit live on the position itself and are amended atomically through
+    # ProtoOAAmendPositionSLTPReq. The previous levels keep working until the
+    # broker accepts the new ones, and a refused request changes nothing - which
+    # is what makes `supports_stop_amendment` safe to declare. Because the
+    # request has no dedicated response message, success is never taken from
+    # the send: the position is re-read from the broker and the amendment only
+    # counts once the broker reports the new stop.
+
+    @property
+    def supports_stop_amendment(self) -> bool:
+        return True
+
+    async def list_protective_stops(self) -> list[ProtectiveStop]:
+        """One amendable protective stop per open position that has one.
+
+        Synthesized from ``ProtoOAPosition.stopLoss``: ``order_id`` is the
+        broker ``positionId`` (there is no separate stop order to name), and
+        ``side`` is the order side that would reduce the position - ``sell``
+        for a long, ``buy`` for a short. Read from the broker on every call,
+        so a restart continues from broker state.
+
+        A position with no stop is simply not listed - the caller reports the
+        missing protection. A position whose broker-native trailing stop is
+        active is also not listed: that mechanism is not an absolute-price
+        amend, so offering it would let a trail overwrite a level the broker
+        manages itself. Anything structurally unreadable (no trade data, an
+        unknown symbol or side) raises: a stop that cannot be named cannot be
+        safely amended, and the whole listing failing is the loud answer.
+        """
+        open_positions = await self._fetch_open_positions()
+        stops: list[ProtectiveStop] = []
+        for position in open_positions:
+            position_id = self._positive_int(getattr(position, "positionId", 0))
+            trade_data = getattr(position, "tradeData", None)
+            if position_id is None or trade_data is None:
+                raise ValueError(
+                    "cTrader open position is missing positionId or tradeData; "
+                    "refusing to report protective stops for an unattributable position"
+                )
+            if bool(getattr(position, "trailingStopLoss", False)):
+                continue
+            if not self._has_proto_field(position, "stopLoss"):
+                continue
+            stop_price = parse_optional(getattr(position, "stopLoss", None))
+            if stop_price is None or stop_price <= 0:
+                raise ValueError(
+                    f"cTrader position {position_id} carries an unreadable stopLoss "
+                    f"({getattr(position, 'stopLoss', None)!r}); refusing to guess it"
+                )
+            symbol_id = self._positive_int(getattr(trade_data, "symbolId", 0))
+            if symbol_id is None:
+                raise ValueError(
+                    f"cTrader position {position_id} has no readable symbolId; "
+                    "refusing to report its protective stop"
+                )
+            symbol = self._symbol_name_for_id(symbol_id).strip().upper()
+            trade_side = self._positive_int(getattr(trade_data, "tradeSide", 0))
+            if trade_side == int(self._ProtoOATradeSide.BUY):
+                stop_side = "sell"
+            elif trade_side == int(self._ProtoOATradeSide.SELL):
+                stop_side = "buy"
+            else:
+                raise ValueError(
+                    f"cTrader position {position_id} has unreadable tradeSide "
+                    f"({getattr(trade_data, 'tradeSide', None)!r}); cannot tell "
+                    "which side its stop protects"
+                )
+            qty: float | None = None
+            try:
+                volume = parse_money(getattr(trade_data, "volume", 0))
+                qty = _broker_volume_to_qty(
+                    volume, self._scale_for(symbol).volume_per_qty
+                )
+            except (TypeError, ValueError):
+                qty = None
+            stops.append(
+                ProtectiveStop(
+                    order_id=str(position_id),
+                    symbol=symbol,
+                    side=stop_side,
+                    stop_price=stop_price,
+                    qty=qty,
+                )
+            )
+        return stops
+
+    def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
+        """Round a computed stop onto the symbol's price grid, away from market.
+
+        Same convention as the Alpaca adapter: floor for a ``sell`` stop,
+        ceiling for a ``buy`` stop, so the rounded stop is never tighter than
+        the computed one.
+        """
+        value = float(price)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"Invalid stop price for {stop.symbol}: {price!r}; refusing to amend."
+            )
+        digits = self._scale_for(stop.symbol).price_digits
+        tick = Decimal(1).scaleb(-max(0, int(digits)))
+        # Float noise is removed first (101.96999999999998 is 101.97): flooring
+        # the raw float would otherwise give away a whole tick to a rounding
+        # artefact of the stop arithmetic.
+        rounding = ROUND_FLOOR if stop.side == "sell" else ROUND_CEILING
+        rounded = float(Decimal(repr(round(value, 8))).quantize(tick, rounding=rounding))
+        if rounded <= 0:
+            raise ValueError(
+                f"Stop price for {stop.symbol} rounds to {rounded!r}; refusing to amend."
+            )
+        return rounded
+
+    async def _fetch_open_position(self, position_id: int) -> Any | None:
+        """The open ``ProtoOAPosition`` with this id, or ``None`` when closed."""
+        for position in await self._fetch_open_positions():
+            if self._positive_int(getattr(position, "positionId", 0)) == position_id:
+                return position
+        return None
+
+    async def _confirm_position_stop(
+        self, position_id: int, expected_price: float, *, digits: int
+    ) -> float | None:
+        """The broker-reported stop once it matches ``expected_price``.
+
+        ``None`` while the broker has not yet shown the amended stop; the
+        caller bounds the wait. A position that is gone returns a separate
+        sentinel through the caller's own read - this only answers "does the
+        open position carry the new stop".
+        """
+        position = await self._fetch_open_position(position_id)
+        if position is None:
+            return None
+        if not self._has_proto_field(position, "stopLoss"):
+            return None
+        broker_price = parse_optional(getattr(position, "stopLoss", None))
+        if broker_price is None or broker_price <= 0:
+            return None
+        tolerance = float(Decimal(1).scaleb(-max(0, int(digits)))) * 0.5 + 1e-12
+        if math.isclose(broker_price, expected_price, rel_tol=0.0, abs_tol=tolerance):
+            return broker_price
+        return None
+
+    async def amend_protective_stop(
+        self, stop: ProtectiveStop, new_stop_price: float
+    ) -> ProtectiveStop:
+        """Move a position's stop loss to ``new_stop_price``, TP preserved.
+
+        Sends ``ProtoOAAmendPositionSLTPReq`` with the new absolute stop and
+        the position's current take profit echoed back unchanged (unset when
+        the position has none, which the broker reads as "no TP" either way).
+        The request has no dedicated response message, so the outcome is
+        confirmed by re-reading the position: only a broker-reported stop at
+        the requested price counts as amended. Any send failure that is not a
+        definite broker refusal (timeout, dropped connection, malformed
+        response) is verified the same way - if the state shows the new stop
+        the amendment did land; if it cannot be confirmed this raises and the
+        caller keeps treating the previous broker state as the truth.
+        """
+        position_id = self._positive_int(getattr(stop, "order_id", None))
+        if position_id is None:
+            raise ValueError(
+                f"cTrader protective stop for {stop.symbol} has no usable "
+                f"position id ({stop.order_id!r}); refusing to amend."
+            )
+        if self._ProtoOAAmendPositionSLTPReq is None:
+            raise RuntimeError("cTrader amend-position-SLTP request type is not loaded")
+        # Read the position first: it connects/authenticates (so the symbol
+        # scale is broker-sourced), proves the position is still open, and
+        # supplies the TP and protection flags to echo back unchanged.
+        position = await self._fetch_open_position(position_id)
+        if position is None:
+            raise RuntimeError(
+                f"cTrader position {position_id} ({stop.symbol}) is no longer open; "
+                "there is no stop to amend."
+            )
+        digits = self._scale_for(stop.symbol).price_digits
+        price = self.round_stop_price(stop, new_stop_price)
+
+        request = self._ProtoOAAmendPositionSLTPReq()
+        request.ctidTraderAccountId = self.ctid_trader_account_id
+        request.positionId = position_id
+        request.stopLoss = float(price)
+        if self._has_proto_field(position, "takeProfit"):
+            current_tp = parse_optional(getattr(position, "takeProfit", None))
+            if current_tp is not None and current_tp > 0:
+                request.takeProfit = float(current_tp)
+        for field_name in (
+            "guaranteedStopLoss",
+            "trailingStopLoss",
+            "stopLossTriggerMethod",
+        ):
+            if self._has_proto_field(position, field_name):
+                setattr(request, field_name, getattr(position, field_name))
+
+        send_error: BaseException | None = None
+        try:
+            response = await self._send_request_with_refresh_retry(
+                request, timeout_seconds=10
+            )
+            self._raise_if_order_error_event(response)
+        except CTraderApiError as exc:
+            # A definite refusal: the broker changed nothing, the previous
+            # stop is still in force.
+            self._raise_terminal_auth_from_api_error(exc)
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            # Timeout, transport failure or an unparseable response: the
+            # request may or may not have landed. Broker state decides below.
+            send_error = exc
+
+        confirmed_price: float | None = None
+        for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
+            try:
+                confirmed_price = await self._confirm_position_stop(
+                    position_id, price, digits=digits
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # except-kind: money-decision
+                confirmed_price = None
+            if confirmed_price is not None:
+                break
+            if attempt + 1 < _AMEND_CONFIRM_ATTEMPTS:
+                await asyncio.sleep(_AMEND_CONFIRM_INTERVAL_SECONDS)
+        if confirmed_price is None:
+            position_now = await self._fetch_open_position(position_id)
+            if position_now is None:
+                raise RuntimeError(
+                    f"cTrader position {position_id} ({stop.symbol}) closed while its "
+                    "stop was being amended; the amendment outcome is moot but the "
+                    "close itself must be reconciled."
+                )
+            detail = f" send error: {send_error!r}" if send_error is not None else ""
+            raise RuntimeError(
+                f"cTrader did not confirm the stop amendment for position "
+                f"{position_id} ({stop.symbol}): broker still reports stopLoss "
+                f"{getattr(position_now, 'stopLoss', None)!r}, requested {price!r}.{detail}"
+            )
+        return ProtectiveStop(
+            order_id=str(position_id),
+            symbol=stop.symbol,
+            side=stop.side,
+            stop_price=confirmed_price,
+            qty=stop.qty,
+        )
 
     async def _persist_execution_event(self, event: Any) -> None:
         execution_type = int(event.executionType)
