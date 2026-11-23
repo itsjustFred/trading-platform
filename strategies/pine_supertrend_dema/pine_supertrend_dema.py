@@ -8,10 +8,11 @@ Exits: only the INITIAL Supertrend band is protective on native — ``sl_price``
 is written on the entry bar alone, so the engine's stop never trails. The
 trailed level travels in the exit bar's ``exit_price``/``trailing_stop_at_exit``,
 which native honors only with ``exit_order_type="level"`` (not emitted here).
-A trailed-stop hit or Supertrend flip-down is therefore a close-triggered
-market exit (no explicit ``exit_price``) that fills at the next bar's open
-under the default ``signal_exit_fill="next_open"`` — the trailed level itself
-is not enforced as a fill price.
+A trailed-stop hit (a low-touch, not close-triggered) or Supertrend flip-down
+is therefore a market exit that fills at the next bar's open under the default
+``signal_exit_fill="next_open"`` — any ``exit_price`` written on the stop-hit
+bar is informational and ignored without ``exit_order_type="level"``, so the
+trailed level itself is not enforced as a fill price.
 """
 
 STRATEGY_META = {
@@ -117,8 +118,9 @@ def generate_signals(df: pd.DataFrame, params: dict):
                 # trails. The trailed level travels in exit_price /
                 # trailing_stop_at_exit, honored as a level only with
                 # exit_order_type="level" (not emitted here). A trailed-stop
-                # hit or flip is a close-triggered MARKET exit: no explicit
-                # exit_price -> next bar's open.
+                # hit or flip is a MARKET exit -> next bar's open; on a stop
+                # hit exit_price is informational only (ignored without
+                # exit_order_type="level").
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "trailing_stop"
