@@ -1467,245 +1467,34 @@
   ],
   "n_rows": 900
  },
- "risk_parity": {
+ "intraday_volatility_breakout": {
   "entries": [
-   315,
-   399,
-   525,
-   630,
-   756,
-   882
+   354
   ],
   "exits": [
-   336,
-   441,
-   567,
-   693,
-   819
-  ],
-  "drawings": [
-   {
-    "type": "marker",
-    "time": "2022-11-12T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-02-04T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-06-10T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-09-23T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-27T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-06-01T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2022-12-03T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-03-18T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-07-22T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-11-25T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-30T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   }
-  ],
-  "n_rows": 900
- },
- "sector_rotation": {
-  "entries": [
-   271,
-   393,
-   512,
-   629,
-   752,
-   871
-  ],
-  "exits": [
-   326,
-   443,
-   563,
-   686,
-   804
-  ],
-  "drawings": [
-   {
-    "type": "marker",
-    "time": "2022-09-29T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-01-29T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-05-28T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-09-22T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-23T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-05-21T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2022-11-23T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-03-20T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-07-18T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-11-18T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-15T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   }
-  ],
-  "n_rows": 900
- },
- "stat_arb_pairs": {
-  "entries": [
+   91,
+   92,
+   93,
    94,
-   212,
-   332,
-   451,
-   574,
-   691,
-   811
-  ],
-  "exits": [
-   131,
-   252,
-   373,
-   492,
-   611,
-   733,
-   851
+   95,
+   96,
+   187,
+   188,
+   189,
+   190,
+   191,
+   192,
+   283,
+   284,
+   285,
+   286,
+   287,
+   288
   ],
   "drawings": [
    {
     "type": "marker",
-    "time": "2022-04-05T00:00:00+00:00",
+    "time": "2024-01-04T16:30:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -1713,55 +1502,7 @@
    },
    {
     "type": "marker",
-    "time": "2022-08-01T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2022-11-29T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-03-28T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-07-29T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-11-23T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-22T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2022-05-12T00:00:00+00:00",
+    "time": "2024-01-01T22:45:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -1769,7 +1510,7 @@
    },
    {
     "type": "marker",
-    "time": "2022-09-10T00:00:00+00:00",
+    "time": "2024-01-01T23:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -1777,7 +1518,7 @@
    },
    {
     "type": "marker",
-    "time": "2023-01-09T00:00:00+00:00",
+    "time": "2024-01-01T23:15:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -1785,7 +1526,7 @@
    },
    {
     "type": "marker",
-    "time": "2023-05-08T00:00:00+00:00",
+    "time": "2024-01-01T23:30:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -1793,7 +1534,103 @@
    },
    {
     "type": "marker",
-    "time": "2023-09-04T00:00:00+00:00",
+    "time": "2024-01-01T23:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T22:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T23:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T23:15:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T23:30:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T23:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T22:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T23:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T23:15:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T23:30:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T23:45:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -1806,89 +1643,9 @@
     "shape": "arrowDown",
     "color": "#ef4444",
     "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-05-01T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
    }
   ],
-  "n_rows": 900
- },
- "trend_following": {
-  "entries": [
-   368
-  ],
-  "exits": [
-   651
-  ],
-  "drawings": [
-   {
-    "type": "marker",
-    "time": "2024-01-04T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-10-13T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   }
-  ],
-  "n_rows": 700
- },
- "short_term_reversal": {
-  "entries": [
-   151,
-   155
-  ],
-  "exits": [
-   154,
-   160
-  ],
-  "drawings": [
-   {
-    "type": "marker",
-    "time": "2023-06-01T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-06-05T00:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2023-06-04T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2023-06-10T00:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   }
-  ],
-  "n_rows": 260
+  "n_rows": 374
  },
  "mean_reversion_rsi_bb": {
   "entries": [
@@ -1917,115 +1674,19 @@
   ],
   "n_rows": 200
  },
- "volatility_breakout": {
+ "pine_superosc_vumanchu": {
   "entries": [
-   112,
-   136,
-   186,
-   208,
-   353,
-   376,
-   401,
-   426,
-   544,
-   571,
-   595,
-   664,
-   761,
-   787,
-   810,
-   858,
-   883,
-   928,
-   1048,
-   1122,
-   1192,
-   1218,
-   1315,
-   1362,
-   1385,
-   1433,
-   1507,
-   1601,
-   1626,
-   1695,
-   1721,
-   1743,
-   1793,
-   1889,
-   1911,
-   2080,
-   2106,
-   2153,
-   2176,
-   2198,
-   2270,
-   2342,
-   2487,
-   2512,
-   2535,
-   2561,
-   2608,
-   2633,
-   2920,
-   2945
+   93,
+   234
   ],
   "exits": [
-   115,
-   139,
-   187,
-   211,
-   355,
-   379,
-   403,
-   427,
-   547,
-   572,
-   596,
-   667,
-   763,
-   788,
-   811,
-   859,
-   884,
-   931,
-   1051,
-   1123,
-   1195,
-   1219,
-   1316,
-   1363,
-   1387,
-   1435,
-   1508,
-   1603,
-   1627,
-   1698,
-   1722,
-   1746,
-   1794,
-   1890,
-   1914,
-   2082,
-   2107,
-   2154,
-   2178,
-   2202,
-   2274,
-   2346,
-   2490,
-   2514,
-   2538,
-   2562,
-   2610,
-   2634,
-   2922,
-   2946
+   96,
+   242
   ],
   "drawings": [
    {
     "type": "marker",
-    "time": "2024-01-05T16:00:00+00:00",
+    "time": "2024-04-03T00:00:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -2033,7 +1694,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-06T16:00:00+00:00",
+    "time": "2024-08-22T00:00:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -2041,231 +1702,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-08T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-09T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-15T17:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-16T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-17T17:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-18T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-23T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-24T19:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-25T19:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-28T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-01T17:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-02T19:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-03T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-05T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-06T19:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-08T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-13T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-16T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-19T16:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-20T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-24T19:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-26T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-27T17:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-29T17:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-03T19:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-07T17:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-08T18:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-11T15:00:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-05T19:00:00+00:00",
+    "time": "2024-04-06T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -2273,238 +1710,86 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-06T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-08T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-09T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-15T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-16T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-17T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-18T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-23T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-24T20:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-25T20:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-01-28T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-01T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-02T20:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-03T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-05T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-06T20:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-08T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-13T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-16T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-19T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-20T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-24T20:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-26T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-27T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-02-29T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-03T20:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-07T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-08T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-11T18:00:00+00:00",
+    "time": "2024-08-30T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
     "text": "Exit"
    }
   ],
-  "n_rows": 3000
+  "n_rows": 800
+ },
+ "pine_supertrend_dema": {
+  "entries": [
+   151
+  ],
+  "exits": [
+   220
+  ],
+  "drawings": [
+   {
+    "type": "marker",
+    "time": "2024-05-31T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-08-08T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   }
+  ],
+  "n_rows": 600
+ },
+ "post_vix_dip_buy": {
+  "entries": [
+   135,
+   165
+  ],
+  "exits": [
+   141,
+   167
+  ],
+  "drawings": [
+   {
+    "type": "marker",
+    "time": "2024-03-08T17:15:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-11T17:15:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-08T18:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-11T17:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   }
+  ],
+  "n_rows": 180
  },
  "qg_30min_es_breakout_strategy": {
   "entries": [
@@ -2632,21 +1917,21 @@
    182,
    206,
    231,
-   260,
+   259,
    278,
    304,
    330,
-   356,
-   380,
-   404,
+   355,
+   379,
+   403,
    422,
-   452,
+   451,
    473,
-   500,
+   499,
    518,
-   548,
-   572,
-   668,
+   547,
+   571,
+   667,
    686,
    710,
    739,
@@ -2654,34 +1939,34 @@
    783,
    806,
    831,
-   860,
+   859,
    880,
    902,
-   932,
+   931,
    951,
    974,
    998,
    1022,
-   1052,
-   1100,
-   1124,
+   1051,
+   1099,
+   1123,
    1142,
-   1172,
+   1171,
    1191,
-   1220,
+   1219,
    1238,
    1262,
    1288,
    1310,
    1334,
    1358,
-   1388,
+   1387,
    1406,
-   1436,
-   1484,
+   1435,
+   1483,
    1502,
    1576,
-   1604,
+   1603,
    1622,
    1646,
    1673,
@@ -2693,22 +1978,22 @@
    1839,
    1864,
    1886,
-   1915,
+   1914,
    1933,
    1957,
    1981,
    2005,
    2033,
    2053,
-   2083,
+   2082,
    2101,
    2125,
-   2155,
+   2154,
    2173,
    2197,
    2221,
    2245,
-   2275,
+   2274,
    2293,
    2317,
    2341,
@@ -2722,7 +2007,7 @@
    2533,
    2559,
    2583,
-   2611,
+   2610,
    2629,
    2683,
    2706,
@@ -2731,10 +2016,10 @@
    2773,
    2798,
    2825,
-   2851,
+   2850,
    2869,
-   2899,
-   2923,
+   2898,
+   2922,
    2941,
    2967,
    2989
@@ -3718,7 +3003,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-11T20:00:00+00:00",
+    "time": "2024-01-11T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3750,7 +3035,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-15T20:00:00+00:00",
+    "time": "2024-01-15T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3758,7 +3043,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-16T20:00:00+00:00",
+    "time": "2024-01-16T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3766,7 +3051,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-17T20:00:00+00:00",
+    "time": "2024-01-17T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3782,7 +3067,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-19T20:00:00+00:00",
+    "time": "2024-01-19T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3798,7 +3083,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-21T20:00:00+00:00",
+    "time": "2024-01-21T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3814,7 +3099,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-23T20:00:00+00:00",
+    "time": "2024-01-23T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3822,7 +3107,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-24T20:00:00+00:00",
+    "time": "2024-01-24T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3830,7 +3115,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-28T20:00:00+00:00",
+    "time": "2024-01-28T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3894,7 +3179,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-05T20:00:00+00:00",
+    "time": "2024-02-05T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3918,7 +3203,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-08T20:00:00+00:00",
+    "time": "2024-02-08T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3958,7 +3243,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-13T20:00:00+00:00",
+    "time": "2024-02-13T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3966,7 +3251,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-15T20:00:00+00:00",
+    "time": "2024-02-15T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3974,7 +3259,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-16T20:00:00+00:00",
+    "time": "2024-02-16T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -3990,7 +3275,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-18T20:00:00+00:00",
+    "time": "2024-02-18T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4006,7 +3291,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-20T20:00:00+00:00",
+    "time": "2024-02-20T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4062,7 +3347,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-27T20:00:00+00:00",
+    "time": "2024-02-27T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4078,7 +3363,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-02-29T20:00:00+00:00",
+    "time": "2024-02-29T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4086,7 +3371,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-03-02T20:00:00+00:00",
+    "time": "2024-03-02T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4110,7 +3395,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-03-07T20:00:00+00:00",
+    "time": "2024-03-07T19:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4206,7 +3491,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-03-20T19:00:00+00:00",
+    "time": "2024-03-20T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4262,7 +3547,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-03-27T19:00:00+00:00",
+    "time": "2024-03-27T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4286,7 +3571,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-03-30T19:00:00+00:00",
+    "time": "2024-03-30T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4326,7 +3611,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-04-04T19:00:00+00:00",
+    "time": "2024-04-04T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4438,7 +3723,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-04-18T19:00:00+00:00",
+    "time": "2024-04-18T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4510,7 +3795,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-04-28T19:00:00+00:00",
+    "time": "2024-04-28T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4526,7 +3811,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-04-30T19:00:00+00:00",
+    "time": "2024-04-30T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4534,7 +3819,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-05-01T19:00:00+00:00",
+    "time": "2024-05-01T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#f59e0b",
@@ -4567,19 +3852,26 @@
   ],
   "n_rows": 3000
  },
- "pine_superosc_vumanchu": {
+ "risk_parity": {
   "entries": [
-   93,
-   234
+   315,
+   399,
+   525,
+   630,
+   756,
+   882
   ],
   "exits": [
-   96,
-   242
+   336,
+   441,
+   567,
+   693,
+   819
   ],
   "drawings": [
    {
     "type": "marker",
-    "time": "2024-04-03T00:00:00+00:00",
+    "time": "2022-11-12T00:00:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -4587,7 +3879,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-08-22T00:00:00+00:00",
+    "time": "2023-02-04T00:00:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -4595,7 +3887,39 @@
    },
    {
     "type": "marker",
-    "time": "2024-04-06T00:00:00+00:00",
+    "time": "2023-06-10T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-09-23T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-27T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-06-01T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2022-12-03T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4603,26 +3927,59 @@
    },
    {
     "type": "marker",
-    "time": "2024-08-30T00:00:00+00:00",
+    "time": "2023-03-18T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-07-22T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-11-25T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-30T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
     "text": "Exit"
    }
   ],
-  "n_rows": 800
+  "n_rows": 900
  },
- "pine_supertrend_dema": {
+ "sector_rotation": {
   "entries": [
-   151
+   271,
+   393,
+   512,
+   629,
+   752,
+   871
   ],
   "exits": [
-   220
+   326,
+   443,
+   563,
+   686,
+   804
   ],
   "drawings": [
    {
     "type": "marker",
-    "time": "2024-05-31T00:00:00+00:00",
+    "time": "2022-09-29T00:00:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -4630,14 +3987,293 @@
    },
    {
     "type": "marker",
-    "time": "2024-08-08T00:00:00+00:00",
+    "time": "2023-01-29T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-05-28T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-09-22T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-23T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-05-21T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2022-11-23T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-03-20T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-07-18T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-11-18T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-15T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
     "text": "Exit"
    }
   ],
-  "n_rows": 600
+  "n_rows": 900
+ },
+ "short_term_reversal": {
+  "entries": [
+   151,
+   155
+  ],
+  "exits": [
+   154,
+   160
+  ],
+  "drawings": [
+   {
+    "type": "marker",
+    "time": "2023-06-01T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-06-05T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-06-04T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-06-10T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   }
+  ],
+  "n_rows": 260
+ },
+ "stat_arb_pairs": {
+  "entries": [
+   94,
+   212,
+   332,
+   451,
+   574,
+   691,
+   811
+  ],
+  "exits": [
+   131,
+   252,
+   373,
+   492,
+   611,
+   733,
+   851
+  ],
+  "drawings": [
+   {
+    "type": "marker",
+    "time": "2022-04-05T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2022-08-01T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2022-11-29T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-03-28T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-07-29T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2023-11-23T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-22T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2022-05-12T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2022-09-10T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-01-09T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-05-08T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2023-09-04T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-04T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-05-01T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   }
+  ],
+  "n_rows": 900
+ },
+ "trend_following": {
+  "entries": [
+   368
+  ],
+  "exits": [
+   651
+  ],
+  "drawings": [
+   {
+    "type": "marker",
+    "time": "2024-01-04T00:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-10-13T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   }
+  ],
+  "n_rows": 700
  },
  "us100_scalper": {
   "entries": [
@@ -4648,7 +4284,7 @@
   "exits": [
    97,
    387,
-   768
+   767
   ],
   "drawings": [
    {
@@ -4693,7 +4329,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-03-06T21:00:00+00:00",
+    "time": "2024-03-06T20:55:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4702,34 +4338,71 @@
   ],
   "n_rows": 828
  },
- "intraday_volatility_breakout": {
+ "volatility_breakout": {
   "entries": [
-   354
+   112,
+   136,
+   208,
+   353,
+   376,
+   401,
+   544,
+   664,
+   761,
+   928,
+   1048,
+   1192,
+   1385,
+   1433,
+   1601,
+   1695,
+   1743,
+   1911,
+   2080,
+   2176,
+   2198,
+   2270,
+   2342,
+   2487,
+   2512,
+   2535,
+   2608,
+   2920
   ],
   "exits": [
-   91,
-   92,
-   93,
-   94,
-   95,
-   96,
-   187,
-   188,
-   189,
-   190,
-   191,
-   192,
-   283,
-   284,
-   285,
-   286,
-   287,
-   288
+   114,
+   138,
+   210,
+   354,
+   378,
+   402,
+   546,
+   666,
+   762,
+   930,
+   1050,
+   1194,
+   1386,
+   1434,
+   1602,
+   1697,
+   1745,
+   1913,
+   2081,
+   2177,
+   2201,
+   2273,
+   2345,
+   2489,
+   2513,
+   2537,
+   2609,
+   2921
   ],
   "drawings": [
    {
     "type": "marker",
-    "time": "2024-01-04T16:30:00+00:00",
+    "time": "2024-01-05T16:00:00+00:00",
     "position": "belowBar",
     "shape": "arrowUp",
     "color": "#22c55e",
@@ -4737,7 +4410,223 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-01T22:45:00+00:00",
+    "time": "2024-01-06T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-09T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-15T17:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-16T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-17T17:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-23T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-28T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-02-01T17:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-02-08T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-02-13T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-02-19T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-02-27T17:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-02-29T17:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-07T17:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-11T15:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-13T15:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-20T15:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-27T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-31T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-01T14:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-04T14:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-07T14:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-13T15:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-14T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-15T15:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-18T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-05-01T16:00:00+00:00",
+    "position": "belowBar",
+    "shape": "arrowUp",
+    "color": "#22c55e",
+    "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-05T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4745,7 +4634,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-01T23:00:00+00:00",
+    "time": "2024-01-06T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4753,7 +4642,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-01T23:15:00+00:00",
+    "time": "2024-01-09T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4761,7 +4650,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-01T23:30:00+00:00",
+    "time": "2024-01-15T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4769,7 +4658,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-01T23:45:00+00:00",
+    "time": "2024-01-16T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4777,7 +4666,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-02T00:00:00+00:00",
+    "time": "2024-01-17T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4785,7 +4674,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-02T22:45:00+00:00",
+    "time": "2024-01-23T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4793,7 +4682,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-02T23:00:00+00:00",
+    "time": "2024-01-28T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4801,7 +4690,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-02T23:15:00+00:00",
+    "time": "2024-02-01T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4809,7 +4698,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-02T23:30:00+00:00",
+    "time": "2024-02-08T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4817,7 +4706,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-02T23:45:00+00:00",
+    "time": "2024-02-13T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4825,7 +4714,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-03T00:00:00+00:00",
+    "time": "2024-02-19T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4833,7 +4722,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-03T22:45:00+00:00",
+    "time": "2024-02-27T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4841,7 +4730,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-03T23:00:00+00:00",
+    "time": "2024-02-29T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4849,7 +4738,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-03T23:15:00+00:00",
+    "time": "2024-03-07T18:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4857,7 +4746,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-03T23:30:00+00:00",
+    "time": "2024-03-11T17:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4865,7 +4754,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-03T23:45:00+00:00",
+    "time": "2024-03-13T17:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4873,58 +4762,93 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-04T00:00:00+00:00",
+    "time": "2024-03-20T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-27T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-03-31T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-01T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-04T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-07T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-13T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-14T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-15T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-04-18T17:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-05-01T17:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
     "text": "Exit"
    }
   ],
-  "n_rows": 374
- },
- "post_vix_dip_buy": {
-  "entries": [
-   135,
-   165
-  ],
-  "exits": [
-   142,
-   168
-  ],
-  "drawings": [
-   {
-    "type": "marker",
-    "time": "2024-03-08T17:15:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-11T17:15:00+00:00",
-    "position": "belowBar",
-    "shape": "arrowUp",
-    "color": "#22c55e",
-    "text": "Entry"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-08T19:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   },
-   {
-    "type": "marker",
-    "time": "2024-03-11T18:00:00+00:00",
-    "position": "aboveBar",
-    "shape": "arrowDown",
-    "color": "#ef4444",
-    "text": "Exit"
-   }
-  ],
-  "n_rows": 180
+  "n_rows": 3000
  }
 }

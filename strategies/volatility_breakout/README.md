@@ -3,7 +3,7 @@
 ## Quelle
 - Original: NT8 `optimized_version_vola_breackout nt8.txt` (VolaBreakout: Tages-ATR-Breakout um den RTH-Open)
 - Discord: `https://discord.com/channels/1230977283888648315/1342609786633584670/1433816630118449322`
-- Konvertiert: 2026-03-08, source-faithful Rewrite: 2026-09-09 (inventierter ATR-Regime-Filter und MT5-Clock entfernt)
+- Konvertiert: 2026-03-08, source-faithful Rewrite: 2026-09-09 (inventierter ATR-Regime-Filter und MT5-Clock entfernt); Version 1.2.0: Exit-Signale eine Bar frueher fuer Next-Open-Fills
 
 ## Kernlogik
 
@@ -16,8 +16,8 @@ Tages-ATR(5, Wilder) aus Tages-Bars, Wert der **Vortages**-Bar (`[1]`):
 
 ### Exit
 1. Schutz-Stop AUF DEM SESSION-OPEN (Stop-Order): Long bei `low <= rthOpen`, Short bei `high >= rthOpen`, Fill am `rthOpen` (`stop_loss`).
-2. Force-Close 60 Min vor Session-Ende (default): ab 14:00 NY wird jede offene Position per Market geschlossen (`force_close`). Laeuft vor dem Session-Gate, greift also auch ausserhalb des Entry-Fensters.
-3. Session-Close (`IsExitOnSessionCloseStrategy`, 30 s): Flatten an der letzten In-Session-Bar (`session_exit`); relevant v. a. bei `ForceCloseInMin = 0`.
+2. Force-Close 60 Min vor Session-Ende (default): zum 14:00-NY-Open wird jede offene Position per Market geschlossen (`force_close`). NT8-Bars sind am Bar-ENDE gestempelt, Signal-Exits fuellen am naechsten Bar-Open (`next_open`): das Signal geht auf der ersten Bar raus, deren Ende 14:00 erreicht (1m: 13:59), ohne expliziten `exit_price`. Laeuft vor dem Session-Gate, greift also auch ausserhalb des Entry-Fensters.
+3. Session-Close (`IsExitOnSessionCloseStrategy`, 30 s): Signal auf der **vorletzten** In-Session-Bar (Fill am Open der letzten, Bar-Abstand + Uhr, kein Blick auf spaetere Bars), ohne expliziten `exit_price`; ab dieser Bar keine neuen Entries. Eine nach der Session / an einem neuen Tag noch offene Position (Datenluecke) wird auf der ersten solchen Bar geflattet (`session_exit`); relevant v. a. bei `ForceCloseInMin = 0`.
 4. Wiedereinstieg nach Force-Close/Stop bleibt moeglich (Quelle setzt ein Flag, das nie gelesen wird — effektives Verhalten, dokumentiert).
 
 Jeder Exit setzt `exit_price` + `exit_reason`, jeder Entry `sl_price` (= rthOpen) + `direction`: kein NaN-Sizing/Pricing (Fix der NaN-PnL-Kaskade: frueher erzeugte ein preisloser Time-Exit `pnl = NaN`, danach war das Equity `NaN` und alle Folge-Trades hatten `qty/pnl = NaN` bei 8 gezaehlten Trades).
