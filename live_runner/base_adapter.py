@@ -647,9 +647,12 @@ class BaseLiveAdapter(ABC):
         The live ``supertrend_flip`` manager binds its plan to a broker
         position only when this read proves the position was opened by the
         entry's own order - never by size or timing coincidence. ``None``
-        means the broker cannot prove it (unreadable order list, ambiguous
-        or absent opening order); callers must treat that as fail-closed.
-        The default cannot prove anything.
+        means PROVEN foreign/ambiguous (the broker read the position's
+        orders and none, or several, resolve to a persisted signal); an
+        unreadable order list or a failed read must RAISE so the caller can
+        retry a transient failure instead of treating it as foreign
+        ownership. Callers must treat ``None`` as fail-closed. The default
+        cannot prove anything.
         """
         return None
 

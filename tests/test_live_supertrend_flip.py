@@ -18,6 +18,7 @@ import pytest
 
 import live_runner.supertrend_flip as flip_module
 from live_runner.base_adapter import (
+    ORDER_STATE_FILLED,
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
@@ -579,6 +580,31 @@ def test_exit_pending_resubmits_idempotently_across_restart(live: _Live) -> None
     assert live.state()["phase"] == PHASE_EXIT_PENDING
 
 
+def test_exit_pending_filled_with_unconfirmed_ledger_waits(
+    live: _Live,
+) -> None:
+    """A FILLED exit whose ledger has not caught up and whose position read
+    is stale must WAIT (bounded by the pending timeout), not resubmit - the
+    same rule TP1 follows, so a lagging ledger cannot burn close attempts
+    or double-close the remainder."""
+    manager = LiveSupertrendFlipManager()
+    _arm_tp1(live, manager)
+    _feed_bars(live, [(1.0, 100.0, 101.0), (2.0, 101.0, 99.0)])
+    live.adapter.auto_fill = False  # the exit order stays working/unfilled
+    live.tick(manager, _at(3.1))
+    assert live.state()["phase"] == PHASE_EXIT_PENDING
+    orders_before = len(live.adapter.orders)
+
+    # Broker says the exit order FILLED; the ledger shows nothing yet and
+    # the position read is stale (still shows the remainder).
+    live.adapter.order_states["ord-2"] = ORDER_STATE_FILLED
+    live.tick(manager, _at(3.2))
+    live.tick(manager, _at(3.3))
+
+    assert len(live.adapter.orders) == orders_before  # no resubmit
+    assert live.state()["phase"] == PHASE_EXIT_PENDING
+
+
 # ── fail-closed paths ────────────────────────────────────────────────────────
 
 
@@ -855,6 +881,47 @@ def test_flip_close_uses_exit_lock_and_in_flight_check(live: _Live) -> None:
     assert check_calls == [SYMBOL]
 
 
+def test_flip_close_waits_for_the_account_order_lock(
+    live: _Live, monkeypatch
+) -> None:
+    """The flip submit is one section under ``account_order_placement``:
+    while another section of the same account holds the lock the close is
+    refused (bounded wait), never submitted on a possibly-stale read."""
+    import live_runner.account_order_lock as lock_module
+
+    # Shrink the bounded wait so the refusal is fast instead of 120s.
+    monkeypatch.setattr(lock_module, "ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS", 0.2)
+    live.adapter.bid = 106.0
+    manager = LiveSupertrendFlipManager()
+
+    async def scenario() -> None:
+        # Same event loop as run_once -> the same per-loop lock the submit
+        # path must acquire.
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold() -> None:
+            async with lock_module.account_order_placement(ACCOUNT):
+                held.set()
+                await release.wait()
+
+        holder = asyncio.create_task(hold())
+        await held.wait()
+        try:
+            await manager.run_once(
+                {ACCOUNT: live.adapter}, [live.deployment], now=_at(0.2)
+            )
+        finally:
+            release.set()
+            await holder
+
+    asyncio.run(scenario())
+    assert live.adapter.orders == []
+
+    live.tick(manager, _at(1.0))
+    assert len(live.adapter.orders) == 1
+
+
 def test_in_flight_exit_defers_flip_close(live: _Live) -> None:
     """SF6: a working exit for the deployment defers the flip close - no
     order is submitted and no failure is recorded."""
@@ -939,10 +1006,45 @@ def test_first_sight_rejects_a_same_size_foreign_position(
     assert any("first sight" in msg for msg, _ in surfaced)
 
 
-def test_first_sight_rejects_when_provenance_is_unreadable(
+def test_first_sight_retries_a_transient_provenance_read(
     live: _Live, surfaced
 ) -> None:
-    """No mapping, no callable, or a raising read all fail closed to done."""
+    """An unreadable broker read is transient, never proven foreign: the
+    pass fails, backs off and retries; only a PROVEN foreign opener ends
+    the plan. The protective stop stays in force throughout."""
+    calls = {"n": 0}
+
+    async def _flaky(position_id: int) -> str | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("order list unreadable")
+        return live.adapter.opening_signal_ids.get(int(position_id))
+
+    live.adapter.opening_signal_id_for_position = _flaky  # type: ignore[method-assign]
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+
+    live.tick(manager, _at(0.1))
+    # Nothing persisted as done; the failure was surfaced as a retry.
+    assert live.state().get("phase") != PHASE_DONE
+    assert live.adapter.orders == []
+    assert any("retried" in msg for msg, _ in surfaced)
+
+    live.tick(manager, _at(0.2))  # still inside the 15s first backoff
+    assert calls["n"] == 1
+
+    live.tick(manager, _at(1.0))  # retry: provenance now proves the opener
+    assert calls["n"] == 2
+    assert live.state().get("phase") != PHASE_DONE
+    assert len(live.adapter.orders) == 1  # the TP1 close went out
+
+
+def test_first_sight_provenance_gives_up_but_stays_recoverable(
+    live: _Live, surfaced
+) -> None:
+    """Past FLIP_GIVE_UP_AFTER_SECONDS the workflow stops retrying every
+    tick and probes instead - the plan is NEVER marked done on a read it
+    could not complete, and a later successful read still binds it."""
     live.adapter.opening_signal_ids.clear()
 
     async def _raise(position_id: int) -> str | None:
@@ -951,11 +1053,27 @@ def test_first_sight_rejects_when_provenance_is_unreadable(
     live.adapter.opening_signal_id_for_position = _raise  # type: ignore[method-assign]
     manager = LiveSupertrendFlipManager()
 
-    live.tick(manager, _at(0.1))
+    # Drive failures past the 40-minute give-up horizon. Backoff doubles
+    # 15s -> 300s cap, so probing every 5 minutes exercises both states.
+    for minute in range(0, 46):
+        live.tick(manager, _at(minute * 1.0 + 0.1))
 
-    assert live.state().get("phase") == PHASE_DONE
+    assert live.state().get("phase") != PHASE_DONE
     assert live.adapter.orders == []
-    assert any("first sight" in msg for msg, _ in surfaced)
+    critical = [msg for msg, _ in surfaced if "given up" in msg]
+    assert len(critical) == 1
+
+    # Recovery: the broker read works again and the next allowed probe
+    # (15 minutes after give-up) binds the plan instead of abandoning it.
+    async def _recovered(position_id: int) -> str | None:
+        return live.adapter.opening_signal_ids.get(int(position_id))
+
+    live.adapter.opening_signal_id_for_position = _recovered  # type: ignore[method-assign]
+    live.adapter.opening_signal_ids[4242] = str(live.entry.id)
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(62.0))
+    assert live.state().get("phase") != PHASE_DONE
+    assert len(live.adapter.orders) == 1
 
 
 def test_done_plan_alerts_once_not_every_pass(live: _Live, surfaced) -> None:
@@ -971,6 +1089,27 @@ def test_done_plan_alerts_once_not_every_pass(live: _Live, surfaced) -> None:
     assert len(surfaced) == 1
 
 
+def test_done_plan_survives_a_restart_without_realerting(
+    live: _Live, surfaced
+) -> None:
+    """The persisted ``done`` gate is what makes the alert once-only across
+    restarts: a NEW manager facing the same foreign position must take no
+    action and surface nothing."""
+    live.adapter.opening_signal_ids[4242] = str(uuid4())
+    first = LiveSupertrendFlipManager()
+    live.tick(first, _at(0.1))
+    assert live.state().get("phase") == PHASE_DONE
+    assert len(surfaced) == 1
+
+    restarted = LiveSupertrendFlipManager()
+    for minute in range(1, 5):
+        live.tick(restarted, _at(minute * 0.25))
+
+    assert live.state().get("phase") == PHASE_DONE
+    assert live.adapter.orders == []
+    assert len(surfaced) == 1
+
+
 def test_first_sight_accepts_the_proven_position(live: _Live) -> None:
     """The happy path still manages: provenance proves, workflow proceeds."""
     manager = LiveSupertrendFlipManager()
@@ -982,6 +1121,43 @@ def test_first_sight_accepts_the_proven_position(live: _Live) -> None:
     # TP1 tranche went out - the workflow is live, not done.
     assert live.state().get("phase") != PHASE_DONE
     assert len(live.adapter.orders) == 1
+
+
+def test_flip_lookback_window_converges_to_full_history_supertrend() -> None:
+    """The live window ``max(300, period*30)`` must reproduce the replay's
+    full-history Supertrend on recent bars: the Wilder-RMA seed dependence
+    has to be negligible at the tail, or live and replay drift."""
+    import numpy as np
+
+    from live_runner.supertrend_flip import FLIP_BAR_LOOKBACK
+    from signal_bots.ramjet.processor import calculate_supertrend
+
+    rng = np.random.default_rng(7)
+    n = 2400
+    closes = 100.0 + np.cumsum(rng.normal(0.01, 0.15, n))
+    opens = np.concatenate([[closes[0]], closes[:-1]])
+    highs = np.maximum(opens, closes) + rng.random(n) * 0.1
+    lows = np.minimum(opens, closes) - rng.random(n) * 0.1
+    index = pd.date_range("2026-01-05", periods=n, freq="min", tz="UTC")
+    df = pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes},
+        index=index,
+    )
+    ohlc = df[["open", "high", "low", "close"]]
+
+    for period in (2, 10, 20):
+        lookback = max(FLIP_BAR_LOOKBACK, period * 30, period + 30)
+        full = calculate_supertrend(ohlc, period, 2.0)
+        window = calculate_supertrend(
+            ohlc.tail(lookback).reset_index(drop=True), period, 2.0
+        )
+        tail = 60
+        assert list(window["supertrend"].tail(tail)) == list(
+            full["supertrend"].tail(tail)
+        )
+        assert list(window["supertrend_ready"].tail(tail)) == list(
+            full["supertrend_ready"].tail(tail)
+        )
 
 
 # ── Gate matrix: who may run supertrend_flip at all (#168) ──────────────────

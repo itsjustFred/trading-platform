@@ -68,6 +68,7 @@ from typing import Any
 
 import pandas as pd
 
+from live_runner.account_order_lock import account_order_placement
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
     ORDER_STATE_FILLED,
@@ -623,6 +624,11 @@ class LiveSupertrendFlipManager:
                     "signal; refusing to manage it",
                     permanent=True,
                 )
+            workflow = self._workflow_for(key, str(entry["signal_id"]))
+            if workflow.outage.probe_blocked(moment) or (
+                workflow.retry_at is not None and moment < workflow.retry_at
+            ):
+                return
             if state.get("_verify_entry_qty") and not (
                 await self._position_proven_for_entry(adapter, position, entry)
             ):
@@ -651,11 +657,6 @@ class LiveSupertrendFlipManager:
                     critical=True,
                 )
                 self._workflows.pop(key, None)
-                return
-            workflow = self._workflow_for(key, str(entry["signal_id"]))
-            if workflow.outage.probe_blocked(moment) or (
-                workflow.retry_at is not None and moment < workflow.retry_at
-            ):
                 return
             bar_seconds = _timeframe_seconds(deployment.signal_timeframe) or 0
             breakeven_due = self._breakeven_due(plan, state, bar_seconds, moment)
@@ -1136,33 +1137,30 @@ class LiveSupertrendFlipManager:
         First sight must never bind by size: the position's opening order
         has to resolve to the persisted entry signal id (cTrader proves it
         through ``clientOrderId``/order-id attribution, the same mechanism
-        the exit path uses). An adapter that cannot prove, an unreadable
-        order list and a foreign opener all return ``False`` - fail closed.
+        the exit path uses).
+
+        Returns ``False`` ONLY on proven foreign ownership - the broker read
+        the position's orders and none resolves to this entry's signal. An
+        adapter that cannot prove, a position/entry missing the ids needed
+        for the lookup, and any read that fails transiently raise instead:
+        the caller's retry schedule then keeps the protective stop in place
+        and the plan recoverable, rather than permanently marking ``done``
+        on a broker hiccup. Only a proven-foreign position ends the plan.
         """
         position_id = self._position_id(position)
         signal_id = str(entry.get("signal_id") or "").strip()
         if position_id is None or not signal_id:
-            return False
+            raise _FlipFailure(
+                "flip first-sight provenance cannot run: the position or "
+                "entry is missing the ids the broker lookup needs",
+            )
         provenance = getattr(adapter, "opening_signal_id_for_position", None)
         if not callable(provenance):
-            return False
-        try:
-            opened_by = await provenance(int(position_id))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # except-kind: money-decision
-            logger.warning(
-                "Flip first-sight provenance read failed; treating the "
-                "position as unproven",
-                extra={
-                    "data": {
-                        "position_id": position_id,
-                        "signal_id": signal_id,
-                        "error": repr(exc),
-                    }
-                },
+            raise _FlipFailure(
+                f"{type(adapter).__name__} cannot prove position "
+                "provenance; flip first sight cannot bind safely",
             )
-            return False
+        opened_by = await provenance(int(position_id))
         return str(opened_by or "").strip() == signal_id
 
     # ── one position ─────────────────────────────────────────────────────
@@ -1786,6 +1784,14 @@ class LiveSupertrendFlipManager:
         if requested is not None and requested > 0.0 and filled >= requested - tolerance:
             # Fully filled; the position read is simply stale. Wait for it.
             return "waiting"
+        if order_state == ORDER_STATE_FILLED and filled <= tolerance:
+            # FILLED at the broker but the ledger has not caught up (and
+            # the position read is stale): wait, bounded by
+            # ``FLIP_PENDING_TIMEOUT_SECONDS``, rather than resubmit a
+            # close the ledger cannot yet account for - the same rule TP1
+            # already follows, so a lagging ledger cannot burn
+            # ``FLIP_MAX_CLOSE_ATTEMPTS`` or double-close the remainder.
+            return "waiting"
         return "retry_terminal"
 
     async def _flip_ledger_filled_qty(
@@ -1926,17 +1932,24 @@ class LiveSupertrendFlipManager:
         )
 
         async def _place() -> str:
-            await self._check_flip_exit_clear(
-                adapter, deployment, symbol, context
-            )
-            if self._mutation_gate is not None:
-                async with self._mutation_gate() as may_mutate:
-                    if not may_mutate:
-                        raise _FlipShutdownRefused(
-                            "daemon is shutting down; flip close not submitted"
-                        )
-                    return await adapter.submit_order(signal, qty=qty)
-            return await adapter.submit_order(signal, qty=qty)
+            # Same serialization the daemon's own exits get: the in-flight
+            # check and the submit are one section under the account's
+            # order-placement lock, inside the per-symbol exit lock, so a
+            # concurrent entry sizing or flatten cannot interleave between
+            # the read and the close. Lock order matches the daemon:
+            # ``_exit_lock`` outer, account lock inner.
+            async with account_order_placement(str(deployment.account_id)):
+                await self._check_flip_exit_clear(
+                    adapter, deployment, symbol, context
+                )
+                if self._mutation_gate is not None:
+                    async with self._mutation_gate() as may_mutate:
+                        if not may_mutate:
+                            raise _FlipShutdownRefused(
+                                "daemon is shutting down; flip close not submitted"
+                            )
+                        return await adapter.submit_order(signal, qty=qty)
+                return await adapter.submit_order(signal, qty=qty)
 
         if self._exit_lock is None:
             return await _place()
@@ -2065,7 +2078,7 @@ class LiveSupertrendFlipManager:
             return False
         # The newest bar that has fully closed: open + length <= now. Bars
         # are broker-anchored, so decidability is judged on the RETURNED bar
-        # timestamps inside ``_supertrend_bars`` - never on epoch arithmetic,
+        # timestamps inside ``_flip_decidable_bars`` - never on epoch arithmetic,
         # which misaligns on broker weeks (Monday-anchored).
         get_market_data = getattr(adapter, "get_market_data", None)
         if not callable(get_market_data):
@@ -2077,7 +2090,7 @@ class LiveSupertrendFlipManager:
             FLIP_BAR_LOOKBACK, plan.supertrend_period * 30, plan.supertrend_period + 30
         )
         frame = await get_market_data(symbol, timeframe=timeframe, limit=lookback)
-        bars = self._supertrend_bars(
+        bars = self._flip_decidable_bars(
             frame,
             plan=plan,
             bar_seconds=bar_seconds,
@@ -2115,7 +2128,7 @@ class LiveSupertrendFlipManager:
         return dirty
 
     @staticmethod
-    def _supertrend_bars(
+    def _flip_decidable_bars(
         frame: Any,
         *,
         plan: SupertrendFlipPlan,
@@ -2412,7 +2425,7 @@ class LiveSupertrendFlipManager:
             )
 
 
-async def run_supertrend_flip_loop(
+async def run_flip_workflow_loop(
     manager: LiveSupertrendFlipManager,
     *,
     eligible_adapters: Callable[[], Mapping[str, BaseLiveAdapter]],

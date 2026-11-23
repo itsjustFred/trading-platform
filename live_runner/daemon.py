@@ -167,7 +167,7 @@ from live_runner.stockkit_routing import (
 from live_runner.supertrend_flip import (
     FLIP_SUPPORTED_BROKERS,
     LiveSupertrendFlipManager,
-    run_supertrend_flip_loop,
+    run_flip_workflow_loop,
 )
 from live_runner.trailing_stops import (
     LiveTrailingStopManager,
@@ -7645,7 +7645,7 @@ async def _run_daemon_locked(
             # adapter is a demo/paper cTrader - the manager re-checks both, so
             # this wiring cannot turn the mode on by itself.
             flip_task = asyncio.create_task(
-                run_supertrend_flip_loop(
+                run_flip_workflow_loop(
                     LiveSupertrendFlipManager(
                         mutation_gate=_broker_mutation,
                         exit_lock=_exit_lock,

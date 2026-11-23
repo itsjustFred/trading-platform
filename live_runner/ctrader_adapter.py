@@ -5034,12 +5034,21 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """Public provenance read for the flip manager's first-sight bind (#168).
 
         Reuses the broker-close attribution path: exactly one persisted
-        opening signal may claim the position. Zero (manual position,
-        foreign order) and several (ambiguous book) both prove nothing.
+        opening signal may claim the position. ``None`` means proven
+        foreign/ambiguous - the broker read the position's orders and none
+        (or several) resolve to a persisted signal. An UNREADABLE order list
+        raises ``CTraderApiError`` instead: the caller retries a transient
+        read failure rather than treating it as proven foreign ownership.
         """
-        signal_id, _cause = await self._resolve_position_parent_signal(
+        signal_id, cause = await self._resolve_position_parent_signal(
             int(position_id)
         )
+        if cause == "position_orders_unreadable":
+            raise CTraderApiError(
+                "ORDER_LIST_UNREADABLE",
+                f"cTrader position orders for position {position_id} are "
+                "unreadable; provenance cannot be proven this pass",
+            )
         return signal_id
 
     @staticmethod

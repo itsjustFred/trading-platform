@@ -589,7 +589,7 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     # The internal strategy loop runs forever by design; like the other
     # gather members it must be stubbed for run_daemon to reach shutdown.
     monkeypatch.setattr(daemon, "run_internal_strategy_loop", _noop_loop)
-    monkeypatch.setattr(daemon, "run_supertrend_flip_loop", _noop_loop)
+    monkeypatch.setattr(daemon, "run_flip_workflow_loop", _noop_loop)
 
     monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_loop)
 
