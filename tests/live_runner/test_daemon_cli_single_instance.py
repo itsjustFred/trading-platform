@@ -406,6 +406,8 @@ def _stub_the_daemons_loops(monkeypatch: Any, adapter: _StreamAdapterStub) -> No
     monkeypatch.setattr(daemon, "_poll_balances", _idle_loop)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _idle_loop)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _idle_loop)
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _idle_loop)
+    monkeypatch.setattr(daemon, "run_internal_strategy_loop", _idle_loop)
 
 
 class TestShutdownJoin:

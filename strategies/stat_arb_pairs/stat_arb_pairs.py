@@ -27,7 +27,8 @@ STRATEGY_META = {
         "Reversion), nicht auf einem Spread zwischen zwei Instrumenten.\n"
         "- Long-only; keine Market-Neutral-Absicherung.\n"
         "- 1.3.0: Z-Score-Ausstiege sind Market-Exits ohne exit_price=close "
-        "(Fill am naechsten Open); der ATR-Stop bleibt ein explizites Level.\n"
+        "(Fill am naechsten Open); das Stop-Level reist in sl_price "
+        "(exit-bar exit_price ist nur mit exit_order_type='level' ein Level).\n"
         "- Quellen-Schwellen exakt: Lookback 60, Entry |z| >= 2.0, "
         "Mean-Reversion-Exit bei z >= -0.5, statistischer Fail-Stop bei "
         "z <= -4.0 (stop_zscore der Quelle).\n"
@@ -98,9 +99,11 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
             zscore_stop_hit = z_value <= -stop_zscore
             if stop_hit or mean_reversion_hit or zscore_stop_hit:
                 exits.iloc[i] = True
-                # Only the ATR stop is a price LEVEL (explicit exit_price). The
-                # z-score exits are close-triggered MARKET exits: no explicit
-                # exit_price, so they fill at the next bar's open.
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The z-score exits are close-triggered MARKET exits:
+                # no explicit exit_price, so they fill at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"

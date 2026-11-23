@@ -22,8 +22,9 @@ STRATEGY_META = {
         "Originals; diese Strategie handelt ein einzelnes Instrument "
         "long/flat mit Volatilitaets-Regime- und SMA-Trendfilter.\n"
         "- 1.2.0: Regime- und Trend-Ausstiege sind Market-Exits ohne "
-        "exit_price=close (Fill am naechsten Open); der ATR-Stop bleibt ein "
-        "explizites Level.\n"
+        "exit_price=close (Fill am naechsten Open); das ATR-Stop-Level "
+        "reist in sl_price (exit-bar exit_price ist nur mit "
+        "exit_order_type='level' ein Level).\n"
         "- Die echte Multi-Asset-Risk-Parity-Gewichtung liegt in "
         "scripts/run_risk_parity_backtest.py (QuantConnect-Reimplementierung) "
         "und runner/risk_parity_optimizer.py."
@@ -103,9 +104,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
             trend_break = not bool(uptrend.iloc[i])
             if stop_hit or regime_break or trend_break:
                 exits.iloc[i] = True
-                # Only the ATR stop is a price LEVEL (explicit exit_price). The
-                # regime / trend breaks are close-triggered MARKET exits: no
-                # explicit exit_price, so they fill at the next bar's open.
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The regime / trend breaks are close-triggered MARKET
+                # exits: no explicit exit_price, so they fill at the next
+                # bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
