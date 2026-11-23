@@ -126,14 +126,16 @@ def _validate(stem: str, frame: pd.DataFrame, ohlc: bool) -> None:
         raise FixtureValidationError(
             f"{stem}: bad columns {list(frame.columns)}"
         )
+    # Missing data is a download failure (exit 3), not a contract violation:
+    # the source simply did not deliver the window.
     if len(frame) != want_rows:
-        raise FixtureValidationError(
+        raise FixtureDownloadError(
             f"{stem}: {len(frame)} rows, expected exactly {want_rows}"
         )
     first = str(frame["timestamp"].iloc[0])[:10]
     last = str(frame["timestamp"].iloc[-1])[:10]
     if first != want_first or last != want_last:
-        raise FixtureValidationError(
+        raise FixtureDownloadError(
             f"{stem}: window {first}..{last} does not cover "
             f"{want_first}..{want_last}"
         )
