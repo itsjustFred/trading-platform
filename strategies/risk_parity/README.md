@@ -26,6 +26,8 @@ Vollausstieg bei einem von drei Events:
 2. Regimebruch: Volatilitaet steigt ueber die Calm-Regime-Schwelle.
 3. Trendbruch: `close < SMA(100)`.
 
+**Fill-Konvention (Version 1.2.0):** Marktausstiege auf Close-Basis (Regime- und Trendbruch) tragen kein `exit_price` mehr (kein Close-Fill) und fuellen am naechsten Bar-Open (`signal_exit_fill="next_open"`). Das ATR-Stop-Level reist in `sl_price` (der protective Stop fuellt es); das `exit_price` der Exit-Bar ist nur mit `exit_order_type="level"` ein Level (wird hier nicht gesetzt).
+
 ### Stop-Loss
 Retrofit fuer den Agent-Standard: ATR-basierter Schutzstop beim Entry.
 Formel: `sl_price = entry_close - ATR(14) * 2.0`.

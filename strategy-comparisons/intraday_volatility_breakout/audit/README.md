@@ -60,7 +60,7 @@ SL-Exits centgenau, Lots exakt, Time-Exits = 22:55-Open (+Spread bei SHORT).
    `spread_price_col` (LONG ask/SHORT bid, opt-in) + Tests.
 5. **Lots aus |Fill−SL** statt MT5-ATR-Distanz → `stop_distance`-Sizing + Tests.
 6. **Time-Exits füllten per Bar-Close** statt First-Tick (Bar-Open) →
-   `signal_exit_fill=open` (opt-in, SHORT-Close +Spread) + Tests.
+   `signal_exit_fill=open` (opt-in, SHORT-Close +Spread; **seit Issue #153 entfernt**, s. u.) + Tests.
 7. **03-20-Ersttag-Trades fehlen** (je ~+$861): Regime braucht Vortag, CSV beginnt
    dort — Datenlimit, kein Fix möglich.
 8. Nicht replizierbar: MT5-Tick-Rundung (sub-tick), EUR-Stale-Rates aus
@@ -75,10 +75,13 @@ kein Fixed-Risk — für diesen EA ungeeignet; 7 s vs. ~110 s Laufzeit).
 
 Der Owner-Entscheid vom 2026-11-13 lässt Signal-Exits standardmäßig zum **nächsten**
 Bar-Open füllen (wie Entries). Der MT5-Time-Exit füllt aber am ersten Tick der
-Exit-Minute = Open der Signal-Bar selbst (22:55). Die MT5-Parity-Läufe müssen deshalb
-weiterhin `signal_exit_fill='open'` setzen (Config oben, unverändert, ergibt identische
-Ergebnisse); mit dem neuen Default liegen die Time-Exits genau eine Bar (M1: eine Minute)
-zu spät (Exit-Preis-Treffer auf den Audit-Fenstern 6→0 bzw. 3→0).
+Exit-Minute = Open der Signal-Bar selbst (22:55). `signal_exit_fill='open'` wurde
+entfernt (#153): die Strategie signalisiert den Time-Exit seit #209 auf der ersten
+Bar, deren Ende die Exit-Zeit erreicht, sodass der `next_open`-Default (und
+`run_native_window.py` ohne `--signal-exit-fill`-Override) genau am MT5-Fill-Open
+füllt. Ältere Läufe mit `'open'` entsprachen demselben Fill; mit dem Default liegen
+die Time-Exits ohne die vorverlegte Exit-Signalation eine Bar zu spät (Exit-Preis-Treffer
+auf den Audit-Fenstern 6→0 bzw. 3→0).
 
 ## Volle Historie 2018–2026: ATR-Glättung, D1-Bars, Broker-Uhr
 
@@ -187,7 +190,7 @@ des neuen Server-Tages statt auf der „letzten Bar des Tages“ (kein Look-ahea
 `run_native_window.py` (dieses Verzeichnis) reproduziert die Platform-Läufe oben mit der
 nativen Engine auf den MT5-M1-CSVs (MT5-ATR aus dem EA-Log injiziert, Fixed-Risk-Sizing,
 Spread-Modell; `.venv/bin/python strategy-comparisons/intraday_volatility_breakout/audit/run_native_window.py
---ref-dir <parse_mt5_reference-Output> [--signal-exit-fill open] [--strategy-file <alte Version>]`,
+--ref-dir <parse_mt5_reference-Output> [--signal-exit-fill next_open|close] [--strategy-file <alte Version>]`,
 ca. 4 min je Symbol). Gemessen 2026-11-13 – Treffer unter den gematchten Trades (Server-Tag +
 Richtung), Exit-Minute / Exit-Preis (Toleranz 1e-6) gleich wie MT5:
 
@@ -197,6 +200,11 @@ Richtung), Exit-Minute / Exit-Preis (Toleranz 1e-6) gleich wie MT5:
 | Strategie 1.1.0, Default `next_open` (Regression) | 4 / 0 | 2 / 0 | 5 / 0 |
 | Strategie 1.2.0, Default `next_open` | **7 / 3** | **9 / 7** | **11 / 6** |
 | Strategie 1.2.0, Legacy `'open'` (jetzt eine Bar zu früh) | 4 / 0 | 2 / 0 | 5 / 0 |
+
+`signal_exit_fill='open'` ist seit Issue #153 entfernt (Config-Validierung und alle Engines
+brechen mit Migrationshinweis ab): ein Exit, der aus Bar *N* berechnet wird, darf nicht zum
+Open derselben Bar *N* gefüllt werden (Look-ahead). Die Zeilen mit `'open'` sind historische
+Messungen und mit der aktuellen Engine nicht mehr reproduzierbar.
 
 (Zahlenpaare = gleiche Exit-Minute / gleicher Exit-Preis; Entries, Lots und PnL-Diffs
 der 1.2.0-Läufe sind identisch zur bisherigen Config: 7/9/13 gematcht, 7/9/13 gleiche

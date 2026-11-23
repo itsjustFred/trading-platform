@@ -196,9 +196,14 @@ conformance tests).
 A-M1/D4 "Fill-zum-Trigger-Close").** A signal exit (not a protective level
 exit) fills at the **next bar's open**, exactly like an entry: a signal on bar
 *N* exits at bar *N+1*'s open. `BacktestConfig.signal_exit_fill` is validated to
-`next_open` (default) / `close` / `open`; the last two are explicit legacy
-opt-ins that fill on the *signal bar itself* (its close / its open — `open`
-serves MT5 clock exits whose signal bar *is* the exit minute).
+`next_open` (default) / `close`; `close` is an explicit legacy opt-in that fills
+on the *signal bar itself* (its close). The former `open` mode (fill at the
+signal bar's own open) was **removed** (issue #153): an exit computed from bar
+*N* cannot be filled at bar *N*'s open without lookahead, and its only
+legitimate use (MT5 clock exits) is served by raising the signal one bar early
+under `next_open` (e.g. `intraday_volatility_breakout` 1.2.0). `BacktestConfig`
+validation rejects `open` with a `ValueError` carrying that migration message
+(`contract.normalize_signal_exit_fill`).
 
 Per engine (ADR `docs/adr/0001-native-single-strategy-engine.md` — only native
 is under active development):
@@ -213,7 +218,8 @@ is under active development):
   engines get fail-loud guards, not silent re-interpretation. Entry points
   that select a frozen engine declare the legacy `close` fill explicitly
   (`contract.default_signal_exit_fill_for_engine`), so the persisted meta
-  records the model actually simulated; explicit `close`/`open` keep working.
+  records the model actually simulated; explicit `close` keeps working and
+  the removed `open` mode fails loudly via `normalize_signal_exit_fill`.
 - **Clock exits (strategy authors).** A strategy that must be flat *at* a clock time
   T (end-of-day flatten, session close, forced exit) raises its exit signal on the
   bar BEFORE the one that opens at T - the first bar whose end reaches T - so the
@@ -596,7 +602,7 @@ behavior**, not a bug to be fixed by silently changing one engine:
 | Engine | Model | Meaning |
 |---|---|---|
 | native | next-bar-open | Signal on bar *N* — entry **and** market signal exit — fills at bar *N+1* open (2026-11-13); protective exits evaluated per bar, filling at the level on a touch and at the open on a gap. `exit_order_type="level"` exits fill at their level on the signal bar (§2). |
-| vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar fill (`close`, or `open` opt-in); a `next_open` config is refused outright (§2). Protective exits fill at the level on a touch (no gap→open rule; frozen). |
+| vectorbt (frozen) | next-bar-open entries / signal-bar-close exits | Entries fill at bar *N+1* open; signal exits keep the legacy trigger-bar `close` fill — `next_open` is refused outright and the `open` mode was removed (§2). Protective exits fill at the level on a touch and at the open on a gap-through-level (§2); frozen otherwise. |
 | signal-replay | same-bar-close | External signal payloads fill at the signal bar's close (entries and signal exits alike); slippage/delay recorded in `trade.meta`. Protective exits fill at the level on a touch and at the open on a gap. The `supertrend_flip` leg is the exception: it fills at the next bar's open (see below). |
 | pynecore | post-hoc restatement | Pine execution produces exit prices that are then *recontained* to the recorded protective levels. |
 
@@ -634,13 +640,12 @@ no gap→open restatement):
 Since A-H4 (D3) the adapter additionally runs `_apply_fill_parity` before
 sizing: non-level exit legs (signal/time exits) are re-priced to the fill
 convention the other engines use — the configured `signal_exit_fill`
-(`close`: the recorded leg bar's close; `open`: that bar's open — the
-Pine ledger stamps legs on the fill bar itself; `next_open` is refused on
-this frozen engine) — when the recorded Pine price disagrees with that
-convention. Level exits (`stop_loss`/`take_profit`) keep their recorded
-price. This re-pricing is a documented divergence from the raw Pine ledger,
-applied so cross-engine comparisons measure strategy edge instead of engine
-artifacts.
+(`close`: the recorded leg bar's close — the only mode this frozen adapter
+accepts; `next_open` is refused and the `open` mode was removed, #153) —
+when the recorded Pine price disagrees with that convention. Level exits
+(`stop_loss`/`take_profit`) keep their recorded price. This re-pricing is a
+documented divergence from the raw Pine ledger, applied so cross-engine
+comparisons measure strategy edge instead of engine artifacts.
 
 The restatement never invents prices beyond the recorded levels and never
 rewrites entry legs. Conformance tests pin the containment as a property:
