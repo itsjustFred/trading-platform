@@ -99,6 +99,9 @@ def _vectorbt_result(tmp_path: Path, frame: pd.DataFrame, strategy_text: str, **
         "modeling_resolution": "main_timeframe",
         "data_dir": str(tmp_path),
         "parameters": {},
+        # Frozen engine: next_open is refused; declare the legacy close fill
+        # the adapter actually simulates (overridable via config_kwargs).
+        "signal_exit_fill": "close",
     }
     payload.update(config_kwargs)
     return VectorbtAdapter().run(BacktestConfig(**with_zero_fees(payload)), strategy_path)
@@ -126,7 +129,7 @@ class TestSignalExitConvention:
     def test_exit_fill_convention_per_engine(self, tmp_path: Path):
         # Owner decision 2026-11-13: the native engine fills a signal exit at
         # the NEXT bar's open; the frozen vectorbt adapter keeps its documented
-        # signal-bar close fill (next_open is mapped to close with a warning).
+        # signal-bar close fill (next_open is refused on the frozen engine).
         frame = _frame()
         text = _strategy_text(entry_bar=2, exit_bar=7)
         strategy_fn = _load_strategy_fn(text, tmp_path, "contract_exit")
@@ -560,6 +563,7 @@ def generate_signals(df, params):
             "modeling_resolution": "5m",
             "data_dir": str(tmp_path),
             "parameters": {},
+            "signal_exit_fill": "close",
         }
         result = VectorbtAdapter().run(
             BacktestConfig(**with_zero_fees(payload)), strategy_path
@@ -908,6 +912,7 @@ class TestSharedEquity:
             modeling_resolution="main_timeframe",
             data_dir=str(tmp_path),
             parameters={"fees": "zero", "slippage": "none"},
+            signal_exit_fill="close",
         )
         result = VectorbtAdapter().run(config, strategy_path)
         assert len(result.trades) == 2

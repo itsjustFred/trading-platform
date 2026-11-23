@@ -115,11 +115,9 @@ def _apply_fill_parity(
       column is configured AND the entry bar is locatable — otherwise the
       engine price stands (default off = unchanged behavior).
     - Non-level exits (anything but stop_loss/take_profit/trailing_stop)
-      follow ``signal_exit_fill``: "close" fills at the exit bar's close,
-      "open" and "next_open" at its open (the ledger leg is stamped on
-      Pine's fill bar, so next_open prices that bar's open); SHORT
-      open-exits pay the spread (ask). Level exits keep the engine price
-      (stop-market fills at the level).
+      follow ``signal_exit_fill``: "close" (default) fills at the exit bar's
+      close, "open" at its open; SHORT open-exits pay the spread (ask).
+      Level exits keep the engine price (stop-market fills at the level).
     - Touched legs get their pnl recomputed from the new prices so
       trade.pnl stays consistent ahead of risk sizing.
 
@@ -131,14 +129,7 @@ def _apply_fill_parity(
     """
     if not trades or df is None or df.empty or "timestamp" not in df.columns:
         return
-    # "next_open" prices the leg bar's open: PyneCore stamps the ledger leg
-    # on the fill bar itself, so the next bar's open IS that bar's open. The
-    # adapter maps next_open to "close" before this runs (frozen engine), so
-    # production never passes it; handling it here keeps the helper total
-    # over the documented enum.
-    fill_at_open = str(
-        getattr(config, "signal_exit_fill", "close") or "close"
-    ).lower() in {"open", "next_open"}
+    fill_at_open = str(getattr(config, "signal_exit_fill", "close") or "close").lower() == "open"
     timestamp_series = df["timestamp"]
     for trade in trades:
         entry_idx = _locate_trade_bar(timestamp_series, trade.entry_time)
@@ -252,20 +243,23 @@ def _pyne_cli_start_bound(start_date: str) -> str:
 
 
 def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
-    """Map the native-only ``next_open`` exit model onto this frozen adapter's
-    documented signal-bar fill (ADR ``docs/adr/0001-native-single-strategy-engine.md``:
-    frozen engines keep their existing semantics until removal). Without this a
-    default ``next_open`` run would silently simulate the legacy ``close`` fill
-    while the persisted meta claimed otherwise.
+    """Refuse the native-only ``next_open`` exit model on this frozen adapter.
+
+    ADR ``docs/adr/0001-native-single-strategy-engine.md``: frozen engines
+    keep their existing semantics until removal and get fail-loud guards, not
+    silent re-interpretation. ``next_open`` is the native default, so a
+    ``BacktestConfig`` that never touched the field would otherwise simulate
+    the legacy signal-bar fill while the persisted meta claimed otherwise —
+    refuse instead of warn-and-run.
     """
     mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
-    if mode != "next_open":
-        return config
-    logger.warning(
-        "frozen engine does not implement signal_exit_fill='next_open'; "
-        "running with the legacy 'close' signal-exit fill instead"
-    )
-    return config.model_copy(update={"signal_exit_fill": "close"})
+    if mode == "next_open":
+        raise ValueError(
+            "engine 'pynecore' does not implement signal_exit_fill='next_open'; "
+            "frozen engines keep their legacy signal-bar fill — pass "
+            "signal_exit_fill='close' or 'open' explicitly, or run the native engine"
+        )
+    return config
 
 
 class PyneCoreAdapter(EngineAdapter):
@@ -411,7 +405,7 @@ class PyneCoreAdapter(EngineAdapter):
                 trades = _parse_trade_csv(trade_csv, symbol, trade_counter)
                 if trade_context:
                     _enrich_trades_with_context(trades, trade_context, df)
-                _normalize_trade_exits(trades, df)
+                _normalize_trade_exits(trades)
                 # A-H4 (D3): warmup gate + fill parity before sizing so the
                 # resized quantities/pnl build on parity prices.
                 trades = _gate_warmup_trades(trades, config)
@@ -1104,29 +1098,7 @@ def _infer_asset_class(data_root: Path, symbol: str, timeframe: str) -> str:
         return "unknown"
 
 
-def _exit_bar_open(df: pd.DataFrame | None, leg_time: str) -> float | None:
-    """Open of the bar a ledger exit leg is stamped on (None when unlocatable)."""
-    if df is None or df.empty or "timestamp" not in df.columns or "open" not in df.columns:
-        return None
-    idx = _locate_trade_bar(df["timestamp"], leg_time)
-    if idx is None:
-        return None
-    try:
-        value = float(df.iloc[idx]["open"])
-    except (TypeError, ValueError):
-        return None
-    return value if math.isfinite(value) else None
-
-
-def _normalize_trade_exits(trades: list[Trade], df: pd.DataFrame | None = None) -> None:
-    """Contain level-violating exit legs at the recorded protective level.
-
-    Owner decision 2026-11-13: the containment price is the level, EXCEPT when
-    the exit bar OPENS beyond the level (a gap) - then the restated price is that
-    bar's open, the price actually available (Pine's own broker emulator fills
-    gaps at the open as well). ``df`` supplies the exit bar; without it (or
-    without a locatable bar) the level is used.
-    """
+def _normalize_trade_exits(trades: list[Trade]) -> None:
     for trade in trades:
         _validate_trade_exit_order(trade)
         if not trade.exits or not trade.meta:
@@ -1141,37 +1113,19 @@ def _normalize_trade_exits(trades: list[Trade], df: pd.DataFrame | None = None) 
             trade.meta.get("tp_price", trade.meta.get("initial_tp")),
         )
         exit_leg = trade.exits[-1]
-        bar_open = _exit_bar_open(df, exit_leg.time)
-
-        def _restated(
-            level: float,
-            kind: str,
-            *,
-            _open: float | None = bar_open,
-            _direction: str = trade.direction,
-        ) -> float:
-            if _open is None:
-                return round(level, 6)
-            return round(
-                contract.level_fill_price(
-                    direction=_direction, kind=kind, level=level, bar_open=_open
-                ),
-                6,
-            )
-
         if trade.direction == "LONG":
             if sl_price is not None and exit_leg.price < float(sl_price):
-                exit_leg.price = _restated(float(sl_price), "stop")
+                exit_leg.price = round(float(sl_price), 6)
                 exit_leg.reason = "stop_loss"
             elif tp_price is not None and exit_leg.price > float(tp_price):
-                exit_leg.price = _restated(float(tp_price), "tp")
+                exit_leg.price = round(float(tp_price), 6)
                 exit_leg.reason = "take_profit"
         else:
             if sl_price is not None and exit_leg.price > float(sl_price):
-                exit_leg.price = _restated(float(sl_price), "stop")
+                exit_leg.price = round(float(sl_price), 6)
                 exit_leg.reason = "stop_loss"
             elif tp_price is not None and exit_leg.price < float(tp_price):
-                exit_leg.price = _restated(float(tp_price), "tp")
+                exit_leg.price = round(float(tp_price), 6)
                 exit_leg.reason = "take_profit"
 
 
