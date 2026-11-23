@@ -1,0 +1,21 @@
+tests/test_gate_tests_harness.py
+  s_c2e002ad5c57b9::t_f9cf8fe714d2da 21,185-208
+scripts/gate-tests.sh
+  s_c2e002ad5c57b9::t_43d279a9795817 105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3239cfd56583a430cc1a6a0e775ed10e7bad58fb",
+  "prompts": {},
+  "sessions": {
+    "s_c2e002ad5c57b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed071e3d-0fde-4b88-a409-4abf5dd3d6ee",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
