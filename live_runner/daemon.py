@@ -154,6 +154,10 @@ from live_runner.stockkit_routing import (
     resolve_deployment_stockkit_route,
     validate_stockkit_deployment_route,
 )
+from live_runner.supertrend_flip import (
+    LiveSupertrendFlipManager,
+    run_supertrend_flip_loop,
+)
 from live_runner.trailing_stops import (
     LiveTrailingStopManager,
     adapter_live_trailing_modes,
@@ -7217,6 +7221,21 @@ async def _run_daemon_locked(
                 ),
                 name="trailing-stops-loop",
             )
+            # #168: the live supertrend_flip workflow. The loop runs
+            # unconditionally but manages nothing unless a deployment carries
+            # the explicit settings opt-in (default off) AND its account's
+            # adapter is a demo/paper cTrader - the manager re-checks both, so
+            # this wiring cannot turn the mode on by itself.
+            flip_task = asyncio.create_task(
+                run_supertrend_flip_loop(
+                    LiveSupertrendFlipManager(mutation_gate=_broker_mutation),
+                    eligible_adapters=lambda: _trailing_eligible_adapters(
+                        active_adapters
+                    ),
+                    current_deployments=lambda: list(deployment_snapshot),
+                ),
+                name="supertrend-flip-loop",
+            )
             commission_task = asyncio.create_task(
                 _backfill_commissions_loop(active_adapters), name="commission-backfill"
             )
@@ -7243,6 +7262,7 @@ async def _run_daemon_locked(
                 service_sync_task,
                 balance_task,
                 trailing_task,
+                flip_task,
                 commission_task,
                 reconciliation_task,
                 internal_strategy_task,

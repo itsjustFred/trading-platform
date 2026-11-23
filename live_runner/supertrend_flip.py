@@ -161,6 +161,42 @@ _FLIP_SIGNAL_NAMESPACE = uuid.uuid5(
 
 EntrySignalLoader = Callable[[list[str], list[str]], dict[str, dict[str, Any]]]
 
+#: Deployment ``settings`` key opting a deployment into the live
+#: ``supertrend_flip`` workflow (#168). Absent or false means the daemon's
+#: flip loop never touches the deployment's positions, whatever its entry
+#: signals carry: the opt-in is explicit and defaults off. Declaring
+#: ``supports_stop_amendment`` on an adapter is NOT the opt-in - cTrader has
+#: had that capability for the percent-trailing groundwork since #167.
+FLIP_DEPLOYMENT_OPT_IN_KEY = "live_supertrend_flip"
+
+#: Broker names the workflow may run against today. cTrader only: it is the
+#: adapter with native partial closes and in-place stop amendment wired for
+#: this workflow. Alpaca stays out until #350's paper run passes, so an
+#: opted-in Alpaca deployment is simply never managed.
+FLIP_SUPPORTED_BROKERS = frozenset({"ctrader"})
+
+_TRUE_OPT_IN_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+
+def deployment_supertrend_flip_enabled(
+    deployment: LiveDeploymentConfig,
+) -> bool:
+    """Whether this deployment opted into the live flip workflow.
+
+    Only an explicit truthy value enables it; every other value - absent,
+    false, blank, or an unrecognized token - is off, so a typo fails closed
+    (the workflow does not run) rather than half-enabling it.
+    """
+    settings = getattr(deployment, "settings", None)
+    if not isinstance(settings, Mapping):
+        return False
+    value = settings.get(FLIP_DEPLOYMENT_OPT_IN_KEY)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _TRUE_OPT_IN_TOKENS
+
 
 def _flip_signal_id(
     kind: str, entry_signal_id: str, *, event: str = "", attempt: int = 0
@@ -357,13 +393,18 @@ class LiveSupertrendFlipManager:
             status = str(deployment.status or "").strip().upper()
             # PAUSED still manages its open positions: every workflow action is
             # a close or a protective amendment, which a pause allows (#126).
-            if status in {"ACTIVE", "PAUSED"}:
+            # The settings opt-in is the other half of "explicit": without it
+            # the deployment's flip signals are nobody's workflow.
+            if status in {"ACTIVE", "PAUSED"} and deployment_supertrend_flip_enabled(
+                deployment
+            ):
                 managed_by_account.setdefault(deployment.account_id, []).append(deployment)
 
         eligible = {
             account_id: adapter
             for account_id, adapter in adapters.items()
             if account_id in managed_by_account
+            and getattr(adapter, "broker_name", "") in FLIP_SUPPORTED_BROKERS
             and getattr(adapter, "supports_stop_amendment", False) is True
         }
         gone = (set(self._schedules) | {key[0] for key in self._workflows}) - set(

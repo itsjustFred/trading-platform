@@ -26,7 +26,6 @@ from live_runner.base_adapter import (
 )
 from live_runner.supertrend_flip import (
     FLIP_STATE_METADATA_KEY,
-    PHASE_ACTIVE,
     PHASE_AWAIT_GREEN,
     PHASE_BEFORE_TP1,
     PHASE_EXIT_PENDING,
@@ -182,9 +181,17 @@ class _FakeFlipAdapter(BaseLiveAdapter):
 class _Live:
     """One cTrader account with a long EURUSD flip position."""
 
-    def __init__(self, database, *, status: str = "ACTIVE", qty: float = POSITION_QTY) -> None:
+    def __init__(
+        self,
+        database,
+        *,
+        status: str = "ACTIVE",
+        qty: float = POSITION_QTY,
+        opt_in: bool = True,
+    ) -> None:
         self.database = database
         database.ensure_live_account(ACCOUNT, "ctrader")
+        settings = {"live_supertrend_flip": True} if opt_in else {}
         self.deployment = LiveDeploymentConfig(
             id=uuid4(),
             strategy_name="flip-probe",
@@ -193,6 +200,7 @@ class _Live:
             timeframe="1m",
             status=status,
             signal_source="internal",
+            settings=settings,
         )
         database.create_live_deployment(self.deployment)
         self.adapter = _FakeFlipAdapter()
@@ -634,6 +642,64 @@ def test_alpaca_adapter_is_never_eligible(live: _Live) -> None:
     adapter.positions = [dict(row) for row in live.adapter.positions]
     manager = LiveSupertrendFlipManager()
     live.adapter.bid = 106.0
+
+    live.tick(manager, _at(0.2), adapter=adapter)
+    assert adapter.orders == []
+
+
+# ── deployment opt-in and broker gate (#168 stage 4) ─────────────────────────
+
+
+def test_opt_in_is_off_by_default(isolated_db, monkeypatch) -> None:
+    """A flip entry signal alone never enables the workflow: the deployment
+    must carry the explicit settings opt-in."""
+    database, _engine, _data_dir = isolated_db
+    monkeypatch.setattr(flip_module, "calculate_supertrend", _green_red_supertrend)
+    plain = _Live(database, opt_in=False)
+    manager = LiveSupertrendFlipManager()
+    plain.adapter.bid = 106.0
+    _feed_bars(plain, [(1.0, 100.0, 101.0), (2.0, 101.0, 99.0)])
+
+    plain.tick(manager, _at(0.2))
+    plain.tick(manager, _at(3.1))
+    assert plain.adapter.orders == []
+    assert plain.state() == {}
+
+
+def test_explicit_opt_in_values_enable_the_workflow(isolated_db, monkeypatch) -> None:
+    database, _engine, _data_dir = isolated_db
+    monkeypatch.setattr(flip_module, "calculate_supertrend", _green_red_supertrend)
+    for value in (True, "true", "1", "yes", "on"):
+        opted = _Live(database, opt_in=False)
+        opted.deployment.settings = {"live_supertrend_flip": value}
+        manager = LiveSupertrendFlipManager()
+        opted.adapter.bid = 106.0
+        opted.tick(manager, _at(0.2), deployments=[opted.deployment])
+        assert len(opted.adapter.orders) == 1, f"opt-in value {value!r} did not enable TP1"
+
+
+def test_unrecognized_opt_in_value_stays_off(isolated_db, monkeypatch) -> None:
+    database, _engine, _data_dir = isolated_db
+    monkeypatch.setattr(flip_module, "calculate_supertrend", _green_red_supertrend)
+    typo = _Live(database, opt_in=False)
+    typo.deployment.settings = {"live_supertrend_flip": "treu"}
+    manager = LiveSupertrendFlipManager()
+    typo.adapter.bid = 106.0
+
+    typo.tick(manager, _at(0.2), deployments=[typo.deployment])
+    assert typo.adapter.orders == []
+
+
+def test_alpaca_broker_is_outside_the_supported_set(live: _Live) -> None:
+    """Even fully opted in, a non-cTrader adapter is never managed: Alpaca's
+    route waits on #350's paper run."""
+
+    class _AlpacaLikeAdapter(_FakeFlipAdapter):
+        broker_name = "alpaca"
+
+    adapter = _AlpacaLikeAdapter()
+    adapter.positions = [dict(row) for row in live.adapter.positions]
+    manager = LiveSupertrendFlipManager()
 
     live.tick(manager, _at(0.2), adapter=adapter)
     assert adapter.orders == []
