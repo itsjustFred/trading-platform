@@ -76,6 +76,10 @@ class NotionalFeeModel:
     flat_per_trade: float = 0.0
 
     def __post_init__(self) -> None:
+        if isinstance(self.rate, bool) or isinstance(self.flat_per_trade, bool):
+            raise ValueError(
+                "Fee rate and flat surcharge must be finite and non-negative."
+            )
         try:
             rate = float(self.rate)
             flat = float(self.flat_per_trade)
@@ -132,9 +136,15 @@ def resolve_fee_model(params: dict[str, Any] | None) -> FeeModel:
             )
         return model
     if "fee_rate" in params or "fee_flat_per_trade" in params:
+        rate_value = params.get("fee_rate", 0.0)
+        flat_value = params.get("fee_flat_per_trade", 0.0)
+        if isinstance(rate_value, bool) or isinstance(flat_value, bool):
+            raise ValueError(
+                "Fee rate and flat surcharge must be finite and non-negative."
+            )
         try:
-            rate = float(params.get("fee_rate", 0.0) or 0.0)
-            flat = float(params.get("fee_flat_per_trade", 0.0) or 0.0)
+            rate = float(rate_value or 0.0)
+            flat = float(flat_value or 0.0)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid fee params: {exc}") from exc
         return NotionalFeeModel(rate=rate, flat_per_trade=flat)
