@@ -1,0 +1,29 @@
+tests/test_viewer_path_containment.py
+  s_d1ffe93eefbbb4::t_687155fa9bef32 555-705
+viewer/main.py
+  s_2bf89379757a94::t_cdd7438f49628e 15,12951-12974
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e8cfe42476691af906dec832560f0a428a83b558",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_d1ffe93eefbbb4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "de0fced8-a35e-419b-9595-dbcd49507893",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
