@@ -67,6 +67,11 @@ logs/
 # by `python -m scripts.fetch_differential_slice` cannot be committed by accident.
 tests/fixtures/differential/eurusd_15m_slice.csv
 
+# Committed parity fixtures: small (<1 MB each) trade lists the native engine is asserted
+# against (docs/reports/parity-reference-libraries.md). Market *data* stays out of the repo.
+!tests/parity/fixtures/*.csv
+!tests/parity/fixtures/*.json
+
 # Node
 node_modules/
 
