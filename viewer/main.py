@@ -12837,26 +12837,13 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     normalized_portfolio["name"] = updated_name
 
     # Resolve and containment-check before the DB write so an unsafe id
-    # cannot half-apply. The guards are inlined at the write sink on the
-    # exact variable the path is built from — the id must fullmatch the
-    # safe-segment whitelist (the same pattern _safe_asset_id applies) and
-    # may not be a dot-segment, symlinks are refused, and the resolved
-    # candidate must be a direct child of the resolved base — so the taint
-    # analyser sees the sanitiser on the path that is written.
-    normalized_id = str(portfolio_id or "").strip()
-    portfolios_base = PORTFOLIOS_DIR.resolve()
-    if (
-        not re.fullmatch(r"[A-Za-z0-9._-]+", normalized_id)
-        or normalized_id in {".", ".."}
-        or "/" in normalized_id
-        or "\\" in normalized_id
-    ):
-        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
-    raw_output_path = PORTFOLIOS_DIR / os.path.basename(f"{normalized_id}.json")
-    if raw_output_path.is_symlink():
-        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
-    output_path = raw_output_path.resolve()
-    if output_path.parent != portfolios_base:
+    # cannot half-apply — the same ordering as create_portfolio. The
+    # shared helper is the single implementation of the id→path
+    # containment contract (#344); SonarCloud's S2083 on the write below
+    # is a known false positive (the flagged flow starts at the read in
+    # _load_portfolio_payload, which this same helper already contained).
+    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if output_path is None:
         raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
 
     try:
