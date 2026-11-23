@@ -617,21 +617,22 @@ def _add_fee_flags(parser: argparse.ArgumentParser) -> None:
 
 def _fee_params_from_args(args) -> dict:
     """Merge CLI fee flags into engine params, failing closed (#84)."""
-    params: dict = {}
+    raw: dict = {}
     if getattr(args, "fee_rate", None) is not None:
-        params["fee_rate"] = float(args.fee_rate)
+        raw["fee_rate"] = args.fee_rate
     if getattr(args, "fee_flat_per_trade", None) is not None:
-        params["fee_flat_per_trade"] = float(args.fee_flat_per_trade)
+        raw["fee_flat_per_trade"] = args.fee_flat_per_trade
     if getattr(args, "fees_zero", False):
-        if "fee_rate" in params or "fee_flat_per_trade" in params:
+        if raw:
             raise ValueError("--fees-zero conflicts with --fee-rate/--fee-flat-per-trade")
-        params["fees"] = "zero"
-    elif params:
-        # Fail at the CLI boundary instead of letting invalid values reach a run.
-        from runner.fees import resolve_fee_model
+        return {"fees": "zero"}
+    if not raw:
+        return {}
+    # Fail at the CLI boundary instead of letting invalid values reach a run.
+    from runner.fees import resolve_fee_model
 
-        resolve_fee_model(params)
-    return params
+    resolve_fee_model(raw)
+    return {key: float(value) for key, value in raw.items()}
 
 
 def _add_slippage_flags(parser: argparse.ArgumentParser) -> None:

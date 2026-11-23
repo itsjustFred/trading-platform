@@ -200,7 +200,11 @@ class BacktestConfig(BaseModel):
     # exposure of a single position as a fraction of equity (0.05 = 5%).
     # Not an aggregate-portfolio limit and not a loss budget — those are
     # ``max_total_exposure`` (RiskConfig) and ``risk_per_trade_pct``.
-    max_position_exposure_pct: float | None = Field(None, gt=0.0, le=1.0)
+    # Values above 1 are leverage (#240): the broker maximum
+    # (``max_leverage``, 1x when unset) bounds the notional at sizing time —
+    # the native engine's MT5-style free-margin clamp (#347) — so the config
+    # itself carries no upper bound.
+    max_position_exposure_pct: float | None = Field(None, gt=0.0)
     max_leverage: float | None = Field(None, gt=0.0)
     # Fixed-risk (``fixed_risk_amount``) sizing policy (#279). The fixed-risk
     # protocol routes through RiskEngine like the pct path; these fields opt

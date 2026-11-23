@@ -42,6 +42,63 @@ def _wait_for_viewer_task(viewer_app_module, task_id: str, *, timeout: float = 5
     return viewer_app_module.DATA_TASKS[task_id]
 
 
+def _tiny_replay_ohlcv_df() -> pd.DataFrame:
+    """Three-bar 1h frame shared by the stubbed signal-replay tests."""
+    return pd.DataFrame(
+        {
+            "timestamp": [
+                "2024-01-01T12:00:00+00:00",
+                "2024-01-01T13:00:00+00:00",
+                "2024-01-01T14:00:00+00:00",
+            ],
+            "open": [100.0, 101.0, 102.0],
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.5, 101.5, 102.5],
+            "volume": [1000, 1100, 1200],
+        }
+    )
+
+
+def _completed_signal_replay_result(result_id: str, source: str) -> BacktestResult:
+    """Minimal completed replay result shared by the stubbed-adapter tests."""
+    return BacktestResult(
+        meta=BacktestMeta(
+            id=result_id,
+            created_at="2026-03-12T12:00:00Z",
+            engine="signal-replay",
+            strategies=["Signal Replay"],
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-02",
+            data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": source},
+            initial_capital=100000.0,
+            tags=["signal-replay"],
+            notes="Signal Replay",
+        ),
+        trades=[],
+        equity_curve=[],
+    )
+
+
+class _ImmediateExitProc:
+    """Popen double whose child 'exits' immediately so the fill-bar watchdog
+    thread terminates instead of blocking pytest shutdown."""
+
+    def __init__(self, lines: list[str]):
+        self.stdout = iter(lines)
+        self.pid = 4242
+        self._killed = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        self._killed = True
+
+
 def test_get_dukascopy_genesis(viewer_client, tmp_path):
     (tmp_path / "dukascopy_genesis.json").write_text(json.dumps({
         "EURUSD": {
@@ -3198,27 +3255,10 @@ def test_backtest_run_registers_task_manager_progress(viewer_client, monkeypatch
     monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
     monkeypatch.setattr(viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: [])
 
-    class _FakeProc:
-        def __init__(self, lines: list[str]):
-            self.stdout = iter(lines)
-            self.pid = 4242
-            self._killed = False
-
-        def wait(self, timeout=None):
-            return 0
-
-        def poll(self):
-            # The fake child "exits" immediately so the fill-bar watchdog
-            # thread terminates instead of blocking pytest shutdown.
-            return 0
-
-        def kill(self):
-            self._killed = True
-
     def fake_popen(cmd, *args, **kwargs):
         assert cmd[:4] == [sys.executable, "-u", "-m", "runner.cli"]
         assert "--progress-stdout" in cmd
-        return _FakeProc(
+        return _ImmediateExitProc(
             [
                 '{"message":"Auto-detected date range: 2024-01-01 to 2024-12-31"}\n',
                 "PROGRESS:5.00:Loading market data...\n",
@@ -3366,20 +3406,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
     monkeypatch.setattr(
         viewer_app_module.legacy_viewer,
         "_load_ohlcv_df",
-        lambda symbol, timeframe: pd.DataFrame(
-            {
-                "timestamp": [
-                    "2024-01-01T12:00:00+00:00",
-                    "2024-01-01T13:00:00+00:00",
-                    "2024-01-01T14:00:00+00:00",
-                ],
-                "open": [100.0, 101.0, 102.0],
-                "high": [101.0, 102.0, 103.0],
-                "low": [99.0, 100.0, 101.0],
-                "close": [100.5, 101.5, 102.5],
-                "volume": [1000, 1100, 1200],
-            }
-        ),
+        lambda symbol, timeframe: _tiny_replay_ohlcv_df(),
     )
 
     class _FakeSignalReplayAdapter:
@@ -3394,22 +3421,7 @@ def test_backtest_run_signals_registers_task_manager_progress(viewer_client, mon
             if callable(progress_callback):
                 progress_callback(50.0, "halfway")
                 progress_callback(100.0, "done")
-            return BacktestResult(
-                meta=BacktestMeta(
-                    id="signal-replay-unit",
-                    created_at="2026-03-12T12:00:00Z",
-                    engine="signal-replay",
-                    strategies=["Signal Replay"],
-                    backtest_start="2024-01-01",
-                    backtest_end="2024-01-02",
-                    data={"symbols": ["AAPL"], "timeframes": ["1h"], "source": "discord"},
-                    initial_capital=100000.0,
-                    tags=["signal-replay"],
-                    notes="Signal Replay",
-                ),
-                trades=[],
-                equity_curve=[],
-            )
+            return _completed_signal_replay_result("signal-replay-unit", "discord")
 
     monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
 
@@ -3652,16 +3664,21 @@ def test_signal_replay_fee_params_map_cli_style_flags():
         '"fee_rate": Infinity',
         '"fee_flat_per_trade": -1.0',
         '"fee_flat_per_trade": NaN',
+        '"fee_rate": true',
+        '"fee_rate": false',
+        '"fee_flat_per_trade": true',
+        '"fee_flat_per_trade": false',
     ],
 )
 def test_backtest_run_signals_rejects_negative_or_nonfinite_fee_params(
     viewer_client, fee_json
 ):
-    """#361: ``resolve_fee_model`` clamps negatives to 0.0, so a negative or
-    NaN declaration would silently become a zero-cost run — and inf would
-    produce non-finite fees. The boundary rejects them with a 400 instead.
-    NaN/Infinity are sent as raw JSON: httpx's ``json=`` refuses to emit them,
-    but Python's ``json.loads`` (and so the API) accepts the literals."""
+    """#361: negative, NaN, infinite or boolean fee declarations must be a 400 —
+    ``NotionalFeeModel``/``resolve_fee_model`` reject them, and the boundary
+    mirrors that validation instead of letting a bad request become a
+    zero-cost run or non-finite fees. NaN/Infinity are sent as raw JSON:
+    httpx's ``json=`` refuses to emit them, but Python's ``json.loads`` (and
+    so the API) accepts the literals."""
     body = (
         '{"signals": [{"timestamp": "2024-01-01T12:00:00Z", "symbol": "AAPL",'
         ' "action": "buy", "entry_price": 100.0}],'
@@ -8345,3 +8362,160 @@ def test_deduplicate_portfolios_recheck_error_skips_item_and_reports_rest(
     assert payload["skipped_ids"] == ["c"]
     assert payload["items"][1] == {"id": "c", "status": "skipped", "reason": "recheck_failed"}
     assert "c" in alive
+
+
+def _stub_signal_replay_pipeline(viewer_app_module, monkeypatch, adapter_init_kwargs):
+    """Shared stubs for run-signals tests: capture adapter kwargs, return a
+    minimal completed BacktestResult from the fake adapter."""
+    monkeypatch.setattr(
+        viewer_app_module, "_ensure_backtest_data_availability", lambda **_kwargs: []
+    )
+    monkeypatch.setattr(viewer_app_module, "_upsert_backtest_meta_cache", lambda _backtest_id: None)
+    monkeypatch.setattr(
+        viewer_app_module.legacy_viewer,
+        "_load_ohlcv_df",
+        lambda symbol, timeframe: _tiny_replay_ohlcv_df(),
+    )
+
+    class _FakeSignalReplayAdapter:
+        def __init__(self, *args, **kwargs):
+            adapter_init_kwargs.update(kwargs)
+
+        def run(self, **kwargs):
+            return _completed_signal_replay_result("signal-replay-leverage", "manual")
+
+    monkeypatch.setattr(viewer_app_module, "SignalReplayAdapter", _FakeSignalReplayAdapter)
+
+
+def _leverage_replay_payload(**overrides):
+    payload = {
+        "signals": [
+            {
+                "timestamp": "2024-01-01T12:00:00Z",
+                "symbol": "AAPL",
+                "action": "buy",
+                "entry_price": 100.0,
+                "stop_loss": 98.0,
+                "take_profit": 104.0,
+                "timeframe": "1h",
+            }
+        ],
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-02",
+        "timeframe": "1h",
+        "auto_download": False,
+        "fees_zero": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_backtest_run_signals_forwards_leverage_declarations(viewer_client, monkeypatch):
+    """#240: max_notional_per_trade / max_leverage on /api/backtests/run-signals
+    reach the SignalReplayAdapter (RiskConfig cap + max_leverage kwarg) and
+    the task's restart_config."""
+    import viewer.main as viewer_app_module
+
+    adapter_init_kwargs: dict[str, object] = {}
+    _stub_signal_replay_pipeline(viewer_app_module, monkeypatch, adapter_init_kwargs)
+
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json=_leverage_replay_payload(max_notional_per_trade=5.0, max_leverage=3.0),
+    )
+
+    assert response.status_code == 202
+    task_id = response.json()["task_id"]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
+    assert task["status"] == "completed"
+
+    assert adapter_init_kwargs["max_leverage"] == 3.0
+    assert adapter_init_kwargs["risk_config"].max_notional_per_trade == 5.0
+    restart_config = viewer_app_module.DATA_TASKS[task_id]["restart_config"]
+    assert restart_config["max_notional_per_trade"] == 5.0
+    assert restart_config["max_leverage"] == 3.0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_notional_per_trade", 0.0),
+        ("max_notional_per_trade", -1.0),
+        ("max_leverage", 0.0),
+        ("max_leverage", -2.5),
+    ],
+)
+def test_backtest_run_signals_rejects_nonpositive_leverage_fields(
+    viewer_client, field, value
+):
+    """#240: leverage declarations are validated at the boundary — a
+    non-positive or non-finite value is a 400, never a silently ignored
+    field."""
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        json=_leverage_replay_payload(**{field: value}),
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_backtest_run_signals_rejects_nonfinite_leverage_field(viewer_client):
+    """#240: a NaN leverage declaration parses as a float but fails the
+    finite check — still a 400."""
+    body = json.dumps(_leverage_replay_payload(max_leverage=0.0))
+    body = body.replace('"max_leverage": 0.0', '"max_leverage": NaN')
+    response = viewer_client.post(
+        "/api/backtests/run-signals",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400, response.text
+
+
+def test_backtest_run_accepts_position_pct_above_one(viewer_client, monkeypatch, tmp_path):
+    """#240: BacktestRunRequest.max_position_pct > 1 is accepted (the le=1.0
+    bound was lifted for leverage) and forwarded to the engine command,
+    which bounds it by max_leverage — 1x when unset."""
+    import viewer.main as viewer_app_module
+
+    strategies_dir = tmp_path / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    (strategies_dir / "demo_strategy.py").write_text(
+        "class DemoStrategy:\n    pass\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(viewer_app_module, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module.legacy_viewer, "STRATEGIES_DIR", strategies_dir)
+    monkeypatch.setattr(viewer_app_module, "_dolthub_pull", lambda: None)
+    monkeypatch.setattr(
+        viewer_app_module, "_ensure_backtest_data_availability", lambda **kwargs: []
+    )
+
+    captured_cmd: list[str] = []
+    saved_line = json.dumps({"message": f"Saved to: {tmp_path}/out.trades.json"}) + "\n"
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured_cmd.extend(cmd)
+        return _ImmediateExitProc([saved_line, "PROGRESS:100.00:Completed\n"])
+
+    monkeypatch.setattr(viewer_app_module.subprocess, "Popen", fake_popen)
+
+    response = viewer_client.post(
+        "/api/backtests/run",
+        json={
+            "strategy": "demo_strategy.py",
+            "engine": "native",
+            "symbols": ["AAPL"],
+            "timeframe": "1d",
+            "capital": 100000,
+            "max_position_pct": 5.0,
+            "max_leverage": 3.0,
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    task_id = response.json()["task_id"]
+    task = _wait_for_viewer_task(viewer_app_module, task_id)
+    assert task["status"] == "completed", task.get("error")
+    assert "--max-position-pct" in captured_cmd
+    assert "5.0" in captured_cmd[captured_cmd.index("--max-position-pct") + 1]
+    assert "--max-leverage" in captured_cmd
+    assert "3.0" in captured_cmd[captured_cmd.index("--max-leverage") + 1]

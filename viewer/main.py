@@ -1423,7 +1423,9 @@ class BacktestRunRequest(SQLModel):
     end: str = ""
     capital: float = 100000.0
     risk_per_trade_pct: float | None = PydanticField(default=None, ge=0.0, lt=1.0)
-    max_position_pct: float | None = PydanticField(default=None, gt=0.0, le=1.0)
+    # #240: above 1 is leverage; the engine bounds the notional by
+    # max_leverage (1x when unset) — no upper bound here.
+    max_position_pct: float | None = PydanticField(default=None, gt=0.0)
     max_leverage: float | None = PydanticField(default=None, gt=0.0)
     modeling_resolution: str | None = "open_close"
     intrabar_resolution: str | None = None
@@ -1454,6 +1456,10 @@ class BacktestRunSignalsRequest(SQLModel):
     risk_per_trade_pct: float | None = None
     max_position_pct: float | None = None
     max_positions: int | None = None
+    # #240: per-position notional ceiling as a fraction of equity; values
+    # above 1 are leverage bounded by max_leverage (1x when unset).
+    max_notional_per_trade: float | None = None
+    max_leverage: float | None = None
     auto_download: bool = True
     # #130: optional fill-price slippage declaration (same spellings as the
     # CLI); absent means the per-asset-class auto model.
@@ -1463,8 +1469,8 @@ class BacktestRunSignalsRequest(SQLModel):
     # #361/#84: the replay adapter fails closed without an explicit fee
     # declaration; the viewer requires the caller to declare costs up front —
     # fees_zero for a conscious no-cost run, or fee_rate/fee_flat_per_trade.
-    fee_rate: float | None = None
-    fee_flat_per_trade: float | None = None
+    fee_rate: float | bool | None = None
+    fee_flat_per_trade: float | bool | None = None
     fees_zero: bool = False
 
 
@@ -1480,12 +1486,14 @@ class BacktestRunFromSignalsRequest(SQLModel):
     risk_per_trade_pct: float | None = None
     max_position_pct: float | None = None
     max_positions: int | None = None
+    max_notional_per_trade: float | None = None
+    max_leverage: float | None = None
     auto_download: bool = True
     slippage: str | None = None
     slippage_bps: float | None = None
     slippage_default_bps: float | None = None
-    fee_rate: float | None = None
-    fee_flat_per_trade: float | None = None
+    fee_rate: float | bool | None = None
+    fee_flat_per_trade: float | bool | None = None
     fees_zero: bool = False
 
 
@@ -4860,6 +4868,12 @@ def _download_request_key_for_source(identity: dict[str, Any]) -> str:
         "options": {},
     }
     if source == "dolthub":
+        # Invariant (#157): a DoltHub download is always the full dataset -
+        # `_generic_download_command` runs `dolthub_manager update`, which
+        # takes no symbol/timeframe/date arguments - so every request shares
+        # one single-flight key and scoping fields are deliberately dropped.
+        # If dolthub_manager ever gains scoped updates, this collapse becomes
+        # a bug: a differently scoped request would merge into the running one.
         request_identity.update(symbols=[], timeframes=[], start=None, end=None)
     if source in {"dukascopy", "jforex"}:
         request_identity["price_type"] = identity.get("offer_side", "")
@@ -11374,6 +11388,16 @@ def _validate_positive_payload_float(value: Any, *, default: float, field: str) 
     return normalized
 
 
+def _validate_optional_positive_payload_float(value: Any, *, field: str) -> float | None:
+    """Like :func:`_validate_positive_payload_float` but preserves ``None``."""
+    if value is None:
+        return None
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise HTTPException(status_code=400, detail=f"{field} must be a finite number > 0")
+    return normalized
+
+
 async def _collect_source_signals(
     *,
     normalized_source: str,
@@ -11457,7 +11481,16 @@ def _public_value_error_detail(exc: Exception) -> str:
 def _validated_signal_replay_request(
     payload: BacktestRunSignalsRequest,
 ) -> tuple[
-    list[dict[str, Any]], str, str, str, str, float, float, int
+    list[dict[str, Any]],
+    str,
+    str,
+    str,
+    str,
+    float,
+    float,
+    int,
+    float | None,
+    float | None,
 ]:
     """Validate a run-signals request; returns the normalized request fields."""
     direct_signals_payload = list(payload.signals or [])
@@ -11486,6 +11519,14 @@ def _validated_signal_replay_request(
     max_positions = int(payload.max_positions or 5)
     if max_positions <= 0:
         raise HTTPException(status_code=400, detail="max_positions must be > 0")
+    # #240: optional leverage declarations — the notional ceiling and the
+    # broker maximum it is bounded by. Both fail closed downstream when unset.
+    max_notional_per_trade = _validate_optional_positive_payload_float(
+        payload.max_notional_per_trade, field="max_notional_per_trade"
+    )
+    max_leverage = _validate_optional_positive_payload_float(
+        payload.max_leverage, field="max_leverage"
+    )
     return (
         direct_signals_payload,
         source_name,
@@ -11495,6 +11536,8 @@ def _validated_signal_replay_request(
         risk_per_trade_pct,
         max_position_pct,
         max_positions,
+        max_notional_per_trade,
+        max_leverage,
     )
 
 
@@ -11511,14 +11554,18 @@ def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> d
     """
     fee_rate = payload.fee_rate
     fee_flat_per_trade = payload.fee_flat_per_trade
-    # #361: reject negative/NaN/inf declarations here — ``resolve_fee_model``
-    # clamps negatives to 0.0 downstream, which would turn a declared cost into
-    # a silent zero-cost run (and inf into non-finite fees).
+    # #361: reject bool/negative/NaN/inf declarations here — this boundary
+    # mirrors ``NotionalFeeModel``/``resolve_fee_model`` validation so a bad
+    # request is a 400 instead of a silent zero-cost run or non-finite fees.
     for field_name, value in (
         ("fee_rate", fee_rate),
         ("fee_flat_per_trade", fee_flat_per_trade),
     ):
-        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+        if value is not None and (
+            isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=f"{field_name} must be a finite, non-negative number",
@@ -11546,21 +11593,30 @@ def _validated_signal_replay_fee_params(payload: BacktestRunSignalsRequest) -> d
     return fee_params
 
 
+@dataclass(frozen=True)
+class _SignalReplayTaskSpec:
+    """Validated replay request fields bundled for task registration (S107)."""
+
+    symbols: list[str]
+    normalized_signals: list[dict[str, Any]]
+    replay_source_label: str
+    account_id: str
+    signal_processor_name: str
+    risk_per_trade_pct: float
+    max_position_pct: float
+    max_positions: int
+    max_notional_per_trade: float | None
+    max_leverage: float | None
+    timeframe: str
+    start_dt: datetime
+    end_dt: datetime
+    fee_params: dict[str, Any]
+
+
 def _register_signal_replay_task(
     *,
     payload: BacktestRunSignalsRequest,
-    symbols: list[str],
-    normalized_signals: list[dict[str, Any]],
-    replay_source_label: str,
-    account_id: str,
-    signal_processor_name: str,
-    risk_per_trade_pct: float,
-    max_position_pct: float,
-    max_positions: int,
-    timeframe: str,
-    start_dt: datetime,
-    end_dt: datetime,
-    fee_params: dict[str, Any],
+    spec: _SignalReplayTaskSpec,
 ) -> tuple[str, Any, int]:
     """Create the replay task record, restart config and job placeholder."""
     task_id = str(uuid.uuid4())[:8]
@@ -11569,10 +11625,10 @@ def _register_signal_replay_task(
     stage_total = 5
     record = _create_task_record(
         task_id,
-        name=_signal_replay_task_name(replay_source_label),
+        name=_signal_replay_task_name(spec.replay_source_label),
         description=(
-            f"Replay {len(normalized_signals)} signals "
-            f"for {', '.join(symbols)} ({timeframe})."
+            f"Replay {len(spec.normalized_signals)} signals "
+            f"for {', '.join(spec.symbols)} ({spec.timeframe})."
         ),
         kind="backtest",
         source="signal-replay",
@@ -11587,18 +11643,20 @@ def _register_signal_replay_task(
     _update_task_fields(
         task_id,
         restart_config={
-            "signal_source": replay_source_label,
-            "account_id": account_id,
-            "start_date": start_dt.date().isoformat(),
-            "end_date": end_dt.date().isoformat(),
-            "timeframe": timeframe,
+            "signal_source": spec.replay_source_label,
+            "account_id": spec.account_id,
+            "start_date": spec.start_dt.date().isoformat(),
+            "end_date": spec.end_dt.date().isoformat(),
+            "timeframe": spec.timeframe,
             "capital": float(payload.capital or 100000.0),
-            "risk_per_trade_pct": risk_per_trade_pct,
-            "max_position_pct": max_position_pct,
-            "max_positions": max_positions,
-            "signal_processor": signal_processor_name or None,
-            "signal_count": len(normalized_signals),
-            "fee_params": dict(fee_params),
+            "risk_per_trade_pct": spec.risk_per_trade_pct,
+            "max_position_pct": spec.max_position_pct,
+            "max_positions": spec.max_positions,
+            "max_notional_per_trade": spec.max_notional_per_trade,
+            "max_leverage": spec.max_leverage,
+            "signal_processor": spec.signal_processor_name or None,
+            "signal_count": len(spec.normalized_signals),
+            "fee_params": dict(spec.fee_params),
         },
     )
     _running_jobs[task_id] = {
@@ -11670,6 +11728,8 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
         risk_per_trade_pct,
         max_position_pct,
         max_positions,
+        max_notional_per_trade,
+        max_leverage,
     ) = _validated_signal_replay_request(payload)
     # #361: resolve the fee declaration BEFORE registering the task — a
     # missing/conflicting declaration is a 400, not a task that dies in the
@@ -11697,18 +11757,22 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
     end_str = end_dt.date().isoformat()
     task_id, log_file, stage_total = _register_signal_replay_task(
         payload=payload,
-        symbols=symbols,
-        normalized_signals=normalized_signals,
-        replay_source_label=replay_source_label,
-        account_id=account_id,
-        signal_processor_name=signal_processor_name,
-        risk_per_trade_pct=risk_per_trade_pct,
-        max_position_pct=max_position_pct,
-        max_positions=max_positions,
-        timeframe=timeframe,
-        start_dt=start_dt,
-        end_dt=end_dt,
-        fee_params=fee_params,
+        spec=_SignalReplayTaskSpec(
+            symbols=symbols,
+            normalized_signals=normalized_signals,
+            replay_source_label=replay_source_label,
+            account_id=account_id,
+            signal_processor_name=signal_processor_name,
+            risk_per_trade_pct=risk_per_trade_pct,
+            max_position_pct=max_position_pct,
+            max_positions=max_positions,
+            max_notional_per_trade=max_notional_per_trade,
+            max_leverage=max_leverage,
+            timeframe=timeframe,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            fee_params=fee_params,
+        ),
     )
     _set_task_status(task_id, "queued")
     _register_job(
@@ -11828,13 +11892,18 @@ async def run_backtest_signals(payload: BacktestRunSignalsRequest) -> dict[str, 
                     slippage_params["slippage_default_bps"] = float(
                         payload.slippage_default_bps
                     )
+                risk_config_kwargs: dict[str, Any] = {
+                    "max_risk_per_trade": risk_per_trade_pct,
+                    "max_total_exposure": max_position_pct,
+                    "max_positions": max_positions,
+                    "default_sl_atr_multiplier": 2.0,
+                }
+                if max_notional_per_trade is not None:
+                    # #240: unset keeps the RiskConfig default (0.20).
+                    risk_config_kwargs["max_notional_per_trade"] = max_notional_per_trade
                 adapter = SignalReplayAdapter(
-                    risk_config=RiskConfig(
-                        max_risk_per_trade=risk_per_trade_pct,
-                        max_total_exposure=max_position_pct,
-                        max_positions=max_positions,
-                        default_sl_atr_multiplier=2.0,
-                    ),
+                    risk_config=RiskConfig(**risk_config_kwargs),
+                    max_leverage=max_leverage,
                     initial_capital=float(payload.capital or 100000.0),
                     default_timeframe=timeframe,
                     signal_processor_name=signal_processor_name or None,
@@ -12014,6 +12083,8 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
             risk_per_trade_pct=payload.risk_per_trade_pct,
             max_position_pct=payload.max_position_pct,
             max_positions=payload.max_positions,
+            max_notional_per_trade=payload.max_notional_per_trade,
+            max_leverage=payload.max_leverage,
             auto_download=payload.auto_download,
             slippage=payload.slippage,
             slippage_bps=payload.slippage_bps,
@@ -12067,6 +12138,8 @@ async def run_backtest_from_signals(payload: BacktestRunFromSignalsRequest) -> d
         risk_per_trade_pct=payload.risk_per_trade_pct,
         max_position_pct=payload.max_position_pct,
         max_positions=payload.max_positions,
+        max_notional_per_trade=payload.max_notional_per_trade,
+        max_leverage=payload.max_leverage,
         auto_download=payload.auto_download,
         slippage=payload.slippage,
         slippage_bps=payload.slippage_bps,
@@ -15524,6 +15597,9 @@ def _generic_download_command(request: _PreparedDownloadRequest) -> list[str]:
         "alpaca": "data_tools.downloaders.alpaca_dl",
     }
     if request.source == "dolthub":
+        # Full-dataset update only: no symbol/timeframe/date flags exist, so
+        # the request key collapses all DoltHub downloads into one
+        # single-flight slot (see `_download_request_key_for_source`, #157).
         return [sys.executable, "-u", "-m", "data_tools.dolthub_manager", "update"]
     if request.source not in module_names:
         raise HTTPException(status_code=400, detail="Unknown source")
