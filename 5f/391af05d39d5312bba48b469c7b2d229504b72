@@ -1,0 +1,21 @@
+tests/test_viewer_path_containment.py
+  s_323f516dbee5fa::t_7547e50dbf0ab7 454-554
+viewer/main.py
+  s_323f516dbee5fa::t_7829348fbd8f5a 12821-12840,12859-12868,12870,12875-12876
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5f391af05d39d5312bba48b469c7b2d229504b72",
+  "prompts": {},
+  "sessions": {
+    "s_323f516dbee5fa": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_323f516dbee5fa",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
