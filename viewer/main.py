@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -274,6 +275,7 @@ _STATIC_ASSET_SUFFIXES = {
 LOGS_DIR = LOG_DIR
 TASK_LOGS_DIR = LOG_DIR / "tasks"
 OPTIMIZATIONS_DIR = legacy_viewer.OPTIMIZATIONS_DIR
+JSON_FILE_GLOB = legacy_viewer.JSON_FILE_GLOB
 ALL_LOGS_NAME = legacy_viewer.ALL_LOGS_NAME
 BARS_BEFORE = legacy_viewer.BARS_BEFORE
 BARS_AFTER = legacy_viewer.BARS_AFTER
@@ -2786,7 +2788,7 @@ def _snapshot_portfolio_payloads() -> list[dict[str, Any]]:
     by_id: dict[str, dict[str, Any]] = {}
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
 
-    for file_path in sorted(PORTFOLIOS_DIR.glob("*.json")):
+    for file_path in sorted(PORTFOLIOS_DIR.glob(JSON_FILE_GLOB)):
         try:
             data = _normalize_portfolio_payload(json.loads(file_path.read_text(encoding="utf-8")))
         except (OSError, TypeError, ValueError) as exc:
@@ -5824,14 +5826,16 @@ def _log_live_endpoint_request(endpoint: str, **params: Any) -> None:
     )
 
 
-def _calculate_realized_live_pnl(
+def _iter_live_position_fills(
     rows: list[dict[str, Any]],
-) -> tuple[float, int, int]:
-    positions: dict[str, dict[str, float]] = {}
-    total_pnl = 0.0
-    wins = 0
-    losses = 0
+) -> Iterator[tuple[str, float, float, float, dict[str, Any]]]:
+    """Position-moving fills in execution order: ``(symbol, direction, qty, price, row)``.
 
+    The shared preamble of the realised-PnL walk and the closed-round-trip
+    commission walk (#149): buy/sell rows with a usable quantity and price,
+    sorted by the serialized execution timestamp, symbol upper-cased, and
+    direction ``+1`` for buys / ``-1`` for sells.
+    """
     ordered_rows = sorted(
         rows,
         key=lambda row: _serialize_live_timestamp(row.get("execution_timestamp"))[1],
@@ -5850,7 +5854,18 @@ def _calculate_realized_live_pnl(
         price = _safe_float(row.get("actual_price"), 0.0)
         if quantity <= 0.0 or price <= 0.0:
             continue
+        yield symbol, direction, quantity, price, row
 
+
+def _calculate_realized_live_pnl(
+    rows: list[dict[str, Any]],
+) -> tuple[float, int, int]:
+    positions: dict[str, dict[str, float]] = {}
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    for symbol, direction, quantity, price, _row in _iter_live_position_fills(rows):
         delta = quantity * direction
         state = positions.setdefault(symbol, {"qty": 0.0, "avg": 0.0})
         current_qty = state["qty"]
@@ -5909,6 +5924,90 @@ def _live_commission_totals(rows: list[dict[str, Any]]) -> tuple[float | None, i
     return (None if unknown else total), unknown
 
 
+def _closed_round_trip_commission(rows: list[dict[str, Any]]) -> float | None:
+    """Commission attributable to CLOSED round trips only (#149).
+
+    ``net_pnl`` is realised PnL of closed trades minus the fees of exactly
+    those trades, so commissions are attributed per round trip on the SAME
+    average-cost basis as ``_calculate_realized_live_pnl``. Per symbol a
+    pool tracks the open position's signed quantity, the total commission
+    paid to build it (``fee_pool``) and whether any pooled fee is unknown.
+    A same-direction fill adds its whole commission to the pool — that
+    exposure is still open, so its fee stays unrealised. An opposing fill
+    releases the pool's pro-rata share for the closed quantity
+    (``fee_pool * closed / |qty|``, the average fee rate of the open
+    position — the same share average-cost PnL realises on a partial
+    close) plus its own commission on the closed quantity only. A
+    reversal's opening remainder starts a new pool carrying just the
+    remainder's share of the fill's fee, so its fee is netted only if that
+    position later closes. A NULL commission inside the pool taints any
+    close of that exposure, so one unknown fee makes the result ``None``;
+    a NULL fee on exposure still open at the end is simply not netted yet.
+
+    Returns the summed commission of the closed round trips, or ``None``
+    when any fee touching a closed round trip is unknown (NULL commission —
+    the broker has not reported it yet, e.g. an unposted Alpaca ``CFEE``).
+    """
+    state: dict[str, dict[str, Any]] = {}
+    closed_fees = 0.0
+    fees_known = True
+    for symbol, direction, quantity, _price, row in _iter_live_position_fills(rows):
+        commission = row.get("commission")
+        fee = None if commission is None else _safe_float(commission, 0.0)
+        rate = None if fee is None else fee / quantity
+        delta = quantity * direction
+        st = state.setdefault(
+            symbol, {"qty": 0.0, "fee_pool": 0.0, "fee_unknown": False}
+        )
+        current = float(st["qty"])
+        if abs(current) < LIVE_POSITION_FLAT_THRESHOLD:
+            # Flat (or dust): the whole fill opens fresh exposure; any
+            # residual pool belongs to a position the PnL walk already
+            # treats as closed, so it is replaced, not released.
+            st["qty"] = delta
+            st["fee_pool"] = 0.0 if fee is None else fee
+            st["fee_unknown"] = fee is None
+            continue
+        if current * delta > 0:
+            # Same direction: the fill only adds to the open position, so
+            # its fee stays unrealised until that exposure closes.
+            st["qty"] = current + delta
+            st["fee_pool"] = float(st["fee_pool"]) + (0.0 if fee is None else fee)
+            st["fee_unknown"] = bool(st["fee_unknown"]) or fee is None
+            continue
+
+        closed_qty = min(abs(current), quantity)
+        released = float(st["fee_pool"]) * (closed_qty / abs(current))
+        if st["fee_unknown"]:
+            fees_known = False
+        else:
+            closed_fees += released
+        if rate is None:
+            fees_known = False
+        else:
+            closed_fees += rate * closed_qty
+
+        new_qty = current + delta
+        if abs(new_qty) < LIVE_POSITION_FLAT_THRESHOLD:
+            st["qty"] = 0.0
+            st["fee_pool"] = 0.0
+            st["fee_unknown"] = False
+        elif current * new_qty > 0:
+            # Partial close: the remaining exposure keeps the un-released
+            # share of the pool (and its unknown flag).
+            st["qty"] = new_qty
+            st["fee_pool"] = float(st["fee_pool"]) - released
+        else:
+            # Reversal: the remainder is a fresh position opened by this
+            # fill, so its pool carries only the remainder's share of the
+            # fill's fee and its own unknown flag.
+            st["qty"] = new_qty
+            st["fee_pool"] = 0.0 if rate is None else rate * (quantity - closed_qty)
+            st["fee_unknown"] = rate is None
+
+    return None if not fees_known else closed_fees
+
+
 def _live_unpriced_fill_count(rows: list[dict[str, Any]]) -> int:
     """How many buy/sell fills carry real quantity at an unusable price (#124, review of #143).
 
@@ -5934,12 +6033,23 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     # unknown: never a 0.0 price.
     price_unknown_count = _live_unpriced_fill_count(execution_rows)
     pnl_complete = price_unknown_count == 0
-    # `total_pnl` is gross (price PnL of closed round trips). Net PnL subtracts every execution's
-    # commission and is reported only when every commission is known.
+    # `total_pnl` is gross (price PnL of closed round trips). Net PnL (#149)
+    # subtracts only the commissions attributable to those SAME closed
+    # round trips — entry fees released at the open position's average fee
+    # rate plus each exit fill's fee on the closed quantity — never the
+    # fees of positions still open. US equity regulatory fees on sales (SEC fee /
+    # FINRA TAF) are deliberately NOT modelled: they are fractions of a
+    # cent to a few cents per sale (TAF capped per trade), Alpaca does not
+    # break them out per execution, and net PnL therefore slightly
+    # overstates the true net on equity round trips by those small amounts.
+    closed_commission = _closed_round_trip_commission(execution_rows)
+    # `total_commission`/`commission_unknown_count` still describe ALL
+    # executions (open legs included) for transparency; they no longer
+    # gate `net_pnl`, whose completeness is `closed_commission is not None`.
     total_commission, commission_unknown_count = _live_commission_totals(execution_rows)
     net_pnl = (
-        round(total_pnl_realized - total_commission, 2)
-        if total_commission is not None and pnl_complete
+        round(total_pnl_realized - closed_commission, 2)
+        if closed_commission is not None and pnl_complete
         else None
     )
     # Win rate denominators are closed round trips (a win or a loss), never raw
@@ -5991,7 +6101,11 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
         ),
         "commission_unknown_count": commission_unknown_count,
         "net_pnl": net_pnl,
-        "net_pnl_complete": pnl_complete and commission_unknown_count == 0,
+        # Complete means the closed-round-trip basis is fully known: every
+        # fee touching a CLOSED trade is priced. An unknown fee on a
+        # still-open position does not block it (it is not netted anyway);
+        # `commission_unknown_count` still reports it.
+        "net_pnl_complete": net_pnl is not None,
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "current_balance": round(current_balance, 2),
@@ -12280,7 +12394,7 @@ async def list_optimizations() -> list[dict[str, Any]]:
     if not OPTIMIZATIONS_DIR.exists():
         return results
 
-    for path in sorted(OPTIMIZATIONS_DIR.glob("*.json")):
+    for path in sorted(OPTIMIZATIONS_DIR.glob(JSON_FILE_GLOB)):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             results.append(_optimization_summary_payload(payload, path))
@@ -12321,8 +12435,8 @@ async def compare_portfolios(ids: str = Query(default="")) -> dict[str, Any]:
     portfolio_ids = [item.strip() for item in ids.split(",") if item.strip()]
     portfolios: list[dict[str, Any]] = []
     for portfolio_id in portfolio_ids:
-        path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-        if path.exists():
+        path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+        if path is not None and path.exists():
             portfolios.append(_normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8"))))
             continue
         record = load_portfolio_record(portfolio_id)
@@ -12723,7 +12837,17 @@ def _portfolio_combined_metrics(
     return correlation_matrix, combined_equity_points, stats_result
 
 
-@app.post("/api/portfolios", status_code=201)
+_PORTFOLIO_NOT_FOUND_DETAIL = "Portfolio not found"
+
+
+@app.post(
+    "/api/portfolios",
+    status_code=201,
+    responses={
+        400: {"description": "Invalid account_capital or no valid components"},
+        500: {"description": "Failed to resolve the portfolio output path"},
+    },
+)
 async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     name = str(payload.name or "Untitled").strip() or "Untitled"
     account_capital = float(payload.account_capital or 100000.0)
@@ -12753,6 +12877,14 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     portfolio_id = _portfolio_identifier(name, now=now)
+    # Resolve and containment-check the output path before any DB write, so
+    # an id that cannot map inside PORTFOLIOS_DIR fails before half-applying
+    # (same ordering as rename_portfolio). The explicit parent check keeps
+    # the sanitiser visible at the write sink for static analysis.
+    portfolios_base = PORTFOLIOS_DIR.resolve()
+    output_path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if output_path is None or output_path.parent != portfolios_base:
+        raise HTTPException(status_code=500, detail="Failed to resolve portfolio path")
     all_trades_timed.sort(key=_component_trade_time)
 
     portfolio = {
@@ -12828,20 +12960,19 @@ async def create_portfolio(payload: CreatePortfolioRequest) -> dict[str, Any]:
     )
 
     PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
     output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
     _upsert_portfolio_meta_cache_from_payload(normalized_portfolio)
     return normalized_portfolio
 
 
 def _load_portfolio_payload(portfolio_id: str) -> dict[str, Any]:
-    path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-    if path.exists():
+    path = _contained_asset_path(PORTFOLIOS_DIR, portfolio_id, ".json")
+    if path is not None and path.exists():
         return _normalize_portfolio_payload(json.loads(path.read_text(encoding="utf-8")))
 
     record = load_portfolio_record(portfolio_id)
     if record is None:
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     return _portfolio_record_to_payload(record)
 
 
@@ -12862,7 +12993,10 @@ async def delete_portfolios_bulk(payload: PortfoliosBulkDeleteRequest) -> dict[s
     return {"deleted": deleted, "items": items}
 
 
-@app.get("/api/portfolios/{portfolio_id}")
+@app.get(
+    "/api/portfolios/{portfolio_id}",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     payload = _load_portfolio_payload(portfolio_id)
     payload["combined_stats"] = legacy_viewer.PortfolioStats.from_dict(
@@ -12871,7 +13005,67 @@ async def get_portfolio(portfolio_id: str) -> dict[str, Any]:
     return payload
 
 
-@app.patch("/api/portfolios/{portfolio_id}")
+def _existing_portfolio_json_path(portfolio_id: str) -> Path | None:
+    """The on-disk ``{id}.json`` for an already-validated portfolio id.
+
+    The target is found by enumerating ``PORTFOLIOS_DIR`` and matching the
+    file stem, so the returned ``Path`` is a directory-listing fact rather
+    than a join of client-supplied input — the write sink never receives a
+    tainted path (SonarCloud pythonsecurity:S2083). Symlinked entries are
+    skipped: the read side (``_contained_asset_path``) already refuses them,
+    so a symlink must not become writable through the rename path.
+    """
+    base = PORTFOLIOS_DIR.resolve()
+    for path in PORTFOLIOS_DIR.glob(JSON_FILE_GLOB):
+        if path.stem != portfolio_id or path.is_symlink():
+            continue
+        resolved = path.resolve()
+        if resolved.parent == base:
+            return resolved
+    return None
+
+
+def _write_portfolio_json_atomically(output_path: Path, payload: dict[str, Any]) -> None:
+    """Serialise ``payload`` onto ``output_path`` without a torn write.
+
+    ``json.dump`` used to run before the file was opened on main, so a
+    non-serialisable value left the original intact; streaming into
+    ``open("w")`` truncates first and a mid-dump ``TypeError`` leaves a
+    permanently unreadable portfolio JSON (``_load_portfolio_payload`` has
+    no DB fallback once the file is corrupt). The document is serialised
+    into a temp file in the same directory and ``os.replace``d, so readers
+    see the old file or the new one, never a fragment. The temp file is
+    unlinked on any failure. ``output_path`` is the directory-enumerated
+    handle from ``_existing_portfolio_json_path``, never a join of client
+    input (SonarCloud pythonsecurity:S2083).
+    """
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_path, output_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+@app.patch(
+    "/api/portfolios/{portfolio_id}",
+    responses={
+        400: {"description": "Portfolio name cannot be empty"},
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio rename failed"},
+    },
+)
 async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     updated_name = str(payload.name or "").strip()
     if not updated_name:
@@ -12882,11 +13076,30 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     normalized_portfolio = _normalize_portfolio_payload(portfolio_payload)
     normalized_portfolio["name"] = updated_name
 
+    # Resolve the write target by enumerating PORTFOLIOS_DIR instead of
+    # joining the client-supplied id, so the Path handed to write_text is a
+    # filesystem fact, not a tainted join. The safe-id guard keeps the same
+    # fail-closed ordering as create_portfolio: an id that cannot name a
+    # file inside PORTFOLIOS_DIR 404s before the DB write. A portfolio that
+    # exists only as a DB record has no JSON to update — the record save
+    # below already persists the rename, so the file write is skipped
+    # rather than 404ing a rename that succeeded.
+    safe_id = _safe_asset_id(portfolio_id)
+    if not safe_id:
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
+    output_path = _existing_portfolio_json_path(safe_id)
+
     try:
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = PORTFOLIOS_DIR / f"{portfolio_id}.json"
-        output_path.write_text(json.dumps(normalized_portfolio, indent=2), encoding="utf-8")
+        if output_path is not None:
+            # Off the event loop: the serialise-and-swap is synchronous file
+            # I/O (SonarCloud pythonsecurity:S7493), and the temp-file +
+            # os.replace inside keeps the write atomic and the sink
+            # enumerated rather than client-derived (S2083).
+            await asyncio.to_thread(
+                _write_portfolio_json_atomically, output_path, normalized_portfolio
+            )
     except Exception as exc:
         logger.exception(
             "Failed to rename portfolio",
@@ -12898,12 +13111,22 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
     return {"id": portfolio_id, "name": updated_name, "status": "updated"}
 
 
-@app.put("/api/portfolios/{portfolio_id}/name")
+@app.put(
+    "/api/portfolios/{portfolio_id}/name",
+    responses={
+        400: {"description": "Portfolio name cannot be empty"},
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio rename failed"},
+    },
+)
 async def rename_portfolio_name(portfolio_id: str, payload: NameUpdateRequest) -> dict[str, Any]:
     return await rename_portfolio(portfolio_id, payload)
 
 
-@app.get("/api/portfolios/{portfolio_id}/contributions")
+@app.get(
+    "/api/portfolios/{portfolio_id}/contributions",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio_contributions(
     portfolio_id: str,
     group_by: str = Query(default="component"),
@@ -12912,7 +13135,10 @@ async def get_portfolio_contributions(
     return _compute_portfolio_contributions(portfolio=portfolio, group_by=group_by)
 
 
-@app.get("/api/portfolios/{portfolio_id}/trades")
+@app.get(
+    "/api/portfolios/{portfolio_id}/trades",
+    responses={404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL}},
+)
 async def get_portfolio_trades(
     portfolio_id: str,
     strategy: str = Query(default=""),
@@ -12928,11 +13154,18 @@ async def get_portfolio_trades(
     )
 
 
-@app.delete("/api/portfolios/{portfolio_id}")
+@app.delete(
+    "/api/portfolios/{portfolio_id}",
+    responses={
+        404: {"description": _PORTFOLIO_NOT_FOUND_DETAIL},
+        500: {"description": "Portfolio deletion failed"},
+        503: {"description": "Portfolio deletion is pending cleanup"},
+    },
+)
 async def delete_portfolio(portfolio_id: str) -> dict[str, Any]:
     result = _delete_portfolio_with_artifacts(portfolio_id)
     if result.get("status") == "not_found":
-        raise HTTPException(status_code=404, detail="Portfolio not found")
+        raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     if result.get("status") == "cleanup_pending":
         raise HTTPException(
             status_code=503,
