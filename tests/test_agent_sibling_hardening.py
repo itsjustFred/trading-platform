@@ -584,6 +584,11 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     printf 'Error: Provider request failed with HTTP 429: Too Many Requests\\n' >&2
     exit 1
     ;;
+  nvidia-retry-ok)
+    printf '! retrying (attempt 1): HTTP 429: Too Many Requests\\n' >&2
+    printf 'OK\\n'
+    exit 0
+    ;;
 esac
 """
 
@@ -737,7 +742,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             "not available in your country|service unavailable|overloaded|"
             "sign up for free to continue|too many requests"
         )
-        dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
+        dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr.final\""
         assert body.count(dead_end_grep) == 2, (
             f"{name}: the two zero-exit dead ends do not both classify the "
             "quota signature"
@@ -757,6 +762,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
             "garbage",
             "other",
             "kilo-400",
+            "nvidia-retry-ok",
         ):
             case = tmp_path / f"{stage}-{mode}"
             case.mkdir(parents=True, exist_ok=True)
