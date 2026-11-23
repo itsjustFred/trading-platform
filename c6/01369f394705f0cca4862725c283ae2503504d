@@ -1,0 +1,35 @@
+frontend/package.json
+  s_2bf89379757a94::t_cba67658ede972 10
+frontend/src/pages/LiveHub.tsx
+  s_2bf89379757a94::t_1447720fd9c648 28,308-318,1320
+frontend/src/hooks/useLiveKillSwitch.ts
+  s_0ba88f9b4be87e::t_8121c99cb28c7d 1-69
+frontend/tests/liveKillSwitchPanel.test.ts
+  s_0ba88f9b4be87e::t_d6dc9ee34b27c6 151-156,360-395,483-503
+frontend/tests/liveKillSwitchRefresh.test.ts
+  s_0ba88f9b4be87e::t_65a4bc48b73018 1-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c601369f394705f0cca4862725c283ae2503504d",
+  "prompts": {},
+  "sessions": {
+    "s_0ba88f9b4be87e": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_0ba88f9b4be87e",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
