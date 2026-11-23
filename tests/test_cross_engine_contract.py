@@ -805,19 +805,20 @@ class TestExitLevelGapped:
         assert len(vectorbt.trades) == 2
         assert len(vbt_msgs) == 1
 
-    def test_level_with_signal_exit_fill_open_and_spread(self, tmp_path: Path):
-        # signal_exit_fill="open" + spread must not leak into a level fill:
-        # an in-range level still fills AT the level on both engines.
+    def test_level_with_signal_exit_fill_close_and_spread(self, tmp_path: Path):
+        # signal_exit_fill="close" + spread must not leak into a level fill:
+        # an in-range level still fills AT the level on both engines. (The
+        # "open" mode this test originally used was removed in #153.)
         frame = _frame(spread=0.5)
         params = {"spread_price_col": "spread_price"}
         text = _exit_order_type_strategy_text(order_type="level", exit_price=107.1)
         strategy_fn = _load_strategy_fn(text, tmp_path, "exit_lvl_openfill")
 
         native = _native_result(
-            frame, strategy_fn, signal_exit_fill="open", parameters=params
+            frame, strategy_fn, signal_exit_fill="close", parameters=params
         )
         vectorbt = _vectorbt_result(
-            tmp_path, frame, text, signal_exit_fill="open", parameters=params
+            tmp_path, frame, text, signal_exit_fill="close", parameters=params
         )
 
         for result in (native, vectorbt):
@@ -1120,3 +1121,26 @@ class TestExitOrderContractHelpers:
         )
         with pytest.raises(ValueError, match="direction"):
             c(direction="SIDEWAYS", level=107.0, high=high, low=low)
+class TestSignalExitFillOpenRemoved:
+    """Issue #153: ``open`` filled a signal exit at the open of the bar it was
+    computed from (lookahead). Every engine entry must reject it."""
+
+    @pytest.mark.parametrize("spelling", ["open", "OPEN", " Open "])
+    def test_normalizer_rejects_open_with_migration_message(self, spelling):
+        from runner.engines import contract
+
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
+            contract.normalize_signal_exit_fill(spelling)
+
+    @pytest.mark.parametrize("value", ["next_open", "Close", "CLOSE "])
+    def test_normalizer_accepts_the_supported_modes(self, value):
+        from runner.engines import contract
+
+        assert contract.normalize_signal_exit_fill(value) == value.strip().lower()
+
+    def test_vectorbt_helpers_reject_open(self):
+        from runner.engines import vectorbt_adapter as vbt
+
+        row = pd.Series({"open": 1.0, "close": 2.0})
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
+            vbt._resolve_exit_price(row, 0, None, signal_exit_fill="open")

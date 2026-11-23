@@ -28,6 +28,7 @@ from runner.engine_pkg._time import to_iso_utc
 from runner.engine_pkg.execution_model import ExecutionModelSettings
 from runner.engine_pkg.orders import Order, OrderType, Position
 from runner.engine_pkg.result import build_indicator_series, build_result
+from runner.engines import contract
 from runner.engines._shared import resolve_ask_high_low, resolve_bar_spread
 from runner.engines.base import BacktestConfig
 from runner.engines.contract import (
@@ -250,8 +251,11 @@ class TradeEngine:
         # bar) and before pending entry orders fill (so a reversal's exit leg
         # closes the OLD position, never the position the same open creates).
         self._pending_signal_exit = False
+        # Fail loudly even if the config bypassed pydantic validation (#153).
         self._signal_exit_next_open = (
-            str(getattr(config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)).lower()
+            contract.normalize_signal_exit_fill(
+                getattr(config, "signal_exit_fill", SIGNAL_EXIT_FILL_NEXT_OPEN)
+            )
             == SIGNAL_EXIT_FILL_NEXT_OPEN
         )
         self._intrabar = self._prepare_intrabar(intrabar_data)
@@ -1784,23 +1788,15 @@ class TradeEngine:
                     self.symbol,
                 )
 
-        # signal_exit_fill modes that still route a MARKET signal exit
-        # through this method: "close" (the signal bar's close), "open" (the
-        # signal bar's open - MT5 clock exits whose signal bar IS the exit
-        # minute) and the forced end_of_data close. Under the default
-        # "next_open" market signal exits are parked in ``_pending_signal_exit``
-        # and filled at the next bar's open by ``_check_stops``; only
-        # ``exit_order_type="level"`` exits and end_of_data reach this method
-        # on the signal/last bar itself.
-        # Closing a SHORT buys the ask (open + spread); closing a LONG
-        # sells the bid. Verified tick-for-tick: MT5 long time-exits ==
-        # 22:55 bar open, short time-exits == 22:55 bar open + spread.
-        fill_at_open = (
-            str(getattr(self.config, "signal_exit_fill", "close")).lower()
-            == "open"
-        )
-        spread = self._bar_spread(row) if fill_at_open else 0.0
-        base_exit = float(row["open"]) if fill_at_open else float(row["close"])
+        # Under the default ``signal_exit_fill="next_open"`` market signal
+        # exits are parked in ``_pending_signal_exit`` and filled at the next
+        # bar's open by ``_check_stops``; this method serves the forced
+        # ``end_of_data`` close and the explicit legacy ``"close"`` opt-in —
+        # both fill at the bar's close. The former ``"open"`` mode (the
+        # signal bar's own open) was removed (issue #153):
+        # ``contract.normalize_signal_exit_fill`` rejects it, and MT5 clock
+        # exits are served by raising the signal one bar early instead.
+        base_exit = float(row["close"])
         time_iso = self._to_iso(row["timestamp"])
         next_positions: list[Position] = []
         ask_high, ask_low = self._ask_bar(row)
@@ -1873,9 +1869,7 @@ class TradeEngine:
                     else 0.0
                 )
             else:
-                fill_price = base_exit + (
-                    spread if position.direction == "SHORT" else 0.0
-                )
+                fill_price = base_exit
             if level_missing_price:
                 position.meta["exit_level_missing_price"] = True
             if level_unreachable:

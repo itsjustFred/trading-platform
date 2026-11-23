@@ -817,12 +817,17 @@ def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     the legacy signal-bar fill while the persisted meta claimed otherwise —
     refuse instead of warn-and-run.
     """
-    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
-    if mode == "next_open":
+    # normalize first: a config that bypassed BacktestConfig validation still
+    # fails loudly on the removed "open" mode (issue #153) instead of silently
+    # keeping an unsupported fill.
+    mode = contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
+    if mode == contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
         raise ValueError(
             "engine 'vectorbt' does not implement signal_exit_fill='next_open'; "
             "frozen engines keep their legacy signal-bar fill — pass "
-            "signal_exit_fill='close' or 'open' explicitly, or run the native engine"
+            "signal_exit_fill='close' explicitly, or run the native engine"
         )
     return config
 
@@ -1568,14 +1573,17 @@ def _resolve_exit_price(
     direction: str | None = None,
     gap_open: bool = False,
 ) -> float:
-    # D4 (Phase 3, A-M1 — implemented): unified Fill-zum-Trigger-Close.
-    # Signal exits stay on the trigger bar (see
-    # _prepare_next_open_execution_data) and fill at its close (or open with
-    # signal_exit_fill="open", mirroring native _close_position); stop/TP
+    # Frozen engine (ADR 0001): signal exits stay on the trigger bar (see
+    # _prepare_next_open_execution_data) and fill at its close — the frozen
+    # adapter refuses ``next_open`` upstream and the lookahead-prone ``open``
+    # mode was removed (issue #153). Stop/TP
     # legs resolve via the intrabar walk at their levels. An explicit
     # strategy exit_price level always wins — except a level that gapped
     # the bar's open (gap_open=True), which fills at the open under the
     # gap-through-level convention regardless of signal_exit_fill.
+    # Normalize anyway so a bypassed config still fails loudly on the
+    # removed "open" mode (#153).
+    contract.normalize_signal_exit_fill(signal_exit_fill or "close")
     # Spread mirrors native: only open-fills carry it, and only SHORT exits
     # pay it (closing a SHORT buys the ask); LONG exits sell the bid.
     if exit_price_series is not None and not gap_open:
@@ -1586,7 +1594,7 @@ def _resolve_exit_price(
         level = contract.usable_exit_price(exit_price_series.iloc[exit_idx])
         if level is not None:
             return level
-    fill_at_open = gap_open or str(signal_exit_fill or "close").lower() == "open"
+    fill_at_open = gap_open
     open_value = exit_row.get("open")
     close_value = exit_row.get("close")
     open_ok = open_value is not None and pd.notna(open_value)

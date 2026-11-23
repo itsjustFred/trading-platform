@@ -100,7 +100,7 @@ class TestContractPrimitives:
             start_date="2024-01-01",
             end_date="2024-01-02",
         ).signal_exit_fill == "next_open"
-        for legacy in ("close", "open", "Next_Open"):
+        for legacy in ("close", "Next_Open"):
             assert BacktestConfig(
                 strategy_name="x",
                 symbols=["X"],
@@ -408,11 +408,10 @@ class TestNativeSignalExitNextOpen:
         assert trade.exits[-1].price == pytest.approx(102.0)  # bar3 close
         assert pd.Timestamp(trade.exits[-1].time) == pd.Timestamp("2024-01-01 03:00", tz="UTC")
 
-    def test_legacy_open_opt_in_still_fills_at_the_signal_bar_open(self):
-        result = _native(self.ROWS, exit_bar=3, signal_exit_fill="open")
-        (trade,) = result.trades
-        assert trade.exits[-1].price == pytest.approx(102.0)  # bar3 open
-        assert pd.Timestamp(trade.exits[-1].time) == pd.Timestamp("2024-01-01 03:00", tz="UTC")
+    def test_open_mode_is_removed_and_fails_loudly(self):
+        # Issue #153: filling a signal exit at the signal bar's own open is a lookahead.
+        with pytest.raises(ValueError, match=r"removed.*next_open"):
+            _native(self.ROWS, exit_bar=3, signal_exit_fill="open")
 
     def test_execution_model_metadata_records_the_exit_rules(self):
         result = _native(self.ROWS, exit_bar=3)
@@ -743,9 +742,10 @@ class TestFrozenEnginesRefuseNextOpen:
             guard(self._config("next_open"))
 
     @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill, _lean_frozen_fill])
-    @pytest.mark.parametrize("fill", ["close", "open"])
-    def test_legacy_fills_pass_through(self, guard, fill):
-        config = self._config(fill)
+    def test_legacy_close_fill_passes_through(self, guard):
+        # "open" was removed (issue #153): BacktestConfig rejects it before the
+        # guard runs, so only the legacy "close" fill remains to pass through.
+        config = self._config("close")
         assert guard(config) is config
 
     @pytest.mark.parametrize("adapter", [VectorbtAdapter, PyneCoreAdapter, LeanAdapter])
