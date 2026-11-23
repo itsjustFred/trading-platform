@@ -95,6 +95,7 @@ def _signal(
 
 def _adapter(**kwargs) -> SignalReplayAdapter:
     kwargs.setdefault("fee_params", {"fees": "zero"})
+    kwargs.setdefault("slippage_params", {"slippage": "none"})
     # ``initial_capital`` is overridable: it is the lever that sizes a position
     # to a known quantity (risk % of the balance / stop distance).
     kwargs.setdefault("initial_capital", 100_000.0)
