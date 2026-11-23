@@ -552,6 +552,157 @@ def test_portfolio_rename_db_only_portfolio_skips_file_write(
     assert list(portfolios_dir.glob("*.json")) == []
 
 
+def test_portfolio_rename_failed_dump_leaves_original_file_intact(
+    security_client, tmp_path, monkeypatch
+):
+    """A json.dump failure mid-write must not truncate the portfolio JSON.
+
+    The write used to stream into ``open("w")``, so a non-serialisable value
+    raised *after* the truncate and left a permanently unreadable file -
+    ``_load_portfolio_payload`` has no DB fallback once the JSON is corrupt.
+    The rename now serialises into a temp file and ``os.replace``s it, so the
+    original survives any dump failure and no ``.tmp`` file is left behind.
+    """
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    portfolio_id = f"pf-{uuid.uuid4().hex[:12]}"
+    target = portfolios_dir / f"{portfolio_id}.json"
+    original_text = json.dumps(
+        {"id": portfolio_id, "name": "old-name", "components": []}
+    )
+    target.write_text(original_text, encoding="utf-8")
+
+    def failing_dump(obj, fp, *args, **kwargs):
+        fp.write('{"name": "truncated')
+        raise TypeError("Object of type int64 is not JSON serializable")
+
+    monkeypatch.setattr(viewer_app_module.json, "dump", failing_dump)
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                portfolio_id,
+                viewer_app_module.NameUpdateRequest(name="new-name"),
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert target.read_text(encoding="utf-8") == original_text
+    leftovers = list(portfolios_dir.glob("*.tmp")) + list(
+        portfolios_dir.glob(".*.tmp")
+    )
+    assert leftovers == []
+
+
+def test_portfolio_rename_skips_symlinked_json_entry(
+    security_client, tmp_path, monkeypatch
+):
+    """A symlinked ``{id}.json`` must not become the rename's write target.
+
+    Without the ``is_symlink`` guard, ``a.json -> b.json`` inside
+    PORTFOLIOS_DIR plus a DB record for ``a`` would let renaming ``a``
+    overwrite ``b.json`` through the resolved path. The read side already
+    refuses symlinks, so the write side must skip them too: the rename then
+    persists only the DB record and ``b.json`` stays byte-identical.
+    """
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    victim = portfolios_dir / "victim.json"
+    victim_text = json.dumps({"id": "victim", "name": "do-not-touch"})
+    victim.write_text(victim_text, encoding="utf-8")
+    link = portfolios_dir / "linked.json"
+    try:
+        link.symlink_to(victim.name)
+    except OSError:
+        pytest.skip("symlinks are not permitted in this environment")
+
+    record_payload = {
+        "id": "linked",
+        "name": "linked-name",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "account_capital": 100000.0,
+        "components": [],
+        "combined_stats": {},
+        "combined_equity": [],
+        "trades": [],
+    }
+    monkeypatch.setattr(
+        viewer_app_module,
+        "load_portfolio_record",
+        lambda _id: record_payload if _id == "linked" else None,
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    result = asyncio.run(
+        viewer_app_module.rename_portfolio(
+            "linked",
+            viewer_app_module.NameUpdateRequest(name="renamed"),
+        )
+    )
+
+    assert result["status"] == "updated"
+    assert len(saved) == 1
+    assert victim.read_text(encoding="utf-8") == victim_text
+
+
+def test_portfolio_rename_unsafe_id_with_db_record_returns_404(
+    security_client, tmp_path, monkeypatch
+):
+    """An id that cannot name a file inside PORTFOLIOS_DIR 404s before the DB
+    write, even when a record exists: the safe-id guard is what keeps a
+    legacy unsafe-id record from being written back under a path-unsafe name.
+    """
+    import asyncio
+
+    import viewer.main as viewer_app_module
+
+    portfolios_dir = tmp_path / "portfolios"
+    portfolios_dir.mkdir(parents=True, exist_ok=True)
+    record_payload = {
+        "id": "../evil",
+        "name": "evil-name",
+        "created_at": "2024-01-01T00:00:00+00:00",
+        "account_capital": 100000.0,
+        "components": [],
+        "combined_stats": {},
+        "combined_equity": [],
+        "trades": [],
+    }
+    monkeypatch.setattr(
+        viewer_app_module, "load_portfolio_record", lambda _id: record_payload
+    )
+    saved: list[object] = []
+    monkeypatch.setattr(
+        viewer_app_module, "save_portfolio_record", saved.append
+    )
+
+    with pytest.raises(viewer_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            viewer_app_module.rename_portfolio(
+                "../evil",
+                viewer_app_module.NameUpdateRequest(name="pwned"),
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+    assert saved == []
+
+
 # ---------------------------------------------------------------------------
 # Seam 6: CSV signal replay containment
 # ---------------------------------------------------------------------------

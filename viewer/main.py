@@ -12,6 +12,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -12947,12 +12948,30 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         save_portfolio_record(_portfolio_payload_to_model(normalized_portfolio))
         PORTFOLIOS_DIR.mkdir(parents=True, exist_ok=True)
         if output_path is not None:
-            # Stream the document to the enumerated handle instead of
-            # passing the loaded-payload-derived string to write_text, so
-            # no file-content-derived value reaches a filesystem call
-            # (SonarCloud pythonsecurity:S2083).
-            with output_path.open("w", encoding="utf-8") as handle:
-                json.dump(normalized_portfolio, handle, indent=2)
+            # Serialise-then-swap: json.dump used to run before the file was
+            # opened on main, so a non-serialisable value left the original
+            # intact; streaming into open("w") truncates first and a mid-dump
+            # TypeError would leave a permanently unreadable portfolio JSON.
+            # The temp file lives in PORTFOLIOS_DIR so os.replace stays on one
+            # filesystem, and the write sink is still the enumerated handle,
+            # never a join of client input (SonarCloud S2083).
+            tmp_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=PORTFOLIOS_DIR,
+                    prefix=f".{output_path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    tmp_path = Path(handle.name)
+                    json.dump(normalized_portfolio, handle, indent=2)
+                os.replace(tmp_path, output_path)
+                tmp_path = None
+            finally:
+                if tmp_path is not None:
+                    tmp_path.unlink(missing_ok=True)
     except Exception as exc:
         logger.exception(
             "Failed to rename portfolio",
