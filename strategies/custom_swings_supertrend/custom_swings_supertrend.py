@@ -14,10 +14,13 @@ It does not attempt a full 1:1 reproduction of the original Pine source's
 stateful swing/BOS, MTF `request.security(...)`, session gating, or partial-exit
 management. Those differences are documented in the accompanying README.
 
-Exits (1.1.0): stop-loss and fixed-RRR take-profit are price LEVELS (explicit
-``exit_price``). The Supertrend flip is a close-triggered MARKET exit with no
+Exits (1.1.0): the Supertrend flip is a close-triggered MARKET exit with no
 explicit ``exit_price``; under the default ``signal_exit_fill="next_open"`` it
-fills at the next bar's open.
+fills at the next bar's open. Stop-loss and fixed-RRR take-profit carry their
+level in ``exit_price``, which engines honor only with
+``exit_order_type="level"`` (not emitted here): on native the protective
+``stop_loss``/``sl_price`` covers the stop, while the take-profit level is
+not enforced as a resting order.
 """
 
 STRATEGY_META = {
