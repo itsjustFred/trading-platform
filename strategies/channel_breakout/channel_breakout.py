@@ -181,6 +181,9 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
     # derived from the feed's session schedule (modal last-bar time of day) and bar
     # spacing only: the position is closed at the last bar's open instead of being
     # carried into the next session. Whole-day feed properties, no per-bar look-ahead.
+    # A day with a single bar has no second-to-last bar (e.g. a daily-bar feed,
+    # where the clock formula would mark EVERY bar): the flatten then falls to the
+    # ``session_day_start`` safeguard on the next session's first bar.
     # Safeguard: if a day ends early (holiday/half day) the signal bar never comes;
     # the position is then flattened on the first bar of the next session
     # (``session_day_start``) - one bar later, never skipped.
@@ -199,17 +202,22 @@ def generate_signals(df: pd.DataFrame, params: dict | None = None):
         except Exception:
             logger.warning("Session-date fallback failed; session-close exit disabled")
             session_dates = None
-    if session_dates is not None and session_ts is not None:
+    if session_dates is not None and session_ts is not None and len(session_dates) == n:
+        day_start = np.ones(n, dtype=bool)
+        day_start[1:] = session_dates[1:] != session_dates[:-1]
+        bars_in_day = np.bincount(np.cumsum(day_start) - 1)
+        multi_bar_day = bars_in_day[np.cumsum(day_start) - 1] > 1
         spacing = modal_bar_minutes(pd.to_datetime(df["timestamp"], utc=True, errors="coerce"))
         minute_of_day = session_ts.dt.hour * 60 + session_ts.dt.minute
         last_minute_by_day = minute_of_day.groupby(session_dates).max()
         if len(last_minute_by_day):
             session_end = float(last_minute_by_day.mode().min()) + spacing
             # first bar whose END reaches the START of the session's last bar
-            session_exit_bar = (minute_of_day + 2.0 * spacing) >= session_end
-        session_day_start = pd.Series(
-            np.r_[False, session_dates[1:] != session_dates[:-1]], index=df.index
-        )
+            session_exit_bar = pd.Series(
+                (minute_of_day + 2.0 * spacing >= session_end) & multi_bar_day,
+                index=df.index,
+            )
+        session_day_start = pd.Series(day_start, index=df.index)
 
     entries = pd.Series(False, index=df.index)
     exits = pd.Series(False, index=df.index)
