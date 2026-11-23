@@ -1120,3 +1120,27 @@ def _isolate_loss_breaker_accounts_env():
         # tests must never inherit that override from an earlier test.
         patch.setattr(loss_breaker, "_ACCOUNTS_ENV_OVERRIDE", None)
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_daemon_shutdown_gate():
+    """Give every test a fresh daemon shutdown coordinator.
+
+    ``run_daemon`` marks its coordinator requested on every exit path - that is
+    the submission gate doing its job - and ``_ACTIVE_SHUTDOWN`` is restored to
+    the process-wide ``_SHUTDOWN`` afterwards. Without isolation a test that ran
+    the daemon leaves the gate closed for every later test in the same process
+    (and, under xdist, the same worker), so submissions that should reach the
+    broker are refused with "daemon is shutting down".
+
+    Uses its own ``MonkeyPatch`` rather than the ``monkeypatch`` fixture, for
+    the same reason as ``_isolate_loss_breaker_accounts_env`` above.
+    """
+    import live_runner.daemon as daemon
+    from live_runner.shutdown import ShutdownCoordinator
+
+    fresh = ShutdownCoordinator(force_exit_fn=lambda code: pytest.fail("forced exit"))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(daemon, "_SHUTDOWN", fresh)
+        patch.setattr(daemon, "_ACTIVE_SHUTDOWN", fresh)
+        yield

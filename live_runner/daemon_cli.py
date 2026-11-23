@@ -22,7 +22,6 @@ interpreter's unbounded thread-join stays out of the path).
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import logging
 import os
@@ -98,7 +97,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     from live_runner import daemon
 
     try:
-        asyncio.run(daemon.run_daemon())
+        # ``daemon.main`` owns the process exit: it runs the daemon on its own
+        # loop, closes that loop under a bounded deadline and leaves through
+        # ``os._exit`` on every path - a clean shutdown, a cleanup timeout and
+        # a crash alike - so the interpreter's unbounded thread-join teardown
+        # never runs. It only returns when the exit itself was stubbed out
+        # (tests); a real run never reaches the ``return`` below.
+        daemon.main()
     except SingleInstanceError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ALREADY_RUNNING
