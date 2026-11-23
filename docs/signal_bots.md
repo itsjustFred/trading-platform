@@ -278,7 +278,9 @@ Bedingung nennt, erzeugt eine neue Entry-Order.
   eine ganze Einheit → strikt 1e-9 + `WARNING`),
   oder übersteigt die eigene Menge die Broker-Position, wird der gedeckelte Exit
   **trotzdem abgeschickt** und ein Alert ausgelöst: `ERROR`-Log mit
-  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event), allen
+  `alert=exit_ledger_mismatch` (Sentry macht daraus ein Event; mit
+  `OPS_ALERT_WEBHOOK_URL` konfiguriert geht der Alert zusätzlich an den
+  Ops-Alert-Channel, siehe `docs/live-deploy-runbook.md`), allen
   Ledger-Mengen (`ledger_qty_by_deployment`, `ledger_qty_total`), `broker_qty`
   und `own_ledger_qty`. Grund der Abweichung sind meist Broker-seitige
   Schließungen (SL/TP-Legs, cTrader-SL/TP, Flatten, manuelles Schließen), die

@@ -60,31 +60,43 @@ def test_message_to_debug_fields_extracts_scalar_and_repeated_values():
     assert payload["permissions"] == ["1", "2"]
 
 
-def test_discover_alpaca_accounts_sets_broker_login(monkeypatch):
-    class _FakeAccount:
-        id = "acc-id"
-        account_number = "broker-42"
-        status = "ACTIVE"
-        equity = 1234.56
-        cash = 1234.56
+def _install_fake_alpaca(monkeypatch, account) -> None:
+    """Point ``alpaca.trading.client`` at a stub whose ``get_account`` returns ``account``."""
 
     class _FakeTradingClient:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
         def get_account(self):
-            return _FakeAccount()
+            return account
 
     fake_module = SimpleNamespace(TradingClient=_FakeTradingClient)
+    modules = __import__("sys").modules
     monkeypatch.setitem(
-        __import__("sys").modules,
+        modules,
         "alpaca",
         SimpleNamespace(trading=SimpleNamespace(client=fake_module)),
     )
     monkeypatch.setitem(
-        __import__("sys").modules, "alpaca.trading", SimpleNamespace(client=fake_module)
+        modules, "alpaca.trading", SimpleNamespace(client=fake_module)
     )
-    monkeypatch.setitem(__import__("sys").modules, "alpaca.trading.client", fake_module)
+    monkeypatch.setitem(modules, "alpaca.trading.client", fake_module)
+
+
+def _fake_alpaca_account(**overrides):
+    fields = {
+        "id": "acc-id",
+        "account_number": "broker-42",
+        "status": "ACTIVE",
+        "equity": 1234.56,
+        "cash": 1234.56,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_discover_alpaca_accounts_sets_broker_login(monkeypatch):
+    _install_fake_alpaca(monkeypatch, _fake_alpaca_account())
 
     accounts = account_discovery.discover_alpaca_accounts("k", "s", True)
     assert len(accounts) == 1
@@ -728,3 +740,20 @@ def test_adapter_client_after_discovery_uses_the_adapter_installed_reactor():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+
+
+def test_trader_balance_raises_on_an_unreadable_balance():
+    """A garbage broker balance must not be discovered as a 0.00 account."""
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery._trader_balance(SimpleNamespace(moneyDigits=2, balance="junk"))
+
+
+@pytest.mark.parametrize("field", ["cash", "equity"])
+def test_discover_alpaca_accounts_raises_on_unreadable_money(monkeypatch, field):
+    _install_fake_alpaca(monkeypatch, _fake_alpaca_account(**{field: "junk"}))
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        account_discovery.discover_alpaca_accounts("k", "s", True)

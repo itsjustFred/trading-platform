@@ -25,6 +25,7 @@ from live_runner.alpaca_adapter import (
 )
 from live_runner.base_adapter import is_order_not_submitted
 from shared.models import LiveSignal
+from shared.money import MoneyParseError
 
 
 @dataclass
@@ -50,6 +51,9 @@ class _FakeOrder:
 class _FakePosition:
     symbol: str
     qty: float
+    avg_entry_price: float = 1.0
+    current_price: float = 1.0
+    unrealized_pl: float = 0.0
 
 
 class _FakeTradingClient:
@@ -1780,10 +1784,23 @@ def test_bulk_response_shape_is_not_read_as_zero() -> None:
         asyncio.run(adapter.cancel_open_orders())
 
 
+def _position_row(**overrides):
+    """A broker position row with every money field readable by default."""
+    row = {
+        "symbol": "AAPL",
+        "qty": 1.0,
+        "avg_entry_price": 100.0,
+        "current_price": 101.0,
+        "unrealized_pl": 1.0,
+    }
+    row.update(overrides)
+    return SimpleNamespace(**row)
+
+
 def test_positions_mark_an_unparseable_qty_instead_of_reading_it_as_flat() -> None:
     """A broker row whose qty cannot be read is flagged, not silently zeroed."""
     client = _FakeTradingClient(
-        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+        positions=[_position_row(qty="not-a-number")]
     )
     adapter = _adapter(client)
 
@@ -1802,7 +1819,7 @@ def test_flatten_refuses_to_treat_an_unparseable_qty_as_flat() -> None:
     stamp the deployment stopped over a live position.
     """
     client = _FakeTradingClient(
-        positions=[SimpleNamespace(symbol="AAPL", qty="not-a-number")]
+        positions=[_position_row(qty="not-a-number")]
     )
     adapter = _adapter(client)
 
@@ -1817,7 +1834,7 @@ def test_cancel_orphaned_protections_refuses_an_unparseable_qty() -> None:
     stop that is guarding a live position.
     """
     client = _FakeTradingClient(
-        positions=[SimpleNamespace(symbol="AAPL", qty="nan-ish")],
+        positions=[_position_row(qty="nan-ish")],
         orders=[_FakeOrder(id="stop-1", symbol="AAPL", side="sell", order_type="stop")],
     )
     adapter = _adapter(client)
@@ -2024,3 +2041,283 @@ def test_alpaca_exit_qty_below_one_step_is_refused_as_below_step() -> None:
 def test_alpaca_exit_qty_step_is_one_fractional_share_step() -> None:
     adapter = _adapter(_FakeTradingClient())
     assert adapter.exit_qty_step("AAPL") == pytest.approx(1e-9)
+
+
+# ── Money fields fail closed (#280) ──────────────────────────────────────────
+#
+# ``_to_float(..., default=0.0)`` used to map an unreadable money field onto
+# zero: a malformed qty read as "flat", a malformed stop price as "no stop",
+# a malformed cash balance as "0.00". Every money field below now parses
+# through ``shared.money`` and raises on a value the broker did not really send.
+
+
+def test_get_balance_raises_on_an_unreadable_cash_field() -> None:
+    client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash="not-a-number", equity=100.0)
+    )
+    adapter = _adapter(client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_raises_on_an_unreadable_equity_field() -> None:
+    client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash=100.0, equity="not-a-number")
+    )
+    adapter = _adapter(client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_balance())
+
+
+def test_get_balance_falls_back_to_cash_when_equity_is_absent() -> None:
+    client = SimpleNamespace(
+        get_account=lambda: SimpleNamespace(cash=100.0, equity=None)
+    )
+    adapter = _adapter(client)  # type: ignore[arg-type]
+
+    balance, equity = asyncio.run(adapter.get_balance())
+
+    assert (balance, equity) == (100.0, 100.0)
+
+
+def test_get_positions_raises_on_an_unreadable_required_money_field() -> None:
+    # avg_entry_price is a required broker field; a garbage value still fails
+    # the whole listing rather than reporting a guessed entry price.
+    client = _FakeTradingClient(positions=[_position_row(avg_entry_price="junk")])
+    adapter = _adapter(client)
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter.get_positions())
+
+
+def test_get_positions_tolerates_absent_display_money_fields() -> None:
+    # current_price/unrealized_pl are Optional[str] on the Alpaca model: null
+    # is a legitimate broker answer and no risk path reads them, so the row
+    # must list with None rather than take down get_positions — and with it
+    # the flatten and exit-sizing paths.
+    client = _FakeTradingClient(
+        positions=[_position_row(current_price=None, unrealized_pl=None)]
+    )
+    adapter = _adapter(client)
+
+    positions = asyncio.run(adapter.get_positions())
+
+    assert positions[0]["current_price"] is None
+    assert positions[0]["unrealized_pnl"] is None
+    assert "current_price_unparseable" not in positions[0]
+
+
+def test_get_positions_marks_garbage_display_money_fields() -> None:
+    client = _FakeTradingClient(
+        positions=[_position_row(current_price="junk", unrealized_pl="junk")]
+    )
+    adapter = _adapter(client)
+
+    positions = asyncio.run(adapter.get_positions())
+
+    assert positions[0]["current_price"] is None
+    assert positions[0]["current_price_unparseable"] is True
+    assert positions[0]["unrealized_pnl"] is None
+    assert positions[0]["unrealized_pnl_unparseable"] is True
+
+
+def test_flatten_completes_with_null_display_money_fields() -> None:
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=1.0, stop_price=90.0
+            )
+        ],
+        positions=[_position_row(current_price=None, unrealized_pl=None, qty=1.0)],
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert client.close_calls == ["AAPL"]
+
+
+def test_flatten_completes_with_a_garbage_stop_leg_price() -> None:
+    # _best_stop_price only picks a price to *restore* a protection if the
+    # close fails; one unreadable leg must not abort the flatten for every
+    # remaining symbol.
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "sl-1", "AAPL", "sell", order_type="stop", qty=1.0, stop_price="junk"
+            )
+        ],
+        positions=[_position_row(qty=1.0)],
+    )
+
+    outcome = asyncio.run(_adapter(client).close_all_positions())
+
+    assert outcome.complete is True
+    assert client.cancelled == ["sl-1"]
+    assert client.close_calls == ["AAPL"]
+
+
+def test_protective_stop_skips_an_unreadable_stop_price() -> None:
+    from live_runner.alpaca_adapter import _protective_stop_of
+
+    order = {
+        "id": "stop-1",
+        "symbol": "AAPL",
+        "side": "sell",
+        "order_type": "stop",
+        "stop_price": "junk",
+        "qty": 1.0,
+    }
+
+    # Skipped, not raised: the symbol then lists zero stops and the trailing
+    # path refuses to amend on anything but exactly one — fail closed per
+    # symbol instead of downing the whole account's listing.
+    assert _protective_stop_of(order, order, {"AAPL": "sell"}) is None
+
+
+def test_protective_stop_tolerates_an_unreadable_qty() -> None:
+    from live_runner.alpaca_adapter import _protective_stop_of
+
+    order = {
+        "id": "stop-1",
+        "symbol": "AAPL",
+        "side": "sell",
+        "order_type": "stop",
+        "stop_price": 190.0,
+        "qty": "junk",
+    }
+
+    stop = _protective_stop_of(order, order, {"AAPL": "sell"})
+
+    assert stop is not None
+    assert stop.qty is None
+
+
+def test_list_protective_stops_isolates_a_malformed_candidate() -> None:
+    client = _FakeTradingClient(
+        positions=[_FakePosition("AAPL", 10.0), _FakePosition("MSFT", 5.0)],
+        orders=[
+            _FakeOrder(
+                "bad-1", "AAPL", "sell", order_type="stop", stop_price="junk"
+            ),
+            _FakeOrder(
+                "ok-1", "MSFT", "sell", order_type="stop", stop_price=300.0
+            ),
+        ],
+    )
+    adapter = _adapter(client)
+
+    stops = asyncio.run(adapter.list_protective_stops())
+
+    assert [stop.order_id for stop in stops] == ["ok-1"]
+
+
+def test_list_protective_stops_drops_a_symbol_with_an_unreadable_candidate() -> None:
+    # A malformed stop on a symbol that also has a readable one is ambiguous:
+    # listing only the readable stop would let trailing amend it while the
+    # malformed one stays put. The whole symbol must list zero stops so the
+    # trailing path fails closed.
+    client = _FakeTradingClient(
+        positions=[_FakePosition("AAPL", 10.0)],
+        orders=[
+            _FakeOrder(
+                "bad-1", "AAPL", "sell", order_type="stop", stop_price="junk"
+            ),
+            _FakeOrder(
+                "ok-1", "AAPL", "sell", order_type="stop", stop_price=190.0
+            ),
+        ],
+    )
+    adapter = _adapter(client)
+
+    stops = asyncio.run(adapter.list_protective_stops())
+
+    assert stops == []
+
+
+def test_best_stop_price_skips_an_unreadable_stop_price() -> None:
+    adapter = _adapter(_FakeTradingClient())
+    bad = SimpleNamespace(id="bad-1", symbol="AAPL", stop_price="junk")
+    good = SimpleNamespace(id="ok-1", symbol="AAPL", stop_price=190.0)
+
+    assert adapter._best_stop_price([bad], "AAPL") is None
+    assert adapter._best_stop_price([bad, good], "AAPL") == 190.0
+
+
+def test_reconcile_skips_a_money_parse_error_and_continues() -> None:
+    adapter = _adapter(_FakeTradingClient())
+
+    async def _page(before, max_signals):
+        return ["sig-1", "sig-2"] if before is None else []
+
+    adapter._fetch_reconciliation_page = _page
+    seen: list[str] = []
+
+    async def _reconcile(signal_id):
+        seen.append(signal_id)
+        if signal_id == "sig-1":
+            raise MoneyParseError("unreadable money value: 'junk'")
+        return True
+
+    adapter._reconcile_signal_fill = _reconcile
+
+    assert asyncio.run(adapter.reconcile_executions()) == 1
+    assert seen == ["sig-1", "sig-2"]
+
+
+def test_reconcile_does_not_swallow_a_non_parse_value_error() -> None:
+    # Only MoneyParseError is skipped per signal: a programming error or a
+    # database ValueError must surface, not read as "unreadable order data".
+    adapter = _adapter(_FakeTradingClient())
+
+    async def _page(before, max_signals):
+        return ["sig-1"] if before is None else []
+
+    adapter._fetch_reconciliation_page = _page
+
+    async def _reconcile(signal_id):
+        raise ValueError("database constraint violated")
+
+    adapter._reconcile_signal_fill = _reconcile
+
+    with pytest.raises(ValueError, match="database constraint violated"):
+        asyncio.run(adapter.reconcile_executions())
+
+
+def test_reconcile_raises_on_an_unreadable_filled_qty() -> None:
+    class _OrderClient:
+        def get_order_by_client_id(self, _signal_id):
+            return SimpleNamespace(filled_qty="junk")
+
+    adapter = _adapter(_OrderClient())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="unreadable money value"):
+        asyncio.run(adapter._reconcile_signal_fill("00000000-0000-0000-0000-000000000001"))
+
+
+def test_order_filled_qty_reads_an_unreadable_quantity_as_unknown() -> None:
+    """``None`` means "unknown", not zero: the refuse-cancel excusal must not
+    read a quantity nobody could parse as "nothing filled" (#280)."""
+    from live_runner.alpaca_adapter import _order_filled_qty
+
+    assert _order_filled_qty(SimpleNamespace(filled_qty="junk")) is None
+    assert _order_filled_qty(SimpleNamespace(filled_qty=float("nan"))) is None
+    assert _order_filled_qty(SimpleNamespace()) is None
+    assert _order_filled_qty(SimpleNamespace(filled_qty=2.5)) == 2.5
+
+
+def test_a_refused_cancel_is_not_excused_by_an_unreadable_filled_qty() -> None:
+    """A ``canceled`` order whose ``filled_qty`` cannot be read proves nothing:
+    it may have executed, so the refusal stands (#280)."""
+    client = _FakeTradingClient(
+        orders=[
+            _FakeOrder(
+                "entry-1", "AAPL", "buy", status="canceled", filled_qty="junk"
+            )
+        ]
+    )
+    adapter = _adapter(client)
+
+    assert asyncio.run(adapter._cancel_already_gone(client, "entry-1")) is False

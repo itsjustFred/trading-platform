@@ -75,9 +75,11 @@ def _is_daily_spaced(index: pd.DatetimeIndex) -> bool:
 def daily_returns_frame(returns_frame: pd.DataFrame) -> pd.DataFrame | None:
     """Resample per-bar returns to daily close-to-close returns.
 
-    Sharpe is annualised with sqrt(252) across the platform
-    (``runner/stats.py``, ``runner/portfolio_optimizer.py``), which is only
-    valid for daily observations (#87, #129 H8). Per-bar returns inside a UTC
+    Sharpe here is annualised with sqrt(252) on daily observations (#87,
+    #129 H8); ``runner/stats.py`` drops calendar-filled non-trading rows and
+    annualises at 252 (equities/FX/CFDs) or 365 (crypto) since #229, so the
+    two conventions intentionally differ.
+    Per-bar returns inside a UTC
     day are compounded (``prod(1 + r) - 1``), which for an interior day is
     exactly the day's close-to-close return, because each bar return already
     spans the gap to the previous bar; the window's first day compounds from
