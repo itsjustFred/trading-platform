@@ -126,6 +126,7 @@ _KNOWN_PHASES = frozenset(
         PHASE_HALTED,
     }
 )
+_TP1_PHASES = frozenset({PHASE_BEFORE_TP1, PHASE_TP1_PENDING})
 _POST_TP1_PHASES = frozenset({PHASE_AWAIT_GREEN, PHASE_ACTIVE, PHASE_EXIT_PENDING})
 
 #: How often the daemon loop should wake this manager. TP1 is an intrabar
@@ -269,6 +270,53 @@ class _AccountSchedule:
     stops_outage: _Outage = field(default_factory=_Outage)
 
 
+@dataclass
+class _ProtectiveStopListing:
+    """The account-wide stop listing shared by one pass's due positions.
+
+    ``stops`` stays ``None`` until the first due position triggers the read;
+    ``unavailable`` marks a failed read so later positions do not retry it
+    within the same pass (the failure itself is paced on the account
+    schedule).
+    """
+
+    stops: list[ProtectiveStop] | None = None
+    unavailable: bool = False
+
+
+def _bar_open_utc(raw_time: Any) -> datetime:
+    """A bar row's timestamp as a UTC ``datetime``."""
+    opened = pd.Timestamp(raw_time)
+    if opened.tzinfo is None:
+        opened = opened.tz_localize("UTC")
+    else:
+        opened = opened.tz_convert("UTC")
+    return opened.to_pydatetime()
+
+
+def _bar_decidable(
+    open_time: datetime,
+    *,
+    moment: datetime,
+    bar_seconds: int,
+    after: datetime | None,
+    dead_at_or_before: datetime | None,
+) -> bool:
+    """Whether this bar's close is final and the workflow may act on it.
+
+    A bar counts once ``open + length <= now``; bars at or before ``after``
+    were already evaluated and bars at or before ``dead_at_or_before`` (the
+    TP1 bar) are dead for the workflow by rule, not by accident.
+    """
+    if open_time + timedelta(seconds=bar_seconds) > moment:
+        return False
+    if after is not None and open_time <= after:
+        return False
+    return not (
+        dead_at_or_before is not None and open_time <= dead_at_or_before
+    )
+
+
 def _normalize_symbol(value: object) -> str:
     return str(value or "").strip().upper()
 
@@ -388,25 +436,8 @@ class LiveSupertrendFlipManager:
         themselves through ``_Workflow.retry_at``.
         """
         moment = now or datetime.now(timezone.utc)
-        managed_by_account: dict[str, list[LiveDeploymentConfig]] = {}
-        for deployment in deployments:
-            status = str(deployment.status or "").strip().upper()
-            # PAUSED still manages its open positions: every workflow action is
-            # a close or a protective amendment, which a pause allows (#126).
-            # The settings opt-in is the other half of "explicit": without it
-            # the deployment's flip signals are nobody's workflow.
-            if status in {"ACTIVE", "PAUSED"} and deployment_supertrend_flip_enabled(
-                deployment
-            ):
-                managed_by_account.setdefault(deployment.account_id, []).append(deployment)
-
-        eligible = {
-            account_id: adapter
-            for account_id, adapter in adapters.items()
-            if account_id in managed_by_account
-            and getattr(adapter, "broker_name", "") in FLIP_SUPPORTED_BROKERS
-            and getattr(adapter, "supports_stop_amendment", False) is True
-        }
+        managed_by_account = self._managed_deployments_by_account(deployments)
+        eligible = self._eligible_flip_adapters(adapters, managed_by_account)
         gone = (set(self._schedules) | {key[0] for key in self._workflows}) - set(
             eligible
         )
@@ -438,6 +469,36 @@ class LiveSupertrendFlipManager:
                 schedule.retry_at = None
                 schedule.retry_delay = FLIP_RETRY_INITIAL_SECONDS
 
+    @staticmethod
+    def _managed_deployments_by_account(
+        deployments: Iterable[LiveDeploymentConfig],
+    ) -> dict[str, list[LiveDeploymentConfig]]:
+        managed: dict[str, list[LiveDeploymentConfig]] = {}
+        for deployment in deployments:
+            status = str(deployment.status or "").strip().upper()
+            # PAUSED still manages its open positions: every workflow action is
+            # a close or a protective amendment, which a pause allows (#126).
+            # The settings opt-in is the other half of "explicit": without it
+            # the deployment's flip signals are nobody's workflow.
+            if status in {"ACTIVE", "PAUSED"} and deployment_supertrend_flip_enabled(
+                deployment
+            ):
+                managed.setdefault(deployment.account_id, []).append(deployment)
+        return managed
+
+    @staticmethod
+    def _eligible_flip_adapters(
+        adapters: Mapping[str, BaseLiveAdapter],
+        managed_by_account: Mapping[str, list[LiveDeploymentConfig]],
+    ) -> dict[str, BaseLiveAdapter]:
+        return {
+            account_id: adapter
+            for account_id, adapter in adapters.items()
+            if account_id in managed_by_account
+            and getattr(adapter, "broker_name", "") in FLIP_SUPPORTED_BROKERS
+            and getattr(adapter, "supports_stop_amendment", False) is True
+        }
+
     def _forget_account(self, account_id: str) -> None:
         self._schedules.pop(account_id, None)
         for key in [key for key in self._workflows if key[0] == account_id]:
@@ -465,67 +526,110 @@ class LiveSupertrendFlipManager:
             self._load_entry_signals, sorted(deployments_by_id), sorted(positions)
         )
 
-        stops: list[ProtectiveStop] | None = None
-        stops_unavailable = False
+        stops = _ProtectiveStopListing()
         for symbol, rows in positions.items():
-            entry = entry_signals.get(symbol)
-            context = {
-                "account_id": account_id,
-                "symbol": symbol,
-                "adapter": type(adapter).__name__,
-                "signal_id": (entry or {}).get("signal_id"),
-                "deployment_id": (entry or {}).get("deployment_id"),
-            }
-            key = (account_id, symbol)
-            try:
-                prepared = self._prepare_position(
-                    adapter, deployments_by_id, entry, rows, context
+            await self._manage_symbol(
+                account_id=account_id,
+                adapter=adapter,
+                deployments_by_id=deployments_by_id,
+                entry=entry_signals.get(symbol),
+                symbol=symbol,
+                rows=rows,
+                stops=stops,
+                moment=moment,
+            )
+
+    async def _manage_symbol(
+        self,
+        *,
+        account_id: str,
+        adapter: BaseLiveAdapter,
+        deployments_by_id: Mapping[str, LiveDeploymentConfig],
+        entry: Mapping[str, Any] | None,
+        symbol: str,
+        rows: list[Mapping[str, Any]],
+        stops: _ProtectiveStopListing,
+        moment: datetime,
+    ) -> None:
+        """One position's pass; failures are recorded, never propagated."""
+        context = {
+            "account_id": account_id,
+            "symbol": symbol,
+            "adapter": type(adapter).__name__,
+            "signal_id": (entry or {}).get("signal_id"),
+            "deployment_id": (entry or {}).get("deployment_id"),
+        }
+        key = (account_id, symbol)
+        try:
+            prepared = self._prepare_position(
+                adapter, deployments_by_id, entry, rows, context
+            )
+            if prepared is None:
+                self._workflows.pop(key, None)
+                return
+            deployment, plan, state, position = prepared
+            if entry is None:
+                # ``_prepare_position`` only returns a plan for a real entry;
+                # reaching this means the loader contract broke. Fail closed
+                # rather than assert inside the money-decision handler below.
+                raise _FlipFailure(
+                    f"prepared flip position for {symbol} lost its entry "
+                    "signal; refusing to manage it",
+                    permanent=True,
                 )
-                if prepared is None:
-                    self._workflows.pop(key, None)
-                    continue
-                # ``_prepare_position`` only returns a plan for a real entry.
-                assert entry is not None
-                deployment, plan, state, position = prepared
-                workflow = self._workflow_for(key, str(entry["signal_id"]))
-                if workflow.outage.probe_blocked(moment) or (
-                    workflow.retry_at is not None and moment < workflow.retry_at
-                ):
-                    continue
-                bar_seconds = _timeframe_seconds(deployment.signal_timeframe) or 0
-                breakeven_due = self._breakeven_due(plan, state, bar_seconds, moment)
-                if breakeven_due and stops is None and not stops_unavailable:
-                    # One account-wide read shared by every due position: a
-                    # failure is tracked on the account schedule, not per
-                    # position.
-                    try:
-                        stops = list(await adapter.list_protective_stops())
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # except-kind: money-decision
-                        stops_unavailable = True
-                        self._record_stops_failure(
-                            account_id, exc, context, moment
-                        )
-                if breakeven_due and stops is None:
-                    continue
-                await self._manage_position(
-                    adapter=adapter,
-                    deployment=deployment,
-                    entry=entry,
-                    position=position,
-                    plan=plan,
-                    state=state,
-                    stops=stops if breakeven_due else None,
-                    bar_seconds=bar_seconds,
-                    moment=moment,
-                    context=context,
+            workflow = self._workflow_for(key, str(entry["signal_id"]))
+            if workflow.outage.probe_blocked(moment) or (
+                workflow.retry_at is not None and moment < workflow.retry_at
+            ):
+                return
+            bar_seconds = _timeframe_seconds(deployment.signal_timeframe) or 0
+            breakeven_due = self._breakeven_due(plan, state, bar_seconds, moment)
+            if breakeven_due:
+                await self._load_stops_once(
+                    adapter, account_id, stops, context, moment
                 )
-                self._record_success(workflow)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # except-kind: money-decision
-                await self._record_failure(key, entry, exc, context, moment)
+                if stops.stops is None:
+                    return
+            await self._manage_position(
+                adapter=adapter,
+                deployment=deployment,
+                entry=entry,
+                position=position,
+                plan=plan,
+                state=state,
+                stops=stops.stops if breakeven_due else None,
+                bar_seconds=bar_seconds,
+                moment=moment,
+                context=context,
+            )
+            self._record_success(workflow)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            await self._record_failure(key, entry, exc, context, moment)
+
+    async def _load_stops_once(
+        self,
+        adapter: BaseLiveAdapter,
+        account_id: str,
+        stops: _ProtectiveStopListing,
+        context: Mapping[str, Any],
+        moment: datetime,
+    ) -> None:
+        """The shared account-wide stop listing, read lazily once per pass.
+
+        One read serves every due position; a failure is tracked on the
+        account schedule, not per position.
+        """
+        if stops.stops is not None or stops.unavailable:
+            return
+        try:
+            stops.stops = list(await adapter.list_protective_stops())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # except-kind: money-decision
+            stops.unavailable = True
+            self._record_stops_failure(account_id, exc, context, moment)
 
     async def _read_positions(
         self, adapter: BaseLiveAdapter
@@ -606,16 +710,7 @@ class LiveSupertrendFlipManager:
                 "flip workflow",
                 permanent=True,
             )
-        get_market_data = getattr(adapter, "get_market_data", None)
-        serves = getattr(adapter, "supports_market_data_timeframe", None)
-        if not callable(get_market_data) or (
-            callable(serves) and not serves(timeframe)
-        ):
-            raise _FlipFailure(
-                f"{type(adapter).__name__} cannot serve {timeframe!r} market "
-                "data, so the flip workflow can never run for this deployment",
-                permanent=True,
-            )
+        self._require_flip_market_data(adapter, timeframe)
         symbol = _normalize_symbol(position.get("symbol"))
         try:
             plan = parse_supertrend_flip_plan(
@@ -642,6 +737,22 @@ class LiveSupertrendFlipManager:
         if state is None:
             state = _fresh_state(qty, entry_price)
         return deployment, plan, state, position
+
+    @staticmethod
+    def _require_flip_market_data(
+        adapter: BaseLiveAdapter,
+        timeframe: str,
+    ) -> None:
+        get_market_data = getattr(adapter, "get_market_data", None)
+        serves = getattr(adapter, "supports_market_data_timeframe", None)
+        if not callable(get_market_data) or (
+            callable(serves) and not serves(timeframe)
+        ):
+            raise _FlipFailure(
+                f"{type(adapter).__name__} cannot serve {timeframe!r} market "
+                "data, so the flip workflow can never run for this deployment",
+                permanent=True,
+            )
 
     # ── workflow bookkeeping ─────────────────────────────────────────────
 
@@ -850,15 +961,14 @@ class LiveSupertrendFlipManager:
         context["timeframe"] = deployment.signal_timeframe
         signal_id = str(entry["signal_id"])
         qty = abs(self._position_qty(position))
+
+        if state["phase"] == PHASE_HALTED:
+            return
         dirty = False
 
-        phase = state["phase"]
-        if phase == PHASE_HALTED:
-            return
-
         # ── TP1 ──────────────────────────────────────────────────────────
-        if phase in {PHASE_BEFORE_TP1, PHASE_TP1_PENDING}:
-            outcome = await self._step_tp1(
+        if state["phase"] in _TP1_PHASES:
+            if await self._tp1_phase(
                 adapter=adapter,
                 symbol=symbol,
                 signal_id=signal_id,
@@ -870,94 +980,158 @@ class LiveSupertrendFlipManager:
                 bar_seconds=bar_seconds,
                 moment=moment,
                 context=context,
-            )
-            dirty = dirty or outcome
-            phase = state["phase"]
-            if phase == PHASE_TP1_PENDING:
-                if dirty:
-                    await self._persist_state(signal_id, state)
-                return
-            if phase == PHASE_BEFORE_TP1:
-                # TP1 skipped (zero tranche) or not yet triggered: nothing else
-                # to do - the broker-side stop protects the whole position.
-                if dirty:
-                    await self._persist_state(signal_id, state)
+            ):
                 return
             dirty = True
 
         # ── post-TP1: breakeven, then Supertrend bars ────────────────────
-        if phase in _POST_TP1_PHASES:
-            if self._breakeven_due(plan, state, bar_seconds, moment) and not state.get(
-                "breakeven_done"
-            ):
-                if stops is None:
-                    # Stop listing unavailable this pass; the bars below can
-                    # still be evaluated, the amendment waits.
-                    pass
-                else:
-                    amended = await self._maybe_breakeven(
-                        adapter=adapter,
-                        symbol=symbol,
-                        position=position,
-                        state=state,
-                        stops=stops,
-                        moment=moment,
-                        context=context,
-                    )
-                    if amended is None:
-                        # Shutdown refused the mutation: persist progress and
-                        # retry next pass.
-                        if dirty:
-                            await self._persist_state(signal_id, state)
-                        return
-                    state["breakeven_done"] = True
-                    dirty = True
-                    logger.info(
-                        "Moved live flip stop to breakeven",
-                        extra={
-                            "data": {
-                                **context,
-                                "entry_price": self._entry_price(position, state),
-                            }
-                        },
-                    )
-
-            if phase != PHASE_EXIT_PENDING:
-                flipped = await self._step_bars(
-                    adapter=adapter,
-                    symbol=symbol,
-                    timeframe=deployment.signal_timeframe,
-                    plan=plan,
-                    state=state,
-                    bar_seconds=bar_seconds,
-                    moment=moment,
-                    context=context,
-                )
-                dirty = dirty or flipped
-                phase = state["phase"]
-
-            if phase == PHASE_EXIT_PENDING:
-                # Persist the decision BEFORE submitting: a crash after the
-                # submit but before this write still recovers through the
-                # deterministic signal id.
-                if dirty:
-                    await self._persist_state(signal_id, state)
-                    dirty = False
-                await self._step_remainder_close(
-                    adapter=adapter,
-                    symbol=symbol,
-                    signal_id=signal_id,
-                    deployment_id=str(deployment.id),
-                    position_id=self._position_id(position),
-                    qty=qty,
-                    state=state,
-                    moment=moment,
-                    context=context,
-                )
-                dirty = True
+        if state["phase"] in _POST_TP1_PHASES:
+            dirty, finished = await self._post_tp1_phase(
+                adapter=adapter,
+                deployment=deployment,
+                symbol=symbol,
+                signal_id=signal_id,
+                position=position,
+                plan=plan,
+                state=state,
+                stops=stops,
+                bar_seconds=bar_seconds,
+                moment=moment,
+                context=context,
+                dirty=dirty,
+                qty=qty,
+            )
+            if finished:
+                return
 
         if dirty:
             await self._persist_state(signal_id, state)
+
+    async def _tp1_phase(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        symbol: str,
+        signal_id: str,
+        deployment_id: str,
+        position_id: int | None,
+        qty: float,
+        plan: SupertrendFlipPlan,
+        state: dict[str, Any],
+        bar_seconds: int,
+        moment: datetime,
+        context: dict[str, Any],
+    ) -> bool:
+        """Run the TP1 step; ``True`` when the pass ends here.
+
+        A still-pending or still-untriggered TP1 persists any progress and
+        ends the pass - the broker-side stop protects the whole position.
+        """
+        dirty = await self._step_tp1(
+            adapter=adapter,
+            symbol=symbol,
+            signal_id=signal_id,
+            deployment_id=deployment_id,
+            position_id=position_id,
+            qty=qty,
+            plan=plan,
+            state=state,
+            bar_seconds=bar_seconds,
+            moment=moment,
+            context=context,
+        )
+        if state["phase"] in {PHASE_TP1_PENDING, PHASE_BEFORE_TP1}:
+            if dirty:
+                await self._persist_state(signal_id, state)
+            return True
+        return False
+
+    async def _post_tp1_phase(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        deployment: LiveDeploymentConfig,
+        symbol: str,
+        signal_id: str,
+        position: Mapping[str, Any],
+        plan: SupertrendFlipPlan,
+        state: dict[str, Any],
+        stops: list[ProtectiveStop] | None,
+        bar_seconds: int,
+        moment: datetime,
+        context: dict[str, Any],
+        dirty: bool,
+        qty: float,
+    ) -> tuple[bool, bool]:
+        """Breakeven, bar evaluation and the remainder close.
+
+        Returns ``(dirty, finished)``: ``finished`` means the pass already
+        persisted and must not run the trailing persist.
+        """
+        if (
+            self._breakeven_due(plan, state, bar_seconds, moment)
+            and not state.get("breakeven_done")
+            and stops is not None
+        ):
+            amended = await self._maybe_breakeven(
+                adapter=adapter,
+                symbol=symbol,
+                position=position,
+                state=state,
+                stops=stops,
+                context=context,
+            )
+            if amended is None:
+                # Shutdown refused the mutation: persist progress and
+                # retry next pass.
+                if dirty:
+                    await self._persist_state(signal_id, state)
+                return dirty, True
+            state["breakeven_done"] = True
+            dirty = True
+            logger.info(
+                "Moved live flip stop to breakeven",
+                extra={
+                    "data": {
+                        **context,
+                        "entry_price": self._entry_price(position, state),
+                    }
+                },
+            )
+
+        if state["phase"] != PHASE_EXIT_PENDING:
+            flipped = await self._step_bars(
+                adapter=adapter,
+                symbol=symbol,
+                timeframe=deployment.signal_timeframe,
+                plan=plan,
+                state=state,
+                bar_seconds=bar_seconds,
+                moment=moment,
+                context=context,
+            )
+            dirty = dirty or flipped
+
+        if state["phase"] == PHASE_EXIT_PENDING:
+            # Persist the decision BEFORE submitting: a crash after the
+            # submit but before this write still recovers through the
+            # deterministic signal id.
+            if dirty:
+                await self._persist_state(signal_id, state)
+                dirty = False
+            await self._step_remainder_close(
+                adapter=adapter,
+                symbol=symbol,
+                signal_id=signal_id,
+                deployment_id=str(deployment.id),
+                position_id=self._position_id(position),
+                qty=qty,
+                state=state,
+                moment=moment,
+                context=context,
+            )
+            dirty = True
+        return dirty, False
 
     # ── TP1 ──────────────────────────────────────────────────────────────
 
@@ -983,81 +1157,137 @@ class LiveSupertrendFlipManager:
             dirty = True
 
         if state["phase"] == PHASE_TP1_PENDING:
-            outcome = await self._confirm_pending_close(
+            resolved = await self._resolve_tp1_pending(
                 adapter=adapter,
                 symbol=symbol,
+                signal_id=signal_id,
+                deployment_id=deployment_id,
+                position_id=position_id,
                 state=state,
-                pending_key="tp1",
-                expected_remaining=(
-                    float(state.get("entry_qty") or qty)
-                    - float(state.get("tp1_qty") or 0.0)
-                ),
                 qty=qty,
+                bar_seconds=bar_seconds,
                 moment=moment,
                 context=context,
             )
-            if outcome == "confirmed":
-                state["phase"] = PHASE_AWAIT_GREEN
-                trigger = _parse_iso(state.get("tp1_trigger_time")) or moment
-                state["tp1_time"] = _iso(trigger)
-                if bar_seconds > 0:
-                    bar_open_ts = (int(trigger.timestamp()) // bar_seconds) * bar_seconds
-                    state["tp1_bar_open"] = _iso(
-                        datetime.fromtimestamp(bar_open_ts, tz=timezone.utc)
-                    )
-                    # The TP1 bar is dead for the workflow: bar evaluation
-                    # starts on the bar after it (replay parity).
-                    state["last_bar_time"] = state["tp1_bar_open"]
-                state["tp1_order_id"] = None
-                state["tp1_signal_id"] = None
-                state["tp1_pending_since"] = None
-                return True
-            if outcome == "retry_terminal":
-                await self._resubmit_close(
-                    adapter=adapter,
-                    symbol=symbol,
-                    signal_id=signal_id,
-                    deployment_id=deployment_id,
-                    position_id=position_id,
-                    qty=float(state.get("tp1_qty") or 0.0),
-                    kind="tp1",
-                    event="",
-                    state=state,
-                    pending_key="tp1",
-                    moment=moment,
-                    context=context,
-                )
-                return True
-            if outcome == "resubmit_same":
-                # Pending state lost its order id (a crash between submit and
-                # persist): resubmit under the SAME deterministic id - the
-                # adapter's persisted-order recovery answers with the existing
-                # order id if one exists, so this cannot double-close.
-                order_id = await self._submit_close(
-                    adapter=adapter,
-                    symbol=symbol,
-                    signal_id=signal_id,
-                    deployment_id=deployment_id,
-                    position_id=position_id,
-                    qty=float(state.get("tp1_qty") or 0.0),
-                    kind="tp1",
-                    event="",
-                    attempt=int(state.get("tp1_attempts") or 0),
-                    reference_price=None,
-                    context=context,
-                )
-                state["tp1_order_id"] = order_id
-                state["tp1_signal_id"] = str(
-                    _flip_signal_id(
-                        "tp1", signal_id, attempt=int(state.get("tp1_attempts") or 0)
-                    )
-                )
-                state["tp1_pending_since"] = _iso(moment)
-                return True
-            # "waiting": order still working or state unknown; nothing to do.
-            return dirty
+        else:
+            resolved = await self._trigger_tp1(
+                adapter=adapter,
+                symbol=symbol,
+                signal_id=signal_id,
+                deployment_id=deployment_id,
+                position_id=position_id,
+                qty=qty,
+                plan=plan,
+                state=state,
+                moment=moment,
+                context=context,
+            )
+        return dirty or resolved
 
-        # PHASE_BEFORE_TP1: quote check, then maybe submit the tranche.
+    async def _resolve_tp1_pending(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        symbol: str,
+        signal_id: str,
+        deployment_id: str,
+        position_id: int | None,
+        state: dict[str, Any],
+        qty: float,
+        bar_seconds: int,
+        moment: datetime,
+        context: dict[str, Any],
+    ) -> bool:
+        """Resolve a submitted TP1 close; ``True`` when state changed."""
+        outcome = await self._confirm_pending_close(
+            adapter=adapter,
+            symbol=symbol,
+            state=state,
+            pending_key="tp1",
+            expected_remaining=(
+                float(state.get("entry_qty") or qty)
+                - float(state.get("tp1_qty") or 0.0)
+            ),
+            qty=qty,
+            moment=moment,
+            context=context,
+        )
+        if outcome == "confirmed":
+            state["phase"] = PHASE_AWAIT_GREEN
+            trigger = _parse_iso(state.get("tp1_trigger_time")) or moment
+            state["tp1_time"] = _iso(trigger)
+            if bar_seconds > 0:
+                bar_open_ts = (int(trigger.timestamp()) // bar_seconds) * bar_seconds
+                state["tp1_bar_open"] = _iso(
+                    datetime.fromtimestamp(bar_open_ts, tz=timezone.utc)
+                )
+                # The TP1 bar is dead for the workflow: bar evaluation
+                # starts on the bar after it (replay parity).
+                state["last_bar_time"] = state["tp1_bar_open"]
+            state["tp1_order_id"] = None
+            state["tp1_signal_id"] = None
+            state["tp1_pending_since"] = None
+            return True
+        if outcome == "retry_terminal":
+            await self._resubmit_close(
+                adapter=adapter,
+                symbol=symbol,
+                signal_id=signal_id,
+                deployment_id=deployment_id,
+                position_id=position_id,
+                qty=float(state.get("tp1_qty") or 0.0),
+                kind="tp1",
+                event="",
+                state=state,
+                pending_key="tp1",
+                moment=moment,
+                context=context,
+            )
+            return True
+        if outcome == "resubmit_same":
+            # Pending state lost its order id (a crash between submit and
+            # persist): resubmit under the SAME deterministic id - the
+            # adapter's persisted-order recovery answers with the existing
+            # order id if one exists, so this cannot double-close.
+            order_id = await self._submit_close(
+                adapter=adapter,
+                symbol=symbol,
+                signal_id=signal_id,
+                deployment_id=deployment_id,
+                position_id=position_id,
+                qty=float(state.get("tp1_qty") or 0.0),
+                kind="tp1",
+                event="",
+                attempt=int(state.get("tp1_attempts") or 0),
+                reference_price=None,
+                context=context,
+            )
+            state["tp1_order_id"] = order_id
+            state["tp1_signal_id"] = str(
+                _flip_signal_id(
+                    "tp1", signal_id, attempt=int(state.get("tp1_attempts") or 0)
+                )
+            )
+            state["tp1_pending_since"] = _iso(moment)
+            return True
+        # "waiting": order still working or state unknown; nothing to do.
+        return False
+
+    async def _trigger_tp1(
+        self,
+        *,
+        adapter: BaseLiveAdapter,
+        symbol: str,
+        signal_id: str,
+        deployment_id: str,
+        position_id: int | None,
+        qty: float,
+        plan: SupertrendFlipPlan,
+        state: dict[str, Any],
+        moment: datetime,
+        context: dict[str, Any],
+    ) -> bool:
+        """PHASE_BEFORE_TP1: quote check, then maybe submit the tranche."""
         get_quote = getattr(adapter, "get_quote", None)
         if not callable(get_quote):
             raise _FlipFailure(
@@ -1077,7 +1307,7 @@ class LiveSupertrendFlipManager:
         except Exception as exc:  # except-kind: money-decision
             raise _FlipFailure(f"TP1 quote unavailable for {symbol}: {exc!r}") from exc
         if bid < plan.tp1_price:
-            return dirty
+            return False
 
         tranche = tp1_partial_quantity(qty, plan.tp1_exit_fraction)
         if tranche <= 0.0:
@@ -1089,7 +1319,7 @@ class LiveSupertrendFlipManager:
                     extra={"data": {**context, "qty": qty}},
                 )
                 return True
-            return dirty
+            return False
 
         close_qty = qty if tranche >= qty else tranche
         try:
@@ -1290,7 +1520,6 @@ class LiveSupertrendFlipManager:
         position: Mapping[str, Any],
         state: dict[str, Any],
         stops: list[ProtectiveStop],
-        moment: datetime,
         context: dict[str, Any],
     ) -> bool | None:
         """Amend the stop to the entry price once the TP1 bar has closed.
@@ -1451,17 +1680,14 @@ class LiveSupertrendFlipManager:
             computed["supertrend"],
             strict=True,
         ):
-            opened = pd.Timestamp(raw_time)
-            if opened.tzinfo is None:
-                opened = opened.tz_localize("UTC")
-            else:
-                opened = opened.tz_convert("UTC")
-            open_time = opened.to_pydatetime()
-            if open_time + timedelta(seconds=bar_seconds) > moment:
-                continue
-            if after is not None and open_time <= after:
-                continue
-            if dead_at_or_before is not None and open_time <= dead_at_or_before:
+            open_time = _bar_open_utc(raw_time)
+            if not _bar_decidable(
+                open_time,
+                moment=moment,
+                bar_seconds=bar_seconds,
+                after=after,
+                dead_at_or_before=dead_at_or_before,
+            ):
                 continue
             bars.append((open_time, bool(raw_ready), bool(raw_green)))
         return bars

@@ -159,8 +159,9 @@ def test_list_protective_stops_fails_closed_on_unknown_symbol() -> None:
     state = {"positions": [_position(position_id=7, symbol_id=999)]}
     _wire_positions(adapter, state)
 
+    listing = adapter.list_protective_stops()
     with pytest.raises(ValueError, match="not in the symbols cache"):
-        asyncio.run(adapter.list_protective_stops())
+        asyncio.run(listing)
 
 
 def test_list_protective_stops_fails_closed_on_unreadable_side() -> None:
@@ -182,8 +183,9 @@ def test_list_protective_stops_fails_closed_on_unreadable_side() -> None:
     state = {"positions": [position]}
     _wire_positions(adapter, state)
 
+    listing = adapter.list_protective_stops()
     with pytest.raises(ValueError, match="tradeSide"):
-        asyncio.run(adapter.list_protective_stops())
+        asyncio.run(listing)
 
 
 def test_round_stop_price_floors_sell_and_ceilings_buy() -> None:
@@ -257,8 +259,9 @@ def test_amend_refusal_raises_and_never_confirms() -> None:
         order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
     )
 
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(CTraderApiError):
-        asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+        asyncio.run(amendment)
     # The broker snapshot never changed: the previous stop stays in force.
     assert position.stopLoss == pytest.approx(1.08000)
 
@@ -282,8 +285,9 @@ def test_amend_order_error_event_is_a_refusal() -> None:
         order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
     )
 
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(CTraderApiError, match="TRADING_BAD_STOPS"):
-        asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+        asyncio.run(amendment)
 
 
 def test_amend_timeout_with_confirmed_state_still_succeeds() -> None:
@@ -322,8 +326,9 @@ def test_amend_timeout_without_confirmation_fails_closed(monkeypatch) -> None:
         order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
     )
 
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(RuntimeError, match="did not confirm"):
-        asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+        asyncio.run(amendment)
     assert position.stopLoss == pytest.approx(1.08000)
 
 
@@ -344,8 +349,9 @@ def test_amend_position_closed_during_amend_fails_closed(monkeypatch) -> None:
         order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
     )
 
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(RuntimeError, match="closed while"):
-        asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+        asyncio.run(amendment)
 
 
 def test_amend_missing_position_raises_before_sending() -> None:
@@ -355,8 +361,9 @@ def test_amend_missing_position_raises_before_sending() -> None:
         order_id="7", symbol="EURUSD", side="sell", stop_price=1.08000
     )
 
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(RuntimeError, match="no longer open"):
-        asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+        asyncio.run(amendment)
     assert state["sent"] == []
 
 
@@ -367,8 +374,9 @@ def test_amend_rejects_a_stop_without_a_position_id() -> None:
         order_id="not-a-position", symbol="EURUSD", side="sell", stop_price=1.0
     )
 
+    amendment = adapter.amend_protective_stop(stop, 1.08500)
     with pytest.raises(ValueError, match="position id"):
-        asyncio.run(adapter.amend_protective_stop(stop, 1.08500))
+        asyncio.run(amendment)
 
 
 def test_amend_preserves_gsl_and_trigger_flags() -> None:

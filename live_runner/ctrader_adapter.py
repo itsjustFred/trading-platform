@@ -287,6 +287,54 @@ def _decode_trendbar_price(raw_value: Any, *, price_digits: int) -> float:
     return round(price, max(0, int(price_digits)))
 
 
+def _trendbar_present(bar: Any, has_field: Any, name: str) -> bool:
+    if has_field is None:
+        return getattr(bar, name, None) is not None
+    try:
+        return bool(has_field(name))
+    except (TypeError, ValueError):
+        return getattr(bar, name, None) is not None
+
+
+def _trendbar_field(bar: Any, name: str) -> float:
+    try:
+        return float(getattr(bar, name))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"cTrader trendbar field {name!r} is unreadable") from exc
+
+
+def _require_trendbar_fields(bar: Any, has_field: Any) -> None:
+    for name in ("low", "deltaOpen", "deltaClose", "deltaHigh"):
+        if not _trendbar_present(bar, has_field, name):
+            raise ValueError(f"cTrader trendbar is missing required field {name!r}")
+
+
+def _validate_trendbar_prices(prices: Mapping[str, float]) -> None:
+    if min(prices.values()) <= 0:
+        raise ValueError(
+            "cTrader trendbar decoded a non-positive price: "
+            f"O={prices['open']!r} H={prices['high']!r} "
+            f"L={prices['low']!r} C={prices['close']!r}"
+        )
+    if prices["high"] < max(prices["open"], prices["close"], prices["low"]) or (
+        prices["low"] > min(prices["open"], prices["close"])
+    ):
+        raise ValueError(
+            "cTrader trendbar OHLC is inconsistent: "
+            f"O={prices['open']!r} H={prices['high']!r} "
+            f"L={prices['low']!r} C={prices['close']!r}"
+        )
+
+
+def _trendbar_open_time(bar: Any, timestamp_ms_fallback: int | None) -> datetime:
+    open_minutes = _optional_int(getattr(bar, "utcTimestampInMinutes", None))
+    if open_minutes is not None and open_minutes > 0:
+        return datetime.fromtimestamp(open_minutes * 60, tz=timezone.utc)
+    if timestamp_ms_fallback is not None and timestamp_ms_fallback > 0:
+        return datetime.fromtimestamp(timestamp_ms_fallback / 1000.0, tz=timezone.utc)
+    raise ValueError("cTrader trendbar has no usable open timestamp")
+
+
 def decode_trendbar(
     bar: Any,
     *,
@@ -302,57 +350,27 @@ def decode_trendbar(
     the series a workflow trades on.
     """
     has_field = getattr(bar, "HasField", None)
-
-    def _present(name: str) -> bool:
-        if has_field is None:
-            return getattr(bar, name, None) is not None
-        try:
-            return bool(has_field(name))
-        except (TypeError, ValueError):
-            return getattr(bar, name, None) is not None
-
-    def _field(name: str) -> float:
-        try:
-            return float(getattr(bar, name))
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError(f"cTrader trendbar field {name!r} is unreadable") from exc
-
-    for name in ("low", "deltaOpen", "deltaClose", "deltaHigh"):
-        if not _present(name):
-            raise ValueError(f"cTrader trendbar is missing required field {name!r}")
-    low_raw = _field("low")
-    open_raw = low_raw + _field("deltaOpen")
-    high_raw = low_raw + _field("deltaHigh")
-    close_raw = low_raw + _field("deltaClose")
-    open_price = _decode_trendbar_price(open_raw, price_digits=price_digits)
-    high_price = _decode_trendbar_price(high_raw, price_digits=price_digits)
-    low_price = _decode_trendbar_price(low_raw, price_digits=price_digits)
-    close_price = _decode_trendbar_price(close_raw, price_digits=price_digits)
-    if min(open_price, high_price, low_price, close_price) <= 0:
-        raise ValueError(
-            f"cTrader trendbar decoded a non-positive price: "
-            f"O={open_price!r} H={high_price!r} L={low_price!r} C={close_price!r}"
-        )
-    if high_price < max(open_price, close_price, low_price) or low_price > min(
-        open_price, close_price
-    ):
-        raise ValueError(
-            f"cTrader trendbar OHLC is inconsistent: "
-            f"O={open_price!r} H={high_price!r} L={low_price!r} C={close_price!r}"
-        )
-    open_minutes = _optional_int(getattr(bar, "utcTimestampInMinutes", None))
-    if open_minutes is not None and open_minutes > 0:
-        open_time = datetime.fromtimestamp(open_minutes * 60, tz=timezone.utc)
-    elif timestamp_ms_fallback is not None and timestamp_ms_fallback > 0:
-        open_time = datetime.fromtimestamp(timestamp_ms_fallback / 1000.0, tz=timezone.utc)
-    else:
-        raise ValueError("cTrader trendbar has no usable open timestamp")
+    _require_trendbar_fields(bar, has_field)
+    low_raw = _trendbar_field(bar, "low")
+    prices = {
+        "open": _decode_trendbar_price(
+            low_raw + _trendbar_field(bar, "deltaOpen"), price_digits=price_digits
+        ),
+        "high": _decode_trendbar_price(
+            low_raw + _trendbar_field(bar, "deltaHigh"), price_digits=price_digits
+        ),
+        "low": _decode_trendbar_price(low_raw, price_digits=price_digits),
+        "close": _decode_trendbar_price(
+            low_raw + _trendbar_field(bar, "deltaClose"), price_digits=price_digits
+        ),
+    }
+    _validate_trendbar_prices(prices)
     return {
-        "timestamp": open_time,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": close_price,
+        "timestamp": _trendbar_open_time(bar, timestamp_ms_fallback),
+        "open": prices["open"],
+        "high": prices["high"],
+        "low": prices["low"],
+        "close": prices["close"],
         "volume": float(getattr(bar, "volume", 0) or 0),
     }
 
@@ -4442,59 +4460,72 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         open_positions = await self._fetch_open_positions()
         stops: list[ProtectiveStop] = []
         for position in open_positions:
-            position_id = self._positive_int(getattr(position, "positionId", 0))
-            trade_data = getattr(position, "tradeData", None)
-            if position_id is None or trade_data is None:
-                raise ValueError(
-                    "cTrader open position is missing positionId or tradeData; "
-                    "refusing to report protective stops for an unattributable position"
-                )
-            if bool(getattr(position, "trailingStopLoss", False)):
-                continue
-            if not self._has_proto_field(position, "stopLoss"):
-                continue
-            stop_price = parse_optional(getattr(position, "stopLoss", None))
-            if stop_price is None or stop_price <= 0:
-                raise ValueError(
-                    f"cTrader position {position_id} carries an unreadable stopLoss "
-                    f"({getattr(position, 'stopLoss', None)!r}); refusing to guess it"
-                )
-            symbol_id = self._positive_int(getattr(trade_data, "symbolId", 0))
-            if symbol_id is None:
-                raise ValueError(
-                    f"cTrader position {position_id} has no readable symbolId; "
-                    "refusing to report its protective stop"
-                )
-            symbol = self._symbol_name_for_id(symbol_id).strip().upper()
-            trade_side = self._positive_int(getattr(trade_data, "tradeSide", 0))
-            if trade_side == int(self._ProtoOATradeSide.BUY):
-                stop_side = "sell"
-            elif trade_side == int(self._ProtoOATradeSide.SELL):
-                stop_side = "buy"
-            else:
-                raise ValueError(
-                    f"cTrader position {position_id} has unreadable tradeSide "
-                    f"({getattr(trade_data, 'tradeSide', None)!r}); cannot tell "
-                    "which side its stop protects"
-                )
-            qty: float | None = None
-            try:
-                volume = parse_money(getattr(trade_data, "volume", 0))
-                qty = _broker_volume_to_qty(
-                    volume, self._scale_for(symbol).volume_per_qty
-                )
-            except (TypeError, ValueError):
-                qty = None
-            stops.append(
-                ProtectiveStop(
-                    order_id=str(position_id),
-                    symbol=symbol,
-                    side=stop_side,
-                    stop_price=stop_price,
-                    qty=qty,
-                )
-            )
+            stop = self._position_protective_stop(position)
+            if stop is not None:
+                stops.append(stop)
         return stops
+
+    def _position_protective_stop(self, position: Any) -> ProtectiveStop | None:
+        """The amendable protective stop of one open position, or ``None``.
+
+        ``None`` covers the two skip cases - a broker-native trailing stop
+        (not an absolute-price amend) and a position carrying no stopLoss at
+        all. Anything structurally unreadable raises instead: a stop that
+        cannot be named cannot be safely amended.
+        """
+        position_id = self._positive_int(getattr(position, "positionId", 0))
+        trade_data = getattr(position, "tradeData", None)
+        if position_id is None or trade_data is None:
+            raise ValueError(
+                "cTrader open position is missing positionId or tradeData; "
+                "refusing to report protective stops for an unattributable position"
+            )
+        if bool(getattr(position, "trailingStopLoss", False)):
+            return None
+        if not self._has_proto_field(position, "stopLoss"):
+            return None
+        stop_price = parse_optional(getattr(position, "stopLoss", None))
+        if stop_price is None or stop_price <= 0:
+            raise ValueError(
+                f"cTrader position {position_id} carries an unreadable stopLoss "
+                f"({getattr(position, 'stopLoss', None)!r}); refusing to guess it"
+            )
+        symbol_id = self._positive_int(getattr(trade_data, "symbolId", 0))
+        if symbol_id is None:
+            raise ValueError(
+                f"cTrader position {position_id} has no readable symbolId; "
+                "refusing to report its protective stop"
+            )
+        symbol = self._symbol_name_for_id(symbol_id).strip().upper()
+        stop_side = self._stop_side_for_position(position_id, trade_data)
+        qty: float | None = None
+        try:
+            volume = parse_money(getattr(trade_data, "volume", 0))
+            qty = _broker_volume_to_qty(
+                volume, self._scale_for(symbol).volume_per_qty
+            )
+        except (TypeError, ValueError):
+            qty = None
+        return ProtectiveStop(
+            order_id=str(position_id),
+            symbol=symbol,
+            side=stop_side,
+            stop_price=stop_price,
+            qty=qty,
+        )
+
+    def _stop_side_for_position(self, position_id: int, trade_data: Any) -> str:
+        """The order side that reduces this position - ``sell`` long, ``buy`` short."""
+        trade_side = self._positive_int(getattr(trade_data, "tradeSide", 0))
+        if trade_side == int(self._ProtoOATradeSide.BUY):
+            return "sell"
+        if trade_side == int(self._ProtoOATradeSide.SELL):
+            return "buy"
+        raise ValueError(
+            f"cTrader position {position_id} has unreadable tradeSide "
+            f"({getattr(trade_data, 'tradeSide', None)!r}); cannot tell "
+            "which side its stop protects"
+        )
 
     def round_stop_price(self, stop: ProtectiveStop, price: float) -> float:
         """Round a computed stop onto the symbol's price grid, away from market.
@@ -4587,6 +4618,20 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         digits = self._scale_for(stop.symbol).price_digits
         price = self.round_stop_price(stop, new_stop_price)
 
+        request = self._build_amend_position_request(position_id, price, position)
+        send_error = await self._send_amend_position_request(request)
+        return await self._confirmed_amendment(
+            position_id=position_id,
+            price=price,
+            digits=digits,
+            stop=stop,
+            send_error=send_error,
+        )
+
+    def _build_amend_position_request(
+        self, position_id: int, price: float, position: Any
+    ) -> Any:
+        """The SLTP amendment: new absolute stop, TP and flags echoed back."""
         request = self._ProtoOAAmendPositionSLTPReq()
         request.ctidTraderAccountId = self.ctid_trader_account_id
         request.positionId = position_id
@@ -4602,8 +4647,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         ):
             if self._has_proto_field(position, field_name):
                 setattr(request, field_name, getattr(position, field_name))
+        return request
 
-        send_error: BaseException | None = None
+    async def _send_amend_position_request(self, request: Any) -> BaseException | None:
+        """Send the amendment; the send error when the outcome is ambiguous.
+
+        ``None`` means the broker answered without an order-error event. A
+        definite ``CTraderApiError`` refusal propagates (the broker changed
+        nothing); anything else - timeout, transport failure, malformed
+        response - comes back as the exception for the caller to resolve
+        against broker state.
+        """
         try:
             response = await self._send_request_with_refresh_retry(
                 request, timeout_seconds=10
@@ -4617,8 +4671,19 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         except Exception as exc:  # except-kind: money-decision
             # Timeout, transport failure or an unparseable response: the
             # request may or may not have landed. Broker state decides below.
-            send_error = exc
+            return exc
+        return None
 
+    async def _confirmed_amendment(
+        self,
+        *,
+        position_id: int,
+        price: float,
+        digits: int,
+        stop: ProtectiveStop,
+        send_error: BaseException | None,
+    ) -> ProtectiveStop:
+        """Poll broker state until the new stop shows, or fail closed."""
         confirmed_price: float | None = None
         for attempt in range(_AMEND_CONFIRM_ATTEMPTS):
             try:

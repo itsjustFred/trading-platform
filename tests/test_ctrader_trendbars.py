@@ -211,8 +211,9 @@ def test_get_market_data_decodes_and_drops_forming_bar() -> None:
 
 def test_get_market_data_rejects_unsupported_timeframe() -> None:
     adapter, sent = _adapter_with_fakes(response=None)
+    fetch = adapter.get_market_data("EURUSD", timeframe="2h", limit=10)
     with pytest.raises(ValueError, match="cannot serve '2h'"):
-        asyncio.run(adapter.get_market_data("EURUSD", timeframe="2h", limit=10))
+        asyncio.run(fetch)
     assert sent == []
 
 
@@ -220,14 +221,16 @@ def test_get_market_data_rejects_empty_response() -> None:
     from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsRes
 
     adapter, _ = _adapter_with_fakes(response=ProtoOAGetTrendbarsRes())
+    fetch = adapter.get_market_data("EURUSD", timeframe="5m", limit=10)
     with pytest.raises(ValueError, match="no 5m trendbars"):
-        asyncio.run(adapter.get_market_data("EURUSD", timeframe="5m", limit=10))
+        asyncio.run(fetch)
 
 
 def test_get_market_data_rejects_unexpected_response_type() -> None:
     adapter, _ = _adapter_with_fakes(response=SimpleNamespace())
+    fetch = adapter.get_market_data("EURUSD", timeframe="5m", limit=10)
     with pytest.raises(RuntimeError, match="Unexpected cTrader trendbars response"):
-        asyncio.run(adapter.get_market_data("EURUSD", timeframe="5m", limit=10))
+        asyncio.run(fetch)
 
 
 def test_get_market_data_connects_when_needed() -> None:
