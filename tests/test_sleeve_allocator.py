@@ -1039,9 +1039,12 @@ def test_curve_metrics_hand_computed_values():
     assert metrics["final_equity"] == pytest.approx(expected_final)
     assert metrics["total_return"] == pytest.approx(expected_final - 1.0)
 
-    # Measured density: 60 returns over 60 business days (~84 calendar days).
-    span_days = (index[-1] - index[0]).days + 1
-    ppy = 60 * 365.25 / span_days
+    # Measured density via the shared stats.py helper (#353): 60 returns
+    # over ~84 calendar days inside leap-year 2024.
+    from runner.stats import return_periods_per_year
+
+    ppy = return_periods_per_year(returns)
+    assert ppy is not None
     assert metrics["ann_return"] == pytest.approx(
         expected_final ** (ppy / 60) - 1.0
     )

@@ -1,0 +1,81 @@
+name: Dependency audit
+
+# Weekly advisory audit (decision on #298). Two independent gates:
+#
+# - pip-audit scans the *locked* export (requirements.txt is generated from
+#   uv.lock by scripts/sync_requirements_from_lock.py), then
+#   scripts/pip_audit_severity_gate.py enriches each finding with its CVSS
+#   base score from OSV and fails on HIGH/CRITICAL (>= 7.0) - or on a finding
+#   whose severity cannot be determined, because an unrated advisory is not
+#   a cleared one. pip-audit itself exits non-zero on *any* finding, so its
+#   exit status is deliberately not the gate.
+# - npm audit fails on high/critical frontend findings via --audit-level.
+#
+# The job is expected to be red while known high-severity findings exist in
+# the locked set; the run is the signal, not noise. Accepted-risk rationale
+# for the pins that hold findings back lives in docs/dependency-security.md.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  python-audit:
+    name: pip-audit severity gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.10.4"
+          enable-cache: true
+      - name: Audit locked Python dependencies
+        run: |
+          set +e
+          # --python 3.12 matches the project's only supported interpreter;
+          # without it uvx may resolve a different python for the audit env.
+          # pip-audit is pinned exactly, like the dev tools in pyproject.
+          # --no-build keeps uvx from ever running an sdist setup script;
+          # pip-audit ships wheels, so nothing is lost.
+          uvx --no-build --python 3.12 --from pip-audit==2.10.1 pip-audit \
+            --no-deps -r requirements.txt --format json \
+            --output pip-audit-report.json
+          status=$?
+          set -e
+          if [ ! -s pip-audit-report.json ]; then
+            echo "pip-audit produced no report (exit $status)"
+            exit 1
+          fi
+          # Exit 1 here means "vulnerabilities found", which is the normal
+          # case this job exists for; the gate step decides what blocks.
+      - name: Fail on high-severity findings
+        # The gate is stdlib-only, so the runner's python3 is enough.
+        run: python3 scripts/pip_audit_severity_gate.py pip-audit-report.json
+
+  frontend-audit:
+    name: npm audit severity gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci --ignore-scripts
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high

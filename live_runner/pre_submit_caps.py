@@ -32,8 +32,10 @@ quantity is **clamped down to the broker maximum** (floored to the
 instrument's quantity step) and the remaining caps run against the clamped
 size. An undeterminable broker maximum fails closed to 1x. The clamp is a
 backstop against a broken size, not the platform's notional policy —
-sizing still caps order notional at ``max_notional_per_trade`` (default
-0.20, ``RiskConfig`` refuses values > 1) until #240 decides otherwise.
+sizing caps order notional at ``max_notional_per_trade`` (default
+0.20, ``RiskConfig``), which since #240 may exceed 1: the effective
+ceiling is ``min(configured, broker_max_leverage)`` with an undeterminable
+broker maximum failing closed to 1x (``risk.config.effective_max_notional_per_trade``).
 
 The leverage ceiling is MT5-style **free margin** — the same rule the
 native engine applies since #355 (#359, the live half of #347): free
@@ -344,7 +346,7 @@ async def _record_refusal_audit(data: Mapping[str, Any]) -> None:
     await _record_cap_audit(data, action="pre_submit_cap_refusal", succeeded=False)
 
 
-async def _safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | None:
+async def safe_max_leverage(adapter: BaseLiveAdapter, symbol: str) -> float | None:
     """The broker's maximum leverage, or ``None`` when it cannot be determined.
 
     A leverage lookup failure degrades to the 1x ceiling (#240) — it never
@@ -445,7 +447,7 @@ async def _verify_broker_facts(
     # already carries true equity the default ``get_equity`` returns the same
     # value.
     equity_task = asyncio.create_task(adapter.get_equity())
-    leverage_task = asyncio.create_task(_safe_max_leverage(adapter, signal.symbol))
+    leverage_task = asyncio.create_task(safe_max_leverage(adapter, signal.symbol))
     margin_task = asyncio.create_task(_safe_used_margin(adapter))
     try:
         quote, pip_value, equity, max_leverage, used_margin = (

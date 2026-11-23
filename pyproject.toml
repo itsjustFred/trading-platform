@@ -2,7 +2,11 @@
 name = "trading-platform"
 version = "0.1.0"
 description = "Universal backtesting framework with multi-engine support and trade viewer"
-requires-python = ">=3.12"
+# Capped below 3.13 (decision on #298): 3.12 is the only tested interpreter -
+# the CI matrix, mypy python_version and ruff target all say 3.12, and
+# viewer/main.py's ThreadPoolExecutor mirror validates sys.version_info ==
+# (3, 12) exactly. Widen only together with a tested 3.13 CI leg.
+requires-python = ">=3.12,<3.13"
 # B3: every floor carries a same-epoch ceiling (>=,<n+1) so a future
 # breaking major can never slip in silently. Ceilings reflect the tested
 # environment (pandas 3.x, pyarrow 25.x, websockets 17.x); bump deliberately.
