@@ -1,0 +1,37 @@
+live_runner/account_order_lock.py
+  s_01882244573a36::t_8e274a0903a0c7 1-155
+tests/live_runner/test_account_order_lock.py
+  s_01882244573a36::t_b983fd6cab1511 5-11,17,24,26-27,36,52-54,61,103-127,186-207,361-367,398,424,476,498-831
+docs/live-deploy-runbook.md
+  s_84174c897470c6::t_c4270d6342be5c 466-470,472-477,480-489
+live_runner/base_adapter.py
+  s_84174c897470c6::t_69b644e49de8b7 5,10,416-441
+live_runner/daemon.py
+  s_84174c897470c6::t_255aac7937317d 35-39,1742-1747,2541-2546,3531-3533,3547-3572,3651-3707,6142-6161
+live_runner/kill_switch.py
+  s_84174c897470c6::t_cf05cefd0e8658 41-44,634-668,740,759
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "aa75db627514d9da70714e1cd966661730f64c88",
+  "prompts": {},
+  "sessions": {
+    "s_01882244573a36": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "689e544e-9ae9-43cf-8f23-15899f279555",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_84174c897470c6": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_84174c897470c6",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
