@@ -36,6 +36,9 @@ DEPLOYMENT_ID = str(uuid4())
 
 class FakeAdapter:
     broker_name = "fake"
+    # The reconciler only trusts protective-stop listings from adapters that
+    # declare stop-amendment capability (cTrader deliberately does not, #168).
+    supports_stop_amendment = True
 
     def __init__(
         self,
