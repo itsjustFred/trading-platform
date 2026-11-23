@@ -118,12 +118,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.cache/parity-vendor
-          # The key hashes the fetch script and the code that defines the data
-          # contract (vendor_data.py read/validate rules, the Dukascopy
-          # downloader, the resampler and the session calendar the RTH filter
-          # uses). A change to any of them must regenerate the cache, not reuse
-          # files built under the old rules.
-          key: parity-vendor-${{ hashFiles('scripts/fetch_parity_web_data.py', 'tests/parity/vendor_data.py', 'data_tools/**/*.py', 'shared/market_calendar.py') }}
+          # The key hashes BOTH parity fetch scripts (this PR owns the combined
+          # vendor-data step; the published-strategies fetch joins the same step
+          # and cache) plus the code that defines the data contract
+          # (vendor_data.py read/validate rules, the Dukascopy downloader, the
+          # resampler and the session calendar the RTH filter uses). A change
+          # to any of them must regenerate the cache, not reuse files built
+          # under the old rules.
+          key: parity-vendor-${{ hashFiles('scripts/fetch_parity_web_data.py', 'scripts/build_parity_published_fixtures.py', 'tests/parity/vendor_data.py', 'data_tools/**/*.py', 'shared/market_calendar.py') }}
       - name: Fetch the parity vendor data
         if: runner.os == 'Linux'
         id: fetch-parity

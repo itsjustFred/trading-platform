@@ -1,7 +1,7 @@
 """Parity: platform engine vs an independent reference on the 5-minute ORB.
 
 Fixture: Dukascopy USA500 (S&P 500 CFD) 1-minute data resampled to 5-minute
-regular-session bars, 2026-03-20..2026-05-15 (38 complete sessions).  The
+regular-session bars, 2026-03-20..2026-05-15 (40 complete sessions).  The
 published study trades QQQ 2016-2023; the instrument and window differ, see
 ``docs/reports/parity-web-strategies.md``.
 

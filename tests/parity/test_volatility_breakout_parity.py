@@ -4,8 +4,7 @@
 (session open +/- k x prior-day range measure) as an intraday ATR breakout with a
 protective stop at the session open, so it is verified here instead of adding a
 duplicate Williams strategy.  Fixture: the same USA500 5-minute sessions as the
-ORB test (the fixture has 38 sessions; the strategy's day-based ATR warm-up
-leaves 32).
+ORB test (the fixture has 40 sessions).
 """
 
 from __future__ import annotations
