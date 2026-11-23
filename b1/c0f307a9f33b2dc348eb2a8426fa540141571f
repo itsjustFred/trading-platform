@@ -1,0 +1,38 @@
+docs/cross-engine-backtest-contract.md
+  h_f251b30ae7fbf6 134-152
+runner/backtest_grid.py
+  h_f251b30ae7fbf6 32,920-923
+runner/cli.py
+  h_f251b30ae7fbf6 34,234-237
+runner/engines/base.py
+  h_f251b30ae7fbf6 10,106-170,348-366
+runner/engines/native_adapter.py
+  h_f251b30ae7fbf6 4,16,20,52-61,119-123,145-154
+strategies/custom_swings_supertrend/README.md
+  h_f251b30ae7fbf6 29,83-84
+strategies/custom_swings_supertrend/custom_swings_supertrend.py
+  h_f251b30ae7fbf6 23-26
+strategies/pine_supertrend_dema/README.md
+  h_f251b30ae7fbf6 27
+strategies/pine_supertrend_dema/pine_supertrend_dema.py
+  h_f251b30ae7fbf6 15-17
+tests/test_backtest_grid.py
+  h_f251b30ae7fbf6 279-347
+tests/test_native_trailing_sl_refusal.py
+  h_f251b30ae7fbf6 1-139
+tests/test_viewer_features.py
+  h_f251b30ae7fbf6 3287-3324
+viewer/main.py
+  h_f251b30ae7fbf6 93,11048-11051
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b1c0f307a9f33b2dc348eb2a8426fa540141571f",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
