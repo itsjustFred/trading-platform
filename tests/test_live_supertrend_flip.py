@@ -1110,6 +1110,117 @@ def test_done_plan_survives_a_restart_without_realerting(
     assert len(surfaced) == 1
 
 
+def test_done_plan_foreign_position_after_restart_alerts_once(
+    live: _Live, surfaced
+) -> None:
+    """Alert-once across a restart, facing a DIFFERENT position.
+
+    The ``done``/``halted`` early return in ``_prepare_position`` is what
+    keeps a finished plan from re-alerting every pass; the case it exists
+    for is a later position on the same symbol, not the bound one. Removing
+    the early return makes the identity mismatch fire on every tick.
+    """
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(0.2))  # bound to position 4242
+    live.adapter.positions = [
+        {
+            "symbol": SYMBOL,
+            "qty": POSITION_QTY,
+            "entry_price": ENTRY_PRICE,
+            "position_id": 9999,
+        }
+    ]
+    live.tick(manager, _at(0.4))  # mismatch -> done, one alert
+    assert live.state()["phase"] == PHASE_DONE
+    surfaced_count = len(surfaced)
+    order_count = len(live.adapter.orders)
+
+    restarted = LiveSupertrendFlipManager()
+    for minute in range(1, 5):
+        live.tick(restarted, _at(0.5 + minute * 0.25))
+
+    assert live.state()["phase"] == PHASE_DONE
+    assert len(surfaced) == surfaced_count
+    assert len(live.adapter.orders) == order_count
+
+
+def test_give_up_alert_is_critical_and_probes_add_no_surface(
+    live: _Live, monkeypatch
+) -> None:
+    """The give-up surface is the one alert the decision calls critical:
+    exactly one ``logger.critical`` past ``FLIP_GIVE_UP_AFTER_SECONDS``, and
+    the given-up probes that follow add no critical surface, no order and
+    no stop amendment - the broker-side stop stays untouched."""
+    critical_msgs: list[str] = []
+    error_msgs: list[str] = []
+
+    def _critical(message, *args, **kwargs):
+        critical_msgs.append(str(message))
+
+    def _error(message, *args, **kwargs):
+        error_msgs.append(str(message))
+
+    monkeypatch.setattr(flip_module.logger, "critical", _critical)
+    monkeypatch.setattr(flip_module.logger, "error", _error)
+    monkeypatch.setattr(flip_module, "capture_exception", lambda *a, **k: None)
+
+    live.adapter.opening_signal_ids.clear()
+
+    async def _raise(position_id: int) -> str | None:
+        raise RuntimeError("order list unreadable")
+
+    live.adapter.opening_signal_id_for_position = _raise  # type: ignore[method-assign]
+    manager = LiveSupertrendFlipManager()
+
+    # Drive failures past the 40-minute give-up horizon (backoff doubles
+    # 15s -> 300s cap), then keep probing: probes past
+    # FLIP_GIVEN_UP_PROBE_SECONDS must not re-surface.
+    for minute in range(0, 90):
+        live.tick(manager, _at(minute * 1.0 + 0.1))
+
+    assert live.state().get("phase") != PHASE_DONE
+    assert live.adapter.orders == []
+    assert live.adapter.amends == []
+    give_up = [msg for msg in critical_msgs if "given up" in msg]
+    assert len(give_up) == 1
+    assert not any("given up" in msg for msg in error_msgs)
+
+    # Recovery half: the read works again and the next probe binds the plan.
+    async def _recovered(position_id: int) -> str | None:
+        return live.adapter.opening_signal_ids.get(int(position_id))
+
+    live.adapter.opening_signal_ids[4242] = str(live.entry.id)
+    live.adapter.opening_signal_id_for_position = _recovered  # type: ignore[method-assign]
+    live.adapter.bid = 106.0
+    live.tick(manager, _at(120.0))
+    assert live.state().get("phase") != PHASE_DONE
+    assert len(live.adapter.orders) == 1
+
+
+def test_unimplemented_provenance_retries_and_never_binds(
+    live: _Live, surfaced
+) -> None:
+    """The base ``opening_signal_id_for_position`` RAISES ``NotImplementedError``:
+    ``None`` would read as proven-foreign and end the plan, so an adapter
+    that never implemented the read must instead take the transient-retry
+    path - never bind, never mark ``done``."""
+    base_read = BaseLiveAdapter.opening_signal_id_for_position.__get__(live.adapter)
+    with pytest.raises(NotImplementedError):
+        asyncio.run(base_read(4242))
+
+    live.adapter.opening_signal_id_for_position = base_read  # type: ignore[method-assign]
+    manager = LiveSupertrendFlipManager()
+    live.adapter.bid = 106.0
+
+    for minute in (0.1, 1.0, 5.0):
+        live.tick(manager, _at(minute))
+
+    assert live.state().get("phase") != PHASE_DONE
+    assert live.adapter.orders == []
+    assert any("retried" in msg or "step failed" in msg for msg, _ in surfaced)
+
+
 def test_first_sight_accepts_the_proven_position(live: _Live) -> None:
     """The happy path still manages: provenance proves, workflow proceeds."""
     manager = LiveSupertrendFlipManager()

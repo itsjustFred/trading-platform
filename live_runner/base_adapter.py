@@ -652,9 +652,13 @@ class BaseLiveAdapter(ABC):
         unreadable order list or a failed read must RAISE so the caller can
         retry a transient failure instead of treating it as foreign
         ownership. Callers must treat ``None`` as fail-closed. The default
-        cannot prove anything.
+        cannot prove anything, so it RAISES: returning ``None`` would read
+        as "proven foreign" and silently end every first-sight plan on an
+        adapter that never implemented the read.
         """
-        return None
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot prove which signal opened a position"
+        )
 
     async def backfill_commissions(self) -> int:
         """Fill in commissions the broker reports only after the fill. Returns the rows updated.

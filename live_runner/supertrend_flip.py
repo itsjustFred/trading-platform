@@ -1160,7 +1160,16 @@ class LiveSupertrendFlipManager:
                 f"{type(adapter).__name__} cannot prove position "
                 "provenance; flip first sight cannot bind safely",
             )
-        opened_by = await provenance(int(position_id))
+        try:
+            opened_by = await provenance(int(position_id))
+        except NotImplementedError as exc:
+            # The base default raises: an adapter that never implemented the
+            # read cannot prove anything, so first sight must retry like any
+            # other transient failure - never bind, never mark ``done``.
+            raise _FlipFailure(
+                f"{type(adapter).__name__} cannot prove position "
+                "provenance; flip first sight cannot bind safely",
+            ) from exc
         return str(opened_by or "").strip() == signal_id
 
     # ── one position ─────────────────────────────────────────────────────
