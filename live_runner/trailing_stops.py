@@ -48,6 +48,7 @@ from typing import Any
 import pandas as pd
 
 from live_runner.base_adapter import BaseLiveAdapter, ProtectiveStop
+from live_runner.shutdown import BrokerMutationGate
 from live_runner.signal_sources.execution_timing import _timeframe_seconds
 from risk import RiskEngine, TradeSignal
 from shared.database import find_latest_filled_live_entry_signals
@@ -93,13 +94,6 @@ TRAILING_GIVEN_UP_PROBE_SECONDS = 15 * 60
 TRAILING_BAR_GRACE_SECONDS = 900
 
 EntrySignalLoader = Callable[[list[str], list[str]], dict[str, dict[str, Any]]]
-
-#: The daemon's shutdown drain guard for one broker mutation:
-#: ``async with gate() as may_mutate`` registers the mutation so the shutdown
-#: drain waits for it instead of cancelling a request whose broker outcome is
-#: unknown, and refuses it (``may_mutate`` False) once shutdown was requested.
-#: The live daemon injects ``live_runner.daemon._broker_mutation``.
-BrokerMutationGate = Callable[[], contextlib.AbstractAsyncContextManager[bool]]
 
 
 def adapter_live_trailing_modes(adapter: Any) -> frozenset[str]:

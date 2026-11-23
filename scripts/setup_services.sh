@@ -44,14 +44,17 @@ WantedBy=multi-user.target
 EOF
 
 # Worst-case graceful shutdown: 30 s drain + 20 s per bounded cleanup phase
-# (live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS, 7 phases), so 170 s, plus
-# the bounded exit path that runs after the daemon has reported its verdict
-# (live_runner.shutdown.EXIT_PATH_TIMEOUT_SECONDS, 2 s, then the bounded Sentry
-# flush in live_runner.shutdown.SENTRY_FLUSH_TIMEOUT_SECONDS, 2 s): 174 s in all.
+# (7 phases) + the daemon's own tail inside run_daemon (the bounded worker
+# join, WORKER_JOIN_TIMEOUT_SECONDS 30 s, and the bounded alert-sink flush,
+# SHUTDOWN_FLUSH_SECONDS 2 s) = live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS,
+# 202 s, plus the bounded exit path that runs after the daemon has reported
+# its verdict (live_runner.shutdown.EXIT_PATH_TIMEOUT_SECONDS, 2 s, then the
+# bounded Sentry flush in live_runner.shutdown.SENTRY_FLUSH_TIMEOUT_SECONDS,
+# 2 s): 206 s in all.
 # systemd's default TimeoutStopSec is 90 s, which SIGKILLs the daemon before it
 # can finish the drain and report its exit code - the operator's only signal
 # that a broker outcome was left unknown (docs/live-deploy-runbook.md,
-# "Stopping the daemon"). 180 s covers the whole 174 s window;
+# "Stopping the daemon"). 240 s covers the whole 206 s window;
 # tests/test_shutdown_budget_contract.py pins that against the constants.
 
 cat <<EOF > /etc/systemd/system/trading-daemon.service
@@ -69,7 +72,7 @@ EnvironmentFile=-${PROJECT_ROOT}/.accounts.env
 ExecStart=${PROJECT_ROOT}/.venv/bin/python -m live_runner.daemon
 Restart=always
 RestartSec=5
-TimeoutStopSec=180
+TimeoutStopSec=240
 
 [Install]
 WantedBy=multi-user.target

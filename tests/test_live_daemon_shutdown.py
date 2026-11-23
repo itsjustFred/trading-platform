@@ -41,7 +41,13 @@ import pytest
 
 import live_runner.daemon as daemon
 import live_runner.shutdown as shutdown_module
+from live_runner.base_adapter import ControlOutcome
 from live_runner.daemon_cli import EXIT_WORKER_JOIN_TIMEOUT
+from live_runner.kill_switch import (
+    KillSwitchMode,
+    KillSwitchState,
+    enforce_live_kill_switch,
+)
 from live_runner.shutdown import (
     DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_DRAIN_TIMEOUT_SECONDS,
@@ -166,6 +172,41 @@ class _GateAdapter:
     async def cancel_orphaned_protections(self) -> Any:
         self.mutation_calls.append("cancel_orphaned_protections")
         raise AssertionError("shutdown must never sweep protections")
+
+
+class _KillSwitchSweepAdapter(_GateAdapter):
+    """``_GateAdapter`` plus the kill-switch control plane (#300).
+
+    The sweep is the same cancel/flatten/orphan sequence STOPPED enforcement
+    runs, so the shutdown drain has to cover it exactly like an order
+    submission: a flatten already at the broker when the stop flag lands must
+    be awaited, and none may start after it.
+    """
+
+    supports_cancel_orders = True
+    supports_flatten = True
+
+    def __init__(self, *, hold_flatten: bool = False) -> None:
+        super().__init__()
+        self.hold_flatten = hold_flatten
+        self.flatten_entered = asyncio.Event()
+        self.release_flatten = asyncio.Event()
+        self.sweep_calls: list[str] = []
+
+    async def cancel_open_orders(self) -> ControlOutcome:
+        self.sweep_calls.append("cancel_open_orders")
+        return ControlOutcome(completed=1)
+
+    async def close_all_positions(self) -> ControlOutcome:
+        self.sweep_calls.append("close_all_positions")
+        self.flatten_entered.set()
+        if self.hold_flatten:
+            await self.release_flatten.wait()
+        return ControlOutcome(completed=1)
+
+    async def cancel_orphaned_protections(self) -> ControlOutcome:
+        self.sweep_calls.append("cancel_orphaned_protections")
+        return ControlOutcome(completed=1)
 
 
 class _RecordingScheduler:
@@ -510,6 +551,32 @@ def test_bind_clears_the_in_flight_count_a_timed_out_drain_left_behind() -> None
         return coordinator.inflight, drained
 
     assert asyncio.run(_probe()) == (0, True)
+
+
+def test_requested_on_only_counts_the_run_bound_to_this_loop() -> None:
+    """The coordinator outlives its run; a stale flag must not stop a new loop.
+
+    ``requested`` stays set after the daemon exits - it is only cleared by the
+    next ``bind`` - and the coordinator is process-wide. A caller on a
+    different (newer) loop, like a ``sync_deployments_loop`` driven directly
+    in a test, must not read a finished run's flag as its own stop.
+    """
+    coordinator = ShutdownCoordinator(force_exit_fn=lambda code: None)
+
+    async def _first_run() -> bool:
+        coordinator.bind(asyncio.get_running_loop())
+        coordinator.request("run_daemon_exit")
+        return coordinator.requested_on(asyncio.get_running_loop())
+
+    assert asyncio.run(_first_run()) is True
+    # The run is over: the flag stays set until the next ``bind``, but it
+    # belongs to the closed loop - a caller on a new loop must not read it.
+    assert coordinator.requested is True
+
+    async def _second_run() -> bool:
+        return coordinator.requested_on(asyncio.get_running_loop())
+
+    assert asyncio.run(_second_run()) is False
 
 
 def test_submit_order_with_risk_counts_itself_in_flight(
@@ -916,6 +983,170 @@ def test_no_new_submission_starts_after_the_stop_flag(
     assert adapter.writes == []
     assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
     assert any("daemon is shutting down" in r.getMessage() for r in caplog.records)
+
+
+# ─── the kill-switch sweep is broker work too (#300 on the shutdown ledger) ────
+
+
+def test_a_kill_switch_sweep_in_flight_is_drained_not_cancelled(
+    isolated_db_sandbox: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flatten already at the broker when the stop flag lands must finish.
+
+    The kill switch's cancel/flatten/orphan sweep is the same broker mutation
+    class as a STOPPED enforcement: cancelling it mid-request leaves the
+    broker outcome unknown. It registers on the shutdown ledger, so the drain
+    waits for it exactly like an order submission.
+    """
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+    coordinator = _new_coordinator()
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _KillSwitchSweepAdapter(hold_flatten=True)
+    state = KillSwitchState(
+        halts={ACCOUNT_ID: KillSwitchMode.FLATTEN}, readable=True
+    )
+
+    async def _probe() -> tuple[bool, Any]:
+        coordinator.bind(asyncio.get_running_loop())
+        sweep = asyncio.create_task(
+            enforce_live_kill_switch(
+                {ACCOUNT_ID: adapter},
+                [ACCOUNT_ID],
+                state=state,
+                mutation_gate=daemon._broker_mutation,
+            )
+        )
+        await asyncio.wait_for(adapter.flatten_entered.wait(), timeout=10)
+        assert coordinator.inflight == 1, "the sweep must be on the drain's ledger"
+        # The stop flag lands while the flatten is half-way to the broker.
+        coordinator.request("SIGTERM")
+        cleanup = asyncio.create_task(
+            daemon._shutdown_cleanup(
+                loop_tasks=(),
+                active_listener_tasks={},
+                active_discord_tasks={},
+                active_discord_bot_tasks={},
+                active_discord_bots={},
+                active_adapters={ACCOUNT_ID: adapter},
+                scheduler=_RecordingScheduler(),  # type: ignore[arg-type]
+                shutdown=coordinator,
+                drain_timeout=5.0,
+                cleanup_timeout=5.0,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not cleanup.done(), "the clean-up must wait for the in-flight sweep"
+        adapter.release_flatten.set()
+        ok = await asyncio.wait_for(cleanup, timeout=30)
+        report = await asyncio.wait_for(sweep, timeout=10)
+        return ok, report
+
+    ok, report = asyncio.run(_probe())
+    assert ok is True
+    # Not interrupted midway: the whole control-plane sequence ran to the end.
+    assert adapter.sweep_calls == [
+        "cancel_open_orders",
+        "close_all_positions",
+        "cancel_orphaned_protections",
+    ]
+    assert report.swept == (ACCOUNT_ID,)
+    assert coordinator.inflight == 0
+
+
+def test_no_kill_switch_sweep_starts_after_the_stop_flag(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sweep that has not started when shutdown was requested never starts.
+
+    The halt is not lost by the refusal: the sweep ledger is only written on a
+    completed sweep, so the account stays due and the next daemon start (or
+    the next readable tick, were there one) retries it.
+    """
+    coordinator = _new_coordinator()
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    adapter = _KillSwitchSweepAdapter()
+    state = KillSwitchState(
+        halts={ACCOUNT_ID: KillSwitchMode.FLATTEN}, readable=True
+    )
+
+    async def _probe() -> Any:
+        coordinator.bind(asyncio.get_running_loop())
+        coordinator.request("SIGTERM")
+        with caplog.at_level("WARNING"):
+            return await enforce_live_kill_switch(
+                {ACCOUNT_ID: adapter},
+                [ACCOUNT_ID],
+                state=state,
+                mutation_gate=daemon._broker_mutation,
+            )
+
+    report = asyncio.run(_probe())
+    assert adapter.sweep_calls == [], "no broker mutation may start after the flag"
+    assert adapter.mutation_calls == []
+    assert report.swept == ()
+    assert report.unmet == (ACCOUNT_ID,), "the refused sweep stays due for a retry"
+    assert coordinator.inflight == 0
+
+
+def test_the_sync_loop_starts_no_new_work_once_shutdown_is_requested(
+    isolated_db_sandbox: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """During the drain the sync loop must not start what shutdown is stopping.
+
+    Its tick used to keep running through the whole drain: it could connect a
+    new adapter, start a listener or Discord task, and begin an enforcement
+    sweep the mutation gate would only refuse a moment later. Once the stop
+    flag is set for this loop the iteration does nothing but sleep - the
+    cleanup phases own every adapter and task from there.
+    """
+    database, _, _ = isolated_db_sandbox
+    database.init_db()
+    coordinator = _new_coordinator()
+    monkeypatch.setattr(daemon, "_ACTIVE_SHUTDOWN", coordinator)
+    calls: list[str] = []
+
+    async def _spy_connect(*args: Any, **kwargs: Any) -> None:
+        calls.append("connect")
+
+    async def _spy_enforce(*args: Any, **kwargs: Any) -> None:
+        calls.append("enforce_stopped")
+
+    async def _spy_kill_switch(*args: Any, **kwargs: Any) -> Any:
+        calls.append("enforce_kill_switch")
+        return None
+
+    async def _spy_listener(*args: Any, **kwargs: Any) -> None:
+        calls.append("listener")
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(daemon, "_connect_active_accounts", _spy_connect)
+    monkeypatch.setattr(daemon, "_enforce_stopped_deployments", _spy_enforce)
+    monkeypatch.setattr(daemon, "enforce_live_kill_switch", _spy_kill_switch)
+    monkeypatch.setattr(daemon, "_run_adapter", _spy_listener)
+    monkeypatch.setattr(
+        daemon, "_run_discord_listener_with_retries", _spy_listener
+    )
+
+    async def _stop_after_iteration(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon.asyncio, "sleep", _stop_after_iteration)
+
+    async def _probe() -> None:
+        coordinator.bind(asyncio.get_running_loop())
+        coordinator.request("SIGTERM")
+        with pytest.raises(asyncio.CancelledError):
+            await daemon.sync_deployments_loop(
+                {},
+                {},
+                {},
+                accounts_env=Path("/nonexistent/accounts.env"),
+                interval_seconds=0,
+            )
+
+    asyncio.run(_probe())
+    assert calls == [], "a requested shutdown must leave the sync loop nothing to start"
 
 
 def test_a_dropped_exit_is_logged_as_an_error_that_the_position_stays_open(
@@ -1660,8 +1891,9 @@ def test_main_exits_with_the_code_the_daemon_returned(
     cooperative cancel did not stop, Twisted's pool workers - and that join has
     no deadline, so a verdict that reached ``sys.exit`` could still be replaced
     by the SIGKILL the unit sends at ``TimeoutStopSec``. The flush that happens
-    first is what that exit skips, so it is pinned here in order: logs, then the
-    bounded Sentry flush, then the exit.
+    first is what that exit skips, so it is pinned here in order: the bounded
+    Sentry flush (whose own failure still has to be loggable, so it runs while
+    the handlers are open), then the logs, then the exit.
     """
     order: list[str] = []
 
@@ -1677,7 +1909,7 @@ def test_main_exits_with_the_code_the_daemon_returned(
         daemon.main()
 
     assert excinfo.value.code == code
-    assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", f"exit:{code}"]
+    assert order == [f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", "logs", f"exit:{code}"]
 
 
 def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
@@ -1709,7 +1941,7 @@ def test_main_forces_the_exit_when_the_reactor_release_was_abandoned(
 
     assert excinfo.value.code == EXIT_CLEANUP_TIMEOUT
     assert abandoned == [True], "the timed-out release has to be recorded"
-    assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", "exit:1"]
+    assert order == [f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", "logs", "exit:1"]
 
 
 def test_main_logs_the_traceback_and_exits_after_a_crash(
@@ -1745,11 +1977,12 @@ def test_main_logs_the_traceback_and_exits_after_a_crash(
     assert crashed[0].exc_info is not None
     assert crashed[0].exc_info[0] is RuntimeError
     assert "the daemon crashed" in caplog.text
-    # Same exit tail as a signal: logs, then the Sentry flush, then the exit -
-    # with the traceback written before all three, because ``logging.shutdown``
-    # closes the handlers and ``os._exit`` writes nothing at all.
+    # Same exit tail as a signal: the Sentry flush, then the logs, then the
+    # exit - with the traceback written before all three, because
+    # ``logging.shutdown`` closes the handlers and ``os._exit`` writes nothing
+    # at all.
     assert excinfo.value.code == EXIT_CRASH
-    assert order == ["logs", f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", f"exit:{EXIT_CRASH}"]
+    assert order == [f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}", "logs", f"exit:{EXIT_CRASH}"]
 
 
 @pytest.mark.parametrize(
@@ -1781,6 +2014,48 @@ def test_a_crash_exits_with_the_code_the_interpreter_would_have_used(
 
     assert excinfo.value.code == expected
     assert order[-1] == f"exit:{expected}"
+
+
+def test_leave_the_process_flushes_everything_before_os_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``os._exit`` skips every flush the interpreter would have done.
+
+    The order is the contract: the bounded Sentry flush runs while the log
+    handlers are still open (its own failure is a log record), then the
+    handlers, then the standard streams - a traceback or print buffered at
+    the moment of the exit must reach the operator before the process is
+    gone - and only then ``os._exit``.
+    """
+    order: list[str] = []
+
+    class _Stream:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def write(self, _text: str) -> int:
+            return 0
+
+        def flush(self) -> None:
+            order.append(self._name)
+
+    monkeypatch.setattr(daemon, "flush_sentry", _record_flush(order))
+    monkeypatch.setattr(daemon.logging, "shutdown", lambda: order.append("logs"))
+    monkeypatch.setattr(sys, "stdout", _Stream("stdout"))
+    monkeypatch.setattr(sys, "stderr", _Stream("stderr"))
+    monkeypatch.setattr(daemon.os, "_exit", _record_exit(order))
+
+    with pytest.raises(_ProcessLeft) as excinfo:
+        daemon._leave_the_process(EXIT_OK)
+
+    assert excinfo.value.code == EXIT_OK
+    assert order == [
+        f"sentry:{SENTRY_FLUSH_TIMEOUT_SECONDS}",
+        "logs",
+        "stdout",
+        "stderr",
+        f"exit:{EXIT_OK}",
+    ]
 
 
 def test_shutdown_timeouts_are_bounded_by_default() -> None:

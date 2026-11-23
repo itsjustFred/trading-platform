@@ -3,8 +3,8 @@
 Shutdown contract (see ``live_runner.daemon.run_daemon``):
 
 1. The first SIGINT/SIGTERM stops the daemon accepting new work: an order
-   submission, a trailing-stop amendment and a STOPPED enforcement sweep are
-   all refused once the flag is set.
+   submission, a trailing-stop amendment, a STOPPED enforcement sweep and a
+   kill-switch sweep are all refused once the flag is set.
 2. Broker work that is already in flight is allowed to finish, up to a
    timeout. Cancelling it mid-request would leave the broker outcome unknown.
    Every kind of in-flight broker work shares one ledger (the coordinator's
@@ -14,8 +14,8 @@ Shutdown contract (see ``live_runner.daemon.run_daemon``):
    thread pool is released so the interpreter can exit.
 4. Exit code 0 on a clean shutdown, non-zero when a cleanup phase timed out or
    failed. After a non-zero exit the outcome of the broker work that did not
-   finish (an order submission, a stop amendment, a stopped-deployment sweep) is
-   unknown and needs reconciliation.
+   finish (an order submission, a stop amendment, a stopped-deployment or
+   kill-switch sweep) is unknown and needs reconciliation.
 5. A second signal forces an immediate exit.
 
 Every step is bounded: the drain gets ``DEFAULT_DRAIN_TIMEOUT_SECONDS`` and each
@@ -50,6 +50,7 @@ handler is harmless but it will never fire there.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -58,6 +59,7 @@ import threading
 from collections.abc import Callable
 from types import FrameType
 
+from shared.alerts import SHUTDOWN_FLUSH_SECONDS
 from shared.logging import get_logger
 
 logger = get_logger("live_runner.shutdown")
@@ -81,15 +83,41 @@ EXIT_CRASH = 1
 # ``WORST_CASE_SHUTDOWN_SECONDS``.
 CLEANUP_PHASE_COUNT = 7
 
+#: The daemon's shutdown drain guard for one broker mutation:
+#: ``async with gate() as may_mutate`` registers the mutation so the shutdown
+#: drain waits for it instead of cancelling a request whose broker outcome is
+#: unknown, and refuses it (``may_mutate`` False) once shutdown was requested.
+#: ``live_runner.daemon._broker_mutation`` is the production gate; the trailing
+#: stop manager and the kill-switch sweep take it as a parameter so they stay
+#: testable without the daemon.
+BrokerMutationGate = Callable[[], contextlib.AbstractAsyncContextManager[bool]]
+
+#: How long ``run_daemon`` waits for its own worker threads to finish joining
+#: before it stops waiting for them. The join covers ``asyncio.to_thread``
+#: bodies - the startup discovery's database reads and writes, and a loop
+#: iteration's own - which normally finish in milliseconds. One still running
+#: after this budget is inside a call that is not coming back (a broker stream
+#: thread whose socket never closes), and a process that trades nothing must not
+#: wait for it while holding the single-instance lock.
+WORKER_JOIN_TIMEOUT_SECONDS = 30.0
+
 # The longest a bounded shutdown can take: the drain, then one deadline per
-# cleanup phase. A service manager that stops the daemon (``systemctl stop`` →
+# cleanup phase, then the two bounded waits ``run_daemon`` still owes inside
+# its own ``finally`` before it returns its verdict - the worker-thread join
+# (a worker still writing keeps the single-instance lock, so the join is the
+# price of never releasing the lock under a live writer) and the alert-sink
+# flush (the shutdown's own ERROR records are the ones most likely to be
+# queued). A service manager that stops the daemon (``systemctl stop`` →
 # SIGTERM, then SIGKILL at ``TimeoutStopSec``) must stay above this or it kills
 # the daemon before it can report its exit code, which is the signal an
 # operator needs when a broker outcome was left unknown. Kept here, next to the
 # timeouts, so the number the runbook and the unit file quote is computed rather
 # than retold.
 WORST_CASE_SHUTDOWN_SECONDS = (
-    DEFAULT_DRAIN_TIMEOUT_SECONDS + CLEANUP_PHASE_COUNT * DEFAULT_CLEANUP_TIMEOUT_SECONDS
+    DEFAULT_DRAIN_TIMEOUT_SECONDS
+    + CLEANUP_PHASE_COUNT * DEFAULT_CLEANUP_TIMEOUT_SECONDS
+    + WORKER_JOIN_TIMEOUT_SECONDS
+    + SHUTDOWN_FLUSH_SECONDS
 )
 
 # How much of the budget the exit path may still spend: the tail that runs after
@@ -291,6 +319,9 @@ def force_exit(code: int = FORCED_EXIT_CODE) -> None:
     """Terminate immediately (second signal). Flushes logs, skips all cleanup."""
     try:
         logging.shutdown()
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
     finally:
         os._exit(code)
 
@@ -312,6 +343,16 @@ class ShutdownCoordinator:
     @property
     def requested(self) -> bool:
         return self._requested
+
+    def requested_on(self, loop: asyncio.AbstractEventLoop) -> bool:
+        """Whether shutdown was requested for the run bound to ``loop``.
+
+        ``requested`` alone outlives its run: it stays set after the daemon
+        exits until the next ``bind``, and the coordinator is process-wide, so
+        a caller on a different (newer) loop must not read a finished run's
+        flag as its own stop.
+        """
+        return self._requested and self._loop is loop
 
     @property
     def reactor_release_abandoned(self) -> bool:

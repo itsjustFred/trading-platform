@@ -32,9 +32,11 @@ from live_runner.shutdown import (
     EXIT_PATH_TIMEOUT_SECONDS,
     EXIT_PATH_WINDOW_SECONDS,
     SENTRY_FLUSH_TIMEOUT_SECONDS,
+    WORKER_JOIN_TIMEOUT_SECONDS,
     WORST_CASE_SHUTDOWN_SECONDS,
     ShutdownCoordinator,
 )
+from shared.alerts import SHUTDOWN_FLUSH_SECONDS
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "live-deploy-runbook.md"
@@ -66,13 +68,25 @@ def _unit_block(script: str, unit_name: str) -> str:
     return script.split(marker, 1)[1].split("\ncat <<EOF", 1)[0]
 
 
-def test_the_budget_is_the_drain_plus_one_deadline_per_phase() -> None:
-    """The published worst case is computed, not retold."""
+def test_the_budget_is_the_drain_phases_and_the_daemons_own_tail() -> None:
+    """The published worst case is computed, not retold.
+
+    It has to cover every wait a stop can spend before ``main`` starts its
+    exit path: the drain, one deadline per cleanup phase, and the two bounded
+    waits ``run_daemon`` still owes inside its own ``finally`` - the worker
+    join and the alert-sink flush. Omitting either is how the documented
+    window ended up 32 s shorter than the real one.
+    """
     assert CLEANUP_PHASE_COUNT > 0
     assert DEFAULT_DRAIN_TIMEOUT_SECONDS > 0
     assert DEFAULT_CLEANUP_TIMEOUT_SECONDS > 0
+    assert WORKER_JOIN_TIMEOUT_SECONDS > 0
+    assert SHUTDOWN_FLUSH_SECONDS > 0
     assert WORST_CASE_SHUTDOWN_SECONDS == (
-        DEFAULT_DRAIN_TIMEOUT_SECONDS + CLEANUP_PHASE_COUNT * DEFAULT_CLEANUP_TIMEOUT_SECONDS
+        DEFAULT_DRAIN_TIMEOUT_SECONDS
+        + CLEANUP_PHASE_COUNT * DEFAULT_CLEANUP_TIMEOUT_SECONDS
+        + WORKER_JOIN_TIMEOUT_SECONDS
+        + SHUTDOWN_FLUSH_SECONDS
     )
 
 
@@ -158,6 +172,24 @@ def test_the_runbook_states_the_budget_the_code_actually_has() -> None:
     assert float(sentry_flush.group(1)) == SENTRY_FLUSH_TIMEOUT_SECONDS, (
         "the documented flush must be the computed one"
     )
+    worker_join = re.search(
+        r"at most (\d+(?:\.\d+)?) s \(`WORKER_JOIN_TIMEOUT_SECONDS`\)", section
+    )
+    assert worker_join is not None, (
+        "the runbook must state the worker join the shutdown budget counts"
+    )
+    assert float(worker_join.group(1)) == WORKER_JOIN_TIMEOUT_SECONDS, (
+        "the documented worker join must be the computed one"
+    )
+    alert_flush = re.search(
+        r"at most (\d+(?:\.\d+)?) s \(`SHUTDOWN_FLUSH_SECONDS`\)", section
+    )
+    assert alert_flush is not None, (
+        "the runbook must state the alert-sink flush the shutdown budget counts"
+    )
+    assert float(alert_flush.group(1)) == SHUTDOWN_FLUSH_SECONDS, (
+        "the documented alert flush must be the computed one"
+    )
 
 
 def test_the_exit_path_is_bounded_and_short() -> None:
@@ -211,8 +243,9 @@ def test_the_generated_daemon_unit_outlives_the_worst_case_shutdown() -> None:
         f"TimeoutStopSec={seconds:g} is inside the "
         f"{WORST_CASE_SHUTDOWN_SECONDS + EXIT_PATH_WINDOW_SECONDS:g} s shutdown window"
     )
-    # The reviewed value: the worst case plus 30 s for the exit path itself.
-    assert seconds == 180.0
+    # The reviewed value: the 206 s window plus headroom for the join and flush
+    # waits jittering against their own deadlines.
+    assert seconds == 240.0
     # And the runbook tells the operator the unit file it generates, so a
     # hand-written unit can be checked against the same number. Compare the whole
     # number, not a substring: "TimeoutStopSec=180" is also a prefix of the

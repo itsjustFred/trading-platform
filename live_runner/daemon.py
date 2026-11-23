@@ -130,6 +130,7 @@ from live_runner.shutdown import (
     EXIT_PATH_TIMEOUT_SECONDS,
     FORCED_EXIT_CODE,
     SENTRY_FLUSH_TIMEOUT_SECONDS,
+    WORKER_JOIN_TIMEOUT_SECONDS,
     ShutdownCoordinator,
     SubmissionRefusedError,
     close_the_loop_bounded,
@@ -3191,7 +3192,8 @@ async def _broker_mutation() -> AsyncIterator[bool]:
     """Count one broker mutation on the shutdown ledger for the drain to see.
 
     A broker mutation - a trailing-stop amendment, a stopped deployment's
-    enforcement sweep - has the same two requirements as an order submission,
+    enforcement sweep, a kill-switch sweep - has the same two requirements as
+    an order submission,
     and the two share one in-flight ledger (an order submission *is* a broker
     mutation):
 
@@ -6575,6 +6577,19 @@ async def sync_deployments_loop(
     halt_state = read_kill_switch_state()
     while True:
         try:
+            # Once the stop flag is set for this loop the shutdown drain owns
+            # every broker mutation and the cleanup phases own every adapter
+            # and task: a tick from here could only start what both are trying
+            # to stop - a new adapter connect, a listener or Discord task, an
+            # enforcement sweep the mutation gate would refuse a moment later.
+            # ``requested_on`` ties the flag to THIS loop: the coordinator is
+            # process-wide and its ``requested`` stays set after a run until
+            # the next ``bind``, so a stale flag from a finished run must not
+            # idle this loop forever. Sleep through the drain instead; the
+            # flag cannot be cleared, so there is nothing left to reconcile.
+            if _ACTIVE_SHUTDOWN.requested_on(asyncio.get_running_loop()):
+                await asyncio.sleep(interval_seconds)
+                continue
             # Read credential file directly without repeatedly mutating process env.
             current_mtime = _accounts_env_mtime(accounts_env)
             if current_mtime != accounts_env_mtime:
@@ -6689,6 +6704,10 @@ async def sync_deployments_loop(
                 active_adapters,
                 halt_enforcement_account_ids | retained_account_ids | set(active_adapters),
                 state=halt_state,
+                # A sweep is broker work like the STOPPED enforcement above:
+                # the drain waits for one already running and none may start
+                # once the stop flag is set.
+                mutation_gate=_broker_mutation,
             )
             if kill_switch_report.modes:
                 logger.warning(
@@ -6833,9 +6852,10 @@ async def _shutdown_cleanup(
     """Bounded shutdown sequence. Returns True when every phase completed in time.
 
     The drain comes first and covers every kind of in-flight broker work (an
-    order submission, a stop amendment, a stopped-deployment sweep): cancelling
-    any of them mid-request would leave the broker outcome unknown. Only after
-    it is anything cancelled, and by then no broker request can be started.
+    order submission, a stop amendment, a stopped-deployment sweep, a
+    kill-switch sweep): cancelling any of them mid-request would leave the
+    broker outcome unknown. Only after it is anything cancelled, and by then
+    no broker request can be started.
 
     The drain and every one of the ``live_runner.shutdown.CLEANUP_PHASE_COUNT``
     phases below has its own deadline (``drain_timeout`` / ``cleanup_timeout``),
@@ -6854,7 +6874,8 @@ async def _shutdown_cleanup(
     ok = True
     # 1. Let the broker work that is already in flight finish: an order
     #    submission a listener task owns, a trailing-stop amendment, a stopped
-    #    deployment's cancel/flatten sweep. All three register on the
+    #    deployment's cancel/flatten sweep, a kill-switch sweep. All of them
+    #    register on the
     #    coordinator's in-flight ledger, so the drain waits for them here -
     #    before anything is cancelled. Cancelling one of them would leave the
     #    broker outcome unknown. Nothing new can start meanwhile: the stop flag
@@ -6864,8 +6885,8 @@ async def _shutdown_cleanup(
         ok = False
         logger.error(
             "Shutdown timed out waiting for in-flight broker work (order "
-            "submissions, stop amendments, stopped-deployment sweeps); "
-            "their broker outcome is unknown and needs reconciliation",
+            "submissions, stop amendments, stopped-deployment and kill-switch "
+            "sweeps); their broker outcome is unknown and needs reconciliation",
             extra={
                 "data": {
                     "in_flight": shutdown.inflight,
@@ -7005,15 +7026,6 @@ async def _start_daemon_services(
     )
     await asyncio.to_thread(_recover_failed_services)
     await scheduler.start()
-
-
-#: How long the daemon waits for its own worker threads to finish joining before it stops waiting
-#: for them. The join covers ``asyncio.to_thread`` bodies - the startup discovery's database reads
-#: and writes, and a loop iteration's own - which normally finish in milliseconds. One still running
-#: after this budget is inside a call that is not coming back (a broker stream thread whose socket
-#: never closes), and a process that trades nothing must not wait for it while holding the
-#: single-instance lock.
-WORKER_JOIN_TIMEOUT_SECONDS = 30.0
 
 
 class WorkerJoinTimeout(RuntimeError):
@@ -7473,9 +7485,18 @@ def _leave_the_process(exit_code: int) -> None:
     interpreter teardown ever runs for the live daemon, so no ``atexit`` hook, no
     ``__del__``, no second pass of generator finalisation. Everything the daemon
     needs on the way out is already closed by the bounded shutdown above.
+
+    The order of the tail is the contract: the bounded Sentry flush runs while
+    the log handlers are still open - its own failure is a log record - then
+    the handlers, then the standard streams, because ``os._exit`` skips every
+    flush the interpreter would have done and a traceback or print still
+    buffered at this point would be lost with the process.
     """
-    logging.shutdown()
     flush_sentry(SENTRY_FLUSH_TIMEOUT_SECONDS)
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
     os._exit(exit_code)
 
 
