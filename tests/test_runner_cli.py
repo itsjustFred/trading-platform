@@ -93,6 +93,303 @@ def test_cmd_run_persists_canonical_stats(monkeypatch, tmp_path: Path):
     assert payload["stats"]["total_return"] == 0.05
 
 
+def test_cmd_run_records_not_modeled_slippage_note_for_out_of_scope_engine(
+    monkeypatch, tmp_path: Path
+):
+    """#130: engines outside native/signal-replay get an explicit 'not
+    modeled' slippage record — never silence."""
+    output_path = tmp_path / "cli-demo.trades.json"
+
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    args = SimpleNamespace(
+        engine="vectorbt",
+        strategy="strategies/demo.py",
+        symbols=["AAPL"],
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-02-01",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        data_dir="",
+        params="{}",
+        name="demo",
+        output=str(output_path),
+        slippage=None,
+        slippage_bps=None,
+        slippage_default_bps=None,
+    )
+
+    runner_cli.cmd_run(args)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    slippage = payload["meta"]["data"]["slippage"]
+    assert slippage["models"] == {}
+    assert "does not apply a slippage model" in slippage["note"]
+
+
+def _slippage_args(**overrides):
+    base = dict(
+        engine="vectorbt",
+        strategy="strategies/demo.py",
+        symbols=["AAPL"],
+        timeframe="1d",
+        start="2024-01-01",
+        end="2024-02-01",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        data_dir="",
+        params="{}",
+        name="demo",
+        output="",
+        result_id="",
+        skip_sqlite=True,
+        keep_indicators=False,
+        progress_stdout=False,
+        intrabar_resolution="open_close",
+        universe_source="",
+        universe_as_of="",
+        universe_membership="",
+        universe_source_name="",
+        fee_rate=None,
+        fee_flat_per_trade=None,
+        fees_zero=False,
+        slippage=None,
+        slippage_bps=None,
+        slippage_default_bps=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_cmd_run_rejects_declared_slippage_on_out_of_scope_engine(
+    monkeypatch, tmp_path: Path
+):
+    """#130: ``run --engine vectorbt --slippage-bps 5`` must fail closed —
+    the engine has no slippage path, so the flag would be silently ignored."""
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    args = _slippage_args(slippage="bps", slippage_bps=5.0)
+    with pytest.raises(ValueError, match="does not model slippage"):
+        runner_cli.cmd_run(args)
+
+
+def test_cmd_run_allows_explicit_none_slippage_on_out_of_scope_engine(
+    monkeypatch, tmp_path: Path
+):
+    """``slippage='none'`` declares the gross behaviour vectorbt already
+    has — allowed, and still recorded as 'not modeled'."""
+    output_path = tmp_path / "cli-demo.trades.json"
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _DummyEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    args = _slippage_args(slippage="none", output=str(output_path))
+    runner_cli.cmd_run(args)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert "does not apply a slippage model" in payload["meta"]["data"]["slippage"]["note"]
+    assert payload["meta"]["data"]["pnl_basis"]["slippage_embedded"] is False
+
+
+def test_cmd_run_forwards_slippage_flags_into_params(monkeypatch, tmp_path: Path):
+    """Mutant guard: the CLI slippage flags must reach engine params."""
+    captured: dict[str, object] = {}
+
+    class _CaptureEngine(_DummyEngine):
+        name = "native"
+
+        def validate_config(self, config):
+            captured["parameters"] = dict(config.parameters)
+            return []
+
+    monkeypatch.setattr(runner_cli, "get_engine", lambda _: _CaptureEngine())
+    monkeypatch.setattr(runner_cli, "ensure_backtest_data", lambda **_kwargs: [])
+
+    args = _slippage_args(
+        slippage="bps",
+        slippage_bps=7.5,
+        slippage_default_bps=2.5,
+        output=str(tmp_path / "out.json"),
+    )
+    runner_cli.cmd_run(args)
+
+    params = captured["parameters"]
+    assert params["slippage"] == "bps"
+    assert params["slippage_bps"] == 7.5
+    assert params["slippage_default_bps"] == 2.5
+
+
+def test_cmd_walkforward_forwards_slippage_flags(monkeypatch, capsys):
+    captured: dict[str, object] = {}
+
+    def fake_run_walkforward(**kwargs):
+        captured.update(kwargs)
+        return {"mode": "strategy", "summary": {}, "output_path": ""}
+
+    monkeypatch.setattr(runner_cli, "run_walkforward", fake_run_walkforward)
+
+    args = SimpleNamespace(
+        strategy="strategies/demo.py",
+        engine="native",
+        symbols="SPY",
+        timeframe="1d",
+        start="2020-01-01",
+        end="2022-01-01",
+        capital=100000.0,
+        train_months=12,
+        test_months=3,
+        step_months=None,
+        purge_days=0,
+        embargo_days=0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params="{}",
+        data_dir="",
+        output_dir="",
+        fee_rate=None,
+        fee_flat_per_trade=None,
+        fees_zero=False,
+        slippage="bps",
+        slippage_bps=7.5,
+        slippage_default_bps=None,
+    )
+    runner_cli.cmd_walkforward(args)
+
+    assert captured["params"]["slippage"] == "bps"
+    assert captured["params"]["slippage_bps"] == 7.5
+
+
+def test_cmd_grid_forwards_slippage_flags(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_run_backtest_grid(**kwargs):
+        captured.update(kwargs)
+        return {"runs": [], "failed": 0}
+
+    monkeypatch.setattr(runner_cli, "run_backtest_grid", fake_run_backtest_grid)
+
+    args = SimpleNamespace(
+        strategy="strategies/demo.py",
+        symbols="SPY",
+        timeframes="1d",
+        start="2020-01-01",
+        end="2021-01-01",
+        engine="native",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params="{}",
+        output_dir="",
+        data_dir="",
+        max_workers=1,
+        timeout_seconds=60,
+        resume=False,
+        subprocess=False,
+        skip_sqlite=True,
+        keep_indicators=False,
+        fee_rate=None,
+        fee_flat_per_trade=None,
+        fees_zero=False,
+        slippage="bps",
+        slippage_bps=7.5,
+        slippage_default_bps=None,
+    )
+    runner_cli.cmd_grid(args)
+
+    assert captured["params"]["slippage"] == "bps"
+    assert captured["params"]["slippage_bps"] == 7.5
+
+
+def test_cmd_matrix_forwards_slippage_flags(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_run_backtest_matrix(**kwargs):
+        captured.update(kwargs)
+        return {"rows": [], "failed_cells": 0}
+
+    monkeypatch.setattr(runner_cli, "run_backtest_matrix", fake_run_backtest_matrix)
+
+    args = SimpleNamespace(
+        strategy=["demo"],
+        strategies_dir="strategies",
+        symbols="SPY",
+        timeframes="1d",
+        start="2020-01-01",
+        end="2021-01-01",
+        engine="native",
+        capital=100000.0,
+        risk_pct=None,
+        max_position_exposure_pct=None,
+        max_leverage=None,
+        intrabar_resolution="open_close",
+        params="{}",
+        output_dir="",
+        data_dir="",
+        max_workers=1,
+        timeout_seconds=60,
+        resume=False,
+        subprocess=False,
+        skip_sqlite=True,
+        keep_indicators=False,
+        fee_rate=None,
+        fee_flat_per_trade=None,
+        fees_zero=False,
+        slippage="bps",
+        slippage_bps=7.5,
+        slippage_default_bps=None,
+    )
+    runner_cli.cmd_matrix(args)
+
+    assert captured["params"]["slippage"] == "bps"
+    assert captured["params"]["slippage_bps"] == 7.5
+
+
+def test_run_backtest_grid_rejects_declared_slippage_on_vectorbt(tmp_path: Path):
+    """The grid defaults to vectorbt — a declared slippage model must fail
+    before any cell runs, not produce gross artifacts."""
+    from runner.backtest_grid import run_backtest_grid
+
+    with pytest.raises(ValueError, match="does not model slippage"):
+        run_backtest_grid(
+            strategy="strategies/demo.py",
+            symbols=["SPY"],
+            timeframes=["1d"],
+            start="2020-01-01",
+            end="2021-01-01",
+            engine="vectorbt",
+            params={"slippage": "bps", "slippage_bps": 5.0},
+            output_dir=tmp_path,
+        )
+
+
+def test_run_walkforward_rejects_declared_slippage_on_vectorbt():
+    from runner.walkforward import run_walkforward
+
+    class _StubEngine:
+        name = "vectorbt"
+
+    with pytest.raises(ValueError, match="does not model slippage"):
+        run_walkforward(
+            strategy="strategies/demo.py",
+            engine=_StubEngine(),
+            symbols=["SPY"],
+            timeframe="1d",
+            start="2020-01-01",
+            end="2022-01-01",
+            params={"slippage_bps": 5.0},
+        )
+
+
 def test_cmd_run_refuses_unapproved_generated_strategy(monkeypatch, tmp_path: Path):
     from runner.approval_gate import StrategyNotApprovedError, mark_generated_strategy
 
