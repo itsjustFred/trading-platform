@@ -49,6 +49,7 @@ import os
 import re
 import subprocess
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -177,7 +178,7 @@ def _scan_file(path: Path) -> tuple[Counter[str], list[str]]:
     return tags, forbidden
 
 
-def _iter_source_files() -> list[Path]:
+def _iter_source_files(repo_root: Path = REPO_ROOT) -> list[Path]:
     """Tracked ``*.py`` files only, via ``git ls-files``.
 
     Scanning the working tree would flag unrelated local clutter (a scratch
@@ -186,15 +187,14 @@ def _iter_source_files() -> list[Path]:
     first-party source; if git cannot answer, fail loudly rather than fall
     back to an untracked-file scan.
     """
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-    }
+    # Inherit the user environment minus GIT_*: a parent GIT_DIR/GIT_WORK_TREE
+    # must not redirect the query, while HOME (and with it a user's
+    # safe.directory setting) stays so container/devcontainer checkouts owned
+    # by another uid do not die on "dubious ownership".
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         proc = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", "*.py"],
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--", "*.py"],
             capture_output=True,
             env=env,
             check=True,
@@ -217,7 +217,14 @@ def _iter_source_files() -> list[Path]:
             continue
         if rel.parts[:2] == ("shared", "indicators"):
             continue
-        files.append(REPO_ROOT / rel)
+        path = repo_root / rel
+        # `ls-files` still lists a tracked file deleted in the working tree;
+        # scanning it would crash on FileNotFoundError. Skip it — the roster
+        # comparison then reports the removed signal, which is the intended
+        # message for a deleted allowlisted file.
+        if not path.is_file():
+            continue
+        files.append(path)
     return files
 
 
@@ -232,7 +239,9 @@ def _is_generated_strategy(path: Path, repo_root: Path = REPO_ROOT) -> bool:
     generated provenance — the ``.generated.json`` marker written by
     ``mark_generated_strategy`` or a ``STRATEGY_META.provenance.generated``
     declaration (both defined by ``runner.approval_gate``). Hand-written code
-    can never qualify.
+    cannot qualify by accident — any file *can* declare the provenance, but
+    ``require_generated_strategy_approval`` then demands an approval ledger
+    entry before the strategy may run, which is the real deterrent.
     """
     try:
         rel = path.resolve().relative_to(repo_root.resolve())
@@ -367,35 +376,48 @@ def test_no_third_party_indicator_libraries() -> None:
     )
 
 
-def test_private_indicator_copies_match_roster() -> None:
+def _roster_problems(
+    paths: Iterable[Path],
+    *,
+    expected: dict[str, dict[str, int]] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> list[str]:
+    """Compare scanned private-copy signals against the ``_ALLOWED`` roster.
+
+    Generated strategies are exempt (see ``_is_generated_strategy``):
+    codegen emits self-contained pandas by contract, so its ``.rolling()``/
+    ``.ewm()`` chains are required, not copied indicators. Parameterised over
+    the file set and root so the exemption wiring itself can be tested on a
+    scratch tree — with no tracked generated file in the repo, the skip in
+    ``test_private_indicator_copies_match_roster`` would otherwise be
+    untested.
+    """
+    roster = _ALLOWED if expected is None else expected
     actual: dict[str, dict[str, int]] = {}
-    for path in _iter_source_files():
-        # Generated strategies are exempt (see _is_generated_strategy):
-        # codegen emits self-contained pandas by contract, so its
-        # .rolling()/.ewm() chains are required, not copied indicators.
-        if _is_generated_strategy(path):
+    for path in paths:
+        if _is_generated_strategy(path, repo_root=repo_root):
             continue
         tags, _forbidden = _scan_file(path)
         if tags:
-            actual[path.relative_to(REPO_ROOT).as_posix()] = dict(sorted(tags.items()))
+            actual[path.relative_to(repo_root).as_posix()] = dict(sorted(tags.items()))
 
-    expected = {name: dict(sorted(counts.items())) for name, counts in _ALLOWED.items()}
+    expected_map = {name: dict(sorted(counts.items())) for name, counts in roster.items()}
 
     stale_entries = sorted(
-        name for name in expected if not (REPO_ROOT / name).exists()
+        name for name in expected_map if not (repo_root / name).exists()
     )
     missing_signals = sorted(
         name
-        for name in expected
-        if (REPO_ROOT / name).exists() and name not in actual
+        for name in expected_map
+        if (repo_root / name).exists() and name not in actual
     )
     unexpected = {
-        name: counts for name, counts in actual.items() if name not in expected
+        name: counts for name, counts in actual.items() if name not in expected_map
     }
     mismatched = {
-        name: {"expected": expected[name], "actual": actual[name]}
-        for name in expected.keys() & actual.keys()
-        if expected[name] != actual[name]
+        name: {"expected": expected_map[name], "actual": actual[name]}
+        for name in expected_map.keys() & actual.keys()
+        if expected_map[name] != actual[name]
     }
 
     problems: list[str] = [
@@ -416,6 +438,11 @@ def test_private_indicator_copies_match_roster() -> None:
         for name, diff in mismatched.items()
     )
 
+    return problems
+
+
+def test_private_indicator_copies_match_roster() -> None:
+    problems = _roster_problems(_iter_source_files())
     assert not problems, "\n".join(problems)
 
 
@@ -464,3 +491,65 @@ def test_generated_exempt_file_still_flagged_without_provenance(tmp_path: Path) 
     )
     tags, _ = _scan_file(path)
     assert tags, "fixture must produce a private-copy signal to be meaningful"
+
+
+def test_roster_comparison_applies_the_generated_exemption(tmp_path: Path) -> None:
+    """The exemption must be wired into the roster check itself.
+
+    No tracked file in the repo is generated today, so the ``continue`` in
+    ``_roster_problems`` was previously unpinned: deleting it changed
+    nothing. On a scratch tree the marked file must produce no problem
+    while the identical unmarked file is flagged as a new private copy.
+    """
+    marked = _write_generated_fixture(
+        tmp_path, "strategies/gen_x/gen_x.py", marker=True, declared=False
+    )
+    unmarked = _write_generated_fixture(
+        tmp_path, "strategies/plain_y/plain_y.py", marker=False, declared=False
+    )
+
+    assert _roster_problems([marked], expected={}, repo_root=tmp_path) == []
+
+    problems = _roster_problems([marked, unmarked], expected={}, repo_root=tmp_path)
+    assert len(problems) == 1
+    assert "strategies/plain_y/plain_y.py" in problems[0]
+    assert "new private indicator copy" in problems[0]
+
+
+def test_iter_source_files_tolerates_tracked_but_deleted(tmp_path: Path) -> None:
+    """A tracked file deleted in the working tree is skipped, not a crash.
+
+    ``git ls-files`` keeps listing a deleted-but-unstaged file; ``_scan_file``
+    would raise FileNotFoundError on it. Build a scratch repo, commit a
+    file, delete it from the worktree, and the guard must return the
+    remaining files without raising.
+    """
+    import subprocess as sp
+
+    def git(*args: str) -> None:
+        sp.run(
+            ["git", "-C", str(tmp_path), *args],
+            check=True,
+            capture_output=True,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("GIT_")
+            },
+        )
+
+    git("init", "-q")
+    kept = tmp_path / "kept.py"
+    kept.write_text("x = 1\n", encoding="utf-8")
+    deleted = tmp_path / "deleted.py"
+    deleted.write_text("y = 2\n", encoding="utf-8")
+    git("add", "kept.py", "deleted.py")
+    git(
+        "-c", "user.email=test@example.com", "-c", "user.name=test",
+        "commit", "-qm", "init",
+    )
+    deleted.unlink()
+
+    files = _iter_source_files(repo_root=tmp_path)
+
+    assert files == [kept]
