@@ -235,6 +235,14 @@ jobs:
               echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
             fi
           }
+          # opencode repeats the provider's error on every retry line ("retrying
+          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
+          # A cap only counts once all retries are through, so the quota classifier
+          # reads stderr without those lines (<file>.final); the final error line
+          # stays.
+          drop_retry_lines() {
+            grep -v 'retrying (attempt' "$1" > "$1.final" || true
+          }
           # opencode has been seen exiting 0 on the cap for this tiny prompt,
           # so the exit status alone cannot clear the model: the quota
           # signature is grepped over BOTH streams whatever the status, and
@@ -247,6 +255,7 @@ jobs:
             "Reply with the single word: OK" 2> "$probe_dir/stderr") || status=$?
           printf '%s\n' "$raw" > "$probe_dir/stdout"
           note_exhausted_retries "$probe_dir/stderr"
+          drop_retry_lines "$probe_dir/stderr"
           cat "$probe_dir/stdout" "$probe_dir/stderr" > "$probe_dir/combined"
           # Always logged, bounded like the agent step's echo: run 44962236033
           # passed this probe and hit "Free usage limit reached" 26 s later,
@@ -261,7 +270,7 @@ jobs:
           # an exhausted quota or a region refusal - and deliberately not the
           # misconfiguration class (a model or variant that cannot be resolved
           # at all): that is a genuine failure, and the agent job reports it.
-          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr"; then
+          if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$probe_dir/stdout" "$probe_dir/stderr.final"; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::warning::The free model is capped, rate-limited, region-refused or unavailable; the agent job is skipped - not run: quota. Re-run the workflow after the quota resets."
           elif [ "$status" -eq 0 ] && grep -qw 'OK' "$probe_dir/stdout"; then
@@ -451,6 +460,14 @@ jobs:
               echo 'rate limit: opencode gave up retrying a retryable provider error' >> "$1"
             fi
           }
+          # opencode repeats the provider's error on every retry line ("retrying
+          # (attempt N): ... Too Many Requests"), also when a later retry succeeds.
+          # A cap only counts once all retries are through, so the quota classifier
+          # reads stderr without those lines (<file>.final); the final error line
+          # stays.
+          drop_retry_lines() {
+            grep -v 'retrying (attempt' "$1" > "$1.final" || true
+          }
           report_quota_skip() {
             echo "::warning::The review agent could not run - the free model was capped, rate-limited, refused or unavailable (see the group above for the exact reason). That is a transient infra failure, not a review result: not run: quota. Re-run this job after the quota resets."
             {
@@ -470,6 +487,7 @@ jobs:
             "Review PR #${PR_NUMBER}. Base ${BASE_SHA}, head ${HEAD_SHA}. PR metadata: $RUNNER_TEMP/review/meta.json. Review rules loaded from: ${SKILL_SOURCE}." \
             2> "$out.stderr"); then
             note_exhausted_retries "$out.stderr"
+            drop_retry_lines "$out.stderr"
             printf '%s\n' "$raw" > "$out.raw"
             cat "$out.stderr" >> "$out.raw"
             # The reason the agent failed is only in stderr, and a file no one
@@ -488,7 +506,7 @@ jobs:
             # until the repository variable changes. Only the first class takes
             # the quota path; anything else fails with its own message and the
             # captured stderr above it.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.stderr.final"; then
               report_quota_skip
             elif grep -qiE 'model (is )?(not (found|available|supported))|no provider|invalid model|unknown variant' "$out.stderr"; then
               echo "::error::The review agent could not resolve its model - REVIEW_MODEL / REVIEW_VARIANT name a model, variant or provider that does not exist or is not authorised (see the group above for the exact reason). That is a configuration error, not a transient one: re-running this job cannot succeed until the repository variable changes."
@@ -498,6 +516,7 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$raw" > "$out.raw"
+          drop_retry_lines "$out.stderr"
           # stderr went to a file for the failure classifier; on success it
           # would otherwise never reach the log, so it is echoed bounded too.
           if [ -s "$out.stderr" ]; then
@@ -515,7 +534,7 @@ jobs:
             # classified before it fails. The grep covers the raw stream and
             # stderr both, and runs only here - a real report's own text may
             # mention "quota", so a produced report is never re-classified.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr.final"; then
               echo "::group::Agent output (last 4000 bytes)"
               tail -c 4000 "$out.raw"
               echo "::endgroup::"
@@ -531,7 +550,7 @@ jobs:
           if ! grep -v '^[[:space:]]*$' "$out" | tail -n 1 | grep -q '^\*\*Verdict:'; then
             # Same zero-exit cap as above: a report that starts but never reaches
             # a verdict line can still be the quota signature, on either stream.
-            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr"; then
+            if grep -qiE 'usage limit|rate.?limit|quota|insufficient credits|limit reached|not available in your country|service unavailable|overloaded|sign up for free to continue|too many requests' "$out.raw" "$out.stderr.final"; then
               echo "::group::Agent output (last 4000 bytes)"
               tail -c 4000 "$out.raw"
               echo "::endgroup::"

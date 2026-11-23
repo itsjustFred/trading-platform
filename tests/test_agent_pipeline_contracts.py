@@ -1704,7 +1704,7 @@ def test_the_free_model_quota_is_a_skip_not_a_failure() -> None:
     # grepped over the raw stream and stderr at both, so a cap on a zero exit takes
     # the quota path instead of going red. Only on those paths - a produced report's
     # own text may mention "quota".
-    dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr\""
+    dead_end_grep = f"grep -qiE '{transient}' \"$out.raw\" \"$out.stderr.final\""
     assert body.count(dead_end_grep) == 2, (
         "the two zero-exit dead ends do not both classify the quota signature"
     )
@@ -1919,6 +1919,11 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     printf 'Error: Provider request failed with HTTP 429: Too Many Requests\\n' >&2
     exit 1
     ;;
+  nvidia-retry-ok)
+    printf '! retrying (attempt 1): HTTP 429: Too Many Requests\\n' >&2
+    printf 'OK\\n'
+    exit 0
+    ;;
 esac
 """
 
@@ -2030,6 +2035,13 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
     result, written = _run_probe_step(tmp_path, "nvidia-429")
     assert result.returncode == 0, f"probe step failed on nvidia-429: {result.stderr}"
     assert "available=false" in written, "an NVIDIA 429 did not skip the agent job"
+    # Grey only once all retries are through: a 429 that cleared on a retry is a
+    # reachable model, and its retry line on stderr does not count.
+    result, written = _run_probe_step(tmp_path, "nvidia-retry-ok")
+    assert result.returncode == 0, f"probe step failed on nvidia-retry-ok: {result.stderr}"
+    assert "available=true" in written and "available=false" not in written, (
+        "a 429 that cleared on a retry skipped the agent job"
+    )
     result, written = _run_probe_step(tmp_path, "kilo-retry-ok")
     assert result.returncode == 0, f"probe step failed on kilo-retry-ok: {result.stderr}"
     assert "available=true" in written and "available=false" not in written, (
@@ -2342,6 +2354,7 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         ("garbage", False),
         ("other", False),
         ("kilo-400", False),
+        ("nvidia-retry-ok", False),
     ):
         case = tmp_path / mode
         case.mkdir()
