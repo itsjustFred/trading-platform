@@ -528,8 +528,33 @@ vorhandene OHLCV-Frame — ATR(14) samt Perzentil-Rang im Frame, Abstände zu
 SMA20/SMA50 und VWAP (nur wenn `volume` vorhanden), Gap der letzten Bar,
 grobe Trend-Regime (`above_sma50`/`below_sma50`) — und ist damit auch für
 die spätere Offline-Berechnung aus historischen OHLCV-Daten per
-`message_created_at` nutzbar (außer Spread, der Quotes bräuchte). Zusätzlich
-schreibt der Decision-Record Prozessor-Metadaten, wenn ein Processor läuft
+`message_created_at` nutzbar (außer Spread, der Quotes bräuchte).
+
+**Offline-Anreicherung.** `scripts/signal_archive_market_features.py`
+schließt diese Lücke: Es liest die `discord_signals-<tag>.jsonl`-Archive,
+joimet jeden parsbaren Signal-Record über Symbol und Timeframe mit dem
+lokalen OHLCV-Parquet-Store (`select_ohlcv_path`, gleiche
+Source-Priorität wie im Backtest) und schreibt pro Archiv-Tag eine
+Sidecar-Datei `signal_log/features/discord_signal_features-<tag>.jsonl`
+(abgeleitete Daten — pro Lauf komplett neu geschrieben, das
+Append-only-Archiv wird nie angefasst). Jeder Sidecar-Record trägt
+`discord_message_id`, `message_created_at`, Symbol, Timeframe,
+OHLCV-Pfad, `bars_used`, `features` und bei Ausfall einen `skip_reason`
+(`no_ohlcv`, `no_timeframe`, `unknown_timeframe`, `no_closed_bars`,
+`features_failed`, …),
+damit die Coverage gegen das Archiv prüfbar bleibt. Es werden nur
+**abgeschlossene** Balken verwendet (`bar_open + timeframe <=
+message_created_at`) — der noch laufende Balken zum Signalzeitpunkt
+fließt nie ein, und ATR-Perzentil-Rang sowie VWAP werden über ein festes
+Fenster (`--lookback-bars`, Default 250) berechnet, damit gleiche Signale
+unabhängig von der verfügbaren Historie dieselben Werte liefern. Aufruf:
+
+```bash
+python -m scripts.signal_archive_market_features [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--lookback-bars N] [--data-source SRC]
+```
+
+Der Decision-Record schreibt außerdem
+Prozessor-Metadaten, wenn ein Processor läuft
 (Processor-ATR, Supertrend-Entry-State, Slippage, Trailing-Mode). Die
 Clock-/Parse-Features (Stunde/Wochentag UTC, Content-Länge, explizites
 SL/TP, Exit-Flag) stehen im `discord_signal_received`-Record. Bewusst
