@@ -1,0 +1,19 @@
+tests/test_engine_behavior.py
+  s_95eb36a5a7ac14::t_acabc33ca5742c 2701-2728,2734-2741,2744-2745,2747,2754
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e05e015e0208432f37a48005b36449f8f9209f8f",
+  "prompts": {},
+  "sessions": {
+    "s_95eb36a5a7ac14": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_95eb36a5a7ac14",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
