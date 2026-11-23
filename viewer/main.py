@@ -12852,7 +12852,7 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
         or "\\" in normalized_id
     ):
         raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
-    raw_output_path = PORTFOLIOS_DIR / f"{normalized_id}.json"
+    raw_output_path = PORTFOLIOS_DIR / os.path.basename(f"{normalized_id}.json")
     if raw_output_path.is_symlink():
         raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     output_path = raw_output_path.resolve()
