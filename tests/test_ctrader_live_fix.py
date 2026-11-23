@@ -1696,3 +1696,168 @@ def test_ctrader_step_volume_comes_from_broker_props() -> None:
         )
         assert scale is not None
         assert scale.step_volume == 1
+
+
+def test_list_reconciliation_orders_reads_symbol_side_and_qty_from_trade_data() -> None:
+    """#303: ProtoOAOrder keeps symbolId/volume/tradeSide under tradeData, not at
+    the message root - the reconciliation view must read them there or every
+    detached order is reported with an empty symbol, side and qty."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderType,
+        ProtoOATradeSide,
+    )
+
+    adapter = _control_adapter(orders=[_order(501, ProtoOAOrderType.LIMIT)])
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._symbol_props = {}
+
+    views = _run(adapter.list_reconciliation_orders())
+
+    assert len(views) == 1
+    view = views[0]
+    assert view.order_id == "501"
+    assert view.symbol == "EURUSD"
+    assert view.side == "buy"
+    assert view.qty is not None and view.qty > 0
+
+
+def test_list_reconciliation_orders_fails_closed_on_an_unknown_symbol_id() -> None:
+    """An order whose tradeData names a symbol outside the cache cannot be
+    scaled; the read must raise so the reconciler reports the account
+    unreadable instead of emitting an unpriced view."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAReconcileRes
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderType,
+        ProtoOATradeData,
+        ProtoOATradeSide,
+    )
+
+    adapter = _control_adapter()
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._symbol_props = {}
+
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOAOrder
+
+    order = ProtoOAOrder()
+    order.orderId = 502
+    order.orderType = ProtoOAOrderType.LIMIT
+    order.orderStatus = 1
+    trade_data = ProtoOATradeData()
+    trade_data.symbolId = 999
+    trade_data.volume = 1000
+    trade_data.tradeSide = ProtoOATradeSide.BUY
+    order.tradeData.CopyFrom(trade_data)
+
+    snapshot = ProtoOAReconcileRes()
+    snapshot.order.append(order)
+
+    async def _reconcile_state():
+        return snapshot
+
+    adapter._reconcile_state = _reconcile_state
+
+    import pytest
+
+    with pytest.raises(ValueError, match="symbol id"):
+        _run(adapter.list_reconciliation_orders())
+
+
+def test_list_reconciliation_orders_fails_closed_on_missing_or_malformed_trade_data() -> None:
+    """A working order without readable tradeData is unreadable, not a blank view."""
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrder,
+        ProtoOAOrderType,
+        ProtoOATradeSide,
+    )
+
+    adapter = _control_adapter()
+    adapter._ProtoOATradeSide = ProtoOATradeSide
+    adapter._symbol_name_to_id = {"EURUSD": 1}
+    adapter._symbol_props = {}
+
+    missing = ProtoOAOrder()
+    missing.orderId = 601
+    missing.orderType = ProtoOAOrderType.LIMIT
+    missing.orderStatus = 1
+
+    zero_volume = ProtoOAOrder()
+    zero_volume.orderId = 602
+    zero_volume.orderType = ProtoOAOrderType.LIMIT
+    zero_volume.orderStatus = 1
+    zero_volume.tradeData.CopyFrom(_trade_data(volume=0))
+
+    bad_side = SimpleNamespace(
+        orderId=603,
+        orderType=int(ProtoOAOrderType.LIMIT),
+        orderStatus=1,
+        clientOrderId="bad-side",
+        positionId=0,
+        tradeData=SimpleNamespace(symbolId=1, volume=1000, tradeSide=999),
+    )
+
+    non_numeric = SimpleNamespace(
+        orderId=604,
+        orderType=int(ProtoOAOrderType.LIMIT),
+        orderStatus=1,
+        clientOrderId="bad-trade-data",
+        positionId=0,
+        tradeData=SimpleNamespace(symbolId="x", volume="x", tradeSide="x"),
+    )
+
+    for order in (missing, zero_volume, bad_side, non_numeric):
+        snapshot = SimpleNamespace(order=[order], position=[])
+
+        async def _reconcile_state(snapshot=snapshot):
+            return snapshot
+
+        adapter._reconcile_state = _reconcile_state
+        with pytest.raises(ValueError, match="tradeData"):
+            _run(adapter.list_reconciliation_orders())
+
+
+def test_get_order_state_reads_working_and_terminal_orders(tmp_path: Path) -> None:
+    """Reconciliation lookups classify one order via ProtoOAOrderDetailsReq."""
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+        ProtoOAOrderDetailsReq,
+        ProtoOAOrderDetailsRes,
+    )
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
+        ProtoOAOrderStatus,
+    )
+
+    from live_runner.ctrader_adapter import CTraderLiveAdapter
+
+    adapter = CTraderLiveAdapter(
+        app_id="app", app_secret="secret", access_token="token", account_id="123",
+        accounts_env_path=tmp_path / ".accounts.env",
+    )
+    adapter._connected = True
+    adapter._authenticated = True
+    adapter._ProtoOAOrderDetailsReq = ProtoOAOrderDetailsReq
+    adapter._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
+    adapter._ProtoOAOrderStatus = ProtoOAOrderStatus
+
+    statuses = {
+        301: ProtoOAOrderStatus.ORDER_STATUS_FILLED,
+        302: ProtoOAOrderStatus.ORDER_STATUS_ACCEPTED,
+        303: ProtoOAOrderStatus.ORDER_STATUS_CANCELLED,
+    }
+
+    async def _fake_send(request, **_kwargs):
+        assert isinstance(request, ProtoOAOrderDetailsReq)
+        res = ProtoOAOrderDetailsRes()
+        if request.orderId in statuses:
+            res.order.orderId = request.orderId
+            res.order.orderStatus = statuses[request.orderId]
+        return res
+
+    adapter._send_request_with_refresh_retry = _fake_send  # type: ignore[method-assign]
+
+    assert asyncio.run(adapter.get_order_state("301")) == "terminal"
+    assert asyncio.run(adapter.get_order_state("302")) == "working"
+    assert asyncio.run(adapter.get_order_state("303")) == "terminal"
+    # An order id the broker does not know reads as unknown, never terminal.
+    assert asyncio.run(adapter.get_order_state("999")) is None
+    assert asyncio.run(adapter.get_order_state("not-a-number")) is None

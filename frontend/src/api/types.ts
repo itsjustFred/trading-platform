@@ -688,6 +688,10 @@ export interface LiveDeploymentConfig {
    * fact about exposure, so the UI must not present this deployment as stopped.
    */
   exposure_may_be_open?: boolean;
+  /** Broker reconciliation is refusing new entries while exits continue. */
+  entries_halted?: boolean;
+  entries_halted_at?: string | null;
+  entries_halted_by?: string | null;
   signal_source_type?: LiveSignalSource;
   signal_source_id?: string | null;
   symbol_filter?: string[];
