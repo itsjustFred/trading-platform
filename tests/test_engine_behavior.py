@@ -2713,6 +2713,11 @@ class TestPendingStopGapPricing:
             # (>= / <=) — mutating to strict inequality flips to the limit.
             ("STOP_LIMIT", "LONG", 101.0, 102.0, 100.5, 101.0, 103.0, 101.5),
             ("STOP_LIMIT", "SHORT", 100.0, 100.5, 99.0, 100.0, 98.0, 100.0),
+            # STOP_LIMIT LONG: marketability is judged on the ask the buy
+            # would pay (open + spread = 101.3), not the bid open (100.8 <=
+            # 101). The limit is NOT marketable at the open, so the resting
+            # limit fills at 101.0 — a buy limit never fills above its limit.
+            ("STOP_LIMIT", "LONG", 100.8, 101.5, 100.5, 100.0, 101.0, 101.0),
         ],
     )
     def test_pending_stop_gap_fill_prices_with_spread(
@@ -2752,6 +2757,12 @@ class TestPendingStopGapPricing:
 
         assert len(engine.positions) == 1
         assert engine.positions[0].entry_price == pytest.approx(expected)
+        if (
+            order_type_name == "STOP_LIMIT"
+            and direction == "LONG"
+            and limit_price is not None
+        ):
+            assert engine.positions[0].entry_price <= limit_price
 
     def test_gap_filled_stop_is_resized_from_the_spread_adjusted_open(
         self, tmp_path

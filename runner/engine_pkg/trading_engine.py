@@ -1113,9 +1113,11 @@ class TradeEngine:
         column with the spread in PRICE units (e.g. converted from MT5
         spread points at ingest). Default off (0.0): all existing behavior
         is unchanged. Only LONG market fills pay the spread (buys lift the
-        ask); SHORT fills and stop fills stay on the bid-side data, matching
-        MT5 order semantics tick-for-tick (verified: platform long entries
-        equaled MT5 entries exactly after adding open-side spread).
+        ask); SHORT fills stay on the bid-side data, and gap-through STOP and
+        marketable-at-open STOP_LIMIT fills pay it too — matching the
+        cross-engine contract §1 and MT5 order semantics tick-for-tick
+        (verified: platform long entries equaled MT5 entries exactly after
+        adding open-side spread).
         """
         return resolve_bar_spread(row, self.config.parameters.get("spread_price_col"))
 
@@ -1361,10 +1363,17 @@ class TradeEngine:
         at that open (``open + spread``); a SHORT hits the bid like a MARKET
         sell — the same convention as ``_pending_stop_fill_price``. A fill at
         the resting limit price carries no spread.
+
+        LONG marketability is judged on that ask, not the bid open: a buy
+        limit must never fill above its limit, so when ``open + spread``
+        exceeds the limit the order rests at the limit price instead of
+        filling through it. SHORT is symmetric on the bid and unchanged: its
+        open fill can never print below the limit.
         """
         if direction == "LONG":
             gapped_through_stop = bar_open >= stop_price
-            limit_marketable_at_open = bar_open <= limit_price
+            ask_open = float(bar_open) + bar_spread
+            limit_marketable_at_open = ask_open <= limit_price
         else:
             gapped_through_stop = bar_open <= stop_price
             limit_marketable_at_open = bar_open >= limit_price
