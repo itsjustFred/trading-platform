@@ -1,0 +1,27 @@
+runner/backtest_grid.py
+  s_2bf89379757a94::t_866216405631c2 871-874
+runner/engines/base.py
+  s_2bf89379757a94::t_3127883b89461e 108,111-122,124-134,180,190-191,193-195,201-206
+shared/strategy_registry.py
+  s_2bf89379757a94::t_383d12a8853ad3 199-203
+strategies/custom_swings_supertrend/custom_swings_supertrend.py
+  s_2bf89379757a94::t_d3ead7af2ac552 25-27,195-203
+tests/test_native_trailing_sl_refusal.py
+  s_2bf89379757a94::t_4603b0239b79b2 61-73,79-90,164-271
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "808b3306a83714e0ceb887387218b4f088b73933",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
