@@ -47,6 +47,8 @@ import pandas as pd
 
 from live_runner.promotion import deployment_signal_processor_name
 from shared import constants as _constants
+from shared.indicators import core as indicators
+from shared.indicators import presets as indicator_presets
 from shared.logging import get_logger
 
 logger = get_logger("signal-archive")
@@ -614,15 +616,11 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
         high = work["high"].astype(float)
         low = work["low"].astype(float)
         close = work["close"].astype(float)
-        prev_close = close.shift(1)
-        true_range = pd.concat(
-            [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-        ).max(axis=1)
-        # First bar has no previous close; seed its TR with high - low so
-        # atr_14 exists on short frames. The ewm(span=14, adjust=False)
-        # smoothing matches the convention the signal processors use.
-        true_range = true_range.fillna(high - low)
-        atr = true_range.ewm(span=_ATR_SPAN, adjust=False).mean()
+        # EMA-span "ATR" is a named parity preset (issue #317): the same
+        # ewm(span=14, adjust=False) recursion the signal processors use,
+        # with the first bar's TR seeded high - low so atr_14 exists on
+        # short frames.
+        atr = indicator_presets.atr_ema_span(high, low, close, _ATR_SPAN)
 
         features["bars"] = len(work)
         features["close"] = _finite(close.iloc[-1])
@@ -636,8 +634,8 @@ def market_features_from_frame(frame: pd.DataFrame | None) -> dict[str, Any]:
 
         for span, key in ((_SMA_FAST, "sma_20"), (_SMA_SLOW, "sma_50")):
             if len(work) >= span:
-                sma = close.rolling(span).mean().iloc[-1]
-                sma_value = _finite(sma)
+                sma_last = indicators.sma(close, span).iloc[-1]
+                sma_value = _finite(sma_last)
                 features[key] = sma_value
                 if sma_value:
                     features[f"dist_{key}_pct"] = _finite(
