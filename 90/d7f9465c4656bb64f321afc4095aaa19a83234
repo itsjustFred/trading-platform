@@ -1,0 +1,31 @@
+docs/signal_bots.md
+  s_c2e002ad5c57b9::t_1f965a87cab90b 509
+live_runner/daemon.py
+  s_c2e002ad5c57b9::t_3bc1e52eb9156f 3450-3469,3658
+tests/live_runner/test_live_kill_switch.py
+  s_72b81e13fd197a::t_8a98b254c53132 1318-1385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "90d7f9465c4656bb64f321afc4095aaa19a83234",
+  "prompts": {},
+  "sessions": {
+    "s_72b81e13fd197a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b26fdc3a-6176-466d-9ab1-1ac4055c946c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    },
+    "s_c2e002ad5c57b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ed071e3d-0fde-4b88-a409-4abf5dd3d6ee",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
