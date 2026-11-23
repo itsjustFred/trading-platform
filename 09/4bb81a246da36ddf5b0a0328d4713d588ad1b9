@@ -1,0 +1,19 @@
+live_runner/daemon.py
+  s_0f5724d7820059::t_c837bf6098db55 3550-3579
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "094bb81a246da36ddf5b0a0328d4713d588ad1b9",
+  "prompts": {},
+  "sessions": {
+    "s_0f5724d7820059": {
+      "agent_id": {
+        "tool": "devin",
+        "id": "s_0f5724d7820059",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
