@@ -1713,6 +1713,69 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
+#: Order-placement critical sections in flight, per running event loop and
+#: account (issue #362, maintainer decision 2026-11-23, option b).
+_ACCOUNT_ORDER_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+#: Upper bound on the wait for an account's order-placement lock. The section
+#: it guards runs every broker read sizing and the pre-submit caps make, plus
+#: the submit itself, so the bound must cover a slow-but-live chain of broker
+#: round trips; a submission that cannot start inside it is refused rather than
+#: sized on a read another submission may already have invalidated. Refusing is
+#: safe: nothing reached the broker.
+ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS = 120.0
+
+
+class AccountOrderLockTimeoutError(RuntimeError):
+    """The per-account order-placement lock could not be acquired in time.
+
+    Raised instead of sizing or submitting on a broker read that another
+    in-flight submission of the same account may already have invalidated: the
+    safe answer to "the book moved under us" is to refuse, never to trade on it.
+    """
+
+
+def _account_order_lock(account_id: str) -> asyncio.Lock:
+    """The lock serialising one account's position-read -> submit sections."""
+    locks = _ACCOUNT_ORDER_LOCKS.setdefault(asyncio.get_running_loop(), {})
+    return locks.setdefault(str(account_id), asyncio.Lock())
+
+
+@contextlib.asynccontextmanager
+async def _account_order_placement(account_id: str) -> AsyncIterator[None]:
+    """Hold the account's order-placement lock for one critical section.
+
+    Every broker position/quantity read that feeds sizing, the pre-submit
+    caps, leverage or exit quantity runs inside this section together with the
+    ``adapter.submit_order`` call it feeds, so no other submission of the same
+    account can interleave a fill or an order between the read and the write
+    (#362). Exits additionally hold ``_exit_lock`` per symbol; the account
+    lock is always the inner one, so the two orderings cannot deadlock.
+
+    The wait is bounded: a submission that cannot start within
+    ``ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS`` raises
+    :class:`AccountOrderLockTimeoutError` and the caller refuses the order -
+    it never submits on a stale read.
+    """
+    lock = _account_order_lock(account_id)
+    try:
+        await asyncio.wait_for(
+            lock.acquire(), timeout=ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        raise AccountOrderLockTimeoutError(
+            f"account {account_id!r}: the order-placement lock was still held "
+            f"after {ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS:g}s; refusing rather "
+            "than sizing or submitting on a broker read that may be stale"
+        ) from exc
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 async def _alert_ledger_mismatch(
     deployment: LiveDeploymentConfig,
     symbol: str,
@@ -2488,35 +2551,41 @@ async def submit_order_with_risk(
                 "order submission refused: the daemon is shutting down; nothing "
                 "was sent to the broker and its outcome is not unknown"
             )
-        prepared_signal, prepared_qty = await prepare_order_with_risk(
-            adapter,
-            deployment,
-            signal,
-            current_exposure=current_exposure,
-            account_balance=account_balance,
-            pip_value=pip_value,
-        )
-        # The same last-moment halt gate the leased submission path runs: this
-        # caller has no claim to protect, but a halt written while the order was
-        # being sized must still stop it. Entries only - an exit is never blocked.
-        if not is_exit_order(signal.action, signal.metadata or {}):
-            await refuse_entry_while_halted(
-                deployment.account_id,
-                deployment_id=str(deployment.id),
-                symbol=signal.symbol,
-            )
-        # #302: the last check before the broker sees the order, independent of
-        # the sizing code that produced it. Inside order_not_submitted so a
-        # refusal is provably pre-request.
-        with order_not_submitted():
-            prepared_qty = await enforce_pre_submit_caps(
+        # #362: the position reads sizing and the caps make, and the submit
+        # they feed, are one serialized section per account - a second
+        # submission of this account can never interleave between them. A
+        # bounded wait that expires refuses with AccountOrderLockTimeoutError:
+        # never submit on a stale read.
+        async with _account_order_placement(deployment.account_id):
+            prepared_signal, prepared_qty = await prepare_order_with_risk(
                 adapter,
                 deployment,
-                prepared_signal,
-                qty=prepared_qty,
-                risk_config=_risk_config_for_deployment(deployment),
+                signal,
+                current_exposure=current_exposure,
+                account_balance=account_balance,
+                pip_value=pip_value,
             )
-        return await adapter.submit_order(prepared_signal, qty=prepared_qty)
+            # The same last-moment halt gate the leased submission path runs: this
+            # caller has no claim to protect, but a halt written while the order was
+            # being sized must still stop it. Entries only - an exit is never blocked.
+            if not is_exit_order(signal.action, signal.metadata or {}):
+                await refuse_entry_while_halted(
+                    deployment.account_id,
+                    deployment_id=str(deployment.id),
+                    symbol=signal.symbol,
+                )
+            # #302: the last check before the broker sees the order, independent of
+            # the sizing code that produced it. Inside order_not_submitted so a
+            # refusal is provably pre-request.
+            with order_not_submitted():
+                prepared_qty = await enforce_pre_submit_caps(
+                    adapter,
+                    deployment,
+                    prepared_signal,
+                    qty=prepared_qty,
+                    risk_config=_risk_config_for_deployment(deployment),
+                )
+            return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
 
 def _mint_signal_idempotency_key(
@@ -3467,6 +3536,13 @@ async def _prepare_claim_and_submit_signal(
     before the broker saw anything, ``unknown`` means the broker may have the
     order. Callers that only fan out (Discord) ignore the value; the internal
     strategy runner counts non-clean outcomes toward its escalation.
+
+    The whole prepare -> claim -> caps -> submit section runs under the
+    account's order-placement lock (#362): the broker position reads sizing
+    and the caps make, and the submit they feed, are atomic with respect to
+    every other submission of the same account. A bounded wait that expires
+    refuses with ``account_order_lock_timeout`` - the order is never sized or
+    submitted on a read that may be stale.
     """
     # This chokepoint serves Discord and internal-strategy signals alike;
     # refusal logs name the actual metadata source, not a hardcoded "Discord".
@@ -3476,6 +3552,103 @@ async def _prepare_claim_and_submit_signal(
         if str(_metadata.get("source") or "").strip().lower() == "internal"
         else "Discord"
     )
+    try:
+        async with _account_order_placement(account_id):
+            return await _prepare_claim_and_submit_signal_locked(
+                account_id,
+                adapter,
+                deployment,
+                normalized_signal,
+                live_signal,
+                is_exit=is_exit,
+                decision=decision,
+                source_label=source_label,
+            )
+    except AccountOrderLockTimeoutError as exc:
+        return await _refuse_account_order_lock_timeout(
+            account_id,
+            deployment,
+            live_signal,
+            is_exit=is_exit,
+            decision=decision,
+            exc=exc,
+            source_label=source_label,
+        )
+
+
+async def _refuse_account_order_lock_timeout(
+    account_id: str,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    exc: AccountOrderLockTimeoutError,
+    source_label: str,
+) -> str:
+    """Record the fail-closed refusal of an order that could not take the lock.
+
+    Nothing was sent to the broker and no broker state was read for sizing, so
+    this is a plain pre-submission refusal - but for an exit it leaves the
+    position open, which is an operator-visible error like every other refused
+    exit (#121).
+    """
+    if is_exit:
+        logger.error(
+            "Exit signal refused: the account's order-placement lock could not "
+            "be acquired in time; nothing was sent to the broker and the "
+            "position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "action": live_signal.action,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
+    else:
+        logger.warning(
+            f"{source_label} signal refused: the account's order-placement "
+            "lock could not be acquired in time; nothing was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+    if decision is not None:
+        decision.refused("account_order_lock_timeout", detail=str(exc))
+    return SUBMIT_OUTCOME_REFUSED
+
+
+async def _prepare_claim_and_submit_signal_locked(
+    account_id: str,
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    normalized_signal: TradeSignal,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    source_label: str,
+) -> str:
+    """The claim-and-submit body, run under the account order-placement lock.
+
+    Split from :func:`_prepare_claim_and_submit_signal` so the bounded lock
+    wait wraps exactly the section that reads broker position state and
+    submits; ``source_label`` is computed once by the wrapper.
+    """
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL

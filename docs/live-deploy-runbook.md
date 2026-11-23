@@ -460,6 +460,23 @@ sees a real stop. A *stale* exit is skipped like a stale entry — with the
 unbounded-TP policy the position is then held until the fallback stop or
 the next exit signal.
 
+**Order-placement serialization (#362).** Every broker position/quantity read
+that feeds sizing, the pre-submit caps, leverage or exit quantity, and the
+`adapter.submit_order` call it feeds, runs inside one per-account critical
+section (`_account_order_placement` in `live_runner/daemon.py`). Two
+submissions of the same account — entries and exits of any deployment,
+Discord or internal — can never interleave a fill or an order between the
+read and the write; submissions of *different* accounts are unaffected. The
+wait is bounded (`ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS`, 120 s): a submission
+that cannot start inside it is refused (`decision.refused` with reason
+`account_order_lock_timeout` on the leased path,
+`AccountOrderLockTimeoutError` from `submit_order_with_risk`) — it never
+sizes or submits on a read that may be stale. Exits still hold the
+per-account+symbol `_exit_lock` first; the account lock is always the inner
+one. Broker sweeps that are not signal submissions (STOP flatten, kill-switch
+sweeps, trailing-stop amendments, broker reconciliation) keep their own
+adapter-level serialization and are not queued behind this lock.
+
 **Idempotency.** Each emitted intent carries a producer-stable
 `metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
 close and intent kind. Within a process the runner tracks the newest
