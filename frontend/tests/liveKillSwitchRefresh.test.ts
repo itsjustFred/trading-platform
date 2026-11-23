@@ -361,3 +361,79 @@ test("a successful halt/resume write clears the poll error text", async () => {
   assert.equal(field("error"), "");
   assert.equal(field("stale"), "false");
 });
+
+test("a poll that fails after a halt/resume write cannot clobber the read-back", async () => {
+  // #300 follow-up: the in-flight poll's writeSeq is stale the moment the
+  // write lands, so its REJECTION must be discarded too - otherwise the
+  // pre-write failure would re-stamp the error text and stale mark over the
+  // fresher read-back state the write just returned.
+  globalThis.__ksRefreshResponder = () => killSwitchState();
+
+  await renderHarness();
+  assert.equal(field("halted"), "false");
+
+  // Hold the next poll's response open.
+  let rejectPoll: (reason: unknown) => void = () => undefined;
+  const pending = new Promise<unknown>((_resolve, reject) => {
+    rejectPoll = reject;
+  });
+  globalThis.__ksRefreshResponder = () => pending;
+
+  // The poll starts and stays in flight on the held promise.
+  await tickPoll();
+
+  // While that poll is still in flight, a halt write returns the server's
+  // read-back state.
+  globalThis.__ksWriteState = killSwitchState({
+    global_halted: true,
+    halts: [{ scope: "global", mode: "entries" }],
+  });
+  await writeReadBack();
+  assert.equal(field("halted"), "true");
+
+  // The older poll finally REJECTS.
+  await act(async () => {
+    rejectPoll(new Error("viewer 500"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  assert.equal(
+    field("halted"),
+    "true",
+    "the pre-write poll failure must not overwrite the write's read-back",
+  );
+  assert.equal(field("stale"), "false");
+  assert.equal(field("error"), "");
+});
+
+test("a poll started after a halt/resume write still applies", async () => {
+  // #300 follow-up: the writeSeq guard must only discard polls that were in
+  // flight BEFORE the write - a poll initiated afterwards carries newer
+  // truth and has to land, or the panel would freeze on the write's
+  // read-back until the next write.
+  globalThis.__ksRefreshResponder = () => killSwitchState();
+
+  await renderHarness();
+  assert.equal(field("halted"), "false");
+
+  // A halt write lands its read-back.
+  globalThis.__ksWriteState = killSwitchState({
+    global_halted: true,
+    halts: [{ scope: "global", mode: "entries" }],
+  });
+  await writeReadBack();
+  assert.equal(field("halted"), "true");
+
+  // The halt is then lifted elsewhere; the next poll sees it.
+  globalThis.__ksRefreshResponder = () => killSwitchState();
+  await tickPoll();
+
+  assert.equal(
+    field("halted"),
+    "false",
+    "a poll started after the write must apply its newer state",
+  );
+  assert.equal(field("stale"), "false");
+});
