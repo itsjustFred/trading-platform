@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import AbstractAsyncContextManager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterator
 
+from live_runner.account_order_lock import account_order_placement
 from shared.logging import get_logger
 from shared.models import LiveSignal
 
@@ -411,6 +412,32 @@ class BaseLiveAdapter(ABC):
     #: trailing-mode table in ``shared.trailing``. Blank means "unknown", which
     #: every per-broker lookup treats as the fail-closed baseline.
     broker_name: str = ""
+
+    @property
+    def order_placement_account_id(self) -> str:
+        """The ``live_accounts.id`` whose broker book this adapter mutates.
+
+        Adapters name the broker account differently (Alpaca stores the live
+        account id directly; cTrader stores the cTrader trader id separately
+        from the configured account id), but the shared order-placement lock
+        must key on the same account the daemon's deployments use.
+        """
+        for attr in ("account_id", "account_config_id"):
+            value = getattr(self, attr, None)
+            if value:
+                return str(value)
+        return ""
+
+    def order_placement_lock(self) -> AbstractAsyncContextManager[None]:
+        """The shared per-account critical section for adapter-internal paths.
+
+        Adapter code that reads broker position/order state and then writes -
+        outside the daemon's submit chokepoints - takes this same lock so it
+        serialises with signal submissions and STOPPED/kill-switch flattens
+        (#362). It is not re-entrant: a path already inside the daemon's
+        ``submit_order`` call must not take it again.
+        """
+        return account_order_placement(self.order_placement_account_id)
 
     @abstractmethod
     async def connect(self) -> None:

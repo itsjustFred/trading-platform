@@ -32,6 +32,11 @@ if __name__ == "__main__":
 
 import pandas as pd
 
+from live_runner.account_order_lock import (
+    AccountOrderLockTimeoutError,
+    account_order_lock,
+    account_order_placement,
+)
 from live_runner.account_routing import (
     ctrader_account_identifier,
     validate_live_account_routes,
@@ -1734,67 +1739,12 @@ def _exit_lock(account_id: str, symbol: str) -> asyncio.Lock:
     return locks.setdefault((str(account_id), str(symbol).upper()), asyncio.Lock())
 
 
-#: Order-placement critical sections in flight, per running event loop and
-#: account (issue #362, maintainer decision 2026-11-23, option b).
-_ACCOUNT_ORDER_LOCKS: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
-] = weakref.WeakKeyDictionary()
-
-#: Upper bound on the wait for an account's order-placement lock. The section
-#: it guards runs every broker read sizing and the pre-submit caps make, plus
-#: the submit itself, so the bound must cover a slow-but-live chain of broker
-#: round trips; a submission that cannot start inside it is refused rather than
-#: sized on a read another submission may already have invalidated. Refusing is
-#: safe: nothing reached the broker.
-ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS = 120.0
-
-
-class AccountOrderLockTimeoutError(RuntimeError):
-    """The per-account order-placement lock could not be acquired in time.
-
-    Raised instead of sizing or submitting on a broker read that another
-    in-flight submission of the same account may already have invalidated: the
-    safe answer to "the book moved under us" is to refuse, never to trade on it.
-    """
-
-
-def _account_order_lock(account_id: str) -> asyncio.Lock:
-    """The lock serialising one account's position-read -> submit sections."""
-    locks = _ACCOUNT_ORDER_LOCKS.setdefault(asyncio.get_running_loop(), {})
-    return locks.setdefault(str(account_id), asyncio.Lock())
-
-
-@contextlib.asynccontextmanager
-async def _account_order_placement(account_id: str) -> AsyncIterator[None]:
-    """Hold the account's order-placement lock for one critical section.
-
-    Every broker position/quantity read that feeds sizing, the pre-submit
-    caps, leverage or exit quantity runs inside this section together with the
-    ``adapter.submit_order`` call it feeds, so no other submission of the same
-    account can interleave a fill or an order between the read and the write
-    (#362). Exits additionally hold ``_exit_lock`` per symbol; the account
-    lock is always the inner one, so the two orderings cannot deadlock.
-
-    The wait is bounded: a submission that cannot start within
-    ``ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS`` raises
-    :class:`AccountOrderLockTimeoutError` and the caller refuses the order -
-    it never submits on a stale read.
-    """
-    lock = _account_order_lock(account_id)
-    try:
-        await asyncio.wait_for(
-            lock.acquire(), timeout=ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS
-        )
-    except TimeoutError as exc:
-        raise AccountOrderLockTimeoutError(
-            f"account {account_id!r}: the order-placement lock was still held "
-            f"after {ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS:g}s; refusing rather "
-            "than sizing or submitting on a broker read that may be stale"
-        ) from exc
-    try:
-        yield
-    finally:
-        lock.release()
+#: The per-account order-placement lock lives in ``live_runner.account_order_lock``
+#: so broker adapters can take the same critical section as the daemon's submit
+#: chokepoints (#362). These aliases keep the daemon's call sites and tests on
+#: the names they already use.
+_account_order_lock = account_order_lock
+_account_order_placement = account_order_placement
 
 
 async def _alert_ledger_mismatch(
@@ -2588,10 +2538,12 @@ async def submit_order_with_risk(
                 "was sent to the broker and its outcome is not unknown"
             )
         # #362: the position reads sizing and the caps make, and the submit
-        # they feed, are one serialized section per account - a second
-        # submission of this account can never interleave between them. A
-        # bounded wait that expires refuses with AccountOrderLockTimeoutError:
-        # never submit on a stale read.
+        # they feed, are one serialized section per account - another of this
+        # daemon's submissions, or a STOPPED/kill-switch flatten, can never
+        # interleave between them. A bounded wait that expires refuses with
+        # AccountOrderLockTimeoutError: never submit on a read that may be
+        # stale. Broker-side fills can still move the book inside the section;
+        # reconciliation is the backstop for that residual race.
         async with _account_order_placement(deployment.account_id):
             prepared_signal, prepared_qty = await prepare_order_with_risk(
                 adapter,
@@ -3576,7 +3528,9 @@ async def _prepare_claim_and_submit_signal(
     The whole prepare -> claim -> caps -> submit section runs under the
     account's order-placement lock (#362): the broker position reads sizing
     and the caps make, and the submit they feed, are atomic with respect to
-    every other submission of the same account. A bounded wait that expires
+    every other signal submission of the same account and to STOPPED/
+    kill-switch flattens. Broker-side fills can still move the book inside
+    the section; reconciliation is the backstop. A bounded wait that expires
     refuses with ``account_order_lock_timeout`` - the order is never sized or
     submitted on a read that may be stale.
     """
@@ -3590,6 +3544,32 @@ async def _prepare_claim_and_submit_signal(
     )
     try:
         async with _account_order_placement(account_id):
+            # The lock wait is bounded but can still be long: re-run the age
+            # gate now that the section has started, so a signal that was fresh
+            # at dispatch cannot be sized and submitted after it expired (#362).
+            try:
+                _validate_signal_age_before_wait(
+                    normalized_signal,
+                    deployment,
+                    timeframe=(
+                        normalized_signal.timeframe
+                        or str(
+                            (live_signal.metadata or {}).get("timeframe")
+                            or deployment.timeframe
+                        )
+                    ),
+                    require_producer_timestamp=False,
+                )
+            except ValueError as exc:
+                return await _refuse_signal_aged_out_after_lock(
+                    account_id,
+                    deployment,
+                    live_signal,
+                    is_exit=is_exit,
+                    decision=decision,
+                    exc=exc,
+                    source_label=source_label,
+                )
             return await _prepare_claim_and_submit_signal_locked(
                 account_id,
                 adapter,
@@ -3665,6 +3645,63 @@ async def _refuse_account_order_lock_timeout(
         )
     if decision is not None:
         decision.refused("account_order_lock_timeout", detail=str(exc))
+    return SUBMIT_OUTCOME_REFUSED
+
+
+async def _refuse_signal_aged_out_after_lock(
+    account_id: str,
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    is_exit: bool,
+    decision: SignalDecisionRecorder | None,
+    exc: ValueError,
+    source_label: str,
+) -> str:
+    """Record a signal that expired while it waited for the account lock.
+
+    The age gate ran before dispatch and again inside the order-placement
+    section; this is the second refusal, so it gets its own reason rather than
+    looking like a sizing failure. Nothing reached the broker.
+    """
+    reason = "signal_aged_out_during_lock_wait"
+    if is_exit:
+        logger.error(
+            "Exit signal refused after the order-placement lock wait: the "
+            "signal aged out before the section started; nothing was sent to "
+            "the broker and the position stays open",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "action": live_signal.action,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
+    else:
+        logger.warning(
+            f"{source_label} signal refused after the order-placement lock "
+            "wait: the signal aged out before the section started; nothing "
+            "was sent to the broker",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "reason": str(exc),
+                }
+            },
+        )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+    if decision is not None:
+        decision.refused(reason, detail=str(exc))
     return SUBMIT_OUTCOME_REFUSED
 
 
@@ -6102,7 +6139,26 @@ async def _enforce_stopped_deployments(
                     },
                 )
                 continue
-            if not await _enforce_one_stopped_deployment(deployment, adapter):
+            try:
+                async with _account_order_placement(deployment.account_id):
+                    enforced = await _enforce_one_stopped_deployment(
+                        deployment, adapter
+                    )
+            except AccountOrderLockTimeoutError as exc:
+                logger.error(
+                    "STOPPED enforcement refused: the account's order-placement "
+                    "lock could not be acquired in time; the deployment stays "
+                    "unenforced and the cancel/flatten is retried",
+                    extra={
+                        "data": {
+                            "deployment_id": deployment_id,
+                            "account_id": deployment.account_id,
+                            "reason": str(exc),
+                        }
+                    },
+                )
+                continue
+            if not enforced:
                 continue
             already_enforced.add(deployment_id)
 
