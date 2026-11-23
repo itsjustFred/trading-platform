@@ -29,18 +29,12 @@ jobs:
       # always required there and a permanent outage is noticed. A present
       # malformed slice still fails inside the tests either way.
       DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
-<<<<<<< HEAD
-      # The published-strategy parity vendor data is downloaded, not committed
-      # (see scripts/build_parity_published_fixtures.py and
+      # The parity vendor data (web- and published-strategy suites) is
+      # downloaded, not committed (see scripts/fetch_parity_web_data.py,
+      # scripts/build_parity_published_fixtures.py and
       # tests/parity/vendor_data.py). Same contract as the differential slice:
       # cached path, warn-and-skip on pull requests when the download fails,
       # required on push to main.
-=======
-      # The web-strategy parity vendor data is downloaded, not committed (see
-      # scripts/fetch_parity_web_data.py and tests/parity/vendor_data.py). Same
-      # contract as the differential slice: cached path, warn-and-skip on pull
-      # requests when the download fails, required on push to main.
->>>>>>> test/parity-web-strategies
       PARITY_VENDOR_DATA_DIR: ${{ github.workspace }}/.cache/parity-vendor
     steps:
       - uses: actions/checkout@v4
