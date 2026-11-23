@@ -699,11 +699,19 @@ def test_a_network_violation_names_the_test_that_attempted_it(
 def _consume_stub_hits(edge: str, nodeid: str) -> list[str]:
     """Remove and return the stub hits a test deliberately triggered.
 
-    The session-end warning exists to expose *accidental* leaks; a test that
+    The session-end failure exists to expose *accidental* leaks; a test that
     exercises the blocked edge on purpose must not leave its own hit behind.
+    Only hits recorded on the calling thread are consumed: a leaked worker
+    thread firing during this test is attributed to this node id too, and it
+    must stay behind to fail the session.
     """
     hits = suite_conftest._DUKASCOPY_STUB_HITS
-    mine = [hit for hit in hits if edge in hit and nodeid in hit]
+    thread_label = f"(thread {threading.current_thread().name})"
+    mine = [
+        hit
+        for hit in hits
+        if edge in hit and nodeid in hit and thread_label in hit
+    ]
     hits[:] = [hit for hit in hits if hit not in mine]
     return mine
 
@@ -733,7 +741,7 @@ def test_jforex_classpath_resolution_cannot_reach_the_jnlp_endpoint(
     assert request.node.nodeid in hit
 
 
-def test_dukascopy_native_fetch_is_blocked_in_tests(request) -> None:
+def test_dukascopy_native_fetch_is_stubbed_in_tests(request) -> None:
     """``_fetch_one`` is the single aiohttp edge to ``datafeed.dukascopy.com``."""
     import asyncio
 

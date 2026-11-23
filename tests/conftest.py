@@ -135,9 +135,11 @@ _NETWORK_VIOLATIONS: list[str] = []
 _CURRENT_TEST_NODEID: str | None = None
 
 # Hits on the Dukascopy network-edge stubs (``_no_dukascopy_sdk_network``).
-# Recorded, not failed: the stub already turned what would have been a
-# hermeticity violation into an ordinary downloader error, and the session
-# report naming the test that triggered it is what makes the leak findable.
+# Recorded and failed at session end like ``_NETWORK_VIOLATIONS``: the stub
+# already turned what would have been a hermeticity violation into an ordinary
+# downloader error, so without this handoff a swallowed stub hit would fail
+# nothing. A test that exercises a stub on purpose consumes its own hits (see
+# ``_consume_stub_hits`` in tests/test_suite_isolation.py).
 _DUKASCOPY_STUB_HITS: list[str] = []
 
 
@@ -469,9 +471,6 @@ def _accounts_env_readers() -> list[str]:
 # A worker's own ``session.exitstatus`` is ignored by xdist, so without this handoff a swallowed
 # violation on a worker would fail nothing.
 _WORKER_VIOLATIONS: list[str] = []
-# Same handoff for the Dukascopy stub hits: warnings, not failures, but a
-# worker's stderr is not reliably shown, so the controller prints them.
-_WORKER_STUB_HITS: list[str] = []
 
 
 def _hermeticity_failure_messages(session: pytest.Session) -> list[str]:
@@ -524,6 +523,18 @@ def _hermeticity_failure_messages(session: pytest.Session) -> list[str]:
             " also raised SuiteHermeticityViolation, which broad exception handlers can swallow."
         )
 
+    stub_hits = dukascopy_stub_hits()
+    if stub_hits:
+        shown = "\n  ".join(dict.fromkeys(stub_hits))
+        failures.append(
+            "\n\nERROR: the Dukascopy/JForex network-edge stubs blocked calls that would have"
+            f" reached the network:\n  {shown}"
+            "\nEach became an ordinary downloader error instead of a socket violation, so nothing"
+            " else would have failed. A test reached a real download path: give it a fixture, a"
+            " stub transport or localhost, or an explicit patch of the fetch edge. A test that"
+            " exercises a stub on purpose must consume its own hits."
+        )
+
     return failures
 
 
@@ -553,30 +564,15 @@ def pytest_sessionfinish(session: pytest.Session) -> None:
     ``config.workeroutput`` and :func:`pytest_testnodedown` collects them there.
     """
     failures = _hermeticity_failure_messages(session)
-    stub_hits = dukascopy_stub_hits()
     if hasattr(session.config, "workerinput"):
         workeroutput = getattr(session.config, "workeroutput", None)
         if isinstance(workeroutput, dict):
             workeroutput["tp_violations"] = failures
-            workeroutput["tp_stub_hits"] = list(stub_hits)
         for message in failures:
             print(message, file=sys.stderr)
         return
     for message in dict.fromkeys((*failures, *_WORKER_VIOLATIONS)):
         _fail_session(session, message)
-    all_stub_hits = list(dict.fromkeys((*stub_hits, *_WORKER_STUB_HITS)))
-    if all_stub_hits:
-        shown = "\n  ".join(all_stub_hits[:25])
-        more = f"\n  ... and {len(all_stub_hits) - 25} more" if len(all_stub_hits) > 25 else ""
-        print(
-            "\n\nWARNING: the Dukascopy/JForex network-edge stubs blocked "
-            f"{len(all_stub_hits)} call(s) that would have reached the network:\n"
-            f"  {shown}{more}\n"
-            "Each became an ordinary downloader error instead of a hermeticity "
-            "violation. A test reached a real download path: give it a fixture, "
-            "a stub transport or localhost, or an explicit patch of the fetch edge.",
-            file=sys.stderr,
-        )
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -592,9 +588,6 @@ def pytest_testnodedown(node: object, error: object) -> None:
         reported = workeroutput.get("tp_violations")
         if isinstance(reported, list):
             _WORKER_VIOLATIONS.extend(str(item) for item in reported)
-        stub_hits = workeroutput.get("tp_stub_hits")
-        if isinstance(stub_hits, list):
-            _WORKER_STUB_HITS.extend(str(item) for item in stub_hits)
 
 
 def _requested_browser_name(item: pytest.Item) -> str:
@@ -695,13 +688,16 @@ def _no_dukascopy_sdk_network():
     Viewer download tasks run on background threads that can outlive the
     per-test monkeypatch window (and the JVM prewarm patch above only covers
     ``prewarm_jvm``), so under a randomized order an accidental real fetch
-    fires while an unrelated test - or no test - is current. The audit hook
-    still refuses the socket, but the session then fails on a violation no
-    single test owns. Stubbing the edges themselves turns that leak into an
-    ordinary task failure inside the downloader, which its callers already
-    handle. Tests that exercise the fetchers patch the same attributes
-    themselves; a test-local ``monkeypatch.setattr`` wins for the duration of
-    the test and this fixture's undo restores the real callable afterwards.
+    fires while an unrelated test - or no test - is current. Stubbing the
+    edges themselves turns that leak into an ordinary task failure inside the
+    downloader, which its callers already handle - and every hit is recorded
+    and fails the session at :func:`pytest_sessionfinish` like a network
+    violation, so a stub hit can never pass silently. Tests that exercise the
+    fetchers patch the same attributes themselves; a test-local
+    ``monkeypatch.setattr`` wins for the duration of the test and this
+    fixture's undo restores the real callable afterwards. Both modules are
+    import-safe here: ``jforex_dl`` guards its ``jpype`` import and neither
+    module touches the network or starts a JVM at import time.
     """
     from data_tools.downloaders import dukascopy_native, jforex_dl
 
@@ -729,6 +725,44 @@ def _no_dukascopy_sdk_network():
         patch.setattr(jforex_dl, "urlopen", _blocked_urlopen)
         patch.setattr(dukascopy_native, "_fetch_one", _blocked_fetch_one)
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_viewer_interrupted_task_resume():
+    """Keep ``TestClient(app)`` lifespans from resuming persisted download tasks.
+
+    The viewer lifespan marks queued/running ``BackgroundTaskRecord`` rows
+    interrupted and ``_resume_interrupted_tasks`` re-dispatches them - including
+    Dukascopy/JForex downloads that spawn ``run_download`` threads. Task records
+    live in the session-shared DATA_DIR database, so a lifespan entered by one
+    test resumes whatever an earlier test left behind, and the resumed worker
+    threads then run real fetches while unrelated tests are current (the leak
+    ``_no_dukascopy_sdk_network`` can only blunt, not prevent).
+
+    Only the lifespan entry point is stubbed: tests that exercise resume call
+    ``viewer.main._resume_interrupted_tasks`` directly and still see the real
+    function. ``app.router.lifespan_context`` is what ``TestClient`` runs on
+    ``__enter__``, so wrapping it covers every ``with TestClient(app)`` in the
+    suite without touching production code. ``viewer.main`` is imported here so
+    a test that imports it lazily still gets the wrapped app.
+    """
+    import viewer.main as viewer_main_module
+
+    app = viewer_main_module.app
+    original_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan_without_task_resume(lifespan_app):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(viewer_main_module, "_resume_interrupted_tasks", lambda: None)
+            async with original_lifespan(lifespan_app):
+                yield
+
+    app.router.lifespan_context = _lifespan_without_task_resume
+    try:
+        yield
+    finally:
+        app.router.lifespan_context = original_lifespan
 
 
 @pytest.fixture
@@ -797,6 +831,30 @@ def _viewer_state_lock(lock, name: str):
         lock.release()
 
 
+def _join_viewer_task_threads(tasks: list, *, timeout: float = 2.0) -> None:
+    """Signal and briefly join viewer worker threads a test left behind.
+
+    Download/backtest/agent tasks run on daemon threads registered as
+    ``task["thread"]``; a worker still alive at reset time would keep fetching
+    or writing while later tests are current. ``stop_event`` asks the
+    cooperative loops to exit, then each thread gets a short join - the threads
+    are daemon, so one that ignores the signal cannot pin the interpreter, but
+    joining forever would hang the suite instead.
+    """
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        stop_event = task.get("stop_event")
+        if stop_event is not None:
+            stop_event.set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        thread = task.get("thread")
+        if isinstance(thread, threading.Thread) and thread.is_alive():
+            thread.join(timeout=timeout)
+
+
 def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
     """Clear viewer module state that must not cross test boundaries.
 
@@ -852,7 +910,9 @@ def _reset_viewer_runtime_state(viewer_main_module=None) -> None:
         # DATA_TASKS lives in viewer.core (viewer.main re-exports it), so it
         # is cleared here to cover sessions that never import viewer.main.
         with _viewer_state_lock(legacy_module.DATA_TASKS_LOCK, "DATA_TASKS_LOCK"):
+            leftover_tasks = list(legacy_module.DATA_TASKS.values())
             legacy_module.DATA_TASKS.clear()
+        _join_viewer_task_threads(leftover_tasks)
         with _viewer_state_lock(legacy_module._OHLCV_DF_CACHE_LOCK, "_OHLCV_DF_CACHE_LOCK"):
             legacy_module._OHLCV_DF_CACHE.clear()
     from data_tools import cache_manager
