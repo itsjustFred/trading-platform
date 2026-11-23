@@ -1057,8 +1057,15 @@ class _DiscordSmokeAdapter:
     async def get_balance(self) -> tuple[float, float]:
         return 100000.0, 100000.0
 
+    async def get_equity(self) -> float:
+        return 100000.0
+
     async def get_positions(self) -> list[dict[str, Any]]:
         return []
+
+    async def get_used_margin(self) -> float | None:
+        # Flat fake account: no margin is held against open positions.
+        return 0.0
 
     async def get_quote(self, symbol: str) -> Any:
         # #125 entry-deviation gate: quote at the replayed message price.

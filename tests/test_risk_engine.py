@@ -626,6 +626,9 @@ class _DummyAdapter(BaseLiveAdapter):
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
 
+    async def get_used_margin(self) -> float | None:
+        return 0.0
+
     async def get_pip_value(self, symbol):
         # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
         from live_runner.base_adapter import LivePipValue

@@ -402,6 +402,40 @@ def test_live_deployments_returns_empty_array(monkeypatch):
     assert response.json() == []
 
 
+def test_live_deployments_expose_the_entries_halt_marker(monkeypatch):
+    import viewer.main as viewer_main_module
+
+    deployment = LiveDeploymentConfig(
+        id="66666666-6666-6666-6666-666666666666",
+        strategy_name="halted_strategy",
+        account_id="acct-halt",
+        symbols=["AAPL"],
+        timeframe="1h",
+        status="ACTIVE",
+        signal_source="internal",
+        signal_config={},
+        settings={
+            "broker_reconciliation_entries_halted": {
+                "by": "broker_reconciliation",
+                "at": "2026-11-21T12:00:00+00:00",
+                "account_id": "acct-halt",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        viewer_main_module, "list_live_deployments", lambda: [deployment]
+    )
+
+    response = TestClient(viewer_main_module.app).get("/api/live/deployments")
+
+    assert response.status_code == 200
+    payload = response.json()[0]
+    assert payload["status"] == "ACTIVE"
+    assert payload["entries_halted"] is True
+    assert payload["entries_halted_by"] == "broker_reconciliation"
+    assert payload["entries_halted_at"] == "2026-11-21T12:00:00+00:00"
+
+
 def test_live_dashboard_endpoint_returns_telemetry(monkeypatch):
     import viewer.main as viewer_main_module
 

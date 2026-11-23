@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlmodel.sql.expression import SelectOfScalar
 
-from shared.alpaca_symbols import classify_alpaca_symbol
+from shared.alpaca_symbols import classify_alpaca_symbol, crypto_pair_key
 from shared.constants import DATA_DIR as RESOLVED_DATA_DIR
 from shared.constants import normalize_symbols
 from shared.fill_keys import canonical_utc_timestamp
@@ -4022,6 +4022,213 @@ def get_live_deployment_net_filled_qty(deployment_id: str, symbol: str) -> float
     return net
 
 
+def list_live_deployment_unfilled_entry_order_refs(deployment_id: str) -> set[str]:
+    """Order references of this deployment's entries that have no fills yet (#360).
+
+    Returns every broker order id *and* signal id (the broker's client order
+    id is the canonical signal id) carried by entry signals whose persisted
+    fill quantity is at most ``_EXIT_FILL_TOLERANCE``. Only the broker can say
+    whether such an order is still working or dead, so the caller asks for the
+    working-order list only when this set is non-empty.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the unfilled entry refs")
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    refs: set[str] = set()
+    for signal_id, symbol, broker_order_id, source, metadata in signal_rows:
+        if not str(symbol or "").strip():
+            continue
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        is_close = (
+            _is_exit_only_signal_metadata(metadata_dict)
+            or str(source or "") == BROKER_CLOSE_SIGNAL_SOURCE
+        )
+        if is_close:
+            continue
+        if filled_by_signal.get(str(signal_id), 0.0) > _EXIT_FILL_TOLERANCE:
+            continue
+        refs.add(str(signal_id))
+        if broker_order_id:
+            refs.add(str(broker_order_id))
+    return refs
+
+
+def list_live_deployment_open_entry_counts_by_symbol(
+    deployment_id: str,
+    working_order_ids: Collection[str] | None = None,
+    broker_held_symbols: Collection[str] | None = None,
+) -> dict[str, int]:
+    """Open entry count per symbol for one deployment (#360 maintainer decision).
+
+    An *open entry* is a persisted entry signal — not exit-only and not a
+    broker-side close — that still holds quantity: its filled quantity minus
+    the reducing fills attributed to it, allocated oldest-first, is above
+    ``_EXIT_FILL_TOLERANCE``. Reducing fills are every fill on the
+    deployment's exit-only signals plus every broker-side close signal for
+    the symbol: the same rows the net ledger sums with the opposite sign.
+
+    FIFO attribution is an approximation — a deployment-level FULL_EXIT is
+    not tied to one entry — but it is conservative in the direction that
+    matters: a partially closed oldest entry keeps counting until its own
+    residual reaches zero.
+
+    An entry with no fills yet counts as one open position **only while the
+    broker still lists its order as working** — a DAY entry that expired
+    unfilled or an order cancelled after acceptance must not lock the symbol
+    forever (#360 review). ``working_order_ids`` is the adapter's
+    ``working_order_ids()`` result: broker order ids and client order ids
+    (the canonical signal id). An entry matches on either its persisted
+    ``broker_order_id`` or its signal id. When ``working_order_ids`` is
+    ``None`` the working status cannot be proven, so every unfilled entry
+    that carries a broker order id still counts — the fail-closed direction.
+
+    A *filled* order is not working either, so the working list alone cannot
+    tell "dead unfilled" from "filled but its fill is not yet booked" (the
+    trade-update stream is down, the post-restart reconcile has not run, or
+    persistence lags a bar). ``broker_held_symbols`` is the adapter's
+    non-zero-position symbol set for the account: a not-working unfilled
+    entry that carries a broker order id counts as open while its symbol is
+    held — over-counting when another deployment holds the symbol only
+    blocks entries, the fail-closed direction. ``broker_held_symbols=None``
+    means the position state could not be proven, so such an entry still
+    counts — again fail-closed. Entries with neither fills nor any order
+    reference never reached the broker and do not count.
+
+    Returns ``{SYMBOL: open entry count}`` for symbols with at least one
+    open entry; flat symbols are absent.
+    """
+    normalized_deployment_id = str(deployment_id or "").strip()
+    if not normalized_deployment_id:
+        raise ValueError("A deployment id is required for the open entry counts")
+    working = (
+        {str(order_id) for order_id in working_order_ids}
+        if working_order_ids is not None
+        else None
+    )
+    # Broker position symbols and stored signal symbols spell the same pair
+    # differently (Alpaca reports crypto as ``BTCUSD`` while a signal may say
+    # ``BTC/USD``): compare on ``crypto_pair_key``, which collapses every
+    # crypto spelling and leaves equities (``BRK.B``, ``BF-B``) untouched.
+    held_symbols = (
+        {crypto_pair_key(symbol) for symbol in broker_held_symbols}
+        if broker_held_symbols is not None
+        else None
+    )
+    init_db()
+    with get_session() as session:
+        signal_rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.timestamp,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.source,
+                LiveSignalModel.metadata_json,
+            ).where(LiveSignalModel.deployment_id == normalized_deployment_id)
+        ).all()
+        fill_rows = session.exec(
+            select(
+                LiveExecutionModel.signal_id,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveSignalModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveSignalModel.deployment_id == normalized_deployment_id)
+            .group_by(LiveExecutionModel.signal_id)
+        ).all()
+    filled_by_signal = {str(signal_id): float(filled or 0.0) for signal_id, filled in fill_rows}
+
+    by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for signal_id, symbol, timestamp, broker_order_id, source, metadata in signal_rows:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            continue
+        by_symbol.setdefault(normalized_symbol, []).append(
+            {
+                "signal_id": str(signal_id),
+                "timestamp": timestamp,
+                "broker_order_id": str(broker_order_id or ""),
+                "source": str(source or ""),
+                "metadata": metadata if isinstance(metadata, dict) else {},
+                "filled_qty": filled_by_signal.get(str(signal_id), 0.0),
+            }
+        )
+
+    counts: dict[str, int] = {}
+    for symbol, signals in by_symbol.items():
+        reducing_qty = 0.0
+        entries: list[dict[str, Any]] = []
+        for signal in signals:
+            metadata = signal["metadata"]
+            is_close = (
+                _is_exit_only_signal_metadata(metadata)
+                or str(signal["source"] or "") == BROKER_CLOSE_SIGNAL_SOURCE
+            )
+            if is_close:
+                reducing_qty += max(0.0, signal["filled_qty"])
+            else:
+                entries.append(signal)
+        entries.sort(
+            key=lambda item: (
+                item["timestamp"] is None,
+                item["timestamp"] or datetime.min.replace(tzinfo=timezone.utc),
+                item["signal_id"],
+            )
+        )
+        remaining_reduction = reducing_qty
+        open_count = 0
+        for entry in entries:
+            entry_qty = max(0.0, entry["filled_qty"])
+            if entry_qty <= _EXIT_FILL_TOLERANCE:
+                if working is None:
+                    still_open = bool(entry["broker_order_id"])
+                else:
+                    still_open = (
+                        entry["broker_order_id"] in working
+                        or entry["signal_id"] in working
+                    )
+                    if not still_open and entry["broker_order_id"]:
+                        # Not working: a filled-but-unbooked entry looks the
+                        # same as a dead unfilled one. The broker's non-zero
+                        # position is the proof it is still open; an
+                        # unreadable position set fails closed.
+                        still_open = (
+                            held_symbols is None
+                            or crypto_pair_key(symbol) in held_symbols
+                        )
+                if still_open:
+                    open_count += 1
+                continue
+            closed = min(entry_qty, remaining_reduction)
+            remaining_reduction -= closed
+            if entry_qty - closed > _EXIT_FILL_TOLERANCE:
+                open_count += 1
+        if open_count:
+            counts[symbol] = open_count
+    return counts
+
+
 def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> dict[str, float]:
     """Every deployment's signed net filled quantity for ``symbol`` on one account.
 
@@ -4067,6 +4274,91 @@ def get_account_net_filled_qty_by_deployment(account_id: str, symbol: str) -> di
         key = str(deployment_id)
         ledgers[key] = ledgers.get(key, 0.0) + signed
     return ledgers
+
+
+def list_live_account_filled_symbols(account_id: str) -> list[str]:
+    """Symbols with at least one persisted fill on one account.
+
+    Reconciliation compares every symbol the ledger can hold a position in, not
+    only symbols that still have an unfilled order (#303).
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for the filled-symbol ledger")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(func.distinct(func.upper(LiveSignalModel.symbol)))
+            .join(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+        ).all()
+    return sorted({str(symbol).strip().upper() for symbol in rows if str(symbol or "").strip()})
+
+
+def list_live_account_order_expectations(account_id: str) -> list[dict[str, Any]]:
+    """Persisted signals on one account with their broker id and fill total.
+
+    Reconciliation uses these rows to know which broker orders the ledger still
+    expects to be working and which client order ids name a signal (#303). The
+    requested quantity is read from signal metadata by the caller; this function
+    only returns the persisted facts.
+    """
+    normalized_account_id = str(account_id or "").strip()
+    if not normalized_account_id:
+        raise ValueError("An account id is required for order expectations")
+    init_db()
+    with get_session() as session:
+        rows = session.exec(
+            select(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+                func.coalesce(func.sum(LiveExecutionModel.filled_qty), 0.0),
+            )
+            .join(LiveDeploymentModel, LiveDeploymentModel.id == LiveSignalModel.deployment_id)
+            .outerjoin(LiveExecutionModel, LiveExecutionModel.signal_id == LiveSignalModel.id)
+            .where(LiveDeploymentModel.account_id == normalized_account_id)
+            .group_by(
+                LiveSignalModel.id,
+                LiveSignalModel.deployment_id,
+                LiveSignalModel.symbol,
+                LiveSignalModel.action,
+                LiveSignalModel.broker_order_id,
+                LiveSignalModel.metadata_json,
+                LiveSignalModel.timestamp,
+            )
+        ).all()
+    return [
+        {
+            "signal_id": str(signal_id),
+            "deployment_id": str(deployment_id),
+            "symbol": str(symbol or "").strip().upper(),
+            "action": str(action or "").strip().lower(),
+            "broker_order_id": str(broker_order_id or "").strip(),
+            # A stored non-object metadata value must not raise here: the
+            # reconciliation loop treats a comparison failure as an
+            # unreadable pass, and an unreadable *requested qty* already
+            # fails closed (the order stays expected). Normalise instead.
+            "metadata": dict(metadata_json) if isinstance(metadata_json, dict) else {},
+            "timestamp": timestamp,
+            "filled_qty": float(filled_qty or 0.0),
+        }
+        for (
+            signal_id,
+            deployment_id,
+            symbol,
+            action,
+            broker_order_id,
+            metadata_json,
+            timestamp,
+            filled_qty,
+        ) in rows
+    ]
 
 
 #: A filled quantity this close to the requested one counts as fully filled.
@@ -5020,7 +5312,9 @@ def _resolve_deployment_signal_source(deployment: LiveDeploymentConfig) -> tuple
 
 
 def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentConfig:
+    from live_runner.broker_reconciliation import validate_broker_reconciliation_settings
     from live_runner.loss_breaker import deployment_loss_breaker_limits
+    from live_runner.pre_submit_caps import validate_pre_submit_cap_settings
     from live_runner.stockkit_routing import validate_stockkit_deployment_route
     from risk.live import entry_gate_settings
 
@@ -5028,6 +5322,12 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     # dispatch: a value such as max_entry_deviation_sl_fraction=25 would
     # otherwise sit in the database until the first signal is rejected.
     entry_gate_settings(deployment.settings)
+    # Same for the broker-reconciliation settings (#303): a typo'd boolean
+    # or out-of-range interval is refused here, not silently defaulted later.
+    validate_broker_reconciliation_settings(deployment.settings)
+    # Same for the pre-submit hard caps (#302): a malformed cap must not sit
+    # in the database until the first order is refused by it.
+    validate_pre_submit_cap_settings(deployment.settings)
     # Loss breaker settings (#301) get the same treatment: a malformed
     # threshold would otherwise refuse every entry at dispatch.
     deployment_loss_breaker_limits(deployment)
@@ -5090,6 +5390,124 @@ def create_live_deployment(deployment: LiveDeploymentConfig) -> LiveDeploymentCo
     return record.to_live_deployment()
 
 
+#: ``settings`` key the broker reconciler uses for its entry-only halt (#303).
+#: The value is a small marker dict; only a marker written by the reconciler
+#: itself is cleared automatically (see :func:`resume_live_deployment_entries_halt`).
+ENTRIES_HALT_SETTINGS_KEY = "broker_reconciliation_entries_halted"
+ENTRIES_HALT_ACTOR = "broker_reconciliation"
+
+
+def entries_halt_marker_is_halted(value: object) -> bool:
+    """Whether a settings value counts as an entries halt.
+
+    This mirrors the atomic claim predicate in
+    :func:`claim_live_deployment_submission`: missing/null/false/0/"" are not
+    halted, while every other JSON value - including an empty object or array -
+    fails closed as halted.
+    """
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value != ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Truthiness, not a float compare: 0/0.0 clear, NaN and every other
+        # number halt (fail closed), matching SQLite's ``IN (0, '')``.
+        return bool(value)
+    return True
+
+
+def set_live_deployment_entries_halt(
+    deployment_id: str, detail: Mapping[str, Any] | None
+) -> bool:
+    """Set (``detail``) or clear (``None``) the entry-only halt flag.
+
+    Persisted in ``settings`` so the halt survives a daemon restart without a
+    schema change. Returns ``False`` when the deployment does not exist.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        if detail is None:
+            settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        else:
+            settings[ENTRIES_HALT_SETTINGS_KEY] = dict(detail)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
+def live_deployment_entries_halted(deployment_id: str) -> bool:
+    """Fresh read of the entry-halt flag; a read failure counts as halted.
+
+    Entries are the dangerous direction, so an unreadable deployment row must
+    fail closed here - the caller blocks the entry rather than trading on a
+    stale answer. A missing row reads as *not* halted: the ACTIVE-status gate
+    upstream already refuses dispatch for a deployment that is gone, and this
+    flag can only exist on a row that does.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return True
+    if deployment is None:
+        return False
+    return entries_halt_marker_is_halted(
+        (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    )
+
+
+def live_deployment_entries_halt_marker(deployment_id: str) -> Mapping[str, Any] | None:
+    """The persisted entries-halt marker dict, or ``None`` when absent/unreadable.
+
+    Unlike :func:`live_deployment_entries_halted` this distinguishes *who* set
+    the halt, which the reconciler needs to write and audit only on the
+    transition into a halt it owns.
+    """
+    try:
+        deployment = get_live_deployment(str(deployment_id or "").strip())
+    except Exception:
+        return None
+    if deployment is None:
+        return None
+    marker = (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    return dict(marker) if isinstance(marker, dict) else None
+
+
+def resume_live_deployment_entries_halt(deployment_id: str) -> bool:
+    """Clear the halt only when the broker reconciler set it.
+
+    Returns ``True`` when a reconciler-owned halt was actually removed, so the
+    caller can audit the resume. An operator-set or unmarked value is left
+    alone.
+    """
+    normalized = str(deployment_id or "").strip()
+    if not normalized:
+        return False
+    init_db()
+    with get_session() as session:
+        record = session.get(LiveDeploymentModel, normalized)
+        if record is None:
+            return False
+        settings = dict(record.settings_json or {})
+        halt = settings.get(ENTRIES_HALT_SETTINGS_KEY)
+        if not isinstance(halt, dict) or halt.get("by") != ENTRIES_HALT_ACTOR:
+            return False
+        settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+        record.settings_json = settings
+        record.updated_at = _utcnow_naive()
+        session.add(record)
+        session.commit()
+    return True
+
+
 def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> None:
     """Write a deployment's status (and the fields that go with it) on a loaded row.
 
@@ -5113,7 +5531,7 @@ def _apply_live_deployment_status_row(row: LiveDeploymentModel, status: str) -> 
 
 
 def update_live_deployment_status(
-    deployment_id: str, status: str
+    deployment_id: str, status: str, *, release_entries_halt: bool = True
 ) -> LiveDeploymentConfig | None:
     next_status = str(status or "").upper()
     if next_status not in {"ACTIVE", "PAUSED", "STOPPED"}:
@@ -5123,6 +5541,19 @@ def update_live_deployment_status(
         record = session.get(LiveDeploymentModel, deployment_id)
         if record is None:
             return None
+        if next_status == "ACTIVE" and release_entries_halt:
+            # Resuming is the operator's explicit "trade again": it also
+            # releases a broker-reconciliation entry halt. A still-mismatched
+            # account is re-halted on the next pass, so this cannot hide a
+            # live divergence - it only ends the halt early by decision.
+            # ``release_entries_halt=False`` is for internal status writes
+            # that merely restore a previous state (the delete endpoint's
+            # rollback): they are not an operator resume and must not clear
+            # a halt the operator never lifted.
+            settings = dict(record.settings_json or {})
+            if ENTRIES_HALT_SETTINGS_KEY in settings:
+                settings.pop(ENTRIES_HALT_SETTINGS_KEY, None)
+                record.settings_json = settings
         _apply_live_deployment_status_row(record, next_status)
         session.add(record)
         session.commit()
@@ -5462,6 +5893,7 @@ def claim_live_deployment_submission(
     *,
     ttl_seconds: float = LIVE_SUBMISSION_CLAIM_TTL_SECONDS,
     allow_paused: bool = False,
+    refuse_entries_halt: bool = False,
 ) -> bool:
     """Take the single submission lease for one deployment, or refuse.
 
@@ -5477,6 +5909,12 @@ def claim_live_deployment_submission(
     what it holds but opens nothing. The caller is the daemon's claim site, which knows
     the signal kind; leaving it at the default keeps a plain status gate for entries.
 
+    ``refuse_entries_halt`` adds a third fact for *entry* submissions only:
+    the broker-reconciliation entries halt is checked inside the same
+    statement, so a halt committed while the dispatcher was sizing the order
+    still wins the race. Exits pass ``False`` - the halt is entry-only and
+    must never freeze them.
+
     An expired lease is deleted first, in its own committed transaction, so a
     claimer that died mid-submission cannot wedge the deployment forever. The
     cleanup is committed separately on purpose: it must survive a refused
@@ -5490,6 +5928,15 @@ def claim_live_deployment_submission(
     init_db()
     now = _utcnow_naive()
     expires_at = now + timedelta(seconds=max(float(ttl_seconds), 0.01))
+    halt_predicate = ""
+    if refuse_entries_halt:
+        # json_extract mirrors live_deployment_entries_halted's truthiness for
+        # every JSON type: missing/null/false/0/"" read as not halted, anything
+        # else (the reconciler always stores a non-empty marker dict) blocks.
+        halt_predicate = (
+            "AND COALESCE(json_extract(settings, "
+            f"'$.{ENTRIES_HALT_SETTINGS_KEY}'), 0) IN (0, '')"
+        )
     # Built from the shared status tuple, never from caller text, so the set cannot be
     # widened by anything but this flag - and so the daemon's dispatch statuses and this
     # filter cannot drift apart.
@@ -5511,7 +5958,8 @@ def claim_live_deployment_submission(
                     "INSERT INTO live_deployment_submission_claims "
                     "(token, deployment_id, claimed_at, expires_at) "
                     "SELECT :token, id, :claimed_at, :expires_at FROM live_deployments "
-                    f"WHERE id = :deployment_id AND {status_filter}"
+                    f"WHERE id = :deployment_id AND {status_filter} "
+                    f"{halt_predicate}"
                 ),
                 {
                     "token": normalized_token,
