@@ -736,6 +736,62 @@ export interface LiveDeploymentDeleteResponse {
   warning?: string;
 }
 
+/**
+ * The kill-switch modes, least restrictive first - the same ranking
+ * `live_runner.kill_switch.KillSwitchMode` declares and the database stores.
+ * `entries` refuses new entries only; `orders` also cancels working orders;
+ * `flatten` also closes positions and sweeps the protections it orphaned.
+ */
+export type LiveKillSwitchMode = "entries" | "orders" | "flatten";
+
+export interface LiveKillSwitchHalt {
+  scope: string;
+  mode: string;
+}
+
+export interface LiveKillSwitchHaltDetail {
+  scope: string;
+  mode: string;
+  halted_at?: string | null;
+  halted_by: string;
+  reason: string;
+  history_available: boolean;
+}
+
+/**
+ * `GET /api/live/kill-switch` as the daemon enforces it. `readable: false` is
+ * the fail-closed case - the state could not be read, so entries are refused
+ * anyway - and must never be rendered like "nothing is halted".
+ */
+export interface LiveKillSwitchState {
+  readable: boolean;
+  unreadable_reason?: string | null;
+  global_scope: string;
+  modes: string[];
+  halts: LiveKillSwitchHalt[];
+  halted_accounts: string[];
+  global_halted: boolean;
+  halt_details: LiveKillSwitchHaltDetail[];
+}
+
+export interface LiveKillSwitchHaltResponse {
+  halted: boolean;
+  scope: string;
+  mode: string;
+  halted_at?: string | null;
+  halted_by?: string;
+  reason?: string;
+  /** The combined state after the write, read back by the server. */
+  state: LiveKillSwitchState;
+}
+
+export interface LiveKillSwitchResumeResponse {
+  halted: boolean;
+  lifted: boolean;
+  scope: string;
+  state: LiveKillSwitchState;
+}
+
 export interface LiveDeploymentCreateRequest {
   strategy_name?: string;
   account_id: string;
