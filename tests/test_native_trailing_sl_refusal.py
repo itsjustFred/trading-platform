@@ -178,6 +178,40 @@ def test_strategy_parameter_default_survives_unparseable_source(tmp_path):
     assert strategy_parameter_default(strategy, "use_trailing_sl") is None
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        RecursionError("maximum recursion depth exceeded"),
+        ValueError("source code string cannot contain null bytes"),
+        TypeError("expected str, bytes or ast.AST"),
+        MemoryError("out of memory"),
+        SyntaxError("invalid syntax"),
+    ],
+)
+def test_strategy_parameter_default_survives_ast_parse_failure(
+    tmp_path, monkeypatch, error
+):
+    """The widened ``except`` around ``ast.parse`` must catch every failure
+    class, not just SyntaxError: reverting to ``except SyntaxError`` let
+    RecursionError/ValueError/TypeError/MemoryError escape as a 500.
+    """
+    from runner.engines import base as engines_base
+    from runner.engines.base import strategy_parameter_default
+
+    strategy = tmp_path / "fine_signature.py"
+    strategy.write_text(
+        "def generate_signals(df, use_trailing_sl=True):\n    pass\n",
+        encoding="utf-8",
+    )
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(engines_base.ast, "parse", boom)
+
+    assert strategy_parameter_default(strategy, "use_trailing_sl") is None
+
+
 def _load_custom_swings_supertrend():
     import importlib.util
     from pathlib import Path
@@ -266,6 +300,62 @@ def test_kwargs_style_false_string_does_not_trail_or_take_profit():
     assert _signals_equal(run(use_rrr="true"), run(use_rrr=True))
     assert not _signals_equal(run(use_rrr=True), run(use_rrr=False))
 
-    # Same for the trailing switch itself.
-    assert _signals_equal(run(use_trailing_sl="false"), run(use_trailing_sl=False))
-    assert _signals_equal(run(use_trailing_sl="0"), run(use_trailing_sl=False))
+    # The same coercion is observable for the other two switches on this
+    # fixture (True vs False changes the signals), so pin them the same way —
+    # dropping either ``_coerce_bool`` line flips these to unequal.
+    assert _signals_equal(run(use_breakeven="false"), run(use_breakeven=False))
+    assert _signals_equal(run(use_breakeven="0"), run(use_breakeven=False))
+    assert not _signals_equal(run(use_breakeven=True), run(use_breakeven=False))
+    assert _signals_equal(
+        run(ema_filter_enabled="false"), run(ema_filter_enabled=False)
+    )
+    assert not _signals_equal(
+        run(ema_filter_enabled=True), run(ema_filter_enabled=False)
+    )
+
+
+def test_kwargs_style_switches_pass_through_coerce_bool():
+    """Every boolean kwarg must reach ``_coerce_bool`` with its raw value.
+
+    ``use_trailing_sl`` itself cannot be observed in this strategy's signals:
+    ``tp_hit`` is only set on the bar that first touches ``tp_target``, and
+    that same bar always exits (fixed-RR take-profit or stop), so the
+    trailing branch is unreachable on every engine — ``True`` and ``False``
+    produce identical frames. The spy below pins the next best thing: each
+    kwarg's raw token still flows through ``_coerce_bool`` on the kwargs
+    path, so deleting e.g. ``use_trailing_sl = _coerce_bool(use_trailing_sl)``
+    drops its token from the recorded calls. (A bare ``_coerce_bool(x)`` call
+    whose result is discarded would still pass — that residual is inherent
+    to the parameter being a no-op; flagged to the maintainer.)
+    """
+    module = _load_custom_swings_supertrend()
+    df = _trailing_fixture_df()
+    calls = []
+    real_coerce = module._coerce_bool
+
+    def spy(value):
+        calls.append(value)
+        return real_coerce(value)
+
+    module._coerce_bool = spy
+    try:
+        module.generate_signals(
+            df,
+            st_period=3,
+            st_multiplier=2.0,
+            ema_fast=3,
+            ema_slow=5,
+            ema_filter_enabled="",
+            use_rrr="0",
+            risk_reward=1.0,
+            use_breakeven="no",
+            use_trailing_sl="off",
+            trade_direction="long",
+        )
+    finally:
+        module._coerce_bool = real_coerce
+
+    # One distinct false-ish token per switch: each must appear among the
+    # values handed to _coerce_bool exactly when its coercion line runs.
+    for token in ("", "0", "no", "off"):
+        assert token in calls
