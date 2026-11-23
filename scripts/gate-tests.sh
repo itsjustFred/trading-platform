@@ -102,7 +102,6 @@ GUARDED_SCRIPTS=(
     scripts/backtest_to_validation_ref.py
     scripts/db_backup.py
     scripts/dedupe_executions.py
-    scripts/fetch_differential_slice.py
     scripts/overnight_strategy_discovery.py
     scripts/recalculate_backtest_stats.py
     scripts/regenerate_backtests.py
@@ -110,6 +109,7 @@ GUARDED_SCRIPTS=(
     scripts/regenerate_qc_risk_parity_artifact.py
     scripts/run_risk_parity_backtest.py
     scripts/seed_demo_backtests.py
+    scripts/signal_archive_market_features.py
 )
 
 run_one "guarded scripts lint (ruff --select F)" \
