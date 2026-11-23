@@ -75,10 +75,13 @@ kein Fixed-Risk — für diesen EA ungeeignet; 7 s vs. ~110 s Laufzeit).
 
 Der Owner-Entscheid vom 2026-11-13 lässt Signal-Exits standardmäßig zum **nächsten**
 Bar-Open füllen (wie Entries). Der MT5-Time-Exit füllt aber am ersten Tick der
-Exit-Minute = Open der Signal-Bar selbst (22:55). Die MT5-Parity-Läufe müssen deshalb
-weiterhin `signal_exit_fill='open'` setzen (Config oben, unverändert, ergibt identische
-Ergebnisse); mit dem neuen Default liegen die Time-Exits genau eine Bar (M1: eine Minute)
-zu spät (Exit-Preis-Treffer auf den Audit-Fenstern 6→0 bzw. 3→0).
+Exit-Minute = Open der Signal-Bar selbst (22:55). `signal_exit_fill='open'` wurde
+entfernt (#153): die Strategie signalisiert den Time-Exit seit #209 auf der ersten
+Bar, deren Ende die Exit-Zeit erreicht, sodass der `next_open`-Default (und
+`run_native_window.py` ohne `--signal-exit-fill`-Override) genau am MT5-Fill-Open
+füllt. Ältere Läufe mit `'open'` entsprachen demselben Fill; mit dem Default liegen
+die Time-Exits ohne die vorverlegte Exit-Signalation eine Bar zu spät (Exit-Preis-Treffer
+auf den Audit-Fenstern 6→0 bzw. 3→0).
 
 ## Volle Historie 2018–2026: ATR-Glättung, D1-Bars, Broker-Uhr
 

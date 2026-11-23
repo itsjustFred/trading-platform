@@ -98,6 +98,30 @@ def test_one_minute_feed_signals_the_second_to_last_minute():
     assert _et(df, exit_idx) == "01-03 23:58"
 
 
+def test_daily_feed_has_no_second_to_last_bar_so_flattens_on_next_session():
+    """Feed-level gate: bar spacing >= 1440min is not intraday.
+
+    On a daily feed EVERY bar's clock formula would qualify as "second-to-last"
+    (there is no intraday session schedule to be second-to-last of), so the
+    session-close mask must stay off and the flatten falls back to the
+    ``session_day_start`` safeguard on the next session's first bar. The gate
+    reads the feed's modal spacing - a feed property - never a per-day count
+    of how many bars the day happens to contain (that count is look-ahead).
+    """
+    module = _load()
+    # warmup is 20 bars, so the breakout must land late in a longer frame
+    days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range("2024-01-02", periods=25)]
+    df = _frame(days, "1D", bars=1, breakout_bar=21)
+    entries, exits, indicators, _ = module.generate_signals(df, _PARAMS)
+    assert int(entries.sum()) >= 1
+    exit_idx = exits[exits].index.tolist()
+    assert exit_idx, "daily feed must still flatten the carried position"
+    # First bar of the session AFTER the entry day, reason session_close.
+    first_entry = entries[entries].index[0]
+    assert exit_idx[0] == first_entry + 1
+    assert indicators["exit_reason"].loc[exit_idx[0]] == "session_close"
+
+
 def test_day_ending_early_flattens_on_the_first_bar_of_the_next_session():
     module = _load()
     # day 1 normal (14 bars), day 2 enters and then the session ends 2 bars early
