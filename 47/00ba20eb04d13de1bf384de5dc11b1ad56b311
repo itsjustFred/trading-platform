@@ -1,0 +1,24 @@
+runner/cli.py
+  h_f251b30ae7fbf6 615,617,619,621,623-630
+runner/fees.py
+  h_f251b30ae7fbf6 79-82,139-144,146-147
+tests/test_fees.py
+  h_f251b30ae7fbf6 50-53,56,99-111
+tests/test_runner_cli.py
+  h_f251b30ae7fbf6 73-76,79
+tests/test_viewer_features.py
+  h_f251b30ae7fbf6 3617-3620,3626-3631
+viewer/main.py
+  h_f251b30ae7fbf6 1465-1466,1486-1487,11509-11511,11516-11520
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4700ba20eb04d13de1bf384de5dc11b1ad56b311",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
