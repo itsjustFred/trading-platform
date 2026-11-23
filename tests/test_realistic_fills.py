@@ -10,11 +10,12 @@ B. Signal-driven exits fill at the NEXT bar's open, like entries. A signal on
 
 Covered engines: native ``TradeEngine`` (the only engine under development,
 ADR ``docs/adr/0001-native-single-strategy-engine.md``), ``SignalReplayAdapter``
-(separate product, already gap-aware) and PyneCore's exit-containment helper,
-plus the shared ``contract`` primitives. The frozen vectorbt adapter keeps its
-level fills and legacy signal-exit convention (``next_open`` is mapped to
-``close`` with a warning), so its gap/next-open coverage is intentionally
-absent here.
+(separate product, already gap-aware) and the shared ``contract`` primitives.
+The frozen vectorbt/pynecore adapters keep their level fills and legacy
+signal-exit convention and REFUSE ``signal_exit_fill="next_open"`` outright
+(fail loud, not warn-and-run), so their gap/next-open coverage is intentionally
+absent here — their containment is pinned at the level in
+tests/test_engine_contract.py.
 """
 
 from __future__ import annotations
@@ -26,8 +27,16 @@ from risk.config import RiskConfig
 from runner.engine import TradeEngine
 from runner.engines import contract
 from runner.engines.base import BacktestConfig
+from runner.engines.pynecore_adapter import (
+    PyneCoreAdapter,
+    _frozen_signal_exit_fill as _pyne_frozen_fill,
+)
 from runner.engines.pynecore_adapter import _normalize_trade_exits
 from runner.engines.signal_replay_adapter import ReplaySignal, SignalReplayAdapter
+from runner.engines.vectorbt_adapter import (
+    VectorbtAdapter,
+    _frozen_signal_exit_fill as _vbt_frozen_fill,
+)
 from shared.models import Trade, TradeExit
 
 # --------------------------------------------------------------------------- #
@@ -124,6 +133,7 @@ def _native(
     entry_bar: int = 0,
     spread: float = 0.0,
     parameters: dict | None = None,
+    extra_indicators: dict | None = None,
     **config_kwargs,
 ):
     """Entry signal on ``entry_bar`` (fills at the next open) with optional levels."""
@@ -140,6 +150,8 @@ def _native(
             indicators["stop_loss"] = pd.Series(stop, index=df.index)
         if take_profit is not None:
             indicators["take_profit"] = pd.Series(take_profit, index=df.index)
+        for key, value in (extra_indicators or {}).items():
+            indicators[key] = pd.Series(value, index=df.index)
         return entries, exits, indicators, []
 
     payload = {
@@ -398,12 +410,84 @@ class TestNativeSignalExitNextOpen:
         assert model["signal_exit_fill"] == "next_open"
 
 
+class TestNativeGapEdgeCases:
+    """Review follow-ups: ladder remainders, ask-side gaps, trailed stops."""
+
+    def test_gapped_tp1_remainder_is_closed_by_the_parked_signal_exit_at_the_same_open(self):
+        # Bar3 opens at 110: beyond tp1 (105, gapped) but below tp2 (120). tp1
+        # fills half the position at the open; the parked signal exit (bar2's
+        # exit signal) claims the remainder at that SAME open.
+        rows = [
+            _flat(100.0), _flat(100.0), _flat(101.0),
+            (110.0, 112.0, 109.0, 111.0), _flat(111.0),
+        ]
+        result = _native(
+            rows,
+            stop=95.0,
+            exit_bar=2,
+            extra_indicators={"tp1": 105.0, "tp2": 120.0},
+        )
+        (trade,) = result.trades
+        assert len(trade.exits) == 2
+        tp_leg, signal_leg = trade.exits
+        assert tp_leg.price == pytest.approx(110.0)  # gap open, not the 105 level
+        assert tp_leg.reason == "tp1"
+        assert signal_leg.price == pytest.approx(110.0)
+        assert signal_leg.reason == "signal"
+        assert pd.Timestamp(signal_leg.time) == pd.Timestamp("2024-01-01 03:00", tz="UTC")
+
+    def test_tp_ladder_with_only_the_first_level_gapped(self):
+        # Same gap, no signal exit: tp1 fills at the open, tp2 (120) is never
+        # reached, and the remainder runs to the end-of-data close.
+        rows = [
+            _flat(100.0), _flat(100.0), _flat(101.0),
+            (110.0, 112.0, 109.0, 111.0), _flat(111.0), _flat(111.0),
+        ]
+        result = _native(
+            rows,
+            stop=95.0,
+            extra_indicators={"tp1": 105.0, "tp2": 120.0},
+        )
+        (trade,) = result.trades
+        assert trade.exits[0].price == pytest.approx(110.0)
+        assert trade.exits[0].reason == "tp1"
+        assert trade.exits[-1].reason == "end_of_data"
+        # The ladder's first level took its 1/2 fraction; the remainder is half.
+        assert trade.exits[0].quantity == pytest.approx(trade.quantity / 2)
+
+    def test_short_ask_open_gap_fills_at_the_ask_open(self):
+        # ask_ohlc: the SHORT stop triggers on the ask. Bid open 104.7 alone is
+        # NOT beyond the 105 stop, but ask open (104.7 + 0.4 = 105.1) is — a
+        # gap the bid-only view would miss. Fill is the ask open.
+        rows = [
+            _flat(100.0), _flat(100.0),
+            (104.7, 105.3, 104.5, 105.0), _flat(105.0),
+        ]
+        result = _native(
+            rows,
+            direction="SHORT",
+            stop=105.0,
+            spread=0.4,
+            parameters={"spread_price_col": "spread_price", "ask_ohlc": True},
+        )
+        (trade,) = result.trades
+        assert trade.exits[-1].price == pytest.approx(105.1)
+        assert trade.exits[-1].reason == "stop_loss"
+
+
 # --------------------------------------------------------------------------- #
 # signal replay
 # --------------------------------------------------------------------------- #
 
 
-def _replay(frame: pd.DataFrame, *, action: str, stop: float | None, tp: float | None):
+def _replay(
+    frame: pd.DataFrame,
+    *,
+    action: str,
+    stop: float | None,
+    tp: float | None,
+    metadata: dict | None = None,
+):
     signal = ReplaySignal.from_payload(
         {
             "timestamp": "2026-01-01T00:00:00Z",
@@ -414,6 +498,7 @@ def _replay(frame: pd.DataFrame, *, action: str, stop: float | None, tp: float |
             "take_profit": tp,
             "timeframe": "1m",
             "source": "test",
+            **({"metadata": metadata} if metadata else {}),
         },
         default_timeframe="1m",
     )
@@ -506,6 +591,26 @@ class TestSignalReplayGaps:
         )
         assert trade.exits[-1].price == pytest.approx(expected)
 
+    def test_gapped_trailing_stop_fills_at_the_open(self):
+        # Bar1's close (103) trails the 98 stop up to ~101.97; bar2 then OPENS
+        # at 100.5, beyond the trailed stop — a gap, so the fill is the open,
+        # and the reason stays trailing_stop.
+        trade = _replay(
+            _replay_frame(
+                [100.0, 100.5, 100.5],
+                [100.8, 103.5, 100.8],
+                [99.8, 100.2, 100.0],
+                [100.0, 103.0, 100.6],
+            ),
+            action="buy",
+            stop=98.0,
+            tp=140.0,
+            metadata={"trailing_sl_config": {"mode": "percent", "percent": 0.01}},
+        )
+        assert trade.exit_reason == "trailing_stop"
+        assert trade.exits[-1].price == pytest.approx(100.5)
+        assert trade.meta["trailing_stop_updates"] >= 1
+
 
 # --------------------------------------------------------------------------- #
 # PyneCore exit containment
@@ -534,31 +639,66 @@ def _pyne_trade(
 
 
 class TestPyneCoreContainment:
-    def _frame(self, bar2_open: float) -> pd.DataFrame:
-        return _bars([_flat(), _flat(), (bar2_open, bar2_open + 1, bar2_open - 1, bar2_open)])
+    """Frozen engine: containment restates to the recorded LEVEL only — the
+    2026-11-13 gap→open restatement was reverted (frozen engines get no
+    behaviour changes)."""
 
-    def test_violating_exit_without_a_gap_is_restated_to_the_level(self):
-        trade = _pyne_trade("LONG", 93.0, sl=95.0)
-        _normalize_trade_exits([trade], self._frame(97.0))  # bar opens above the stop
-        assert trade.exits[-1].price == pytest.approx(95.0)
-        assert trade.exits[-1].reason == "stop_loss"
-
-    def test_violating_exit_on_a_gap_bar_is_restated_to_the_open(self):
-        trade = _pyne_trade("LONG", 93.0, sl=95.0)
-        _normalize_trade_exits([trade], self._frame(92.0))  # bar opens below the stop
-        assert trade.exits[-1].price == pytest.approx(92.0)
-        assert trade.exits[-1].reason == "stop_loss"
-
-    def test_short_target_gap_is_restated_to_the_open(self):
-        trade = _pyne_trade("SHORT", 84.0, tp=90.0)
-        _normalize_trade_exits([trade], self._frame(86.0))  # opens below the target
-        assert trade.exits[-1].price == pytest.approx(86.0)
-        assert trade.exits[-1].reason == "take_profit"
-
-    def test_without_a_frame_the_level_is_used(self):
+    def test_violating_exit_is_restated_to_the_level_even_on_a_gap_bar(self):
+        # The exit bar opens below the 95 stop (a gap), but the frozen
+        # containment still restates to the level, not the open.
         trade = _pyne_trade("LONG", 93.0, sl=95.0)
         _normalize_trade_exits([trade])
         assert trade.exits[-1].price == pytest.approx(95.0)
+        assert trade.exits[-1].reason == "stop_loss"
+
+    def test_short_target_violation_is_restated_to_the_level(self):
+        trade = _pyne_trade("SHORT", 84.0, tp=90.0)
+        _normalize_trade_exits([trade])
+        assert trade.exits[-1].price == pytest.approx(90.0)
+        assert trade.exits[-1].reason == "take_profit"
+
+    def test_exit_inside_the_levels_is_untouched(self):
+        trade = _pyne_trade("LONG", 97.0, sl=95.0, tp=105.0)
+        _normalize_trade_exits([trade])
+        assert trade.exits[-1].price == pytest.approx(97.0)
+        assert trade.exits[-1].reason == "signal"
+
+
+# --------------------------------------------------------------------------- #
+# frozen engines refuse next_open (fail loud, not warn-and-run)
+# --------------------------------------------------------------------------- #
+
+
+class TestFrozenEnginesRefuseNextOpen:
+    def _config(self, fill: str) -> BacktestConfig:
+        return BacktestConfig(
+            strategy_name="frozen",
+            symbols=["T"],
+            timeframe="1h",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            signal_exit_fill=fill,
+        )
+
+    @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill])
+    def test_next_open_is_refused(self, guard):
+        with pytest.raises(ValueError, match="next_open"):
+            guard(self._config("next_open"))
+
+    @pytest.mark.parametrize("guard", [_vbt_frozen_fill, _pyne_frozen_fill])
+    @pytest.mark.parametrize("fill", ["close", "open"])
+    def test_legacy_fills_pass_through(self, guard, fill):
+        config = self._config(fill)
+        assert guard(config) is config
+
+    @pytest.mark.parametrize("adapter", [VectorbtAdapter, PyneCoreAdapter])
+    def test_run_refuses_next_open_before_touching_data(self, adapter, tmp_path):
+        # The guard runs before data loading, so a next_open config fails loud
+        # even with no OHLCV on disk.
+        strategy = tmp_path / "strat.py"
+        strategy.write_text("def generate_signals(df, params):\n    pass\n")
+        with pytest.raises(ValueError, match="next_open"):
+            adapter().run(self._config("next_open"), str(strategy))
 
 
 # --------------------------------------------------------------------------- #

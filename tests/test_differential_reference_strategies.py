@@ -594,6 +594,9 @@ def run_vbt(tmp_path: Path, frame, strategy: str, params: dict, **cfg_kwargs):
         timeframe=cfg_kwargs.get("timeframe", "1d"),
         cls=cfg_kwargs.pop("cls", "equities"),
     )
+    # The frozen vectorbt adapter refuses next_open; the comparison reference
+    # models its legacy signal-bar-close fill (``signal_exit_close=True``).
+    cfg_kwargs.setdefault("signal_exit_fill", "close")
     return VectorbtAdapter().run(_config(data_dir, params=params, **cfg_kwargs), strategy)
 
 

@@ -18,7 +18,10 @@ from uuid import UUID
 
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_TERMINAL,
+    ORDER_STATE_WORKING,
     BaseLiveAdapter,
+    BrokerOrderView,
     ControlOutcome,
     LivePipValue,
     LiveQuote,
@@ -932,6 +935,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #146: (baseAssetId, quoteAssetId) per upper symbol name, from the
         # light symbol list, and the account's deposit asset. Session state.
         self._symbol_assets: dict[str, tuple[int, int]] = {}
+        # #240: ProtoOASymbol.leverageId per upper symbol name, captured with
+        # the symbol props; resolved to a leverage via GetDynamicLeverageByID.
+        self._symbol_leverage_ids: dict[str, int] = {}
         self._deposit_asset_id: int | None = None
         self._asset_names: dict[int, str] = {}
         self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
@@ -986,6 +992,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._ProtoOASubscribeSpotsReq: Any = None
         self._ProtoOAUnsubscribeSpotsReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDRes: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLReq: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLRes: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -1012,6 +1022,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOADealListRes,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
+                ProtoOAGetDynamicLeverageByIDReq,
+                ProtoOAGetDynamicLeverageByIDRes,
+                ProtoOAGetPositionUnrealizedPnLReq,
+                ProtoOAGetPositionUnrealizedPnLRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -1069,6 +1083,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
         self._ProtoOAOrderListReq = ProtoOAOrderListReq
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
+        self._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
+        self._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+        self._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+        self._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOADealListReq = ProtoOADealListReq
@@ -1571,9 +1589,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         if not symbol_name_to_id:
             self._symbol_props.clear()
+            self._symbol_leverage_ids.clear()
             return
         for name in symbol_name_to_id:
             self._symbol_props.pop(name, None)
+            self._symbol_leverage_ids.pop(name, None)
         try:
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOASymbolByIdReq,
@@ -1614,6 +1634,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
+            # #240: the symbol's dynamic-leverage id rides on the same detail
+            # payload. Archived entries come first, so a live entry's id wins.
+            leverage_id = _optional_int(getattr(detail, "leverageId", None))
+            if leverage_id is not None and leverage_id > 0:
+                self._symbol_leverage_ids[name] = leverage_id
+            else:
+                self._symbol_leverage_ids.pop(name, None)
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
             scale = _symbol_scale_from_broker_props(
                 digits=getattr(detail, "digits", None),
@@ -2420,6 +2447,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
         self._symbol_props.clear()
+        self._symbol_leverage_ids.clear()
         self._symbol_assets.clear()
         self._deposit_asset_id = None
         self._asset_names.clear()
@@ -3122,6 +3150,114 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise ValueError(f"cTrader conversion rate for {label} is not positive: {rate!r}")
         return rate, tuple(symbols), tuple(quotes)
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol`` (#240).
+
+        Two broker-granted ceilings bound the answer and the tighter one wins:
+
+        * the symbol's dynamic-leverage tiers — ``ProtoOASymbol.leverageId``,
+          captured with the symbol props, resolves through
+          ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
+          ascending by volume. ``ProtoOADynamicLeverageTier.leverage`` is in
+          the cents convention (1:200 is ``20000``): Spotware's own Open API
+          example divides the field by 100 before display, so the plain ratio
+          is ``value / 100``. Leverage shrinks as position volume grows, so
+          the maximum sits in the first tier — an upper bound: a larger order
+          is margined at a lower tier, which the broker still enforces;
+        * the account's own leverage — ``ProtoOATrader.leverageInCents`` is
+          the leverage the account actually trades at. Spotware's example
+          computes the effective leverage as
+          ``min(trader.leverageInCents, tier.leverage) / 100``, so an account
+          set to 1:50 on a symbol offering 1:500 is capped at 50 — the tier
+          alone would overstate what the broker will margin.
+          ``ProtoOATrader.maxLeverage`` is deliberately *not* read: it is a
+          plain uint32 named without an "InCents" suffix (Spotware uses it to
+          validate leverage *changes*, not margining), the broker already
+          validates ``leverageInCents`` against it so it can never be the
+          tighter bound, and reading it in the wrong unit would silently
+          shrink every order.
+
+        The account leg degrades on its own (no readable trader record or an
+        unset/nonpositive field contributes nothing), while a failed tier
+        request fails the whole lookup closed — ``None``, never a partial
+        answer — so callers treat ``None`` as 1x.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            self._raise_if_terminal_auth_failed()
+
+            account_cents = await self._account_leverage_cents()
+
+            tier_cents: float | None = None
+            if (
+                self._ProtoOAGetDynamicLeverageByIDReq is not None
+                and self._ProtoOAGetDynamicLeverageByIDRes is not None
+            ):
+                leverage_id = self._symbol_leverage_ids.get(
+                    str(symbol or "").strip().upper()
+                )
+                if leverage_id is not None:
+                    request = self._ProtoOAGetDynamicLeverageByIDReq()
+                    request.ctidTraderAccountId = self.ctid_trader_account_id
+                    request.leverageId = int(leverage_id)
+                    response = await self._send_request_with_refresh_retry(
+                        request, timeout_seconds=10
+                    )
+                    if isinstance(
+                        response, self._ProtoOAGetDynamicLeverageByIDRes
+                    ):
+                        leverage_msg = getattr(response, "leverage", None)
+                        tiers = (
+                            getattr(leverage_msg, "tiers", None)
+                            if leverage_msg is not None
+                            else None
+                        )
+                        values = [
+                            value
+                            for tier in tiers or []
+                            if (value := _optional_float(getattr(tier, "leverage", None)))
+                            is not None
+                            and math.isfinite(value)
+                            and value > 0
+                        ]
+                        if values:
+                            tier_cents = max(values)
+
+            candidates = [cents for cents in (tier_cents, account_cents) if cents is not None]
+            return min(candidates) / 100.0 if candidates else None
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader max leverage lookup failed; treating it as unknown (1x)",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            return None
+
+    async def _account_leverage_cents(self) -> float | None:
+        """The account's own leverage in cents, or ``None``.
+
+        Reads ``ProtoOATrader.leverageInCents`` — the leverage the account
+        actually trades at — which is the account-side bound the symbol
+        tiers are clamped against. ``maxLeverage`` is not read: its unit is
+        unverified and it is only the broker's ceiling for *changing*
+        leverage, which ``leverageInCents`` is already validated against.
+        An unreadable trader record or an unset/nonpositive field degrades
+        to ``None`` — the tier leg may still answer on its own.
+        """
+        try:
+            trader = await self._fetch_trader()
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader trader leverage lookup failed; using the symbol tiers only",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+        value = _optional_float(getattr(trader, "leverageInCents", None))
+        if value is None or not math.isfinite(value) or value <= 0:
+            return None
+        return value
+
     async def _fetch_trader(self) -> Any:
         """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""
         self._raise_if_terminal_auth_failed()
@@ -3183,8 +3319,14 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         scale = money_scale(digits)
         total = 0.0
         for position_pnl in response.positionUnrealizedPnL:
-            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None))
-        return total / scale
+            # Fail closed per entry (#302): an unreadable or non-finite
+            # netUnrealizedPnL read as 0.0 would understate a losing position
+            # and overstate equity - the unsafe direction for both the loss
+            # breaker and the pre-submit caps' free-margin ceiling.
+            # ``parse_money`` raises ``MoneyParseError`` on a missing or
+            # garbage field, so the whole equity read fails closed.
+            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None)) / scale
+        return total
 
     async def get_balance(self) -> tuple[float, float]:
         trader = await self._fetch_trader()
@@ -3198,13 +3340,54 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 equity = raw_equity / scale
         return balance, equity
 
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, summed in account currency (#359).
+
+        Sums the broker-reported ``ProtoOAPosition.usedMargin`` of every OPEN
+        position — cTrader has already applied each position's own leverage
+        (account leverage clamped by the symbol's volume tier), so no leverage
+        lookup is needed here. ``None`` when the reconcile or any open
+        position's margin figure is unreadable: a partial sum would understate
+        used margin and overstate the free margin the pre-submit caps judge
+        the order against.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            reconcile_res = await self._reconcile_state()
+            total = 0.0
+            for position in getattr(reconcile_res, "position", []) or []:
+                status = int(getattr(position, "positionStatus", 0) or 0)
+                if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                    continue
+                used = _optional_float(getattr(position, "usedMargin", None))
+                digits = getattr(position, "moneyDigits", None)
+                if used is None or used < 0 or digits is None:
+                    return None
+                try:
+                    digits_int = int(digits)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if digits_int < 0:
+                    return None
+                total += used / money_scale(digits_int)
+            return total
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader used-margin lookup failed; treating it as unknown",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+
     async def get_equity(self) -> float:
         """Account equity including unrealized P&L, for the loss breaker (#301).
 
         Deliberately a separate path from :meth:`get_balance`: the #267
         maintainer decision keeps position sizing on realized balance, so
-        ``get_balance`` must not start carrying unrealized P&L. Only the
-        breaker reads this. ``ProtoOATrader`` has no equity field, so equity
+        ``get_balance`` must not start carrying unrealized P&L. The loss
+        breaker (#301) and the pre-submit caps' free-margin ceiling (#302,
+        #359) read this. ``ProtoOATrader`` has no equity field, so equity
         is balance plus the summed net unrealized P&L of open positions -
         reporting balance here would hide an open losing position until it
         closes. Any failure raises: unreadable equity is never "no loss".
@@ -3447,6 +3630,180 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             if client_order_id:
                 ids.add(client_order_id)
         return ids
+
+    async def list_reconciliation_orders(self) -> list[BrokerOrderView]:
+        """Working orders with client ids and position-protection marks (#303)."""
+        reconcile_res = await self._reconcile_state()
+        trade_side_enum = getattr(self, "_ProtoOATradeSide", None)
+        if trade_side_enum is None:
+            raise ValueError("cTrader trade-side enum is unavailable")
+        try:
+            buy_side = int(trade_side_enum.BUY)
+            sell_side = int(trade_side_enum.SELL)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("cTrader trade-side enum is unreadable") from exc
+
+        def _trade_int(value: Any, field: str, order_key: str) -> int:
+            if isinstance(value, bool):
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            try:
+                number = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                ) from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(
+                    f"cTrader working order {order_key} has unreadable tradeData.{field}"
+                )
+            return number
+
+        views: list[BrokerOrderView] = []
+        for order in getattr(reconcile_res, "order", []) or []:
+            if not self._is_working_order(order):
+                continue
+            try:
+                order_type = int(getattr(order, "orderType", 0) or 0)
+            except (TypeError, ValueError):
+                order_type = 0
+            order_id = self._positive_int(getattr(order, "orderId", 0))
+            client_order_id = str(getattr(order, "clientOrderId", "") or "").strip()
+            key = str(order_id) if order_id is not None else client_order_id
+            if not key:
+                continue
+
+            # ProtoOAOrder carries symbol, volume and side under tradeData,
+            # not at the message root. A missing or malformed tradeData makes
+            # the whole broker read unreadable: emitting a blank/zero view
+            # would let reconciliation treat an unpriced order as accounted
+            # for instead of failing closed.
+            trade_data = getattr(order, "tradeData", None)
+            if trade_data is None:
+                raise ValueError(f"cTrader working order {key} has no tradeData")
+            symbol_id = _trade_int(
+                getattr(trade_data, "symbolId", 0), "symbolId", key
+            )
+            if symbol_id <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has no tradeData.symbolId"
+                )
+            symbol = self._symbol_name_for_id(symbol_id)
+
+            volume_raw = getattr(trade_data, "volume", 0)
+            if isinstance(volume_raw, bool):
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                )
+            try:
+                volume = float(volume_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData.volume"
+                ) from exc
+            if not math.isfinite(volume) or volume <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has non-positive tradeData.volume"
+                )
+
+            trade_side = _trade_int(
+                getattr(trade_data, "tradeSide", 0), "tradeSide", key
+            )
+            if trade_side == buy_side:
+                side = "buy"
+            elif trade_side == sell_side:
+                side = "sell"
+            else:
+                raise ValueError(
+                    f"cTrader working order {key} has unknown tradeData.tradeSide"
+                )
+
+            scale = self._scale_for(symbol)
+            qty = _broker_volume_to_qty(volume, scale.volume_per_qty)
+            if not math.isfinite(qty) or qty <= 0:
+                raise ValueError(
+                    f"cTrader working order {key} has unreadable tradeData volume"
+                )
+
+            protection = order_type == int(self._ProtoOAOrderType.STOP_LOSS_TAKE_PROFIT)
+            views.append(
+                BrokerOrderView(
+                    order_id=key,
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    order_type=str(order_type),
+                    protection=protection,
+                )
+            )
+        return views
+
+    async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
+        """Working/terminal state of one order for reconciliation (#303).
+
+        ``ProtoOAOrderDetailsReq`` answers for a specific order id, including
+        orders no longer working. ``None`` - a transport error, an unknown
+        order, a missing status or a status this client cannot name - always
+        fails closed: the reconciler keeps its finding.
+        """
+        order_id_int = self._coerce_broker_order_id(order_id)
+        if order_id_int is None:
+            return None
+        self._raise_if_terminal_auth_failed()
+        if not self._connected or not self._authenticated:
+            await self.connect()
+        self._raise_if_terminal_auth_failed()
+        if (
+            self._ProtoOAOrderDetailsReq is None
+            or self._ProtoOAOrderDetailsRes is None
+            or self._ProtoOAOrderStatus is None
+        ):
+            return None
+        details_req = self._ProtoOAOrderDetailsReq()
+        details_req.ctidTraderAccountId = self.ctid_trader_account_id
+        details_req.orderId = order_id_int
+        try:
+            details_res = await self._send_request_with_refresh_retry(
+                details_req, timeout_seconds=15
+            )
+        except CTraderApiError:
+            return None
+        if not isinstance(details_res, self._ProtoOAOrderDetailsRes):
+            return None
+        order = getattr(details_res, "order", None)
+        if order is None:
+            return None
+        # ``orderStatus`` defaults to ACCEPTED on an unset order, so a broker
+        # response without a real order id must read as unknown, not working.
+        if not getattr(order, "orderId", 0):
+            return None
+        raw_status = getattr(order, "orderStatus", None)
+        if raw_status is None:
+            raw_status = getattr(order, "status", None)
+        if raw_status is None:
+            return None
+        try:
+            status = int(raw_status)
+        except (TypeError, ValueError):
+            return None
+        status_enum = self._ProtoOAOrderStatus
+        if status == int(status_enum.ORDER_STATUS_ACCEPTED):
+            return ORDER_STATE_WORKING
+        terminal = {
+            int(getattr(status_enum, name))
+            for name in (
+                "ORDER_STATUS_FILLED",
+                "ORDER_STATUS_REJECTED",
+                "ORDER_STATUS_EXPIRED",
+                "ORDER_STATUS_CANCELLED",
+            )
+            if getattr(status_enum, name, None) is not None
+        }
+        if status in terminal:
+            return ORDER_STATE_TERMINAL
+        return None
 
     def position_qty_tolerance(self, symbol: str) -> float:
         """Half of one broker volume unit, in qty units, for ``symbol``.

@@ -508,6 +508,26 @@ def resolve_same_bar_exit(
 SIGNAL_EXIT_FILL_NEXT_OPEN = "next_open"
 SIGNAL_EXIT_FILL_VALUES = frozenset({SIGNAL_EXIT_FILL_NEXT_OPEN, "close", "open"})
 
+#: Frozen bar engines that implement only the legacy signal-bar exit fills
+#: (ADR ``docs/adr/0001-native-single-strategy-engine.md``). They REFUSE a
+#: ``next_open`` config (fail loud, not warn-and-run), so entry points that
+#: select one of these engines must declare the legacy ``close`` fill
+#: explicitly — the fill the engine actually simulates is then what the
+#: persisted meta records.
+FROZEN_SIGNAL_EXIT_ENGINES = frozenset({"vectorbt", "pynecore"})
+
+
+def default_signal_exit_fill_for_engine(engine_name: str) -> str:
+    """The ``signal_exit_fill`` to declare when the caller did not choose one.
+
+    ``next_open`` on native (and any engine without a frozen guard); the
+    legacy ``close`` signal-bar fill on the frozen bar engines, matching the
+    semantics they have always simulated.
+    """
+    if str(engine_name or "").strip().lower() in FROZEN_SIGNAL_EXIT_ENGINES:
+        return "close"
+    return SIGNAL_EXIT_FILL_NEXT_OPEN
+
 
 def level_gapped_at_open(
     *,

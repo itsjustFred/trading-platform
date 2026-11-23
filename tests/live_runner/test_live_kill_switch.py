@@ -73,6 +73,12 @@ class _EntryAdapter:
     async def get_balance(self):
         return 100_000.0, 100_000.0
 
+    async def get_equity(self):
+        return 100_000.0
+
+    async def get_used_margin(self):
+        return 0.0
+
     async def get_pip_value(self, symbol):
         return LivePipValue(
             value=1.0,
