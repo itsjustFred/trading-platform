@@ -62,25 +62,31 @@ def test_support_sets_are_what_the_paths_can_execute() -> None:
     # Live support is per broker (#167): percent on Alpaca only.
     assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER == {
         "alpaca": {"none", "percent"},
-        "ctrader": {"none"},
+        # #168: cTrader can execute supertrend_flip, but only for deployments
+        # carrying the live_supertrend_flip opt-in on a demo/paper account -
+        # enforced by the deployment-validation and signal-time gates.
+        "ctrader": {"none", "supertrend_flip"},
     }
     assert LIVE_BASELINE_TRAILING_MODES == {"none"}
-    assert LIVE_ANY_BROKER_TRAILING_MODES == {"none", "percent"}
+    assert LIVE_ANY_BROKER_TRAILING_MODES == {"none", "percent", "supertrend_flip"}
 
 
 def test_live_modes_are_resolved_per_broker_and_fail_closed() -> None:
     assert live_supported_trailing_modes("alpaca") == {"none", "percent"}
     assert live_supported_trailing_modes(" Alpaca ") == {"none", "percent"}
-    assert live_supported_trailing_modes("ctrader") == {"none"}
+    assert live_supported_trailing_modes("ctrader") == {"none", "supertrend_flip"}
     # Unknown or missing broker: baseline only.
     for broker in (None, "", "ibkr"):
         assert live_supported_trailing_modes(broker) == {"none"}
     # No stop-amendment capability: baseline only, whatever the broker.
     assert live_supported_trailing_modes("alpaca", supports_stop_amendment=False) == {"none"}
     assert live_supported_trailing_modes("alpaca", supports_stop_amendment="yes") == {"none"}  # type: ignore[arg-type]
-    # No live broker executes supertrend_flip (#168).
-    for modes in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER.values():
-        assert "supertrend_flip" not in modes
+    # supertrend_flip is cTrader-only (#168); every other broker stays
+    # without it, and the deployment opt-in + demo/paper gates apply
+    # downstream of this table.
+    for broker, modes in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER.items():
+        if broker != "ctrader":
+            assert "supertrend_flip" not in modes
 
 
 def test_mode_is_normalised() -> None:

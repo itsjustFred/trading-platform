@@ -5096,6 +5096,32 @@ def get_live_signal_broker_order_id(signal_id: str) -> str | None:
     return broker_order_id or None
 
 
+def merge_live_signal_metadata(signal_id: str, updates: Mapping[str, Any]) -> bool:
+    """Merge ``updates`` into a signal's ``metadata_json`` and return success.
+
+    Read-modify-write under ``BEGIN IMMEDIATE`` like the other signal-state
+    writers, so two writers cannot lose each other's keys. Used by the live
+    ``supertrend_flip`` workflow (#168) to persist its per-position state on
+    the entry signal - the same row that already carries the plan, so the
+    workflow survives a daemon restart without a second store.
+    """
+    normalized_signal_id = str(signal_id or "").strip()
+    if not normalized_signal_id or not updates:
+        return False
+    init_db()
+    with get_session() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        record = session.get(LiveSignalModel, normalized_signal_id)
+        if record is None:
+            return False
+        metadata = dict(record.metadata_json or {})
+        metadata.update(dict(updates))
+        record.metadata_json = metadata
+        session.add(record)
+        session.commit()
+    return True
+
+
 def get_live_signal_metadata(signal_id: str) -> dict[str, Any] | None:
     normalized_signal_id = str(signal_id or "").strip()
     if not normalized_signal_id:

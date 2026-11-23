@@ -364,9 +364,13 @@ def coerce_positive_live_qty(value: Any, *, field_name: str = "qty") -> float:
 
 
 #: Values :meth:`BaseLiveAdapter.get_order_state` may return. ``None`` means
-#: "unknown" and always fails closed in the reconciler.
+#: "unknown" and always fails closed in the reconciler. ``ORDER_STATE_FILLED``
+#: distinguishes a fully executed order from other terminal outcomes so
+#: fill-aware workflows (the supertrend_flip closes, #168) can tell "filled"
+#: from "died unfilled" without a second broker call.
 ORDER_STATE_WORKING = "working"
 ORDER_STATE_TERMINAL = "terminal"
+ORDER_STATE_FILLED = "filled"
 
 
 @dataclass(frozen=True)
@@ -560,6 +564,16 @@ class BaseLiveAdapter(ABC):
         """Whether this adapter can safely amend a broker-side protective stop."""
         return False
 
+    @property
+    def supports_supertrend_flip(self) -> bool:
+        """Whether this adapter instance can run the live ``supertrend_flip``
+        workflow (#168): native partial closes, protective-stop listing and
+        in-place amendment, market data for the signal timeframe, and a
+        provably demo/paper account. Default ``False``: an adapter that cannot
+        prove every one of those must never be managed by the flip loop.
+        """
+        return False
+
     async def list_protective_stops(self) -> list[ProtectiveStop]:
         """Working stop orders on the reducing side of each open position.
 
@@ -580,8 +594,9 @@ class BaseLiveAdapter(ABC):
     async def get_order_state(self, order_id: str, *, client_order_id: str = "") -> str | None:
         """Classify one order the ledger expects, by broker or client order id.
 
-        Returns ``"working"`` when the broker still has it open, ``"terminal"``
-        when it reached a final state (filled, cancelled, expired, rejected),
+        Returns ``"working"`` when the broker still has it open,
+        ``"terminal"`` when it reached a final state other than filled
+        (cancelled, expired, rejected), ``"filled"`` when it executed,
         and ``None`` when the state cannot be determined - an unknown answer
         must never suppress a reconciliation finding (#303).
         """
@@ -660,6 +675,25 @@ class BaseLiveAdapter(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} cannot identify orphaned protections"
+        )
+
+    async def opening_signal_id_for_position(self, position_id: int) -> str | None:
+        """The persisted entry signal whose order opened ``position_id`` (#168).
+
+        The live ``supertrend_flip`` manager binds its plan to a broker
+        position only when this read proves the position was opened by the
+        entry's own order - never by size or timing coincidence. ``None``
+        means PROVEN foreign/ambiguous (the broker read the position's
+        orders and none, or several, resolve to a persisted signal); an
+        unreadable order list or a failed read must RAISE so the caller can
+        retry a transient failure instead of treating it as foreign
+        ownership. Callers must treat ``None`` as fail-closed. The default
+        cannot prove anything, so it RAISES: returning ``None`` would read
+        as "proven foreign" and silently end every first-sight plan on an
+        adapter that never implemented the read.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot prove which signal opened a position"
         )
 
     async def backfill_commissions(self) -> int:

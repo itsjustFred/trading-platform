@@ -2129,6 +2129,7 @@ def test_get_order_state_maps_broker_statuses() -> None:
     rest fail closed (#303)."""
     orders = {
         "ord-expired": SimpleNamespace(status="expired"),
+        "ord-filled": SimpleNamespace(status="filled"),
         "ord-working": SimpleNamespace(status="new"),
         "ord-weird": SimpleNamespace(status="some_future_status"),
         "ord-done-for-day": SimpleNamespace(status="done_for_day"),
@@ -2147,6 +2148,8 @@ def test_get_order_state_maps_broker_statuses() -> None:
     adapter = _adapter(client)
 
     assert asyncio.run(adapter.get_order_state("ord-expired")) == "terminal"
+    # A fill is not a dead order: callers must never resubmit it as terminal.
+    assert asyncio.run(adapter.get_order_state("ord-filled")) == "filled"
     assert asyncio.run(adapter.get_order_state("ord-working")) == "working"
     assert asyncio.run(adapter.get_order_state("ord-weird")) is None
     assert asyncio.run(adapter.get_order_state("ord-missing")) is None

@@ -1817,8 +1817,13 @@ def test_list_reconciliation_orders_fails_closed_on_missing_or_malformed_trade_d
             _run(adapter.list_reconciliation_orders())
 
 
-def test_get_order_state_reads_working_and_terminal_orders(tmp_path: Path) -> None:
-    """Reconciliation lookups classify one order via ProtoOAOrderDetailsReq."""
+def test_get_order_state_reads_working_filled_and_terminal_orders(tmp_path: Path) -> None:
+    """Reconciliation lookups classify one order via ProtoOAOrderDetailsReq.
+
+    ``ORDER_STATUS_FILLED`` reports ``filled`` (not ``terminal``) so
+    fill-aware workflows can distinguish an executed close from one that died
+    unfilled; the reconciler treats both as non-working (#168).
+    """
     from ctrader_open_api.messages.OpenApiMessages_pb2 import (
         ProtoOAOrderDetailsReq,
         ProtoOAOrderDetailsRes,
@@ -1855,7 +1860,7 @@ def test_get_order_state_reads_working_and_terminal_orders(tmp_path: Path) -> No
 
     adapter._send_request_with_refresh_retry = _fake_send  # type: ignore[method-assign]
 
-    assert asyncio.run(adapter.get_order_state("301")) == "terminal"
+    assert asyncio.run(adapter.get_order_state("301")) == "filled"
     assert asyncio.run(adapter.get_order_state("302")) == "working"
     assert asyncio.run(adapter.get_order_state("303")) == "terminal"
     # An order id the broker does not know reads as unknown, never terminal.

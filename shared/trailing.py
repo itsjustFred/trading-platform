@@ -17,12 +17,12 @@ per-broker table lives here (``LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER``);
 the live runner additionally requires the adapter instance to declare the
 ``supports_stop_amendment`` capability at signal time.
 
-``supertrend_flip`` (#168) is executed by the replay backtest only. Its
-parameters are validated by ``parse_supertrend_flip_plan`` (fail closed, no
-invented defaults). The live path keeps rejecting it: the Alpaca entry is a
-full-quantity bracket whose take-profit leg would close the whole position at
-TP1, so a TP1 *partial* exit needs a different entry order structure first
-(see ``docs/live-deploy-runbook.md``).
+``supertrend_flip`` (#168) runs live on cTrader demo/paper deployments that
+carry the explicit ``live_supertrend_flip`` settings opt-in (see
+``deployment_supertrend_flip_enabled``); every other live broker and every
+non-opted-in deployment still rejects it. Its parameters are validated by
+``parse_supertrend_flip_plan`` (fail closed, no invented defaults). The live
+workflow lives in ``live_runner/supertrend_flip.py``.
 """
 from __future__ import annotations
 
@@ -69,13 +69,15 @@ LIVE_BASELINE_TRAILING_MODES: frozenset[str] = frozenset({TRAILING_MODE_NONE})
 #: Modes the live path executes, per broker (``LiveAccountConfig.broker``).
 #: - ``alpaca``: ``percent`` is trailed by `live_runner/trailing_stops.py`,
 #:   which replaces the protective stop order in place (#167).
-#: - ``ctrader``: the daemon has no cTrader market data to trail on and the
-#:   adapter declares no stop-amendment capability, so only ``none``.
-#: ``supertrend_flip`` is on no broker: its TP1 partial exit cannot coexist
-#: with the full-quantity entry bracket (module docstring, #168).
+#: - ``ctrader``: ``supertrend_flip`` is executable by
+#:   `live_runner/supertrend_flip.py`, but ONLY for deployments that carry the
+#:   ``live_supertrend_flip`` settings opt-in on a provably demo/paper account
+#:   — the deployment-validation and signal-time gates below enforce both
+#:   halves; this table only says the broker *can* execute the mode. ``percent``
+#:   stays unsupported: cTrader declares no ``supports_stop_amendment``.
 LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER: dict[str, frozenset[str]] = {
     "alpaca": frozenset({TRAILING_MODE_NONE, TRAILING_MODE_PERCENT}),
-    "ctrader": LIVE_BASELINE_TRAILING_MODES,
+    "ctrader": frozenset({TRAILING_MODE_NONE, TRAILING_MODE_SUPERTREND_FLIP}),
 }
 
 #: Signal timeframes a live broker can trail on, per broker. Trailing is replayed
@@ -88,6 +90,12 @@ LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER: dict[str, frozenset[str]] = {
 #: trails on no timeframe.
 LIVE_TRAILING_TIMEFRAMES_BY_BROKER: dict[str, frozenset[str]] = {
     "alpaca": frozenset({"1m", "5m", "15m", "30m", "1h"}),
+    # cTrader ``supertrend_flip`` (#168): sub-day bars only. ``4h``/``1d``/``1w``
+    # are excluded because the broker anchors them to its server day, which is
+    # not provably the UTC alignment the replay's bar boundaries use; the flip
+    # workflow's dead-bar and TP1-bar rules are only replay-faithful on bars
+    # both sides agree on.
+    "ctrader": frozenset({"1m", "5m", "15m", "30m", "1h"}),
 }
 
 #: Modes at least one live broker executes. This is NOT a gate for trading a
@@ -110,6 +118,43 @@ RISK_ENGINE_SUPPORTED_TRAILING_MODES: frozenset[str] = frozenset(
 def normalize_trailing_mode(value: Any) -> str:
     """Normalize a configured trailing mode value (strip + lowercase)."""
     return str(value or "").strip().lower()
+
+
+# ── supertrend_flip deployment opt-in (#168) ──────────────────────────────────
+#
+# The live ``supertrend_flip`` workflow is deliberately opt-in per deployment:
+# the mode alone never enables it. A deployment must ALSO carry the explicit
+# ``live_supertrend_flip`` settings flag, and the account's adapter must be a
+# provably demo/paper cTrader (``supports_supertrend_flip`` +
+# ``_adapter_is_demo`` at the daemon's signal gates). Absent or
+# unrecognized values fail closed: the workflow simply does not run.
+
+#: ``LiveDeploymentConfig.settings`` key opting a deployment into the live
+#: ``supertrend_flip`` workflow (#168).
+FLIP_DEPLOYMENT_OPT_IN_KEY = "live_supertrend_flip"
+
+_TRUE_OPT_IN_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+
+def supertrend_flip_opted_in(settings: Any) -> bool:
+    """Whether deployment ``settings`` carry the live flip opt-in.
+
+    Only an explicit truthy value enables it; every other value - absent,
+    false, blank, or an unrecognized token - is off, so a typo fails closed.
+    """
+    if not isinstance(settings, Mapping):
+        return False
+    value = settings.get(FLIP_DEPLOYMENT_OPT_IN_KEY)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _TRUE_OPT_IN_TOKENS
+
+
+def deployment_supertrend_flip_enabled(deployment: Any) -> bool:
+    """Whether this deployment opted into the live flip workflow."""
+    return supertrend_flip_opted_in(getattr(deployment, "settings", None))
 
 
 def validate_trailing_mode(
@@ -236,6 +281,7 @@ def _validate_trailing_mode_for_stage(
     broker: Any,
     timeframe: Any,
     context: str,
+    flip_opted_in: bool = False,
 ) -> None:
     """Validate one trailing mode against a broker, and a timeframe when known.
 
@@ -250,20 +296,32 @@ def _validate_trailing_mode_for_stage(
       wherever the account is resolved): the mode must be supported by that
       broker (``None``/unknown brokers fail closed to ``none`` only) and, when
       a timeframe is given, trailable on it.
+
+    ``supertrend_flip`` additionally requires the deployment's explicit
+    ``live_supertrend_flip`` opt-in (``flip_opted_in``): the broker table says
+    cTrader *can* execute the mode, but only an opted-in deployment may ask
+    for it. Demo/paper enforcement happens later, at the signal gates where
+    the adapter instance is known.
     """
     if broker is ANY_BROKER:
-        validate_trailing_mode(
+        mode = validate_trailing_mode(
             value,
             supported=LIVE_ANY_BROKER_TRAILING_MODES,
             context=context,
         )
-        return
-    mode = validate_trailing_mode(
-        value,
-        supported=live_supported_trailing_modes(broker),
-        context=context,
-    )
-    if timeframe is not None:
+    else:
+        mode = validate_trailing_mode(
+            value,
+            supported=live_supported_trailing_modes(broker),
+            context=context,
+        )
+    if mode == TRAILING_MODE_SUPERTREND_FLIP and not flip_opted_in:
+        raise ValueError(
+            f"Trailing stop mode 'supertrend_flip' in {context} requires the "
+            f"deployment '{FLIP_DEPLOYMENT_OPT_IN_KEY}' settings opt-in; "
+            "refusing to run the live flip workflow without it."
+        )
+    if broker is not ANY_BROKER and timeframe is not None:
         validate_live_trailing_timeframe(
             mode,
             timeframe,
@@ -278,6 +336,7 @@ def validate_live_deployment_trailing_override(
     context: str,
     broker: Any = ANY_BROKER,
     timeframe: Any = None,
+    flip_opted_in: bool = False,
 ) -> None:
     """Validate a live deployment's trailing-mode override, if it sets one.
 
@@ -307,6 +366,7 @@ def validate_live_deployment_trailing_override(
         broker=broker,
         timeframe=timeframe,
         context=where,
+        flip_opted_in=flip_opted_in,
     )
 
 
@@ -340,12 +400,18 @@ def validate_live_deployment_trailing_mode(
 
     A deployment without a signal processor, and a processor that declares no
     trailing mode at all (e.g. RocketFuel), pass untouched.
+
+    ``supertrend_flip`` additionally requires the deployment's explicit
+    ``live_supertrend_flip`` settings opt-in (#168); the flag is read from the
+    deployment itself, so every caller gets the same answer.
     """
+    flip_opted_in = deployment_supertrend_flip_enabled(deployment)
     validate_live_deployment_trailing_override(
         deployment.signal_config,
         context=context,
         broker=broker,
         timeframe=timeframe,
+        flip_opted_in=flip_opted_in,
     )
     processor_name = deployment.signal_processor_name
     if not processor_name:
@@ -380,6 +446,7 @@ def validate_live_deployment_trailing_mode(
         mode,
         broker=broker,
         timeframe=timeframe,
+        flip_opted_in=flip_opted_in,
         context=(
             f"{context}: its signal processor '{processor_name}' requests "
             f"trailing mode {normalize_trailing_mode(mode)!r}"

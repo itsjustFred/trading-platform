@@ -163,6 +163,10 @@ from shared.database import (
 from shared.logging import get_logger
 from shared.models import VALID_TIMEFRAMES, LiveDeploymentConfig
 from shared.strategy_registry import load_strategy_module
+from shared.trailing import (
+    FLIP_DEPLOYMENT_OPT_IN_KEY,
+    deployment_supertrend_flip_enabled,
+)
 
 logger = get_logger("live-runner")
 
@@ -310,30 +314,6 @@ def _max_open_per_symbol(
     return value
 
 
-#: ``LiveDeploymentConfig.settings`` key opting a deployment into the live
-#: ``supertrend_flip`` workflow (#168). ``shared.trailing`` carries the same
-#: constant on the flip branch; it is mirrored here so this refusal does not
-#: depend on which PR merges first.
-FLIP_DEPLOYMENT_OPT_IN_KEY = "live_supertrend_flip"
-_FLIP_OPT_IN_TOKENS = frozenset({"1", "true", "yes", "on"})
-
-
-def _flip_opted_in(settings: Any) -> bool:
-    """Whether deployment ``settings`` carry the live flip opt-in (#168).
-
-    Mirrors ``shared.trailing.supertrend_flip_opted_in``: only an explicit
-    truthy value enables it; every other value fails closed to off.
-    """
-    if not isinstance(settings, Mapping):
-        return False
-    value = settings.get(FLIP_DEPLOYMENT_OPT_IN_KEY)
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in _FLIP_OPT_IN_TOKENS
-
-
 async def _multi_lot_cap_refusal(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, cap: int
 ) -> str | None:
@@ -372,7 +352,7 @@ async def _multi_lot_cap_refusal(
                 "deployment to a hedging account; entries are disabled, "
                 "exits still evaluated."
             )
-    if _flip_opted_in(deployment.settings):
+    if deployment_supertrend_flip_enabled(deployment):
         return (
             f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} cannot be combined with the "
             f"'{FLIP_DEPLOYMENT_OPT_IN_KEY}' opt-in: the live supertrend_flip "

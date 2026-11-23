@@ -654,16 +654,23 @@ def test_capability_and_central_broker_table_agree() -> None:
     assert adapter_live_trailing_modes(alpaca) == {"none", "percent"}
 
     assert CTraderLiveAdapter.broker_name == "ctrader"
+    # #168: cTrader's flip-workflow stop primitives deliberately do NOT declare
+    # ``supports_stop_amendment``, so the adapter-level mode set stays {"none"}
+    # for every cTrader account - the flip mode is added only by the daemon's
+    # deployment-aware gate for opted-in demo/paper deployments.
     assert CTraderLiveAdapter.supports_stop_amendment is BaseLiveAdapter.supports_stop_amendment
-    ctrader = SimpleNamespace(broker_name="ctrader", supports_stop_amendment=False)
-    assert adapter_live_trailing_modes(ctrader) == {"none"}
-    # Even a cTrader adapter that claimed the capability stays on the table's answer.
-    assert adapter_live_trailing_modes(
-        SimpleNamespace(broker_name="ctrader", supports_stop_amendment=True)
-    ) == {"none"}
+    # An amend-capable cTrader adapter sees the broker table's flip entry;
+    # the REAL CTraderLiveAdapter declares no stop-amendment capability, so it
+    # resolves to {"none"} - and the daemon's deployment gate strips the flip
+    # mode unless the deployment opted in on a demo/paper account.
+    ctrader = SimpleNamespace(broker_name="ctrader", supports_stop_amendment=True)
+    assert adapter_live_trailing_modes(ctrader) == {"none", "supertrend_flip"}
 
     assert "percent" in LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER[AlpacaLiveAdapter.broker_name]
-    assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["ctrader"] == {"none"}
+    assert LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER["ctrader"] == {
+        "none",
+        "supertrend_flip",
+    }
     assert adapter_live_trailing_modes(None) == {"none"}
     assert adapter_live_trailing_modes(SimpleNamespace(supports_stop_amendment=True)) == {"none"}
     # A truthy-but-not-True flag is not a declared capability.
@@ -1748,18 +1755,30 @@ _FULL_FLIP_CONFIG = {
 }
 
 
-def test_no_live_broker_executes_supertrend_flip() -> None:
-    """Replay executes supertrend_flip; live does not, on any broker, because
-    the full-quantity entry bracket would close everything at TP1."""
-    for broker in ("alpaca", "ctrader", "unknown", None):
+def test_supertrend_flip_is_ctrader_only_and_adapter_gated() -> None:
+    """#168: the broker table lists ``supertrend_flip`` for cTrader only. The
+    real CTraderLiveAdapter declares no stop-amendment capability so its
+    adapter-level modes stay {"none"}; reachability additionally requires the
+    daemon's deployment opt-in + demo/paper gate on top."""
+    assert "supertrend_flip" in live_supported_trailing_modes("ctrader")
+    for broker in ("alpaca", "unknown", None):
         assert "supertrend_flip" not in live_supported_trailing_modes(broker)
+    # No real adapter resolves the flip mode today: cTrader's adapter has
+    # supports_stop_amendment=False (baseline {"none"}) and no other broker
+    # lists the mode.
+    for adapter in (
+        SimpleNamespace(broker_name="ctrader", supports_stop_amendment=False),
+        SimpleNamespace(broker_name="alpaca", supports_stop_amendment=True),
+        SimpleNamespace(broker_name="unknown", supports_stop_amendment=True),
+    ):
+        assert "supertrend_flip" not in adapter_live_trailing_modes(adapter)
 
 
-def test_persisted_supertrend_flip_entry_is_surfaced_and_never_amended(
+def test_persisted_supertrend_flip_entry_is_never_amended_by_percent_trail(
     live: _Live, surfaced
 ) -> None:
-    """A fully parameterised supertrend_flip entry that reached the database
-    anyway is reported on every pass and its stop is left alone."""
+    """#168: ``supertrend_flip`` belongs to LiveSupertrendFlipManager; the
+    percent trail ignores it entirely - no amend, no cancel, no surface."""
     manager = LiveTrailingStopManager()
     live.add_signal(
         "buy",
@@ -1773,6 +1792,5 @@ def test_persisted_supertrend_flip_entry_is_surfaced_and_never_amended(
     assert live.client.replace_calls == []
     assert live.client.cancelled == []
     assert live.client.stop_prices() == [98.0]
-    assert surfaced, "the unsupported persisted mode must be surfaced"
-    assert all("supertrend_flip" in event[1]["error"] for event in surfaced)
+    assert surfaced == []
 

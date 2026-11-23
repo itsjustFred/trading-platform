@@ -32,7 +32,10 @@ from pydantic import (
 )
 
 from shared.atomic_io import write_text_atomically
-from shared.trailing import validate_live_deployment_trailing_override
+from shared.trailing import (
+    supertrend_flip_opted_in,
+    validate_live_deployment_trailing_override,
+)
 
 #: Validation-context flag set when a deployment is rehydrated from the DB.
 STORED_ROW_CONTEXT = "stored_row"
@@ -275,6 +278,7 @@ class LiveDeploymentConfig(BaseModel):
         validate_live_deployment_trailing_override(
             self.signal_config,
             context=f"live deployment '{self.strategy_name}'",
+            flip_opted_in=supertrend_flip_opted_in(self.settings),
         )
         return self
 

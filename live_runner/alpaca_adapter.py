@@ -30,6 +30,7 @@ from live_runner.alpaca_fees import (
 )
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    ORDER_STATE_FILLED,
     ORDER_STATE_TERMINAL,
     ORDER_STATE_WORKING,
     BaseLiveAdapter,
@@ -2871,6 +2872,8 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         ]
         if ORDER_STATE_WORKING in states:
             return ORDER_STATE_WORKING
+        if ORDER_STATE_FILLED in states:
+            return ORDER_STATE_FILLED
         if ORDER_STATE_TERMINAL in states:
             return ORDER_STATE_TERMINAL
         return None
@@ -2893,6 +2896,10 @@ class AlpacaLiveAdapter(BaseLiveAdapter):
         if order is None:
             return None
         status = _order_status(order)
+        if status == "filled":
+            # The base contract distinguishes a fill from a dead order: a
+            # filled close is not a terminal failure a caller may resubmit.
+            return ORDER_STATE_FILLED
         if status in _ALPACA_ACCOUNTED_ORDER_STATUSES:
             return ORDER_STATE_TERMINAL
         if status in _ALPACA_WORKING_ORDER_STATUSES:
