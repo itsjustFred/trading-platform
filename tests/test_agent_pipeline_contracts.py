@@ -1863,7 +1863,21 @@ _STUB_OPENCODE = """#!/usr/bin/env bash
 # on stdout, exit 0), garbage (a zero exit with no signature and no report),
 # no-ok (a zero exit whose reply carries no OK token), other (a non-quota
 # failure, exit 1).
+# kilo-429 / kilo-400 / kilo-retry-ok are what opencode 2.2.7 printed against
+# Kilo's OpenAI-compatible gateway: a 429 is retried and then ends on the bare
+# "Provider returned error" (exit 1), a 400 ends on the same line without any
+# retry (exit 1), and a 429 that clears on a retry goes on to reply (exit 0).
+# kilo-signup is the gateway's anonymous per-IP cap: a 429 sent with
+# `x-should-retry: false`, so opencode prints it without retrying (exit 1).
 set -u
+# Like the real CLI, every run first prints "> <agent> · <model>" on stderr:
+# a probe that greps stderr must not read its own agent name as a signature.
+agent=build
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--agent" ] && [ "$#" -gt 1 ]; then agent="$2"; fi
+  shift
+done
+printf '\\033[0m\\n> %s \\302\\267 stub/model\\n' "$agent" >&2
 case "${STUB_OPENCODE_MODE:-ok}" in
   ok) printf 'OK\\n'; exit 0 ;;
   quota) printf 'Free usage limit reached for this model\\n' >&2; exit 1 ;;
@@ -1877,6 +1891,26 @@ case "${STUB_OPENCODE_MODE:-ok}" in
   garbage) printf 'The agent said something unrelated.\\n'; exit 0 ;;
   no-ok) printf 'Here is the answer you asked for.\\n'; exit 0 ;;
   other) printf 'Error: no provider for model\\n' >&2; exit 1 ;;
+  kilo-429)
+    for n in 1 2 3; do
+      printf '\\033[93m\\033[1m! \\033[0mretrying (attempt %s): Provider returned error\\n' "$n" >&2
+    done
+    printf '\\033[91m\\033[1mError: \\033[0mProvider returned error\\n' >&2
+    exit 1
+    ;;
+  kilo-400)
+    printf '\\033[91m\\033[1mError: \\033[0mProvider returned error\\n' >&2
+    exit 1
+    ;;
+  kilo-signup)
+    printf 'Error: Sign up for free to continue and explore 500 other models.\\n' >&2
+    exit 1
+    ;;
+  kilo-retry-ok)
+    printf '\\033[93m\\033[1m! \\033[0mretrying (attempt 1): Provider returned error\\n' >&2
+    printf 'OK\\n'
+    exit 0
+    ;;
 esac
 """
 
@@ -1965,6 +1999,122 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
         "a non-quota probe failure skipped the agent job - a genuine failure would go grey"
     )
     assert "::warning::" in result.stdout, "the fail-open path does not say what it did"
+
+    # Kilo's gateway reports a 429 only as "Provider returned error"; opencode retries it, and
+    # the retries are what tell it from a 400 that ends on the same line. A rate limit that
+    # outlasted the retries skips the agent job like any cap; the same final line without a
+    # retry is a broken request and fails open; a retry that cleared is a reachable model.
+    result, written = _run_probe_step(tmp_path, "kilo-429")
+    assert result.returncode == 0, f"probe step failed on kilo-429: {result.stderr}"
+    assert "available=false" in written, (
+        "a Kilo rate limit that outlasted opencode's retries did not skip the agent job"
+    )
+    result, written = _run_probe_step(tmp_path, "kilo-signup")
+    assert result.returncode == 0, f"probe step failed on kilo-signup: {result.stderr}"
+    assert "available=false" in written, "Kilo's anonymous per-IP cap did not skip the agent job"
+    result, written = _run_probe_step(tmp_path, "kilo-400")
+    assert result.returncode == 0, f"probe step failed on kilo-400: {result.stderr}"
+    assert "available=true" in written, (
+        "a provider error opencode did not retry skipped the agent job - a broken request "
+        "would go grey"
+    )
+    result, written = _run_probe_step(tmp_path, "kilo-retry-ok")
+    assert result.returncode == 0, f"probe step failed on kilo-retry-ok: {result.stderr}"
+    assert "available=true" in written and "available=false" not in written, (
+        "a rate limit that cleared on a retry skipped the agent job"
+    )
+
+
+KILO_GATEWAY = "https://ai-gateway.kilo.ai/api/v1"
+
+
+def _kilo_config(model_id: str) -> dict:
+    """The config a `kilo/<model_id>` stage must get: the gateway and the model declared, so
+    opencode cannot fall back to its default model when its catalog has not resolved it."""
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "update": "disable",
+        "providers": {"kilo": {"settings": {"baseURL": KILO_GATEWAY}, "models": {model_id: {}}}},
+    }
+
+
+ZEN_CONFIG = '{"$schema":"https://opencode.ai/config.json","update":"disable"}'
+
+
+@needs_bash
+@pytest.mark.parametrize("name", AGENT_WORKFLOWS)
+def test_a_kilo_model_enables_the_kilo_provider_and_nothing_else_changes(name, tmp_path) -> None:
+    """opencode ships Kilo's anonymous gateway as a provider but enables it only when the
+    config names it, so a `kilo/...` model in a stage variable needs the provider in the
+    generated config - and every other model must keep the config it always had. Executed
+    on the probe's config step, which needs no opencode, for each workflow."""
+    step = _find_step(_load(name)["jobs"]["quota-probe"], r"^Configure quota probe agent$")
+    zen = json.loads(ZEN_CONFIG)
+    for model, expected in (
+        ("kilo/reflection/beam-free", _kilo_config("reflection/beam-free")),
+        ("kilo/inclusionai/ling-3.2-flash:free", _kilo_config("inclusionai/ling-3.2-flash:free")),
+        ("opencode/inkling-2-small-free", zen),
+        ("kilonova/some-model", zen),
+    ):
+        home = tmp_path / model.replace("/", "_").replace(":", "_")
+        home.mkdir()
+        env = {**os.environ, "HOME": str(home), "MODEL": model, "VARIANT": "high"}
+        script = home / "configure.sh"
+        script.write_text(_run(step), encoding="utf-8")
+        result = subprocess.run(
+            [shutil.which("bash") or "bash", str(script)], env=env, capture_output=True, text=True
+        )
+        assert result.returncode == 0, f"{name} {model}: {result.stderr}"
+        written = (home / ".config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+        assert json.loads(written) == expected, f"{name} {model}: wrote {written!r}"
+        agent = (home / ".config" / "opencode" / "agents" / "model-probe.md").read_text(
+            encoding="utf-8"
+        )
+        assert f'model: "{model}#high"' in agent, f"{name} {model}: probe pings another model"
+
+
+def test_every_agent_config_step_writes_the_same_provider_choice() -> None:
+    """The probe and the agent must resolve the same model the same way: a probe that
+    enables Kilo in front of an agent that does not would clear a run that cannot start.
+    Every step that writes the opencode config, in every agent workflow, carries the one
+    conditional."""
+    choice = (
+        'if [ "${MODEL%%/*}" = "kilo" ]; then\n'
+        '  jq -cn --arg model "${MODEL#kilo/}" \'{"$schema": "https://opencode.ai/config.json", '
+        'update: "disable", providers: {kilo: {settings: {baseURL: '
+        f'"{KILO_GATEWAY}"}}, models: {{($model): {{}}}}}}}}}}\' > "$conf/opencode.json"\n'
+        "else\n"
+        f"  printf '{ZEN_CONFIG}\\n' > \"$conf/opencode.json\"\n"
+        "fi\n"
+    )
+    for name in AGENT_WORKFLOWS:
+        writers = [
+            step
+            for job in _load(name)["jobs"].values()
+            for step in _steps(job)
+            if "opencode.json" in _run(step)
+        ]
+        assert len(writers) == 2, f"{name}: expected the probe and the agent config steps"
+        for step in writers:
+            assert choice in _run(step), f"{name}: {step.get('name')!r} skips the Kilo choice"
+
+
+def test_every_agent_step_names_an_exhausted_retry_before_classifying() -> None:
+    """The probe is not the only place a Kilo rate limit lands: a run cleared by the probe
+    can hit it mid-run. Every agent step marks an exhausted retry on stderr before its
+    classifier reads it, with the same helper the probe uses."""
+    probe_body = _run(_find_step(_load(MUTATION)["jobs"]["quota-probe"], r"^Probe model quota$"))
+    start = probe_body.index("note_exhausted_retries() {")
+    helper = probe_body[start : probe_body.index("\n}\n", start) + 3]
+    for name in AGENT_WORKFLOWS:
+        _job_name, agent = _agent_job(_load(name))
+        body = _run(_find_step(agent, r"^Run .* agent$"))
+        assert helper in body, f"{name}: the agent step's retry helper drifted from the probe's"
+        failed = body.index('2> "$out.stderr"); then\n')
+        after = body[failed:].split("\n", 2)[1]
+        assert after.strip() == 'note_exhausted_retries "$out.stderr"', (
+            f"{name}: the failed run's stderr is classified before an exhausted retry is named"
+        )
 
 
 def test_the_quota_probe_agent_is_denied_every_tool() -> None:
@@ -2071,8 +2221,11 @@ def test_the_mid_run_quota_skip_reports_instead_of_failing(tmp_path) -> None:
         ("quota", True),
         ("quota-zero", True),
         ("quota-verdict", True),
+        ("kilo-429", True),
+        ("kilo-signup", True),
         ("garbage", False),
         ("other", False),
+        ("kilo-400", False),
     ):
         case = tmp_path / mode
         case.mkdir()

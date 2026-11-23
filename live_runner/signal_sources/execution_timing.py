@@ -76,6 +76,17 @@ def _timeframe_seconds(timeframe: str) -> int | None:
     return None
 
 
+def timeframe_seconds(timeframe: str) -> int | None:
+    """Length of one bar of ``timeframe`` in seconds.
+
+    ``None`` for labels with no fixed bar length (``""``/``tick``) and for
+    anything the ``<n><unit>`` grammar does not parse. Public counterpart of
+    the private helper the live path uses internally, for offline tooling
+    that needs the same bar length (e.g. the signal-archive feature script).
+    """
+    return _timeframe_seconds(timeframe)
+
+
 def _next_candle_close(
     reference: datetime, timeframe_seconds: int, *, timeframe: str = ""
 ) -> datetime:

@@ -20,10 +20,12 @@ import {
   updateLiveDeploymentStatus,
 } from "../api/client";
 import { liveWinRateToPoints } from "../api/metricScale";
+import { LiveKillSwitchPanel } from "../components/LiveKillSwitchPanel";
 import { Modal } from "../components/Modal";
 import { Sparkline } from "../components/Sparkline";
 import { SymbolInput } from "../components/SymbolInput";
 import { useLiveAccountsStream } from "../hooks/liveStreams";
+import { useLiveKillSwitch } from "../hooks/useLiveKillSwitch";
 import { useDebouncedCallback } from "../hooks/useDebouncedValue";
 import type {
   LiveAccount,
@@ -303,6 +305,17 @@ export function LiveHubPage() {
   const [cards, setCards] = useState<DeploymentCard[]>([]);
   const [statsByAccount, setStatsByAccount] = useState<Record<string, LiveHubAccountStats>>({});
   const [dashboard, setDashboard] = useState<LiveDashboardResponse | null>(null);
+  // The kill-switch state reads on its own mount effect and timer (see the
+  // hook): it must keep refreshing even when the accounts/deployments fetch
+  // below fails, and a halt written elsewhere still surfaces without waiting
+  // for account-stream traffic.
+  const {
+    state: killSwitch,
+    error: killSwitchError,
+    stale: killSwitchStale,
+    readAt: killSwitchReadAt,
+    onStateChange: handleKillSwitchStateChange,
+  } = useLiveKillSwitch();
   const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -1297,6 +1310,15 @@ export function LiveHubPage() {
           </strong>
         </div>
       </div>
+
+      <LiveKillSwitchPanel
+        state={killSwitch}
+        loadError={killSwitchError}
+        stale={killSwitchStale}
+        staleSince={killSwitchReadAt}
+        accounts={accounts}
+        onStateChange={handleKillSwitchStateChange}
+      />
 
       {loading && (
         <div style={{ color: "var(--color-text-muted)", textAlign: "center", padding: "48px 0" }}>

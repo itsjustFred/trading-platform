@@ -190,8 +190,10 @@ creation-price estimate forever.
 
 **Decision (documented policy):** orders size once, at the price they
 actually fill. MARKET re-sizes at the next-bar open (creation sizing is only
-the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their trigger price
-at fill. Quantities across order types are now computed from the same rule:
+the pending estimate); LIMIT/STOP/STOP_LIMIT re-size from their fill price
+at fill (the level, or the bar open for a stop that gaps through — for a
+LONG that open fill is `open + spread`, the same ask a MARKET buy pays). Quantities
+across order types are now computed from the same rule:
 quantity = sizing rule evaluated at the fill price.
 
 **Superseded (#190):** the original record carried one exception — a MARKET
@@ -216,7 +218,7 @@ behavior only; the perf fix lands with the structural cleanup (16-D2) to keep
 the golden-master diffs reviewable.
 
 **Pinned by:** `tests/test_engine_behavior.py::TestOrderTypeSizingSemantics`
-(LIMIT and STOP re-sized at the trigger price, and the stopless MARKET order
+(LIMIT and STOP re-sized at their fill price, and the stopless MARKET order
 sized at the fill price with the fallback stop anchored to it — no exception).
 
 ## D5 — Stats definitions are environment-independent (F17)

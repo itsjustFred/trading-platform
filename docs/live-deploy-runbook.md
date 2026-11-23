@@ -467,6 +467,34 @@ sees a real stop. A *stale* exit is skipped like a stale entry — with the
 unbounded-TP policy the position is then held until the fallback stop or
 the next exit signal.
 
+**Order-placement serialization (#362).** Every broker position/quantity read
+that feeds sizing, the pre-submit caps, leverage or exit quantity, and the
+`adapter.submit_order` call it feeds, runs inside one per-account critical
+section (`account_order_placement` in `live_runner/account_order_lock.py`;
+the daemon reaches it through `_account_order_placement`). Two of this
+daemon's own signal submissions of the same account — entries and exits of
+any deployment, Discord or internal — can never interleave another of this
+daemon's signal submissions, or a STOPPED/kill-switch flatten, between the
+read and the write; submissions of *different* accounts are unaffected. The
+lock does **not** make the read→write atomic against the broker: a working
+order can still fill inside the section (a resting entry, a bracket leg, a
+broker-side close or a manual trade), and broker reconciliation remains the
+backstop for that residual race. The wait is bounded
+(`ACCOUNT_ORDER_LOCK_TIMEOUT_SECONDS`, 120 s): a submission that cannot start
+inside it is refused (`decision.refused` with reason
+`account_order_lock_timeout` on the leased path,
+`AccountOrderLockTimeoutError` from `submit_order_with_risk`) — it never
+sizes or submits on a read that may be stale. Signal age is re-checked after
+the lock is acquired, so a signal that expired while queued is refused
+(`signal_aged_out_during_lock_wait`). Exits still hold the per-account+symbol
+`_exit_lock` first; the account lock is always the inner one, and adapter
+code must not take `_exit_lock` inside it. STOPPED enforcement and
+kill-switch flatten sweeps take the same account lock; adapter-internal
+read→write paths outside the submit chokepoints use
+`adapter.order_placement_lock()` (not re-entrant — never inside
+`submit_order`). Trailing-stop amendments and broker reconciliation keep
+their own adapter-level serialization and are not queued behind this lock.
+
 **Idempotency.** Each emitted intent carries a producer-stable
 `metadata.idempotency_key` derived from deployment, symbol, timeframe, bar
 close and intent kind. Within a process the runner tracks the newest
@@ -1214,6 +1242,17 @@ database.
 | `POST /api/live/kill-switch/halt` | halt one scope; `confirmed_scope` required for `orders` and `flatten` |
 | `POST /api/live/kill-switch/resume` | lift the halt on one scope; `confirmed_scope` required |
 
+The Live Hub page carries the same control: a kill-switch panel above the account grid shows
+the enforced state per scope (global, every live account, and any halted scope the account list
+does not name), offers all three modes, keeps `entries` one click, and puts `orders`, `flatten`
+and resume behind a confirmation dialog that echoes the scope. A scope that is already halted
+offers only the stricter modes as escalation (`entries` → orders/flatten, `orders` → flatten) -
+a weaker mode is refused by the server, so resuming first is never required to escalate. An
+unreadable state is displayed as fail-closed, not as "nothing halted": halt controls stay
+available while Resume is hidden. A failed refresh after a good read marks the panel stale -
+statuses read "last known:" and Resume is disabled - rather than passing the old state off as
+current.
+
 `entries` is deliberately unconfirmed: it refuses new entries and can cost nothing, so it stays
 one click in an incident. The modes that move money, and resuming trading, are confirmed on the
 server - the API is directly callable, so a dialog in the UI constrains nothing but the UI.
@@ -1268,7 +1307,7 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 
 ## Execution prices and commissions (Alpaca, #124)
 
-- `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet. Every reader treats `NULL` as "net PnL incomplete", never as zero: the live stats payload reports `net_pnl: null`, `net_pnl_complete: false` and `commission_unknown_count`, and trade/signal payloads carry `commission: null`.
+- `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet, never zero. `net_pnl` nets only **closed round trips'** fees on the average-cost basis: an unknown fee on still-open exposure is not netted and does not block the number, but an unknown fee inside a pool that is later partly or fully closed makes `net_pnl` null with `net_pnl_complete: false`. `commission_unknown_count` and `total_commission` still cover every execution, open or closed, and trade/signal payloads carry `commission: null`.
 - Alpaca crypto fees are posted as `CFEE` account activities in batches, so crypto fills are stored with `NULL`. `CFEE.date` is the *posting* date (the New York date of `created_at`), not the trade date, and observed posting delays reach ~51 h, so there is no fixed delay to wait out. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST for fills up to 30 days back. `CFEE` entries are clustered into posting batches by `created_at` (entries within 15 minutes of each other are one batch); a batch's fee covers the fills since the previous batch's latest `created_at` up to its own. A fill newer than the latest posted batch stays `NULL` and is retried on the next pass - "not posted yet" is never treated as "no fee". Two fee kinds exist: asset fees (on buys) name their pair and a base-asset `qty`; USD fees (on sells) carry only a negative `net_amount` and *no* `symbol`, so they form a per-account, per-batch USD pool that is allocated to a pair only when exactly one crypto pair has sells in the batch window - with several selling pairs the USD part fails closed while pair-attributed asset fees are still priced. Each fee is allocated pro rata by received quantity and converted to USD. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules. The first fetched batch fails closed when an earlier batch or earlier fills may exist outside the fetch window, so a posting stall longer than the lookback leaves a batch unpriced rather than risk the wrong attribution. Checking for earlier crypto fills is a full-history `FILL` scan per adapter, bounded by `MAX_ACTIVITY_PAGES` (200) requests against the shared ~200/min Alpaca budget. A found instant and an unfinished scan are cached, but a completed scan that finds *no* crypto fill is deliberately rescanned every pass - a fill posted later can still carry an earlier `transaction_time`, so `None` is not fixed history. That state only persists while crypto executions await a commission that the broker reports no fills for (for example local rows Alpaca does not report - a wrong account or symbol mismatch), which the pass logs as a warning; on a healthy account the scan resolves to a cached instant or UNKNOWN and runs once.
 - The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, no posted CFEE batch covers it yet).
 - `actual_price_observed` labels every Alpaca price: `observed` (stated for this fill), `derived` (computed from broker prices: the order's `filled_avg_price` on a single-fill order, or a reconciled remainder), `sent_bad`/`absent` (no usable price), `derived_unavailable` (the remainder's price could not be derived honestly). A stream event never borrows the order's cumulative average for a partial fill.
