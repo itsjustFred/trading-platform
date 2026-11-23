@@ -742,10 +742,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "--signal-exit-fill",
         default="",
-        choices=["", "next_open", "close", "open"],
+        choices=["", "next_open", "close"],
         help=(
             "Signal-exit fill convention. Default: 'next_open' on native; the "
-            "frozen engines (vectorbt, pynecore) only implement the legacy "
+            "frozen engines (vectorbt, pynecore, lean) only implement the legacy "
             "signal-bar fills and default to 'close' — they refuse 'next_open'"
         ),
     )
