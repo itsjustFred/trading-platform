@@ -4707,19 +4707,24 @@
    354
   ],
   "exits": [
+   91,
    92,
    93,
    94,
    95,
+   96,
+   187,
    188,
    189,
    190,
    191,
+   192,
+   283,
    284,
    285,
    286,
    287,
-   373
+   288
   ],
   "drawings": [
    {
@@ -4729,6 +4734,14 @@
     "shape": "arrowUp",
     "color": "#22c55e",
     "text": "Entry"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-01T22:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
    },
    {
     "type": "marker",
@@ -4757,6 +4770,22 @@
    {
     "type": "marker",
     "time": "2024-01-01T23:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-02T22:45:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
@@ -4796,6 +4825,22 @@
    },
    {
     "type": "marker",
+    "time": "2024-01-03T00:00:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
+    "time": "2024-01-03T22:45:00+00:00",
+    "position": "aboveBar",
+    "shape": "arrowDown",
+    "color": "#ef4444",
+    "text": "Exit"
+   },
+   {
+    "type": "marker",
     "time": "2024-01-03T23:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
@@ -4828,7 +4873,7 @@
    },
    {
     "type": "marker",
-    "time": "2024-01-04T21:15:00+00:00",
+    "time": "2024-01-04T00:00:00+00:00",
     "position": "aboveBar",
     "shape": "arrowDown",
     "color": "#ef4444",
