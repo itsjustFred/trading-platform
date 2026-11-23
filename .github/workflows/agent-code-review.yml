@@ -52,7 +52,7 @@ name: Agent Code Review
 # restarted with "Re-run jobs" on the run page or `gh run rerun <run-id>`.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
-#   REVIEW_MODEL    opencode model, provider/model (default: opencode/deepseek-v4.1-flash-free)
+#   REVIEW_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
 #   REVIEW_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
 
 on:
@@ -65,7 +65,7 @@ concurrency:
 
 env:
   OPENCODE_VERSION: "2.2.7"
-  MODEL: ${{ vars.REVIEW_MODEL || 'opencode/deepseek-v4.1-flash-free' }}
+  MODEL: ${{ vars.REVIEW_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.REVIEW_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-code-review/SKILL.md
 

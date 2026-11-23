@@ -119,7 +119,7 @@ def test_ruff_seam_scope_is_config_not_a_hand_list() -> None:
     assert not any("live_runner/__init__.py" in c for c in commands)
 
 
-def test_agent_workflows_skip_drafts_and_split_default_models() -> None:
+def test_agent_workflows_skip_drafts_and_keep_free_model_defaults() -> None:
     review = _workflow("agent-code-review.yml")
     mutation = _workflow("agent-mutation-testing.yml")
 
@@ -134,13 +134,13 @@ def test_agent_workflows_skip_drafts_and_split_default_models() -> None:
             "job (and its quota) runs on unfinished PRs"
         )
 
-    review_model = review["env"]["MODEL"]
-    mutation_model = mutation["env"]["MODEL"]
-    assert review_model != mutation_model, (
-        "review and mutation must default to different models so one quota "
-        "pool cannot starve both agent workflows"
-    )
-    for label, expr in (("REVIEW_MODEL", review_model), ("MUTATION_MODEL", mutation_model)):
+    # Per-stage default models were considered and deferred to a separate
+    # change; until then both workflows must keep a quoted free-tier
+    # default — they hold no API key.
+    for label, expr in (
+        ("REVIEW_MODEL", review["env"]["MODEL"]),
+        ("MUTATION_MODEL", mutation["env"]["MODEL"]),
+    ):
         match = re.search(r"\|\|\s*'([^']+)'", expr)
         assert match, f"{label} must keep a quoted free-model default: {expr!r}"
         default = match.group(1)

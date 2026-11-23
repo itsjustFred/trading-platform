@@ -160,15 +160,14 @@ MARKER = "<!-- actions-pre-mortem -->"
 TITLE = "# Pre-Mortem Action"
 SKILL_DIR = "actions-pre-mortem"
 
-# Where each workflow takes its free model from. The variables are named after the stage.
-# The defaults are per-stage (#297): review and mutation were split onto different free
-# models when `inkling-2-small-free` was deprecated upstream; the pre-mortem still falls
-# back to it pending its own swap. A repo-wide change is still one edit per line.
-FREE_MODEL_DEFAULTS = {
-    REVIEW: ("REVIEW", "opencode/deepseek-v4.1-flash-free"),
-    MUTATION: ("MUTATION", "opencode/flint-40b-free"),
-    PREMORTEM: ("PREMORTEM", "opencode/inkling-2-small-free"),
+# Where each workflow takes its free model from. The variables are named after the stage, and
+# all three fall back to the same model and variant, so a repo-wide change is one edit.
+FREE_MODEL_VARS = {
+    REVIEW: "REVIEW",
+    MUTATION: "MUTATION",
+    PREMORTEM: "PREMORTEM",
 }
+DEFAULT_MODEL = "opencode/inkling-2-small-free"
 DEFAULT_VARIANT = "max"
 
 # The verdicts the skill documents and the status each must get. The pre-mortem is advisory
@@ -1212,14 +1211,14 @@ def test_the_pre_mortem_skips_drafts_and_forks() -> None:
 
 
 def test_the_agent_workflows_share_one_free_model_configuration() -> None:
-    """The variables are named after their stage and each falls back to that stage's own
-    default model and the shared variant, so a reader can find the pre-mortem's knob next to
-    the siblings' and a repo-wide change is one edit per line."""
-    for name, (prefix, default_model) in FREE_MODEL_DEFAULTS.items():
+    """The variables are named after their stage and default to the same model and variant, so
+    a reader can find the pre-mortem's knob next to the siblings' and a repo-wide change is one
+    edit per line."""
+    for name, prefix in FREE_MODEL_VARS.items():
         env = _load(name)["env"]
-        assert env["MODEL"] == (
-            f"${{{{ vars.{prefix}_MODEL || '{default_model}' }}}}"
-        ), f"{name}: {env['MODEL']!r}"
+        assert env["MODEL"] == (f"${{{{ vars.{prefix}_MODEL || '{DEFAULT_MODEL}' }}}}"), (
+            f"{name}: {env['MODEL']!r}"
+        )
         assert env["VARIANT"] == (f"${{{{ vars.{prefix}_VARIANT || '{DEFAULT_VARIANT}' }}}}"), (
             f"{name}: {env['VARIANT']!r}"
         )

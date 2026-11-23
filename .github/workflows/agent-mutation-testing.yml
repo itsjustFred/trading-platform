@@ -52,7 +52,7 @@ name: Agent Mutation Testing
 # `gh run rerun <run-id>`.
 #
 # Configuration (Settings -> Secrets and variables -> Actions -> Variables):
-#   MUTATION_MODEL    opencode model, provider/model (default: opencode/flint-40b-free)
+#   MUTATION_MODEL    opencode model, provider/model (default: opencode/inkling-2-small-free)
 #   MUTATION_VARIANT  reasoning variant offered by that model, e.g. low/high/max (default: max)
 
 on:
@@ -65,7 +65,7 @@ concurrency:
 
 env:
   OPENCODE_VERSION: "2.2.7"
-  MODEL: ${{ vars.MUTATION_MODEL || 'opencode/flint-40b-free' }}
+  MODEL: ${{ vars.MUTATION_MODEL || 'opencode/inkling-2-small-free' }}
   VARIANT: ${{ vars.MUTATION_VARIANT || 'max' }}
   SKILL_PATH: .agents/skills/actions-mutation-testing/SKILL.md
 
