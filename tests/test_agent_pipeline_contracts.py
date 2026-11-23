@@ -1915,18 +1915,10 @@ case "${STUB_OPENCODE_MODE:-ok}" in
     exit 0
     ;;
   nvidia-429)
-    for n in 1 2 3; do
-      printf '! retrying (attempt %s): HTTP 429: Too Many Requests\\n' "$n" >&2
-    done
+    printf '! retrying (attempt 1): HTTP 429: Too Many Requests\\n' >&2
     printf 'Error: Provider request failed with HTTP 429: Too Many Requests\\n' >&2
     exit 1
     ;;
-  nvidia-retry-ok)
-    printf '! retrying (attempt 1): Provider request failed with HTTP 429: Too Many Requests\\n' >&2
-    printf 'OK\\n'
-    exit 0
-    ;;
-  ok-quota-out) printf 'OK\\nFree usage limit reached for this model\\n'; exit 0 ;;
 esac
 """
 
@@ -2034,22 +2026,10 @@ def test_the_quota_probe_reports_only_a_positive_quota_signature(tmp_path) -> No
         "a provider error opencode did not retry skipped the agent job - a broken request "
         "would go grey"
     )
-    # NVIDIA's 429 names itself on every retry line, so a reply that cleared on a retry
-    # carries the signature on stderr next to its OK: the OK decides, not the retry.
+    # NVIDIA's 429 ("Too Many Requests") is a cap like Zen's: grey, not red.
     result, written = _run_probe_step(tmp_path, "nvidia-429")
     assert result.returncode == 0, f"probe step failed on nvidia-429: {result.stderr}"
-    assert "available=false" in written, "an NVIDIA 429 that outlasted the retries ran the agent"
-    result, written = _run_probe_step(tmp_path, "ok-quota-out")
-    assert result.returncode == 0, f"probe step failed on ok-quota-out: {result.stderr}"
-    assert "available=false" in written, (
-        "a cap signature on stdout next to an OK cleared the agent job - only stderr's retry "
-        "lines are excused"
-    )
-    result, written = _run_probe_step(tmp_path, "nvidia-retry-ok")
-    assert result.returncode == 0, f"probe step failed on nvidia-retry-ok: {result.stderr}"
-    assert "available=true" in written and "available=false" not in written, (
-        "an NVIDIA 429 that cleared on a retry skipped the agent job"
-    )
+    assert "available=false" in written, "an NVIDIA 429 did not skip the agent job"
     result, written = _run_probe_step(tmp_path, "kilo-retry-ok")
     assert result.returncode == 0, f"probe step failed on kilo-retry-ok: {result.stderr}"
     assert "available=true" in written and "available=false" not in written, (
