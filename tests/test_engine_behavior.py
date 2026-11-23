@@ -287,14 +287,14 @@ class TestSizingEquityExcludesUnrealizedPnl:
 
     def test_recorded_basis_follows_the_surviving_quantity(self, tmp_path: Path):
         """``equity_at_entry`` must be the basis the surviving quantity was
-        sized from, not whatever the ledger reads at fill time.
+        sized from, not whatever the ledger reads at creation time.
 
-        Entry 2 is a fallback-sized MARKET order with no stop, so D4 lets it
-        keep its creation-time quantity (sized at bar 2's close from realized
-        cash 100k). On bar 3 entry 1 stops out (−1,000 realized) *before*
-        entry 2 fills, so the fill-time ledger reads 99k. Recording that would
-        hand the shared-equity replay a coefficient ``quantity / equity_at_entry``
-        that no longer matches the quantity it is re-scaling.
+        Entry 2 is a fallback-sized MARKET order with no stop; like every
+        other order it is re-sized at its fill on bar 3 (89), by which point
+        entry 1 has stopped out on that same bar and the realized basis reads
+        99k. Recording the creation-time 100k would hand the shared-equity
+        replay a coefficient ``quantity / equity_at_entry`` that no longer
+        matches the quantity it is re-scaling.
         """
         frame = pd.DataFrame(
             {
@@ -314,7 +314,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         # stop at all, so it is sized on the 2% fallback and keeps its
         # creation-time quantity at fill.
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
+        stop_loss = pd.Series([90.0, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
@@ -328,14 +328,15 @@ class TestSizingEquityExcludesUnrealizedPnl:
         )
         assert first.exits[0].reason == "stop_loss", "entry 1 stops out on bar 3"
         second = engine.closed_trades[1]
-        assert second.quantity == pytest.approx(500.0, rel=1e-9), (
-            "entry 2 keeps its creation-time size: 1% of 100k over the 2% "
-            "fallback stop (2.0) = 500 shares"
+        assert second.quantity == pytest.approx(990.0 / 1.78, rel=1e-9), (
+            "entry 2 is re-sized at its fill like every other order: 1% of "
+            "the 99k fill-time basis over the 2% fallback stop of the 89 "
+            "fill (1.78) = 556.18 shares"
         )
-        assert second.meta["equity_at_entry"] == pytest.approx(100_000.0, rel=1e-9), (
-            "the basis must be the one the 500 shares were sized from (100k); "
-            "the fill-time ledger (99k after entry 1's stop) is a different "
-            "number and would corrupt the replay's per-unit coefficient"
+        assert second.meta["equity_at_entry"] == pytest.approx(99_000.0, rel=1e-9), (
+            "the basis must be the one the surviving quantity was sized from "
+            "(99k at the fill, after entry 1's stop); the creation-time 100k "
+            "would corrupt the replay's per-unit coefficient"
         )
 
     def test_resized_order_records_its_fill_time_basis(self, tmp_path: Path):
@@ -364,8 +365,8 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries.iloc[2] = True
         exits = pd.Series([False] * len(frame), index=frame.index)
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([90.0] + blanks[1:], index=frame.index)
-        stop_distance = pd.Series(blanks[:2] + [5.0] + blanks[3:], index=frame.index)
+        stop_loss = pd.Series([90.0, *blanks[1:]], index=frame.index)
+        stop_distance = pd.Series([*blanks[:2], 5.0, *blanks[3:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss, "stop_distance": stop_distance})
 
@@ -409,7 +410,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries = pd.Series([True] + [False] * 5, index=frame.index)
         exits = pd.Series([False] * len(frame), index=frame.index)
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        stop_loss = pd.Series([95.0, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
@@ -549,10 +550,10 @@ class TestSizingEquityExcludesUnrealizedPnl:
         # A 50% take-profit at 105 (plus a second level that is never
         # reached, so the ladder leaves a remainder open) on entry 1 only.
         blanks: list[float | None] = [None] * len(frame)
-        tp1 = pd.Series([105.0] + blanks[1:], index=frame.index)
-        tp1_pct = pd.Series([0.5] + blanks[1:], index=frame.index)
-        tp2 = pd.Series([200.0] + blanks[1:], index=frame.index)
-        tp2_pct = pd.Series([0.5] + blanks[1:], index=frame.index)
+        tp1 = pd.Series([105.0, *blanks[1:]], index=frame.index)
+        tp1_pct = pd.Series([0.5, *blanks[1:]], index=frame.index)
+        tp2 = pd.Series([200.0, *blanks[1:]], index=frame.index)
+        tp2_pct = pd.Series([0.5, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries,
         exits,
@@ -594,18 +595,20 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entry may not size on cash the fee model has already been paid.
 
         Same shape as ``test_open_paper_profit_does_not_grow_next_entry`` but
-        priced (fee_rate 0.001): entry 1 keeps its creation-time size of 500
-        shares (1% of 100k over bar 0's 2% fallback stop) and fills at 101, so
-        its entry leg is 0.001 x 101 x 500 = 50.5. The basis entry 2 is sized
-        from is therefore 100,000 − 50.5 = 99,949.5, and entry 2 risks 1% of
-        that over bar 2's 2% fallback stop (2.1) = 475.8071... shares — where
-        a run that held nothing back would still size from the full 100,000.
+        priced (fee_rate 0.001): entry 1 is re-sized at its 101 fill, so it
+        keeps 1% of 100k over the 2% fallback stop of the fill (2.02) =
+        495.05 shares and its entry leg is 0.001 x 101 x 495.05 = 50.0. The
+        basis entry 2 is sized from is therefore 100,000 − 50 = 99,950, and
+        entry 2 (fill 105, fallback distance 2.1) risks 1% of that =
+        475.95 shares — where a run that held nothing back would still size
+        from the full 100,000.
         """
         trades = self._run_open_position_scenario(
             105.0, tmp_path, parameters={"fee_rate": 0.001}
         )
-        entry_fee = 0.001 * 101.0 * 500.0
-        assert trades[0].quantity == pytest.approx(500.0, rel=1e-9)
+        entry_qty = 1000.0 / 2.02
+        entry_fee = 0.001 * 101.0 * entry_qty
+        assert trades[0].quantity == pytest.approx(entry_qty, rel=1e-9)
         assert trades[1].quantity == pytest.approx(
             (0.01 * (100_000.0 - entry_fee)) / 2.1, rel=1e-9
         ), (
@@ -639,7 +642,7 @@ class TestSizingEquityExcludesUnrealizedPnl:
         entries = pd.Series([True, False, False, True, False, False], index=frame.index)
         exits = pd.Series([False] * len(frame), index=frame.index)
         blanks: list[float | None] = [None] * len(frame)
-        stop_loss = pd.Series([95.0] + blanks[1:], index=frame.index)
+        stop_loss = pd.Series([95.0, *blanks[1:]], index=frame.index)
         strategy = lambda df, params: (  # noqa: E731
         entries, exits, {"stop_loss": stop_loss})
 
@@ -942,6 +945,49 @@ class TestFreeMarginLeverageCap:
         )
         assert qty == pytest.approx(920.0)
 
+    def test_leverage_clamp_floors_with_the_shared_lot_grid(
+        self, tmp_path: Path
+    ):
+        """The free-margin clamp must floor through ``shared.lot_grid``
+        (#365/#278), not a private ``floor(x / step + eps)``: an exact
+        3-step cap on a 0.1 grid is ``0.3``, not ``0.30000000000000004`` —
+        and the risk-engine path never re-floors, so a private floor's
+        off-grid float would reach the order."""
+        # Balance 30 at 1x with no open position: free margin = 30, so the
+        # leverage cap is exactly 30 * 1 / 100 = 0.3 — three 0.1 steps.
+        risk_engine = self._engine(
+            tmp_path,
+            initial_capital=30.0,
+            max_leverage=1.0,
+            parameters={"lot_step": 0.1},
+        )
+        # 1% of 30 = 0.3 risk over a ~0.1 stop distance → ~3 shares pre-cap.
+        qty = risk_engine._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.3
+
+        fixed_risk = self._engine(
+            tmp_path,
+            initial_capital=30.0,
+            max_leverage=1.0,
+            parameters={
+                "fixed_risk_amount": 30.0,
+                "tick_value": 1.0,
+                "tick_size": 1.0,
+                "lot_step": 0.1,
+            },
+        )
+        # 30 / ~0.1 ≈ 300 shares pre-cap; the same 0.3 leverage cap binds.
+        qty = fixed_risk._calculate_position_size(
+            entry_price=100.0,
+            stop_loss_price=99.9,
+            direction="LONG",
+        )
+        assert qty == 0.3
+
     def test_exposure_cap_stays_on_realized_cash(self, tmp_path: Path):
         engine = self._engine(
             tmp_path, max_leverage=10.0, max_position_exposure_pct=0.4
@@ -1090,10 +1136,10 @@ class TestFreeMarginLeverageCap:
         """End-to-end: with the default unknown-broker 1x, a second entry
         sized while the first rides is clamped to what free margin affords.
 
-        Entry 1 keeps 500 shares @ 101 and is marked at 105 when entry 2 is
-        sized: equity = 102k, used margin = 500 * 105 / 1 = 52.5k → free
-        margin = 49.5k → cap = 471.43 shares, below the 476.19 the 1% risk
-        target on realized cash (100k) would want.
+        1.5% risk: entry 1 is re-sized at its 101 fill to 1500 / (0.02 x 101)
+        = 742.57 shares — 75k notional, so free margin at the 105 mark is
+        100k − 75k = 25k → cap = 238.10 shares at 1x, far below the 714.29
+        the 1.5%-of-realized-cash risk target on the 105 fill would want.
         """
         frame = _linear_frame(6, start=100.0)
         for bar in (1, 2, 3):
@@ -1109,17 +1155,72 @@ class TestFreeMarginLeverageCap:
         strategy = lambda df, params: (  # noqa: E731
         entries, exits)
 
-        engine = TradeEngine(_config(tmp_path), symbol="PROBE")
+        engine = TradeEngine(
+            _config(tmp_path, risk_per_trade_pct=0.015), symbol="PROBE"
+        )
         engine.run(frame, strategy)
 
         assert len(engine.closed_trades) >= 2, "both entries must have filled"
-        assert engine.closed_trades[0].quantity == pytest.approx(500.0)
-        assert engine.closed_trades[1].quantity == pytest.approx(
-            49_500.0 / 105.0, rel=1e-9
-        ), (
-            "the second entry is clamped to free margin (49.5k at 1x), not "
-            "the 476.19 shares the realized-cash risk target would want"
+        assert engine.closed_trades[0].quantity == pytest.approx(
+            1500.0 / 2.02, rel=1e-9
         )
+        assert engine.closed_trades[1].quantity == pytest.approx(
+            25_000.0 / 105.0, rel=1e-9
+        ), (
+            "the second entry is clamped to free margin (25k at 1x), not "
+            "the 714.29 shares the realized-cash risk target would want"
+        )
+
+
+class TestSizingEquityBasis:
+    def test_equity_at_entry_records_the_sizing_basis_not_mark_to_market(self):
+        """cubic #190: the replay derives quantity / equity_at_entry, so the
+        recorded basis must be the realized cash the entry was sized from."""
+        frame = _linear_frame(6, start=100.0)
+        frame.loc[2, "high"] = 130.0
+        frame.loc[2, "close"] = 130.0
+        frame.loc[3, "close"] = 130.0
+        frame.loc[3, "open"] = 130.0
+        entries = pd.Series([False] * len(frame), index=frame.index)
+        entries.iloc[0] = True
+        entries.iloc[2] = True
+        exits = pd.Series([False] * len(frame), index=frame.index)
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, lambda df, params: (entries, exits))
+
+        assert len(engine.closed_trades) >= 2
+        # Open +30/qty profit from entry 1 must not leak into the basis.
+        assert engine.closed_trades[1].meta["equity_at_entry"] == pytest.approx(100_000.0)
+
+    def test_partial_exit_cash_is_net_of_fees_still_owed(self):
+        """cubic #190: gross partial proceeds are not spendable while the
+        fees already incurred on the position are unsettled. The owed amount
+        is the entry leg on the full quantity plus the exit fee of each leg
+        that actually closed; the open remainder's future exit fee is a
+        future cost and is not held back."""
+        from runner.engine import Order, OrderType
+
+        engine = TradeEngine(
+            _config(Path("/tmp"), parameters={"fee_rate": 0.001}), symbol="PROBE"
+        )
+        order = Order(
+            symbol="PROBE",
+            direction="LONG",
+            order_type=OrderType.MARKET,
+            created_index=0,
+            created_time="2024-01-01T00:00:00+00:00",
+            quantity=100.0,
+        )
+        engine._open_position(order, 100.0, "2024-01-01T01:00:00+00:00", 1)
+        position = engine.positions[0]
+        engine._close_partial(position, 110.0, 50.0, "2024-01-01T02:00:00+00:00", "tp1")
+
+        gross = 50.0 * 10.0
+        # Owed = the entry leg on the full position plus the exit fee of the
+        # leg that actually closed; the still-open remainder's future exit fee
+        # is not held back (the #267 realized-cash rule).
+        owed = 100.0 * 100.0 * 0.001 + 110.0 * 50.0 * 0.001
+        assert engine._sizing_equity == pytest.approx(100_000.0 + gross - owed)
 
 
 # ─── F22: max_positions comes from risk policy, not strategy params ─────────
@@ -1556,9 +1657,12 @@ class TestFixedRiskViaRiskEngine:
         self, tmp_path: Path
     ):
         """Floor flips: ``a / (b * (tv / ts))`` vs ``(a / b) * (ts / tv)``
-        differ by an ulp that the absolute ``1e-12`` lot-step epsilon cannot
-        absorb — the accepted size is recomputed in the MT5 order so the
-        result is bit-identical to legacy when unclamped."""
+        differ by an ulp — the accepted size is recomputed in the MT5 order
+        so the pre-grid value stays bit-identical to legacy when unclamped.
+        Since #278 the shared ``_floor_to_lot_grid`` snap band (1e-6 of a
+        step, exact decimal) absorbs that ulp, so the two orders now agree
+        on the grid result; the recompute is retained for the parity
+        protocol's pre-grid value."""
         engine = self._engine(
             tmp_path,
             parameters=self._fixed_params(
@@ -1578,11 +1682,14 @@ class TestFixedRiskViaRiskEngine:
             direction="LONG",
             stop_distance=1e-5,
         )
-        # MT5 order: (228.0 / 1e-5) * (1e-5 / 1.0) = 227.99999999999997 →
-        # floor to the 0.01 lot grid → 227.99. The engine's
-        # ``risk / (distance * pip_value)`` form gives 228.00000000000003 →
-        # 228.0 — one floor flip the PR originally claimed could not happen.
-        assert qty == pytest.approx(227.99)
+        # MT5 order: (228.0 / 1e-5) * (1e-5 / 1.0) = 227.99999999999997,
+        # one ulp below the 228.0 grid point; the engine's
+        # ``risk / (distance * pip_value)`` form gives
+        # 228.00000000000003, one ulp above. Both sit inside the shared
+        # grid floor's 1e-6-of-a-step snap band (#278), so the floored
+        # result is 228.0 either way — the snap band, not the operation
+        # order, decides this edge now.
+        assert qty == pytest.approx(228.0)
 
     def test_fixed_risk_clamped_size_is_equity_proportional(
         self, tmp_path: Path
@@ -1730,7 +1837,7 @@ class TestOrderTypeSizingSemantics:
         return engine, frame
 
     def test_limit_order_is_resized_to_trigger_price_at_fill(self):
-        engine, frame = self._limit_order_engine(limit_price=100.5)
+        engine, _frame = self._limit_order_engine(limit_price=100.5)
         assert engine.closed_trades, "limit order must fill"
         trade = engine.closed_trades[0]
         # C1: explicit risk sizing (1% of 100k = 1000 risk, 2% fallback stop
@@ -1796,12 +1903,29 @@ class TestOrderTypeSizingSemantics:
             "STOP orders must be sized at fill from the trigger price"
         )
 
-    def test_market_order_without_stop_keeps_documented_fallback_sizing(self):
-        """Stopless MARKET entries are the documented exception: no re-size.
+    def test_market_order_without_stop_sizes_on_the_fill_price(self):
+        """Stopless MARKET entries size on the FILL via the documented fallback.
 
-        Without a stop there is no fill-time risk input, so the creation-time
-        (signal-bar close) estimate stands — pinned here so a future change
-        to that policy has to update this test deliberately.
+        16-D1 documented an exception ("a MARKET order without any stop has no
+        fill-time risk input, so its creation-time estimate stands") and
+        pinned it here. That exception is superseded, for two documented
+        reasons:
+
+        1. the premise is false — a stopless order DOES have a documented
+           fill-time risk input, the fallback stop (`allow_fallback_stop` /
+           `RiskConfig.fallback_stop_pct`, documented in
+           `docs/live-risk-consistency.md`, and in
+           `docs/cross-engine-backtest-contract.md` §4 as "a documented
+           default stop distance ... 2% of entry"), which the risk engine
+           derives from the entry price it is handed — i.e. from the fill.
+        2. keeping it breached a documented cap. The notional cap is
+           `equity * leverage / fill`, but the creation sizing came from the
+           signal bar's close, so any gap between them sized a position
+           beyond the cap (the #189 differential repro: 103.4k notional on a
+           100k equity / 1x cap).
+
+        The class policy above ("MARKET fills at next-bar open → sized from
+        the fill price") therefore holds for every MARKET order.
         """
         frame = _linear_frame(4)
         entries = pd.Series([True] + [False] * 3, index=frame.index)
@@ -1814,9 +1938,266 @@ class TestOrderTypeSizingSemantics:
 
         assert engine.closed_trades
         trade = engine.closed_trades[0]
-        # Fill happens on bar 1 (open 101); stopless sizing was computed on
-        # bar 0 close (100) → C1 risk sizing: 1000 risk / 2.0 distance = 500.
-        assert trade.quantity == pytest.approx(1000.0 / 2.0, rel=1e-6)
+        # Fill happens on bar 1 (open 101); C1 risk sizing uses the fallback
+        # distance 2% * 101 = 2.02 of the FILL, not 2% of bar 0's close:
+        # 1000 risk / 2.02.
+        assert trade.entry_price == pytest.approx(101.0)
+        assert trade.quantity == pytest.approx(1000.0 / 2.02, rel=1e-6)
+        assert trade.quantity * trade.entry_price <= 100_000.0 * (1.0 + 1e-12)
+
+    def test_market_order_without_stop_sizes_on_the_fill_after_a_gap(self):
+        """Same rule across a gap: the risk distance follows the fill, not the
+        signal close. Signal close 100, fill 120 → 1000 risk / (2% * 120)."""
+        frame = _linear_frame(4)
+        frame.loc[1, ["open", "high", "low", "close"]] = [120.0, 120.5, 119.5, 120.0]
+        entries = pd.Series([True] + [False] * 3, index=frame.index)
+        exits = pd.Series([False] * 4, index=frame.index)
+        strategy = lambda df, params: (  # noqa: E731
+        entries, exits)  # noqa: E731
+
+        engine = TradeEngine(_config(Path("/tmp")), symbol="PROBE")
+        engine.run(frame, strategy)
+
+        assert engine.closed_trades
+        trade = engine.closed_trades[0]
+        assert trade.entry_price == pytest.approx(120.0)
+        assert trade.quantity == pytest.approx(1000.0 / 2.4, rel=1e-6)
+
+
+# ─── #288: pending orders never fill on their creation bar ──────────────────
+
+
+class TestPendingOrderCreationBarGuard:
+    """LIMIT/STOP/STOP_LIMIT share the MARKET rule: a pending order may only
+    fill on a bar strictly after the bar whose close produced its signal.
+    Filling on the creation bar would spend that bar's own range — lookahead.
+
+    The native engine only creates MARKET orders today (#339's explicit exit
+    order types will use these branches), so the guard is pinned directly on
+    ``_fill_pending_orders``.
+    """
+
+    @staticmethod
+    def _engine(tmp_path: Path, **param_overrides) -> TradeEngine:
+        return TradeEngine(
+            _config(tmp_path, parameters=dict(param_overrides)), symbol="PROBE"
+        )
+
+    @staticmethod
+    def _order(order_type, direction: str, created_index: int, **kwargs):
+        from runner.engine import Order
+
+        return Order(
+            symbol="PROBE",
+            direction=direction,
+            order_type=order_type,
+            created_index=created_index,
+            created_time="2024-01-01T01:00:00+00:00",
+            quantity=10.0,
+            **kwargs,
+        )
+
+    def test_limit_long_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        order = self._order(
+            OrderType.LIMIT,
+            "LONG",
+            created_index=1,
+            limit_price=101.5,
+            stop_loss=100.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1 is the creation bar: low 100.5 <= 101.5 touches the limit,
+        # but the order must survive untouched.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        # Bar 2's low (101.5) still touches the limit -> fills one bar later.
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        position = engine.positions[0]
+        assert position.entry_index == 2
+        assert position.entry_price == pytest.approx(101.5)
+
+    def test_limit_short_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        order = self._order(
+            OrderType.LIMIT,
+            "SHORT",
+            created_index=1,
+            limit_price=101.0,
+            stop_loss=102.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1 high (101.5) >= 101.0 touches the short limit -> guarded.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        # Bar 2 high (102.5) still trades through -> fills at the limit.
+        # Bar 2 opens at 102.0, above the 101.0 sell limit, so a real fill
+        # would price-improve to the open; the engine deliberately does not
+        # model gap price improvement for pending orders (#371).
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(101.0)
+
+    def test_stop_long_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        # Bar 2 must not gap through the buy stop: a stop whose bar opens
+        # above 101.0 fills at the open (gap -> open), not at the level —
+        # that fill-price gap is tracked in #371. Open 100.8 keeps this a
+        # plain through-trade so the fill lands on the stop price.
+        frame.loc[2, "open"] = 100.8
+        frame.loc[2, "low"] = 100.7
+        order = self._order(
+            OrderType.STOP,
+            "LONG",
+            created_index=1,
+            stop_price=101.0,
+            stop_loss=100.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1 high (101.5) >= 101.0 triggers the stop -> guarded.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        # Bar 2 high (102.5) still trades through -> fills at the stop.
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(101.0)
+
+    def test_stop_short_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        frame.loc[2, "low"] = 100.0  # only bar 2 trades down through the stop
+        order = self._order(
+            OrderType.STOP,
+            "SHORT",
+            created_index=1,
+            stop_price=100.6,
+            stop_loss=102.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1 low (100.5) <= 100.6 triggers the short stop -> guarded.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(100.6)
+
+    def test_stop_limit_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        # Bar 2 keeps the stop trigger (high 102.5 >= 101.0) but only dips
+        # to the limit when its low is forced down.
+        frame.loc[2, "low"] = 100.5
+        order = self._order(
+            OrderType.STOP_LIMIT,
+            "LONG",
+            created_index=1,
+            stop_price=101.0,
+            limit_price=100.8,
+            stop_loss=99.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1: high 101.5 triggers AND low 100.5 <= 100.8 reaches the
+        # limit — both legs fire on the creation bar -> guarded.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(100.8)
+
+    def test_stop_limit_short_cannot_fill_on_creation_bar(self, tmp_path):
+        from runner.engine import OrderType
+
+        engine = self._engine(tmp_path)
+        frame = _linear_frame(4)
+        # Only bar 2 dips through the sell stop (low 100.0 <= 100.6) while
+        # its high still reaches the limit. Bar 2 opens at 102.0, above the
+        # 100.6 stop, so this is not a gap case (#371).
+        frame.loc[2, "low"] = 100.0
+        order = self._order(
+            OrderType.STOP_LIMIT,
+            "SHORT",
+            created_index=1,
+            stop_price=100.6,
+            limit_price=101.0,
+            stop_loss=102.0,
+        )
+        engine.pending_orders.append(order)
+
+        # Bar 1: low 100.5 <= 100.6 triggers AND high 101.5 >= 101.0
+        # reaches the limit — both legs fire on the creation bar -> guarded.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert engine.positions == []
+        assert engine.pending_orders == [order]
+
+        engine._fill_pending_orders(frame.iloc[2], 2)
+        assert len(engine.positions) == 1
+        assert engine.positions[0].entry_price == pytest.approx(101.0)
+
+    @pytest.mark.parametrize(
+        "fixed_amount,expected",
+        [(500.0, False), (None, True)],
+        ids=["fixed_risk_amount", "percentage_sizing"],
+    )
+    def test_limit_fill_site_flag_follows_fill_time_sizing(
+        self, tmp_path, fixed_amount, expected
+    ):
+        """The LIMIT/STOP fill-site re-size must refresh `_equity_proportional`
+        (#288 / #170 review finding): the flag describes the branch that sized
+        the FINAL quantity, not the creation-time estimate. The order is
+        pre-seeded `_equity_proportional = False` (a value `_create_order`
+        never writes for these params) so BOTH parametrizations fail if the
+        fill-site update is dropped — without the seed the percentage case
+        would pass on the `getattr(..., True)` default alone."""
+        from runner.engine import OrderType
+
+        params = {} if fixed_amount is None else {"fixed_risk_amount": fixed_amount}
+        engine = self._engine(tmp_path, **params)
+        frame = _linear_frame(4)
+        order = self._order(
+            OrderType.LIMIT,
+            "LONG",
+            created_index=0,
+            limit_price=101.5,
+            stop_loss=100.0,
+        )
+        order._equity_proportional = False
+        engine.pending_orders.append(order)
+
+        # created_index=0 -> bar 1 is already a post-creation bar.
+        engine._fill_pending_orders(frame.iloc[1], 1)
+        assert len(engine.positions) == 1
+        assert (
+            engine.positions[0].meta["equity_proportional_sizing"] is expected
+        )
 
 
 # ─── Mutation hardening: reporting equity curve ─────────────────────────────

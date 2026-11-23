@@ -28,6 +28,12 @@ per engine: native clamps to 1x (#347), while the vectorbt and pynecore
 adapters resolve it through `runner.engines._shared.resolve_max_leverage`
 to 2.0x.
 
+**Pending #240:** that `<= 1` ceiling is the current validation limit, not a permanent
+design rule. The maintainer decided on 2026-11-16 that leverage may be allowed up to the
+broker maximum per account and asset — `RiskConfig.max_notional_per_trade` above 1×, with
+the entry size at the stop keeping the exposure sane. No PR implements it yet, so the
+range above still applies on main.
+
 | Name | Layer | Meaning (Decision Record, verbatim) |
 |---|---|---|
 | `max_position_exposure_pct` | `BacktestConfig` field, CLI `--max-position-exposure-pct` | **Position-size semantics**: the maximum notional of ONE position as a fraction of equity (e.g. `0.2` = a single position may reach 20% of equity). Not an aggregate-portfolio limit and not a loss budget. |

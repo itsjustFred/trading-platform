@@ -71,6 +71,12 @@ class _ControlAdapter:
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
 
+    async def get_equity(self) -> float:
+        return 100_000.0
+
+    async def get_used_margin(self):
+        return 0.0
+
     async def get_pip_value(self, symbol):
         # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
         from live_runner.base_adapter import LivePipValue
@@ -654,6 +660,67 @@ def test_preparation_failure_never_takes_the_claim(
     assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
 
 
+def test_entries_halt_written_during_prepare_blocks_the_claim(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """A halt committed while the dispatcher was sizing must still stop the entry.
+
+    The pre-submit ``live_deployment_entries_halted`` read runs before
+    ``prepare_order_with_risk``; the claim re-checks the flag inside its own
+    transaction, so a halt landing in that window wins the race (#303).
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    adapter = _ControlAdapter()
+
+    async def _halt_during_prepare(_adapter, _deployment, live_signal):
+        database.set_live_deployment_entries_halt(
+            DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+        )
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _halt_during_prepare)
+
+    _submit(database, adapter)
+
+    assert adapter.submitted == []
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
+def test_exit_claim_is_not_gated_by_the_entries_halt(
+    isolated_db_sandbox, monkeypatch
+) -> None:
+    """The halt is entry-only: an exit on a halted deployment still submits."""
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    database.set_live_deployment_entries_halt(
+        DEPLOYMENT_ID, {"by": "broker_reconciliation", "at": "now"}
+    )
+    adapter = _ControlAdapter()
+
+    async def _prepared(_adapter, _deployment, live_signal):
+        return live_signal, 1.0
+
+    monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepared)
+
+    exit_signal = _trade_signal()
+    exit_signal.action = "sell"
+    exit_signal.metadata = {**dict(exit_signal.metadata), "exit_only": True}
+    asyncio.run(
+        daemon._submit_normalized_discord_signal(
+            ACCOUNT_ID,
+            adapter,
+            _deployment(database),
+            exit_signal,
+            signal_timeframe="1h",
+            wait_enabled=False,
+        )
+    )
+
+    assert len(adapter.submitted) == 1
+    assert list_live_deployment_submission_claims(DEPLOYMENT_ID) == []
+
+
 def test_claim_is_renewed_while_the_submit_is_in_flight(
     isolated_db_sandbox, monkeypatch
 ) -> None:
@@ -755,6 +822,104 @@ def test_stamp_is_refused_while_a_live_submission_lease_exists(isolated_db_sandb
     assert retry.calls == ["cancel", "flatten", "orphan"]
     assert DEPLOYMENT_ID in ledger
     assert get_live_deployment(DEPLOYMENT_ID).stopped_enforced_at is not None
+
+
+def test_a_paused_deployment_takes_a_claim_only_for_an_exit(isolated_db_sandbox) -> None:
+    """#126 decision at the one gate the daemon cannot re-check afterwards.
+
+    The claim is the atomic status decision taken immediately before the broker call,
+    so an exit on a PAUSED deployment has to pass it or the widened dispatch statuses
+    would be undone at the last moment - and an entry must not pass it at all.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+    update_live_deployment_status(DEPLOYMENT_ID, "PAUSED")
+
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-entry") is False
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-exit", allow_paused=True
+    ) is True
+
+    # The lease is still single: an exit may not take a second one while it works, or
+    # two orders could reach the broker for one position.
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-exit-2", allow_paused=True
+    ) is False
+    assert database.release_live_deployment_submission("tok-exit") is True
+
+    # A STOPPED deployment is closed by the sweeps, so the widen applies to no status.
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-stopped", allow_paused=True
+    ) is False
+
+
+def test_an_exit_claim_is_accepted_while_the_deployment_is_active(
+    isolated_db_sandbox,
+) -> None:
+    """The widened claim must not narrow what it widened.
+
+    A running deployment answers an exit through the same `allow_paused=True` claim, and
+    its SQL filter reads `IN ('ACTIVE', 'PAUSED')`. Every exit-path test around this one
+    stubs the claim, so a filter that shrank to PAUSED alone would refuse every close on a
+    running deployment - no order reaching the broker - with a green suite.
+    """
+    database, _, _ = isolated_db_sandbox
+    _seed(database, status="ACTIVE")
+
+    assert (
+        database.claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-active-exit", allow_paused=True
+        )
+        is True
+    )
+    # The lease is still single: an exit may not take a second one while it works.
+    assert database.claim_live_deployment_submission(
+        DEPLOYMENT_ID, "tok-active-exit-2", allow_paused=True
+    ) is False
+    assert database.release_live_deployment_submission("tok-active-exit") is True
+
+    # And an entry on the same ACTIVE row still takes the un-widened filter.
+    assert database.claim_live_deployment_submission(DEPLOYMENT_ID, "tok-entry") is True
+
+
+def test_the_exit_gates_all_read_the_one_status_set(isolated_db_sandbox) -> None:
+    """#311 nit: three modules each carried their own copy of the exit status set.
+
+    The daemon's dispatch statuses, the atomic claim's SQL filter and the halt's exempt
+    set answer the same question ("which statuses may still close a position"), and a copy
+    that forgets to widen stops a close reaching the broker with a green suite. They now
+    derive from one tuple; this pins that they still agree after any change to it.
+    """
+    import live_runner.daemon as daemon
+    from shared.database import LIVE_DISPATCH_EXIT_STATUSES
+
+    assert daemon.EXIT_DISPATCH_STATUSES == frozenset(LIVE_DISPATCH_EXIT_STATUSES)
+    assert daemon.ENTRY_DISPATCH_STATUSES == frozenset({"ACTIVE"})
+
+    # The claim's own filter, through the real SQL: every shared status takes a claim and
+    # anything outside it does not.
+    database, _, _ = isolated_db_sandbox
+    for index, status in enumerate(LIVE_DISPATCH_EXIT_STATUSES):
+        if index == 0:
+            _seed(database, status=status)
+        else:
+            update_live_deployment_status(DEPLOYMENT_ID, status)
+        assert (
+            database.claim_live_deployment_submission(
+                DEPLOYMENT_ID, f"tok-shared-{index}", allow_paused=True
+            )
+            is True
+        )
+        database.release_live_deployment_submission(f"tok-shared-{index}")
+
+    update_live_deployment_status(DEPLOYMENT_ID, "STOPPED")
+    assert (
+        database.claim_live_deployment_submission(
+            DEPLOYMENT_ID, "tok-outside", allow_paused=True
+        )
+        is False
+    )
 
 
 def test_stamp_is_refused_while_an_expired_but_unreleased_lease_exists(

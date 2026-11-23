@@ -542,8 +542,14 @@ def test_dispatch_fans_out_to_every_matching_deployment() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
+
+        async def get_used_margin(self):
+            return 0.0
 
         async def get_pip_value(self, symbol):
             # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
@@ -631,8 +637,14 @@ def test_dispatch_respects_each_deployments_own_allowlist() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
+
+        async def get_used_margin(self):
+            return 0.0
 
         async def get_pip_value(self, symbol):
             # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
@@ -715,8 +727,14 @@ def test_dispatch_without_signal_author_metadata_still_dispatches() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
+
+        async def get_used_margin(self):
+            return 0.0
 
         async def get_pip_value(self, symbol):
             # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
@@ -927,6 +945,107 @@ def test_account_listener_merges_trusted_authors_across_channel_group(
     )
 
     assert captured.get("trusted_author_ids") == {"bot-1", "bot-2"}
+
+
+def test_the_listeners_primary_deployment_is_an_active_one(monkeypatch) -> None:
+    """#311 should-fix: one listener serves the account, so one bot's token drives it.
+
+    The dispatchable set now includes PAUSED deployments, and it is ordered newest
+    first while a freshly created deployment is PAUSED - so the head of the list could be
+    a paused bot whose token, auth scheme and timeframe decide how an older ACTIVE bot's
+    channel is polled. The ACTIVE deployment wins whenever there is one.
+    """
+    import asyncio
+
+    import live_runner.daemon as daemon
+
+    # A brand-new PAUSED deployment first, an older ACTIVE one second: the order
+    # `_dispatchable_discord_deployments_for_account` produces from created_at DESC.
+    paused_newer = _deployment_for_test(
+        "dep-3", symbols=["AAPL"], channel_id="channel-1", status="PAUSED"
+    )
+    paused_newer.signal_config["service_name"] = "NEWER-BOT"
+    paused_newer.signal_config["timeframe"] = "15m"
+    paused_newer.signal_config["trusted_author_ids"] = ["bot-1"]
+    active_older = _deployment_for_test(
+        "dep-1", symbols=["AAPL"], channel_id="channel-1", status="ACTIVE"
+    )
+    active_older.signal_config["service_name"] = "OLDER-BOT"
+    active_older.signal_config["timeframe"] = "1h"
+    active_older.signal_config["trusted_author_ids"] = ["bot-1"]
+
+    captured: dict[str, object] = {}
+
+    class _Source:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self, **_kwargs):
+            return None
+
+        async def listen_signals(self):
+            if False:
+                yield None
+
+    monkeypatch.setattr(daemon, "DiscordSignalSource", _Source)
+
+    asyncio.run(
+        daemon._run_discord_signal_listener_for_account(
+            "acc-1",
+            object(),
+            [paused_newer, active_older],
+            accounts_env_values={},
+        )
+    )
+
+    assert captured.get("timeframe") == "1h"
+
+
+def test_the_listeners_primary_deployment_falls_back_to_the_paused_one(
+    monkeypatch,
+) -> None:
+    """An account with no ACTIVE deployment still needs a listener for its exits (#126)."""
+    import asyncio
+
+    import live_runner.daemon as daemon
+
+    paused = _deployment_for_test(
+        "dep-5", symbols=["AAPL"], channel_id="channel-1", status="PAUSED"
+    )
+    paused.signal_config["timeframe"] = "15m"
+    paused.signal_config["trusted_author_ids"] = ["bot-1"]
+
+    captured: dict[str, object] = {}
+
+    class _Source:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def connect(self):
+            return None
+
+        async def disconnect(self, **_kwargs):
+            return None
+
+        async def listen_signals(self):
+            if False:
+                yield None
+
+    monkeypatch.setattr(daemon, "DiscordSignalSource", _Source)
+
+    asyncio.run(
+        daemon._run_discord_signal_listener_for_account(
+            "acc-1",
+            object(),
+            [paused],
+            accounts_env_values={},
+        )
+    )
+
+    assert captured.get("timeframe") == "15m"
 
 
 def test_service_listener_uses_service_trusted_author_config(monkeypatch) -> None:
@@ -1224,6 +1343,149 @@ def _burst_message(i: int) -> dict:
         "content": "**$AAPL** is now oversold — buy signal\nPrice: $190.50",
         "author": {"id": "bot-1", "bot": True},
     }
+
+
+class TestIssue232PoisonMessage:
+    """One malformed message must not silence the rest of its page.
+
+    Regression: the seen-set was updated before the message was parsed/queued, so
+    an exception after `seen.add` propagated to `_poll_loop`, aborted the page
+    and left the id in `seen` -- the message was skipped forever and every
+    later message on that page was lost for that poll.
+    """
+
+    def test_parse_error_is_logged_at_error_with_channel_and_message_id(
+        self, monkeypatch, caplog
+    ) -> None:
+        import asyncio
+        import logging
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+
+        def _explode(*_args, **_kwargs):
+            raise ValueError("boom: structurally malformed payload")
+
+        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _explode)
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [_burst_message(1)]
+
+        source._fetch_messages = _fetch
+
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(source._poll_once("channel-1"))
+
+        records = [r for r in caplog.records if "Discord message dropped" in r.getMessage()]
+        assert records, "a dropped signal must be logged at ERROR, not silent"
+        data = getattr(records[0], "data", {})
+        assert data.get("channel_id") == "channel-1"
+        assert data.get("message_id") == "1001"
+        assert data.get("bot_name") == "ramjet"
+        assert data.get("error_type") == "ValueError"
+        # The poison id stays seen so it is not retried forever, and the cursor
+        # still moves past it so the channel is not pinned.
+        assert "1001" in source._seen_ids["channel-1"]
+        assert source._last_seen_message_ids["channel-1"] == "1001"
+        assert source._queue.empty()
+
+    def test_one_bad_message_does_not_lose_the_rest_of_the_page(self, monkeypatch) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        real_parser = ds._parse_trade_signal_from_message
+
+        def _maybe_explode(message, **kwargs):
+            if str(message.id) == "1002":
+                raise RuntimeError("poison payload")
+            return real_parser(message, **kwargs)
+
+        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _maybe_explode)
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [_burst_message(index) for index in (4, 1, 3, 2)]  # ids 1001..1004
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1001", "1003", "1004"]
+        assert source._last_seen_message_ids["channel-1"] == "1004"
+
+    def test_malformed_author_row_is_skipped_not_raised(self, caplog) -> None:
+        import asyncio
+        import logging
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        bad = {**_burst_message(1), "author": "not-a-dict"}
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [bad, _burst_message(2)]
+
+        source._fetch_messages = _fetch
+        with caplog.at_level(logging.ERROR):
+            asyncio.run(source._poll_once("channel-1"))  # must not raise
+
+        queued = [source._queue.get_nowait() for _ in range(source._queue.qsize())]
+        ids = [item.metadata["discord_message_id"] for item in queued]
+        assert ids == ["1002"]
+        assert any("Discord message dropped" in r.getMessage() for r in caplog.records)
+
+    def test_poison_message_is_not_retried_when_the_page_repeats_it(
+        self, monkeypatch
+    ) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+        source._last_seen_message_ids["channel-1"] = "1000"
+        # The poison row keeps its place at the head of the page (a server that
+        # answers `after=` with a repeat of the boundary row).
+        poison = {**_burst_message(1), "author": "not-a-dict"}
+        attempts: list[str] = []
+        real_parser = ds._parse_trade_signal_from_message
+
+        def _counting_parser(message, **kwargs):
+            attempts.append(str(message.id))
+            if getattr(message, "id", None) == "1001":
+                # The poison row is already inside the parser when it dies on
+                # the malformed author, so it must never be re-parsed.
+                return real_parser(message, **kwargs)
+            raise ValueError("poison")
+
+        monkeypatch.setattr(ds, "_parse_trade_signal_from_message", _counting_parser)
+
+        async def _fetch(_channel_id, *, after=None, **kwargs):
+            return [_burst_message(2), poison] if after == "1000" else [poison]
+
+        source._fetch_messages = _fetch
+        asyncio.run(source._poll_once("channel-1"))
+        asyncio.run(source._poll_once("channel-1"))
+
+        assert attempts == ["1002"], "a skipped poison message must not be retried"
+        assert source._seen_ids["channel-1"] == {"1001", "1002"}
+        assert source._last_seen_message_ids["channel-1"] == "1002"
+        assert source._queue.qsize() == 0
+
+    def test_cancellation_is_not_swallowed_by_the_per_message_guard(self) -> None:
+        import asyncio
+
+        source = _source(trusted_author_ids={"bot-1"})
+
+        async def _cancel(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        source._emit_parsed_message = _cancel
+
+        async def _run() -> None:
+            with pytest.raises(asyncio.CancelledError):
+                await source._emit_polled_message(
+                    "channel-1", _burst_message(1), set(), emit=True
+                )
+
+        asyncio.run(_run())
 
 
 class TestIssueB2Backfill:
@@ -1731,8 +1993,14 @@ def test_dispatch_discards_stale_signals() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
+
+        async def get_used_margin(self):
+            return 0.0
 
         async def get_pip_value(self, symbol):
             # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
@@ -2330,7 +2598,7 @@ class TestNitroGrammarContract:
         from signal_bots.registry import get_signal_processor
 
         processor = get_signal_processor("nitro", {})
-        with pytest.raises(ValueError, match="BUY|LONG"):
+        with pytest.raises(ValueError, match=r"BUY|LONG"):
             processor._normalize_buy_action("sell")
 
     def test_sell_bearing_words_do_not_flip_a_buy_message(self):
@@ -2922,7 +3190,7 @@ class TestRejectionStreakIsLoggedNotFatal:
             _parse_trade_signal_from_message,
         )
 
-        for index in range(count):
+        for _ in range(count):
             _parse_trade_signal_from_message(
                 _live_channel_message(NITRO_OVERSOLD_MESSAGE, author_id=author),
                 default_timeframe="1h",
@@ -3689,7 +3957,7 @@ class TestAuthorDiscoveryRecord:
         monkeypatch.setattr(
             module.service_discovery,
             "discover_discord_bots_from_env",
-            lambda: [entry["bot"] for entry in results],
+            lambda *_a, **_k: [entry["bot"] for entry in results],
         )
 
         # One observation per discovered bot, consumed in order. Handing every
@@ -4597,8 +4865,14 @@ def test_another_bots_author_cannot_trade_on_this_bots_deployment() -> None:
         async def get_balance(self):
             return 100_000.0, 100_000.0
 
+        async def get_equity(self):
+            return 100_000.0
+
         async def get_positions(self):
             return []
+
+        async def get_used_margin(self):
+            return 0.0
 
         async def get_pip_value(self, symbol):
             # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.
@@ -4799,7 +5073,9 @@ def _patch_discovery(monkeypatch, module, results):
     monkeypatch.setattr(
         module.service_discovery,
         "discover_discord_bots_from_env",
-        lambda: [{"name": entry["bot"], "channel_id": entry["channel_id"]} for entry in results],
+        lambda *_a, **_k: [
+            {"name": entry["bot"], "channel_id": entry["channel_id"]} for entry in results
+        ],
     )
     queue = list(results)
 

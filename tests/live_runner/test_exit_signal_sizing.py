@@ -283,6 +283,12 @@ class _Adapter:
     async def get_balance(self):
         return 100_000.0, 100_000.0
 
+    async def get_equity(self):
+        return 100_000.0
+
+    async def get_used_margin(self):
+        return 0.0
+
     async def get_pip_value(self, symbol):
         # Entries fail closed without a broker pip value (#146).
         return LivePipValue(
@@ -442,11 +448,11 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         return None
 
     original_wait = daemon.wait_for_candle_close
-    original_active = daemon._deployment_is_currently_active
+    original_can_dispatch = daemon._deployment_can_dispatch
     original_claim = daemon.claim_live_deployment_submission
     original_release = daemon.release_live_deployment_submission
     daemon.wait_for_candle_close = _no_wait
-    daemon._deployment_is_currently_active = lambda _deployment: True
+    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
     daemon.claim_live_deployment_submission = lambda *_a, **_k: True
     daemon.release_live_deployment_submission = lambda *_a, **_k: True
     try:
@@ -462,9 +468,136 @@ def _run_submit(adapter, deployment, trade_signal) -> None:
         )
     finally:
         daemon.wait_for_candle_close = original_wait
-        daemon._deployment_is_currently_active = original_active
+        daemon._deployment_can_dispatch = original_can_dispatch
         daemon.claim_live_deployment_submission = original_claim
         daemon.release_live_deployment_submission = original_release
+
+
+def _run_internal_submit(adapter, deployment, trade_signal) -> str:
+    """Drive the real chokepoint for an internal-runner signal and return
+    its ``SUBMIT_OUTCOME_*`` — the outcome contract the runner escalates on
+    (#360). Only the claim/active seams are stubbed, exactly like
+    ``_run_submit``; prepare, sizing and submission are the production path.
+    """
+    import live_runner.daemon as daemon
+
+    original_can_dispatch = daemon._deployment_can_dispatch
+    original_claim = daemon.claim_live_deployment_submission
+    original_release = daemon.release_live_deployment_submission
+    daemon._deployment_can_dispatch = lambda _deployment, **_kwargs: True
+    daemon.claim_live_deployment_submission = lambda *_a, **_k: True
+    daemon.release_live_deployment_submission = lambda *_a, **_k: True
+    try:
+        return asyncio.run(
+            daemon._submit_internal_strategy_signal(adapter, deployment, trade_signal)
+        )
+    finally:
+        daemon._deployment_can_dispatch = original_can_dispatch
+        daemon.claim_live_deployment_submission = original_claim
+        daemon.release_live_deployment_submission = original_release
+
+
+def _internal_exit_trade_signal() -> TradeSignal:
+    return TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=None,
+        take_profit=None,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "signal_intent": "exit",
+            "exit_only": True,
+            "risk_sizing_mode": "exit_only",
+            "exit_fraction": 1.0,
+            "idempotency_key": "b" * 32,
+        },
+    )
+
+
+def test_internal_submit_reports_ignored_for_nothing_to_exit(monkeypatch) -> None:
+    """Real chokepoint: an exit with no position returns ``ignored`` — a
+    clean no-op the runner must not count as a failure."""
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _Adapter([])
+
+    outcome = _run_internal_submit(adapter, deployment, _internal_exit_trade_signal())
+
+    assert outcome == "ignored"
+    assert adapter.submitted == []
+
+
+def test_internal_submit_reports_refused_for_short_on_long_only(
+    monkeypatch,
+) -> None:
+    """Real chokepoint: the pre-chokepoint short gate reports ``refused`` —
+    a normal outcome the runner counts toward escalation, not an exception."""
+    deployment = _deployment()  # allow_short=False
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _Adapter([])
+    signal = TradeSignal(
+        action="sell",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "internal_direction": "SHORT",
+            "idempotency_key": "c" * 32,
+        },
+    )
+
+    outcome = _run_internal_submit(adapter, deployment, signal)
+
+    assert outcome == "refused"
+    assert adapter.submitted == []
+
+
+def test_internal_submit_reports_submitted_end_to_end(monkeypatch) -> None:
+    """Real chokepoint: a well-formed internal entry reaches the broker and
+    reports ``submitted`."""
+    deployment = _deployment()
+    _patch_ledger(monkeypatch, deployment, 0.0)
+    adapter = _Adapter([])
+    # Demo/paper skips the promotion gate; the point here is the outcome
+    # contract, not promotion (covered by the promotion tests).
+    adapter.demo = True
+
+    async def _quote(_symbol: str):
+        from live_runner.base_adapter import LiveQuote
+
+        return LiveQuote(
+            bid=100.0,
+            ask=100.0,
+            timestamp=datetime.now(timezone.utc),
+            source="test",
+            timestamp_source="broker",
+        )
+
+    # Entries need a fresh broker quote for the #125 deviation gate.
+    adapter.get_quote = _quote
+    signal = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata={
+            "source": "internal",
+            "internal_direction": "LONG",
+            "idempotency_key": "d" * 32,
+        },
+    )
+
+    outcome = _run_internal_submit(adapter, deployment, signal)
+
+    assert outcome == "submitted"
+    assert len(adapter.submitted) == 1
 
 
 def test_exit_without_a_position_is_ignored_and_logged(monkeypatch, caplog) -> None:
@@ -1318,19 +1451,19 @@ def test_nothing_to_exit_on_a_flat_book_stays_info(monkeypatch, caplog) -> None:
         (0.125, 1.0, 0.0),
     ],
 )
-def test_round_exit_qty_down_to_step(qty, step, expected) -> None:
-    from live_runner.exit_signals import round_exit_qty_down
+def test_floor_qty_to_step_to_step(qty, step, expected) -> None:
+    from shared.lot_grid import floor_qty_to_step
 
-    assert round_exit_qty_down(qty, step) == pytest.approx(expected, abs=1e-15)
-    assert round_exit_qty_down(qty, step) <= qty + 1e-12
+    assert floor_qty_to_step(qty, step) == pytest.approx(expected, abs=1e-15)
+    assert floor_qty_to_step(qty, step) <= qty + 1e-12
 
 
 @pytest.mark.parametrize("step", [0.0, -1.0, float("nan"), float("inf")])
-def test_round_exit_qty_down_refuses_an_unusable_step(step) -> None:
-    from live_runner.exit_signals import round_exit_qty_down
+def test_floor_qty_to_step_refuses_an_unusable_step(step) -> None:
+    from shared.lot_grid import floor_qty_to_step
 
     with pytest.raises(ValueError):
-        round_exit_qty_down(1.0, step)
+        floor_qty_to_step(1.0, step)
 
 
 class _SteppedAdapter(_Adapter):
@@ -1659,7 +1792,7 @@ def test_concurrent_exits_of_two_deployments_are_sized_one_after_the_other(
         return None
 
     monkeypatch.setattr(daemon, "wait_for_candle_close", _no_wait)
-    monkeypatch.setattr(daemon, "_deployment_is_currently_active", lambda _d: True)
+    monkeypatch.setattr(daemon, "_deployment_can_dispatch", lambda _d, **_k: True)
     monkeypatch.setattr(daemon, "claim_live_deployment_submission", lambda *_a, **_k: True)
     monkeypatch.setattr(daemon, "release_live_deployment_submission", lambda *_a, **_k: True)
 
@@ -1823,3 +1956,38 @@ def test_a_stale_exit_is_logged_at_warning_an_entry_at_info(caplog, exit_signal)
     level = logging.WARNING if exit_signal else logging.INFO
     assert _records_at(caplog, level, "stale discord signal")
     assert not _records_at(caplog, logging.INFO if exit_signal else logging.WARNING, "stale")
+
+
+def test_entries_are_skipped_while_the_reconciliation_halt_is_set(
+    monkeypatch, caplog
+) -> None:
+    """#303: the entry-only halt blocks new entries but never exits."""
+    import live_runner.daemon as daemon
+
+    deployment = _deployment(allow_short=True)
+    adapter = _Adapter([])
+    monkeypatch.setattr(daemon, "live_deployment_entries_halted", lambda _id: True)
+    entry = TradeSignal(
+        action="buy",
+        symbol="AAPL",
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        timeframe="1h",
+        metadata=dict(_sell_trade_signal().metadata),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _run_submit(adapter, deployment, entry)
+
+    assert adapter.submitted == []
+    assert any(
+        "entries are halted by broker reconciliation" in record.getMessage()
+        for record in caplog.records
+    )
+
+    # An exit on the same halted deployment still reaches the broker.
+    _patch_ledger(monkeypatch, deployment, 10.0)
+    adapter.positions = [{"symbol": "AAPL", "qty": 10.0}]
+    _run_submit(adapter, deployment, _exit_trade_signal())
+    assert len(adapter.submitted) == 1

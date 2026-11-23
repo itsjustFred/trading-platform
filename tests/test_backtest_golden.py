@@ -493,6 +493,11 @@ def _run_native_cli(tmp_path: Path, *, timeout: float = CLI_TIMEOUT_SECONDS) -> 
             "0.0005",
             "--fee-flat-per-trade",
             "1.0",
+            # #130: the golden pins gross-fill economics — declare the
+            # explicit parity opt-out so per-asset-class slippage defaults
+            # cannot move the fixture.
+            "--slippage",
+            "none",
             "--intrabar-resolution",
             "main_timeframe",
             "--data-dir",
@@ -531,7 +536,11 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert result.meta.parameters == {
         "fee_rate": 0.0005,
         "fee_flat_per_trade": 1.0,
+        "slippage": "none",
     }
+    # #130: the run records which slippage model priced its fills — here
+    # the explicit parity opt-out.
+    assert result.meta.data["slippage"]["models"]["PARITY"]["model"] == "none"
     assert [trade.id for trade in result.trades] == [1, 2, 3]
     assert [trade.entry_time for trade in result.trades] == [
         "2024-01-01T03:00:00+00:00",
@@ -747,12 +756,12 @@ def _describe_golden_change(
         f"  fields removed: {len(removed)}",
         f"  fields changed: {len(changed)}",
     ]
-    for key in added[:MAX_REPORTED_PATHS]:
-        lines.append(f"    + {key} = {new_flat[key]!r}")
-    for key in removed[:MAX_REPORTED_PATHS]:
-        lines.append(f"    - {key} = {old_flat[key]!r}")
-    for key in changed[:MAX_REPORTED_PATHS]:
-        lines.append(f"    ~ {key}: {old_flat[key]!r} -> {new_flat[key]!r}")
+    lines.extend(f"    + {key} = {new_flat[key]!r}" for key in added[:MAX_REPORTED_PATHS])
+    lines.extend(f"    - {key} = {old_flat[key]!r}" for key in removed[:MAX_REPORTED_PATHS])
+    lines.extend(
+        f"    ~ {key}: {old_flat[key]!r} -> {new_flat[key]!r}"
+        for key in changed[:MAX_REPORTED_PATHS]
+    )
     if len(changed) > MAX_REPORTED_PATHS:
         lines.append(f"    ... {len(changed) - MAX_REPORTED_PATHS} further changed fields")
 
@@ -911,7 +920,7 @@ def _assert_oracle_series(
     assert result.stats["daily_return_count"] == len(ORACLE_DAYS) == 10
     assert [row["date"] for row in result.stats["daily_returns"]] == ORACLE_DAYS
     for row, (_day, expected_return, expected_close) in zip(
-        result.stats["daily_returns"], expected
+        result.stats["daily_returns"], expected, strict=True
     ):
         assert row["return"] == pytest.approx(expected_return, rel=1e-12, abs=1e-15)
         assert row["equity"] == expected_close
@@ -973,7 +982,7 @@ def test_oracle_calendar_path_agrees_with_the_engine_curve_path(scenario: str) -
     assert "engine_curve_reconciliation" not in calendar.meta.data
     _assert_oracle_series(calendar, window_trades)
     for engine_row, calendar_row in zip(
-        engine.stats["daily_returns"], calendar.stats["daily_returns"]
+        engine.stats["daily_returns"], calendar.stats["daily_returns"], strict=True
     ):
         assert engine_row["date"] == calendar_row["date"]
         assert engine_row["return"] == pytest.approx(calendar_row["return"], abs=1e-15)
@@ -990,7 +999,15 @@ def test_oracle_calendar_path_agrees_with_the_engine_curve_path(scenario: str) -
         for name, result in (("engine", engine), ("calendar", calendar))
     }
     for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value", "total_return"):
-        assert ratios["engine"][key] == pytest.approx(ratios["calendar"][key], abs=1e-9), key
+        engine_value = ratios["engine"].get(key)
+        calendar_value = ratios["calendar"].get(key)
+        if engine_value is None or calendar_value is None:
+            # Weekend filler rows no longer count toward the PSR
+            # observation minimum, so a short window can leave it
+            # undefined on BOTH paths — agreement is what matters.
+            assert engine_value == calendar_value, key
+        else:
+            assert engine_value == pytest.approx(calendar_value, abs=1e-9), key
     assert ratios["engine"]["duplicate_equity_timestamps"] == 0
 
 

@@ -18,6 +18,17 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    env:
+      # The differential real-data slice is downloaded, not committed (see
+      # scripts/fetch_differential_slice.py). Pointing the tests at a cached path
+      # keeps the scenario from depending on the working directory of the step
+      # that reads it. On pull requests REQUIRE_REAL_DATA_SLICE is set on the
+      # test step only when the fetch succeeded, so a Dukascopy outage warns and
+      # skips the real-data scenarios instead of failing the job; on push to
+      # main the fetch step itself fails on a download error, so the slice is
+      # always required there and a permanent outage is noticed. A present
+      # malformed slice still fails inside the tests either way.
+      DIFFERENTIAL_REAL_SLICE_CSV: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,6 +49,7 @@ jobs:
           live_runner/__init__.py
           live_runner/account_discovery.py
           live_runner/ctrader_adapter.py
+          live_runner/pre_submit_caps.py
           scripts/sync_requirements_from_lock.py
           scripts/check_requirements_drift.py
           scripts/matrix_queue_runner.py
@@ -47,8 +59,59 @@ jobs:
       - name: Lint (advisory)
         continue-on-error: true
         run: uv run --no-sync --no-build ruff check .
+      - name: Lint (bug-class families, blocking)
+        if: runner.os == 'Linux'
+        # `ruff check .` above is advisory because main carries an E501 backlog,
+        # so it can never fail on the families this change drove to zero: a new
+        # B/DTZ/PERF/... hit would land inside a green build. This step selects
+        # exactly the families pyproject.toml enabled and pins them at zero.
+        # Keep the list in sync with [tool.ruff.lint].select; the
+        # `tests/test_lint_family_ratchet.py` test asserts the two agree.
+        run: >-
+          uv run --no-sync --no-build ruff check --select
+          B,DTZ,PERF,PLE,PLW0120,PLW0602,PLW1510,RUF005,RUF006,RUF007,RUF012,RUF013,RUF015,RUF019,RUF021,RUF023,RUF036,RUF043,RUF046,RUF059,S307 .
+      - name: Type check (mypy)
+        if: runner.os == 'Linux'
+        # mypy is a dev dependency (`uv sync` installs it) and pinned there to
+        # 2.4.1, so this is the same interpreter the developer gets from
+        # `uv sync --frozen --extra dev && uv run mypy` (AGENTS.md): no --with
+        # overlay, no second copy of the type-checker, and a version bump is one
+        # lock change.
+        run: uv run --no-sync --no-build mypy
+      - name: Restore the differential real-data slice
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache/differential/eurusd_15m_slice.csv
+          # The key hashes the fetch script and the whole data_tools package: the window,
+          # schema and validation (differential_slice.py), the 1m parse (downloaders/),
+          # and the 15m resample rules (resample.py). A change to any of them must
+          # regenerate the slice, not reuse one built under the old rules. A hit means
+          # the download below is skipped entirely, so the network is touched rarely.
+          key: differential-slice-${{ hashFiles('scripts/fetch_differential_slice.py', 'data_tools/**/*.py') }}
+      - name: Fetch the differential real-data slice
+        if: runner.os == 'Linux'
+        id: fetch-slice
+        shell: bash
+        run: |
+          set +e
+          uv run --no-sync --no-build python -m scripts.fetch_differential_slice --skip-if-valid
+          status=$?
+          set -e
+          # Exit 3 is a download failure with no usable cache. On pull requests
+          # (and workflow_dispatch) that warns and skips the real-data tests;
+          # on push to main the slice is required, so the step - and the job -
+          # fails instead.
+          if [ "$status" -eq 3 ] && [ "${{ github.event_name }}" != "push" ]; then
+            echo "::warning::Dukascopy real-data slice download failed; the differential real-data tests will skip."
+            echo "download_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$status"
       - name: Tests
         if: runner.os == 'Linux'
+        env:
+          REQUIRE_REAL_DATA_SLICE: ${{ steps.fetch-slice.outputs.download_failed == 'true' && '0' || '1' }}
         run: >-
           uv run --no-sync --no-build pytest -q -p no:cacheprovider -m "not slow"
           --ignore=tests/strategies
