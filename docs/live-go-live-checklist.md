@@ -15,31 +15,38 @@ reviewed like any other money-path change — never a config flip.
 All of the following are merged. Each must be verified working in the paper
 environment before go-live, not just present in the tree.
 
-- [ ] **Kill switch** — persisted halt on every trading path (#316;
-  runbook "Kill Switch"). Verify set/lift/CLI and that a halt survives a
-  daemon restart.
+- [ ] **Kill switch** — persisted halt on every trading path (#300; PR
+  #316; runbook "Kill Switch"). Verify set/lift/CLI and that a halt
+  survives a daemon restart.
 - [ ] **Loss circuit breaker** — persisted per-scope drawdown latches for
-  entries (#301, #351; runbook "Loss Circuit Breaker"). Verify latch,
+  entries (#301; PR #351; runbook "Loss Circuit Breaker"). Verify latch,
   alert and the documented reset semantics.
 - [ ] **Pre-submit hard caps** — independent caps on quantity, notional
-  and price deviation judged before any order reaches the broker (#329),
-  with the leverage ceiling judged on free margin (#369). Verify a
-  deliberate breach is refused before submission, not after.
+  and price deviation judged before any order reaches the broker (#302;
+  PR #329), with the leverage ceiling judged on free margin (#359; PR
+  #369). Verify a deliberate breach is refused or clamped per cap before
+  submission, not after.
 - [ ] **Broker reconciliation** — periodic comparison of the platform's
-  view against the broker's working book (#330; runbook "Periodic Broker
-  Reconciliation"). Verify mismatches alert and that the documented
-  open-decision items are resolved or accepted.
+  view against the broker's working book (#303; PR #330; runbook
+  "Periodic Broker Reconciliation"). Verify mismatches alert **and** the
+  halt-and-release behaviour: the default of 2 consecutive mismatches
+  halts the account's deployments' entries, and a clean pass releases
+  them. Confirm the documented open-decision items are resolved or
+  accepted.
 - [ ] **Ops alerting** — ERROR-and-above records page a webhook
-  (`OPS_ALERT_*`, #331; runbook "Ops Alert Channel"). Verify an induced
-  error actually arrives.
+  (`OPS_ALERT_*`, #304; PR #331; runbook "Ops Alert Channel"). Verify an
+  induced error actually arrives.
 - [ ] **Backup / restore / rollback** — SQLite live-DB backup, guarded
-  restore and the release/rollback procedure (#333; runbook "Release /
-  rollback"). Verify a restore into a scratch DB once before go-live.
+  restore and the release/rollback procedure (#305; PR #333; runbook
+  "Release / rollback"). Verify a restore into a scratch DB once before
+  go-live.
 - [ ] **Promotion gate** — only promoted `production` code may touch a
   real-money account; paper runs `experimental` (#165; runbook "Strategy
   Promotion Gate"). Its evidence table already requires ≥ 60 days and
-  ≥ 30 trades of paper plus ≤ 2 % parity deviation — section 2 below is
-  the operational evidence on top of that.
+  ≥ 30 trades of paper plus ≤ 2 % parity deviation — at the default
+  thresholds, and no `promotion_thresholds.json` may lower them for this
+  checklist — section 2 below is the operational evidence on top of
+  that.
 
 ## 2. Evidence period
 
@@ -52,13 +59,14 @@ environment before go-live, not just present in the tree.
     stored with the run's evidence), and
   - a **live-vs-backtest drift review**: compare the paper run's fills,
     slippage and PnL against the backtest/promotion evidence on the same
-    window; the review bar is the promotion gate's ≤ 2 % relative
-    deviation on compared metrics. A drift above the bar is a stop, not a
-    talking point.
+    window; the proposed review bar is the promotion gate's ≤ 2 %
+    relative deviation on compared metrics (a proposal pending maintainer
+    sign-off, not a recorded decision). A drift above the bar is a stop,
+    not a talking point.
 - [ ] No unresolved `CRITICAL`/high-severity audit findings on the locked
-  dependency set attributable to the deployed extras (see
-  `docs/dependency-security.md`; the weekly `security-audit` workflow is
-  the standing check).
+  dependency set attributable to the deployed extras (once #389 lands:
+  see `docs/dependency-security.md` and the weekly `security-audit`
+  workflow; until then, check the locked dependency set manually).
 
 ## 3. Staged capital ramp (operator steps, not code)
 
@@ -93,3 +101,6 @@ responsibility, staged as follows:
   maintainer decision (2026-11-23).
 - Automating the daily PnL statement or drift report — today they are
   operator-produced artifacts; automating them is a separate issue.
+- Scope per the #184 maintainer decision (2026-11-23): Alpaca crypto is
+  not traded live, and the Discord-token signal path is out of scope —
+  real-money go-live covers cTrader plus Alpaca equities only.
