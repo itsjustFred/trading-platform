@@ -198,6 +198,10 @@ results stop predicting live behaviour:
   stop is never cancelled in order to move it. The replace and the adapter's order sweeps (STOP
   flatten, cancel of exposure-opening orders, orphan cleanup) are serialised per adapter, so a
   flatten never misses a stop that was replaced under it.
+- Shutdown: an amendment that is already in flight when SIGINT/SIGTERM arrives is drained (30 s)
+  before the daemon's loops are cancelled, so the daemon always learns whether the stop moved; a
+  new amendment is refused once the stop flag is set and retried on the next start (the previous
+  broker-side stop stays in force). See "Stopping the daemon" below.
 - Failure: a refused or failed amendment, a missing or ambiguous stop, or missing market data is
   logged at ERROR (`Live trailing stop could not be updated; ...`, with account, symbol, signal,
   stop order id, current and target stop, consecutive failure count) and sent to Sentry
@@ -931,6 +935,22 @@ the running build does not have yet applies them on startup (see "Commission sig
 (cTrader, #205)"). Roll out as stop, deploy, start: never run an old and a new build side by side.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+## Stopping the daemon
+
+`SIGTERM` (systemd stop, `kill`) and `SIGINT` (Ctrl-C) start a graceful shutdown:
+
+1. No new broker work is accepted. An order submission, a trailing-stop amendment, a STOPPED enforcement sweep or a kill-switch sweep that starts now is refused (a signal is logged and dropped before the broker request; a stop amendment leaves the previous broker-side stop in force and the bars unprocessed; a STOPPED sweep leaves the deployment unenforced and is retried; a kill-switch sweep leaves the halt due and is retried on the next start). A STOPPED enforcement that is already running is one unit: its order cancel, its flatten and the sweep of the protections the flatten detached are drained together, because dropping the later steps would leave the account flat with detached stops still resting. A kill-switch sweep is one unit the same way.
+2. Broker work already in flight is allowed to finish - all four kinds above - before anything is cancelled (default 30 s for the whole drain). None of them is cancelled out from under the broker request *within that 30 s*, so the daemon always knows the outcome of what it sent while the drain held. When the drain times out instead, whatever is still in flight is abandoned and its broker outcome is unknown - that is exactly what the `1` says, and a broker request already handed to a worker thread is not something a cancel can reach.
+3. The daemon then stops itself: its loops, its listeners, the Discord bots, the scheduler, its broker connections and the Twisted reactor's thread pool (default 20 s per phase, seven phases - loop cancel, listener cancel, Discord close, scheduler stop, adapter disconnect, signal-archive close, reactor release).
+4. Exit code `0` on a clean shutdown, `1` if the drain or a cleanup phase timed out or failed. After `1`, the outcome of the broker work that did not finish is unknown: an order submission keeps its lease (reconcile the account before sending new signals), a stop amendment leaves the broker's own state in force, and a STOPPED sweep is retried. A daemon that crashed also exits 1, with its traceback in the log: every exit path, crash included, leaves the process immediately instead of running the interpreter's teardown.
+5. A second signal forces an immediate exit (code `130`) and skips all cleanup. A Ctrl-C that lands before the handlers are installed - during startup - exits `130` too, the same code the interpreter would have reported.
+
+Shutdown itself never cancels or closes open orders or positions at the broker; they are left exactly as they were.
+
+Worst case the bounded shutdown takes 30 s (drain) plus 20 s for each of the 7 cleanup phases, then the daemon's own tail inside `run_daemon`: a bounded join of its worker threads - at most 30 s (`WORKER_JOIN_TIMEOUT_SECONDS`), because a worker still writing keeps the single-instance lock - and a bounded flush of the alert sink - at most 2 s (`SHUTDOWN_FLUSH_SECONDS`). That is 202 s in total before the daemon has even reported (`live_runner.shutdown.WORST_CASE_SHUTDOWN_SECONDS`; `tests/test_shutdown_budget_contract.py` pins that constant, this figure and the generated unit file together). The tail after the daemon has reported is bounded too: `main` closes the loop itself rather than letting `asyncio.run` do it, and waits at most 2 s (`EXIT_PATH_TIMEOUT_SECONDS`) for the tasks it cancelled to unwind. Closing the loop is not the end of it - a task that awaited a broker request in a worker thread honours its cancel and still leaves that thread running, and no deadline can reach it - so `main` then flushes the Sentry queue - at most 2 s (`SENTRY_FLUSH_TIMEOUT_SECONDS`) - and leaves the process with `os._exit`, which skips the interpreter's own teardown: that teardown would join every thread the bounded shutdown could not account for, with no deadline, and the join is what turns a shutdown that already reported its verdict into one the service manager SIGKILLs. So the whole window is 206 s, exit path included. On systemd the stop timeout has to stay above that so the unit is not SIGKILLed mid-shutdown: `scripts/setup_services.sh` generates `trading-daemon.service` with `TimeoutStopSec=240`. A hand-written unit needs the same, because a daemon that is killed before it finishes never reports its exit code - and a `1` is the operator's only signal that a broker outcome needs reconciliation.
+
+On Windows only Ctrl-C/Ctrl-Break (`SIGINT`) can be delivered; `SIGTERM` cannot, so stop the process with Ctrl-C.
 
 ## Indicator Kernel Warm-up (#378)
 
