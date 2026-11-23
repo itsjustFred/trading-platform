@@ -29,7 +29,7 @@ from runner.engines.base import (
     ProgressCallback,
     warn_if_engine_frozen,
 )
-from runner.engines.contract import SIGNAL_EXIT_FILL_NEXT_OPEN
+from runner.engines import contract
 from shared.atomic_io import write_text_atomically
 from shared.models import BacktestResult
 
@@ -52,12 +52,17 @@ def _frozen_signal_exit_fill(config: BacktestConfig) -> BacktestConfig:
     imported result records ``signal_exit_fill`` as unset — "not modelled by
     this platform"). Mirrors the vectorbt/pynecore frozen-engine guards.
     """
-    mode = str(getattr(config, "signal_exit_fill", "close") or "close").lower()
-    if mode == SIGNAL_EXIT_FILL_NEXT_OPEN:
+    # normalize first: a config that bypassed BacktestConfig validation still
+    # fails loudly on the removed "open" mode (issue #153) instead of silently
+    # keeping an unsupported fill.
+    mode = contract.normalize_signal_exit_fill(
+        getattr(config, "signal_exit_fill", "close") or "close"
+    )
+    if mode == contract.SIGNAL_EXIT_FILL_NEXT_OPEN:
         raise ValueError(
             "engine 'lean' does not implement signal_exit_fill='next_open'; "
             "LEAN fills come from LEAN itself — pass signal_exit_fill='close' "
-            "or 'open' explicitly, or run the native engine"
+            "explicitly, or run the native engine"
         )
     return config
 
