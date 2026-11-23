@@ -118,4 +118,3 @@ class TestStrategyRegression:
                 )
                 margin_split_days += 1
         assert margin_split_days <= 3
-
