@@ -1,0 +1,19 @@
+frontend/package.json
+  s_72b81e13fd197a::t_2e890d74d6e6e9 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2231d3511442225757f2647873660d154c385a9b",
+  "prompts": {},
+  "sessions": {
+    "s_72b81e13fd197a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b26fdc3a-6176-466d-9ab1-1ac4055c946c",
+        "model": "unknown"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
