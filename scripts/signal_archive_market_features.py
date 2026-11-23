@@ -62,7 +62,7 @@ from live_runner.signal_archive import (
     market_features_from_frame,
     utcnow_iso,
 )
-from live_runner.signal_sources.execution_timing import _timeframe_seconds
+from live_runner.signal_sources.execution_timing import timeframe_seconds
 from runner.engines.contract import normalize_ohlcv_frame, select_ohlcv_path
 from shared.atomic_io import write_text_atomically
 from shared.constants import DATA_DIR, normalize_timeframe
@@ -186,7 +186,7 @@ def _frame_for_signal(
     data_source: str = "",
 ) -> tuple[pd.DataFrame | None, Path | None, str | None]:
     """The lookback window of bars closed at signal time, or a skip reason."""
-    bar_seconds = _timeframe_seconds(timeframe)
+    bar_seconds = timeframe_seconds(timeframe)
     if bar_seconds is None:
         return None, None, "unknown_timeframe"
     path, _candidates = select_ohlcv_path(data_root, symbol, timeframe, data_source=data_source)
@@ -200,8 +200,17 @@ def _frame_for_signal(
             extra={"data": {"path": str(path), "error": str(exc)}},
         )
         return None, path, "ohlcv_unreadable"
-    frame = normalize_ohlcv_frame(frame)
-    closed = _closed_bars(frame, signal_time, bar_seconds)
+    try:
+        frame = normalize_ohlcv_frame(frame)
+        closed = _closed_bars(frame, signal_time, bar_seconds)
+    except Exception as exc:  # except-kind: loop-survival
+        # One malformed feed must not abort the whole archive pass; the
+        # signal gets a skip record like every other per-signal failure.
+        logger.warning(
+            "OHLCV frame unusable; signal skipped",
+            extra={"data": {"path": str(path), "error": str(exc)}},
+        )
+        return None, path, "features_failed"
     if closed.empty:
         return None, path, "no_closed_bars"
     window = closed.tail(max(1, int(lookback_bars)))
@@ -267,10 +276,42 @@ def enrich_record(
         out["skip_reason"] = skip_reason or "no_frame"
         return out
     out["bars_used"] = len(frame)
-    out["features"] = market_features_from_frame(frame)
+    try:
+        out["features"] = market_features_from_frame(frame)
+    except Exception as exc:  # except-kind: loop-survival
+        # market_features_from_frame is total by contract; guard anyway so a
+        # regression there costs one skip record, not the whole run.
+        logger.warning(
+            "Market feature computation raised; signal skipped",
+            extra={"data": {"error": str(exc)}},
+        )
+        out["skip_reason"] = "features_failed"
+        return out
     if not out["features"]:
         out["skip_reason"] = "no_features"
     return out
+
+
+def _dedupe_key(record: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    """Dedupe identity of a record, or ``None`` when it is never deduped.
+
+    Only ``discord_signal_received`` records dedupe: a restart can re-archive
+    the same message, and one message can also be *received* by two bot
+    listeners running different parsers, so the key carries the listener
+    identity (``bot_name``/``account_id``) next to the message id. Every
+    other record type - ``discord_signal_decision`` shares the received
+    record's ``discord_message_id`` - always produces its own sidecar record.
+    """
+    if record.get("type") != "discord_signal_received":
+        return None
+    message_id = str(record.get("discord_message_id") or "")
+    if not message_id:
+        return None
+    return (
+        message_id,
+        str(record.get("bot_name") or ""),
+        str(record.get("account_id") or ""),
+    )
 
 
 def process_archive_file(
@@ -280,22 +321,22 @@ def process_archive_file(
     data_root: Path,
     lookback_bars: int = DEFAULT_LOOKBACK_BARS,
     data_source: str = "",
-    seen_message_ids: set[str] | None = None,
+    seen_keys: set[tuple[str, str, str]] | None = None,
 ) -> dict[str, int]:
     """Enrich one archive day file into its features sidecar. Returns counts."""
     counts = {"records": 0, "features": 0, "skipped": 0, "duplicates": 0}
     lines: list[str] = []
-    seen = seen_message_ids if seen_message_ids is not None else set()
+    seen = seen_keys if seen_keys is not None else set()
     for record in _iter_records(input_path):
         counts["records"] += 1
-        message_id = str(record.get("discord_message_id") or "")
-        if message_id and message_id in seen:
-            # A restart can re-archive the same message; the sidecar is
-            # keyed on the id, so the first occurrence wins.
-            counts["duplicates"] += 1
-            continue
-        if message_id:
-            seen.add(message_id)
+        key = _dedupe_key(record)
+        if key is not None:
+            if key in seen:
+                # A restart can re-archive the same message; the sidecar is
+                # keyed on the id, so the first occurrence wins.
+                counts["duplicates"] += 1
+                continue
+            seen.add(key)
         enriched = enrich_record(
             record,
             data_root=data_root,
@@ -374,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     totals = {"records": 0, "features": 0, "skipped": 0, "duplicates": 0, "files": 0}
-    seen_message_ids: set[str] = set()
+    seen_keys: set[tuple[str, str, str]] = set()
     for input_path in files:
         counts = process_archive_file(
             input_path,
@@ -382,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
             data_root=data_root,
             lookback_bars=args.lookback_bars,
             data_source=args.data_source,
-            seen_message_ids=seen_message_ids,
+            seen_keys=seen_keys,
         )
         totals["files"] += 1
         for key in ("records", "features", "skipped", "duplicates"):

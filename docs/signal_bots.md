@@ -540,7 +540,8 @@ Sidecar-Datei `signal_log/features/discord_signal_features-<tag>.jsonl`
 Append-only-Archiv wird nie angefasst). Jeder Sidecar-Record trägt
 `discord_message_id`, `message_created_at`, Symbol, Timeframe,
 OHLCV-Pfad, `bars_used`, `features` und bei Ausfall einen `skip_reason`
-(`no_ohlcv`, `no_timeframe`, `unknown_timeframe`, `no_closed_bars`, …),
+(`no_ohlcv`, `no_timeframe`, `unknown_timeframe`, `no_closed_bars`,
+`features_failed`, …),
 damit die Coverage gegen das Archiv prüfbar bleibt. Es werden nur
 **abgeschlossene** Balken verwendet (`bar_open + timeframe <=
 message_created_at`) — der noch laufende Balken zum Signalzeitpunkt
