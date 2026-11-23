@@ -688,6 +688,10 @@ export interface LiveDeploymentConfig {
    * fact about exposure, so the UI must not present this deployment as stopped.
    */
   exposure_may_be_open?: boolean;
+  /** Broker reconciliation is refusing new entries while exits continue. */
+  entries_halted?: boolean;
+  entries_halted_at?: string | null;
+  entries_halted_by?: string | null;
   signal_source_type?: LiveSignalSource;
   signal_source_id?: string | null;
   symbol_filter?: string[];
@@ -796,6 +800,23 @@ export interface LiveTradeSlippage {
   actual_price_observed?: string | null;
   slippage: number | null;
   slippage_bps: number | null;
+  /** #134 slippage decomposition; each is null when its inputs are missing. */
+  signal_delay_bps?: number | null;
+  execution_slippage_bps?: number | null;
+  spread_bps?: number | null;
+  /** true: the signal carried no usable quote snapshot - metrics are null, not zero. */
+  quote_snapshot_missing?: boolean;
+  quote_bid?: number | null;
+  quote_ask?: number | null;
+  quote_price?: number | null;
+  quote_time?: string | null;
+  quote_source?: string | null;
+  order_type?: string | null;
+  requested_qty?: number | null;
+  producer_at?: string | null;
+  message_received_at?: string | null;
+  order_submitted_at?: string | null;
+  broker_ack_at?: string | null;
   filled_qty: number;
   /** null: the fee is not known yet (Alpaca posts crypto fees end of day); not a zero fee. */
   commission: number | null;

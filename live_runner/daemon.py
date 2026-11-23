@@ -38,15 +38,23 @@ from live_runner.account_routing import (
 from live_runner.alpaca_adapter import AlpacaLiveAdapter, resolve_alpaca_credentials
 from live_runner.base_adapter import (
     EXIT_ONLY_RISK_SIZING_MODE,
+    LIVE_QUOTE_FUTURE_SKEW_SECONDS,
+    QUOTE_TIME_RULE_IN_FUTURE,
+    QUOTE_TIME_RULE_INVALID,
+    QUOTE_TIME_RULE_MISSING,
+    QUOTE_TIME_RULE_STALE,
     BaseLiveAdapter,
     LivePipValue,
     LiveQuote,
     coerce_positive_live_qty,
     is_order_not_submitted,
     is_unbounded_tp,
+    live_quote_time_rule,
+    order_not_submitted,
     validate_live_quote_prices,
 )
 from live_runner.broker_order_conflicts import enforce_broker_order_conflict_halts
+from live_runner.broker_reconciliation import run_broker_reconciliation_loop
 from live_runner.credential_env import (
     accounts_env_mtime,
     discord_bot_env_canonical_name,
@@ -79,6 +87,13 @@ from live_runner.exit_signals import (
     resolve_exit_order,
     usable_qty_tolerance,
 )
+from live_runner.internal_strategy_runner import (
+    SUBMIT_OUTCOME_IGNORED,
+    SUBMIT_OUTCOME_REFUSED,
+    SUBMIT_OUTCOME_SUBMITTED,
+    SUBMIT_OUTCOME_UNKNOWN,
+    run_internal_strategy_loop,
+)
 from live_runner.kill_switch import (
     PENDING_CANCEL_ESCALATION_PASSES,
     KillSwitchMode,
@@ -98,6 +113,7 @@ from live_runner.loss_breaker import (
     refuse_entry_if_loss_breaker_tripped,
     set_accounts_env_file,
 )
+from live_runner.pre_submit_caps import enforce_pre_submit_caps
 from live_runner.promotion import (
     deployment_signal_processor_name,
     enforce_promotion_gate,
@@ -149,6 +165,7 @@ from shared.database import (
     get_account_net_filled_qty_by_deployment,
     get_live_account,
     get_live_deployment,
+    get_live_signal_metadata,
     get_service,
     list_account_unfilled_exit_orders,
     list_live_accounts,
@@ -157,10 +174,12 @@ from shared.database import (
     list_services,
     list_stopped_enforced_deployment_ids,
     live_db_path,
+    live_deployment_entries_halted,
     mark_live_deployment_stopped_enforced,
     release_live_deployment_submission,
     renew_live_deployment_submission,
     save_live_balance,
+    save_live_signal_rejection,
     update_service_status,
 )
 from shared.fill_keys import canonical_utc_timestamp
@@ -990,6 +1009,7 @@ def _apply_signal_processor(
         take_profit=processed.take_profit,
         timeframe=processed.timeframe or signal.timeframe,
         metadata=metadata,
+        received_at_local=getattr(signal, "received_at_local", None),
     )
 
 
@@ -1089,8 +1109,11 @@ def size_live_signal_for_submission(
 #: :func:`risk.live.entry_gate_settings` (#125).
 
 #: How far a quote time may lie in the future before it is treated as a clock
-#: or feed fault rather than skew between our clock and the broker's.
-ENTRY_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+#: or feed fault rather than skew between our clock and the broker's. The rule
+#: itself lives in :func:`live_runner.base_adapter.live_quote_time_rule` so the
+#: entry gate, the pip-value conversion check and the pre-submit caps (#302)
+#: share one implementation.
+ENTRY_QUOTE_FUTURE_SKEW_SECONDS = LIVE_QUOTE_FUTURE_SKEW_SECONDS
 
 
 def _utc_now() -> datetime:
@@ -1126,14 +1149,25 @@ _ENTRY_QUOTE_METADATA_KEYS = (
 #: the market is, so no price rule may be judged on it. The crossed-level rules
 #: come next: they name the more specific problem when the quote has also moved
 #: further than the deviation limit.
-ENTRY_GATE_RULE_QUOTE_TIME_MISSING = "quote_time_missing"
-ENTRY_GATE_RULE_QUOTE_TIME_INVALID = "quote_time_invalid"
-ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE = "quote_time_in_future"
-ENTRY_GATE_RULE_QUOTE_STALE = "quote_stale"
+ENTRY_GATE_RULE_QUOTE_TIME_MISSING = QUOTE_TIME_RULE_MISSING
+ENTRY_GATE_RULE_QUOTE_TIME_INVALID = QUOTE_TIME_RULE_INVALID
+ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE = QUOTE_TIME_RULE_IN_FUTURE
+ENTRY_GATE_RULE_QUOTE_STALE = QUOTE_TIME_RULE_STALE
 ENTRY_GATE_RULE_AT_STOP_LOSS = "quote_at_or_beyond_stop_loss"
 ENTRY_GATE_RULE_AT_TAKE_PROFIT = "quote_at_or_beyond_take_profit"
 ENTRY_GATE_RULE_TOWARD_STOP_LOSS = "deviation_toward_stop_loss"
 ENTRY_GATE_RULE_AWAY_FROM_STOP_LOSS = "deviation_away_from_stop_loss"
+
+#: Attribute carrying the gate's quote/deviation record on a rejection
+#: exception (#134), so the refusal can be persisted with the snapshot it was
+#: judged against. Same marker pattern as ``order_not_submitted``.
+_ENTRY_GATE_RECORD_ATTR = "_entry_gate_record"
+
+
+def _entry_gate_record(exc: BaseException) -> dict[str, object] | None:
+    """The quote record a gate rejection carries, if it carries one."""
+    record = getattr(exc, _ENTRY_GATE_RECORD_ATTR, None)
+    return record if isinstance(record, dict) else None
 
 
 def _entry_gate_rejection_rule(
@@ -1169,18 +1203,10 @@ def _quote_time_rule(
 
     Fails closed: a missing time, anything but a timezone-aware datetime, a
     time beyond the clock-skew allowance in the future, or a quote older than
-    the limit all reject.
+    the limit all reject. The rule itself is shared with the pre-submit caps
+    in :func:`live_runner.base_adapter.live_quote_time_rule`.
     """
-    if timestamp is None:
-        return ENTRY_GATE_RULE_QUOTE_TIME_MISSING, None
-    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
-        return ENTRY_GATE_RULE_QUOTE_TIME_INVALID, None
-    age = (now - timestamp).total_seconds()
-    if -age > ENTRY_QUOTE_FUTURE_SKEW_SECONDS:
-        return ENTRY_GATE_RULE_QUOTE_TIME_IN_FUTURE, age
-    if age > max_age_seconds:
-        return ENTRY_GATE_RULE_QUOTE_STALE, age
-    return None, age
+    return live_quote_time_rule(timestamp, now=now, max_age_seconds=max_age_seconds)
 
 
 def _validated_quote_prices(quote: object, *, symbol: str) -> tuple[float, float]:
@@ -1320,7 +1346,7 @@ async def _check_entry_deviation(
             "Live entry deviation gate rejected the signal",
             extra={"data": {**log_data, **record}},
         )
-        raise ValueError(
+        error = ValueError(
             f"Refusing live entry for {signal.symbol}: entry deviation gate rejected "
             f"({rule}): signed deviation {deviation:.4f} of the SL distance "
             f"(positive = toward the stop), limit +/-{max_fraction}; quote time "
@@ -1328,6 +1354,11 @@ async def _check_entry_deviation(
             f"(entry={entry_price}, stop={stop_loss}, take_profit={take_profit}, "
             f"{side}={quote_price})."
         )
+        # #134: the refusal is persisted with this record, so the quote the
+        # signal was judged against survives the rejection instead of living
+        # only in this log line.
+        setattr(error, _ENTRY_GATE_RECORD_ATTR, record)
+        raise error
     return record
 
 
@@ -2055,6 +2086,15 @@ async def _resolve_account_balance(
     return account_balance
 
 
+#: Metadata keys an ENTRY order must never carry to the adapter: the raw
+#: broker-unit overrides (the risk-sized ``qty`` is binding, #79) and the
+#: exit-only markers (payload-controlled, and the adapters key on them to
+#: build a reduce-only order without SL/TP legs).
+_ENTRY_STRIPPED_METADATA_KEYS = frozenset(
+    {"volume", "ctrader_volume", "exit_only", "risk_sizing_mode"}
+)
+
+
 async def prepare_order_with_risk(
     adapter: BaseLiveAdapter,
     deployment: LiveDeploymentConfig,
@@ -2380,10 +2420,15 @@ async def prepare_order_with_risk(
     preserved_metadata = {
         key: value for key, value in metadata.items() if key not in sizing_keys
     }
+    # An entry never carries the exit markers to the adapter: a payload
+    # ``exit_only``/``risk_sizing_mode`` would flip it to a reduce-only order
+    # without SL/TP legs (and would have skipped the pre-submit caps). Real
+    # exits return early via ``prepare_exit_intent_order``, which stamps the
+    # markers itself.
     final_metadata = {
         key: value
         for key, value in {**sized_metadata, **preserved_metadata}.items()
-        if key not in {"volume", "ctrader_volume"}
+        if key not in _ENTRY_STRIPPED_METADATA_KEYS
     }
     # The gate's and the pip value's figures are written last: a payload value
     # under one of these keys can neither shadow nor survive them.
@@ -2425,6 +2470,17 @@ async def submit_order_with_risk(
             deployment.account_id,
             deployment_id=str(deployment.id),
             symbol=signal.symbol,
+        )
+    # #302: the last check before the broker sees the order, independent of
+    # the sizing code that produced it. Inside order_not_submitted so a
+    # refusal is provably pre-request.
+    with order_not_submitted():
+        prepared_qty = await enforce_pre_submit_caps(
+            adapter,
+            deployment,
+            prepared_signal,
+            qty=prepared_qty,
+            risk_config=_risk_config_for_deployment(deployment),
         )
     return await adapter.submit_order(prepared_signal, qty=prepared_qty)
 
@@ -2493,6 +2549,18 @@ def _trade_signal_to_live_signal(
         metadata["take_profit"] = float(signal.take_profit)
     metadata["timeframe"] = signal.timeframe
     metadata["source"] = str(metadata.get("source") or "discord")
+    # #134: the submit/ack stamps are written by the broker path after the
+    # order returns - a payload value under these names must never survive to
+    # persistence. ``received_at_local`` is the local receipt stamp: the
+    # Discord source stamps it at parse time and the daemon carries it on the
+    # signal through the candle-close wait; any other producer could smuggle
+    # an arbitrary metadata value, so payload is never trusted here.
+    metadata.pop("order_submitted_at", None)
+    metadata.pop("broker_ack_at", None)
+    metadata["received_at_local"] = (
+        getattr(signal, "received_at_local", None)
+        or datetime.now(timezone.utc).isoformat()
+    )
     _mint_signal_idempotency_key(signal, deployment, metadata)
     if is_exit_intent(metadata):
         # A parsed exit is reduce-only whatever the deployment allows: on a
@@ -2952,6 +3020,13 @@ async def _prepare_discord_signal_for_submission(
         take_profit=trade_signal.take_profit,
         timeframe=signal_timeframe,
         metadata={**trade_signal.metadata, "wait_for_candle_close": wait_enabled},
+        # Receipt is stamped at the daemon's first contact with the signal -
+        # before the candle-close wait - and carried on the signal, not in
+        # payload metadata, so a producer cannot smuggle an analytics stamp.
+        received_at_local=(
+            getattr(trade_signal, "received_at_local", None)
+            or datetime.now(timezone.utc).isoformat()
+        ),
     )
     try:
         # Fail closed on an already-stale signal BEFORE the candle-close wait:
@@ -3104,6 +3179,24 @@ async def _submit_normalized_discord_signal(
             return
 
         is_exit = _signal_is_exit(live_signal.action, live_signal.metadata, deployment)
+        if not is_exit and await asyncio.to_thread(
+            live_deployment_entries_halted, str(deployment.id)
+        ):
+            # Entry-only halt (#303): broker reconciliation froze new entries on
+            # this deployment but exits must keep flowing, so the check sits
+            # after the exit classification and reads the flag fresh from the DB.
+            logger.warning(
+                "Skipping entry signal: deployment entries are halted by broker reconciliation",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": live_signal.symbol,
+                    }
+                },
+            )
+            decision.refused("entries_halted")
+            return
         if is_exit:
             # Exits of every deployment on this account and symbol go one after the
             # other, from sizing to the persisted order (see ``_exit_lock``).
@@ -3137,6 +3230,140 @@ async def _submit_normalized_discord_signal(
         raise
 
 
+async def _submit_internal_strategy_signal(
+    adapter: BaseLiveAdapter,
+    deployment: LiveDeploymentConfig,
+    trade_signal: TradeSignal,
+) -> str:
+    """Route one internally generated strategy signal through the shared chokepoint.
+
+    The signal was produced by ``internal_strategy_runner`` on a closed bar;
+    conversion, sizing, the submission claim and adapter persistence are the
+    same path Discord signals take. The only internal-specific gate is the
+    short-side check: ``_trade_signal_to_live_signal`` would otherwise turn a
+    SHORT entry on a long-only deployment into a full exit, which is the
+    opposite of what the strategy asked for — skip it instead.
+
+    Returns the chokepoint's ``SUBMIT_OUTCOME_*`` so the runner can count
+    refusals toward its escalation; its own pre-chokepoint skips report
+    ``refused``.
+    """
+    account_id = str(deployment.account_id)
+    direction = str(
+        (trade_signal.metadata or {}).get("internal_direction") or ""
+    ).upper()
+    if direction == "SHORT" and not is_exit_order(
+        trade_signal.action, trade_signal.metadata
+    ):
+        try:
+            allows_short = _deployment_allows_short(deployment)
+        except ValueError:
+            logger.exception(
+                "Invalid deployment boolean config; skipping internal signal",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                    }
+                },
+            )
+            return SUBMIT_OUTCOME_REFUSED
+        if not allows_short:
+            logger.warning(
+                "Internal strategy SHORT entry skipped: deployment does not allow shorts",
+                extra={
+                    "data": {
+                        "account_id": account_id,
+                        "deployment_id": str(deployment.id),
+                        "symbol": trade_signal.symbol,
+                    }
+                },
+            )
+            return SUBMIT_OUTCOME_REFUSED
+    try:
+        live_signal = _trade_signal_to_live_signal(trade_signal, deployment)
+    except ValueError:
+        logger.exception(
+            "Internal strategy signal failed conversion; skipping",
+            extra={
+                "data": {
+                    "account_id": account_id,
+                    "deployment_id": str(deployment.id),
+                    "symbol": trade_signal.symbol,
+                }
+            },
+        )
+        return SUBMIT_OUTCOME_REFUSED
+
+    is_exit = is_exit_order(live_signal.action, live_signal.metadata)
+    if is_exit:
+        async with _exit_lock(account_id, live_signal.symbol):
+            return await _prepare_claim_and_submit_signal(
+                account_id, adapter, deployment, trade_signal, live_signal, is_exit=True
+            )
+    return await _prepare_claim_and_submit_signal(
+        account_id, adapter, deployment, trade_signal, live_signal, is_exit=False
+    )
+
+
+async def _persist_submission_rejection(
+    deployment: LiveDeploymentConfig,
+    live_signal: LiveSignal,
+    *,
+    stage: str,
+    exc: BaseException,
+) -> None:
+    """Best-effort record of a signal refused before broker submission (#134).
+
+    Rejections are part of the cost picture: the quote snapshot and timing a
+    refused signal carried must not die with the log line. A gate rejection
+    contributes its quote record via ``_entry_gate_record``.
+
+    Never raises and never changes the refusal: a bookkeeping failure is
+    logged and the refusal stands. When the adapter already persisted a
+    ``live_signals`` row for this signal (a refusal after ``save_live_signal``),
+    that row IS the record - its NULL submit/ack stamps flag the non-submission
+    - so no second row is written.
+    """
+    try:
+        # Bounded: this runs on the refusal path, possibly inside the
+        # per-symbol exit lock, so a contended database must not delay the
+        # operator-visible log or the fan-out to sibling deployments. The two
+        # lookups share one deadline (wait_for bounds the await, not the
+        # worker thread - a stuck DB call still finishes in the background).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        existing = await asyncio.wait_for(
+            asyncio.to_thread(get_live_signal_metadata, str(live_signal.id)),
+            timeout=max(0.0, deadline - loop.time()),
+        )
+        if existing is not None:
+            return
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                save_live_signal_rejection,
+                live_signal,
+                stage=stage,
+                reason=str(exc),
+                extra_metadata=_entry_gate_record(exc),
+            ),
+            timeout=max(0.0, deadline - loop.time()),
+        )
+    except Exception:  # except-kind: loop-survival
+        logger.warning(
+            "Could not persist live signal rejection",
+            extra={
+                "data": {
+                    "deployment_id": str(deployment.id),
+                    "symbol": live_signal.symbol,
+                    "stage": stage,
+                }
+            },
+            exc_info=True,
+        )
+
+
 async def _prepare_claim_and_submit_signal(
     account_id: str,
     adapter: BaseLiveAdapter,
@@ -3146,7 +3373,23 @@ async def _prepare_claim_and_submit_signal(
     *,
     is_exit: bool,
     decision: SignalDecisionRecorder | None = None,
-) -> None:
+) -> str:
+    """Prepare, claim and submit one signal; report the outcome.
+
+    Returns one of the ``SUBMIT_OUTCOME_*`` constants: ``submitted`` reached
+    the broker, ``ignored`` was a deliberate no-op, ``refused`` was rejected
+    before the broker saw anything, ``unknown`` means the broker may have the
+    order. Callers that only fan out (Discord) ignore the value; the internal
+    strategy runner counts non-clean outcomes toward its escalation.
+    """
+    # This chokepoint serves Discord and internal-strategy signals alike;
+    # refusal logs name the actual metadata source, not a hardcoded "Discord".
+    _metadata = getattr(live_signal, "metadata", None) or {}
+    source_label = (
+        "Internal strategy"
+        if str(_metadata.get("source") or "").strip().lower() == "internal"
+        else "Discord"
+    )
     # Prepare before claiming. Sizing and the fail-closed SL/TP validation run
     # here, and every failure in them happens before an order can reach the
     # broker. Claiming first (as this used to) held the lease for the whole TTL
@@ -3174,12 +3417,15 @@ async def _prepare_claim_and_submit_signal(
         )
         if decision is not None:
             decision.ignored("nothing_to_exit", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_IGNORED
     except ExitBelowStepError as exc:
         _log_exit_below_step(account_id, deployment, live_signal.symbol, exc)
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
         if decision is not None:
             decision.ignored("exit_below_step", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_IGNORED
     except ExitInFlightError as exc:
         # An error, not a skipped signal: nothing was sent and this deployment's
         # position stays open (a later exit signal is sized once the earlier
@@ -3198,9 +3444,12 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare_exit", exc=exc
+        )
         if decision is not None:
             decision.refused("exit_in_flight", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_REFUSED
     except LiveHaltError as exc:
         # The kill switch (#300) refused this entry. Nothing was sent, which is
         # the halt working; reported as its own reason rather than as a generic
@@ -3219,7 +3468,10 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
-        return
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+        return SUBMIT_OUTCOME_REFUSED
     except LossBreakerBreachError as exc:
         # The loss circuit breaker (#301) refused this entry. Nothing was sent,
         # which is the breaker working; reported distinctly so an operator sees
@@ -3239,7 +3491,10 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
-        return
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
+        return SUBMIT_OUTCOME_REFUSED
     except Exception as exc:  # except-kind: money-decision
         if is_exit:
             # A refused exit leaves this deployment's position open: an operator
@@ -3257,11 +3512,14 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
+            await _persist_submission_rejection(
+                deployment, live_signal, stage="prepare_exit", exc=exc
+            )
             if decision is not None:
                 decision.refused("exit_pre_submission_error", detail=str(exc))
-            return
+            return SUBMIT_OUTCOME_REFUSED
         logger.warning(
-            "Discord signal refused before submission; nothing was sent to the broker",
+            f"{source_label} signal refused before submission; nothing was sent to the broker",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -3271,9 +3529,12 @@ async def _prepare_claim_and_submit_signal(
                 }
             },
         )
+        await _persist_submission_rejection(
+            deployment, live_signal, stage="prepare", exc=exc
+        )
         if decision is not None:
             decision.refused("pre_submission_error", detail=str(exc))
-        return
+        return SUBMIT_OUTCOME_REFUSED
 
     # Kill switch (#300), read again at the last moment before the broker sees
     # anything. The gate in `prepare_order_with_risk` ran before the broker
@@ -3304,12 +3565,16 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
-            return
+            await _persist_submission_rejection(
+                deployment, live_signal, stage="prepare", exc=exc
+            )
+            return SUBMIT_OUTCOME_REFUSED
 
     # Atomic submission claim. The status re-checks above ran against a
     # snapshot; between them and the broker call an operator can pause the
-    # deployment. The claim turns "still dispatchable" into a single atomic database
-    # fact taken immediately before submission, so a PAUSE either wins the race
+    # deployment, and the reconciler can halt entries. The claim turns "still
+    # dispatchable and not entries-halted" into a single atomic database fact
+    # taken immediately before submission, so either gate either wins the race
     # (the claim fails and nothing is sent) or is already in effect while this
     # dispatcher finishes the order it had already claimed. For an exit the claim
     # also passes a PAUSED row, because a pause does not forbid closing what is
@@ -3320,10 +3585,12 @@ async def _prepare_claim_and_submit_signal(
         str(deployment.id),
         claim_token,
         allow_paused=is_exit,
+        refuse_entries_halt=not is_exit,
     )
     if not claimed:
         logger.info(
-            "Skipping discord signal: deployment no longer ACTIVE at submission claim",
+            f"Skipping {source_label.lower()} signal: deployment no longer "
+            "ACTIVE at submission claim",
             extra={
                 "data": {
                     "account_id": account_id,
@@ -3335,7 +3602,7 @@ async def _prepare_claim_and_submit_signal(
         )
         if decision is not None:
             decision.refused("submission_claim_failed")
-        return
+        return SUBMIT_OUTCOME_REFUSED
 
     # The claim itself awaited the database, so a halt written while it ran is
     # still unseen by the gate above. Read the halt one last time now that the
@@ -3372,7 +3639,10 @@ async def _prepare_claim_and_submit_signal(
                     }
                 },
             )
-            return
+            await _persist_submission_rejection(
+                deployment, live_signal, stage="prepare", exc=exc
+            )
+            return SUBMIT_OUTCOME_REFUSED
 
     renew_task = asyncio.create_task(
         _renew_submission_claim_until_cancelled(claim_token),
@@ -3380,6 +3650,18 @@ async def _prepare_claim_and_submit_signal(
     )
     try:
         try:
+            # #302: the last check before the broker sees the order,
+            # independent of the sizing code that produced it. Inside
+            # order_not_submitted so a refusal is provably pre-request and
+            # the submission lease is released below.
+            with order_not_submitted():
+                prepared_qty = await enforce_pre_submit_caps(
+                    adapter,
+                    deployment,
+                    prepared_signal,
+                    qty=prepared_qty,
+                    risk_config=_risk_config_for_deployment(deployment),
+                )
             broker_order_id = await adapter.submit_order(
                 prepared_signal, qty=prepared_qty
             )
@@ -3403,9 +3685,12 @@ async def _prepare_claim_and_submit_signal(
                     _log_exit_below_step(
                         account_id, deployment, prepared_signal.symbol, exc
                     )
+                    await _persist_submission_rejection(
+                        deployment, prepared_signal, stage="submit_exit", exc=exc
+                    )
                     if decision is not None:
                         decision.ignored("exit_below_step", detail=str(exc))
-                    return
+                    return SUBMIT_OUTCOME_IGNORED
                 # A refused exit leaves the position open (#121): error, so an
                 # operator sees it. A refused entry opened nothing: warning.
                 log = logger.error if is_exit else logger.warning
@@ -3428,6 +3713,12 @@ async def _prepare_claim_and_submit_signal(
                         }
                     },
                 )
+                await _persist_submission_rejection(
+                    deployment,
+                    prepared_signal,
+                    stage="submit_exit" if is_exit else "submit",
+                    exc=exc,
+                )
                 if decision is not None:
                     decision.refused(
                         "broker_refused_pre_request"
@@ -3435,7 +3726,7 @@ async def _prepare_claim_and_submit_signal(
                         else "exit_refused_pre_request",
                         detail=str(exc),
                     )
-                return
+                return SUBMIT_OUTCOME_REFUSED
             # **Do not release the lease.** The broker may have accepted the
             # order and only the response was lost; releasing would let the next
             # signal submit a duplicate before anyone reconciled. The lease is
@@ -3460,7 +3751,7 @@ async def _prepare_claim_and_submit_signal(
                 decision.unknown(
                     "broker_submit_outcome_unknown", detail=str(exc)
                 )
-            return
+            return SUBMIT_OUTCOME_UNKNOWN
     finally:
         renew_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -3477,7 +3768,7 @@ async def _prepare_claim_and_submit_signal(
             extra={"data": {"deployment_id": str(deployment.id)}},
         )
     logger.info(
-        "Discord signal submitted",
+        f"{source_label} signal submitted",
         extra={
             "data": {
                 "account_id": account_id,
@@ -3497,6 +3788,7 @@ async def _prepare_claim_and_submit_signal(
                 str(broker_order_id) if broker_order_id is not None else None
             ),
         )
+    return SUBMIT_OUTCOME_SUBMITTED
 
 
 def _deployment_accepts_signal_author(
@@ -6023,6 +6315,7 @@ async def sync_deployments_loop(
     accounts_env: Path | str | None = None,
     interval_seconds: int = DEPLOYMENT_POLL_INTERVAL_SECONDS,
     deployment_snapshot: list[LiveDeploymentConfig] | None = None,
+    first_sync_complete: asyncio.Event | None = None,
 ) -> None:
     accounts_env = _accounts_env_file(accounts_env)
     known_deployment_statuses: dict[str, str] = {}
@@ -6185,6 +6478,11 @@ async def sync_deployments_loop(
                 deployments_by_account,
                 accounts_env_values=accounts_env_values,
             )
+            if first_sync_complete is not None:
+                # The snapshot and adapters now reflect the DB: background
+                # loops gated on this event (broker reconciliation, #303) may
+                # take their first real pass.
+                first_sync_complete.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # except-kind: loop-survival
@@ -6318,6 +6616,7 @@ async def _run_daemon_locked(
         await scheduler.start()
 
         deployment_snapshot: list[LiveDeploymentConfig] = []
+        first_sync_complete = asyncio.Event()
         sync_task = asyncio.create_task(
             sync_deployments_loop(
                 active_adapters,
@@ -6325,6 +6624,7 @@ async def _run_daemon_locked(
                 active_discord_tasks,
                 accounts_env=accounts_env,
                 deployment_snapshot=deployment_snapshot,
+                first_sync_complete=first_sync_complete,
             ),
             name="deployment-sync-loop",
         )
@@ -6351,6 +6651,24 @@ async def _run_daemon_locked(
         commission_task = asyncio.create_task(
             _backfill_commissions_loop(active_adapters), name="commission-backfill"
         )
+        reconciliation_task = asyncio.create_task(
+            run_broker_reconciliation_loop(
+                active_adapters,
+                current_deployments=lambda: list(deployment_snapshot),
+                deployments_ready=first_sync_complete,
+            ),
+            name="broker-reconciliation",
+        )
+        internal_strategy_task = asyncio.create_task(
+            run_internal_strategy_loop(
+                current_deployments=lambda: list(deployment_snapshot),
+                eligible_adapters=lambda: _trailing_eligible_adapters(
+                    active_adapters
+                ),
+                submit_signal=_submit_internal_strategy_signal,
+            ),
+            name="internal-strategy-loop",
+        )
     except Exception:  # except-kind: money-decision
         # A startup failure (broken DB, bad config) propagates out of
         # asyncio.run as a traceback, not an ERROR record — log one here so
@@ -6359,7 +6677,13 @@ async def _run_daemon_locked(
         raise
     try:
         await asyncio.gather(
-            sync_task, service_sync_task, balance_task, trailing_task, commission_task
+            sync_task,
+            service_sync_task,
+            balance_task,
+            trailing_task,
+            commission_task,
+            reconciliation_task,
+            internal_strategy_task,
         )
     except asyncio.CancelledError:
         logger.info("Live daemon cancelled")
@@ -6383,6 +6707,8 @@ async def _run_daemon_locked(
             balance_task,
             trailing_task,
             commission_task,
+            reconciliation_task,
+            internal_strategy_task,
         ):
             if not task.done():
                 task.cancel()
@@ -6393,6 +6719,8 @@ async def _run_daemon_locked(
                 balance_task,
                 trailing_task,
                 commission_task,
+                reconciliation_task,
+                internal_strategy_task,
                 return_exceptions=True,
             )
         for task in list(active_listener_tasks.values()):

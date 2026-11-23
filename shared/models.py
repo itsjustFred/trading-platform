@@ -488,6 +488,16 @@ class LiveExecution(BaseModel):
     # which is different from a verdict of `observed`. Both cTrader and Alpaca (#124) classify.
     actual_price_observed: str | None = None
 
+    # Order context for the slippage decomposition (#134). `order_type` is the
+    # broker's own type label for the order this fill belongs to (e.g.
+    # "market", "MARKET", "LIMIT"); `requested_qty` is the quantity the order
+    # asked for, in the same qty units as `filled_qty`, so a row can show
+    # requested vs filled without joining back to the order. Both are read
+    # from the broker payload when it states them and stay ``None`` when it
+    # does not - a fill is never given an invented order type or quantity.
+    order_type: str | None = None
+    requested_qty: float | None = None
+
     @field_validator("commission", mode="before")
     @classmethod
     def _commission_is_a_non_negative_cost(cls, value: float | None) -> float | None:

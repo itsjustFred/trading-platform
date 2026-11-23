@@ -78,6 +78,7 @@ os.environ.setdefault("TRADING_DATA_DIR", str(DATA_DIR))
 LOG_DIR = RESOLVED_LOG_DIR
 os.environ.setdefault("LOG_DIR", str(LOG_DIR))
 
+from live_runner.broker_reconciliation import load_reconciliation_report
 from live_runner.ctrader_deployment import build_ctrader_deployment_plan
 from live_runner.kill_switch import (
     KillSwitchMode,
@@ -97,6 +98,7 @@ from shared.database import (
 )
 from shared.database import (
     BROKER_CLOSE_SIGNAL_SOURCE,
+    ENTRIES_HALT_SETTINGS_KEY,
     LIVE_SUBMISSION_DRAIN_BUDGET_SECONDS,
     LiveDeploymentInUseError,
     LiveDeploymentSubmissionClaim,
@@ -109,6 +111,7 @@ from shared.database import (
     delete_service,
     deployments_with_broker_order_conflicts,
     ensure_live_account,
+    entries_halt_marker_is_halted,
     get_background_task_record,
     get_latest_live_balances,
     get_live_account,
@@ -1699,6 +1702,7 @@ _QUIET_EXACT_PATHS = {
     "/api/data/tasks",
     "/api/live/accounts",
     LIVE_DEPLOYMENTS_PATH,
+    "/api/live/reconciliation",
 }
 _QUIET_PREFIX_PATHS = (
     "/api/tasks/",
@@ -5271,6 +5275,10 @@ def _serialize_live_deployment_payload(
         str(deployment.status or "").strip().upper() == "STOPPED"
         and stopped_enforced_at is None
     )
+    entries_halt_marker = (deployment.settings or {}).get(ENTRIES_HALT_SETTINGS_KEY)
+    entries_halt_details = (
+        entries_halt_marker if isinstance(entries_halt_marker, dict) else {}
+    )
     # None means "this response did not read the conflict ledger", which is a different
     # statement from "there is none" - the same distinction that makes
     # `exposure_may_be_open` worth reporting. A create, update or re-point response never
@@ -5313,6 +5321,20 @@ def _serialize_live_deployment_payload(
         "signal_source": deployment.signal_source,
         "signal_config": deployment.signal_config,
         "settings": deployment.settings,
+        # The broker-reconciliation entry halt lives in ``settings``; surface
+        # it as a first-class flag so a deployment that is ACTIVE-but-not-
+        # trading-entries is visible without reading the settings blob (#303).
+        "entries_halted": entries_halt_marker_is_halted(entries_halt_marker),
+        "entries_halted_at": (
+            entries_halt_details.get("at")
+            if isinstance(entries_halt_details.get("at"), str)
+            else None
+        ),
+        "entries_halted_by": (
+            entries_halt_details.get("by")
+            if isinstance(entries_halt_details.get("by"), str)
+            else None
+        ),
     }
     safe_payload = redact_value(payload)
     return safe_payload if isinstance(safe_payload, dict) else {}
@@ -12895,6 +12917,34 @@ async def _live_trades_payload(account_id: str) -> dict[str, Any]:
                 "actual_price_observed": row.get("actual_price_observed"),
                 "slippage": _optional_float(row.get("slippage")),
                 "slippage_bps": _optional_float(row.get("slippage_bps")),
+                # #134: the slippage split a later SlippageModel (#130) fits
+                # against. Each is None independently when its inputs are
+                # missing; quote_snapshot_missing flags a fill whose signal
+                # carries no usable quote snapshot - never silently zero.
+                "signal_delay_bps": _optional_float(row.get("signal_delay_bps")),
+                "execution_slippage_bps": _optional_float(
+                    row.get("execution_slippage_bps")
+                ),
+                "spread_bps": _optional_float(row.get("spread_bps")),
+                "quote_snapshot_missing": bool(row.get("quote_snapshot_missing")),
+                "quote_bid": _optional_float(row.get("quote_bid")),
+                "quote_ask": _optional_float(row.get("quote_ask")),
+                "quote_price": _optional_float(row.get("quote_price")),
+                "quote_time": _serialize_live_timestamp(row.get("quote_time"))[0]
+                or None,
+                "quote_source": row.get("quote_source"),
+                "order_type": row.get("order_type"),
+                "requested_qty": _optional_float(row.get("requested_qty")),
+                "producer_at": _serialize_live_timestamp(row.get("producer_at"))[0]
+                or None,
+                "message_received_at": (
+                    _serialize_live_timestamp(row.get("message_received_at"))[0] or None
+                ),
+                "order_submitted_at": (
+                    _serialize_live_timestamp(row.get("order_submitted_at"))[0] or None
+                ),
+                "broker_ack_at": _serialize_live_timestamp(row.get("broker_ack_at"))[0]
+                or None,
                 "filled_qty": float(row.get("filled_qty", 0.0)),
                 "position_size": _execution_risk_value(row, metadata, "position_size"),
                 "risk_amount": _execution_risk_value(row, metadata, "risk_amount"),
@@ -13406,6 +13456,13 @@ async def get_live_deployments() -> list[dict[str, Any]]:
         )
         for deployment in deployments
     ]
+
+
+@app.get("/api/live/reconciliation")
+async def get_live_broker_reconciliation() -> dict[str, Any]:
+    """Latest periodic broker-reconciliation report (#303), read-only."""
+    _log_live_endpoint_request("/api/live/reconciliation")
+    return await asyncio.to_thread(load_reconciliation_report)
 
 
 @app.get("/api/live/dashboard")
@@ -14920,7 +14977,10 @@ async def delete_live_deployment_endpoint(
     if status_gated:
         try:
             gated = await asyncio.to_thread(
-                update_live_deployment_status, deployment_id, "PAUSED"
+                update_live_deployment_status,
+                deployment_id,
+                "PAUSED",
+                release_entries_halt=False,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -14951,8 +15011,16 @@ async def delete_live_deployment_endpoint(
         restored_to: str | None = None
         if status_gated:
             try:
+                # release_entries_halt=False: this write only restores the
+                # status the refused delete borrowed. It is not an operator
+                # resume, so it must not clear a broker-reconciliation entry
+                # halt - entries would otherwise reopen on a known-mismatched
+                # account until the next pass.
                 await asyncio.to_thread(
-                    update_live_deployment_status, deployment_id, original_status
+                    update_live_deployment_status,
+                    deployment_id,
+                    original_status,
+                    release_entries_halt=False,
                 )
                 restored_to = original_status
             except Exception as restore_exc:  # pragma: no cover - defensive
