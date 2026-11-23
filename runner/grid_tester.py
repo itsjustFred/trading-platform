@@ -15,6 +15,7 @@ from uuid import uuid4
 from runner.approval_gate import require_generated_strategy_approval
 from runner.cli import get_engine
 from runner.engines.base import BacktestConfig
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from shared.constants import DATA_DIR
 from shared.database import get_grid_results
 from shared.strategy_registry import find_strategy_entry
@@ -61,6 +62,9 @@ def _run_grid_cell(
             end_date=end,
             initial_capital=capital,
             risk_per_trade_pct=risk_per_trade_pct,
+            # Frozen engines refuse next_open; declare the legacy close fill
+            # they simulate so the persisted meta stays truthful.
+            signal_exit_fill=default_signal_exit_fill_for_engine(getattr(engine, "name", "")),
         )
         validate = getattr(engine, "validate_config", None)
         if callable(validate):

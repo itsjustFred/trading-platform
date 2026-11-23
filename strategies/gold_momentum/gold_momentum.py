@@ -157,9 +157,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
             if stop_hit or score_exit_hit:
                 in_trade = False
                 exits.iloc[i] = True
-                # Only the ATR stop is a price LEVEL (explicit exit_price). The
-                # score reversal is a close-triggered MARKET exit: no explicit
-                # exit_price, so it fills at the next bar's open.
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The score reversal is a close-triggered MARKET exit:
+                # no explicit exit_price, so it fills at the next bar's open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"

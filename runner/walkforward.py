@@ -23,6 +23,7 @@ from runner.engines.base import (
     resolve_legacy_max_position_kwarg,
     resolve_strategy_parameters,
 )
+from runner.engines.contract import default_signal_exit_fill_for_engine
 from runner.portfolio_optimizer import (
     MIN_OOS_DAILY_OBSERVATIONS,
     optimize_portfolio_allocation,
@@ -152,6 +153,9 @@ def _run_fold_backtest(
         modeling_resolution=modeling_resolution,
         data_dir=data_dir,
         parameters=parameters,
+        # Frozen engines refuse next_open; declare the legacy close fill they
+        # simulate so the persisted meta stays truthful.
+        signal_exit_fill=default_signal_exit_fill_for_engine(getattr(engine, "name", "")),
     )
     errors = engine.validate_config(config)
     if errors:

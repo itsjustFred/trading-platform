@@ -33,7 +33,10 @@ from runner.engines.base import (
     resolve_strategy_parameters,
     warn_if_engine_frozen,
 )
-from runner.engines.contract import resolve_intrabar_timeframe
+from runner.engines.contract import (
+    default_signal_exit_fill_for_engine,
+    resolve_intrabar_timeframe,
+)
 from runner.grid_identity import (
     GRID_IDENTITY_KEY,
     cell_identity,
@@ -623,6 +626,9 @@ def _run_backtest_in_process_body(request: CellRequest) -> dict[str, Any]:
         modeling_resolution=intrabar_resolution or "open_close",
         data_dir=data_dir,
         parameters=resolved_parameters,
+        # Frozen engines refuse next_open; declare the legacy close fill they
+        # simulate so the persisted meta stays truthful.
+        signal_exit_fill=default_signal_exit_fill_for_engine(request.engine),
     )
     engine_adapter = get_engine(request.engine)
     errors = engine_adapter.validate_config(config)

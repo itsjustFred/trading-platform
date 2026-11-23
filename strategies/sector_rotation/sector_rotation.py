@@ -41,7 +41,8 @@ STRATEGY_META = {
         "Source-exact entry: mom63 > 0, mom21 > 0, close > SMA200. "
         "Default exit: trend break (close < SMA200). 1.2.0: market exits "
         "carry no exit_price=close and fill at the next open; the ATR stop "
-        "stays an explicit level. Dropped (not "
+        "level travels in sl_price (exit-bar exit_price is a level only "
+        "with exit_order_type='level'). Dropped (not "
         "single-symbol-expressible): sector universe, RS ranking, "
         "regime tables, defensive basket. ATR stop / mom63<0 exit / "
         "10d-weakness exit are opt-in only (default OFF)."
@@ -119,10 +120,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
             weakness_hit = bool(short_weakness.iloc[i]) if use_weakness_exit else False
             if stop_hit or trend_break or momentum_break or weakness_hit:
                 exits.iloc[i] = True
-                # Only the ATR stop is a price LEVEL (explicit exit_price). The
-                # trend / momentum / weakness exits are close-triggered MARKET
-                # exits: no explicit exit_price, so they fill at the next bar's
-                # open under the default next_open convention.
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The trend / momentum / weakness exits are
+                # close-triggered MARKET exits: no explicit exit_price, so
+                # they fill at the next bar's open under next_open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"

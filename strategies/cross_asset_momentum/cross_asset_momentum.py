@@ -41,7 +41,8 @@ STRATEGY_META = {
         "lookbacks [21, 63, 126, 252], weights [0.35, 0.30, 0.20, 0.15], "
         "vol window 60. 1.2.0: market exits (signal / momentum / drawdown) "
         "carry no exit_price=close and fill at the next open; the ATR stop "
-        "stays an explicit level. Dropped (not single-symbol-expressible): "
+        "level travels in sl_price (exit-bar exit_price is a level only "
+        "with exit_order_type='level'). Dropped (not single-symbol-expressible): "
         "cross-sectional ranking, risk-parity weighting + caps, vol "
         "targeting, SPY crash-protection leg. ATR stop / momentum-break "
         "exit / drawdown exit are opt-in only (default OFF)."
@@ -127,10 +128,12 @@ def generate_signals(df: pd.DataFrame, params: dict):
             )
             if stop_hit or signal_break or momentum_break or drawdown_break:
                 exits.iloc[i] = True
-                # Only the ATR stop is a price LEVEL (explicit exit_price).
-                # The signal / momentum / drawdown exits are close-triggered
-                # MARKET exits: no explicit exit_price, so they fill at the
-                # next bar's open under the default next_open convention.
+                # The ATR stop's level travels in sl_price (the protective
+                # stop fills it); the exit-bar exit_price is only honored as
+                # a level with exit_order_type="level", which is not emitted
+                # here. The signal / momentum / drawdown exits are
+                # close-triggered MARKET exits: no explicit exit_price, so
+                # they fill at the next bar's open under next_open.
                 if stop_hit:
                     exit_price.iloc[i] = active_stop
                     exit_reason.iloc[i] = "stop_loss"
