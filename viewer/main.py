@@ -12838,17 +12838,18 @@ async def rename_portfolio(portfolio_id: str, payload: NameUpdateRequest) -> dic
 
     # Resolve and containment-check before the DB write so an unsafe id
     # cannot half-apply. The guards are inlined at the write sink on the
-    # exact variable the path is built from — the whitelisted id may not
-    # contain a path separator or dot-segment, symlinks are refused, and the
-    # resolved candidate must be a direct child of the resolved base — so
-    # the taint analyser sees the sanitiser on the path that is written.
-    normalized_id = _safe_asset_id(portfolio_id)
+    # exact variable the path is built from — the id must fullmatch the
+    # safe-segment whitelist (the same pattern _safe_asset_id applies) and
+    # may not be a dot-segment, symlinks are refused, and the resolved
+    # candidate must be a direct child of the resolved base — so the taint
+    # analyser sees the sanitiser on the path that is written.
+    normalized_id = str(portfolio_id or "").strip()
     portfolios_base = PORTFOLIOS_DIR.resolve()
     if (
-        not normalized_id
+        not re.fullmatch(r"[A-Za-z0-9._-]+", normalized_id)
+        or normalized_id in {".", ".."}
         or "/" in normalized_id
         or "\\" in normalized_id
-        or normalized_id in {".", ".."}
     ):
         raise HTTPException(status_code=404, detail=_PORTFOLIO_NOT_FOUND_DETAIL)
     raw_output_path = PORTFOLIOS_DIR / f"{normalized_id}.json"
