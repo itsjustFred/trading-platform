@@ -5912,79 +5912,83 @@ def _closed_round_trip_commission(rows: list[dict[str, Any]]) -> float | None:
     """Commission attributable to CLOSED round trips only (#149).
 
     ``net_pnl`` is realised PnL of closed trades minus the fees of exactly
-    those trades, so commissions are attributed per round trip with a FIFO
-    walk per symbol: an entry fill opens a lot carrying its per-unit
-    commission rate (``commission / filled_qty``); an opposing fill consumes
-    lots oldest-first and accrues the consumed entry rates plus its own
-    rate on the closed quantity. A reversal's opening remainder becomes a
-    new lot at the same rate, so its fee is netted only if that position
-    later closes. Fees of lots still open at the end are NOT netted against
-    realised PnL.
+    those trades, so commissions are attributed per round trip on the SAME
+    average-cost basis as ``_calculate_realized_live_pnl``. Per symbol a
+    pool tracks the open position's signed quantity, the total commission
+    paid to build it (``fee_pool``) and whether any pooled fee is unknown.
+    A same-direction fill adds its whole commission to the pool — that
+    exposure is still open, so its fee stays unrealised. An opposing fill
+    releases the pool's pro-rata share for the closed quantity
+    (``fee_pool * closed / |qty|``, the average fee rate of the open
+    position — the same share average-cost PnL realises on a partial
+    close) plus its own commission on the closed quantity only. A
+    reversal's opening remainder starts a new pool carrying just the
+    remainder's share of the fill's fee, so its fee is netted only if that
+    position later closes. A NULL commission inside the pool taints any
+    close of that exposure, so one unknown fee makes the result ``None``;
+    a NULL fee on exposure still open at the end is simply not netted yet.
 
     Returns the summed commission of the closed round trips, or ``None``
     when any fee touching a closed round trip is unknown (NULL commission —
     the broker has not reported it yet, e.g. an unposted Alpaca ``CFEE``).
-    An unknown fee on a still-open lot does not block the result: it is
-    simply not part of any closed round trip yet.
     """
     state: dict[str, dict[str, Any]] = {}
     closed_fees = 0.0
     fees_known = True
     for symbol, direction, quantity, _price, row in _iter_live_position_fills(rows):
         commission = row.get("commission")
-        rate = (
-            None if commission is None else _safe_float(commission, 0.0) / quantity
-        )
+        fee = None if commission is None else _safe_float(commission, 0.0)
+        rate = None if fee is None else fee / quantity
         delta = quantity * direction
-        st = state.setdefault(symbol, {"qty": 0.0, "lots": []})
+        st = state.setdefault(
+            symbol, {"qty": 0.0, "fee_pool": 0.0, "fee_unknown": False}
+        )
         current = float(st["qty"])
         if abs(current) < LIVE_POSITION_FLAT_THRESHOLD:
             # Flat (or dust): the whole fill opens fresh exposure; any
-            # residual lots belong to a position the PnL walk already
-            # treats as closed, so they are replaced, not consumed.
+            # residual pool belongs to a position the PnL walk already
+            # treats as closed, so it is replaced, not released.
             st["qty"] = delta
-            st["lots"] = [{"qty": quantity, "rate": rate}]
+            st["fee_pool"] = 0.0 if fee is None else fee
+            st["fee_unknown"] = fee is None
             continue
         if current * delta > 0:
             # Same direction: the fill only adds to the open position, so
             # its fee stays unrealised until that exposure closes.
             st["qty"] = current + delta
-            st["lots"].append({"qty": quantity, "rate": rate})
+            st["fee_pool"] = float(st["fee_pool"]) + (0.0 if fee is None else fee)
+            st["fee_unknown"] = bool(st["fee_unknown"]) or fee is None
             continue
 
         closed_qty = min(abs(current), quantity)
-        opened_qty = quantity - closed_qty
-        remaining = closed_qty
-        lots = st["lots"]
-        while remaining > 1e-12 and lots:
-            lot = lots[0]
-            take = min(float(lot["qty"]), remaining)
-            if lot["rate"] is None:
-                fees_known = False
-            else:
-                closed_fees += float(lot["rate"]) * take
-            lot["qty"] = float(lot["qty"]) - take
-            remaining -= take
-            if lot["qty"] <= 1e-12:
-                lots.pop(0)
-        if remaining > 1e-12:
-            # Lots and signed quantity drifted apart (should be impossible
-            # under the shared skip rules): the closed fee is unmeasurable,
-            # so fail closed rather than under-count it.
+        released = float(st["fee_pool"]) * (closed_qty / abs(current))
+        if st["fee_unknown"]:
             fees_known = False
+        else:
+            closed_fees += released
         if rate is None:
             fees_known = False
         else:
             closed_fees += rate * closed_qty
-        if opened_qty > 0:
-            lots.append({"qty": opened_qty, "rate": rate})
 
         new_qty = current + delta
         if abs(new_qty) < LIVE_POSITION_FLAT_THRESHOLD:
             st["qty"] = 0.0
-            st["lots"] = []
-        else:
+            st["fee_pool"] = 0.0
+            st["fee_unknown"] = False
+        elif current * new_qty > 0:
+            # Partial close: the remaining exposure keeps the un-released
+            # share of the pool (and its unknown flag).
             st["qty"] = new_qty
+            st["fee_pool"] = float(st["fee_pool"]) - released
+        else:
+            # Reversal: the remainder is a fresh position opened by this
+            # fill, so its pool carries only the remainder's share of the
+            # fill's fee and its own unknown flag.
+            st["qty"] = new_qty
+            st["fee_pool"] = 0.0 if rate is None else rate * (quantity - closed_qty)
+            st["fee_unknown"] = rate is None
+
     return None if not fees_known else closed_fees
 
 
@@ -6015,8 +6019,9 @@ def _live_account_stats_payload(account_id: str) -> dict[str, Any]:
     pnl_complete = price_unknown_count == 0
     # `total_pnl` is gross (price PnL of closed round trips). Net PnL (#149)
     # subtracts only the commissions attributable to those SAME closed
-    # round trips — entry and exit fills consumed FIFO — never the fees of
-    # positions still open. US equity regulatory fees on sales (SEC fee /
+    # round trips — entry fees released at the open position's average fee
+    # rate plus each exit fill's fee on the closed quantity — never the
+    # fees of positions still open. US equity regulatory fees on sales (SEC fee /
     # FINRA TAF) are deliberately NOT modelled: they are fractions of a
     # cent to a few cents per sale (TAF capped per trade), Alpaca does not
     # break them out per execution, and net PnL therefore slightly

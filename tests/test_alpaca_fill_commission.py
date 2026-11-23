@@ -3499,7 +3499,7 @@ def test_crypto_pair_key_is_one_key_for_every_spelling(symbol):
 
 
 def test_closed_round_trip_commission_walk_unit():
-    """Direct walk checks: FIFO attribution, open lots excluded, unknowns."""
+    """Direct walk checks: average-cost attribution, open exposure excluded, unknowns."""
     import viewer.main as viewer_main
 
     fn = viewer_main._closed_round_trip_commission
@@ -3533,6 +3533,77 @@ def test_closed_round_trip_commission_walk_unit():
         _stats_row("buy", 50.0, 1.0, 10, None),
     ]
     assert fn(rows) == pytest.approx(0.75)
+
+
+def test_closed_round_trip_commission_partial_close_uses_average_fee_rate():
+    """#149: entry fees release at the open position's AVERAGE fee rate, the
+    same basis the realised-PnL walk uses — not oldest-lot-first FIFO."""
+    import viewer.main as viewer_main
+
+    fn = viewer_main._closed_round_trip_commission
+
+    # Two entries at different rates: pool fee 10.0 + 0.0 over qty 2.
+    # Closing 1 releases the average 5.0, where FIFO would release 10.0.
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 10.0),
+        _stats_row("buy", 100.0, 1.0, 1, 0.0),
+        _stats_row("sell", 110.0, 1.0, 5, 0.0),
+    ]
+    assert fn(rows) == pytest.approx(5.0)
+    # A second close of the remaining unit releases the other 5.0.
+    rows.append(_stats_row("sell", 110.0, 1.0, 6, 0.0))
+    assert fn(rows) == pytest.approx(10.0)
+
+
+def test_closed_round_trip_commission_reversal_lot_fee_is_netted_on_close():
+    """#149: a reversal's remainder keeps its share of the reversing fill's
+    fee; closing that reversed position nets it."""
+    import viewer.main as viewer_main
+
+    fn = viewer_main._closed_round_trip_commission
+
+    # Buy 1 (fee 0.2), sell 3 (fee 0.6, rate 0.2): closes the long for
+    # 0.2 + 0.2 = 0.4 and opens a 2-short whose pool carries 0.2 * 2 = 0.4
+    # of the sell's fee. Buying back 2 (fee 0.8, rate 0.4) then nets
+    # 0.4 + 0.8 = 1.2 more, 1.6 in total. Dropping the reversal remainder
+    # would leave 1.2.
+    rows = [
+        _stats_row("buy", 100.0, 1.0, 0, 0.2),
+        _stats_row("sell", 90.0, 3.0, 5, 0.6),
+        _stats_row("buy", 95.0, 2.0, 10, 0.8),
+    ]
+    assert fn(rows) == pytest.approx(1.6)
+
+
+@pytest.mark.parametrize(
+    "quantities",
+    [
+        [621973.53204816, 154302.10340252, 958825.26142375],
+        [0.1, 0.2],
+        [1000.0, 2000.5, 0.25, 7777.75],
+    ],
+)
+def test_closed_round_trip_commission_large_and_fractional_quantities(quantities):
+    """#149 review: separate float accumulations of the same fills drift by
+    ~1 ulp of the position size; at 1e3-1e5 units that exceeded the old
+    absolute 1e-12 lot tolerance and made net_pnl permanently None. The
+    pool walk shares the PnL walk's quantity state, so a full close of
+    exactly their float sum must return a number, never None."""
+    import viewer.main as viewer_main
+
+    fn = viewer_main._closed_round_trip_commission
+
+    total = 0.0
+    rows = []
+    for index, qty in enumerate(quantities):
+        total += qty
+        rows.append(_stats_row("buy", 100.0, qty, index, 1.0))
+    rows.append(_stats_row("sell", 110.0, total, len(quantities), 2.0))
+
+    result = fn(rows)
+    assert result is not None
+    # Every pooled fee (1.0 per buy) plus the exit fee (2.0) is released.
+    assert result == pytest.approx(float(len(quantities)) + 2.0)
 
 
 def test_viewer_stats_net_pnl_excludes_fees_of_open_positions(monkeypatch):
@@ -3581,9 +3652,10 @@ def test_viewer_stats_net_pnl_open_position_unknown_fee_does_not_block(monkeypat
     assert payload["net_pnl_complete"] is True
 
 
-def test_viewer_stats_net_pnl_partial_close_uses_fifo_fees(monkeypatch):
-    """#149: a partial close nets the consumed entry fee pro-rata plus the
-    exit fill's fee on the closed quantity only."""
+def test_viewer_stats_net_pnl_partial_close_uses_average_fees(monkeypatch):
+    """#149: a partial close nets the open position's average entry fee
+    pro-rata plus the exit fill's fee on the closed quantity only — the
+    same basis the realised-PnL walk uses."""
     import viewer.main as viewer_main
 
     rows = [
