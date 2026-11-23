@@ -1315,16 +1315,31 @@ class TradeEngine:
 
     @staticmethod
     def _pending_stop_fill_price(
-        direction: str, stop_price: float, bar_open: float
+        direction: str,
+        stop_price: float,
+        bar_open: float,
+        *,
+        bar_spread: float = 0.0,
     ) -> float:
         """Fill price for a pending stop-market order on one bar.
 
         Owner decision 2026-11-13 (gap -> open): a LONG buy-stop that gaps up
         fills at the open above the stop; a SHORT sell-stop that gaps down
         fills at the open below it. An intrabar touch keeps the stop price.
+
+        A gap-through fill is a marketable order at the open, so it pays the
+        same spread a MARKET order at that open would (maintainer default
+        2026-11-23): a LONG lifts the ask (``open + spread``), a SHORT hits
+        the bid open — symmetric with ``OrderType.MARKET`` above. The
+        intrabar level fill keeps the stop price (pre-existing convention).
+        ``max``/``min`` are kept so a NaN open still propagates NaN into the
+        fail-closed unpriced-fill check instead of filling at the stop.
         """
         if direction == "LONG":
-            return max(float(bar_open), float(stop_price))
+            fill = max(float(bar_open), float(stop_price))
+            if fill == float(bar_open):
+                fill += bar_spread
+            return fill
         return min(float(bar_open), float(stop_price))
 
     @staticmethod
@@ -1333,12 +1348,19 @@ class TradeEngine:
         stop_price: float,
         limit_price: float,
         bar_open: float,
+        *,
+        bar_spread: float = 0.0,
     ) -> float:
         """Fill price for a pending stop-limit order on one bar.
 
         When the bar opens through the stop, the stop leg fires at the open;
         if that makes the limit marketable at the open, the fill is the open.
         Otherwise the resting limit keeps its limit price.
+
+        The open fill is marketable, so a LONG pays the ask like a MARKET buy
+        at that open (``open + spread``); a SHORT hits the bid like a MARKET
+        sell — the same convention as ``_pending_stop_fill_price``. A fill at
+        the resting limit price carries no spread.
         """
         if direction == "LONG":
             gapped_through_stop = bar_open >= stop_price
@@ -1347,7 +1369,8 @@ class TradeEngine:
             gapped_through_stop = bar_open <= stop_price
             limit_marketable_at_open = bar_open >= limit_price
         if gapped_through_stop and limit_marketable_at_open:
-            return float(bar_open)
+            spread = bar_spread if direction == "LONG" else 0.0
+            return float(bar_open) + spread
         return float(limit_price)
 
     def _fill_pending_orders(self, row: pd.Series, i: int) -> None:
@@ -1388,13 +1411,19 @@ class TradeEngine:
                     filled = i > order.created_index and bar_high >= order.stop_price
                     if filled:
                         fill_price = self._pending_stop_fill_price(
-                            order.direction, order.stop_price, bar_open
+                            order.direction,
+                            order.stop_price,
+                            bar_open,
+                            bar_spread=self._bar_spread(row),
                         )
                 elif order.direction == "SHORT" and order.stop_price is not None:
                     filled = i > order.created_index and bar_low <= order.stop_price
                     if filled:
                         fill_price = self._pending_stop_fill_price(
-                            order.direction, order.stop_price, bar_open
+                            order.direction,
+                            order.stop_price,
+                            bar_open,
+                            bar_spread=self._bar_spread(row),
                         )
             elif order.order_type == OrderType.STOP_LIMIT:
                 # The trigger is evaluated per bar, not latched: trigger and
@@ -1414,6 +1443,7 @@ class TradeEngine:
                             order.stop_price,
                             order.limit_price,
                             bar_open,
+                            bar_spread=self._bar_spread(row),
                         )
                 elif order.direction == "SHORT" and order.stop_price is not None:
                     trigger = trigger and bar_low <= order.stop_price
@@ -1428,6 +1458,7 @@ class TradeEngine:
                             order.stop_price,
                             order.limit_price,
                             bar_open,
+                            bar_spread=self._bar_spread(row),
                         )
 
             if filled:

@@ -47,7 +47,11 @@ parent Cleanup 16 record.
   intrabar touch keeps the stop price. STOP_LIMIT applies the open fill only
   when the bar opens through the stop AND the resulting limit is marketable
   at that open; a plain LIMIT keeps the conservative level fill (no
-  favourable-gap price improvement).
+  favourable-gap price improvement). A gap-through open fill is marketable,
+  so it pays the same spread a MARKET order at that open pays (maintainer
+  default 2026-11-23): a LONG buys the ask (`open + spread`), a SHORT sells
+  the bid open — symmetric with MARKET entries; intrabar level fills and
+  fills at a resting limit price carry no spread.
   `ExecutionModelSettings.market_order_timing = "next_bar_open"` and
   `entry_price_side = "open"` document this on every native trade
   (`trade.meta["execution_model"]`, `trade.meta["entry_fill"]`).
@@ -436,8 +440,9 @@ Implementation:
 - **`entry` is the price the order actually fills at**, for every order type
   (MARKET: the next bar's open, plus the configured spread for a LONG;
   LIMIT: its limit price; STOP/STOP_LIMIT: the trigger/limit level, or the
-  bar open when the bar gaps through the stop — for STOP_LIMIT only when the
-  limit is marketable at that open). Pre-fill
+  bar open — plus the configured spread for a LONG — when the bar gaps
+  through the stop and the fill is marketable at that open; for STOP_LIMIT
+  only when the limit is marketable at that open). Pre-fill
   creation sizing is only a pending-order estimate and must never survive into
   the position: because the caps are evaluated against the fill price, a
   quantity derived from the signal bar's close sizes a position *beyond* the
