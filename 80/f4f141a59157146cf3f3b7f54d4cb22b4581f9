@@ -1,0 +1,18 @@
+docs/live-deploy-runbook.md
+  h_f251b30ae7fbf6 463-479
+live_runner/daemon.py
+  h_f251b30ae7fbf6 1716-1778,2554-2560,2563-2566,2568-2588,3539-3545,3555-3651
+tests/live_runner/test_account_order_lock.py
+  h_f251b30ae7fbf6 1-452
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "80f4f141a59157146cf3f3b7f54d4cb22b4581f9",
+  "prompts": {},
+  "humans": {
+    "h_f251b30ae7fbf6": {
+      "author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
