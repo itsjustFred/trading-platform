@@ -366,6 +366,10 @@ def test_non_finite_stats_are_not_published_as_measurements():
     for value in (float("nan"), float("inf"), float("-inf"), "n/a"):
         assert _stat_number_or_undefined({"sharpe_ratio": value}, "sharpe_ratio", 0.0) is None
 
+    # A JSON integer outside float64 range is the same unreadable value: float()
+    # raises OverflowError on it, which must resolve to undefined like the rest (#256).
+    assert _stat_number_or_undefined({"sharpe_ratio": 10**400}, "sharpe_ratio", 0.0) is None
+
     # A numeric string is a real measurement written by an older producer.
     assert _stat_number_or_undefined({"sharpe_ratio": "1.25"}, "sharpe_ratio", 0.0) == 1.25
 

@@ -53,6 +53,9 @@ STRATEGY_META = {
 import numpy as np
 import pandas as pd
 
+from shared.indicators import presets
+from shared.strategy_markers import entry_exit_markers
+
 
 def generate_signals(df: pd.DataFrame, params: dict):
     # ``fast_sma``/``mid_sma``/``slow_sma`` are deprecated aliases from the
@@ -68,20 +71,11 @@ def generate_signals(df: pd.DataFrame, params: dict):
     high = df["high"]
     low = df["low"]
 
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_mid = close.ewm(span=mid, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    ema_fast = presets.ema_first_seed(close, fast)
+    ema_mid = presets.ema_first_seed(close, mid)
+    ema_slow = presets.ema_first_seed(close, slow)
 
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / atr_period, min_periods=atr_period, adjust=False).mean()
+    atr = presets.atr_qc_wilder(high, low, close, atr_period)
 
     fast_cross_up = (ema_fast > ema_mid) & (ema_fast.shift(1) <= ema_mid.shift(1))
     trend_up = ema_mid > ema_slow
@@ -156,35 +150,6 @@ def generate_signals(df: pd.DataFrame, params: dict):
         "exit_price": exit_price,
         "exit_reason": exit_reason,
     }
-    drawings: list[dict] = []
-    if "timestamp" in df.columns:
-        entry_times = pd.to_datetime(
-            df.loc[entries[entries].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        exit_times = pd.to_datetime(
-            df.loc[exits[exits].index, "timestamp"], utc=True, errors="coerce"
-        ).dropna()
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "belowBar",
-                "shape": "arrowUp",
-                "color": "#22c55e",
-                "text": "Entry",
-            }
-            for ts in entry_times.iloc[:30]
-        )
-        drawings.extend(
-            {
-                "type": "marker",
-                "time": ts.isoformat(),
-                "position": "aboveBar",
-                "shape": "arrowDown",
-                "color": "#ef4444",
-                "text": "Exit",
-            }
-            for ts in exit_times.iloc[:30]
-        )
+    drawings = entry_exit_markers(df, entries, exits)
 
     return entries, exits, indicators_dict, drawings

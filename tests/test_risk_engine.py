@@ -239,6 +239,40 @@ def test_calculate_position_size_notional_cap_edge_is_inclusive():
     assert sized.decision.metadata["capped_by_notional"] is False
 
 
+def test_calculate_position_size_math_inf_notional_is_documented_uncapped():
+    """#347: engines that apply their own post-size caps pass math.inf as the
+    caller ceiling — no engine-level cap binds and the decision metadata
+    records the JSON-safe "uncapped" sentinel, never 1.8e308."""
+    engine = RiskEngine(RiskConfig(max_risk_per_trade=0.01, max_total_exposure=0.05))
+    signal = TradeSignal(
+        action="buy", symbol="INF", entry_price=100.0, stop_loss=99.0,
+        take_profit=None, timeframe="1h", metadata={},
+    )
+
+    sized = engine.calculate_position_size(
+        signal=signal,
+        account_balance=10_000.0,
+        pip_value=1.0,
+        current_exposure=0.0,
+        max_notional_per_trade=math.inf,
+    )
+
+    # Risk sizing alone: 100 / 1 = 100 shares; nothing caps it.
+    assert sized.position_size == pytest.approx(100.0)
+    assert sized.decision.metadata["capped_by_notional"] is False
+    assert sized.decision.metadata["max_notional_per_trade"] == "uncapped"
+
+    for bad in (math.nan, math.inf * -1, 0.0, -1.0, True, False):
+        with pytest.raises(ValueError, match="max_notional_per_trade"):
+            engine.calculate_position_size(
+                signal=signal,
+                account_balance=10_000.0,
+                pip_value=1.0,
+                current_exposure=0.0,
+                max_notional_per_trade=bad,
+            )
+
+
 def test_calculate_position_size_exposure_limit_hit():
     engine = RiskEngine(
         RiskConfig(
@@ -591,6 +625,9 @@ class _DummyAdapter(BaseLiveAdapter):
 
     async def get_balance(self) -> tuple[float, float]:
         return 100_000.0, 100_000.0
+
+    async def get_used_margin(self) -> float | None:
+        return 0.0
 
     async def get_pip_value(self, symbol):
         # #146: a USD-quoted share in a USD account moves 1.0 per 1.0.

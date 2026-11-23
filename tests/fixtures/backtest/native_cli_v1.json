@@ -64,7 +64,8 @@
       },
       "pnl_basis": {
         "net_pnl": "net_after_fees",
-        "pnl": "gross"
+        "pnl": "gross",
+        "slippage_embedded": true
       },
       "risk_config": {
         "max_leverage": 1.0,
@@ -76,6 +77,17 @@
         "warmup_start": ""
       },
       "shared_equity": {},
+      "slippage": {
+        "models": {
+          "PARITY": {
+            "asset_class": "equities",
+            "bps": 0.0,
+            "model": "none",
+            "price_basis": "single_price",
+            "reason": "explicit_opt_out"
+          }
+        }
+      },
       "source": "ohlcv",
       "symbols": [
         "PARITY"
@@ -119,7 +131,8 @@
     "max_position_exposure_pct": 1.0,
     "parameters": {
       "fee_flat_per_trade": 1.0,
-      "fee_rate": 0.0005
+      "fee_rate": 0.0005,
+      "slippage": "none"
     },
     "risk_per_trade_pct": 0.01,
     "strategies": [
@@ -153,6 +166,7 @@
     ],
     "duplicate_equity_timestamps": 0,
     "equity_return_frequency": "daily",
+    "equity_return_periods_per_year": 252.0,
     "losers": 2,
     "max_consecutive_losses": 2,
     "max_consecutive_wins": 1,

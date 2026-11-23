@@ -75,12 +75,13 @@ class PromotionTarget:
 
 
 def deployment_signal_processor_name(deployment: LiveDeploymentConfig) -> str:
-    """Registered processor id of a deployment, ``""`` when none is configured."""
-    configured = deployment.signal_config or {}
-    settings = deployment.settings or {}
-    return str(
-        configured.get("signal_processor") or settings.get("signal_processor") or ""
-    ).strip().lower()
+    """Registered processor id of a deployment, ``""`` when none is configured.
+
+    Delegates to the model's own property: deployment validation (#150 trailing
+    gates) and the daemon resolve the same id through the same definition, so
+    the promotion gate hashes the processor that is actually applied there.
+    """
+    return deployment.signal_processor_name
 
 
 def _module_file(name: str, repo_root: Path) -> Path | None:
@@ -288,7 +289,7 @@ def strategy_target(
         )
     try:
         meta = load_strategy_meta(path, root)
-    except Exception as exc:
+    except Exception as exc:  # except-kind: money-decision
         raise PromotionTargetError(f"STRATEGY_META of '{name}' is unreadable: {exc}") from exc
     defaults = meta.get("parameters", {}) if isinstance(meta, Mapping) else None
     if not meta or not isinstance(defaults, Mapping):

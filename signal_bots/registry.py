@@ -63,6 +63,11 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+#: What a bot factory builds. Kept generic so each `_build_<bot>` still returns
+#: its own concrete processor class instead of widening to `object`.
+_ProcessorT = TypeVar("_ProcessorT")
+
+
 def _build_from_config(
     config_path: Path,
     factory: Callable[[dict[str, Any]], _T],

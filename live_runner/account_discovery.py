@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import re
 import socket
 import ssl
@@ -20,9 +19,10 @@ from live_runner.alpaca_adapter import (
     _default_alpaca_credentials,
 )
 from live_runner.base_adapter import money_digits_from_trader, money_scale
-from live_runner.credential_env import load_accounts_env_values
+from live_runner.credential_env import load_accounts_env_values, resolve_accounts_env_path
 from shared.logging import get_logger
 from shared.models import LiveAccount
+from shared.money import parse_money, parse_optional
 
 logger = get_logger("live-account-discovery")
 
@@ -199,16 +199,6 @@ _CTRADER_BROKER_NAME_FIELDS = (
 )
 
 
-def _safe_float(value: Any, *, default: float = 0.0) -> float:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(numeric):
-        return default
-    return numeric
-
-
 def _ctrader_host_matches_environment(*, host: str, is_live: bool) -> bool:
     normalized_host = host.strip().lower()
     if "demo" in normalized_host:
@@ -337,9 +327,11 @@ def discover_alpaca_accounts(api_key: str, secret_key: str, paper: bool) -> list
         raise RuntimeError("Alpaca account discovery returned no account id.")
 
     status = str(getattr(account, "status", "") or "").strip()
-    equity = _safe_float(getattr(account, "equity", None), default=math.nan)
-    cash = _safe_float(getattr(account, "cash", None), default=0.0)
-    balance = cash if math.isnan(equity) else equity
+    # An unreadable cash/equity raises (skipping this credential block upstream)
+    # rather than reporting a discovered account with a fabricated 0 balance.
+    cash = parse_money(getattr(account, "cash", None))
+    equity = parse_optional(getattr(account, "equity", None))
+    balance = cash if equity is None else equity
 
     display_name = f"Alpaca {account_number}" if account_number else "Alpaca Account"
     if status:
@@ -365,7 +357,7 @@ def _trader_balance(trader: Any) -> float:
     too small. The `or 2` collapse that used to live here did exactly that.
     """
     money_digits = money_digits_from_trader(trader)
-    return _safe_float(getattr(trader, "balance", 0.0), default=0.0) / money_scale(money_digits)
+    return parse_money(getattr(trader, "balance", None)) / money_scale(money_digits)
 
 
 def _ctrader_message_name_sources(message: Any) -> list[Any]:
@@ -490,7 +482,7 @@ def _message_to_debug_fields(message: Any) -> dict[str, Any]:
             )
             if isinstance(payload, dict):
                 return payload
-        except Exception:
+        except Exception:  # except-kind: loop-survival
             pass
     if not hasattr(message, "ListFields"):
         return {}
@@ -722,7 +714,7 @@ def _request_ctrader_account_detail(ctx: _CtraderAccountContext, account_id: int
             },
         )
         raise _CtraderStreamError(str(exc)) from exc
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         logger.debug(
             "Optional cTrader account detail request failed",
             extra={
@@ -851,7 +843,7 @@ def _build_ctrader_live_account(
         _load_ctrader_trader_details(ctx, account_id)
     except _CtraderStreamError:
         raise
-    except Exception as exc:
+    except Exception as exc:  # except-kind: loop-survival
         error_text = repr(exc)
         if _handle_ctrader_trader_error(error_text, host, account_id) == "skip":
             return None
@@ -916,7 +908,7 @@ async def discover_ctrader_accounts(
                 app_secret=app_secret,
                 access_token=access_token,
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             error_text = repr(exc)
             if _is_expected_ctrader_host_route_error(error_text):
                 logger.info(
@@ -949,11 +941,13 @@ async def discover_ctrader_accounts(
 
 
 async def discover_configured_accounts(
-    accounts_env: Path = DEFAULT_ACCOUNTS_ENV,
+    accounts_env: Path | str | None = None,
 ) -> list[LiveAccount]:
     # File-first precedence: .accounts.env wins over the process environment.
     # Discovery also must not mutate os.environ (no load_dotenv side effects).
-    env = load_accounts_env_values(accounts_env)
+    env = load_accounts_env_values(
+        resolve_accounts_env_path(accounts_env, default=DEFAULT_ACCOUNTS_ENV)
+    )
 
     discovered_accounts: dict[tuple[str, str], LiveAccount] = {}
 
@@ -978,7 +972,7 @@ async def discover_configured_accounts(
                     }
                 },
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping cTrader account discovery because of runtime error",
                 extra={"data": {"error": repr(exc)}},
@@ -991,7 +985,7 @@ async def discover_configured_accounts(
                 credentials["secret_key"],
                 bool(credentials["paper"]),
             )
-        except Exception as exc:
+        except Exception as exc:  # except-kind: loop-survival
             logger.warning(
                 "Skipping Alpaca account discovery for credential block",
                 extra={

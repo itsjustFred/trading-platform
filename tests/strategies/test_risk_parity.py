@@ -598,6 +598,100 @@ def test_trade_gate_uses_drifted_holding_weight(monkeypatch):
     assert "2024-03-01" not in by_day
 
 
+@pytest.mark.parametrize(
+    ("spy_jump_day", "expect_spy_trade"),
+    [
+        ("2024-02-01", False),  # jump ON the rebalance day: invisible to the 10:00 gate
+        ("2024-01-31", True),  # the session before: visible at 10:00, the gate must react
+    ],
+)
+def test_trade_gate_ignores_the_rebalance_day_close(monkeypatch, spy_jump_day, expect_spy_trade):
+    """#259: QC's 10:00 Rebalance reads HoldingsValue/TotalPortfolioValue through the
+    PREVIOUS close — the rebalance day's own close must not move the 2% gate.
+
+    Hand computation (11 legs at 1/11, SPY +30% from the jump day on): when the jump
+    is visible the drifted SPY weight is (1/11 * 1.3) / (1 + 0.3/11) = 0.11503, a
+    delta of 0.0909 - 0.11503 = -0.0241 against the 1/11 target (> 2% gate, SPY is
+    trimmed). When the jump lands ON the rebalance day the 10:00 decision cannot
+    see it: every leg still reads 1/11, delta 0, nothing trades — even though the
+    MOC fill at that day's close does observe the new price.
+    """
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    prices.loc[prices.index >= pd.Timestamp(spy_jump_day), "SPY"] = 130.0
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    feb_trades = [
+        trade for trade in result["trades"] if trade["exit_time"].startswith("2024-02-01")
+    ]
+    # Exact symbol set, not just SPY membership: a regression trading ANOTHER leg on
+    # the rebalance day must fail too. The other legs drift only ~0.0024 off target.
+    assert {t["symbol"] for t in feb_trades} == ({"SPY"} if expect_spy_trade else set())
+
+
+def test_carried_book_weight_marks_through_the_rebalance_day_close(monkeypatch):
+    """#259: a leg kept by the 2% gate still carries its weight book marked through the
+    rebalance-day close (the MOC fill bar) — NOT the previous-close gate mark.
+
+    Hand computation (11 legs at 1/11, SPY +1% ON 2024-02-01 and flat after): the gate
+    reads every leg at 1/11 through the Jan-31 close (delta 0, nothing trades). The
+    carried book marks through the Feb-1 close: SPY = (1/11 * 1.01) / (1 + 0.01/11)
+    = 1.01/11.01, every other leg = (1/11) / (11.01/11) = 1/11.01. Carrying the gate
+    weight instead would store 1/11 for all legs and silently flatten the drift the
+    published equity curve then compounds.
+    """
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    prices.loc[dates >= pd.Timestamp("2024-02-01"), "SPY"] = 101.0
+    _mock_flat_pipeline(monkeypatch, lambda: {t: 1.0 / len(TICKERS) for t in TICKERS})
+
+    result = run_backtest(
+        start_date=str(dates[0].date()),
+        end_date=str(dates[-1].date()),
+        prices=prices,
+        open_prices=prices,
+        warm_up_days=0,
+    )
+
+    feb = result["rebalance_schedule"][pd.Timestamp("2024-02-01")]
+    assert feb["SPY"] == pytest.approx(1.01 / 11.01, rel=1e-9)
+    for ticker in TICKERS:
+        if ticker != "SPY":
+            assert feb[ticker] == pytest.approx(1.0 / 11.01, rel=1e-9)
+
+
+def test_stale_gate_mark_is_logged_when_a_return_bar_is_dropped(monkeypatch, caplog):
+    """#259: a missing close drops that return bar and the next, so the gate mark can be
+    older than the previous session — staler than QC's 10:00 snapshot, never ahead of
+    it. The rebalance must say so instead of silently using the older mark."""
+    _patch_equal_weights(monkeypatch)
+    dates = pd.bdate_range("2023-12-27", "2024-03-15")
+    dates = dates[dates != pd.Timestamp("2024-01-01")]
+    prices = pd.DataFrame(100.0, index=dates, columns=TICKERS)
+    # NaN on 2024-02-28 drops the Feb-28 AND Feb-29 return bars; at the Mar-1
+    # rebalance the gate marks through Feb-27 while the previous session is Feb-29.
+    prices.loc[pd.Timestamp("2024-02-28"), "QQQ"] = np.nan
+    with caplog.at_level("WARNING"):
+        run_backtest(
+            start_date=str(dates[0].date()),
+            end_date=str(dates[-1].date()),
+            prices=prices,
+            open_prices=prices,
+            warm_up_days=0,
+        )
+    assert any("drift gate marks through" in r.message for r in caplog.records)
+
+
 def test_portfolio_value_is_buy_and_hold_between_rebalances():
     """Hand computation: 50% SPY, then SPY x1.25 and x0.8 (net 1.0).
 
