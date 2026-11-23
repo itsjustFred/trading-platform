@@ -91,6 +91,17 @@ ISOLATED_DOTENV_FILE.write_text("", encoding="utf-8")
 
 os.environ["DATA_DIR"] = str(TEST_DATA_DIR)
 os.environ["TRADING_DATA_DIR"] = str(TEST_DATA_DIR)
+# A developer's shell or .env must never turn the test suite into an alert
+# source: the ops alert sink reads OPS_ALERT_WEBHOOK_URL from the environment.
+# Set it blank rather than popping it: shared.constants load_dotenv() fills in
+# missing variables from .env, but never overrides one that is already set, and
+# create_sink_from_env treats blank as disabled.
+os.environ["OPS_ALERT_WEBHOOK_URL"] = ""
+# Same reasoning for the alert filters: a developer's environment must not
+# change which records the suite's alert-sink tests see.
+os.environ["OPS_ALERT_MIN_LEVEL"] = ""
+os.environ["OPS_ALERT_EVENTS"] = ""
+os.environ["OPS_ALERT_IGNORE"] = ""
 os.environ["LOG_DIR"] = str(TEST_LOG_DIR)
 # Removed rather than redirected: an exported TP_ACCOUNTS_ENV names a real credential file, and
 # nothing in the suite may read one. Removing it leaves exactly one redirect in play - the roster

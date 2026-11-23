@@ -136,7 +136,9 @@ class TestEngineHardError:
             end_date="2024-01-31",
             initial_capital=100_000,
             modeling_resolution="main_timeframe",
-            parameters={},
+            # Slippage is declared so the run reaches the FEE gate this
+            # test exercises; an undeclared slippage refuses even earlier.
+            parameters={"slippage": "none"},
         )
         engine = TradeEngine(cfg, symbol="TEST")
         with pytest.raises(ValueError, match="Missing fee/slippage config"):
