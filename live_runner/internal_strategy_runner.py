@@ -333,7 +333,7 @@ def _flip_opted_in(settings: Any) -> bool:
     return str(value).strip().lower() in _FLIP_OPT_IN_TOKENS
 
 
-def _multi_lot_cap_refusal(
+async def _multi_lot_cap_refusal(
     adapter: BaseLiveAdapter, deployment: LiveDeploymentConfig, cap: int
 ) -> str | None:
     """Why a per-symbol cap above 1 is refused on this account, or ``None``.
@@ -342,19 +342,35 @@ def _multi_lot_cap_refusal(
     refused (entries disabled, exits keep flowing - the same fail-closed
     shape as an unusable cap) on Alpaca accounts until #350 lands, because a
     netted Alpaca book reserves bracket-leg quantity a second lot's exit
-    cannot prove; and on any deployment carrying the live ``supertrend_flip``
-    opt-in, because the flip manager requires exactly one broker position
-    per symbol.
+    cannot prove; on cTrader accounts that cannot prove they hedge positions
+    (``ProtoOAAccountType`` NETTED or unreadable), because a netted cTrader
+    book merges several entries into one position whose per-lot exit cannot
+    be sized safely; and on any deployment carrying the live
+    ``supertrend_flip`` opt-in, because the flip manager requires exactly
+    one broker position per symbol.
     """
     if cap <= 1:
         return None
-    if _adapter_calendar_source(adapter) == "alpaca":
+    source = _adapter_calendar_source(adapter)
+    if source == "alpaca":
         return (
             f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on Alpaca accounts "
             "until #350 lands: a netted book cannot prove a per-lot exit "
             "against bracket-leg quantity reservations. Set the cap to 1 "
             "or wait for #350; entries are disabled, exits still evaluated."
         )
+    if source == "ctrader":
+        account_type = await _adapter_account_type(adapter)
+        if account_type != "hedged":
+            return (
+                f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} is refused on cTrader "
+                f"accounts that are not proven hedging (account type: "
+                f"{account_type or 'unreadable'}): a netted book merges "
+                "several entries into one position, so a per-lot exit "
+                "cannot be sized safely. Set the cap to 1 or move the "
+                "deployment to a hedging account; entries are disabled, "
+                "exits still evaluated."
+            )
     if _flip_opted_in(deployment.settings):
         return (
             f"{MAX_OPEN_PER_SYMBOL_KEY}={cap} cannot be combined with the "
@@ -364,6 +380,22 @@ def _multi_lot_cap_refusal(
             "evaluated."
         )
     return None
+
+
+async def _adapter_account_type(adapter: BaseLiveAdapter) -> str | None:
+    """The adapter's proven account type, or ``None`` when it cannot say.
+
+    Only ``CTraderLiveAdapter`` exposes ``account_type``; any other adapter
+    routed here by name returns ``None``, which the caller treats as "not
+    proven hedging" - the fail-closed direction.
+    """
+    getter = getattr(adapter, "account_type", None)
+    if not callable(getter):
+        return None
+    try:
+        return await getter()
+    except Exception:  # except-kind: money-decision
+        return None
 
 
 def _adapter_calendar_source(adapter: BaseLiveAdapter) -> str:
@@ -1491,7 +1523,7 @@ class InternalStrategyRunner:
                 )
                 max_open_per_symbol = 0
             if max_open_per_symbol > 1:
-                refusal = _multi_lot_cap_refusal(
+                refusal = await _multi_lot_cap_refusal(
                     adapter, deployment, max_open_per_symbol
                 )
                 if refusal is not None:

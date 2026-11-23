@@ -2142,3 +2142,162 @@ def test_strategy_exit_with_no_working_entries_skips_cancel(
 
     assert calls == []
     assert len(sent) == 1
+
+
+class _CTraderFakeAdapter(FakeAdapter):
+    """Name carries 'ctrader' so ``_adapter_calendar_source`` routes it."""
+
+    def __init__(self, *args: Any, acct_type: Any = "hedged", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._acct_type = acct_type
+
+    async def account_type(self) -> Any:
+        if isinstance(self._acct_type, Exception):
+            raise self._acct_type
+        return self._acct_type
+
+
+def test_multi_lot_cap_is_refused_on_netted_ctrader(tmp_path: Path) -> None:
+    """#382 maintainer decision: ``internal_max_open_per_symbol > 1`` is
+    refused on cTrader accounts that cannot prove they hedge - a netted
+    book merges several entries into one position whose per-lot exit cannot
+    be sized safely. Entries disable, exits flow."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _CTraderFakeAdapter(acct_type="netted")},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert sent == []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def test_multi_lot_cap_is_refused_when_ctrader_account_type_unreadable(
+    tmp_path: Path,
+) -> None:
+    """Fail closed: an account type the adapter cannot prove is treated as
+    not-hedging, so the cap is refused rather than guessed."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _CTraderFakeAdapter(acct_type=RuntimeError("trader down"))},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert sent == []
+    assert (str(deployment.id), "open_position_cap") in runner._reported
+
+
+def _continuous_calendar_runner(
+    submit: Any, *, path: Path, module: Any, **kwargs: Any
+) -> InternalStrategyRunner:
+    """A runner whose venue calendar always resolves 24/7.
+
+    The cTrader source has no built-in US-equity calendar model, so a
+    ``*ctrader*``-named fake adapter cannot prove AAPL's session and the
+    symbol fails closed before the cap check matters. These tests pin the
+    cap refusal, not the calendar, so the calendar is stubbed continuous.
+    """
+    from shared import venue_calendar
+
+    runner = _runner(submit, path=path, module=module, **kwargs)
+    runner._symbol_calendar = lambda adapter, symbol: venue_calendar.ContinuousCalendar()
+    return runner
+
+
+def test_multi_lot_cap_is_allowed_on_hedged_ctrader(tmp_path: Path) -> None:
+    """The refusal is account-type-scoped: a proven HEDGED cTrader account
+    keeps the #382 multi-lot behaviour."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _continuous_calendar_runner(
+        submit, path=path, module=_module_with(_entry_strategy)
+    )
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 2})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _CTraderFakeAdapter(acct_type="hedged")},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert len(sent) == 1
+
+
+def test_netted_ctrader_refusal_is_cap_scoped(tmp_path: Path) -> None:
+    """Cap 1 is the maintainer-approved default shape and must keep trading
+    even on a netted account - the refusal only gates cap > 1."""
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _continuous_calendar_runner(
+        submit, path=path, module=_module_with(_entry_strategy)
+    )
+    deployment = _deployment(settings={"internal_max_open_per_symbol": 1})
+
+    asyncio.run(
+        runner.run_once(
+            [deployment],
+            {"acct-1": _CTraderFakeAdapter(acct_type="netted")},
+            now=BASE + timedelta(seconds=70),
+        )
+    )
+
+    assert len(sent) == 1
+
+
+def test_entry_cancel_waits_on_the_account_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#402 semantics pin: the cancel runs inside
+    ``account_order_placement(account_id)`` - held here, the cancel must
+    wait rather than race another section's read->submit."""
+    import live_runner.internal_strategy_runner as runner_mod
+    from live_runner.account_order_lock import account_order_placement
+    from live_runner.base_adapter import ControlOutcome
+
+    cancelled: list[tuple[set[str], str]] = []
+
+    class _CancellingAdapter(FakeAdapter):
+        async def cancel_orders(self, order_refs, *, symbol):
+            cancelled.append((set(order_refs), symbol))
+            return ControlOutcome(completed=len(order_refs))
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id, symbol=None: {"sig-open"},
+    )
+    path = _strategy_file(tmp_path, META)
+    _sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    deployment = _deployment()
+    adapter = _CancellingAdapter()
+
+    async def scenario() -> None:
+        async with account_order_placement(str(deployment.account_id)):
+            task = asyncio.create_task(
+                runner._cancel_working_entry_orders(adapter, deployment, "AAPL")
+            )
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            assert cancelled == []
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(scenario())
+
+    assert cancelled == [({"sig-open"}, "AAPL")]

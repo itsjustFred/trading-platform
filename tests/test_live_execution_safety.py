@@ -6112,3 +6112,50 @@ def test_targeted_partial_exit_keeps_lot_residual_sizing(monkeypatch):
     assert qty == pytest.approx(1.0)
     assert prepared.metadata["exit_ledger_qty"] == pytest.approx(2.0)
     assert alerts == []
+
+
+def test_netted_shared_position_exits_size_off_lot_residuals(monkeypatch):
+    """#382 maintainer decision, composed: on a netted cTrader book the
+    resolver cannot pin a lot to the shared position (its opener set is not
+    exclusive, so ``resolve_exit_position_target`` returns ``None``), and
+    each targeted exit then sizes off its own lot residual. The fan-out
+    closes exactly the broker volume - 5 + 3 = 8 - with no ledger-mismatch
+    alert and no position pinning."""
+    import live_runner.daemon as daemon
+
+    alerts: list[Any] = []
+
+    async def _alert(*args: Any, **kwargs: Any) -> None:
+        alerts.append((args, kwargs))
+
+    monkeypatch.setattr(daemon, "_alert_ledger_mismatch", _alert)
+
+    positions = [{"symbol": "EURUSD", "qty": 8.0, "position_id": 10}]
+    lots = [_lot("entry-1", qty=5.0), _lot("entry-2", qty=3.0)]
+
+    prepared_a, qty_a = _prepare_targeted_exit(
+        monkeypatch,
+        positions,
+        ledger_qty=8.0,
+        lots=lots,
+        target="entry-1",
+        resolved_position_id=None,
+    )
+    prepared_b, qty_b = _prepare_targeted_exit(
+        monkeypatch,
+        positions,
+        ledger_qty=8.0,
+        lots=lots,
+        target="entry-2",
+        resolved_position_id=None,
+    )
+
+    assert qty_a == pytest.approx(5.0)
+    assert qty_b == pytest.approx(3.0)
+    assert qty_a + qty_b == pytest.approx(8.0)
+    # The single netted row is still addressed - but at the LOT residual,
+    # never the whole position: that is what the failed exclusivity proof
+    # used to get wrong (qty 8 for lot A).
+    assert prepared_a.metadata["position_id"] == 10
+    assert prepared_b.metadata["position_id"] == 10
+    assert alerts == []

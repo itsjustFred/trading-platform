@@ -378,8 +378,12 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   non-integers, booleans, or values above 5 — fails closed: **entries are
   disabled for the deployment but exits keep flowing** — a bad cap must
   never suppress an exit on an open position. Open positions are counted
-  from the deployment's own persisted ledger with oldest-first FIFO
-  attribution of reducing fills; an entry with no fills counts only while
+  from the deployment's own persisted ledger; a reducing fill is credited
+  to the entry it names first — `exit_target_signal_id` on a targeted
+  per-lot exit, `parent_signal_id` on a broker-side close — before any
+  oldest-first FIFO pooling of unattributed reductions, and a named lot
+  floors at zero rather than lending excess to siblings. An entry with
+  no fills counts only while
   the broker still lists its order as working or holds a non-zero position
   in the symbol (a filled-but-unbooked entry is not working, so the
   position is what proves it open), so a canceled or expired unfilled
@@ -390,6 +394,28 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   the same way — exits still evaluate; if the per-lot ledger cannot be
   read, exits fall back to a single untargeted close (a hedging broker
   then refuses the ambiguous close rather than guess).
+  **Account-shape refusals (cap > 1):** the cap above 1 is refused —
+  entries disabled, exits still evaluated — on Alpaca accounts until
+  #350 lands (a netted book cannot prove a per-lot exit against
+  bracket-leg reservations), on cTrader accounts that cannot prove they
+  hedge positions (`ProtoOAAccountType` NETTED or unreadable: a netted
+  book merges several entries into one position whose per-lot exit cannot
+  be sized safely), and on any deployment carrying the
+  `live_supertrend_flip` opt-in (the flip workflow manages exactly one
+  position per symbol). On a *hedging* cTrader book each targeted exit is
+  pinned to the position its entry opened — but only when that position's
+  opening orders belong exclusively to the entry's signal; a position
+  shared with other openers (a netted book, or a scale-in the ledger
+  cannot attribute) resolves to no pin and the exit sizes off the lot
+  residual on the single broker row instead. The resolver's per-position
+  order reads are cached inside the account lock only while the
+  position's broker volume is unchanged — a cached read may never be the
+  stale proof that pins a lot to a shared position.
+  **Entry-order retirement:** a strategy exit also cancels this
+  deployment's still-working *entry* orders for the symbol (by broker
+  order id or client order id, inside the per-account order-placement
+  lock) before the exits go out, so a late fill cannot open a lot past
+  the close. Position protections are never in the cancellable set.
   A same-bar reversal (exit + new entry on one bar) emits the exit but the
   entry waits one bar: the closing position still counts against the cap
   until the next evaluation.
