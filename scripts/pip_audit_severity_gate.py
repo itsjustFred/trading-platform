@@ -82,11 +82,11 @@ def _cvss3_base_score(vector: str) -> float | None:
     """
     if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
         return None
-    metrics = dict(
-        part.split(":", 1)
+    metrics = {
+        part.split(":", 1)[0]: part.split(":", 1)[1]
         for part in vector.split("/", 1)[1].split("/")
         if ":" in part
-    )
+    }
     try:
         av = _AV[metrics["AV"]]
         ac = _AC[metrics["AC"]]
@@ -130,6 +130,24 @@ def _record_score(record: dict[str, Any]) -> float | None:
     return best
 
 
+def _best_score(records: list[dict[str, Any]]) -> float | None:
+    """Highest CVSS base score across every candidate OSV record.
+
+    A vuln id and its aliases can each resolve to a distinct OSV record
+    with its own severity entries, and they do not always agree. The gate
+    scores the *worst* of them: taking the first record found would let a
+    low-scored primary mask a high-scored alias (a false green), while an
+    unscored record must not hide a scored sibling either. ``None`` is
+    returned only when no candidate record carries a CVSS v3 score at all.
+    """
+    best: float | None = None
+    for record in records:
+        score = _record_score(record)
+        if score is not None and (best is None or score > best):
+            best = score
+    return best
+
+
 def _findings_from_report(report: dict[str, Any]) -> list[Finding]:
     dependencies = report.get("dependencies")
     if not isinstance(dependencies, list):
@@ -150,6 +168,24 @@ def _findings_from_report(report: dict[str, Any]) -> list[Finding]:
     return findings
 
 
+def _skipped_dependencies(report: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """Dependencies pip-audit skipped, as (name, version, skip_reason).
+
+    A skipped package was never audited, so it cannot produce a finding -
+    printing it keeps a silently uncovered package visible in the log
+    instead of letting the green/yellow summary imply full coverage.
+    """
+    dependencies = report.get("dependencies")
+    if not isinstance(dependencies, list):
+        return []
+    skipped = []
+    for dep in dependencies:
+        reason = dep.get("skip_reason")
+        if reason and dep.get("name"):
+            skipped.append((str(dep["name"]), str(dep.get("version") or "?"), str(reason)))
+    return skipped
+
+
 def _fetch_json(url: str) -> Any:
     with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -158,13 +194,17 @@ def _fetch_json(url: str) -> Any:
 def _make_lookup(
     osv_url: str,
     fetch_json: Callable[[str], Any],
-) -> Callable[[str, tuple[str, ...]], dict[str, Any] | None]:
-    """OSV record lookup by vuln id with alias fallback, cached across calls."""
+) -> Callable[[str, tuple[str, ...]], list[dict[str, Any]]]:
+    """OSV record lookup by vuln id with alias fallback, cached across calls.
+
+    Returns *every* candidate record that resolved, not just the first:
+    aliases are scored alongside the primary id (see :func:`_best_score`).
+    """
     cache: dict[str, dict[str, Any] | None] = {}
     lock = threading.Lock()
 
-    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> dict[str, Any] | None:
-        candidates = (vuln_id, *aliases)
+    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> list[dict[str, Any]]:
+        candidates = tuple(dict.fromkeys((vuln_id, *aliases)))
         with lock:
             pending = [c for c in candidates if c not in cache]
         for candidate in pending:
@@ -174,25 +214,21 @@ def _make_lookup(
                 record = None
             with lock:
                 cache[candidate] = record if isinstance(record, dict) else None
-        for candidate in candidates:
-            with lock:
-                record = cache.get(candidate)
-            if record is not None:
-                return record
-        return None
+        with lock:
+            return [cache[c] for c in candidates if cache.get(c) is not None]
 
     return lookup
 
 
 def _records_lookup(
     records: dict[str, dict[str, Any] | None],
-) -> Callable[[str, tuple[str, ...]], dict[str, Any] | None]:
-    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> dict[str, Any] | None:
-        for candidate in (vuln_id, *aliases):
-            record = records.get(candidate)
-            if record is not None:
-                return record
-        return None
+) -> Callable[[str, tuple[str, ...]], list[dict[str, Any]]]:
+    def lookup(vuln_id: str, aliases: tuple[str, ...]) -> list[dict[str, Any]]:
+        return [
+            record
+            for candidate in dict.fromkeys((vuln_id, *aliases))
+            if (record := records.get(candidate)) is not None
+        ]
 
     return lookup
 
@@ -216,10 +252,10 @@ def evaluate(
     return [
         FindingResult(
             finding=finding,
-            score=_record_score(record) if record else None,
+            score=_best_score(records_for_finding),
             threshold=threshold,
         )
-        for finding, record in zip(findings, osv_records, strict=True)
+        for finding, records_for_finding in zip(findings, osv_records, strict=True)
     ]
 
 
@@ -245,6 +281,12 @@ def main(
     except (OSError, ValueError) as exc:
         print(f"pip-audit report unreadable: {exc}", file=sys.stderr)
         return 2
+
+    skipped = _skipped_dependencies(report)
+    for name, version, reason in skipped:
+        print(f"SKIP {name}=={version} (not audited: {reason})")
+    if skipped:
+        print(f"{len(skipped)} dependencies skipped by pip-audit - unaudited")
 
     results = evaluate(
         findings,

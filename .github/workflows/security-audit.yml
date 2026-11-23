@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.10.4"
@@ -44,7 +44,9 @@ jobs:
           # --python 3.12 matches the project's only supported interpreter;
           # without it uvx may resolve a different python for the audit env.
           # pip-audit is pinned exactly, like the dev tools in pyproject.
-          uvx --python 3.12 --from pip-audit==2.10.1 pip-audit \
+          # --no-build keeps uvx from ever running an sdist setup script;
+          # pip-audit ships wheels, so nothing is lost.
+          uvx --no-build --python 3.12 --from pip-audit==2.10.1 pip-audit \
             --no-deps -r requirements.txt --format json \
             --output pip-audit-report.json
           status=$?
@@ -67,8 +69,8 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm

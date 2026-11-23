@@ -120,6 +120,53 @@ def test_alias_fallback_finds_the_osv_record() -> None:
     assert rows[0].blocked
 
 
+def test_high_scored_alias_is_not_masked_by_low_scored_primary() -> None:
+    """The severity is the max over every candidate record, not the first."""
+    report = _report(("demo", "1.0", [_vuln("PYSEC-1", ["GHSA-high"])]))
+    records = {
+        "PYSEC-1": _osv_record(MODERATE_VECTOR, vuln_id="PYSEC-1"),
+        "GHSA-high": _osv_record(HIGH_VECTOR, vuln_id="GHSA-high"),
+    }
+    rows = gate.evaluate(
+        gate._findings_from_report(report),
+        threshold=7.0,
+        records=records,
+    )
+    assert rows[0].score == pytest.approx(7.5)
+    assert rows[0].blocked
+
+
+def test_unscored_primary_does_not_hide_scored_alias() -> None:
+    """An unscored record is not UNKNOWN while a scored sibling exists."""
+    report = _report(("demo", "1.0", [_vuln("PYSEC-1", ["GHSA-med"])]))
+    records = {
+        "PYSEC-1": {"id": "PYSEC-1", "severity": []},
+        "GHSA-med": _osv_record(MODERATE_VECTOR, vuln_id="GHSA-med"),
+    }
+    rows = gate.evaluate(
+        gate._findings_from_report(report),
+        threshold=7.0,
+        records=records,
+    )
+    assert rows[0].score == pytest.approx(3.1)
+    assert not rows[0].blocked
+
+
+def test_unscored_everywhere_is_unknown() -> None:
+    report = _report(("demo", "1.0", [_vuln("PYSEC-1", ["GHSA-x"])]))
+    records = {
+        "PYSEC-1": {"id": "PYSEC-1", "severity": []},
+        "GHSA-x": {"id": "GHSA-x"},
+    }
+    rows = gate.evaluate(
+        gate._findings_from_report(report),
+        threshold=7.0,
+        records=records,
+    )
+    assert rows[0].score is None
+    assert rows[0].blocked
+
+
 def test_main_exit_codes(tmp_path, capsys) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
@@ -132,7 +179,8 @@ def test_main_exit_codes(tmp_path, capsys) -> None:
         records=records,
     ) == 1
     out = capsys.readouterr().out
-    assert "demo" in out and "PYSEC-1" in out
+    assert "demo" in out
+    assert "PYSEC-1" in out
 
     clean_path = tmp_path / "clean.json"
     clean_path.write_text(
@@ -148,6 +196,42 @@ def test_main_exit_codes(tmp_path, capsys) -> None:
         [str(clean_path), "--osv-url", "https://osv.test"],
         records=clean_records,
     ) == 0
+
+
+def test_main_reports_dependencies_pip_audit_skipped(tmp_path, capsys) -> None:
+    report_path = tmp_path / "report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "dependencies": [
+                    {
+                        "name": "demo",
+                        "version": "1.0",
+                        "vulns": [_vuln("PYSEC-ok")],
+                    },
+                    {
+                        "name": "skipped-pkg",
+                        "version": "2.0",
+                        "skip_reason": "could not be audited",
+                        "vulns": [],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    records = {
+        "PYSEC-ok": _osv_record(
+            "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:N/I:N/A:L"
+        )
+    }
+    assert gate.main(
+        [str(report_path), "--osv-url", "https://osv.test"],
+        records=records,
+    ) == 0
+    out = capsys.readouterr().out
+    assert "SKIP skipped-pkg==2.0" in out
+    assert "not audited" in out
 
 
 def test_main_rejects_missing_or_malformed_report(tmp_path) -> None:
