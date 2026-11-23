@@ -58,12 +58,36 @@ def test_validate_config_rejects_truthy_use_trailing_sl(value):
 
 @pytest.mark.parametrize(
     "parameters",
-    [{}, {"use_trailing_sl": False}, {"use_trailing_sl": "false"}],
+    [
+        {},
+        {"use_trailing_sl": False},
+        {"use_trailing_sl": None},
+        {"use_trailing_sl": 0},
+        {"use_trailing_sl": 0.0},
+        {"use_trailing_sl": "false"},
+        {"use_trailing_sl": "0"},
+        {"use_trailing_sl": "no"},
+        {"use_trailing_sl": "off"},
+        {"use_trailing_sl": ""},
+        {"use_trailing_sl": " FALSE "},
+    ],
 )
 def test_validate_config_allows_absent_or_false_use_trailing_sl(parameters):
     errors = NativeAdapter().validate_config(_config(parameters))
 
     assert not any(TRAILING_ERROR in error for error in errors)
+    assert not any("not a recognised boolean" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["maybe", "2", "n", "enabled", [], {}, [True], float("nan"), float("inf")],
+)
+def test_validate_config_rejects_ambiguous_use_trailing_sl(value):
+    """Values that are neither a boolean nor a known token are refused, not coerced."""
+    errors = NativeAdapter().validate_config(_config({"use_trailing_sl": value}))
+
+    assert any("not a recognised boolean" in error for error in errors)
 
 
 def test_native_run_rejects_use_trailing_sl_before_loading_data(tmp_path, monkeypatch):
@@ -137,3 +161,111 @@ def test_preflight_allows_literal_false_signature_default(tmp_path):
     errors = native_strategy_parameter_errors(strategy, {})
 
     assert not any(TRAILING_ERROR in error for error in errors)
+
+
+def test_strategy_parameter_default_survives_unparseable_source(tmp_path):
+    """A source ast.parse cannot handle must fall back to None, not propagate.
+
+    RecursionError/MemoryError/ValueError (e.g. null bytes) used to escape
+    ``strategy_parameter_default`` and surface as a 500 in the viewer or an
+    aborted CLI/grid run; the imported-signature check stays the authority.
+    """
+    from runner.engines.base import strategy_parameter_default
+
+    strategy = tmp_path / "broken_signature.py"
+    strategy.write_bytes(b"def generate_signals(df, use_trailing_sl=True):\n\x00")
+
+    assert strategy_parameter_default(strategy, "use_trailing_sl") is None
+
+
+def _load_custom_swings_supertrend():
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "strategies"
+        / "custom_swings_supertrend"
+        / "custom_swings_supertrend.py"
+    )
+    spec = importlib.util.spec_from_file_location("custom_swings_supertrend", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _trailing_fixture_df():
+    import numpy as np
+    import pandas as pd
+
+    close = np.concatenate(
+        [
+            np.linspace(100, 80, 120),
+            np.linspace(80, 130, 60),
+            np.linspace(130, 150, 60),
+            np.linspace(150, 110, 60),
+        ]
+    )
+    return pd.DataFrame(
+        {
+            "open": np.roll(close, 1),
+            "high": close * 1.005,
+            "low": close * 0.995,
+            "close": close,
+            "volume": 1000.0,
+        }
+    )
+
+
+def _signal_frame(result):
+    entries, exits, indicators, _ = result
+    return entries, exits, indicators
+
+
+def _signals_equal(first, second) -> bool:
+    entries_a, exits_a, indicators_a = first
+    entries_b, exits_b, indicators_b = second
+    return (
+        entries_a.equals(entries_b)
+        and exits_a.equals(exits_b)
+        and indicators_a.keys() == indicators_b.keys()
+        and all(indicators_a[key].equals(indicators_b[key]) for key in indicators_a)
+    )
+
+
+def test_kwargs_style_false_string_does_not_trail_or_take_profit():
+    """Regression: the native engine calls generate_signals kwargs-style, where
+    the legacy params-dict coercion never ran — a string "false" stayed
+    truthy. The strategy must now coerce its boolean switches on every call.
+    """
+    module = _load_custom_swings_supertrend()
+    df = _trailing_fixture_df()
+    base = dict(
+        st_period=3,
+        st_multiplier=2.0,
+        ema_fast=3,
+        ema_slow=5,
+        ema_filter_enabled=False,
+        use_rrr=False,
+        risk_reward=1.0,
+        use_breakeven=False,
+        use_trailing_sl=False,
+        trade_direction="long",
+    )
+
+    # Sanity: the fixture produces a real trade so the comparison is meaningful.
+    entries, _, _, _ = module.generate_signals(df, **base)
+    assert int(entries.sum()) > 0
+
+    def run(**overrides):
+        return _signal_frame(module.generate_signals(df, **{**base, **overrides}))
+
+    # "false" must behave exactly like False — before the fix it stayed a
+    # truthy string and enabled fixed-RR take-profit exits.
+    assert _signals_equal(run(use_rrr="false"), run(use_rrr=False))
+    assert _signals_equal(run(use_rrr="true"), run(use_rrr=True))
+    assert not _signals_equal(run(use_rrr=True), run(use_rrr=False))
+
+    # Same for the trailing switch itself.
+    assert _signals_equal(run(use_trailing_sl="false"), run(use_trailing_sl=False))
+    assert _signals_equal(run(use_trailing_sl="0"), run(use_trailing_sl=False))

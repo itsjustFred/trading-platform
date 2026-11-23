@@ -868,6 +868,10 @@ def write_matrix_csv(output_dir: Path, rows: list[dict[str, Any]]) -> Path:
 def _assert_native_strategy_parameters(engine: str, strategy: str, params: dict[str, Any]) -> None:
     if str(engine).strip().lower() != "native":
         return
+    # Every grid cell runs with this same ``params`` dict (cells differ only by
+    # symbol/timeframe — there is no per-cell parameter sweep), so checking it
+    # once here refuses a trailing-stop request up front for the whole grid.
+    # ``NativeAdapter.run`` repeats the check per cell as a backstop.
     parameter_errors = native_strategy_parameter_errors(strategy, params)
     if parameter_errors:
         raise ValueError("; ".join(parameter_errors))

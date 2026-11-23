@@ -196,9 +196,11 @@ def read_strategy_source(path: Path, strategies_dir: Path | None = None) -> str 
     """Return a strategy file's source without executing it.
 
     Uses the same containment rule as :func:`load_strategy_meta`: the default
-    root is the repository strategy tree, while engine runs for an explicit
-    user-selected path pass the file's own directory (the run already trusts
-    that path — see :func:`runner.engines.base.resolve_strategy_parameters`).
+    root is the repository strategy tree, while engine callers pass the file's
+    own directory — ``resolved.parent`` — which makes the containment check
+    vacuous (a file is always inside its own parent). Engine callers therefore
+    bypass containment entirely and rely on the path already being trusted
+    (see :func:`runner.engines.base.resolve_strategy_parameters`).
     """
     return _contained_strategy_source(path, strategies_dir or DEFAULT_STRATEGIES_DIR)
 

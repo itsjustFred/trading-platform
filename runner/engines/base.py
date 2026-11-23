@@ -105,14 +105,33 @@ def warn_if_engine_frozen(name: str, *, stacklevel: int = 2) -> None:
 
 NATIVE_TRAILING_SL_PARAM = "use_trailing_sl"
 _TRAILING_SL_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_TRAILING_SL_FALSE_STRINGS = frozenset({"", "0", "false", "no", "off"})
 
 
-def _parameter_requests_trailing_sl(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
+def _trailing_sl_request(value: Any) -> str:
+    """Classify a ``use_trailing_sl`` value as ``"true"``, ``"false"`` or ``"invalid"``.
+
+    Only unambiguous booleans, ``None``, numeric 0/non-zero and the known
+    true/false string tokens are accepted. Anything else — including strings
+    like ``"maybe"`` that Python's ``bool()`` would silently coerce — is
+    ``"invalid"`` so the caller can refuse it rather than guess.
+    """
+    if value is None or value is False:
+        return "false"
+    if value is True:
+        return "true"
     if isinstance(value, str):
-        return value.strip().lower() in _TRAILING_SL_TRUE_STRINGS
-    return bool(value)
+        token = value.strip().lower()
+        if token in _TRAILING_SL_TRUE_STRINGS:
+            return "true"
+        if token in _TRAILING_SL_FALSE_STRINGS:
+            return "false"
+        return "invalid"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return "invalid"
+        return "true" if value != 0 else "false"
+    return "invalid"
 
 
 def _literal_default(node: ast.AST | None) -> Any:
@@ -158,7 +177,7 @@ def strategy_parameter_default(strategy_path: str | Path, name: str) -> Any:
         return None
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
         return None
     return _literal_default(_generate_signals_defaults(tree).get(name))
 
@@ -168,13 +187,22 @@ def native_parameter_errors(parameters: dict[str, Any] | None) -> list[str]:
 
     Maintainer decision (2026-11-23): until the strategies are rebuilt, native
     must refuse ``use_trailing_sl=true`` rather than compute a fixed stop and
-    call it a trailing stop.
+    call it a trailing stop. Values that are not an unambiguous boolean or a
+    known true/false token are refused as invalid — never silently coerced.
     """
-    if _parameter_requests_trailing_sl((parameters or {}).get(NATIVE_TRAILING_SL_PARAM)):
+    parameters = parameters or {}
+    state = _trailing_sl_request(parameters.get(NATIVE_TRAILING_SL_PARAM))
+    if state == "true":
         return [
             "parameters.use_trailing_sl=true requests a trailing stop, but "
             "trailing stops are not modelled by the native engine; set "
             "use_trailing_sl=false or choose a path that models trailing stops"
+        ]
+    if state == "invalid":
+        return [
+            f"parameters.use_trailing_sl={parameters.get(NATIVE_TRAILING_SL_PARAM)!r} "
+            "is not a recognised boolean or true/false token; use a boolean or "
+            "one of 'true'/'1'/'yes'/'on' or 'false'/'0'/'no'/'off'"
         ]
     return []
 
