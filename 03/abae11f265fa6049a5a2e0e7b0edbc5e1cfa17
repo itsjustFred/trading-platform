@@ -1,0 +1,25 @@
+tests/test_live_execution_safety.py
+  s_2bf89379757a94::t_8fb9e36afbeab5 6115-6161
+live_runner/ctrader_adapter.py
+  s_2bf89379757a94::t_7cc2f25c7e4cc7 676-680,957-975,1582-1594,1604-1605,1608-1616,2584-2585,3434-3459,4276,4278,4309,4511-4517,4522,4527-4529,4531-4532,4534,4538,4541,4546,4549
+tests/live_runner/test_internal_strategy_runner.py
+  s_2bf89379757a94::t_2c3455c8e1c0f4 2145-2303
+tests/test_alpaca_adapter.py
+  s_2bf89379757a94::t_59a8bf7d2f2812 2618-2719
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03abae11f265fa6049a5a2e0e7b0edbc5e1cfa17",
+  "prompts": {},
+  "sessions": {
+    "s_2bf89379757a94": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "928e2918-491e-4050-a653-50d9fa585783",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "itsjustFred <justfred.business@gmail.com>"
+    }
+  }
+}
