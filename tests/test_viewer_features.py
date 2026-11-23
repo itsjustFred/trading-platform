@@ -3626,16 +3626,21 @@ def test_signal_replay_fee_params_map_cli_style_flags():
         '"fee_rate": Infinity',
         '"fee_flat_per_trade": -1.0',
         '"fee_flat_per_trade": NaN',
+        '"fee_rate": true',
+        '"fee_rate": false',
+        '"fee_flat_per_trade": true',
+        '"fee_flat_per_trade": false',
     ],
 )
 def test_backtest_run_signals_rejects_negative_or_nonfinite_fee_params(
     viewer_client, fee_json
 ):
-    """#361: ``resolve_fee_model`` clamps negatives to 0.0, so a negative or
-    NaN declaration would silently become a zero-cost run — and inf would
-    produce non-finite fees. The boundary rejects them with a 400 instead.
-    NaN/Infinity are sent as raw JSON: httpx's ``json=`` refuses to emit them,
-    but Python's ``json.loads`` (and so the API) accepts the literals."""
+    """#361: negative, NaN, infinite or boolean fee declarations must be a 400 —
+    ``NotionalFeeModel``/``resolve_fee_model`` reject them, and the boundary
+    mirrors that validation instead of letting a bad request become a
+    zero-cost run or non-finite fees. NaN/Infinity are sent as raw JSON:
+    httpx's ``json=`` refuses to emit them, but Python's ``json.loads`` (and
+    so the API) accepts the literals."""
     body = (
         '{"signals": [{"timestamp": "2024-01-01T12:00:00Z", "symbol": "AAPL",'
         ' "action": "buy", "entry_price": 100.0}],'
