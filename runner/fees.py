@@ -21,6 +21,7 @@ never silent gross.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -75,8 +76,24 @@ class NotionalFeeModel:
     flat_per_trade: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.rate < 0 or self.flat_per_trade < 0:
-            raise ValueError("Fee rate and flat surcharge must be non-negative.")
+        try:
+            rate = float(self.rate)
+            flat = float(self.flat_per_trade)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Fee rate and flat surcharge must be finite and non-negative."
+            ) from exc
+        if (
+            not math.isfinite(rate)
+            or not math.isfinite(flat)
+            or rate < 0
+            or flat < 0
+        ):
+            raise ValueError(
+                "Fee rate and flat surcharge must be finite and non-negative."
+            )
+        object.__setattr__(self, "rate", rate)
+        object.__setattr__(self, "flat_per_trade", flat)
 
     def fee_for_trade(self, entry_price: float, exit_price: float, quantity: float) -> float:
         return self.entry_fee(entry_price, quantity) + self.exit_fee(exit_price, quantity)
@@ -116,8 +133,8 @@ def resolve_fee_model(params: dict[str, Any] | None) -> FeeModel:
         return model
     if "fee_rate" in params or "fee_flat_per_trade" in params:
         try:
-            rate = max(0.0, float(params.get("fee_rate", 0.0) or 0.0))
-            flat = max(0.0, float(params.get("fee_flat_per_trade", 0.0) or 0.0))
+            rate = float(params.get("fee_rate", 0.0) or 0.0)
+            flat = float(params.get("fee_flat_per_trade", 0.0) or 0.0)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Invalid fee params: {exc}") from exc
         return NotionalFeeModel(rate=rate, flat_per_trade=flat)

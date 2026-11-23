@@ -508,21 +508,26 @@ def resolve_same_bar_exit(
 SIGNAL_EXIT_FILL_NEXT_OPEN = "next_open"
 SIGNAL_EXIT_FILL_VALUES = frozenset({SIGNAL_EXIT_FILL_NEXT_OPEN, "close", "open"})
 
-#: Frozen bar engines that implement only the legacy signal-bar exit fills
-#: (ADR ``docs/adr/0001-native-single-strategy-engine.md``). They REFUSE a
-#: ``next_open`` config (fail loud, not warn-and-run), so entry points that
-#: select one of these engines must declare the legacy ``close`` fill
-#: explicitly — the fill the engine actually simulates is then what the
-#: persisted meta records.
-FROZEN_SIGNAL_EXIT_ENGINES = frozenset({"vectorbt", "pynecore"})
+#: Engines that do not simulate the platform's ``next_open`` signal-exit
+#: convention and REFUSE a ``next_open`` config (fail loud, not warn-and-run),
+#: so entry points that select one of these engines must declare the legacy
+#: ``close`` fill explicitly — the fill the engine actually simulates is then
+#: what the persisted meta records. ``lean`` covers the LEAN *run* path only:
+#: its fills come from LEAN itself, and the imported result records
+#: ``signal_exit_fill`` as unset ("not modelled by this platform") — see
+#: ``runner.converters.lean_converter``.
+FROZEN_SIGNAL_EXIT_ENGINES = frozenset({"vectorbt", "pynecore", "lean"})
 
 
 def default_signal_exit_fill_for_engine(engine_name: str) -> str:
     """The ``signal_exit_fill`` to declare when the caller did not choose one.
 
     ``next_open`` on native (and any engine without a frozen guard); the
-    legacy ``close`` signal-bar fill on the frozen bar engines, matching the
-    semantics they have always simulated.
+    legacy ``close`` signal-bar fill on the frozen bar engines and on the
+    LEAN run path, matching the semantics they have always simulated. For
+    LEAN this is only the declared config value — the persisted result meta
+    records ``signal_exit_fill`` as unset because LEAN's own fill model is
+    not a platform convention.
     """
     if str(engine_name or "").strip().lower() in FROZEN_SIGNAL_EXIT_ENGINES:
         return "close"
