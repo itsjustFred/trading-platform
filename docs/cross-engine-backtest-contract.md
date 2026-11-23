@@ -214,6 +214,14 @@ is under active development):
   that select a frozen engine declare the legacy `close` fill explicitly
   (`contract.default_signal_exit_fill_for_engine`), so the persisted meta
   records the model actually simulated; explicit `close`/`open` keep working.
+- **Clock exits (strategy authors).** A strategy that must be flat *at* a clock time
+  T (end-of-day flatten, session close, forced exit) raises its exit signal on the
+  bar BEFORE the one that opens at T - the first bar whose end reaches T - so the
+  next-open fill lands at T's open. Derive it from the bar spacing plus the clock
+  schedule only, never from a later bar (`shared.bar_timing.modal_bar_minutes` /
+  `clock_exit_signal_mask`; PyneCore scripts use `timeframe.in_seconds()`), and add a
+  first-bar-of-the-next-session safeguard for data gaps. Do not write a market
+  `exit_price` for these exits.
 - signal replay: external signals — entries and flip/exit-only exits alike — are
   executed when they arrive at the fill bar's close (§5), so "exits like
   entries" already holds; there is no separate next-open exit.
