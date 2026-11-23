@@ -414,6 +414,85 @@ def test_market_features_empty_and_malformed() -> None:
     assert market_features_from_frame(bad) == {}
 
 
+def _legacy_indicator_features(frame: pd.DataFrame) -> dict[str, object]:
+    """Frozen copy of the pre-#317 private ATR/SMA formulas.
+
+    ``market_features_from_frame`` now routes through
+    ``shared.indicators`` (``atr_ema_span`` + ``sma``); this recomputes the
+    indicator-derived keys with the exact expressions the function used
+    before the swap so the parity stays pinned bit-for-bit.
+    """
+    work = frame.copy()
+    work.columns = [str(column).strip().lower() for column in work.columns]
+    for column in ("open", "high", "low", "close"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["open", "high", "low", "close"])
+    if len(work) < 2:
+        return {}
+
+    high = work["high"].astype(float)
+    low = work["low"].astype(float)
+    close = work["close"].astype(float)
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    true_range = true_range.fillna(high - low)
+    atr = true_range.ewm(span=14, adjust=False).mean()
+
+    out: dict[str, object] = {"atr_14": atr.iloc[-1]}
+    atr_history = atr.dropna()
+    atr_last = atr.iloc[-1]
+    if len(atr_history) >= 2 and pd.notna(atr_last):
+        out["atr_14_pct_rank"] = float((atr_history <= atr_last).mean())
+    for span in (20, 50):
+        if len(work) >= span:
+            out[f"sma_{span}"] = close.rolling(span).mean().iloc[-1]
+    return out
+
+
+@pytest.mark.parametrize("rows", [2, 5, 14, 20, 21, 50, 51, 120, 300])
+def test_market_features_indicators_bit_identical_to_legacy(rows: int) -> None:
+    """The shared-indicator swap must not move a single feature value."""
+    import numpy as np
+
+    rng = np.random.default_rng(rows)
+    close = 100.0 + np.cumsum(rng.normal(0, 0.5, rows))
+    # Flat stretches exercise degenerate TR/ATR paths, not just the walk.
+    close[1::7] = close[::7][: len(close[1::7])]
+    frame = pd.DataFrame(
+        {
+            "open": close - 0.1,
+            "high": close + 0.4,
+            "low": close - 0.4,
+            "close": close,
+            "volume": rng.integers(1000, 5000, rows),
+        }
+    )
+
+    features = market_features_from_frame(frame)
+    legacy = _legacy_indicator_features(frame)
+
+    # Bit-identical: _finite only coerces to float, it does not round.
+    assert features["atr_14"] == legacy["atr_14"]
+    if "atr_14_pct_rank" in legacy:
+        assert features["atr_14_pct_rank"] == legacy["atr_14_pct_rank"]
+    for span in (20, 50):
+        key = f"sma_{span}"
+        if key in legacy:
+            assert features[key] == legacy[key]
+            expected_dist = (close[-1] - legacy[key]) / legacy[key] * 100.0
+            assert features[f"dist_{key}_pct"] == expected_dist
+        else:
+            assert key not in features
+            assert f"dist_{key}_pct" not in features
+    if "sma_50" in legacy:
+        dist_50 = features["dist_sma_50_pct"]
+        assert features["trend_regime"] == (
+            "above_sma50" if dist_50 > 0 else "below_sma50"
+        )
+
+
 def test_writer_exits_when_closed_and_queue_drained(tmp_path, monkeypatch) -> None:
     """close() drops its sentinel on a full queue; the writer must still exit.
 
