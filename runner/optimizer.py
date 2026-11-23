@@ -33,7 +33,7 @@ from runner.portfolio_optimizer import (
     daily_observation_count,
 )
 from runner.risk_parity_optimizer import select_best_risk_parity_universe
-from runner.stats import compute_stats_for_result, daily_returns_moments
+from runner.stats import compute_stats_for_result, daily_returns_moments_for_result
 from runner.universe_provenance import (
     UNIVERSE_PROVENANCE_KEY,
     observe_symbol_coverage,
@@ -1396,7 +1396,7 @@ def _evaluate_trials_on_validation(
             )
             stats = _canonical_stats(result)
             score, raw_metric = _trial_selection_score(stats, config)
-            moments = daily_returns_moments(result.equity_curve)
+            moments = daily_returns_moments_for_result(result)
         except (ValueError, RuntimeError, KeyError) as exc:
             reason = f"validation run failed: {type(exc).__name__}: {exc}"
             trial.set_user_attr(VALIDATION_FAILURE_ATTR, reason)

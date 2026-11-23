@@ -141,12 +141,10 @@ class TestBuildDailyEquityCurve:
         assert points[0].equity == 100000.0
         assert points[-1].equity == 100800.0
         assert any(
-            point.time.startswith("2024-01-15") and point.equity == 100500.0
-            for point in points
+            point.time.startswith("2024-01-15") and point.equity == 100500.0 for point in points
         )
         assert any(
-            point.time.startswith("2024-01-16") and point.equity == 100800.0
-            for point in points
+            point.time.startswith("2024-01-16") and point.equity == 100800.0 for point in points
         )
 
     def test_trades_sorted_chronologically(self):
@@ -172,8 +170,12 @@ class TestBuildDailyEquityCurve:
         """Test that non-finite PnL values are skipped."""
         trade1 = make_trade(pnl=500.0)
         trade2 = Trade(
-            id=2, symbol="AAPL", direction="LONG",
-            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            id=2,
+            symbol="AAPL",
+            direction="LONG",
+            entry_time="2024-01-15T10:00:00Z",
+            entry_price=150.0,
+            quantity=10.0,
             exits=[
                 TradeExit(
                     time="2024-01-15T15:00:00Z",
@@ -185,8 +187,12 @@ class TestBuildDailyEquityCurve:
             pnl=float("nan"),
         )
         trade3 = Trade(
-            id=3, symbol="AAPL", direction="LONG",
-            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            id=3,
+            symbol="AAPL",
+            direction="LONG",
+            entry_time="2024-01-15T10:00:00Z",
+            entry_price=150.0,
+            quantity=10.0,
             exits=[
                 TradeExit(
                     time="2024-01-15T15:00:00Z",
@@ -207,14 +213,22 @@ class TestBuildDailyEquityCurve:
         """Test that trades with invalid exit times are skipped."""
         trade1 = make_trade()
         trade2 = Trade(
-            id=2, symbol="AAPL", direction="LONG",
-            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            id=2,
+            symbol="AAPL",
+            direction="LONG",
+            entry_time="2024-01-15T10:00:00Z",
+            entry_price=150.0,
+            quantity=10.0,
             exits=[TradeExit(time="invalid-time", price=155.0, quantity=10.0, pnl=300.0)],
             pnl=300.0,
         )
         trade3 = Trade(
-            id=3, symbol="AAPL", direction="LONG",
-            entry_time="2024-01-15T10:00:00Z", entry_price=150.0, quantity=10.0,
+            id=3,
+            symbol="AAPL",
+            direction="LONG",
+            entry_time="2024-01-15T10:00:00Z",
+            entry_price=150.0,
+            quantity=10.0,
             exits=[],
             pnl=200.0,
         )
@@ -269,9 +283,7 @@ class TestBuildDailyEquityCurve:
 
     def test_exit_day_uses_utc_date(self):
         """A non-UTC exit belongs to its UTC day, not its local day."""
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-15T23:30:00-05:00", pnl=500.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-01-15T23:30:00-05:00", pnl=500.0)])
 
         _points, returns = build_daily_equity_curve(result)
 
@@ -304,9 +316,7 @@ class TestBuildDailyEquityCurve:
                 return super().astimezone(tz)
 
         monkeypatch.setattr(daily_equity_module, "datetime", NonUtcDateTime)
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-15T23:30:00", pnl=500.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-01-15T23:30:00", pnl=500.0)])
 
         _points, returns = build_daily_equity_curve(result)
 
@@ -410,9 +420,7 @@ class TestAttachDailyEquity:
             ],
         ],
     )
-    def test_daily_equity_rejects_single_point_and_stale_preservation(
-        self, preserved_curve
-    ):
+    def test_daily_equity_rejects_single_point_and_stale_preservation(self, preserved_curve):
         from runner.daily_equity import _preserves_engine_curve
 
         daily_timestamps = pd.date_range("2024-01-01", periods=32, freq="D", tz="UTC")
@@ -434,7 +442,7 @@ class TestAttachDailyEquity:
                 EquityPoint(time="2024-01-10T00:00:00+00:00", equity=101000.0),
                 EquityPoint(time="2024-01-20T00:00:00+00:00", equity=102000.0),
                 EquityPoint(time="2024-02-01T00:00:00+00:00", equity=105000.0),
-            ]
+            ],
         )
         attach_daily_equity(result)
 
@@ -459,7 +467,7 @@ class TestAttachDailyEquity:
             equity_curve=[
                 EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
                 EquityPoint(time="2024-02-01T00:00:00+00:00", equity=101000.0),
-            ]
+            ],
         )
         attach_daily_equity(result)
 
@@ -741,9 +749,7 @@ class TestAttachDailyEquity:
 
     def test_partial_end_bound_uses_requested_instant(self):
         """The last close must not overshoot an explicit end instant."""
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-15T10:00:00Z", pnl=500.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-01-15T10:00:00Z", pnl=500.0)])
 
         attach_daily_equity(result, end="2024-01-15T12:00:00Z")
 
@@ -777,9 +783,7 @@ class TestAttachDailyEquity:
         assert result.equity_curve[-1].equity == 100_500.0
 
     def test_zero_width_window_fails_loudly(self):
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-15T12:00:00Z", pnl=500.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-01-15T12:00:00Z", pnl=500.0)])
 
         with pytest.raises(ValueError, match="start and end bounds must differ"):
             attach_daily_equity(
@@ -805,18 +809,14 @@ class TestAttachDailyEquity:
 
     def test_net_pnl_cutoff_controls_inclusive_boundary(self):
         cutoff = datetime.fromisoformat("2024-01-15T15:00:00+00:00")
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-15T15:00:00Z", pnl=500.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-01-15T15:00:00Z", pnl=500.0)])
 
         assert _net_pnl_before(result, cutoff, inclusive=False) == 0.0
         assert _net_pnl_before(result, cutoff, inclusive=True) == 500.0
 
     def test_trade_exactly_at_window_start_is_counted_once(self):
         """A trade exiting exactly at the window start is window PnL, not prior."""
-        result = make_result(
-            trades=[make_trade(exit_time="2024-02-01T00:00:00Z", pnl=700.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-02-01T00:00:00Z", pnl=700.0)])
 
         attach_daily_equity(
             result,
@@ -883,9 +883,7 @@ class TestAttachDailyEquity:
         window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(
             trades=[prior_trade, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)],
         )
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
@@ -903,9 +901,7 @@ class TestAttachDailyEquity:
         window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(
             trades=[prior_trade, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)],
         )
 
         with capture_module_log(caplog):
@@ -926,9 +922,7 @@ class TestAttachDailyEquity:
         window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(
             trades=[prior_trade, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)],
         )
 
         with capture_module_log(caplog):
@@ -968,9 +962,7 @@ class TestAttachDailyEquity:
         window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=300.0, id=3)
         result = make_result(
             trades=[first_trade, second_trade, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)],
         )
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
@@ -985,9 +977,7 @@ class TestAttachDailyEquity:
         window_trade = make_trade(exit_time="2024-02-10T15:00:00Z", pnl=700.0, id=2)
         result = make_result(
             trades=[prior_trade, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=float("nan"))
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=float("nan"))],
         )
 
         attach_daily_equity(result, start="2024-02-01", end="2024-02-28")
@@ -1002,9 +992,7 @@ class TestAttachDailyEquity:
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
         result = make_result(
             trades=[prior],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=engine_equity)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=engine_equity)],
         )
 
         window_start = _window_starting_equity(result, start)
@@ -1030,9 +1018,7 @@ class TestAttachDailyEquity:
         window_trade.id = 3
         result = make_result(
             trades=[anchored, between_point_and_window, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.0)],
         )
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
 
@@ -1067,9 +1053,7 @@ class TestAttachDailyEquity:
         window_trade.id = 3
         result = make_result(
             trades=[anchored, later, window_trade],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_499.99)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_499.99)],
         )
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
 
@@ -1091,9 +1075,7 @@ class TestAttachDailyEquity:
         start = datetime.fromisoformat("2024-02-01T00:00:00+00:00")
         result = make_result(
             trades=[prior],
-            equity_curve=[
-                EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.015)
-            ],
+            equity_curve=[EquityPoint(time="2024-01-10T15:00:00+00:00", equity=100_500.015)],
         )
 
         window_start = _window_starting_equity(result, start)
@@ -1119,9 +1101,7 @@ class TestAttachDailyEquity:
 
         window_start = _window_starting_equity(result, start)
 
-        assert window_start.equity == pytest.approx(
-            initial_capital + 500.0, rel=0, abs=1e-6
-        )
+        assert window_start.equity == pytest.approx(initial_capital + 500.0, rel=0, abs=1e-6)
         assert window_start.basis == "net_ledger"
 
     def _assert_endpoint_drift(self, *, drift, preserved, initial_capital):
@@ -1175,9 +1155,7 @@ class TestAttachDailyEquity:
             (0.0101, False),  # just outside: the ledger wins
         ],
     )
-    def test_fractional_endpoint_drift_pins_both_sides_of_one_cent(
-        self, drift, preserved
-    ):
+    def test_fractional_endpoint_drift_pins_both_sides_of_one_cent(self, drift, preserved):
         """Pin the one-cent cliff itself, not just points far from it.
 
         The ledger endpoint is quantised to the cent, so the comparison must
@@ -1185,16 +1163,13 @@ class TestAttachDailyEquity:
         and 0.0101 pins the boundary from both sides on an account whose
         absolute size does not wash the fraction out.
         """
-        self._assert_endpoint_drift(
-            drift=drift, preserved=preserved, initial_capital=100_000.0
-        )
+        self._assert_endpoint_drift(drift=drift, preserved=preserved, initial_capital=100_000.0)
 
     def test_preserved_curve_ending_before_last_trade_is_rejected(self):
         """A curve that stops before the last trade cannot describe the window."""
         timestamps = pd.date_range("2024-01-01", "2024-01-27", freq="D", tz="UTC")
         curve = [
-            EquityPoint(time=timestamp.isoformat(), equity=100_000.0)
-            for timestamp in timestamps
+            EquityPoint(time=timestamp.isoformat(), equity=100_000.0) for timestamp in timestamps
         ]
         result = make_result(
             trades=[
@@ -1301,9 +1276,7 @@ class TestAttachDailyEquity:
         end_bound = datetime.fromisoformat("2024-01-01T00:00:00+00:00")
         curve = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
 
-        assert daily_equity_module._strictly_increasing_curve(
-            curve, inception, end_bound
-        ) is None
+        assert daily_equity_module._strictly_increasing_curve(curve, inception, end_bound) is None
 
     def test_strictly_increasing_curve_keeps_shift_that_stays_inside_the_window(self):
         """One microsecond of headroom is enough for the shift to be allowed.
@@ -1315,9 +1288,7 @@ class TestAttachDailyEquity:
         end_bound = datetime.fromisoformat("2024-01-01T00:00:00.000001+00:00")
         curve = [EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100_000.0)]
 
-        normalized = daily_equity_module._strictly_increasing_curve(
-            curve, inception, end_bound
-        )
+        normalized = daily_equity_module._strictly_increasing_curve(curve, inception, end_bound)
 
         assert normalized is not None
         assert normalized[-1].time == "2024-01-01T00:00:00.000001+00:00"
@@ -1354,10 +1325,7 @@ class TestAttachDailyEquity:
 
         _, returns = build_daily_equity_curve(result)
 
-        assert all(
-            day_return["equity"] == round(day_return["equity"], 2)
-            for day_return in returns
-        )
+        assert all(day_return["equity"] == round(day_return["equity"], 2) for day_return in returns)
         assert returns[14]["equity"] == 101_234.57
 
     def test_fractional_starting_equity_is_quantised_like_the_closes(self):
@@ -1368,18 +1336,13 @@ class TestAttachDailyEquity:
         precision as every close, so the opening point does not carry more
         digits than the rest of the series.
         """
-        result = make_result(
-            trades=[make_trade(exit_time="2024-01-15T15:00:00Z", pnl=0.0)]
-        )
+        result = make_result(trades=[make_trade(exit_time="2024-01-15T15:00:00Z", pnl=0.0)])
 
         points, returns = build_daily_equity_curve(result, starting_equity=100_000.005)
 
         # 100_000.005 is the nearest-cent rounding case: it lands on .01.
         assert points[0].equity == 100_000.01
-        assert all(
-            day_return["equity"] == round(day_return["equity"], 2)
-            for day_return in returns
-        )
+        assert all(day_return["equity"] == round(day_return["equity"], 2) for day_return in returns)
         by_date = {daily["date"]: daily for daily in returns}
         # A zero-PnL day reports the same quantised balance and a flat return.
         assert by_date["2024-01-14"]["equity"] == points[0].equity
@@ -1440,11 +1403,85 @@ class TestAttachDailyEquity:
         attach_daily_equity(result)
 
         end_bound = datetime.fromisoformat("2024-01-15T23:59:59.999998+00:00")
-        assert all(
-            datetime.fromisoformat(point.time) <= end_bound
-            for point in result.equity_curve
-        )
+        assert all(datetime.fromisoformat(point.time) <= end_bound for point in result.equity_curve)
         assert result.equity_curve[-1].time == "2024-01-15T23:59:59.999998+00:00"
+
+    def test_weekday_only_trades_publish_calendar_filled_curve(self):
+        """#229: production curves are calendar-filled, not observed-day-only.
+
+        A weekday-only strategy still gets one equity point per calendar
+        day (weekends flat). The published curve keeps that shape, but
+        ``compute_stats`` drops the weekend filler rows before Sharpe and
+        annualises at the asset-class convention — 252 here because no
+        symbol context resolves the book to 24/7 crypto.
+        """
+        from runner.stats import compute_stats
+
+        trades = [
+            make_trade(
+                entry_time=f"2024-01-{day:02d}T10:00:00Z",
+                exit_time=f"2024-01-{day:02d}T15:00:00Z",
+                pnl=100.0 + day,
+                id=day,
+            )
+            for day in (2, 3, 4, 5, 8, 9, 10, 11, 12, 15)
+        ]
+        result = make_result(
+            trades=trades,
+            backtest_start="2024-01-01",
+            backtest_end="2024-01-31",
+        )
+
+        attach_daily_equity(result)
+
+        # Calendar fill: weekend days carry flat points, so the curve spans
+        # every calendar day in the window (plus the opening point), not
+        # just the ten trade days.
+        assert len(result.equity_curve) == 32
+        weekend_days = {
+            point.time[:10]
+            for point in result.equity_curve
+            if datetime.fromisoformat(point.time).weekday() >= 5
+        }
+        assert weekend_days == {
+            "2024-01-06",
+            "2024-01-07",
+            "2024-01-13",
+            "2024-01-14",
+            "2024-01-20",
+            "2024-01-21",
+            "2024-01-27",
+            "2024-01-28",
+        }
+
+        stats = compute_stats(
+            [],
+            initial_capital=result.meta.initial_capital,
+            equity_curve=result.equity_curve,
+        )
+        # Unclassified book: conservative non-crypto convention.
+        assert stats["equity_return_periods_per_year"] == pytest.approx(252.0)
+
+        # The weekend filler rows are zero-return and must not reach the
+        # ratio series: resolving the trading-day grid and filtering leaves
+        # only weekdays.
+        from runner.stats import (
+            _daily_returns_series_from_equity_curve,
+            _resolve_return_convention,
+        )
+
+        _periods, trading_dates = _resolve_return_convention(
+            equity_curve=result.equity_curve,
+            symbols=None,
+            data_source=None,
+            asset_class=None,
+            data_dir=None,
+        )
+        series = _daily_returns_series_from_equity_curve(
+            result.equity_curve, trading_dates=trading_dates
+        )
+        assert series is not None
+        assert all(ts.weekday() < 5 for ts in series.index)
 
 
 class TestEngineCurveGapFill:
@@ -1509,9 +1546,7 @@ class TestEngineCurveGapFill:
             pytest.approx(-2000.0 / 103000.0),
         ]
         # One return per distinct calendar day, and the days are contiguous.
-        assert [item["date"] for item in returns] == [
-            f"2024-01-{day:02d}" for day in range(1, 10)
-        ]
+        assert [item["date"] for item in returns] == [f"2024-01-{day:02d}" for day in range(1, 10)]
 
     def test_multi_day_move_is_not_annualised_as_one_day(self):
         """The reported daily statistics must not scale with the skipped days.
@@ -1553,7 +1588,9 @@ class TestEngineCurveGapFill:
         # A real Sharpe ratio, not only a mean, moves by the same factor: the
         # gap-collapsed series is a *different strategy*, not a coarser view of
         # the same one.
-        assert _sharpe_manual(observed, 0.0) < _sharpe_manual(collapsed, 0.0)
+        assert _sharpe_manual(observed, 0.0, periods_per_year=252) < _sharpe_manual(
+            collapsed, 0.0, periods_per_year=252
+        )
 
     def test_gap_before_the_first_observation_is_filled(self):
         """The flat period before the engine's first point is a gap too."""
@@ -1678,9 +1715,7 @@ class TestEngineCurveGapFill:
             "2024-01-01",
             *[f"2024-01-{day:02d}" for day in range(1, 11)],
         ]
-        assert [item["date"] for item in returns] == [
-            f"2024-01-{day:02d}" for day in range(1, 11)
-        ]
+        assert [item["date"] for item in returns] == [f"2024-01-{day:02d}" for day in range(1, 11)]
         # The flat tail carries the last known equity, not a guess.
         assert points[-1].equity == 101_000.0
         assert returns[-1]["return"] == 0.0
@@ -1728,9 +1763,7 @@ class TestReconciliationTolerance:
         # reconciliation is even reached, so the fixture has to carry a path.
         return [
             EquityPoint(time="2024-01-01T00:00:00+00:00", equity=100000.0),
-            EquityPoint(
-                time="2024-01-15T00:00:00+00:00", equity=(100000.0 + final_equity) / 2
-            ),
+            EquityPoint(time="2024-01-15T00:00:00+00:00", equity=(100000.0 + final_equity) / 2),
             EquityPoint(time="2024-01-28T00:00:00+00:00", equity=final_equity),
         ]
 
@@ -1752,9 +1785,7 @@ class TestReconciliationTolerance:
         trades = self._many_trades(count)
         drift = count * 0.006
         final = 100000.0 + count * 100.0 - drift
-        result = make_result(
-            trades=trades, equity_curve=self._curve(trades, final)
-        )
+        result = make_result(trades=trades, equity_curve=self._curve(trades, final))
 
         assert drift > 0.05, "the fixture must exceed the old flat five-cent gate"
         assert drift < _reconciliation_tolerance(
@@ -1781,15 +1812,10 @@ class TestReconciliationTolerance:
         expected = 100000.0 + count * 100.0
         # $4500 above what 20 x $100 of net PnL can produce.
         contradiction = expected + 4500.0
-        assert (
-            abs(contradiction - expected)
-            > 20 * _reconciliation_tolerance(
-                expected_final=expected, trade_count=count
-            )
+        assert abs(contradiction - expected) > 20 * _reconciliation_tolerance(
+            expected_final=expected, trade_count=count
         )
-        result = make_result(
-            trades=trades, equity_curve=self._curve(trades, contradiction)
-        )
+        result = make_result(trades=trades, equity_curve=self._curve(trades, contradiction))
 
         assert _daily_points_from_engine_curve(result) is None
 
@@ -1803,25 +1829,19 @@ class TestReconciliationTolerance:
         # One trade: exactly one cent, the same absolute cliff the preserved
         # curve gate applies. A separate flat cent on top would double-count
         # the first trade and admit a 1.5-cent drift on a single-trade run.
-        assert _reconciliation_tolerance(
-            expected_final=100000.0, trade_count=1
-        ) == pytest.approx(EQUITY_CENT)
+        assert _reconciliation_tolerance(expected_final=100000.0, trade_count=1) == pytest.approx(
+            EQUITY_CENT
+        )
         # A hundred trades: the per-trade term dominates at a realistic account
         # size, and it is derived from the rounding, not from a round number.
-        hundred = _reconciliation_tolerance(
-            expected_final=100000.0, trade_count=100
-        )
+        hundred = _reconciliation_tolerance(expected_final=100000.0, trade_count=100)
         assert hundred == pytest.approx(100 * EQUITY_CENT)
         assert hundred == pytest.approx(1.0)
         assert hundred > 0.05
         # Monotone in the trade count, and independent of the account size in
         # the range where cent quantisation is the binding limit.
-        assert hundred > _reconciliation_tolerance(
-            expected_final=100000.0, trade_count=10
-        )
-        assert _reconciliation_tolerance(
-            expected_final=1e9, trade_count=10
-        ) == pytest.approx(
+        assert hundred > _reconciliation_tolerance(expected_final=100000.0, trade_count=10)
+        assert _reconciliation_tolerance(expected_final=1e9, trade_count=10) == pytest.approx(
             _reconciliation_tolerance(expected_final=1e5, trade_count=10)
         )
 
@@ -1836,14 +1856,10 @@ class TestReconciliationTolerance:
             _reconciliation_tolerance,
         )
 
-        tolerance = _reconciliation_tolerance(
-            expected_final=1e15, trade_count=10
-        )
+        tolerance = _reconciliation_tolerance(expected_final=1e15, trade_count=10)
 
         # 8 * 10 * 2**-52 * 1e15 = ~17.76, far above ten cents.
-        assert tolerance == pytest.approx(
-            8.0 * 10 * 2.0**-52 * 1e15
-        )
+        assert tolerance == pytest.approx(8.0 * 10 * 2.0**-52 * 1e15)
         assert tolerance > EQUITY_CENT
 
 
@@ -1965,7 +1981,15 @@ class TestEnginePathMatchesCalendarPath:
         engine_stats = self._stats(engine_points, scoped)
         calendar_stats = self._stats(calendar_points, scoped)
         for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value", "total_return"):
-            assert engine_stats[key] == pytest.approx(calendar_stats[key], abs=1e-6), key
+            engine_value = engine_stats.get(key)
+            calendar_value = calendar_stats.get(key)
+            if engine_value is None or calendar_value is None:
+                # Weekend filler rows no longer count toward the PSR
+                # observation minimum, so a short window can leave it
+                # undefined on BOTH paths — agreement is what matters.
+                assert engine_value == calendar_value, key
+            else:
+                assert engine_value == pytest.approx(calendar_value, abs=1e-6), key
         assert engine_stats["duplicate_equity_timestamps"] == 0
 
     def test_day_one_move_is_counted_exactly_once_when_first_point_is_at_midnight(self):
@@ -2018,9 +2042,7 @@ class TestEnginePathMatchesCalendarPath:
         calendar_points, calendar_returns = build_daily_equity_curve(
             result, start=self.START, end=self.END_DAY
         )
-        engine = _daily_points_from_engine_curve(
-            result, start=self.START, end=self.END_NAIVE
-        )
+        engine = _daily_points_from_engine_curve(result, start=self.START, end=self.END_NAIVE)
         assert engine is not None
         engine_points, engine_returns = engine
 
@@ -2034,7 +2056,12 @@ class TestEnginePathMatchesCalendarPath:
         engine_stats = self._stats(engine_points, result)
         calendar_stats = self._stats(calendar_points, result)
         for key in ("sharpe_ratio", "sortino_ratio", "psr", "p_value"):
-            assert engine_stats[key] == pytest.approx(calendar_stats[key], abs=1e-6), key
+            engine_value = engine_stats.get(key)
+            calendar_value = calendar_stats.get(key)
+            if engine_value is None or calendar_value is None:
+                assert engine_value == calendar_value, key
+            else:
+                assert engine_value == pytest.approx(calendar_value, abs=1e-6), key
 
 
 class TestEngineCurvePublishedContract:

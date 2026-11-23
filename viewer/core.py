@@ -36,6 +36,7 @@ from runner.auto_agent import (  # noqa: F401 - re-exported for viewer/main.py a
     SUPPORTED_MODEL_NAMES,
     run_auto_agent,
 )
+from runner.engines import contract
 from runner.llm_providers import (  # noqa: F401 - re-exported for viewer/main.py and the API surface
     DEFAULT_LLM_PROVIDER_NAME,
     SUPPORTED_LLM_PROVIDER_NAMES,
@@ -867,6 +868,35 @@ def _load_ohlcv_df(symbol: str, timeframe: str) -> pd.DataFrame | None:
     return merged.copy(deep=False)
 
 
+def ohlcv_asset_class(symbol: str, timeframe: str) -> str:
+    """Asset class of the OHLCV source ``_load_ohlcv_df`` would read (#130).
+
+    Uses the same candidate selection (source priority, match cap) so the
+    class matches the data actually loaded; ``""`` when the symbol cannot
+    be classified or the merged matches span more than one asset class —
+    the slippage model then records an explicit ``none``.
+    """
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_timeframe = normalize_timeframe(str(timeframe or "").strip())
+    if (
+        _OHLCV_SYMBOL_RE.fullmatch(normalized_symbol) is None
+        or _OHLCV_TIMEFRAME_RE.fullmatch(normalized_timeframe) is None
+    ):
+        return ""
+    ohlcv_root = (DATA_DIR / "ohlcv").resolve()
+    matches = _ohlcv_candidates(ohlcv_root, normalized_symbol, normalized_timeframe)
+    if not matches or len(matches) > _OHLCV_MAX_MATCHES:
+        return ""
+    # ``_load_ohlcv_df`` merges every selected match, so the class is only
+    # well-defined when all of them agree on one asset class.
+    asset_classes = {
+        contract.ohlcv_path_metadata(path)["asset_class"] for path in matches
+    }
+    if len(asset_classes) != 1:
+        return ""
+    return asset_classes.pop()
+
+
 def _infer_symbol_data_category(symbol: str) -> str:
     symbol_upper = symbol.upper()
     entries, used_catalog = _load_catalog_ohlcv_entries()
@@ -1361,6 +1391,10 @@ def _quick_stats_and_equity(
                 trades=trade_models,
                 initial_capital=initial_capital,
                 equity_curve=equity_points or None,
+                symbols=[
+                    str(getattr(trade, "symbol", "") or "")
+                    for trade in trade_models
+                ],
             )
         except (ValueError, TypeError, KeyError) as exc:
             logger.warning("Could not compute canonical quick stats: %s", exc)

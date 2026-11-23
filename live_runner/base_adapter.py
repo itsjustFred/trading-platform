@@ -234,6 +234,41 @@ def validate_live_quote_prices(
     return bid, ask
 
 
+#: How far a quote time may lie in the future before it is treated as a clock
+#: or feed fault rather than skew between our clock and the broker's (#125).
+LIVE_QUOTE_FUTURE_SKEW_SECONDS = 2.0
+
+#: Freshness verdicts of :func:`live_quote_time_rule`.
+QUOTE_TIME_RULE_MISSING = "quote_time_missing"
+QUOTE_TIME_RULE_INVALID = "quote_time_invalid"
+QUOTE_TIME_RULE_IN_FUTURE = "quote_time_in_future"
+QUOTE_TIME_RULE_STALE = "quote_stale"
+
+
+def live_quote_time_rule(
+    timestamp: object, *, now: datetime, max_age_seconds: float
+) -> tuple[str | None, float | None]:
+    """Freshness verdict and age in seconds for a quote time (#125).
+
+    Fails closed: a missing time, anything but a timezone-aware datetime, a
+    time beyond :data:`LIVE_QUOTE_FUTURE_SKEW_SECONDS` in the future, or a
+    quote older than ``max_age_seconds`` all reject. One implementation for
+    every layer that gates or sizes on a broker quote — the entry-deviation
+    gate, the pip-value conversion check and the pre-submit caps (#302) must
+    agree on what "current" means.
+    """
+    if timestamp is None:
+        return QUOTE_TIME_RULE_MISSING, None
+    if not isinstance(timestamp, datetime) or timestamp.utcoffset() is None:
+        return QUOTE_TIME_RULE_INVALID, None
+    age = (now - timestamp).total_seconds()
+    if -age > LIVE_QUOTE_FUTURE_SKEW_SECONDS:
+        return QUOTE_TIME_RULE_IN_FUTURE, age
+    if age > max_age_seconds:
+        return QUOTE_TIME_RULE_STALE, age
+    return None, age
+
+
 @dataclass(frozen=True)
 class LivePipValue:
     """What one qty unit of a symbol gains or loses per 1.0 price move (#146).
@@ -433,6 +468,28 @@ class BaseLiveAdapter(ABC):
         treats that (and any other failure) as "unknown" and refuses the entry.
         """
         raise NotImplementedError(f"{type(self).__name__} cannot provide a pip value")
+
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol``.
+
+        ``None`` means the broker maximum cannot be determined; callers must
+        treat that as 1x (fail safe), never guess a higher ceiling (#240).
+        """
+        return None
+
+    async def get_used_margin(self) -> float | None:
+        """Margin the broker already holds against open positions, account ccy.
+
+        The pre-submit leverage ceiling is MT5-style free margin — account
+        equity minus this figure, times the maximum leverage (#359, the live
+        half of the #347 backtest rule). ``None`` means it cannot be
+        determined; callers must treat that as unverifiable and refuse the
+        order (fail closed), never guess a lower figure — an understated used
+        margin would overstate free margin.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot report used margin"
+        )
 
     # ── Operator safety controls ──────────────────────────────────────────────────────────────
     #

@@ -64,6 +64,7 @@ from shared.models import (
     LiveExecution,
     LiveSignal,
 )
+from shared.money import parse_money, parse_optional
 
 logger = get_logger("live-runner")
 
@@ -518,7 +519,7 @@ def _floor_to_volume_step(volume: int, step_volume: int) -> int:
 
 def _broker_volume_to_qty(volume: float, volume_per_qty: float = QTY_VOLUME_SCALE) -> float:
     """Convert broker volume units into qty units (risk-engine units)."""
-    return _to_float(volume, default=0.0) / float(volume_per_qty)
+    return parse_money(volume) / float(volume_per_qty)
 
 
 def _light_symbol_assets(symbol: Any) -> tuple[int, int] | None:
@@ -584,9 +585,9 @@ def _deal_commission(
     """
     if deal is None:
         return 0.0
-    raw = _to_float(getattr(deal, "commission", 0))
+    raw = parse_money(getattr(deal, "commission", 0))
     # Truthiness, not float equality: an unset int64 (and a test double's 0.0) is falsy.
-    if not raw or not math.isfinite(raw):
+    if not raw:
         return 0.0
     cost = commission_from_signed_cash_flow(raw / money_scale(money_digits_from_trader(deal)))
     if cost < 0:
@@ -934,6 +935,9 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # #146: (baseAssetId, quoteAssetId) per upper symbol name, from the
         # light symbol list, and the account's deposit asset. Session state.
         self._symbol_assets: dict[str, tuple[int, int]] = {}
+        # #240: ProtoOASymbol.leverageId per upper symbol name, captured with
+        # the symbol props; resolved to a leverage via GetDynamicLeverageByID.
+        self._symbol_leverage_ids: dict[str, int] = {}
         self._deposit_asset_id: int | None = None
         self._asset_names: dict[int, str] = {}
         self._asset_names_task: asyncio.Task[dict[int, str]] | None = None
@@ -988,6 +992,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
 
         self._ProtoOASubscribeSpotsReq: Any = None
         self._ProtoOAUnsubscribeSpotsReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDReq: Any = None
+        self._ProtoOAGetDynamicLeverageByIDRes: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLReq: Any = None
+        self._ProtoOAGetPositionUnrealizedPnLRes: Any = None
 
         self._heartbeat_payload_type: int | None = None
         self._spot_payload_type: int | None = None
@@ -1014,6 +1022,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 ProtoOADealListRes,
                 ProtoOAErrorRes,
                 ProtoOAExecutionEvent,
+                ProtoOAGetDynamicLeverageByIDReq,
+                ProtoOAGetDynamicLeverageByIDRes,
+                ProtoOAGetPositionUnrealizedPnLReq,
+                ProtoOAGetPositionUnrealizedPnLRes,
                 ProtoOANewOrderReq,
                 ProtoOAOrderDetailsReq,
                 ProtoOAOrderDetailsRes,
@@ -1071,6 +1083,10 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         self._ProtoOAOrderDetailsRes = ProtoOAOrderDetailsRes
         self._ProtoOAOrderListReq = ProtoOAOrderListReq
         self._ProtoOAOrderListRes = ProtoOAOrderListRes
+        self._ProtoOAGetDynamicLeverageByIDReq = ProtoOAGetDynamicLeverageByIDReq
+        self._ProtoOAGetDynamicLeverageByIDRes = ProtoOAGetDynamicLeverageByIDRes
+        self._ProtoOAGetPositionUnrealizedPnLReq = ProtoOAGetPositionUnrealizedPnLReq
+        self._ProtoOAGetPositionUnrealizedPnLRes = ProtoOAGetPositionUnrealizedPnLRes
         self._ProtoOAOrderListByPositionIdReq = ProtoOAOrderListByPositionIdReq
         self._ProtoOAOrderListByPositionIdRes = ProtoOAOrderListByPositionIdRes
         self._ProtoOADealListReq = ProtoOADealListReq
@@ -1573,9 +1589,11 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         """
         if not symbol_name_to_id:
             self._symbol_props.clear()
+            self._symbol_leverage_ids.clear()
             return
         for name in symbol_name_to_id:
             self._symbol_props.pop(name, None)
+            self._symbol_leverage_ids.pop(name, None)
         try:
             from ctrader_open_api.messages.OpenApiMessages_pb2 import (
                 ProtoOASymbolByIdReq,
@@ -1616,6 +1634,13 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             name = id_to_name.get(sid)  # type: ignore[assignment]  # name reused with a wider type across branches
             if name is None:
                 continue
+            # #240: the symbol's dynamic-leverage id rides on the same detail
+            # payload. Archived entries come first, so a live entry's id wins.
+            leverage_id = _optional_int(getattr(detail, "leverageId", None))
+            if leverage_id is not None and leverage_id > 0:
+                self._symbol_leverage_ids[name] = leverage_id
+            else:
+                self._symbol_leverage_ids.pop(name, None)
             fallback = _fallback_symbol_scale(name) if _fallback_scale_class(name) else None
             scale = _symbol_scale_from_broker_props(
                 digits=getattr(detail, "digits", None),
@@ -2422,6 +2447,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         # reconnect must re-fetch broker props, never trade on stale scales,
         # and the order map must not grow unboundedly across sessions.
         self._symbol_props.clear()
+        self._symbol_leverage_ids.clear()
         self._symbol_assets.clear()
         self._deposit_asset_id = None
         self._asset_names.clear()
@@ -3124,6 +3150,114 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             raise ValueError(f"cTrader conversion rate for {label} is not positive: {rate!r}")
         return rate, tuple(symbols), tuple(quotes)
 
+    async def get_max_leverage(self, symbol: str) -> float | None:
+        """The broker's maximum leverage for this account and ``symbol`` (#240).
+
+        Two broker-granted ceilings bound the answer and the tighter one wins:
+
+        * the symbol's dynamic-leverage tiers — ``ProtoOASymbol.leverageId``,
+          captured with the symbol props, resolves through
+          ``ProtoOAGetDynamicLeverageByIDReq`` into volume tiers sorted
+          ascending by volume. ``ProtoOADynamicLeverageTier.leverage`` is in
+          the cents convention (1:200 is ``20000``): Spotware's own Open API
+          example divides the field by 100 before display, so the plain ratio
+          is ``value / 100``. Leverage shrinks as position volume grows, so
+          the maximum sits in the first tier — an upper bound: a larger order
+          is margined at a lower tier, which the broker still enforces;
+        * the account's own leverage — ``ProtoOATrader.leverageInCents`` is
+          the leverage the account actually trades at. Spotware's example
+          computes the effective leverage as
+          ``min(trader.leverageInCents, tier.leverage) / 100``, so an account
+          set to 1:50 on a symbol offering 1:500 is capped at 50 — the tier
+          alone would overstate what the broker will margin.
+          ``ProtoOATrader.maxLeverage`` is deliberately *not* read: it is a
+          plain uint32 named without an "InCents" suffix (Spotware uses it to
+          validate leverage *changes*, not margining), the broker already
+          validates ``leverageInCents`` against it so it can never be the
+          tighter bound, and reading it in the wrong unit would silently
+          shrink every order.
+
+        The account leg degrades on its own (no readable trader record or an
+        unset/nonpositive field contributes nothing), while a failed tier
+        request fails the whole lookup closed — ``None``, never a partial
+        answer — so callers treat ``None`` as 1x.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            self._raise_if_terminal_auth_failed()
+
+            account_cents = await self._account_leverage_cents()
+
+            tier_cents: float | None = None
+            if (
+                self._ProtoOAGetDynamicLeverageByIDReq is not None
+                and self._ProtoOAGetDynamicLeverageByIDRes is not None
+            ):
+                leverage_id = self._symbol_leverage_ids.get(
+                    str(symbol or "").strip().upper()
+                )
+                if leverage_id is not None:
+                    request = self._ProtoOAGetDynamicLeverageByIDReq()
+                    request.ctidTraderAccountId = self.ctid_trader_account_id
+                    request.leverageId = int(leverage_id)
+                    response = await self._send_request_with_refresh_retry(
+                        request, timeout_seconds=10
+                    )
+                    if isinstance(
+                        response, self._ProtoOAGetDynamicLeverageByIDRes
+                    ):
+                        leverage_msg = getattr(response, "leverage", None)
+                        tiers = (
+                            getattr(leverage_msg, "tiers", None)
+                            if leverage_msg is not None
+                            else None
+                        )
+                        values = [
+                            value
+                            for tier in tiers or []
+                            if (value := _optional_float(getattr(tier, "leverage", None)))
+                            is not None
+                            and math.isfinite(value)
+                            and value > 0
+                        ]
+                        if values:
+                            tier_cents = max(values)
+
+            candidates = [cents for cents in (tier_cents, account_cents) if cents is not None]
+            return min(candidates) / 100.0 if candidates else None
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader max leverage lookup failed; treating it as unknown (1x)",
+                extra={"data": {"symbol": symbol, "error": repr(exc)}},
+            )
+            return None
+
+    async def _account_leverage_cents(self) -> float | None:
+        """The account's own leverage in cents, or ``None``.
+
+        Reads ``ProtoOATrader.leverageInCents`` — the leverage the account
+        actually trades at — which is the account-side bound the symbol
+        tiers are clamped against. ``maxLeverage`` is not read: its unit is
+        unverified and it is only the broker's ceiling for *changing*
+        leverage, which ``leverageInCents`` is already validated against.
+        An unreadable trader record or an unset/nonpositive field degrades
+        to ``None`` — the tier leg may still answer on its own.
+        """
+        try:
+            trader = await self._fetch_trader()
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader trader leverage lookup failed; using the symbol tiers only",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
+        value = _optional_float(getattr(trader, "leverageInCents", None))
+        if value is None or not math.isfinite(value) or value <= 0:
+            return None
+        return value
+
     async def _fetch_trader(self) -> Any:
         """The account's ``ProtoOATrader`` (balance, money digits, deposit asset)."""
         self._raise_if_terminal_auth_failed()
@@ -3185,26 +3319,75 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         scale = money_scale(digits)
         total = 0.0
         for position_pnl in response.positionUnrealizedPnL:
-            total += _to_float(getattr(position_pnl, "netUnrealizedPnL", 0))
-        return total / scale
+            # Fail closed per entry (#302): an unreadable or non-finite
+            # netUnrealizedPnL read as 0.0 would understate a losing position
+            # and overstate equity - the unsafe direction for both the loss
+            # breaker and the pre-submit caps' free-margin ceiling.
+            # ``parse_money`` raises ``MoneyParseError`` on a missing or
+            # garbage field, so the whole equity read fails closed.
+            total += parse_money(getattr(position_pnl, "netUnrealizedPnL", None)) / scale
+        return total
 
     async def get_balance(self) -> tuple[float, float]:
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
-        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        balance = parse_money(getattr(trader, "balance", 0)) / scale
         equity = balance
         if hasattr(trader, "equity"):
-            equity = _to_float(getattr(trader, "equity", balance)) / scale
+            raw_equity = parse_optional(getattr(trader, "equity", None))
+            if raw_equity is not None:
+                equity = raw_equity / scale
         return balance, equity
+
+    async def get_used_margin(self) -> float | None:
+        """Margin held against open positions, summed in account currency (#359).
+
+        Sums the broker-reported ``ProtoOAPosition.usedMargin`` of every OPEN
+        position — cTrader has already applied each position's own leverage
+        (account leverage clamped by the symbol's volume tier), so no leverage
+        lookup is needed here. ``None`` when the reconcile or any open
+        position's margin figure is unreadable: a partial sum would understate
+        used margin and overstate the free margin the pre-submit caps judge
+        the order against.
+        """
+        try:
+            self._raise_if_terminal_auth_failed()
+            if not self._connected or not self._authenticated:
+                await self.connect()
+            reconcile_res = await self._reconcile_state()
+            total = 0.0
+            for position in getattr(reconcile_res, "position", []) or []:
+                status = int(getattr(position, "positionStatus", 0) or 0)
+                if status != self._ProtoOAPositionStatus.POSITION_STATUS_OPEN:
+                    continue
+                used = _optional_float(getattr(position, "usedMargin", None))
+                digits = getattr(position, "moneyDigits", None)
+                if used is None or used < 0 or digits is None:
+                    return None
+                try:
+                    digits_int = int(digits)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if digits_int < 0:
+                    return None
+                total += used / money_scale(digits_int)
+            return total
+        except Exception as exc:  # except-kind: money-decision
+            logger.warning(
+                "cTrader used-margin lookup failed; treating it as unknown",
+                extra={"data": {"error": repr(exc)}},
+            )
+            return None
 
     async def get_equity(self) -> float:
         """Account equity including unrealized P&L, for the loss breaker (#301).
 
         Deliberately a separate path from :meth:`get_balance`: the #267
         maintainer decision keeps position sizing on realized balance, so
-        ``get_balance`` must not start carrying unrealized P&L. Only the
-        breaker reads this. ``ProtoOATrader`` has no equity field, so equity
+        ``get_balance`` must not start carrying unrealized P&L. The loss
+        breaker (#301) and the pre-submit caps' free-margin ceiling (#302,
+        #359) read this. ``ProtoOATrader`` has no equity field, so equity
         is balance plus the summed net unrealized P&L of open positions -
         reporting balance here would hide an open losing position until it
         closes. Any failure raises: unreadable equity is never "no loss".
@@ -3212,11 +3395,15 @@ class CTraderLiveAdapter(BaseLiveAdapter):
         trader = await self._fetch_trader()
         money_digits = money_digits_from_trader(trader)
         scale = money_scale(money_digits)
-        balance = _to_float(getattr(trader, "balance", 0)) / scale
+        balance = parse_money(getattr(trader, "balance", None)) / scale
         if hasattr(trader, "equity"):
             # A trader payload that carries its own equity field is trusted to
-            # include unrealized P&L already (ProtoOATrader does not).
-            return _to_float(getattr(trader, "equity", balance)) / scale
+            # include unrealized P&L already (ProtoOATrader does not). An
+            # absent field falls back to balance plus unrealized P&L; a
+            # present-but-unreadable one raises via parse_optional.
+            raw_equity = parse_optional(getattr(trader, "equity", None))
+            if raw_equity is not None:
+                return raw_equity / scale
         return balance + await self._fetch_position_unrealized_pnl(money_digits)
 
     @property
@@ -3763,9 +3950,17 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                 unidentified.append(f"position:{getattr(position, 'positionId', None)!r}")
                 continue
             trade_data = getattr(position, "tradeData", None)
-            volume = self._positive_int(
-                _to_float(getattr(trade_data, "volume", 0)) if trade_data is not None else 0
-            )
+            try:
+                raw_volume = (
+                    parse_optional(getattr(trade_data, "volume", None))
+                    if trade_data is not None
+                    else None
+                )
+            except ValueError:
+                # An unreadable volume is unidentified, not a zero: reporting it
+                # keeps the flatten honest instead of closing nothing silently.
+                raw_volume = None
+            volume = self._positive_int(raw_volume)
             if volume is None:
                 unidentified.append(f"position:{position_id}:volume")
                 continue
@@ -3824,7 +4019,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
                     f"cTrader symbol id {symbol_id!r} is not in the symbols "
                     "cache; refusing to scale its position with a guess."
                 )
-            volume = _to_float(getattr(trade_data, "volume", 0))
+            volume = parse_money(getattr(trade_data, "volume", 0))
             qty = _broker_volume_to_qty(
                 volume, self._scale_for(symbol).volume_per_qty
             )
@@ -3834,7 +4029,7 @@ class CTraderLiveAdapter(BaseLiveAdapter):
             row: dict[str, Any] = {
                 "symbol": normalized_symbol,
                 "qty": qty,
-                "entry_price": _to_float(getattr(position, "price", 0)),
+                "entry_price": parse_money(getattr(position, "price", 0)),
                 "current_price": 0.0,
                 "unrealized_pnl": 0.0,
             }

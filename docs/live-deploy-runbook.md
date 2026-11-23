@@ -16,6 +16,70 @@ Status: credential-gated as of 2026-07-13.
   a mode that only comes from the bot's own config default, which is read from the processor the
   deployment runs.
 
+## Ops Alert Channel (#304)
+
+The daemon can push alert-worthy log records to a Discord-compatible webhook so an operator is
+paged instead of only finding problems in the logs. Implementation: `shared/alerts.py`, installed
+by `run_daemon()` at daemon start; importing `live_runner.daemon` does not install the alert sink
+(logging and Sentry setup still happen at import).
+
+Set the variables in the environment the daemon runs with — e.g. exported before start or in the
+sourced `.accounts.env` / a systemd `EnvironmentFile`.
+
+- `OPS_ALERT_WEBHOOK_URL` — webhook URL. **Unset disables alerting entirely**; the daemon then
+  behaves exactly as before. There is no other configuration needed to turn it on.
+- `OPS_ALERT_MAX_PER_MINUTE` (default `12`) — alerts per sliding minute; overflow is dropped and
+  the drop count is folded into the next alert that does go out.
+- `OPS_ALERT_DEDUP_SECONDS` (default `300`) — alerts with the same dedup key inside this window
+  send once. The key is the `data.alert` marker plus the record's `account_id`,
+  `deployment_id`, `service_id` and `symbol` when present — so the same marker on a different
+  deployment is a different alert, but a changed payload (e.g. new mismatch quantities) under the
+  same marker and scope is still suppressed until the window expires. For records without a
+  marker the key is logger + level + message template (not the formatted message) plus the same
+  scope identifiers.
+- `OPS_ALERT_MIN_LEVEL` (default `ERROR`) — minimum level for level-triggered alerts, as a level
+  name (`CRITICAL`) or number. Raise it to `CRITICAL` to page only on emergencies; an explicit
+  `data.alert` marker still bypasses the floor because it is a deliberate operator alert. An
+  invalid value falls back to `ERROR` rather than muting the channel.
+- `OPS_ALERT_EVENTS` (unset = everything) — comma-separated allowlist of event classes. An entry
+  matches a record's `data.alert` marker (e.g. `exit_ledger_mismatch`) or its logger name; when set,
+  only matching records page, so routine errors can be filtered without touching call sites. Logger
+  names match the logging hierarchy: `trading.live-runner` also covers
+  `trading.live-runner.<child>` but not `trading.live-runnerx`. **Markers and `CRITICAL` records
+  always page regardless of the allowlist** — the allowlist exists to filter routine errors, and
+  muting those two would hide real emergencies. Note that today all live modules log under the
+  single logger `trading.live-runner` (`get_logger("live-runner")`), so a logger-name allowlist can
+  only select "the whole live daemon", not one module inside it.
+- `OPS_ALERT_IGNORE` (unset = nothing ignored) — comma-separated denylist of fnmatch patterns
+  (e.g. `poll failed for *`, `*heartbeat*`) matched against the message template and the rendered
+  message. Matching is `fnmatchcase`: case-sensitive, and a pattern cannot itself contain a comma
+  (the comma separates entries). A match drops the record even when it is a `data.alert` marker or
+  `CRITICAL`, so this is the explicit "this one routine error is noise" switch — a broad pattern
+  such as `*failed*` can silently mute the known emergency markers, which is why setting it logs a
+  startup warning. Use it to mute a single noisy ERROR without touching call sites; prefer it over
+  a broad `OPS_ALERT_EVENTS` allowlist.
+
+The effective filter (min level, allowlist, denylist) is logged once at startup on the
+`trading.alerts` logger, and setting `OPS_ALERT_EVENTS` or `OPS_ALERT_IGNORE` additionally logs a
+warning — a filter that matches nothing, or a denylist wide enough to mute the emergency markers,
+would otherwise leave the channel silently dead or silently mute.
+
+What is alerted: every `ERROR`/`CRITICAL` record (or whatever `OPS_ALERT_MIN_LEVEL` sets), plus
+any record carrying `data.alert` (the explicit operator-alert marker, e.g. `exit_ledger_mismatch`)
+at any level — `data.alert` markers route even when `LOG_LEVEL` would keep the record out of the
+file/console output — then filtered by `OPS_ALERT_IGNORE` and, for routine errors only,
+`OPS_ALERT_EVENTS`.
+
+Guarantees: the sink is fire-and-forget on a bounded queue (256 alerts). A full queue or a slow
+webhook drops and counts alerts; it can never block or raise into a trading path. A failed send
+(e.g. a Discord 429 or 5xx) is counted and logged on the `trading.alerts` logger, not retried — a single
+lost alert is accepted for v1 rather than risking a retry storm against a struggling webhook.
+The sink's own logger (`trading.alerts`) never pages, so a failing webhook cannot feed alerts
+back into the channel.
+Payloads are
+redacted with the same rules as the JSON log formatter before they leave the process. Only the
+live daemon installs the sink today; other entry points are unaffected.
+
 ## Live Trailing Stops
 
 Central definition: `shared/trailing.py` (`LIVE_SUPPORTED_TRAILING_MODES_BY_BROKER`). Execution:
@@ -536,6 +600,8 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+
+
 ### The cTrader top-N deploy never arms a non-demo account (#261)
 
 That endpoint creates its rows in one shot, with no per-deployment
@@ -710,9 +776,52 @@ set -o pipefail
 uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date -u +%Y%m%dT%H%M%SZ).log"
 ```
 
-> NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
+The daemon takes no options: deployments come from the database (`live_deployments` via
+`shared/database.list_live_deployments`), not from `live_deployments.yaml`, and there is no
+`--config`. An unknown option is a usage error (exit 2), never a silently ignored argument.
+
+`python -m live_runner.daemon --help` is safe to run anywhere, at any time: it prints the usage
+and exits 0 without opening the database, running migrations, or connecting to a broker. It used
+to start the daemon instead (#310).
+
+**One daemon per database.** Before the first migration or broker connect, the daemon takes an
+exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lock`, or the
+`DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
+exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
+was killed (even `kill -9`) releases it on death and never blocks the next start. The data
+directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` - or
+the directory of a SQLite `DATABASE_URL` file - on a network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
+disconnects its broker adapters and then waits - bounded, `WORKER_JOIN_TIMEOUT_SECONDS` = 30s - for
+its in-flight database work, so the lock is never handed on while its own writes are still
+running; if a worker thread is still stuck after the budget the daemon logs CRITICAL and exits 4
+with the lock held until the process dies. `systemctl stop` sends SIGTERM, which this build does
+not handle: the daemon dies immediately with no drain (graceful SIGTERM shutdown is a separate
+change). Deploy this build as stop, deploy, start - the first rollout is **not** protected against
+a daemon already running an older, lockless build: stop the old daemon before starting this one.
+A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
+therefore retries a refused start every `RestartSec` and logs the refusal each time: that is the
+signal to find and stop the other daemon, not to delete the lock file - the file is a handle, the
+lock is the kernel's.
+
+**A newer build runs data migrations.** Starting a build whose schema or one-time data migrations
+the running build does not have yet applies them on startup (see "Commission sign migration
+(cTrader, #205)"). Roll out as stop, deploy, start: never run an old and a new build side by side.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
+
+## Indicator Kernel Warm-up (#378)
+
+The shared indicator hot loops (`shared/indicators/`) run as `numba.njit`
+compiled kernels. Importing `shared.indicators` stays cheap — numba is
+imported lazily — but the **first call of each kernel in a process pays a
+one-time compile of roughly 0.1–0.8 s** (four kernels: the two Supertrend
+recursions and the two `custom_swings` ATR loops). For a live signal bot
+that is the first bar it evaluates; for a backtest it is inside the first
+strategy evaluation and is amortised over the run. Compiled kernels are
+cached in the `__pycache__` directory next to `shared/indicators/` (or
+under `NUMBA_CACHE_DIR` when set), so a warm checkout does not recompile
+after the first process. Set `TP_DISABLE_NUMBA=1` to force the pure
+Python/NumPy path everywhere (parity is pinned bit-for-bit either way).
 
 ## Loss Circuit Breaker (#301)
 
@@ -999,8 +1108,8 @@ Bars are keyed by canonical pair (`BTC/USD`) in every spelling (`BTCUSD`, `btc-u
 ## Execution prices and commissions (Alpaca, #124)
 
 - `live_executions.commission` is nullable. `0.0` is a known zero (Alpaca equities); `NULL` means the fee is not known yet. Every reader treats `NULL` as "net PnL incomplete", never as zero: the live stats payload reports `net_pnl: null`, `net_pnl_complete: false` and `commission_unknown_count`, and trade/signal payloads carry `commission: null`.
-- Alpaca crypto fees are posted end of day as `CFEE` account activities, so crypto fills are stored with `NULL`. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST, once a trade date is two UTC days old and for fills up to 30 days back, allocates each (pair, trade date)'s fee pro rata by received quantity, converts it to USD and writes it. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules.
-- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, trade date not posted yet).
+- Alpaca crypto fees are posted as `CFEE` account activities in batches, so crypto fills are stored with `NULL`. `CFEE.date` is the *posting* date (the New York date of `created_at`), not the trade date, and observed posting delays reach ~51 h, so there is no fixed delay to wait out. The daemon's hourly `commission-backfill` task reads `FILL`, `CFEE` and `FEE` activities over REST for fills up to 30 days back. `CFEE` entries are clustered into posting batches by `created_at` (entries within 15 minutes of each other are one batch); a batch's fee covers the fills since the previous batch's latest `created_at` up to its own. A fill newer than the latest posted batch stays `NULL` and is retried on the next pass - "not posted yet" is never treated as "no fee". Two fee kinds exist: asset fees (on buys) name their pair and a base-asset `qty`; USD fees (on sells) carry only a negative `net_amount` and *no* `symbol`, so they form a per-account, per-batch USD pool that is allocated to a pair only when exactly one crypto pair has sells in the batch window - with several selling pairs the USD part fails closed while pair-attributed asset fees are still priced. Each fee is allocated pro rata by received quantity and converted to USD. Everything it cannot attribute unambiguously stays `NULL` and is logged ("Alpaca commission backfill: leaving ..."); see `live_runner/alpaca_fees.py` for the rules. The first fetched batch fails closed when an earlier batch or earlier fills may exist outside the fetch window, so a posting stall longer than the lookback leaves a batch unpriced rather than risk the wrong attribution. Checking for earlier crypto fills is a full-history `FILL` scan per adapter, bounded by `MAX_ACTIVITY_PAGES` (200) requests against the shared ~200/min Alpaca budget. A found instant and an unfinished scan are cached, but a completed scan that finds *no* crypto fill is deliberately rescanned every pass - a fill posted later can still carry an earlier `transaction_time`, so `None` is not fixed history. That state only persists while crypto executions await a commission that the broker reports no fills for (for example local rows Alpaca does not report - a wrong account or symbol mismatch), which the pass logs as a warning; on a healthy account the scan resolves to a cached instant or UNKNOWN and runs once.
+- The schema migration rebuilds `live_executions` once to drop the `NOT NULL` and turns the hard-coded `0.0` on existing Alpaca fills into `NULL` unless the symbol is provably an equity (`shared/alpaca_symbols.py`): crypto in any accepted spelling (`BTC/USD`, `BTC-USD`, `BTCUSD`) and anything unclassifiable (options, malformed symbols) become unknown. The backfill logs every unknown-commission execution it skips, with the reason (not crypto, no posted CFEE batch covers it yet).
 - `actual_price_observed` labels every Alpaca price: `observed` (stated for this fill), `derived` (computed from broker prices: the order's `filled_avg_price` on a single-fill order, or a reconciled remainder), `sent_bad`/`absent` (no usable price), `derived_unavailable` (the remainder's price could not be derived honestly). A stream event never borrows the order's cumulative average for a partial fill.
 - A reconciled fill whose order has no usable `filled_avg_price` is not stored; the next reconciliation pass (adapter connect) retries it. Otherwise the missing QUANTITY is always stored. Its price is `(avg*broker_qty - sum(local price*qty)) / missing_qty`, labelled `derived`, when every local leg has a usable price and the result lies within 10% of the order's average (`REMAINDER_PRICE_MAX_REL_DEVIATION`); otherwise it is stored at `0.0` with `derived_unavailable`, so exit sizing and duplicate-order protection still see the quantity.
 - `live_executions.timestamp` drives PnL ordering and is never invented (#135). A fill takes the stream event's own timestamp, then the order's `filled_at`, then its `updated_at`; a stamp that carries no time of day (a bare date such as `2026-11-03`) is refused rather than read as midnight. When none parses, no row is stored: the stream path logs the quantity it dropped (`filled_qty`, `broker_cumulative_filled_qty`) and the reconciled path logs `missing_filled_qty`, and both say the retry is the next adapter connect, because Alpaca reconciliation runs on `connect()` only - there is no periodic pass. Until then the local filled quantity understates the broker's, so exit sizing and duplicate-order protection size against a flat position.
@@ -1135,3 +1244,104 @@ so a trimming that hides an older conflict cannot happen there.
    repeat steps 3-5.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## Release / rollback
+
+The live state that must survive a deploy is the SQLite database (`live_executions`, the
+ledgers, `live_deployments`, `schema_data_migrations`). `scripts/db_backup.py` backs it up and
+restores it; run it from the repo root with the same `.env`/`DATA_DIR` the daemon uses.
+
+### Backup
+
+```bash
+uv run python -m scripts.db_backup backup          # snapshot now, keep 14
+uv run python -m scripts.db_backup backup --keep 30
+uv run python -m scripts.db_backup list            # what is retained
+uv run python -m scripts.db_backup verify <file>   # integrity + applied migrations
+```
+
+Backups use the SQLite online backup API (`pages=-1`, one step under a single read
+transaction), so they are **safe while the daemon runs** - the copy is always a consistent
+committed-state snapshot, no stop needed. Files land in `<db parent>/backups/<db file
+name>-<UTC stamp>.db` - `<DATA_DIR>/backups/backtests.db-<UTC stamp>.db` for the default
+database, or pass `--backup-dir` to choose another directory - one self-contained file each
+(rollback-journal mode), rotating to `--keep` per database *within that directory*. Schedule
+it (cron/systemd timer) independently of deploys; the release procedure below takes one
+explicitly anyway, and pre-deploy snapshots should go to their own `--backup-dir` (or be
+copied off-box) so daily rotation cannot prune the backup a rollback past a migration needs.
+
+### Restore
+
+```bash
+uv run python -m scripts.db_backup restore <backup-file>
+```
+
+Restore **refuses while the database may be in use** and exits 2. Before overwriting, it
+holds the daemon's single-instance lock for the whole operation (so no daemon can start
+mid-restore), proves no other process has the database open by switching it to
+rollback-journal mode - which fails while the viewer, a smoke run, or any other connection
+holds it - takes a safety snapshot of the current database into the same backup directory
+(skip with `--no-safety-snapshot`), verifies the backup (`PRAGMA quick_check`), stages the
+restore beside the target, and swaps it in with `os.replace` - a failed copy never leaves a
+half-written database, and stale `-wal`/`-shm`/`-journal` sidecars are removed first so old
+frames cannot replay over the restored file. It prints the `schema_data_migrations` delta
+between the backup and the pre-restore database; read it before starting any build.
+
+The guard works in three layers:
+
+* **Single-instance lock.** Once the daemon lock from PR #313
+  (`shared/single_instance.py`, `<db>.lock` next to the database file) is on main, the script
+  uses it; until then it holds the same `flock` inline on the same file. Either way the lock
+  is *held* through the swap, not just probed.
+* **Process scan.** The script scans the process table for a `live_runner.daemon` command
+  line (`ps` on Linux/macOS, PowerShell CIM on Windows) and refuses when one is found,
+  whatever the lock reports: during the first release after #313 the running daemon is an old
+  build that never takes the lock, and a daemon on another `DATABASE_URL` cannot be told
+  apart from one on this database. If you are certain the found process trades a different
+  database, re-run with `--force` (the override is logged to stderr). Check what the guard
+  sees with `python -m scripts.db_backup status`.
+* **Open-database probe.** `PRAGMA journal_mode=DELETE` on the live file fails while any
+  other process - the viewer above all - has it open, because `os.replace` would strand that
+  connection on the unlinked inode and its later commits would be silently lost. **Stop the
+  viewer and every process using the database before restoring**; `--force` overrides this
+  too, with the same data-loss risk as a live daemon.
+
+### Release procedure
+
+1. **Stop** the daemon (SIGINT/SIGTERM; confirm no `live_runner.daemon` process remains and
+   `db_backup status` shows a free lock) **and stop the viewer and every other process using
+   the database** - restore refuses while any of them holds it open.
+2. **Backup**: `python -m scripts.db_backup backup` - for a risky deploy take it into a
+   dedicated directory (`--backup-dir <dir>`) or copy the file off-box; the default backup
+   dir is local disk only and its `--keep` rotation will eventually prune it.
+3. **Deploy** the new build.
+4. **Migrate**: the first `init_db` runs schema and one-way data migrations exactly once
+   (recorded in `schema_data_migrations`). There is no separate migrate step - do not start two
+   builds side by side across a migration boundary (see #205 below).
+5. **Start** the daemon, then verify fills/ledgers reconcile (`reconcile_executions`).
+
+### Rollback
+
+* **Code-only rollback** (no data migration ran): stop, check out the previous build, start.
+  Safe at any time.
+* **Data rollback**: stop everything on the database (daemon *and* viewer),
+  `python -m scripts.db_backup restore <pre-deploy backup>`, then **before starting anything**
+  reconcile the restored state against the broker: the restore rolls the database back to the
+  backup, so orders, fills and positions created since are invisible to it - compare broker
+  positions and open orders with the restored DB, flatten or manually reconcile anything newer
+  than the backup, and confirm no signal source will re-ingest post-backup messages (a replay
+  would create duplicate live orders; signal-ingestion cursors written after the backup are
+  gone too). Only then start the build that matches the backup's schema. The restore prints
+  which `schema_data_migrations` the backup lacks; the next `init_db` re-applies them, which
+  is only correct if the backup predates them. Note the ledger does not see every data
+  change: the #205-style commission backfill rewrites rows without a
+  `schema_data_migrations` marker, so "no migration ran" cannot be read off the ledger alone.
+* **One-way migrations cannot be rolled back by an old build.** The #205 commission-sign
+  migration and the other `schema_data_migrations` entries transform data in place; an old build
+  starting on a migrated database misreads it (e.g. a raw negative cTrader charge is
+  indistinguishable from a new-convention rebate). To go back past one, restore a backup taken
+  *before* that migration and accept losing every fill written since. `live_executions` can
+  only be rebuilt through reconciliation for fills whose signal the backup already contains -
+  `reconcile_executions` walks local `live_signals`, so orders created after the backup have
+  no local signal and stay invisible; the broker remains the source of truth for those, per
+  the reconciliation steps above.

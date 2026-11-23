@@ -37,6 +37,8 @@ uv run mypy
 
 `mypy` takes no arguments: the scope comes from `files` in `[tool.mypy]`. Run both before a PR. The ruff selection is E/F/I/W plus bug-class families only (bugbear, DTZ, PERF, selected PLE/PLW/RUF); each family was enabled only after every hit was fixed, and the comment block under it records the families deliberately left off. Mypy covers `risk`, `live_runner`, `signal_bots`, `strategies`, `shared/models.py` and `shared/market_calendar.py`; widen it by adding paths, never by loosening flags, and do not add `# type: ignore` without a specific error code and a reason. CI runs `ruff check .` (advisory, existing E501 backlog), a blocking `ruff check --select <the enabled bug-class families>` (the advisory step cannot catch a new hit there), and mypy (blocking, same `uv run mypy` command and the same pinned version from `uv.lock`).
 
+Test order is deliberately fixed by `pytest.ini` (`addopts = -p no:randomly`), so local runs, `ci`, and agent workflows stay in declared order. `pytest-randomly` is installed with the dev extra and runs weekly in the `randomised-tests` workflow to catch order-dependent tests; its header prints `Using --randomly-seed=N` - reproduce a failure with `uv run pytest -p randomly --randomly-seed=N` (or dispatch the workflow with the `seed` input).
+
 ## Issues
 
 When creating an issue, give the appropriate labels. If things are unclear, give the `needs-decision` label. This signals that a maintainer needs to look at the issue and decide on unclear points, like open questions.
