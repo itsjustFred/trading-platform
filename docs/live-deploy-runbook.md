@@ -373,6 +373,15 @@ pre-existing ACTIVE row from a new one, so the flag gates all of them.
   A same-bar reversal (exit + new entry on one bar) emits the exit but the
   entry waits one bar: the closing position still counts against the cap
   until the next evaluation.
+  **Known window:** an entry that reached `adapter.submit_order` but whose
+  `broker_order_id` was never persisted (a crash between the broker accept
+  and the write, or a lost submit response) carries only its signal id — no
+  broker order id and no fills yet. While the broker's position in the
+  symbol is flat *and* the order is no longer working, that row counts as 0
+  open entries, so a same-symbol entry could be submitted in that window.
+  The window closes as soon as either the fill is booked or the broker
+  position goes non-zero; there is no persisted "submitted" marker on the
+  signal row to close it earlier (#360 review).
 - **Session-bound symbols** (anything the venue calendar does not resolve to
   24/7) are only *actioned* while the venue is open, using
   `shared.venue_calendar`. Daily-and-longer bars may be held over the market
@@ -443,6 +452,87 @@ close and intent kind. Within a process the runner tracks the newest
 processed bar per deployment+symbol; across a restart the same closed bar
 re-evaluates to the same key, and the adapter's `save_live_signal` dedupe
 returns the persisted row instead of placing a second broker order.
+
+## Periodic Broker Reconciliation (#303)
+
+The daemon runs `live_runner/broker_reconciliation.py` on the deployment sync
+snapshot. For every account with an ACTIVE or PAUSED deployment it compares:
+
+- the signed ledger quantity per symbol (`live_executions` fills by deployment)
+  with the broker's net position for that symbol;
+- broker order ids/client order ids the ledger still expects to be working with
+  the adapter's normalized working-order view (bracket legs and attached
+  stop/target orders are marked as protection, not untracked entries/exits);
+- protective stops with open broker positions when the adapter can list them.
+
+Unreadable broker state is a mismatch (fail closed), but it must not flap: a
+deployment's entries are halted only after
+`broker_reconciliation_consecutive_mismatches` consecutive bad passes
+(default `2`), and a clean pass resets the streak *and* releases the halt.
+
+The halt is **entry-only**. It is a persisted flag on the deployment (the
+`broker_reconciliation_entries_halted` settings key), re-checked atomically
+inside the submission claim immediately before an entry order is submitted -
+the deployment stays
+`ACTIVE`, so exits, in-flight orders, trailing stops and STOPPED enforcement
+keep their normal semantics. A `PAUSED` status was rejected for this on
+purpose: it would also freeze exits and trailing, exactly when a broker/ledger
+divergence makes them most needed. The halt and its release are written to the
+live control audit trail as `broker_reconciliation_entries_halt` /
+`broker_reconciliation_entries_resume` (actor `broker_reconciliation`).
+
+To release a halt early, set the deployment `PAUSED` and back to `ACTIVE` (the
+resume transition clears the flag); a still-mismatched account is re-halted on
+the next pass, so this cannot hide a live divergence. To make the halt
+permanent, leave the flag - or `PAUSED`/`STOPPED` the deployment.
+
+Only signals younger than 7 days and belonging to ACTIVE/PAUSED deployments
+count as orders the ledger still expects to be working: both live order paths
+expire fast (Alpaca `DAY`, cTrader `IMMEDIATE_OR_CANCEL`), so an older
+unfilled row is a cancelled/expired/rejected historical order, not a working
+one. A younger order missing from the broker's working list is not trusted on
+the age bound alone: the reconciler asks the adapter for that order's state
+(`get_order_state`, bounded lookups per pass), and only a proven `terminal`
+state clears the finding - IOC remainders, cancelled orders and rejected
+submissions all classify terminal, while `working`, unknown, timed-out or
+unreadable states keep it. Accounts holding positions or orders placed
+*outside* the platform
+(manual trades, another tool) will always mismatch - the ledger cannot vouch
+for them; flatten or adopt them at the broker before relying on a clean
+report.
+
+Settings live in deployment `settings` (see `live_deployments.example.yaml`).
+Broker state is account-level, so the strictest values across an account's
+deployments win:
+
+- `broker_reconciliation_interval_seconds` (default `300`, bounds 30-86400)
+- `broker_reconciliation_qty_tolerance` (`null` = adapter precision, strict
+  default when unknown)
+- `broker_reconciliation_consecutive_mismatches` (default `2`, bounds 1-10)
+- `broker_reconciliation_enabled` (default `true`; the account reconciles unless
+  every deployment on it opts out)
+
+All four are validated at deployment creation: an unusable value is refused
+instead of being silently defaulted. At runtime an unrecognised boolean still
+fails closed to *enabled* (a typo like `"flase"` cannot disable
+reconciliation).
+
+The latest pass is written to
+`$DATA_DIR/live/broker_reconciliation_report.json` and served read-only at
+`GET /api/live/reconciliation`. Every mismatch logs the structured diff; the
+halt threshold logs at ERROR with `alert=broker_reconciliation_mismatch`.
+
+### Open decision
+
+Interval, tolerance and the consecutive-mismatch count are maintainer decisions.
+The shipped defaults are deliberately conservative (5-minute interval, adapter
+precision or the strict 1e-9 quantity tolerance, two consecutive mismatches)
+because a false halt is recoverable while a missed broker/ledger divergence is
+not. Whether account-level mismatches should halt entries on *all* ACTIVE
+deployments on the account (current conservative choice) or only the
+deployments whose ledger rows implicate the symbol is also open; the
+account-wide halt is kept because broker positions and working orders are
+netted per account and cannot be attributed to one deployment safely.
 
 ## Strategy Promotion Gate (#165)
 
@@ -633,6 +723,8 @@ The viewer answers HTTP 409 with the reason. Exit-only orders are never blocked:
 closing a position must not depend on a promotion. The daemon check runs on
 every entry, so a deployment edited after activation is caught at order time.
 
+
+
 ### The cTrader top-N deploy never arms a non-demo account (#261)
 
 That endpoint creates its rows in one shot, with no per-deployment
@@ -807,7 +899,36 @@ set -o pipefail
 uv run python -m live_runner.daemon 2>&1 | tee "docs/reports/live_daemon_$(date -u +%Y%m%dT%H%M%SZ).log"
 ```
 
-> NOTE (Stand 2026-09): `daemon.main()` nimmt kein `--config` — Config kommt aus der DB via `shared/database.list_live_deployments`, nicht aus `live_deployments.yaml`.
+The daemon takes no options: deployments come from the database (`live_deployments` via
+`shared/database.list_live_deployments`), not from `live_deployments.yaml`, and there is no
+`--config`. An unknown option is a usage error (exit 2), never a silently ignored argument.
+
+`python -m live_runner.daemon --help` is safe to run anywhere, at any time: it prints the usage
+and exits 0 without opening the database, running migrations, or connecting to a broker. It used
+to start the daemon instead (#310).
+
+**One daemon per database.** Before the first migration or broker connect, the daemon takes an
+exclusive OS lock in a file next to the live database (`DATA_DIR/backtests.db.lock`, or the
+`DATABASE_URL` file's sibling when one is set). A second start is refused with a clear error and
+exit code 3, and the running daemon keeps its lock. The lock is owned by the OS, so a daemon that
+was killed (even `kill -9`) releases it on death and never blocks the next start. The data
+directory must be local: `flock` semantics vary on NFS/SMB mounts, so do not put `DATA_DIR` - or
+the directory of a SQLite `DATABASE_URL` file - on a network filesystem. On an in-process stop (Ctrl-C, or a cancelled coroutine) the daemon first
+disconnects its broker adapters and then waits - bounded, `WORKER_JOIN_TIMEOUT_SECONDS` = 30s - for
+its in-flight database work, so the lock is never handed on while its own writes are still
+running; if a worker thread is still stuck after the budget the daemon logs CRITICAL and exits 4
+with the lock held until the process dies. `systemctl stop` sends SIGTERM, which this build does
+not handle: the daemon dies immediately with no drain (graceful SIGTERM shutdown is a separate
+change). Deploy this build as stop, deploy, start - the first rollout is **not** protected against
+a daemon already running an older, lockless build: stop the old daemon before starting this one.
+A systemd unit with `Restart=always` (see `scripts/setup_services.sh`)
+therefore retries a refused start every `RestartSec` and logs the refusal each time: that is the
+signal to find and stop the other daemon, not to delete the lock file - the file is a handle, the
+lock is the kernel's.
+
+**A newer build runs data migrations.** Starting a build whose schema or one-time data migrations
+the running build does not have yet applies them on startup (see "Commission sign migration
+(cTrader, #205)"). Roll out as stop, deploy, start: never run an old and a new build side by side.
 
 Keep the daemon running long enough to verify Discord connection, paper order submission, fill handling, and `reconcile_executions`.
 
@@ -1246,3 +1367,104 @@ so a trimming that hides an older conflict cannot happen there.
    repeat steps 3-5.
 
 `live_executions.commission` is a positive cost for every broker; a broker rebate cannot be stored as a negative cost, so the cTrader adapter stores it as `NULL` (fee unknown) and logs an ERROR — the fill is kept and net PnL stays flagged incomplete (#285). The first `init_db` of a build with this change converts existing cTrader rows once (`abs` of the stored value, recorded in `schema_data_migrations`). Stop the daemon (and any process on the same SQLite file) before starting the new build: an old build that still writes cTrader fills after the marker is recorded stores a raw negative charge that violates the positive-cost convention and is never converted (the marker is already recorded, and new-convention rebates are stored as NULL, so the stray negative is at least distinguishable). Roll out as stop, deploy, start; do not run old and new builds side by side.
+
+## Release / rollback
+
+The live state that must survive a deploy is the SQLite database (`live_executions`, the
+ledgers, `live_deployments`, `schema_data_migrations`). `scripts/db_backup.py` backs it up and
+restores it; run it from the repo root with the same `.env`/`DATA_DIR` the daemon uses.
+
+### Backup
+
+```bash
+uv run python -m scripts.db_backup backup          # snapshot now, keep 14
+uv run python -m scripts.db_backup backup --keep 30
+uv run python -m scripts.db_backup list            # what is retained
+uv run python -m scripts.db_backup verify <file>   # integrity + applied migrations
+```
+
+Backups use the SQLite online backup API (`pages=-1`, one step under a single read
+transaction), so they are **safe while the daemon runs** - the copy is always a consistent
+committed-state snapshot, no stop needed. Files land in `<db parent>/backups/<db file
+name>-<UTC stamp>.db` - `<DATA_DIR>/backups/backtests.db-<UTC stamp>.db` for the default
+database, or pass `--backup-dir` to choose another directory - one self-contained file each
+(rollback-journal mode), rotating to `--keep` per database *within that directory*. Schedule
+it (cron/systemd timer) independently of deploys; the release procedure below takes one
+explicitly anyway, and pre-deploy snapshots should go to their own `--backup-dir` (or be
+copied off-box) so daily rotation cannot prune the backup a rollback past a migration needs.
+
+### Restore
+
+```bash
+uv run python -m scripts.db_backup restore <backup-file>
+```
+
+Restore **refuses while the database may be in use** and exits 2. Before overwriting, it
+holds the daemon's single-instance lock for the whole operation (so no daemon can start
+mid-restore), proves no other process has the database open by switching it to
+rollback-journal mode - which fails while the viewer, a smoke run, or any other connection
+holds it - takes a safety snapshot of the current database into the same backup directory
+(skip with `--no-safety-snapshot`), verifies the backup (`PRAGMA quick_check`), stages the
+restore beside the target, and swaps it in with `os.replace` - a failed copy never leaves a
+half-written database, and stale `-wal`/`-shm`/`-journal` sidecars are removed first so old
+frames cannot replay over the restored file. It prints the `schema_data_migrations` delta
+between the backup and the pre-restore database; read it before starting any build.
+
+The guard works in three layers:
+
+* **Single-instance lock.** Once the daemon lock from PR #313
+  (`shared/single_instance.py`, `<db>.lock` next to the database file) is on main, the script
+  uses it; until then it holds the same `flock` inline on the same file. Either way the lock
+  is *held* through the swap, not just probed.
+* **Process scan.** The script scans the process table for a `live_runner.daemon` command
+  line (`ps` on Linux/macOS, PowerShell CIM on Windows) and refuses when one is found,
+  whatever the lock reports: during the first release after #313 the running daemon is an old
+  build that never takes the lock, and a daemon on another `DATABASE_URL` cannot be told
+  apart from one on this database. If you are certain the found process trades a different
+  database, re-run with `--force` (the override is logged to stderr). Check what the guard
+  sees with `python -m scripts.db_backup status`.
+* **Open-database probe.** `PRAGMA journal_mode=DELETE` on the live file fails while any
+  other process - the viewer above all - has it open, because `os.replace` would strand that
+  connection on the unlinked inode and its later commits would be silently lost. **Stop the
+  viewer and every process using the database before restoring**; `--force` overrides this
+  too, with the same data-loss risk as a live daemon.
+
+### Release procedure
+
+1. **Stop** the daemon (SIGINT/SIGTERM; confirm no `live_runner.daemon` process remains and
+   `db_backup status` shows a free lock) **and stop the viewer and every other process using
+   the database** - restore refuses while any of them holds it open.
+2. **Backup**: `python -m scripts.db_backup backup` - for a risky deploy take it into a
+   dedicated directory (`--backup-dir <dir>`) or copy the file off-box; the default backup
+   dir is local disk only and its `--keep` rotation will eventually prune it.
+3. **Deploy** the new build.
+4. **Migrate**: the first `init_db` runs schema and one-way data migrations exactly once
+   (recorded in `schema_data_migrations`). There is no separate migrate step - do not start two
+   builds side by side across a migration boundary (see #205 below).
+5. **Start** the daemon, then verify fills/ledgers reconcile (`reconcile_executions`).
+
+### Rollback
+
+* **Code-only rollback** (no data migration ran): stop, check out the previous build, start.
+  Safe at any time.
+* **Data rollback**: stop everything on the database (daemon *and* viewer),
+  `python -m scripts.db_backup restore <pre-deploy backup>`, then **before starting anything**
+  reconcile the restored state against the broker: the restore rolls the database back to the
+  backup, so orders, fills and positions created since are invisible to it - compare broker
+  positions and open orders with the restored DB, flatten or manually reconcile anything newer
+  than the backup, and confirm no signal source will re-ingest post-backup messages (a replay
+  would create duplicate live orders; signal-ingestion cursors written after the backup are
+  gone too). Only then start the build that matches the backup's schema. The restore prints
+  which `schema_data_migrations` the backup lacks; the next `init_db` re-applies them, which
+  is only correct if the backup predates them. Note the ledger does not see every data
+  change: the #205-style commission backfill rewrites rows without a
+  `schema_data_migrations` marker, so "no migration ran" cannot be read off the ledger alone.
+* **One-way migrations cannot be rolled back by an old build.** The #205 commission-sign
+  migration and the other `schema_data_migrations` entries transform data in place; an old build
+  starting on a migrated database misreads it (e.g. a raw negative cTrader charge is
+  indistinguishable from a new-convention rebate). To go back past one, restore a backup taken
+  *before* that migration and accept losing every fill written since. `live_executions` can
+  only be rebuilt through reconciliation for fills whose signal the backup already contains -
+  `reconcile_executions` walks local `live_signals`, so orders created after the backup have
+  no local signal and stay invisible; the broker remains the source of truth for those, per
+  the reconciliation steps above.

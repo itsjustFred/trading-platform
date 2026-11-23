@@ -1293,6 +1293,92 @@ def test_filled_but_unbooked_entry_counts_via_broker_position(
     assert sent == []
 
 
+def test_broker_held_symbols_keeps_the_brokers_crypto_spelling(
+    tmp_path: Path,
+) -> None:
+    """Bundle-51 blocker: Alpaca reports crypto positions as ``BTCUSD``; the
+    runner hands that spelling to the ledger unchanged — the canonical
+    ``crypto_pair_key`` match lives in
+    ``list_live_deployment_open_entry_counts_by_symbol`` (pinned in
+    test_open_entry_counts.py), so ``BTC/USD`` entries still match."""
+    path = _strategy_file(tmp_path, META)
+    _sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.positions = [{"symbol": "BTCUSD", "qty": 0.5}]
+    deployment = _deployment()
+
+    held = asyncio.run(runner._broker_held_symbols(adapter, deployment))
+
+    assert held == {"BTCUSD"}
+
+
+def test_non_dict_position_row_disables_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should-fix: a position row that is not a dict is unreadable, not flat —
+    entries fail closed, exits still flow."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-1"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.working_ids = set()
+    adapter.positions = [{"symbol": "AAPL", "qty": 1.0}, "not-a-dict"]
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "broker_positions") in runner._reported
+
+
+def test_none_positions_disable_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should-fix: ``get_positions`` returning ``None`` is "unproven", not
+    "flat" — entries fail closed."""
+    import live_runner.internal_strategy_runner as runner_mod
+
+    monkeypatch.setattr(
+        runner_mod,
+        "list_live_deployment_unfilled_entry_order_refs",
+        lambda deployment_id: {"bo-1"},
+    )
+    path = _strategy_file(tmp_path, META)
+    sent, submit = _collect()
+    runner = _runner(submit, path=path, module=_module_with(_exit_and_entry_strategy))
+    adapter = FakeAdapter()
+    adapter.working_ids = set()
+
+    async def _none_positions():
+        return None
+
+    adapter.get_positions = _none_positions
+    deployment = _deployment()
+
+    asyncio.run(
+        runner.run_once(
+            [deployment], {"acct-1": adapter}, now=BASE + timedelta(seconds=70)
+        )
+    )
+
+    assert len(sent) == 1
+    assert sent[0].metadata.get("exit_only") is True
+    assert (str(deployment.id), "broker_positions") in runner._reported
+
+
 def test_unreadable_positions_disable_entries_but_exits_flow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1550,6 +1636,7 @@ def test_run_daemon_creates_and_cancels_internal_strategy_task(
     monkeypatch.setattr(daemon, "_poll_balances", _noop)
     monkeypatch.setattr(daemon, "run_trailing_stops_loop", _noop)
     monkeypatch.setattr(daemon, "_backfill_commissions_loop", _noop)
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop)
     monkeypatch.setattr(daemon, "run_internal_strategy_loop", _internal_loop)
 
     with pytest.raises(RuntimeError, match="sync boom"):

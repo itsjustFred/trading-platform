@@ -569,9 +569,15 @@ class InternalStrategyRunner:
                 end_date="2100-01-01",
                 parameters=parameters,
             )
+            engine_symbol = str(deployment.symbols[0] if deployment.symbols else "")
             engine = TradeEngine(
                 config,
-                symbol=str(deployment.symbols[0] if deployment.symbols else ""),
+                symbol=engine_symbol,
+                # #354: the slippage model refuses an undetermined asset
+                # class; derive it the same way the session calendar does.
+                asset_class=(
+                    "crypto" if _is_crypto_symbol(engine_symbol) else "stock"
+                ),
             )
         except Exception as exc:  # except-kind: money-decision
             self._report_once(
@@ -670,9 +676,33 @@ class InternalStrategyRunner:
                 error=str(exc),
             )
             return None
+        if positions is None:
+            # ``None`` is "the adapter could not prove the book", not "flat":
+            # guessing flat here would read a real position as a dead order.
+            self._report_once(
+                deployment_id,
+                "broker_positions",
+                "Broker positions read returned nothing; filled-but-unbooked "
+                "entries cannot be told from dead ones, so entries are "
+                "disabled (exits still evaluated)",
+                deployment_id=deployment_id,
+                adapter=type(adapter).__name__,
+            )
+            return None
         held: set[str] = set()
-        for position in positions or []:
-            row = position if isinstance(position, dict) else {}
+        for position in positions:
+            if not isinstance(position, dict):
+                self._report_once(
+                    deployment_id,
+                    "broker_positions",
+                    "Broker positions read returned a non-dict row; "
+                    "filled-but-unbooked entries cannot be told from dead "
+                    "ones, so entries are disabled (exits still evaluated)",
+                    deployment_id=deployment_id,
+                    adapter=type(adapter).__name__,
+                )
+                return None
+            row = position
             symbol = str(row.get("symbol") or "").strip().upper()
             if not symbol:
                 continue

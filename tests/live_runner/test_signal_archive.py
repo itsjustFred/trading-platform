@@ -501,6 +501,8 @@ def test_run_daemon_shutdown_flushes_signal_archive(
     # gather members it must be stubbed for run_daemon to reach shutdown.
     monkeypatch.setattr(daemon, "run_internal_strategy_loop", _noop_loop)
 
+    monkeypatch.setattr(daemon, "run_broker_reconciliation_loop", _noop_loop)
+
     asyncio.run(daemon.run_daemon(accounts_env=tmp_path / "accounts.env"))
 
     assert close_calls == [5.0]
@@ -919,16 +921,61 @@ def test_claim_and_submit_success_records_traded(
         timestamp=datetime.now(timezone.utc),
         metadata=dict(normalized.metadata),
     )
-    prepared_signal = SimpleNamespace(symbol="AAPL", action="buy")
+    prepared_signal = SimpleNamespace(
+        symbol="AAPL",
+        action="buy",
+        theoretical_price=190.5,
+        metadata={
+            "entry_price": 190.5,
+            "stop_loss": 185.0,
+            "take_profit": 200.0,
+        },
+    )
 
     async def _prepare_order(_adapter, _deployment, _signal):
         return prepared_signal, 1.0
+
+    async def _caps_passthrough(_adapter, _deployment, _signal, *, qty, risk_config):
+        # The caps have their own suite (test_live_pre_submit_caps.py); this
+        # test pins the archive record, so the check is stubbed to a pass —
+        # the SimpleNamespace signal/adapter doubles cannot satisfy its
+        # broker reads.
+        return qty
 
     class _Adapter:
         async def submit_order(self, _signal, qty=None):
             return "ord-42"
 
+        async def get_quote(self, symbol):
+            from live_runner.base_adapter import LiveQuote
+
+            return LiveQuote(
+                bid=190.5,
+                ask=190.5,
+                timestamp=datetime.now(timezone.utc),
+                source="test",
+            )
+
+        async def get_pip_value(self, symbol):
+            from live_runner.base_adapter import LivePipValue
+
+            return LivePipValue(
+                value=1.0,
+                units_per_qty=1.0,
+                conversion_rate=1.0,
+                quote_asset="USD",
+                account_asset="USD",
+                source="test",
+            )
+
+        async def get_equity(self):
+            return 100_000.0
+
+        async def get_used_margin(self):
+            return 0.0
+
     monkeypatch.setattr(daemon, "prepare_order_with_risk", _prepare_order)
+    monkeypatch.setattr(daemon, "enforce_pre_submit_caps", _caps_passthrough)
     monkeypatch.setattr(
         daemon, "claim_live_deployment_submission", lambda *_a, **_k: True
     )

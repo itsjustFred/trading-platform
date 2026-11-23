@@ -493,6 +493,11 @@ def _run_native_cli(tmp_path: Path, *, timeout: float = CLI_TIMEOUT_SECONDS) -> 
             "0.0005",
             "--fee-flat-per-trade",
             "1.0",
+            # #130: the golden pins gross-fill economics — declare the
+            # explicit parity opt-out so per-asset-class slippage defaults
+            # cannot move the fixture.
+            "--slippage",
+            "none",
             "--intrabar-resolution",
             "main_timeframe",
             "--data-dir",
@@ -531,7 +536,11 @@ def _assert_native_cli_semantics(result: BacktestResult) -> None:
     assert result.meta.parameters == {
         "fee_rate": 0.0005,
         "fee_flat_per_trade": 1.0,
+        "slippage": "none",
     }
+    # #130: the run records which slippage model priced its fills — here
+    # the explicit parity opt-out.
+    assert result.meta.data["slippage"]["models"]["PARITY"]["model"] == "none"
     assert [trade.id for trade in result.trades] == [1, 2, 3]
     assert [trade.entry_time for trade in result.trades] == [
         "2024-01-01T03:00:00+00:00",

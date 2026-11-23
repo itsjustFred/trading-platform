@@ -360,6 +360,43 @@ def test_filled_but_unbooked_entry_counts_via_broker_position(isolated_db) -> No
     assert _counts(database, mine, set(), held={"aapl"}) == {"AAPL": 1}
 
 
+def test_held_position_matches_crypto_across_symbol_spellings(isolated_db) -> None:
+    """Bundle-51 blocker: Alpaca reports crypto positions as ``BTCUSD`` while
+    a stored signal may say ``BTC/USD`` — the held-position proof must match
+    on the canonical pair key or the N=1 cap fails open."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    _entry(database, mine, symbol="BTC/USD", broker_order_id="bo-crypto")
+
+    # Broker spelling BTCUSD matches the stored BTC/USD entry.
+    assert _counts(database, mine, set(), held={"BTCUSD"}) == {"BTC/USD": 1}
+    # And the reverse spelling.
+    _entry(database, mine, symbol="BTCUSD", broker_order_id="bo-crypto-2")
+    assert _counts(database, mine, set(), held={"BTC/USD"}) == {
+        "BTC/USD": 1, "BTCUSD": 1,
+    }
+    # A different pair does not rescue either spelling.
+    assert _counts(database, mine, set(), held={"ETHUSD"}) == {}
+
+
+def test_held_position_leaves_equity_symbols_untouched(isolated_db) -> None:
+    """The canonical key must not merge distinct equity tickers."""
+    from tests.conftest import seed_live_deployments
+
+    database, _engine, _data_dir = isolated_db
+    mine = str(uuid.uuid4())
+    seed_live_deployments(database, [mine])
+
+    _entry(database, mine, symbol="BRK.B", broker_order_id="bo-brk")
+
+    assert _counts(database, mine, set(), held={"BRK.B"}) == {"BRK.B": 1}
+    assert _counts(database, mine, set(), held={"BRKB"}) == {}
+
+
 def test_unfilled_entry_refs_cover_both_id_kinds(isolated_db) -> None:
     """The refs set carries signal ids and broker order ids of unfilled
     entries only — never exits, broker closes, or filled entries."""
