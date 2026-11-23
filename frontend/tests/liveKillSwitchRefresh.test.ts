@@ -161,6 +161,28 @@ async function tickPoll() {
   });
 }
 
+// First load succeeds, every later poll fails - the partly-broken-backend
+// shape the stale/error tests all need.
+function failPollsAfterFirstLoad(state: unknown = killSwitchState()) {
+  let calls = 0;
+  return () => {
+    calls += 1;
+    if (calls === 1) {
+      return state;
+    }
+    throw new Error("viewer 500");
+  };
+}
+
+// Drive the harness's halt/resume write: onStateChange with the state the
+// panel set via __ksWriteState (or the default read-back).
+async function writeReadBack() {
+  await act(async () => {
+    globalThis.__ksHookChange?.();
+    await Promise.resolve();
+  });
+}
+
 async function cleanup() {
   if (root) {
     await act(async () => {
@@ -210,14 +232,9 @@ test("the kill-switch state is fetched on mount, on its own", async () => {
 });
 
 test("a failed refresh marks the last good state stale instead of current", async () => {
-  let calls = 0;
-  globalThis.__ksRefreshResponder = () => {
-    calls += 1;
-    if (calls === 1) {
-      return killSwitchState({ halts: [{ scope: "acc-1", mode: "entries" }] });
-    }
-    throw new Error("viewer 500");
-  };
+  globalThis.__ksRefreshResponder = failPollsAfterFirstLoad(
+    killSwitchState({ halts: [{ scope: "acc-1", mode: "entries" }] }),
+  );
 
   await renderHarness();
   assert.equal(field("state"), "loaded");
@@ -260,23 +277,13 @@ test("the state polls on its own timer, not only on account-stream events", asyn
 });
 
 test("a halt/resume write read-back clears the stale mark", async () => {
-  let calls = 0;
-  globalThis.__ksRefreshResponder = () => {
-    calls += 1;
-    if (calls === 1) {
-      return killSwitchState();
-    }
-    throw new Error("viewer 500");
-  };
+  globalThis.__ksRefreshResponder = failPollsAfterFirstLoad();
 
   await renderHarness();
   await tickPoll();
   assert.equal(field("stale"), "true");
 
-  await act(async () => {
-    globalThis.__ksHookChange?.();
-    await Promise.resolve();
-  });
+  await writeReadBack();
 
   assert.equal(field("stale"), "false");
   assert.notEqual(field("readAt"), "");
@@ -311,13 +318,8 @@ test("a poll resolving after a halt/resume write cannot overwrite it", async () 
   });
   globalThis.__ksRefreshResponder = () => pending;
 
-  const poll = intervals.find((entry) => entry.ms === KILL_SWITCH_POLL_MS);
-  assert.ok(poll, `expected a ${KILL_SWITCH_POLL_MS}ms kill-switch poll interval`);
-  await act(async () => {
-    poll.fn();
-    await Promise.resolve();
-    await Promise.resolve();
-  });
+  // The poll starts and stays in flight on the held promise.
+  await tickPoll();
 
   // While that poll is still in flight, a halt write returns the server's
   // read-back state.
@@ -325,10 +327,7 @@ test("a poll resolving after a halt/resume write cannot overwrite it", async () 
     global_halted: true,
     halts: [{ scope: "global", mode: "entries" }],
   });
-  await act(async () => {
-    globalThis.__ksHookChange?.();
-    await Promise.resolve();
-  });
+  await writeReadBack();
   assert.equal(field("halted"), "true");
 
   // The older poll finally resolves with pre-write state.
@@ -351,23 +350,13 @@ test("a successful halt/resume write clears the poll error text", async () => {
   // #300 follow-up: after a failed poll the panel shows the error; a
   // successful halt/resume write is itself a fresh server read-back, so the
   // error text must clear with the state it returns.
-  let calls = 0;
-  globalThis.__ksRefreshResponder = () => {
-    calls += 1;
-    if (calls === 1) {
-      return killSwitchState();
-    }
-    throw new Error("viewer 500");
-  };
+  globalThis.__ksRefreshResponder = failPollsAfterFirstLoad();
 
   await renderHarness();
   await tickPoll();
   assert.equal(field("error"), "Could not load the kill-switch state.");
 
-  await act(async () => {
-    globalThis.__ksHookChange?.();
-    await Promise.resolve();
-  });
+  await writeReadBack();
 
   assert.equal(field("error"), "");
   assert.equal(field("stale"), "false");
